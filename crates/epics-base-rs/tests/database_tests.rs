@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::database::{LinkBacking, PvDatabase};
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::*;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -8971,7 +8971,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
         // Acknowledge at MAJOR — written sev (2) >= acks (2) -> clear.
-        inst.put_acks(2, LinkBacking::none());
+        inst.put_acks(2);
         assert_eq!(
             inst.common.acks,
             AlarmSeverity::NoAlarm,
@@ -8987,7 +8987,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         let mut inst2 = RecordInstance::new("ACKTEST2".into(), rec2);
         inst2.common.acks = AlarmSeverity::Major;
         inst2.common.sevr = AlarmSeverity::Minor;
-        inst2.put_acks(1, LinkBacking::none());
+        inst2.put_acks(1);
         assert_eq!(
             inst2.common.acks,
             AlarmSeverity::Major,
@@ -9003,7 +9003,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.ackt = true;
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
-        inst.put_ackt(0, LinkBacking::none());
+        inst.put_ackt(0);
         assert!(!inst.common.ackt, "ACKT must be cleared");
         assert_eq!(
             inst.common.acks,

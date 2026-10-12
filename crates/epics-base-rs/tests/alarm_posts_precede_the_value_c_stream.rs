@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
@@ -171,7 +170,7 @@ async fn softioc_pin(case: &str, drive: Drive) {
         }
         let (posts, alarm_posts) = inst.process_local().unwrap();
         assert!(alarm_posts.is_empty());
-        inst.notify_from_snapshot(&posts, LinkBacking::none());
+        inst.notify_from_snapshot(&posts);
     }
     let mut got = stream.lock().unwrap().join("\n");
     got.push('\n');

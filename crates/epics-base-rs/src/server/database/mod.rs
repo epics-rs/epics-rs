@@ -17,10 +17,9 @@ pub(crate) mod scan_index;
 mod snapshot;
 
 pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
-pub(crate) use link_set::MetadataPlan;
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
-    LinkSetRegistry, PostBacking, PutAdmission, RemoteAlarm,
+    LinkSetRegistry, PutAdmission, RemoteAlarm,
 };
 pub(crate) use links::{
     multi_out_rows, multi_output_dispatch_owned, posts_software_event, reads_sell,
@@ -3036,98 +3035,6 @@ impl PvDatabase {
         record: &Arc<RecordCell>,
     ) -> HashMap<String, LinkMetadata> {
         self.resolve_link_backed_metadata_with(record, &InputLinkTexts::none())
-    }
-
-    /// [`Self::resolve_link_backed_metadata`] for a POSTER — a process cycle,
-    /// the async-completion tail, the simulation tail, or one of the two
-    /// out-of-band field posters. All of them resolve so a monitor snapshot
-    /// can carry the LINK's units/precision/limits instead of the record's
-    /// own.
-    ///
-    /// Which is why this door may ask a question the serve door must not: a
-    /// poster's result reaches a consumer only through
-    /// `RecordInstance::make_monitor_snapshot`, and every caller of that sits
-    /// inside a `self.subscribers.get(field)` hit
-    /// (`notify_from_snapshot`, `notify_field_with_origin`,
-    /// `notify_record_alarm`), so a record nothing is subscribed to has no
-    /// reader for what this would resolve. C pays nothing here either way —
-    /// its five metadata slots are `dbDb_lset` entries (`dbDbLink.c:414-415`)
-    /// reached from `dbGet`, so a link-backed slot is resolved when a
-    /// CONSUMER asks the link, never from `dbProcess`.
-    ///
-    /// A serve caller (`read_group`, `read_member`) must keep to
-    /// [`Self::resolve_link_backed_metadata`]: it resolves for the client in
-    /// front of it, about which the record's own subscriber list says nothing.
-    ///
-    /// Measured, 2000 `calc` records at 10 Hz each with one set `INPA`: 5.76
-    /// us of CPU per process cycle through the ungated door, 3.01 through this
-    /// one. The same record in C costs 0.45 us.
-    pub(crate) fn resolve_link_backed_metadata_for_posts(
-        &self,
-        record: &Arc<RecordCell>,
-    ) -> PostBacking {
-        let plan =
-            Self::plan_link_backed_metadata_for_posts(&record.read(), &InputLinkTexts::none());
-        self.resolve_link_backed_metadata_plan(plan)
-    }
-
-    /// [`Self::resolve_link_backed_metadata_for_posts`] for a poster inside the
-    /// record's frame. The plan's read guard drops before the resolve, which
-    /// reads the link targets.
-    pub(crate) fn resolve_link_backed_metadata_for_posts_in(
-        &self,
-        frame: InFrame<'_>,
-    ) -> PostBacking {
-        let plan =
-            Self::plan_link_backed_metadata_for_posts(&frame.read(), &InputLinkTexts::none());
-        self.resolve_link_backed_metadata_plan(plan)
-    }
-
-    /// The first half of [`Self::resolve_link_backed_metadata_for_posts`]:
-    /// everything it asks of THIS record, under the caller's acquisition of
-    /// it. The process cycle asks from inside its entry guard, so the gate
-    /// costs it no second acquisition; the other posters ask under a read
-    /// lock of their own.
-    pub(crate) fn plan_link_backed_metadata_for_posts(
-        inst: &crate::server::record::RecordInstance,
-        prefetched: &InputLinkTexts,
-    ) -> MetadataPlan {
-        if prefetched.none_set() || inst.link_backed_metadata_links().is_empty() {
-            return MetadataPlan::Empty;
-        }
-        // **The gate, and the only place it is asked** — inside the one
-        // acquisition the text read below needs anyway. A poster's result
-        // reaches a consumer only through
-        // `RecordInstance::make_monitor_snapshot`, and every caller of
-        // that sits inside a `self.subscribers.get(field)` hit, so with
-        // nobody subscribed the walk is work no one can read. C pays
-        // nothing here either way: its five metadata slots are
-        // `dbDb_lset` entries (`dbDbLink.c:414-415`) reached from `dbGet`,
-        // so a link-backed slot is resolved when a CONSUMER asks the link,
-        // never from `dbProcess`.
-        //
-        // The answer is a DECLINE, not an empty map. A subscriber can
-        // arrive between a poster's read lock and the post's write lock, and
-        // the post must be able to tell that its backing was never looked up —
-        // otherwise that one event carries the record's own C seed where
-        // the link's metadata belongs.
-        if inst.subscribers.is_empty() {
-            return MetadataPlan::Declined;
-        }
-        MetadataPlan::Links(Self::link_backed_metadata_texts(inst, prefetched))
-    }
-
-    /// The second half: the walk, with NO lock on the record held — it
-    /// reaches for each TARGET's lock, and a self-link's target is this
-    /// record.
-    pub(crate) fn resolve_link_backed_metadata_plan(&self, plan: MetadataPlan) -> PostBacking {
-        match plan {
-            MetadataPlan::Empty => PostBacking::empty(),
-            MetadataPlan::Declined => PostBacking::declined(),
-            MetadataPlan::Links(links) => {
-                PostBacking::resolved(self.walk_link_backed_metadata(links))
-            }
-        }
     }
 
     /// [`Self::resolve_link_backed_metadata`] for a caller that has already

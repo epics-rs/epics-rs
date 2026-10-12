@@ -285,7 +285,9 @@ const AMSG_SIZE: usize = 40;
 pub(crate) struct LogHead<'a> {
     pub(crate) stat: u16,
     pub(crate) sevr: u16,
-    pub(crate) amsg: &'a str,
+    /// A prefix and a remainder, as [`SparseText`](crate::server::record::SparseText)
+    /// holds a link failure's `"field %s"` without rendering it.
+    pub(crate) amsg: (&'static str, &'a str),
     pub(crate) time: WallTime,
     pub(crate) utag: i32,
 }
@@ -295,7 +297,7 @@ impl<'a> LogHead<'a> {
         Self {
             stat: snapshot.alarm.status,
             sevr: snapshot.alarm.severity,
-            amsg: &snapshot.alarm.amsg,
+            amsg: ("", &snapshot.alarm.amsg),
             time: snapshot.timestamp,
             utag: snapshot.user_tag,
         }
@@ -336,12 +338,15 @@ impl PostLog {
         mask: crate::server::recgbl::EventMask,
     ) -> Self {
         let mut amsg = [0u8; AMSG_SIZE];
-        let text = head.amsg;
-        let mut n = text.len().min(AMSG_SIZE - 1);
-        while !text.is_char_boundary(n) {
-            n -= 1;
+        let mut at = 0;
+        for text in [head.amsg.0, head.amsg.1] {
+            let mut n = text.len().min(AMSG_SIZE - 1 - at);
+            while !text.is_char_boundary(n) {
+                n -= 1;
+            }
+            amsg[at..at + n].copy_from_slice(&text.as_bytes()[..n]);
+            at += n;
         }
-        amsg[..n].copy_from_slice(&text.as_bytes()[..n]);
         Self {
             stat: head.stat,
             sevr: head.sevr,

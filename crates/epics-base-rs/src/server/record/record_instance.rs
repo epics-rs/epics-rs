@@ -4081,7 +4081,6 @@ impl RecordInstance {
                 field,
                 mask,
                 0,
-                LinkBacking::none(),
                 (
                     |inst: &Self| inst.resolve_field_upper(field),
                     |inst: &Self| inst.walk_skips(field),
@@ -5180,28 +5179,10 @@ impl RecordInstance {
     /// `prev` is the value captured BEFORE the put. Callers that don't need the
     /// change-detection (e.g. internal writers that know the field is neither)
     /// can keep using [`Self::notify_field_written`].
-    ///
-    /// `backing` is what the sweep needs and could not have: the post below
-    /// names EVERY subscribed field, so it reaches a link-backed one whenever a
-    /// client is monitoring it, and this method runs under the record's own
-    /// write lock where the target's lock cannot be taken. The put path that
-    /// calls it has already resolved one at its no-lock point.
-    pub fn notify_field_written_if_changed(
-        &mut self,
-        field: &str,
-        prev: Option<&EpicsValue>,
-        backing: LinkBacking<'_>,
-    ) {
+    pub fn notify_field_written_if_changed(&mut self, field: &str, prev: Option<&EpicsValue>) {
         let upper = upper_field(field);
         let desc = self.field_desc(&upper);
-        self.written_if_changed(
-            None,
-            &upper,
-            is_metadata_cache_source(&upper),
-            desc,
-            prev,
-            backing,
-        );
+        self.written_if_changed(None, &upper, is_metadata_cache_source(&upper), desc, prev);
     }
 
     /// [`Self::notify_field_written_if_changed`] for a settled put target;
@@ -5211,19 +5192,11 @@ impl RecordInstance {
         field: &str,
         at: &PutAddr,
         pre: PrePut,
-        backing: LinkBacking<'_>,
     ) {
         let PrePut(Some(prev)) = pre else {
             return;
         };
-        self.written_if_changed(
-            None,
-            field,
-            at.cache_source,
-            at.field.desc,
-            prev.as_ref(),
-            backing,
-        );
+        self.written_if_changed(None, field, at.cache_source, at.field.desc, prev.as_ref());
     }
 
     /// The pre-put value of `field` at `at` for the change test; a field the
@@ -5243,7 +5216,6 @@ impl RecordInstance {
         cache_source: bool,
         desc: Option<&'static FieldDesc>,
         prev: Option<&EpicsValue>,
-        backing: LinkBacking<'_>,
     ) {
         let posts_property = Self::field_posts_property(desc);
         if !cache_source && !posts_property {
@@ -5284,7 +5256,6 @@ impl RecordInstance {
                     &f,
                     crate::server::recgbl::EventMask::PROPERTY,
                     0,
-                    backing,
                 );
             }
         }
@@ -7191,12 +7162,12 @@ impl RecordInstance {
     /// ordinary put to the field. Posts exactly what C posts: the ACKT change,
     /// the ACKS it may lower, and the record-wide `DBE_ALARM` — and only when
     /// `ackt` actually changed (C returns 0 early otherwise).
-    pub fn put_ackt(&mut self, value: u16, backing: LinkBacking<'_>) {
-        self.put_ackt_in(&mut PostBurst::new(), value, backing);
+    pub fn put_ackt(&mut self, value: u16) {
+        self.put_ackt_in(&mut PostBurst::new(), value);
     }
 
     /// [`Self::put_ackt`] posting into the put body's `burst`.
-    pub fn put_ackt_in(&mut self, burst: &mut PostBurst, value: u16, backing: LinkBacking<'_>) {
+    pub fn put_ackt_in(&mut self, burst: &mut PostBurst, value: u16) {
         let new_ackt = value != 0;
         if new_ackt == self.common.ackt {
             return;
@@ -7204,15 +7175,15 @@ impl RecordInstance {
         use crate::server::recgbl::EventMask;
         let ack_mask = EventMask::VALUE | EventMask::ALARM;
         self.common.ackt = new_ackt;
-        self.notify_field_backed_in(burst, "ACKT", ack_mask, backing);
+        self.notify_field_in(burst, "ACKT", ack_mask);
         // C `:1294-1297`: turning transient acknowledgement off lowers a
         // sticky ACKS down to the current SEVR — an alarm that has already
         // cleared must not keep a higher unacknowledged severity.
         if !new_ackt && self.common.acks > self.common.sevr {
             self.common.acks = self.common.sevr;
-            self.notify_field_backed_in(burst, "ACKS", ack_mask, backing);
+            self.notify_field_in(burst, "ACKS", ack_mask);
         }
-        self.notify_record_alarm_in(burst, backing);
+        self.notify_record_alarm_in(burst);
     }
 
     /// C `dbAccess.c::putAcks` (`:1302-1315`) — the **only** runtime writer of
@@ -7225,20 +7196,20 @@ impl RecordInstance {
     /// since dropped. A too-low acknowledgement changes nothing and posts
     /// nothing; an acknowledgement of an already-clear ACKS still posts, which
     /// is C's literal `if (*psev >= precord->acks)` (0 >= 0 holds).
-    pub fn put_acks(&mut self, value: u16, backing: LinkBacking<'_>) {
-        self.put_acks_in(&mut PostBurst::new(), value, backing);
+    pub fn put_acks(&mut self, value: u16) {
+        self.put_acks_in(&mut PostBurst::new(), value);
     }
 
     /// [`Self::put_acks`] posting into the put body's `burst`.
-    pub fn put_acks_in(&mut self, burst: &mut PostBurst, value: u16, backing: LinkBacking<'_>) {
+    pub fn put_acks_in(&mut self, burst: &mut PostBurst, value: u16) {
         let sev = AlarmSeverity::from_u16(value);
         if sev < self.common.acks {
             return;
         }
         use crate::server::recgbl::EventMask;
         self.common.acks = AlarmSeverity::NoAlarm;
-        self.notify_field_backed_in(burst, "ACKS", EventMask::VALUE | EventMask::ALARM, backing);
-        self.notify_record_alarm_in(burst, backing);
+        self.notify_field_in(burst, "ACKS", EventMask::VALUE | EventMask::ALARM);
+        self.notify_record_alarm_in(burst);
     }
 
     /// Set a common field value from the `.db` loader, which in C is a
@@ -8930,21 +8901,9 @@ impl RecordInstance {
         if self.record.took_metadata_change() {
             self.invalidate_metadata_cache();
             // mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
-            // `none()` and not a parameter, alone among the `DBE_PROPERTY`
-            // sweeps: this function is the link-LESS process path by its own
-            // contract above, and every production process cycle goes through
-            // `PvDatabase::process_record_with_links`, which resolves. The
-            // claim is therefore "no caller of `process_local` has a
-            // link-backed subscriber", and a caller that acquires one must
-            // move to the link path rather than pass a backing here.
             let fields: Vec<String> = self.subscribers.keys().cloned().collect();
             for f in fields {
-                self.notify_field_with_origin(
-                    &f,
-                    crate::server::recgbl::EventMask::PROPERTY,
-                    0,
-                    LinkBacking::none(),
-                );
+                self.notify_field_with_origin(&f, crate::server::recgbl::EventMask::PROPERTY, 0);
             }
         }
 
@@ -9160,7 +9119,7 @@ impl RecordInstance {
     }
 
     /// Build a Snapshot for a given value, populated with the record's display
-    /// metadata and the link metadata the poster resolved for this batch. Uses
+    /// metadata and the link metadata `backing` carries. Uses
     /// the metadata cache so the populate cost is paid at most once per
     /// metadata-stable interval (cf. `cached_metadata`).
     ///
@@ -9171,77 +9130,19 @@ impl RecordInstance {
     /// `link_backed_metadata_is_read_live.rs`). A caller with nothing to
     /// resolve still writes `LinkBacking::none()`, and then it is a claim a
     /// reviewer can see and check.
-    ///
-    /// The monitor path reaches the same one consumer the GET path does
-    /// (`finish_field_snapshot` -> `route_field_metadata`), so it carried the
-    /// same defect: measured on the wire, a `camonitor -s` on a `calc`'s `A`
-    /// after `caput TARGET.PREC 4` with the source never processed printed
-    /// `5.0` where C printed `5.0000`. The resolve cannot happen here — the
-    /// post runs with the record's own lock held — so the caller that owns the
-    /// process/put cycle resolves it at a point where no lock is held and
-    /// hands it in.
-    ///
-    /// Returns `None` when the backing DECLINED and this field is link-backed.
-    /// The poster's gate ("nobody is subscribed, so skip the resolve") is asked
-    /// under a read lock the walk then releases, and a subscriber can attach
-    /// before the post takes the write lock. That one event would otherwise go
-    /// out carrying the record's own seed where the link's metadata belongs.
-    /// C closes the same window by lock discipline: `db_add_event` takes
-    /// `dbScanLock` on the record's lock set (`dbEvent.c:730`), which
-    /// `dbProcess` holds for the whole cycle, so a monitor attaching mid-cycle
-    /// joins after it and receives events from the NEXT process, never that
-    /// one. Refusing here reproduces that: the late subscriber's first event
-    /// comes from the next cycle, and its initial value came from the
-    /// create-channel GET, which resolves on the ungated door.
     pub fn make_monitor_snapshot(
         &self,
         field: &str,
         value: EpicsValue,
         backing: LinkBacking<'_>,
-    ) -> Option<super::super::snapshot::Snapshot> {
-        if self.post_refused(field, backing) {
-            return None;
-        }
+    ) -> super::super::snapshot::Snapshot {
         // A monitor update is posted from the record's own change-detection
         // loop, which hands over the STORED variant. Project it onto the
         // field's declared type here, at the same owner the GET path and the
         // CA create-channel path use, or a client that was told `DBR_ENUM` at
         // create time would be posted a `DBR_SHORT` update.
         let value = self.project_to_declared_type(field, value);
-        Some(self.finish_field_snapshot(field, value, backing))
-    }
-
-    /// Whether a post of `field` under `backing` is refused: the window
-    /// [`Self::make_monitor_snapshot`] describes, in which a subscriber that
-    /// attached mid-cycle takes its first event from the next cycle, as C's
-    /// `db_add_event` under `dbScanLock` would (`dbEvent.c:730`).
-    fn post_refused(&self, field: &str, backing: LinkBacking<'_>) -> bool {
-        // The poster's obligation, checked rather than trusted: a link-backed
-        // field carries its target's units/precision/limits, and only a caller
-        // holding no record lock can resolve them. A `LinkBacking::none()`
-        // here would silently serve the slot's C seed instead — the X2 defect
-        // in its new clothes. Debug-only because it is a property of the call
-        // graph, not of the data: every path either resolves or provably
-        // posts no link-backed field, and the suite is what proves it.
-        debug_assert!(
-            !backing.is_unresolved()
-                || self
-                    .record
-                    .link_backed_metadata_field(&upper_field(field))
-                    .is_none(),
-            "{}: monitor post of link-backed field {field} with nothing resolved \
-             — the poster must call PvDatabase::resolve_link_backed_metadata \
-             at a point where it holds no record lock",
-            self.name
-        );
-        // Cheap enum test first — a declined backing only ever comes from the
-        // poster door, so every other caller pays one discriminant compare
-        // and never the field lookup.
-        backing.is_declined()
-            && self
-                .record
-                .link_backed_metadata_field(&upper_field(field))
-                .is_some()
+        self.finish_field_snapshot(field, value, backing)
     }
 
     /// The record's half of every field log a post makes now
@@ -9250,7 +9151,7 @@ impl RecordInstance {
         crate::server::pv::LogHead {
             stat: self.common.stat,
             sevr: self.common.sevr as u16,
-            amsg: self.common.amsg.as_str(),
+            amsg: self.common.amsg.parts(),
             time: self.common.time.into(),
             utag: self.common.utag as i32,
         }
@@ -9950,12 +9851,8 @@ impl RecordInstance {
     /// [`MonitorEvent`](crate::server::pv::MonitorEvent) reports that intersection — C
     /// `db_post_events(prec, &field, mask)` per-field granularity, then
     /// `pLog->mask = caEventMask & pevent->select` per subscriber.
-    ///
-    /// `backing` is the link metadata the process cycle resolved for this
-    /// batch, at its own no-lock-held point. See [`Self::make_monitor_snapshot`]
-    /// for why it has no default.
     #[inline(always)]
-    pub fn notify_from_snapshot(&self, snapshot: &ProcessSnapshot, backing: LinkBacking<'_>) {
+    pub fn notify_from_snapshot(&self, snapshot: &ProcessSnapshot) {
         // Nothing is subscribed to any field, so no post below can land; the
         // per-field lookup is a hash of the field name per post per cycle to
         // find that out. Same gate as `collect_subscriber_posts`, kept in the
@@ -9964,11 +9861,11 @@ impl RecordInstance {
         if self.subscribers.is_empty() {
             return;
         }
-        self.deliver_snapshot(snapshot, backing);
+        self.deliver_snapshot(snapshot);
     }
 
     #[inline(never)]
-    fn deliver_snapshot(&self, snapshot: &ProcessSnapshot, backing: LinkBacking<'_>) {
+    fn deliver_snapshot(&self, snapshot: &ProcessSnapshot) {
         // Same ambient-origin inheritance as `notify_field_with_origin`:
         // a process cycle driven by an in-process writer's put tags its
         // posts with the writer's origin, so the writer's own filtered
@@ -9986,9 +9883,6 @@ impl RecordInstance {
                 // utag and a scalar value; a wider one is read at delivery
                 // (`dbEvent.c:704-730`). No metadata rides on a post: the
                 // consumer reads it when it serves a class that carries it.
-                if self.post_refused(field, backing) {
-                    continue;
-                }
                 let value = self.declared_view(field, value);
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
@@ -10020,14 +9914,8 @@ impl RecordInstance {
     }
 
     /// Notify subscribers of a specific field, filtering by event mask.
-    ///
-    /// The last wrapper that still answers for its callers: `none()` here is a
-    /// claim that no caller of this function names a link-backed field, and it
-    /// is made once for 25 production call sites rather than at each of them.
-    /// [`Self::notify_field_backed`] is the form for a caller that cannot make
-    /// that claim.
     pub fn notify_field(&mut self, field: &str, mask: crate::server::recgbl::EventMask) {
-        self.notify_field_with_origin(field, mask, 0, LinkBacking::none());
+        self.notify_field_with_origin(field, mask, 0);
     }
 
     /// [`Self::notify_field`] posting into the caller's `burst`.
@@ -10037,29 +9925,7 @@ impl RecordInstance {
         field: &str,
         mask: crate::server::recgbl::EventMask,
     ) {
-        self.notify_field_with_origin_in(burst, field, mask, 0, LinkBacking::none());
-    }
-
-    /// [`Self::notify_field`] for a poster that may name a link-backed field
-    /// and has resolved its backing.
-    pub fn notify_field_backed(
-        &mut self,
-        field: &str,
-        mask: crate::server::recgbl::EventMask,
-        backing: LinkBacking<'_>,
-    ) {
-        self.notify_field_with_origin(field, mask, 0, backing);
-    }
-
-    /// [`Self::notify_field_backed`] posting into the caller's `burst`.
-    pub fn notify_field_backed_in(
-        &mut self,
-        burst: &mut PostBurst,
-        field: &str,
-        mask: crate::server::recgbl::EventMask,
-        backing: LinkBacking<'_>,
-    ) {
-        self.notify_field_with_origin_in(burst, field, mask, 0, backing);
+        self.notify_field_with_origin_in(burst, field, mask, 0);
     }
 
     /// C `db_post_events(precord, NULL, DBE_ALARM)`: post a record-wide
@@ -10068,23 +9934,15 @@ impl RecordInstance {
     /// value (the per-field `notify_field` already filters by mask
     /// intersection). Used by the alarm-acknowledge (ACKT/ACKS) put path so
     /// an alarm-mask monitor on any field observes the acknowledgement.
-    pub fn notify_record_alarm(&mut self, backing: LinkBacking<'_>) {
-        self.notify_record_alarm_in(&mut PostBurst::new(), backing);
+    pub fn notify_record_alarm(&mut self) {
+        self.notify_record_alarm_in(&mut PostBurst::new());
     }
 
     /// [`Self::notify_record_alarm`] posting into the caller's `burst`.
-    pub fn notify_record_alarm_in(&mut self, burst: &mut PostBurst, backing: LinkBacking<'_>) {
-        // Every subscribed field, so a client monitoring a link-backed one
-        // (`CALC.A`) is in the set — this poster takes a backing for that
-        // reason and not because the alarm itself is link-backed.
+    pub fn notify_record_alarm_in(&mut self, burst: &mut PostBurst) {
         let fields: Vec<String> = self.subscribers.keys().cloned().collect();
         for field in fields {
-            self.notify_field_backed_in(
-                burst,
-                &field,
-                crate::server::recgbl::EventMask::ALARM,
-                backing,
-            );
+            self.notify_field_in(burst, &field, crate::server::recgbl::EventMask::ALARM);
         }
     }
 
@@ -10096,23 +9954,17 @@ impl RecordInstance {
     /// `&mut self` is what makes that unbypassable: there is no way to publish
     /// a field's value through the framework without the change detector
     /// learning that it was published.
-    ///
-    /// `backing` is the link metadata the put path resolved for this post, at
-    /// its own no-lock-held point. See [`Self::make_monitor_snapshot`] for why
-    /// it has no default.
     pub fn notify_field_with_origin(
         &mut self,
         field: &str,
         mask: crate::server::recgbl::EventMask,
         origin: u64,
-        backing: LinkBacking<'_>,
     ) {
         self.post_field(
             None,
             field,
             mask,
             origin,
-            backing,
             (
                 |inst: &Self| inst.resolve_field(field),
                 |inst: &Self| inst.walk_skips(field),
@@ -10129,14 +9981,12 @@ impl RecordInstance {
         field: &str,
         mask: crate::server::recgbl::EventMask,
         origin: u64,
-        backing: LinkBacking<'_>,
     ) {
         self.post_field(
             Some(burst),
             field,
             mask,
             origin,
-            backing,
             (
                 |inst: &Self| inst.resolve_field(field),
                 |inst: &Self| inst.walk_skips(field),
@@ -10151,14 +10001,12 @@ impl RecordInstance {
         field: &str,
         at: &PutAddr,
         mask: crate::server::recgbl::EventMask,
-        backing: LinkBacking<'_>,
     ) {
         self.post_field(
             None,
             field,
             mask,
             0,
-            backing,
             (
                 |inst: &Self| inst.resolve_field_upper_at(field, at.field.desc),
                 |_: &Self| at.walk_skip,
@@ -10177,7 +10025,6 @@ impl RecordInstance {
         field: &str,
         mask: crate::server::recgbl::EventMask,
         origin: u64,
-        backing: LinkBacking<'_>,
         access: (
             impl FnOnce(&Self) -> Option<EpicsValue>,
             impl FnOnce(&Self) -> bool,
@@ -10221,13 +10068,6 @@ impl RecordInstance {
         // the value goes straight to the owner.
         if !subscribed {
             self.record_value_post_as(field, walk_skip, value);
-            return;
-        }
-        // A refused post publishes nothing, so it must not advance
-        // `last_posted` either, or the next cycle's change detector would
-        // treat the value as already delivered and the subscriber would never
-        // see it.
-        if self.post_refused(field, backing) {
             return;
         }
         {
@@ -10796,7 +10636,7 @@ mod metadata_cache_tests {
         let before = dropped_monitor_events();
         let posts = event_que_size() - events_per_que() + 10;
         for _ in 0..posts {
-            inst.notify_field_with_origin("VAL", EventMask::VALUE, 0, LinkBacking::none());
+            inst.notify_field_with_origin("VAL", EventMask::VALUE, 0);
         }
         let after = dropped_monitor_events();
         assert!(
@@ -10868,7 +10708,7 @@ mod metadata_cache_tests {
         let gone = add(1);
         let _live = add(2);
         drop(gone);
-        inst.notify_field_with_origin("VAL", EventMask::VALUE, 0, LinkBacking::none());
+        inst.notify_field_with_origin("VAL", EventMask::VALUE, 0);
         let sids: Vec<u32> = inst.subscribers["VAL"].iter().map(|s| s.sid).collect();
         assert_eq!(sids, [2]);
     }
@@ -10959,17 +10799,14 @@ mod metadata_cache_tests {
         }
 
         // The monitor producer shares the same per-field owner.
-        let update = inst
-            .make_monitor_snapshot("RVAL", EpicsValue::Long(7), LinkBacking::none())
-            .expect("nothing was declined: the backing is unresolved, not declined");
+        let update = inst.make_monitor_snapshot("RVAL", EpicsValue::Long(7), LinkBacking::none());
         assert_eq!(
             update.display.expect("ai display").form,
             0,
             "a monitor update on a non-VAL field carries the default form too"
         );
-        let update = inst
-            .make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none())
-            .expect("nothing was declined: the backing is unresolved, not declined");
+        let update =
+            inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
         assert_eq!(update.display.expect("ai display").form, 4);
     }
 
@@ -11070,9 +10907,7 @@ mod metadata_cache_tests {
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
-        let mon = inst
-            .make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none())
-            .expect("nothing was declined: the backing is unresolved, not declined");
+        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
         assert_eq!(mon.user_tag, 5);
         assert_eq!(mon.timestamp.subsec_nanos(), 123_456_700);
         assert_eq!(mon.timestamp.unix_secs(), 42);
@@ -11121,9 +10956,7 @@ mod metadata_cache_tests {
             "GET path must serve the record's utag as timeStamp.userTag"
         );
 
-        let mon = inst
-            .make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none())
-            .expect("nothing was declined: the backing is unresolved, not declined");
+        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
         assert_eq!(
             mon.user_tag, want,
             "MONITOR path must carry the record's utag too"
@@ -11211,7 +11044,7 @@ mod metadata_cache_tests {
         // Capture prev, do a no-op put, then notify — cache must remain.
         let prev = inst.record.get_field("EGU");
         let _ = inst.record.put_field("EGU", prev.clone().unwrap());
-        inst.notify_field_written_if_changed("EGU", prev.as_ref(), LinkBacking::none());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
         assert!(
             inst.metadata_cache.lock().unwrap().is_some(),
             "no-op put must not invalidate the metadata cache"
@@ -11229,7 +11062,7 @@ mod metadata_cache_tests {
         let _ = inst
             .record
             .put_field("EGU", EpicsValue::String("kPa".into()));
-        inst.notify_field_written_if_changed("EGU", prev.as_ref(), LinkBacking::none());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
         assert!(
             inst.metadata_cache.lock().unwrap().is_none(),
             "real metadata change must invalidate cache"
@@ -11290,7 +11123,7 @@ mod metadata_cache_tests {
         assert!(inst.metadata_cache.lock().unwrap().is_some());
         // VAL is neither a cache source nor `prop(YES)` — must be skipped
         // even with a changed value.
-        inst.notify_field_written_if_changed("VAL", None, LinkBacking::none());
+        inst.notify_field_written_if_changed("VAL", None);
         assert!(inst.metadata_cache.lock().unwrap().is_some());
     }
 
@@ -11374,16 +11207,13 @@ mod metadata_cache_tests {
         assert!(inst.metadata_cache.lock().unwrap().is_none());
 
         // make_monitor_snapshot should also populate the cache
-        let snap = inst
-            .make_monitor_snapshot("VAL", EpicsValue::Double(42.0), LinkBacking::none())
-            .expect("nothing was declined: the backing is unresolved, not declined");
+        let snap = inst.make_monitor_snapshot("VAL", EpicsValue::Double(42.0), LinkBacking::none());
         assert!(snap.display.is_some());
         assert!(inst.metadata_cache.lock().unwrap().is_some());
 
         // Subsequent call hits cache
-        let snap2 = inst
-            .make_monitor_snapshot("VAL", EpicsValue::Double(43.0), LinkBacking::none())
-            .expect("nothing was declined: the backing is unresolved, not declined");
+        let snap2 =
+            inst.make_monitor_snapshot("VAL", EpicsValue::Double(43.0), LinkBacking::none());
         let d1 = snap.display.unwrap();
         let d2 = snap2.display.unwrap();
         assert_eq!(d1.units, d2.units);
@@ -11475,9 +11305,7 @@ mod metadata_cache_tests {
         assert_eq!((c.upper_ctrl_limit, c.lower_ctrl_limit), (4.0, 1.0));
 
         // SPD via the monitor path: identical override.
-        let snap = inst
-            .make_monitor_snapshot("SPD", EpicsValue::Double(2.0), LinkBacking::none())
-            .expect("nothing was declined: the backing is unresolved, not declined");
+        let snap = inst.make_monitor_snapshot("SPD", EpicsValue::Double(2.0), LinkBacking::none());
         let d = snap.display.unwrap();
         assert_eq!(d.units, "mm/sec");
         assert_eq!((d.upper_disp_limit, d.lower_disp_limit), (5.0, 0.5));
@@ -12251,7 +12079,7 @@ mod metadata_cache_tests {
         let prev = inst.record.get_field(field);
         assert_ne!(prev.as_ref(), Some(&put), "{field}: put must be a change");
         inst.record.put_field(field, put).expect("put accepted");
-        inst.notify_field_written_if_changed(field, prev.as_ref(), LinkBacking::none());
+        inst.notify_field_written_if_changed(field, prev.as_ref());
         rx.try_recv().is_ok()
     }
 
@@ -12307,7 +12135,7 @@ mod metadata_cache_tests {
         let _ = inst
             .record
             .put_field("EGU", EpicsValue::String("kPa".into()));
-        inst.notify_field_written_if_changed("EGU", prev.as_ref(), LinkBacking::none());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
 
         assert!(
             rx.try_recv().is_ok(),
@@ -12333,7 +12161,7 @@ mod metadata_cache_tests {
         let prev = inst.record.get_field("EGU"); // "degC"
         // Write the same value — no change
         let _ = inst.record.put_field("EGU", prev.clone().unwrap());
-        inst.notify_field_written_if_changed("EGU", prev.as_ref(), LinkBacking::none());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
 
         assert!(
             rx.try_recv().is_err(),
@@ -12360,7 +12188,7 @@ mod metadata_cache_tests {
         let _ = inst
             .record
             .put_field("EGU", EpicsValue::String("kPa".into()));
-        inst.notify_field_written_if_changed("EGU", prev.as_ref(), LinkBacking::none());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
 
         assert!(
             rx.try_recv().is_err(),

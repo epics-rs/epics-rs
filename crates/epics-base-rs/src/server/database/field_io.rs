@@ -397,10 +397,7 @@ pub(crate) fn put_drives_processing_of(
 /// a record field. Only a type whose `cycle_hooks` says `WRITE_POSTED` or
 /// `HAND_POSTED` is asked.
 #[inline(always)]
-pub(crate) fn emit_cycle_posts(
-    instance: &mut crate::server::record::RecordInstance,
-    backing: crate::server::database::LinkBacking<'_>,
-) {
+pub(crate) fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
     use crate::server::record::CycleHooks;
     // The gate stays in every put body; the drain is out of line so a type
     // with nothing to post pays no call.
@@ -408,17 +405,14 @@ pub(crate) fn emit_cycle_posts(
         .cycle_hooks()
         .has(CycleHooks::WRITE_POSTED.union(CycleHooks::HAND_POSTED))
     {
-        drain_cycle_posts(instance, backing);
+        drain_cycle_posts(instance);
     }
 }
 
 #[inline(never)]
-fn drain_cycle_posts(
-    instance: &mut crate::server::record::RecordInstance,
-    backing: crate::server::database::LinkBacking<'_>,
-) {
+fn drain_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
     let marks = instance.record.take_cycle_posted_fields();
-    post_cycle_marks(instance, marks, backing);
+    post_cycle_marks(instance, marks);
 }
 
 /// Post `marks` as [`drain_cycle_posts`] does, committing the alarm at the
@@ -426,7 +420,6 @@ fn drain_cycle_posts(
 pub(crate) fn post_cycle_marks(
     instance: &mut crate::server::record::RecordInstance,
     marks: crate::server::record::CycleMarks,
-    backing: crate::server::database::LinkBacking<'_>,
 ) {
     use crate::server::record::{CyclePostMask, EventMask};
     // The alarm a `monitor()` run from `special()` committed, once per put.
@@ -454,7 +447,7 @@ pub(crate) fn post_cycle_marks(
                 }
             }
         };
-        instance.notify_field_backed(sf, mask, backing);
+        instance.notify_field(sf, mask);
     }
 }
 
@@ -694,12 +687,11 @@ fn put_common(
     value: EpicsValue,
     link: &mut Option<PreparedCommonLink>,
     tail: &mut PutTail,
-    backing: crate::server::database::LinkBacking<'_>,
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let put = instance.put_common_field_prepared(field, value, link);
     collect_after_gate(instance, tail);
     collect_put_report(instance, put.is_err(), tail);
-    emit_cycle_posts(instance, backing);
+    emit_cycle_posts(instance);
     put
 }
 
@@ -733,7 +725,6 @@ fn special_after_put(
     instance: &mut crate::server::record::RecordInstance,
     field: &str,
     out: &mut Vec<crate::server::record::ProcessAction>,
-    backing: crate::server::database::LinkBacking<'_>,
     tail: &mut PutTail,
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let mut status = instance.record.special(field, true);
@@ -760,7 +751,7 @@ fn special_after_put(
     // (`dbAccess.c:1398` vs `:1408`) and before a nonzero return — aCalcout's
     // NUSE arm posts the clamped value and only then `return (-1)`
     // (`aCalcoutRecord.c:495-499`), and `goto done` skips only dbPut's post.
-    emit_cycle_posts(instance, backing);
+    emit_cycle_posts(instance);
     status?;
 
     // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:373-378`,
@@ -795,9 +786,7 @@ fn special_after_put(
             // a literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record
             // carries it.
             let mask = instance.record.special_reseed_post_mask();
-            // `value_field` is the calc-class value slot behind the link just
-            // written (`INPA` -> `A`), i.e. exactly a link-backed field.
-            instance.notify_field_backed(value_field, mask, backing);
+            instance.notify_field(value_field, mask);
         }
     }
 
@@ -1450,7 +1439,6 @@ fn post_array_info(
     instance: &mut crate::server::record::RecordInstance,
     old_nord: &Option<EpicsValue>,
     origin: u64,
-    backing: crate::server::database::LinkBacking<'_>,
 ) {
     let Some(old) = old_nord else { return };
     let moved = instance
@@ -1462,7 +1450,6 @@ fn post_array_info(
             "NORD",
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
             origin,
-            backing,
         );
     }
 }
@@ -1496,14 +1483,12 @@ fn dbput_post_put_field(
     instance: &mut crate::server::record::RecordInstance,
     field: &str,
     at: &crate::server::record::record_instance::PutAddr,
-    backing: crate::server::database::LinkBacking<'_>,
 ) {
     if !at.post_suppressed() {
         instance.notify_field_at(
             field,
             at,
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
-            backing,
         );
     }
 }
@@ -2050,16 +2035,6 @@ impl PvDatabase {
         // Yields the owned outputs those tails consume. Note this is the
         // record's DATA lock coming down, not the advisory gate above.
         use crate::server::record::CommonFieldPutResult;
-        // C reads a link-backed field's metadata live inside the rset,
-        // under the TARGET record's lock; every poster below holds THIS
-        // record's lock and cannot reach for a second one. Resolved here,
-        // where no record lock is held, and handed down as a borrowed
-        // value that dies with this body — so a `caput CALC.A` carries the
-        // metadata `INPA`'s target has NOW, not what it had when the
-        // source last processed. Empty after one read lock for every
-        // record type but calc, calcout, sub, aSub and seq.
-        let link_backing = self.resolve_link_backed_metadata_for_posts(rec);
-        let link_backing = link_backing.as_link_backing();
         let (common_result, special_actions) = {
             let mut instance = rec.write();
 
@@ -2129,14 +2104,13 @@ impl PvDatabase {
                                 &mut instance,
                                 field,
                                 &mut special_actions,
-                                link_backing,
                                 tail,
                             )?;
                             clear_udf_on_value_put(&mut instance, field);
                             result
                         }
                         Err(CaError::FieldNotFound(_)) => {
-                            put_common(&mut instance, field, value, &mut None, tail, link_backing)?
+                            put_common(&mut instance, field, value, &mut None, tail)?
                         }
                         // A refused store does NOT skip the pass above:
                         // C runs it either way (`dbAccess.c:1398`) and lets
@@ -2147,7 +2121,6 @@ impl PvDatabase {
                                 &mut instance,
                                 field,
                                 &mut special_actions,
-                                link_backing,
                                 tail,
                             )?;
                             return Err(e);
@@ -2173,7 +2146,7 @@ impl PvDatabase {
 
             // Invalidate metadata cache only if the metadata-class
             // field's value actually changed (faac1df1).
-            instance.notify_field_written_if_changed_at(field, at, prev_value, link_backing);
+            instance.notify_field_written_if_changed_at(field, at, prev_value);
 
             // C `dbPut:1408-1413`'s field-monitor post, through the one owner
             // (`dbput_post_put_field`, shared with the CA route). `put_pv`
@@ -2183,14 +2156,14 @@ impl PvDatabase {
             // status pusher, all post immediately. Pre-fix this body posted
             // nothing at all, so camonitor on anything written via `put_pv`
             // went silent forever.
-            dbput_post_put_field(&mut instance, field, at, link_backing);
+            dbput_post_put_field(&mut instance, field, at);
 
             // C's `put_array_info` is likewise reached from every `dbPut` —
             // an OUT link that shortens a waveform posts NORD in C even when
             // the link is NPP and the target never processes, and the
             // value-field post above is suppressed for a waveform (VAL is
             // `pp(TRUE)`); NORD has no such second path.
-            post_array_info(&mut instance, &old_nord, 0, link_backing);
+            post_array_info(&mut instance, &old_nord, 0);
 
             (common_result, special_actions)
         };
@@ -2405,16 +2378,6 @@ impl PvDatabase {
             // advisory `_record_gate` still holds the processing-exclusion
             // window across the whole helper.
             use crate::server::record::CommonFieldPutResult;
-            // C reads a link-backed field's metadata live inside the rset,
-            // under the TARGET record's lock; every poster below holds THIS
-            // record's lock and cannot reach for a second one. Resolved here,
-            // where no record lock is held, and handed down as a borrowed
-            // value that dies with this body — so a `caput CALC.A` carries the
-            // metadata `INPA`'s target has NOW, not what it had when the
-            // source last processed. Empty after one read lock for every
-            // record type but calc, calcout, sub, aSub and seq.
-            let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
-            let link_backing = link_backing.as_link_backing();
             let (common_result, special_actions) = {
                 let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
                 let mut instance = rec.write();
@@ -2467,20 +2430,14 @@ impl PvDatabase {
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
-                                    link_backing,
                                     tail,
                                 )?;
                                 clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
-                            Err(CaError::FieldNotFound(_)) => put_common(
-                                &mut instance,
-                                &field,
-                                value,
-                                &mut None,
-                                tail,
-                                link_backing,
-                            )?,
+                            Err(CaError::FieldNotFound(_)) => {
+                                put_common(&mut instance, &field, value, &mut None, tail)?
+                            }
                             // A refused store does NOT skip the pass above:
                             // C runs it either way (`dbAccess.c:1398`) and lets
                             // its status win, then `goto done` — the `return`.
@@ -2490,7 +2447,6 @@ impl PvDatabase {
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
-                                    link_backing,
                                     tail,
                                 )?;
                                 return Err(e);
@@ -2502,7 +2458,7 @@ impl PvDatabase {
                 // Invalidate metadata cache only if a metadata-class
                 // field actually changed value (faac1df1 — DBE_PROPERTY
                 // fires on real changes, not no-op writes).
-                instance.notify_field_written_if_changed_at(&field, &at, pre_put, link_backing);
+                instance.notify_field_written_if_changed_at(&field, &at, pre_put);
 
                 // Post monitor events if value or alarm changed. Read
                 // through the SAME reader the pre-value came from: a field
@@ -2526,7 +2482,6 @@ impl PvDatabase {
                                 | crate::server::recgbl::EventMask::LOG
                                 | crate::server::recgbl::EventMask::ALARM,
                             origin,
-                            link_backing,
                         );
                     }
                     // The NORD post, through the one owner. Without it a CA
@@ -2536,7 +2491,7 @@ impl PvDatabase {
                     // seen length — a frozen-element-count bug that surfaces
                     // in PyDM image views and similar consumers that compute
                     // height = element_count / width.
-                    post_array_info(&mut instance, &old_nord, origin, link_backing);
+                    post_array_info(&mut instance, &old_nord, origin);
                 }
 
                 // The `special()` link writes re-enter the database, so the record
@@ -2933,16 +2888,11 @@ impl PvDatabase {
             .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
         let _record_gate = self.lock_instance(&rec);
 
-        // Resolved before the record lock: the record-wide `DBE_ALARM` post
-        // below reaches every subscribed field, a link-backed one included.
-        let backing = self.resolve_link_backed_metadata_for_posts(&rec);
-        let backing = backing.as_link_backing();
-
         let mut instance = rec.write();
         check_put_disabled(&instance, &field_upper)?;
         match ack {
-            crate::server::record::AlarmAck::Transient => instance.put_ackt(value, backing),
-            crate::server::record::AlarmAck::Severity => instance.put_acks(value, backing),
+            crate::server::record::AlarmAck::Transient => instance.put_ackt(value),
+            crate::server::record::AlarmAck::Severity => instance.put_acks(value),
         }
         Ok(())
     }
@@ -3546,14 +3496,7 @@ impl PvDatabase {
                 };
                 if let Some(rec_arc) = rec_arc {
                     let mut guard = rec_arc.write();
-                    match put_common(
-                        &mut guard,
-                        "PROC",
-                        value,
-                        &mut None,
-                        tail,
-                        crate::server::database::LinkBacking::none(),
-                    ) {
+                    match put_common(&mut guard, "PROC", value, &mut None, tail) {
                         Ok(_) => {
                             guard.notify_field(
                                 "PROC",
@@ -3635,16 +3578,6 @@ impl PvDatabase {
         // guard) before the notify-process / scan-index awaits below. Yields
         // either the success `CommonFieldPutResult`, or `(error, should_process)`
         // so the notify-driven process on a rejected put runs guard-free.
-        // C reads a link-backed field's metadata live inside the rset,
-        // under the TARGET record's lock; every poster below holds THIS
-        // record's lock and cannot reach for a second one. Resolved here,
-        // where no record lock is held, and handed down as a borrowed
-        // value that dies with this body — so a `caput CALC.A` carries the
-        // metadata `INPA`'s target has NOW, not what it had when the
-        // source last processed. Empty after one read lock for every
-        // record type but calc, calcout, sub, aSub and seq.
-        let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
-        let link_backing = link_backing.as_link_backing();
         let outcome: Result<crate::server::record::CommonFieldPutResult, (CaError, bool)> = {
             let mut instance = hold_for_link(self, &rec, &mut common_link);
 
@@ -3712,7 +3645,6 @@ impl PvDatabase {
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
-                                    link_backing,
                                     tail,
                                 );
                                 let result = instance
@@ -3723,14 +3655,9 @@ impl PvDatabase {
                                 clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
-                            Err(CaError::FieldNotFound(_)) => put_common(
-                                &mut instance,
-                                &field,
-                                value,
-                                &mut common_link,
-                                tail,
-                                link_backing,
-                            )?,
+                            Err(CaError::FieldNotFound(_)) => {
+                                put_common(&mut instance, &field, value, &mut common_link, tail)?
+                            }
                             // A refused store does NOT skip the pass above:
                             // C runs it either way (`dbAccess.c:1398`) and lets
                             // its status win, then `goto done` — the `return`.
@@ -3740,7 +3667,6 @@ impl PvDatabase {
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
-                                    link_backing,
                                     tail,
                                 )?;
                                 return Err(e);
@@ -3765,7 +3691,7 @@ impl PvDatabase {
 
                 // Invalidate metadata cache only if the metadata-class
                 // field's value actually changed (faac1df1).
-                instance.notify_field_written_if_changed_at(&field, &at, prev_value, link_backing);
+                instance.notify_field_written_if_changed_at(&field, &at, prev_value);
 
                 // `putf` is neither set nor cleared anywhere in this block: C's
                 // `dbPut` does not touch it. It is raised in `put_driven_process`
@@ -3783,7 +3709,7 @@ impl PvDatabase {
                 // (ACKT/ACKS have no arm here: they are SPC_NOMOD, refused by
                 // the gate above. Alarm acknowledgement arrives as a DBR
                 // request type, through [`Self::put_alarm_ack_from_ca`].)
-                dbput_post_put_field(&mut instance, &field, &at, link_backing);
+                dbput_post_put_field(&mut instance, &field, &at);
 
                 // The NORD post, through the one owner — C reaches `put_array_info`
                 // from `dbPut`, so the CA route posts it exactly like the internal
@@ -3792,7 +3718,7 @@ impl PvDatabase {
                 // not covered by the process cycle either — a `caput -a` to a
                 // slow-scanned or passive-but-unprocessed waveform posts NORD now
                 // and VAL only at the next scan.
-                post_array_info(&mut instance, &old_nord, 0, link_backing);
+                post_array_info(&mut instance, &old_nord, 0);
 
                 Ok(common_result)
             })(
@@ -3828,7 +3754,7 @@ impl PvDatabase {
                         let status = instance.record.special(&field, true);
                         collect_after_gate(&mut instance, tail);
                         collect_put_report(&mut instance, status.is_err(), tail);
-                        emit_cycle_posts(&mut instance, link_backing);
+                        emit_cycle_posts(&mut instance);
                     }
                     // The same `dbPutSpecial(paddr, 1)`-on-reject rule for a field
                     // whose special() raises the inverted-limits alarm (histogram
@@ -4172,16 +4098,6 @@ impl PvDatabase {
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
 
-            // C reads a link-backed field's metadata live inside the rset,
-            // under the TARGET record's lock; every poster below holds THIS
-            // record's lock and cannot reach for a second one. Resolved here,
-            // where no record lock is held, and handed down as a borrowed
-            // value that dies with this body — so a `caput CALC.A` carries the
-            // metadata `INPA`'s target has NOW, not what it had when the
-            // source last processed. Empty after one read lock for every
-            // record type but calc, calcout, sub, aSub and seq.
-            let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
-            let link_backing = link_backing.as_link_backing();
             let mut special_actions = Vec::new();
 
             let common_result = {
@@ -4241,7 +4157,6 @@ impl PvDatabase {
                                         v,
                                         &mut common_link,
                                         tail,
-                                        link_backing,
                                     )?);
                                     None
                                 }
@@ -4271,7 +4186,6 @@ impl PvDatabase {
                                     value,
                                     &mut common_link,
                                     tail,
-                                    link_backing,
                                 )?);
                                 None
                             }
@@ -4300,7 +4214,6 @@ impl PvDatabase {
                             &mut instance,
                             &field,
                             &mut special_actions,
-                            link_backing,
                             tail,
                         );
                         match refused {
@@ -4325,7 +4238,7 @@ impl PvDatabase {
                 clear_udf_on_value_put(&mut instance, &field);
                 // Invalidate metadata cache only if the metadata-class
                 // field actually changed (faac1df1).
-                instance.notify_field_written_if_changed_at(&field, &at, prev_value, link_backing);
+                instance.notify_field_written_if_changed_at(&field, &at, prev_value);
                 result
             };
 

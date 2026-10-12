@@ -104,7 +104,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-use super::{FrameGate, InFrame, MetadataPlan, PvDatabase};
+use super::{FrameGate, InFrame, PvDatabase};
 
 /// C `sCalcoutRecord.c` `STRING_SIZE` (:198) — the 40-byte buffer behind every
 /// string field a string-input link writes into. The text therefore carries at
@@ -753,16 +753,15 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u
 fn publish_cycle(
     instance: &mut RecordInstance,
     snapshot: &crate::server::record::ProcessSnapshot,
-    backing: crate::server::database::LinkBacking<'_>,
     alarm_posts: AlarmPosts,
 ) -> CyclePosts {
     let posts = CyclePosts::of(snapshot).with(alarm_posts.mask());
     // The cycle with no alarm movement makes one call and keeps nothing but
     // `posts` live across it.
     if alarm_posts.mask().is_empty() {
-        instance.notify_from_snapshot(snapshot, backing);
+        instance.notify_from_snapshot(snapshot);
     } else {
-        publish_alarm_cycle(instance, snapshot, backing, alarm_posts);
+        publish_alarm_cycle(instance, snapshot, alarm_posts);
     }
     posts
 }
@@ -773,13 +772,12 @@ fn publish_cycle(
 fn publish_alarm_cycle(
     instance: &mut RecordInstance,
     snapshot: &crate::server::record::ProcessSnapshot,
-    backing: crate::server::database::LinkBacking<'_>,
     alarm_posts: AlarmPosts,
 ) {
     alarm_posts.for_each(|field, mask| instance.notify_field(field, mask));
     // A value-class post advances the record's already-published state
     // (`RecordInstance::record_value_post`), so this is a `&mut` operation.
-    instance.notify_from_snapshot(snapshot, backing);
+    instance.notify_from_snapshot(snapshot);
 }
 
 pub(crate) fn alarm_field_posts(
@@ -1039,9 +1037,7 @@ pub struct InputLinkTexts {
 }
 
 impl InputLinkTexts {
-    /// A caller that read nothing. The put paths and the async-completion path
-    /// resolve link-backed metadata without running a multi-input fetch, so
-    /// they have nothing to hand over.
+    /// A caller that read nothing.
     pub fn none() -> Self {
         Self {
             links: &[],
@@ -1796,7 +1792,6 @@ struct CycleCtx<'c, 'a> {
     device_callback: bool,
     plan: &'c crate::server::record::record_instance::ProcessPlan,
     input_link_texts: &'c InputLinkTexts,
-    link_backing: crate::server::database::link_set::LinkBacking<'c>,
 }
 
 struct DataGuard<'a> {
@@ -2721,7 +2716,7 @@ impl PvDatabase {
         self.execute_process_actions_in(name, rec, actions, visited);
         let forward = {
             let mut instance = rec.write();
-            super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
+            super::field_io::emit_cycle_posts(&mut instance);
             instance.record.should_fire_forward_link()
         };
         // `recGblFwdLink` (`:578`) runs ahead of `valuePut`'s stamp and reset.
@@ -2747,10 +2742,10 @@ impl PvDatabase {
     /// and the SENT post.
     fn post_value_put_tail(&self, rec: InFrame<'_>) {
         let (head, reset) = rec.write().record.take_value_put_tail().split_at_reset();
-        super::field_io::post_cycle_marks(&mut rec.write(), head, super::LinkBacking::none());
+        super::field_io::post_cycle_marks(&mut rec.write(), head);
         if !reset.is_empty() {
             self.rec_gbl_get_time_stamp_in(rec);
-            super::field_io::post_cycle_marks(&mut rec.write(), reset, super::LinkBacking::none());
+            super::field_io::post_cycle_marks(&mut rec.write(), reset);
         }
     }
 
@@ -2904,8 +2899,6 @@ impl PvDatabase {
             records.get(name).cloned()
         };
         let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
-        let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
-        let link_backing = link_backing.as_link_backing();
         let mut links = crate::server::record::PreparedLinks::for_puts(
             &rec,
             post.writes.iter().map(|(f, v)| (f.as_str(), v)),
@@ -2920,11 +2913,7 @@ impl PvDatabase {
             inst.notify_field_written(&field);
             written.push(field);
         }
-        inst.notify_field_backed(
-            &post.post_field,
-            crate::server::recgbl::EventMask::PROPERTY,
-            link_backing,
-        );
+        inst.notify_field(&post.post_field, crate::server::recgbl::EventMask::PROPERTY);
         Ok(written)
     }
 
@@ -2961,11 +2950,6 @@ impl PvDatabase {
             records.get(name).cloned()
         };
         let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
-        // A link-backed field reaches this poster: `seq` posts `DOn` here
-        // (`links.rs`, C `seqRecord.c:266-268`) and `DOn`'s metadata comes
-        // from `DOLn`. Resolved before the write guard, as everywhere.
-        let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
-        let link_backing = link_backing.as_link_backing();
         let mut links = crate::server::record::PreparedLinks::for_puts(
             &rec,
             fields.iter().map(|p| (p.field(), p.value())),
@@ -2986,7 +2970,7 @@ impl PvDatabase {
             // invalidate the cache before the monitor snapshot is built.
             inst.notify_field_written(&field);
             if rule != PostRule::Silent {
-                inst.notify_field_backed(&field, mask, link_backing);
+                inst.notify_field(&field, mask);
                 posted.push(field);
             }
         }
@@ -3537,15 +3521,8 @@ impl PvDatabase {
         let snapshot = instance.max_lock_refusal();
         drop(instance);
         if let Some(snapshot) = snapshot {
-            // Between the write guard's drop and the read guard's take: the one
-            // window where a link target's lock is reachable. The refusal posts
-            // STAT/SEVR/VAL, none of which any type link-backs, but the resolve
-            // is the record's own answer rather than this caller's claim about
-            // it — see `RecordInstance::make_monitor_snapshot`.
-            let backing = self.resolve_link_backed_metadata_for_posts_in(rec);
-            let backing = backing.as_link_backing();
             let inst = rec.read();
-            inst.notify_from_snapshot(&snapshot, backing);
+            inst.notify_from_snapshot(&snapshot);
         }
     }
 
@@ -3909,13 +3886,9 @@ impl PvDatabase {
     /// The text every link in [`Record::multi_input_links`](crate::server::record::Record::multi_input_links) held when this
     /// process cycle started.
     ///
-    /// One read serves both consumers. A by-name field read is a linear search
-    /// of the record type's declared names — around ninety on a calc — and the
-    /// cycle asked for the same twelve `INPA`..`INPL` twice: once at the top,
-    /// to resolve link-backed metadata for the monitor posters, and again in
-    /// the multi-input fetch. Reading once also removes the window in which
-    /// the two answers could disagree, since neither read holds the record
-    /// across the cycle.
+    /// A by-name field read is a linear search of the record type's declared
+    /// names — around ninety on a calc — so the multi-input fetch reads the
+    /// twelve `INPA`..`INPL` once, here.
     fn read_input_link_texts(instance: &RecordInstance) -> InputLinkTexts {
         InputLinkTexts::read_own(instance)
     }
@@ -4808,7 +4781,7 @@ impl PvDatabase {
         // them across two acquisitions cost the record lock twice at the top
         // of every cycle and bought nothing.
         let read_texts;
-        let (plan, active, input_link_texts, metadata, cycle_plan) = {
+        let (plan, active, input_link_texts, cycle_plan) = {
             let plan = guard.rec.process_plan();
             let instance = guard.hold();
             if instance.is_destroyed() {
@@ -4829,31 +4802,10 @@ impl PvDatabase {
             } else {
                 &InputLinkTexts::READ_NONE
             };
-            // C reads a link-backed field's metadata live inside the rset,
-            // under the TARGET record's lock (`dbDbLink.c:240-261`). A poster
-            // here holds THIS record's lock and cannot reach for a second one,
-            // so the cycle resolves once, below, and hands every poster the
-            // borrowed result. The borrow is what makes "the metadata a
-            // monitor carries was resolved during this cycle" true by
-            // construction: there is nowhere to keep it.
-            //
-            // What the resolve asks of this record — which links, and whether
-            // anyone is subscribed to read the answer — it asks here, under
-            // the guard the cycle already holds. The lock set is held for the
-            // whole cycle, so the subscriber list it reads is the one every
-            // poster below will see. Empty for every record type that backs
-            // no field's metadata with a link — all but calc, calcout, sub,
-            // aSub and seq.
-            let metadata = if active {
-                MetadataPlan::Empty
-            } else {
-                PvDatabase::plan_link_backed_metadata_for_posts(instance, input_link_texts)
-            };
             (
                 plan,
                 active,
                 input_link_texts,
-                metadata,
                 instance.cycle_plan(plan, is_continuation),
             )
         };
@@ -4863,14 +4815,6 @@ impl PvDatabase {
             return Ok(());
         }
 
-        // The walk locks each link's target, which for a self-link is this
-        // record; a plan with nothing to walk keeps the guard.
-        if matches!(metadata, MetadataPlan::Links(_)) {
-            guard.release();
-        }
-        let link_backing = self.resolve_link_backed_metadata_plan(metadata);
-        let link_backing = link_backing.as_link_backing();
-
         let ctx = CycleCtx {
             name,
             rec,
@@ -4878,7 +4822,6 @@ impl PvDatabase {
             device_callback,
             plan,
             input_link_texts,
-            link_backing,
         };
         match cycle_plan {
             crate::server::record::record_instance::CyclePlan::General => {
@@ -4914,7 +4857,6 @@ impl PvDatabase {
             device_callback,
             plan,
             input_link_texts,
-            link_backing,
         } = ctx;
         // The arm's answers are facts of its plan, so every `plan.*` below
         // folds to a constant; see `CyclePlan::ConstSoftIn` for what its
@@ -5198,7 +5140,7 @@ impl PvDatabase {
                     };
                     let posts = {
                         let mut instance = rec.write();
-                        sim_process_tail(&mut instance, tsel, siol_stamp, false, link_backing)
+                        sim_process_tail(&mut instance, tsel, siol_stamp, false)
                     };
                     self.run_forward_link_tail(name, rec, posts, visited);
                     self.end_process_cycle(name, rec, cycle_end.take());
@@ -5983,7 +5925,7 @@ impl PvDatabase {
                 self.publish_post_write_fields(rec, post_write_fields);
                 {
                     let inst = rec.read();
-                    inst.notify_from_snapshot(&snapshot, link_backing);
+                    inst.notify_from_snapshot(&snapshot);
                 }
                 self.execute_process_actions_in(name, rec, deferred_actions, visited);
                 // Same as the `AsyncPending` arm: run the restart check through the
@@ -6358,7 +6300,7 @@ impl PvDatabase {
                         crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
                     let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
                     let snapshot = crate::server::record::ProcessSnapshot::new();
-                    let posts = publish_cycle(instance, &snapshot, link_backing, alarm_posts);
+                    let posts = publish_cycle(instance, &snapshot, alarm_posts);
                     break 'epilogue (
                         // No forward link of EITHER kind: the comment above is
                         // C's `return` before `recGblFwdLink`. The external
@@ -6901,7 +6843,7 @@ impl PvDatabase {
             // at the tail.
 
             // 3. Notify subscribers, still under the segment's own guard.
-            let posts = publish_cycle(instance, &cycle_snapshot, link_backing, cycle_alarm_posts);
+            let posts = publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
 
             (
                 flnk_name,
@@ -7366,7 +7308,7 @@ impl PvDatabase {
         }
         // sseq's `processCallback` posts each read as it lands
         // (sseqRecord.c:668-681), under the alarm the record still holds.
-        super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
+        super::field_io::emit_cycle_posts(&mut instance);
         true
     }
 
@@ -7451,7 +7393,7 @@ impl PvDatabase {
         let more = rec.write().record.link_read_result(link_field, read);
         // What the record posted deciding on the read (throttle's `VAL`,
         // `throttleRecord.c:637`) goes out as the read's own posts do.
-        super::field_io::emit_cycle_posts(&mut rec.write(), super::LinkBacking::none());
+        super::field_io::emit_cycle_posts(&mut rec.write());
         more
     }
 
@@ -7461,7 +7403,7 @@ impl PvDatabase {
     /// the tail (`throttleRecord.c:602-612`).
     #[inline(never)]
     fn drain_cycle_marks(&self, rec: InFrame<'_>, visited: &mut ProcStack) {
-        super::field_io::emit_cycle_posts(&mut rec.write(), super::LinkBacking::none());
+        super::field_io::emit_cycle_posts(&mut rec.write());
         if rec.process_plan().hooks.stamps_at_own_reset() {
             let flnk = rec.read().forward_target();
             self.scan_forward_target(rec, &flnk, visited);
@@ -7779,11 +7721,7 @@ impl PvDatabase {
                         .fetch_add(1, Ordering::AcqRel);
                 }
                 ProcessAction::PostAfterEpilogue(marks) => {
-                    super::field_io::post_cycle_marks(
-                        &mut rec.write(),
-                        marks,
-                        super::LinkBacking::none(),
-                    );
+                    super::field_io::post_cycle_marks(&mut rec.write(), marks);
                 }
             }
         }
@@ -7885,12 +7823,6 @@ impl PvDatabase {
             return Ok(()); // Already on this stack, skip
         }
         let name: &str = &canonical;
-
-        // The async completion is the tail of a cycle, and it posts; it owes
-        // the same one resolve, at the same no-lock-held point, as the
-        // synchronous body — see `process_record_with_links_body`.
-        let link_backing = self.resolve_link_backed_metadata_for_posts_in(rec);
-        let link_backing = link_backing.as_link_backing();
 
         // This pass IS C's `process()` re-entry, so it runs the whole
         // `recGblGetTimeStampSimm` again — TSEL read included, before the guard.
@@ -8149,12 +8081,7 @@ impl PvDatabase {
             let flnk_name = instance.forward_target();
 
             // Notify subscribers, still under this segment's own guard.
-            let posts = publish_cycle(
-                &mut instance,
-                &cycle_snapshot,
-                link_backing,
-                cycle_alarm_posts,
-            );
+            let posts = publish_cycle(&mut instance, &cycle_snapshot, cycle_alarm_posts);
 
             // The FLNK's PUTF + put-notify wait-set ride in `flnk_name`
             // (see `ForwardTarget::Db`). On the async-completion path PUTF
@@ -9840,11 +9767,6 @@ impl PvDatabase {
                 .renders_at_source();
             let (fetch, render) = self.db_get_link_rendered_in(rec, "SIOL", &siol_link, render);
             let (fetch, _raw) = self.convert_link_fetch(rec, "SIOL", &siol_link, fetch, render);
-            // Resolved before the write guard below, which reaches
-            // `sim_process_tail`'s posts — see the same resolve at the head of
-            // `process_record_with_links_body`.
-            let link_backing = self.resolve_link_backed_metadata_for_posts_in(rec);
-            let link_backing = link_backing.as_link_backing();
             // The read itself raised C's `setLinkAlarm` (dbLink.c:321 ->
             // `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "field SIOL")`) on a
             // FAILED fetch. For a base record that is AFTER the SIMM_ALARM
@@ -9990,7 +9912,7 @@ impl PvDatabase {
             // having landed (R12-61). UDF is the one part C does gate on the
             // read's status (`if (status == 0) prec->udf = FALSE`), and a
             // constant SIOL is status 0.
-            sim_process_tail(&mut instance, tsel, siol_stamp, fetch_ok, link_backing)
+            sim_process_tail(&mut instance, tsel, siol_stamp, fetch_ok)
         };
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
@@ -10096,7 +10018,6 @@ fn sim_process_tail(
     tsel: super::TselStamp,
     siol_stamp: SiolStamp,
     clear_udf: bool,
-    backing: crate::server::database::LinkBacking<'_>,
 ) -> CyclePosts {
     let alarms_first = instance.record.alarms_before_stamp();
     // `read_sim_stamp` already returned `Keep` for a `.TIME` TSEL
@@ -10129,7 +10050,7 @@ fn sim_process_tail(
     }
     let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
     let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
-    publish_cycle(instance, &cycle_snapshot, backing, cycle_alarm_posts)
+    publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts)
 }
 
 /// The single finalizer for a process cycle, for every path that can end one.

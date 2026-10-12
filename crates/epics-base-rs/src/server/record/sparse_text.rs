@@ -90,7 +90,7 @@ impl SparseText {
 
     /// The text as a prefix and a remainder, `("", "")` when there is none —
     /// C's `char *` view of the field, which never distinguishes the two.
-    fn parts(&self) -> (&'static str, &str) {
+    pub(crate) fn parts(&self) -> (&'static str, &str) {
         match self.view() {
             None => ("", ""),
             Some(View::Owned(text)) => ("", text),

@@ -227,6 +227,8 @@ pub struct PortHandle {
     /// Identity of the actor on the receiving end of `tx`. Every blocking entry
     /// point compares it against the calling thread — see [`guard_reentrant`].
     actor: ActorId,
+    /// The actor's [`crate::request::RequestCell`] queue — see [`Self::new_cell`].
+    cells: Arc<crate::request::CellQueue>,
     /// The port-level half of C `queueRequest`'s gate, over the actor's own
     /// cells — see [`Self::queue_gate`].
     #[cfg(feature = "epics")]
@@ -278,6 +280,7 @@ impl PortHandle {
             tx,
             port_name: port_name.into(),
             actor: actor.id,
+            cells: actor.cells,
             #[cfg(feature = "epics")]
             gate: actor.gate,
             interrupts,
@@ -376,6 +379,21 @@ impl PortHandle {
         self.gate
             .check(user.connect_check(self.multi_device))
             .map_err(AsynError::into_queue_refusal)
+    }
+
+    /// A preallocated request on this port that runs `body` — C
+    /// `createAsynUser(processUser, timeoutUser)` + `connectDevice`. Queueing it
+    /// ([`crate::request::RequestCell::queue`]) allocates nothing.
+    pub fn new_cell(
+        &self,
+        body: Arc<dyn crate::request::CellBody>,
+    ) -> Arc<crate::request::RequestCell> {
+        self.cells.new_cell(body)
+    }
+
+    /// Whether `cell` queues on this port.
+    pub fn owns_cell(&self, cell: &crate::request::RequestCell) -> bool {
+        cell.queues_on(&self.cells)
     }
 
     /// Port name this handle is connected to.
@@ -519,10 +537,8 @@ impl PortHandle {
     /// question to [`CancelToken::time_out_if_queued`], C's `if(!isQueued)`
     /// guard. A request the actor has already begun is *never* aborted — the
     /// wait simply resumes — so this timer cannot cut a transfer short, only a
-    /// wait. The actor re-checks the same deadline at dequeue as well, which is
-    /// C's own belt-and-braces (`asynManager.c:906` cancels the timer as the
-    /// port thread dequeues) rather than a fallback for a caller this timer
-    /// cannot serve — there is no such caller.
+    /// wait. The actor reads no deadline: a request with no waiter is timed
+    /// by `RequestCell`'s queue timer instead.
     async fn await_reply(
         &self,
         mut reply_rx: oneshot::Receiver<AsynResult<RequestResult>>,
@@ -546,6 +562,9 @@ impl PortHandle {
                 Ok(reply) => return reply.map_err(|_| dropped())?,
                 Err(_elapsed) => {
                     if cancel.time_out_if_queued() {
+                        // C's timer signals the port thread (asynManager.c:700)
+                        // so the request's entry leaves the queue now.
+                        self.cells.poke();
                         return Err(AsynError::QueueTimeout {
                             port: self.port_name.to_string(),
                         });
@@ -1274,7 +1293,7 @@ impl PortHandle {
 
     /// Connect the port's transport (blocking) — C `pasynCommon->connect`
     /// reached through a PORT-level user (`connectDevice(port, -1)`), so the
-    /// Connect-queue waiver applies (asynManager.c:1536-1538) and the request
+    /// Connect-queue waiver applies (asynManager.c:1538-1540) and the request
     /// runs on a disconnected port — this is the route that brings a down
     /// line up. A device-addressed connect (asynRecord CNCT at the record's
     /// ADDR) goes through [`Self::submit_blocking`] with the caller's own

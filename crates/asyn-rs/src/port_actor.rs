@@ -10,6 +10,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
 
@@ -22,10 +23,18 @@ use crate::interpose::EomReason;
 use crate::interrupt::InterruptValue;
 use crate::param::ParamValue;
 use crate::port::{PortDriver, QueueGate, QueuePriority};
-use crate::request::{CancelToken, PortCalls, RequestOp, RequestResult};
+use crate::request::{
+    CancelToken, CellQueue, Claim, PortCalls, RequestCell, RequestOp, RequestResult,
+};
 use crate::user::{AsynUser, ConnectCheck};
 
 static ACTOR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The next request's place in its priority band's FIFO — stamped where the
+/// request is queued, whichever way it reaches the actor.
+pub(crate) fn next_seq() -> u64 {
+    ACTOR_SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+}
 static ACTOR_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Identity of a port actor.
@@ -77,6 +86,8 @@ pub(crate) fn queue_gate(
 #[derive(Clone)]
 pub(crate) struct ActorLink {
     pub(crate) id: ActorId,
+    /// The queue the actor drains [`RequestCell`]s from.
+    pub(crate) cells: Arc<CellQueue>,
     /// Read by the asynRecord, which queues from under its hold.
     #[cfg(feature = "epics")]
     pub(crate) gate: QueueGate,
@@ -87,8 +98,11 @@ impl ActorLink {
     /// fixture): a fresh id no thread publishes, and an open gate.
     #[cfg(test)]
     pub(crate) fn unowned() -> Self {
+        let cells = Arc::new(CellQueue::default());
+        cells.close();
         Self {
             id: ActorId::new(),
+            cells,
             #[cfg(feature = "epics")]
             gate: QueueGate::open(),
         }
@@ -128,21 +142,11 @@ pub(crate) struct ActorMessage {
     pub op: RequestOp,
     pub user: AsynUser,
     pub cancel: CancelToken,
-    pub reply: oneshot::Sender<AsynResult<RequestResult>>,
+    /// The waiter's reply; `None` for a [`RequestOp::Cell`], which has none.
+    pub reply: Option<oneshot::Sender<AsynResult<RequestResult>>>,
     pub seq: u64,
     pub priority: QueuePriority,
     pub block_token: Option<u64>,
-    /// When this request stops being allowed to wait — C
-    /// `epicsTimerStartDelay(puserPvt->timer, timeout)` at enqueue
-    /// (asynManager.c:1617-1623). `None` is C's `queueRequest(..., 0.0)`: no
-    /// timer, the request waits as long as the queue makes it.
-    ///
-    /// Stamped **here**, from [`AsynUser::queue_timeout`], so the clock starts
-    /// when the request is queued rather than when someone gets around to
-    /// looking at it — every submit path funnels through this constructor, so no
-    /// caller can enqueue a request whose deadline is measured from the wrong
-    /// instant.
-    pub queue_deadline: Option<Instant>,
 }
 
 impl ActorMessage {
@@ -172,16 +176,33 @@ impl ActorMessage {
             CDispatch::Direct | CDispatch::Queued => user.priority,
         };
         let block_token = user.block_token;
-        let queue_deadline = user.queue_timeout.map(|d| Instant::now() + d);
         Self {
             op,
             user,
             cancel,
-            reply,
-            seq: ACTOR_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
+            reply: Some(reply),
+            seq: next_seq(),
             priority,
             block_token,
-            queue_deadline,
+        }
+    }
+
+    /// A queued cell as the actor's queue holds it: its order and band were
+    /// fixed by [`RequestCell::queue`], and `seq` names the request this entry
+    /// is for.
+    fn from_cell(cell: Arc<RequestCell>, seq: u64) -> Self {
+        let request = cell.request();
+        let user = AsynUser::new(request.reason)
+            .with_addr(request.addr)
+            .with_priority(request.priority);
+        Self {
+            user,
+            cancel: cell.token().clone(),
+            reply: None,
+            seq,
+            priority: request.priority,
+            block_token: None,
+            op: RequestOp::Cell(cell),
         }
     }
 }
@@ -193,9 +214,39 @@ impl ActorMessage {
     fn refuse(self, e: AsynError) {
         match self.op {
             RequestOp::Callback(cb) => cb.refuse(e),
+            RequestOp::Cell(cell) => cell.leave(self.seq, e),
             _ => {
-                let _ = self.reply.send(Err(e));
+                if let Some(reply) = self.reply {
+                    let _ = reply.send(Err(e));
+                }
             }
+        }
+    }
+
+    /// The device-not-connected exit, which C sends to the request's
+    /// `timeoutUser` (asynManager.c:877-886).
+    fn time_out(self, port: String) {
+        if !matches!(self.op, RequestOp::Cell(_)) {
+            self.cancel.time_out_if_queued();
+        }
+        self.refuse(AsynError::QueueTimeout { port });
+    }
+
+    /// The dequeue (asynManager.c:889-891).
+    fn claim(&self) -> Claim {
+        match &self.op {
+            RequestOp::Cell(cell) => cell.claim(self.seq),
+            _ if self.cancel.begin_running() => Claim::Run,
+            _ => Claim::Left,
+        }
+    }
+
+    /// It left the queue on another clock and was reported there — C's timer
+    /// unlinked it (asynManager.c:663-672), so the port thread never sees it.
+    fn is_gone(&self) -> bool {
+        match &self.op {
+            RequestOp::Cell(cell) => cell.is_gone(self.seq),
+            _ => self.cancel.is_timed_out(),
         }
     }
 }
@@ -206,14 +257,6 @@ impl ActorMessage {
 /// the actor would spin. `pending()` is the "this arm never completes" form,
 /// leaving the other arms (request / shutdown) to drive the loop exactly as
 /// they did before the timer existed.
-/// The sooner of two optional deadlines — `None` meaning "never".
-fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.min(y)),
-        (x, y) => x.or(y),
-    }
-}
-
 async fn sleep_until_opt(deadline: Option<Instant>) {
     match deadline {
         Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
@@ -295,7 +338,7 @@ enum CDispatch {
     /// C hands it to `queueRequest` (asynManager.c:1517-1552), so C's gate runs.
     /// Its two refusals are **independent**: `!pport->dpc.enabled → asynDisabled`
     /// (:1541-1546) is unconditional, and only `checkPortConnect` is conditioned
-    /// on the priority and reason (:1536-1538). The request's own user
+    /// on the priority and reason (:1538-1540). The request's own user
     /// ([`AsynUser::connect_check`]) selects the connected waiver;
     /// [`crate::port::PortDriverBase::check_queue`] enforces the split, so nothing can waive
     /// the enabled half.
@@ -393,6 +436,9 @@ pub(crate) struct PortActor {
     id: ActorId,
     driver: Box<dyn PortDriver>,
     rx: mpsc::Receiver<ActorMessage>,
+    /// The other way a request reaches this actor: a [`RequestCell`] queued
+    /// with no message, so queueing one allocates nothing.
+    cells: Arc<CellQueue>,
     heap: BinaryHeap<ActorMessage>,
     /// C keeps **two** block holders, and the drain gate requires both to be
     /// NULL-or-me before a request is eligible (asynManager.c:889-892):
@@ -447,6 +493,31 @@ pub(crate) struct PortActor {
     /// [`Self::take_port_thread_wake`] — the memory that turns a monotonic
     /// counter back into C's edge-triggered signal.
     seen_exceptions: u64,
+    /// The announced-exception count as of the last parked rescan: a port that
+    /// came back or was re-enabled is an exception (asynManager.c:2247), and C's
+    /// port thread rescans its whole queue on every wake.
+    rescanned_exceptions: u64,
+}
+
+/// A cell still queued when the actor goes runs its body as refused, as a
+/// [`RequestOp::Callback`] does when its slot drops; a cell has no slot, so the
+/// actor that held it settles it.
+impl Drop for PortActor {
+    fn drop(&mut self) {
+        self.cells.close();
+        let queued = std::mem::take(&mut self.heap)
+            .into_iter()
+            .chain(std::mem::take(&mut self.parked))
+            .chain(std::mem::take(&mut self.pending_while_blocked));
+        for msg in queued {
+            if let RequestOp::Cell(_) = msg.op {
+                msg.refuse(AsynError::QueueRefused {
+                    status: AsynStatus::Error,
+                    message: "port shut down before the request ran".into(),
+                });
+            }
+        }
+    }
 }
 
 impl PortActor {
@@ -459,6 +530,7 @@ impl PortActor {
             id: ActorId::new(),
             driver,
             rx,
+            cells: Arc::default(),
             heap: BinaryHeap::new(),
             block_holders: BlockHolders::default(),
             pending_while_blocked: Vec::new(),
@@ -466,6 +538,7 @@ impl PortActor {
             rescan_parked: false,
             woken: false,
             seen_exceptions,
+            rescanned_exceptions: seen_exceptions,
         }
     }
 
@@ -476,6 +549,7 @@ impl PortActor {
     pub(crate) fn link(&self) -> ActorLink {
         ActorLink {
             id: self.id,
+            cells: Arc::clone(&self.cells),
             #[cfg(feature = "epics")]
             gate: self.driver.base().queue_gate(),
         }
@@ -486,28 +560,38 @@ impl PortActor {
     #[cfg(test)]
     pub fn run(mut self) {
         let _scope = ActorScope::enter(self.id);
-        loop {
-            // Drain all pending messages into the heap
-            self.drain_channel();
-            self.rescan_parked();
-            self.expire_queued();
-
-            if self.heap.is_empty() {
-                // No work — block on the channel
-                match self.rx.blocking_recv() {
-                    Some(msg) => self.enqueue_message(msg),
-                    None => break,
-                }
-                // Drain any more that arrived
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            loop {
+                // Drain all pending messages into the heap
                 self.drain_channel();
                 self.rescan_parked();
-                self.expire_queued();
-            }
+                self.drop_left();
 
-            // Process one eligible request from the heap
-            self.process_one();
-            self.port_thread_auto_connect();
-        }
+                if self.heap.is_empty() {
+                    // No work — wait for a message or a queued cell.
+                    let cells = Arc::clone(&self.cells);
+                    tokio::select! {
+                        msg = self.rx.recv() => match msg {
+                            Some(msg) => self.enqueue_message(msg),
+                            None => break,
+                        },
+                        _ = cells.pushed() => {}
+                    }
+                    // Drain any more that arrived
+                    self.drain_channel();
+                    self.rescan_parked();
+                    self.drop_left();
+                }
+
+                // Process one eligible request from the heap
+                self.process_one();
+                self.port_thread_auto_connect();
+            }
+        });
         let _ = self.driver.shutdown();
     }
 
@@ -554,7 +638,7 @@ impl PortActor {
                 // Drain all pending messages into the heap
                 self.drain_channel();
                 self.rescan_parked();
-                self.expire_queued();
+                self.drop_left();
 
                 if self.heap.is_empty() {
                     // Wait for a message, an explicit shutdown, or the
@@ -564,17 +648,8 @@ impl PortActor {
                     // Connect-priority request to the port thread,
                     // asynManager.c:3252-3266); here the actor IS the port
                     // thread, so it wakes itself.
-                    // ...and at the earliest parked or blocked request's queue
-                    // deadline: C arms an `epicsTimer` per request at
-                    // `queueRequest` (asynManager.c:1617-1623) that unlinks it
-                    // wherever it is sitting, and such a request may have no
-                    // other clock — a blocking caller with no Tokio reactor arms
-                    // no timer of its own (`PortHandle::await_reply`), and a
-                    // `RequestOp::Callback` has no caller waiting at all.
-                    let retry_at = earliest(
-                        self.driver.base().connect_retry_at,
-                        self.earliest_waiting_deadline(),
-                    );
+                    let retry_at = self.driver.base().connect_retry_at;
+                    let cells = Arc::clone(&self.cells);
                     tokio::select! {
                         msg = self.rx.recv() => {
                             match msg {
@@ -583,6 +658,9 @@ impl PortActor {
                                 None => break,
                             }
                         }
+                        // C `queueRequest`'s `epicsEventSignal`
+                        // (asynManager.c:1626) for a queued cell.
+                        _ = cells.pushed() => {}
                         signal = shutdown_rx.recv(), if can_be_shut_down => {
                             match signal {
                                 // Explicit shutdown.
@@ -598,7 +676,7 @@ impl PortActor {
                     // Drain any more that arrived
                     self.drain_channel();
                     self.rescan_parked();
-                    self.expire_queued();
+                    self.drop_left();
                 }
 
                 // Run any due connect retry before servicing the queue: a
@@ -743,6 +821,9 @@ impl PortActor {
         while let Ok(msg) = self.rx.try_recv() {
             self.enqueue_message(msg);
         }
+        while let Some((cell, seq)) = self.cells.pop() {
+            self.enqueue_message(ActorMessage::from_cell(cell, seq));
+        }
     }
 
     /// Return the parked requests to the eligible queue, if anything has
@@ -754,7 +835,10 @@ impl PortActor {
     /// disabled is not rescanned in a loop: the actor goes back to waiting, and
     /// the request stays queued exactly as C leaves it.
     fn rescan_parked(&mut self) {
-        if !self.rescan_parked {
+        let announced = self.driver.base().exceptions_announced();
+        let edge = announced != self.rescanned_exceptions;
+        self.rescanned_exceptions = announced;
+        if !self.rescan_parked && !edge {
             return;
         }
         self.rescan_parked = false;
@@ -763,59 +847,26 @@ impl PortActor {
         }
     }
 
-    /// The queue timer of a queued request, fired where it sits — C
-    /// `queueTimeoutCallback` unlinks the request from `queueList` while
-    /// `isQueued` (asynManager.c:649-701) and runs the user's timeout callback,
-    /// wherever in the queue the port thread had left it: behind other
-    /// requests, parked behind a disabled device, or held by a block. A
-    /// [`RequestOp::Callback`] has no waiter to arm a timer of its own, so this
-    /// is its only clock.
-    fn expire_queued(&mut self) {
-        let now = Instant::now();
-        let due = |msg: &ActorMessage| msg.queue_deadline.is_some_and(|at| now >= at);
-        if !(self.parked.iter().any(due)
-            || self.pending_while_blocked.iter().any(due)
-            || self.heap.iter().any(due))
-        {
+    /// Drop the entries of requests that left the queue on another clock — the
+    /// queue timer's (`RequestCell::expire`) or a waiter's own — which C's
+    /// `queueTimeoutCallback` unlinks from wherever they sit: behind other
+    /// requests, parked behind a disabled device, or held by a block
+    /// (asynManager.c:663-672). Its signal (:700) is what wakes this pass.
+    fn drop_left(&mut self) {
+        if !self.cells.take_left() {
             return;
         }
-        let port = self.driver.base().port_name.clone();
-        let mut expired = Vec::new();
-        for queue in [&mut self.parked, &mut self.pending_while_blocked] {
-            let (gone, kept) = std::mem::take(queue).into_iter().partition(due);
-            *queue = kept;
-            expired.extend::<Vec<_>>(gone);
-        }
-        let (gone, kept): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.heap).into_iter().partition(due);
-        self.heap = kept.into();
-        expired.extend(gone);
-        // C `queueTimeoutCallback` ends by signalling the port thread (:700): the
-        // request left the queue, so the thread must look at what is left.
+        self.parked.retain(|msg| !msg.is_gone());
+        self.pending_while_blocked.retain(|msg| !msg.is_gone());
+        self.heap.retain(|msg| !msg.is_gone());
         self.woken = true;
-        for msg in expired {
-            // The token settles which outcome wins, exactly as at the dequeue
-            // gate: if the caller's own timer got there first it already
-            // reported, and this reply lands on a dropped receiver.
-            msg.cancel.time_out_if_queued();
-            msg.refuse(AsynError::QueueTimeout { port: port.clone() });
-        }
-    }
-
-    /// When the earliest-deadlined request waiting off the heap must be woken.
-    fn earliest_waiting_deadline(&self) -> Option<Instant> {
-        self.parked
-            .iter()
-            .chain(&self.pending_while_blocked)
-            .filter_map(|m| m.queue_deadline)
-            .min()
     }
 
     /// The gate every connect attempt the actor makes *on its own initiative*
     /// passes — the retry timer and both auto-connect levels. It is the same
     /// gate a request passes, asked on behalf of the connect user C builds for
     /// the port (`pport->pconnectUser`, asynManager.c:3226-3231): `addr == -1` at
-    /// Connect priority, so `checkPortConnect` is `FALSE` (:1536-1538) and only
+    /// Connect priority, so `checkPortConnect` is `FALSE` (:1538-1540) and only
     /// the unconditional enabled/defunct half binds (:1541-1546).
     ///
     /// Nothing in C reaches `pasynCommon->connect` without it — the timer
@@ -1073,6 +1124,8 @@ impl PortActor {
             // The caller's own callback, queued at the band it names.
             RequestOp::Callback(cb) if cb.connect_queue() => CDispatch::ConnectQueue,
             RequestOp::Callback(_) => CDispatch::Queued,
+            RequestOp::Cell(cell) if cell.connect_queue() => CDispatch::ConnectQueue,
+            RequestOp::Cell(_) => CDispatch::Queued,
 
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
             // queued at Connect priority (asynRecord's CNCT put,
@@ -1184,19 +1237,12 @@ impl PortActor {
             None => return,
         };
 
-        // The queue-wait deadline, enforced where C enforces it: at the boundary
-        // between "queued" and "running". C arms a timer at `queueRequest`
-        // (asynManager.c:1617-1623) and its callback unlinks the request only
-        // while `isQueued` (:655-661); the port thread cancels the timer as it
-        // dequeues (:827,:906). Both halves reduce to one rule — *a request that
-        // waited past its deadline never runs* — and the token is where that
-        // rule is settled, so a deadline, an `AQR` cancel and this dequeue race
-        // through one CAS and exactly one of them wins.
-        if msg.queue_deadline.is_some_and(|at| Instant::now() >= at)
-            && msg.cancel.time_out_if_queued()
-        {
-            let port = self.driver.base().port_name.clone();
-            msg.refuse(AsynError::QueueTimeout { port });
+        // The queue-wait deadline is not the port thread's: C's timer thread
+        // unlinks the request (asynManager.c:649-701) while this thread may be
+        // inside the driver, and so does `RequestCell::expire` or the waiter's
+        // own timer here. A deadline, an `AQR` cancel and the dequeue below race
+        // through one CAS on the token, and exactly one of them wins.
+        if msg.is_gone() {
             return;
         }
 
@@ -1209,7 +1255,7 @@ impl PortActor {
         // performs it as a direct manager call) and, when it does, which of its
         // two independent refusals the request may waive. The *connected* waiver
         // follows the request's own user (`AsynUser::connect_check`, C's
-        // `checkPortConnect` at :1536-1538); the *enabled* refusal is waivable by
+        // `checkPortConnect` at :1538-1540); the *enabled* refusal is waivable by
         // nobody, and `check_queue` is where that holds.
         //
         // The waiver is the only route C gives an operator to reconfigure a line
@@ -1240,6 +1286,16 @@ impl PortActor {
             // *after* that drain (:856-861) is the actor loop's.
             if connect == ConnectCheck::Required {
                 self.auto_connect_device(msg.user.addr, msg.user.reason);
+            }
+            // A cell passed the port-level half of `queueRequest` on its caller's
+            // thread. A port disabled or down since then is the port thread's to
+            // answer, and it answers by leaving the request queued until the
+            // state changes back or its timer fires (:808-810, :856-861).
+            if matches!(msg.op, RequestOp::Cell(_))
+                && self.driver.base().queue_gate().check(connect).is_err()
+            {
+                self.parked.push(msg);
+                return;
             }
             if let Err(e) = self.driver.base().check_queue(msg.user.addr, connect) {
                 msg.refuse(e);
@@ -1289,9 +1345,7 @@ impl PortActor {
                     .check_device_connected(msg.user.addr)
                     .is_err()
                 {
-                    msg.cancel.time_out_if_queued();
-                    let port = self.driver.base().port_name.clone();
-                    msg.refuse(AsynError::QueueTimeout { port });
+                    msg.time_out(self.driver.base().port_name.clone());
                     return;
                 }
             }
@@ -1305,19 +1359,23 @@ impl PortActor {
         // cancel, or a queue-wait deadline the *waiter* resolved first (the
         // async path arms its own timer, `PortHandle::submit_cancellable`) — in
         // which case it must be dropped, reporting the outcome that won.
-        if !msg.cancel.begin_running() {
-            let e = if msg.cancel.is_timed_out() {
-                AsynError::QueueTimeout {
-                    port: self.driver.base().port_name.clone(),
-                }
-            } else {
-                AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "request cancelled".into(),
-                }
-            };
-            msg.refuse(e);
-            return;
+        match msg.claim() {
+            Claim::Run => {}
+            Claim::Gone => return,
+            Claim::Left => {
+                let e = if msg.cancel.is_timed_out() {
+                    AsynError::QueueTimeout {
+                        port: self.driver.base().port_name.clone(),
+                    }
+                } else {
+                    AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "request cancelled".into(),
+                    }
+                };
+                msg.refuse(e);
+                return;
+            }
         }
         let ActorMessage {
             op,
@@ -1366,7 +1424,9 @@ impl PortActor {
 
         // Dispatch
         let result = self.dispatch_io(&mut user, &op);
-        let _ = reply.send(result);
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
+        }
 
         // The port-level auto-connect C's `portThread` runs after this
         // (asynManager.c:856-861) is not this function's — it is the actor
@@ -2112,6 +2172,10 @@ impl PortActor {
                     })
                 }
             }
+            RequestOp::Cell(cell) => {
+                cell.run(&mut ActorCalls(self));
+                Ok(RequestResult::write_ok())
+            }
             RequestOp::WithDriver(call) => match call.take() {
                 Some(f) => {
                     f(self.driver.as_mut());
@@ -2759,11 +2823,10 @@ mod tests {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
                 cancel: CancelToken::new(),
-                reply,
+                reply: Some(reply),
                 seq,
                 priority: QueuePriority::Medium,
                 block_token: None,
-                queue_deadline: None,
             }
         };
         let mut heap = BinaryHeap::new();
@@ -2869,11 +2932,10 @@ mod tests {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
                 cancel: CancelToken::new(),
-                reply,
+                reply: Some(reply),
                 seq,
                 priority,
                 block_token: None,
-                queue_deadline: None,
             }
         };
         let mut heap = BinaryHeap::new();
@@ -4106,7 +4168,7 @@ mod tests {
         assert_eq!(r.int_val, Some(1));
     }
 
-    /// C `queueRequest` (asynManager.c:1536-1552): a request queued at
+    /// C `queueRequest` (asynManager.c:1538-1552): a request queued at
     /// `asynQueuePriorityConnect` carrying `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`
     /// skips the `!pport->dpc.connected → asynDisconnected` refusal. Bare Connect
     /// priority does not (unless the user carries no device) — that is what
@@ -4833,7 +4895,7 @@ mod tests {
     }
 
     /// R12-48: C conditions **only** `checkPortConnect` on the priority
-    /// (asynManager.c:1536-1538). `if(!pport->dpc.enabled) return asynDisabled`
+    /// (asynManager.c:1538-1540). `if(!pport->dpc.enabled) return asynDisabled`
     /// (:1541-1546) sits above it and every queued request takes it — and the
     /// port thread will not drain even the Connect queue on a disabled port
     /// (:806-809). So a `CNCT=1` put on a port disabled with `asynEnable(port,0)`
@@ -5003,7 +5065,7 @@ mod tests {
 
     /// Boundary 4, and the reason the other three can be written at all: a user
     /// that never chose a device is *port-level*, so it clears C's
-    /// `checkPortConnect` waiver (`addr == -1`, asynManager.c:1536-1538)
+    /// `checkPortConnect` waiver (`addr == -1`, asynManager.c:1538-1540)
     /// without the caller spelling `-1` anywhere.
     ///
     /// C carries the distinction as a pointer, not a number:

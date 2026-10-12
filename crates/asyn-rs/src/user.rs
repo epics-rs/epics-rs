@@ -52,7 +52,7 @@ pub fn timeout_from_secs(secs: f64) -> Option<Duration> {
 pub const ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED: usize = 0x7000_0000;
 
 /// Which of the two independent refusals C's `queueRequest` applies to a
-/// request (asynManager.c:1536-1552).
+/// request (asynManager.c:1538-1552).
 ///
 /// The two are *not* interchangeable and only one of them is ever waived:
 ///
@@ -238,7 +238,7 @@ impl AsynUser {
     /// `pasynUser->reason = ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` paired with
     /// `queueRequest(..., asynQueuePriorityConnect, ...)`.
     ///
-    /// Both halves are set here because C's gate reads both (:1536-1538) and
+    /// Both halves are set here because C's gate reads both (:1538-1540) and
     /// every C caller sets both together: `asynSetOption`
     /// (asynShellCommands.c:121,127), `asynSetEos`/`asynShowEos` (:240,:291),
     /// the record's HOSTINFO put (asynRecord.c:566-569) and its connect-time

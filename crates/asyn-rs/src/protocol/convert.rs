@@ -120,6 +120,9 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Callback(cb) => Self::Callback {
                 connect_queue: cb.connect_queue(),
             },
+            RequestOp::Cell(cell) => Self::Callback {
+                connect_queue: cell.connect_queue(),
+            },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             RequestOp::SetTimeStampSource { name } => {

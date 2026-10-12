@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 use bitflags::bitflags;
 
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
+use crate::fixed_text::FixedText;
+
+/// The longest line [`TraceManager::print`] writes, its newline aside.
+pub const PRINT_LINE_SIZE: usize = 512;
 
 bitflags! {
     /// What to trace — control message categories.
@@ -702,6 +706,47 @@ impl TraceManager {
         });
     }
 
+    /// C `asynPrint` of one line on the rung C's `findTracePvt` picks — `port:
+    /// None` is a user on no port, which prints on the global rung
+    /// (asynManager.c:546-551). Formatted into a bounded buffer on the stack:
+    /// C's `traceVprintSource` `fprintf`s into the trace file
+    /// (asynManager.c:3065-3090) and allocates nothing, so a caller holding a
+    /// record's lock does not either. A line past [`PRINT_LINE_SIZE`] bytes is
+    /// cut, keeping its newline.
+    pub fn print(
+        &self,
+        port: Option<&str>,
+        addr: Option<i32>,
+        reason: i32,
+        mask: TraceMask,
+        args: std::fmt::Arguments<'_>,
+    ) {
+        let emit = |cfg: &TraceConfig| {
+            if !cfg.trace_mask.intersects(mask) {
+                return;
+            }
+            let mut line = FixedText::<PRINT_LINE_SIZE>::EMPTY;
+            // `Err` is the cut, which ends the text.
+            let _ = write_prefix(&mut line, port, addr, reason, ("", 0), cfg)
+                .and_then(|()| std::fmt::Write::write_fmt(&mut line, args));
+            let mut bytes = [0u8; PRINT_LINE_SIZE + 1];
+            let n = line.len();
+            bytes[..n].copy_from_slice(line.as_bytes());
+            bytes[n] = b'\n';
+            cfg.file.write_bytes(&bytes[..=n]);
+        };
+        match port {
+            Some(port) => {
+                self.with_dp_common(port, addr, emit);
+            }
+            None => {
+                if let Ok(cfg) = self.global_config.lock() {
+                    emit(&cfg);
+                }
+            }
+        }
+    }
+
     /// Output a trace message with source file/line info (C parity: __FILE__/__LINE__).
     pub fn output_with_source(
         &self,
@@ -1075,36 +1120,63 @@ fn format_prefix_addr(
     cfg: &TraceConfig,
 ) -> String {
     let mut out = String::new();
+    let _ = write_prefix(&mut out, Some(port), addr, reason, source, cfg);
+    out
+}
 
+/// [`format_prefix_addr`] into `out`, allocating nothing of its own. `port:
+/// None` is a user on no port, for which C's `printPort` prints nothing
+/// (asynManager.c:3036-3038).
+fn write_prefix(
+    out: &mut impl std::fmt::Write,
+    port: Option<&str>,
+    addr: Option<i32>,
+    reason: i32,
+    source: (&str, u32),
+    cfg: &TraceConfig,
+) -> std::fmt::Result {
     if cfg.trace_info_mask.contains(TraceInfoMask::TIME) {
         // C `printTime` (asynManager.c:2983-3001): `epicsTimeToStrftime` with
-        // `"%Y/%m/%d %H:%M:%S.%03f"`, which formats **local** time. chrono's
-        // `%.3f` is the same field including its leading dot.
+        // `"%Y/%m/%d %H:%M:%S.%03f"`, which formats **local** time. Written
+        // field by field: chrono's `format` builds the offset name and the
+        // text in `String`s.
+        use chrono::{Datelike, Timelike};
         let now = chrono::Local::now();
-        out.push_str(&now.format("%Y/%m/%d %H:%M:%S%.3f ").to_string());
+        write!(
+            out,
+            "{:04}/{:02}/{:02} {:02}:{:02}:{:02}.{:03} ",
+            now.year(),
+            now.month(),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second(),
+            now.nanosecond() % 1_000_000_000 / 1_000_000
+        )?;
     }
 
-    if cfg.trace_info_mask.contains(TraceInfoMask::PORT) {
+    if let (true, Some(port)) = (cfg.trace_info_mask.contains(TraceInfoMask::PORT), port) {
         let a = addr.unwrap_or(-1);
-        out.push_str(&format!("[{port},{a},{reason}] "));
+        write!(out, "[{port},{a},{reason}] ")?;
     }
 
     if cfg.trace_info_mask.contains(TraceInfoMask::SOURCE) {
         let (file, line) = source;
-        out.push_str(&format!("[{}:{}] ", strip_path(file), line));
+        write!(out, "[{}:{}] ", strip_path(file), line)?;
     }
 
     if cfg.trace_info_mask.contains(TraceInfoMask::THREAD) {
         let current = std::thread::current();
-        let name = current.name().unwrap_or("").to_string();
-        out.push_str(&format!(
-            "[{name},{},{}] ",
+        let name = current.name().unwrap_or("");
+        write!(
+            out,
+            "[{name},{:#x},{}] ",
             thread_token(),
             thread_epics_priority()
-        ));
+        )?;
     }
 
-    out
+    Ok(())
 }
 
 /// C prints `epicsThreadGetIdSelf()` with `%p` — an opaque per-thread token,
@@ -1113,11 +1185,11 @@ fn format_prefix_addr(
 /// and render it pointer-style. Like a pointer, the value differs between
 /// runs; what a reader uses it for — telling two threads apart in one log —
 /// is preserved.
-fn thread_token() -> String {
+fn thread_token() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     std::thread::current().id().hash(&mut h);
-    format!("{:#x}", h.finish())
+    h.finish()
 }
 
 /// C prints `epicsThreadGetPrioritySelf()`, the EPICS band (0..=99) stored on

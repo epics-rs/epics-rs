@@ -36,6 +36,12 @@ pub fn option_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
 }
 
+/// `option_key(key) == normalized`, without building the key — for a caller
+/// under a record's hold.
+pub fn is_option_key(key: &str, normalized: &str) -> bool {
+    key.trim().eq_ignore_ascii_case(normalized)
+}
+
 /// C's `epicsStrCaseCmp(val, ...)` — the value half of the same rule
 /// [`option_key`] owns for the key.
 ///
@@ -253,6 +259,8 @@ mod tests {
         assert_eq!(option_key(" rs485_Enable "), "rs485_enable");
         assert_eq!(option_key("Break"), "break");
         assert_eq!(option_key(""), "");
+        assert!(is_option_key(" HostInfo ", "hostinfo"));
+        assert!(!is_option_key("hostinfo2", "hostinfo"));
     }
 
     /// R11-49: C parses every numeric option value with `sscanf("%d")`, a prefix

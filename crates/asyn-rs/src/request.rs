@@ -134,6 +134,482 @@ impl std::fmt::Debug for PortCallback {
     }
 }
 
+/// Why a queued [`RequestCell`] left its queue without running — the three
+/// ways C's `userPvt` is unlinked short of `processUser`.
+#[derive(Debug)]
+pub enum Unrun {
+    /// C `cancelRequest` while `isQueued` (asynManager.c:1661-1668).
+    Canceled,
+    /// C `queueTimeoutCallback` (asynManager.c:649-701).
+    TimedOut,
+    /// The port refused it at dequeue, or went away with it queued.
+    Refused(AsynError),
+}
+
+/// What a [`RequestCell`] runs — C `createAsynUser(processUser, timeoutUser)`,
+/// fixed when the cell is made, so a queue carries nothing but the cell.
+pub trait CellBody: Send + Sync + 'static {
+    /// C `processUser`, on the port's thread, with the port.
+    fn process(&self, port: &mut dyn PortCalls);
+    /// C `timeoutUser`, or the other ways the request never ran.
+    fn unrun(&self, why: Unrun);
+    /// Runs once the cell may be queued again, after `process` or `unrun`.
+    fn done(self: Arc<Self>);
+}
+
+/// One preallocated request — C's `asynUser` and its `userPvt`, which
+/// `queueRequest` links onto a port queue without allocating
+/// (asynManager.c:1606-1626).
+///
+/// One request per cell is outstanding, as C's `isQueued` allows one per
+/// `asynUser` (asynManager.c:1574-1579); here the cell stays outstanding until
+/// its body has run, which for one user queued from one record is the same.
+pub struct RequestCell {
+    queue: Arc<CellQueue>,
+    token: CancelToken,
+    outstanding: std::sync::atomic::AtomicBool,
+    request: Mutex<CellRequest>,
+    body: Arc<dyn CellBody>,
+}
+
+/// What the actor needs of a queued cell: the gate's user and its queue band
+/// and order. `seq` is also the request's generation: an actor entry whose
+/// `seq` is not the cell's is a request that already left, and decides nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct CellRequest {
+    pub reason: usize,
+    pub addr: i32,
+    pub priority: crate::port::QueuePriority,
+    pub seq: u64,
+}
+
+/// What the actor may do with a dequeued cell entry — [`RequestCell::claim`].
+pub(crate) enum Claim {
+    /// C `callbackActive`: run it.
+    Run,
+    /// It left the queue and the actor reports it ([`RequestCell::leave`]).
+    Left,
+    /// It left and was reported, or a later request owns the cell now.
+    Gone,
+}
+
+impl RequestCell {
+    /// C `queueRequest` past its port gate: link the cell and signal the port
+    /// thread. Refused, with C's text, while the cell is still outstanding.
+    pub fn queue(self: &Arc<Self>, user: &crate::user::AsynUser) -> AsynResult<()> {
+        if self
+            .outstanding
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: ALREADY_QUEUED.into(),
+            });
+        }
+        let seq = crate::port_actor::next_seq();
+        {
+            // The generation and the token change together, so an exit that
+            // checks one under this lock sees the other.
+            let mut request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+            *request = CellRequest {
+                reason: user.reason,
+                addr: user.addr,
+                priority: user.priority,
+                seq,
+            };
+            self.token.requeue();
+        }
+        // C starts the timer before it signals the port thread
+        // (asynManager.c:1617-1626).
+        if let Some(timeout) = user.queue_timeout {
+            queue_timer().arm(self, seq, std::time::Instant::now() + timeout);
+        }
+        if self.queue.push(self, seq) {
+            Ok(())
+        } else {
+            queue_timer().disarm(self);
+            self.outstanding
+                .store(false, std::sync::atomic::Ordering::Release);
+            Err(AsynError::QueueRefused {
+                status: AsynStatus::Error,
+                message: "port shut down".into(),
+            })
+        }
+    }
+
+    /// C `cancelRequest`: `true` (C `wasQueued`) when the cell was still
+    /// queued; its body then runs [`Unrun::Canceled`].
+    pub fn cancel(&self) -> bool {
+        self.token.cancel()
+    }
+
+    pub(crate) fn queues_on(&self, queue: &Arc<CellQueue>) -> bool {
+        Arc::ptr_eq(&self.queue, queue)
+    }
+
+    /// Whether it rides C's `asynQueuePriorityConnect` queue.
+    pub fn connect_queue(&self) -> bool {
+        self.request().priority == crate::port::QueuePriority::Connect
+    }
+
+    /// C `isQueued`, or its callback still running.
+    #[cfg(feature = "epics")]
+    pub(crate) fn is_outstanding(&self) -> bool {
+        self.outstanding.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn token(&self) -> &CancelToken {
+        &self.token
+    }
+
+    pub(crate) fn request(&self) -> CellRequest {
+        *self.request.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The port thread's dequeue of the entry queued as `seq` (C
+    /// asynManager.c:889-891, and the timer cancel at :906).
+    pub(crate) fn claim(&self, seq: u64) -> Claim {
+        let claim = {
+            let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+            if request.seq != seq || self.token.is_timed_out() {
+                Claim::Gone
+            } else if self.token.begin_running() {
+                Claim::Run
+            } else {
+                Claim::Left
+            }
+        };
+        if matches!(claim, Claim::Run) {
+            queue_timer().disarm(self);
+        }
+        claim
+    }
+
+    /// On the port's thread, once [`Self::claim`] said [`Claim::Run`].
+    pub(crate) fn run(&self, port: &mut dyn PortCalls) {
+        self.body.process(port);
+        self.token.finish();
+        self.release();
+    }
+
+    /// The actor takes the entry queued as `seq` off its queue without running
+    /// it, for `e`: reported once, by whichever exit wins the token, and not at
+    /// all for an entry a later request has replaced.
+    pub(crate) fn leave(&self, seq: u64, e: AsynError) {
+        let why = {
+            let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+            if request.seq != seq {
+                return;
+            }
+            if self.token.is_cancelled() {
+                Unrun::Canceled
+            } else if !self.token.leave_if_queued() {
+                // The timer reported it.
+                return;
+            } else if matches!(e, AsynError::QueueTimeout { .. }) {
+                Unrun::TimedOut
+            } else {
+                Unrun::Refused(e)
+            }
+        };
+        self.body.unrun(why);
+        self.release();
+    }
+
+    /// C `queueTimeoutCallback` (asynManager.c:649-701), on the timer thread:
+    /// the request queued as `seq` leaves the queue while the port thread may be
+    /// inside the driver, its timeout callback runs, and the port thread is
+    /// told (:700).
+    fn expire(&self, seq: u64) {
+        {
+            let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+            // :655-661 `if(!puserPvt->isQueued) return;`
+            if request.seq != seq || !self.token.time_out_if_queued() {
+                return;
+            }
+        }
+        // :663-672 unlinks it, so the entry is gone before the cell can be
+        // queued again; one the actor already took is its to drop.
+        self.queue.unlink(self);
+        self.body.unrun(Unrun::TimedOut);
+        self.release();
+        self.queue.poke();
+    }
+
+    /// Whether the actor's entry queued as `seq` is one it can drop unseen: a
+    /// later request owns the cell, or the timer took this one.
+    pub(crate) fn is_gone(&self, seq: u64) -> bool {
+        let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+        request.seq != seq || self.token.is_timed_out()
+    }
+
+    fn release(&self) {
+        queue_timer().disarm(self);
+        self.outstanding
+            .store(false, std::sync::atomic::Ordering::Release);
+        Arc::clone(&self.body).done();
+    }
+}
+
+impl Drop for RequestCell {
+    fn drop(&mut self) {
+        self.queue.unregister();
+    }
+}
+
+impl std::fmt::Debug for RequestCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RequestCell")
+    }
+}
+
+/// C `queueRequest`'s refusal of a user already on a queue
+/// (asynManager.c:1574-1579).
+const ALREADY_QUEUED: &str = "asynManager::queueRequest is already queued";
+
+/// A port's queue of [`RequestCell`]s as the queueing side sees it: a push
+/// into capacity every registered cell reserved, and a wake of the actor —
+/// C's `ellAdd` and `epicsEventSignal(notifyPortThread)`
+/// (asynManager.c:1613, :1626).
+#[derive(Default)]
+pub(crate) struct CellQueue {
+    inner: Mutex<CellQueueInner>,
+    wake: tokio::sync::Notify,
+    /// A request left the queue on someone else's clock — the timer's or a
+    /// waiter's — and the actor still holds its entry.
+    left: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct CellQueueInner {
+    /// Each entry with the `seq` it was queued as.
+    cells: std::collections::VecDeque<(Arc<RequestCell>, u64)>,
+    registered: usize,
+    closed: bool,
+}
+
+impl CellQueue {
+    /// A cell for this queue. Each cell reserves its own slot, so queueing one
+    /// never grows the queue.
+    pub(crate) fn new_cell(self: &Arc<Self>, body: Arc<dyn CellBody>) -> Arc<RequestCell> {
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.registered += 1;
+            let spare = inner.registered - inner.cells.len();
+            inner.cells.reserve(spare);
+        }
+        queue_timer().register();
+        Arc::new(RequestCell {
+            queue: Arc::clone(self),
+            token: CancelToken::new(),
+            outstanding: std::sync::atomic::AtomicBool::new(false),
+            request: Mutex::new(CellRequest {
+                reason: 0,
+                addr: -1,
+                priority: crate::port::QueuePriority::default(),
+                seq: 0,
+            }),
+            body,
+        })
+    }
+
+    fn unregister(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.registered -= 1;
+        drop(inner);
+        queue_timer().unregister();
+    }
+
+    fn push(&self, cell: &Arc<RequestCell>, seq: u64) -> bool {
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.closed {
+                return false;
+            }
+            inner.cells.push_back((Arc::clone(cell), seq));
+        }
+        self.wake.notify_one();
+        true
+    }
+
+    fn unlink(&self, cell: &RequestCell) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .cells
+            .retain(|(queued, _)| !std::ptr::eq(Arc::as_ptr(queued), cell));
+    }
+
+    pub(crate) fn pop(&self) -> Option<(Arc<RequestCell>, u64)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cells
+            .pop_front()
+    }
+
+    /// Resolves at the next push or poke since the last wait.
+    pub(crate) async fn pushed(&self) {
+        self.wake.notified().await
+    }
+
+    /// C `queueTimeoutCallback`'s `epicsEventSignal(pport->notifyPortThread)`
+    /// (asynManager.c:700): a request left the queue off the port thread.
+    pub(crate) fn poke(&self) {
+        self.left.store(true, std::sync::atomic::Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    /// Whether a request left since the last call.
+    pub(crate) fn take_left(&self) -> bool {
+        self.left.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// The actor is gone: refuse what is queued and everything queued later.
+    pub(crate) fn close(&self) {
+        let cells = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.closed = true;
+            std::mem::take(&mut inner.cells)
+        };
+        for (cell, seq) in cells {
+            cell.leave(
+                seq,
+                AsynError::QueueRefused {
+                    status: AsynStatus::Error,
+                    message: "port shut down before the request ran".into(),
+                },
+            );
+        }
+    }
+}
+
+/// C `pasynBase->timerQueue` (asynManager.c:501-502): the one queue whose
+/// thread fires every queued [`RequestCell`]'s queue-wait timer, so a request
+/// times out while its port's thread is inside the driver.
+///
+/// Each cell holds one slot from creation on, as C's `userPvt` holds its
+/// `epicsTimer` (:1189-1190), so arming one never allocates.
+struct QueueTimer {
+    slots: epics_libcom_rs::runtime::sync::PriorityInheritanceMutex<TimerSlots>,
+    wake: epics_libcom_rs::runtime::sync::Event,
+}
+
+#[derive(Default)]
+struct TimerSlots {
+    armed: Vec<Armed>,
+    registered: usize,
+    /// The deadline the thread is parked until, while it is parked on one: an
+    /// arm at or after it needs no wake.
+    parked_until: Option<std::time::Instant>,
+}
+
+struct Armed {
+    at: std::time::Instant,
+    seq: u64,
+    cell: Arc<RequestCell>,
+}
+
+fn queue_timer() -> &'static QueueTimer {
+    static TIMER: std::sync::OnceLock<QueueTimer> = std::sync::OnceLock::new();
+    TIMER.get_or_init(|| {
+        use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+        // C: `epicsTimerQueueAllocate(1, epicsThreadPriorityScanLow)`. The
+        // thread blocks in `get_or_init` until this returns.
+        MandatoryThread::new(
+            "asynTimerQueue",
+            ThreadPriority::ScanLow,
+            StackSizeClass::Medium,
+        )
+        .spawn(|| queue_timer().run());
+        QueueTimer {
+            slots: epics_libcom_rs::runtime::sync::PriorityInheritanceMutex::new(
+                TimerSlots::default(),
+            ),
+            wake: epics_libcom_rs::runtime::sync::Event::new(),
+        }
+    })
+}
+
+impl QueueTimer {
+    fn register(&self) {
+        let mut slots = self.slots.lock();
+        slots.registered += 1;
+        let spare = slots.registered - slots.armed.len();
+        slots.armed.reserve(spare);
+    }
+
+    fn unregister(&self) {
+        self.slots.lock().registered -= 1;
+    }
+
+    /// C `epicsTimerStartDelay`: one timer per cell, so a re-arm replaces it.
+    fn arm(&self, cell: &Arc<RequestCell>, seq: u64, at: std::time::Instant) {
+        let wake = {
+            let mut slots = self.slots.lock();
+            let entry = Armed {
+                at,
+                seq,
+                cell: Arc::clone(cell),
+            };
+            match slots.armed.iter_mut().find(|a| Arc::ptr_eq(&a.cell, cell)) {
+                Some(slot) => *slot = entry,
+                None => slots.armed.push(entry),
+            }
+            slots.parked_until.is_none_or(|parked| at < parked)
+        };
+        if wake {
+            self.wake.signal();
+        }
+    }
+
+    /// C `epicsTimerCancel`.
+    fn disarm(&self, cell: &RequestCell) {
+        let gone = {
+            let mut slots = self.slots.lock();
+            let at = slots
+                .armed
+                .iter()
+                .position(|a| std::ptr::eq(Arc::as_ptr(&a.cell), cell));
+            at.map(|at| slots.armed.swap_remove(at))
+        };
+        // The cell's last reference may be this one; it drops unlocked.
+        drop(gone);
+    }
+
+    fn run(&self) {
+        let waiter = self.wake.waiter();
+        loop {
+            let now = std::time::Instant::now();
+            let (due, earliest) = {
+                let mut slots = self.slots.lock();
+                match slots.armed.iter().position(|a| a.at <= now) {
+                    Some(at) => (Some(slots.armed.swap_remove(at)), None),
+                    None => {
+                        let earliest = slots.armed.iter().map(|a| a.at).min();
+                        slots.parked_until = earliest;
+                        (None, earliest)
+                    }
+                }
+            };
+            if let Some(due) = due {
+                due.cell.expire(due.seq);
+                continue;
+            }
+            let nearer = || {
+                let slots = self.slots.lock();
+                slots.armed.iter().map(|a| a.at).min() != earliest
+            };
+            match earliest {
+                Some(at) => {
+                    waiter.wait_until_deadline(at, nearer);
+                }
+                None => waiter.wait_until(nearer),
+            }
+            self.slots.lock().parked_until = None;
+        }
+    }
+}
+
 /// A param value to set directly in the store (no writeInt32/on_param_change).
 /// Mirrors C ADCore's setIntegerParam/setDoubleParam.
 ///
@@ -474,6 +950,9 @@ pub enum RequestOp {
     /// caller's own `processUser` (asynManager.c:1513, :904), as asynRecord
     /// queues `asynCallbackSpecial` (asynRecord.c:528-578).
     Callback(PortCallback),
+    /// A preallocated request the port thread runs — C `queueRequest` of a
+    /// user that carries its own callbacks; see [`RequestCell`].
+    Cell(Arc<RequestCell>),
     /// Set the port's input EOS bytes — C `pasynOctet->setInputEos`.
     /// Drives the same `PortDriver::set_input_eos(&[u8])` hook the EOS
     /// interpose layer reads, so asynRecord IEOS writes survive a
@@ -903,6 +1382,19 @@ impl CancelToken {
             .is_ok()
     }
 
+    /// The port thread takes the request off the queue without running it — a
+    /// refusal at dequeue. `false` when it had already left.
+    pub fn leave_if_queued(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STATE_QUEUED,
+                STATE_DONE,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// Executor at dequeue: claim the request for execution (C dequeue under
     /// `asynManagerLock`, asynManager.c:1661-1666 is the cancel counterpart).
     ///
@@ -940,6 +1432,11 @@ impl CancelToken {
             AtomicOrdering::AcqRel,
             AtomicOrdering::Acquire,
         );
+    }
+
+    /// A [`RequestCell`] queued again: its previous request has run or left.
+    pub(crate) fn requeue(&self) {
+        self.0.store(STATE_QUEUED, AtomicOrdering::Release);
     }
 
     /// True iff the request was cancelled while still queued — the C

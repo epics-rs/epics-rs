@@ -737,9 +737,8 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u
 /// * `sim_process_tail` — the SIMM-mode input tail;
 /// * `RecordInstance::process_local` — the foreign-process / QSRV-group path.
 ///
-/// (The SDIS-disable post in `process_record_with_links_inner` and the
-/// fanout/seq SELN post in `links::apply_selm_alarm` are NOT clients: they
-/// carry C's `dbAccess.c:586-593` and `fanoutRecord.c:116` masks, not
+/// (The SDIS-disable post in `process_record_with_links_inner` is NOT a
+/// client: it carries C's `dbAccess.c:586-593` mask, not
 /// `recGblResetAlarms`'.)
 /// The publication half of a process cycle: post the alarm fields under their
 /// individual C masks, fan the snapshot out to subscribers, and report which
@@ -6768,23 +6767,18 @@ impl PvDatabase {
                     rec.write().record.after_output_decision();
                 }
                 self.dispatch_multi_output_values(rec, src, skip_out, plan, visited);
-                // The value-putting multi-output records — dfanout `OUTn`, seq
-                // `LNKn` — push HERE, with the record's other outputs, so the
-                // whole output stage sits between `checkAlarms` and the alarm
-                // commit exactly as C's does (`dfanoutRecord.c:128-146`
+                // The multi-output records — dfanout `OUTn`, seq `LNKn`, fanout
+                // `LNKn` — dispatch HERE, with the record's other outputs, so
+                // the whole output stage sits between `checkAlarms` and the
+                // alarm commit exactly as C's does (`dfanoutRecord.c:128-146`
                 // push_values → monitor; `seqRecord.c:264` dbPutLink →
-                // asyncFinish's `recGblResetAlarms`, :227). A failed put's
-                // LINK_ALARM therefore folds into THIS cycle's committed SEVR,
-                // and the push reads the VAL the IVOA owner already settled.
-                // The fanout dispatch stays in the forward-link tail: its
-                // `LNKn` are `DBF_FWDLINK` (dbScanFwdLink), driving no value.
+                // asyncFinish's `recGblResetAlarms`, :227; `fanoutRecord.c:103-
+                // 148` SELL read and dbScanFwdLink → `recGblResetAlarms`). A
+                // failed put's LINK_ALARM and a SELN-range SOFT INVALID
+                // therefore fold into THIS cycle's committed SEVR, and the SELN
+                // the SELL read moved posts in this cycle's monitor.
                 let dispatched = if plan.multi_output_dispatch {
-                    self.dispatch_multi_output(
-                        name,
-                        rec,
-                        super::links::MultiOutPhase::Output { skip_out },
-                        visited,
-                    )
+                    self.dispatch_multi_output(name, rec, skip_out, visited)
                 } else {
                     super::links::MultiOutDispatch::default()
                 };
@@ -7064,8 +7058,7 @@ impl PvDatabase {
         );
     }
 
-    /// Steps 4.5 - 7 of the process chain: multi-output dispatch,
-    /// event-record posting, generic OUTA..OUTP links, FLNK forward
+    /// Steps 4.55 - 7 of the process chain: event-record posting, generic OUTA..OUTP links, FLNK forward
     /// link, CP-target dispatch, and RPRO reprocess. Shared by the
     /// main process path and the simulation-mode path so both run the
     /// identical `recGblFwdLink` equivalent.
@@ -7079,23 +7072,6 @@ impl PvDatabase {
         visited: &mut ProcStack,
     ) {
         let rec = guard.rec;
-        // 4.5. Multi-output dispatch, forward-link phase: fanout only. Its
-        // `LNK0..LNKF` are `DBF_FWDLINK` — `dbScanFwdLink`, no value, no put
-        // status, so the tail is where they belong. dfanout `OUTn` and seq
-        // `LNKn` carry a value through `dbPutLink` and dispatch pre-commit in
-        // `process_record_with_links_inner`, so a failed put's LINK_ALARM
-        // folds into the same cycle's SEVR; the `ForwardLink` phase argument
-        // skips them here (`multi_out_phase_of`).
-        if src.plan.multi_output_dispatch {
-            guard.release();
-            let _ = self.dispatch_multi_output(
-                name,
-                rec,
-                super::links::MultiOutPhase::ForwardLink,
-                visited,
-            );
-        }
-
         // 4.55. event record: post the named software event.
         if src.plan.posts_software_event {
             guard.release();
@@ -8112,23 +8088,7 @@ impl PvDatabase {
         // (dbLink.c:434-448). Only the fanout/seq dispatch and the FLNK tail
         // remain here.
 
-        // Multi-output dispatch, forward-link phase (fanout). The
-        // `ForwardLink` phase skips dfanout and seq here, which is correct:
-        // their value-carrying `OUTn`/`LNKn` are driven pre-commit on the
-        // processing path. seq DOES reach this function as an async
-        // completion — it is C's `asyncFinish` for the DLYn group chain
-        // (`seqRecord.c:219-241`) — and its groups have already run, so
-        // re-dispatching them here would drive every LNKn twice.
         let plan = rec.process_plan();
-        if plan.multi_output_dispatch {
-            let _ = self.dispatch_multi_output(
-                &canonical,
-                rec,
-                super::links::MultiOutPhase::ForwardLink,
-                visited,
-            );
-        }
-
         // event record: post the named software event.
         if plan.posts_software_event {
             self.dispatch_event_record(rec);

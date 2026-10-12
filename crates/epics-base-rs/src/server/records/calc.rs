@@ -349,6 +349,16 @@ impl Record for CalcRecord {
         &CALC_INPUT_FIELDS
     }
 
+    /// `monitor()` posts VAL and A..U alone; LA..LU are written, never
+    /// posted (calcRecord.c:415-423).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        static POSTED: [&str; 22] = [
+            "VAL", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
+            "Q", "R", "S", "T", "U",
+        ];
+        Some(&POSTED)
+    }
+
     /// The walk takes this cycle's A..U marks only when there are any.
     fn cycle_marked_fields(&self) -> bool {
         self.input_changes != 0

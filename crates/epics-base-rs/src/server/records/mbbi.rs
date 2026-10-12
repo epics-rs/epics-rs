@@ -591,9 +591,14 @@ impl Record for MbbiRecord {
     }
 
     /// The RVAL block sits outside `if (events)`, so a cycle that leaves VAL
-    /// alone still posts a moved RVAL.
+    /// alone still posts a moved RVAL; shut while RVAL holds, so an idle
+    /// cycle skips the walk.
     fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+        if self.oraw != self.rval {
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+        } else {
+            crate::server::recgbl::EventMask::NONE
+        }
     }
 
     /// `monitor()` decides RVAL from the record's own `oraw`, so the

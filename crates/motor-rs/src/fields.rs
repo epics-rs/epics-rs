@@ -463,6 +463,13 @@ pub mod m {
     pub const PUT_HLM: u64 = 1 << 51;
     pub const PUT_LLM: u64 = 1 << 52;
     pub const PUT_STUP: u64 = 1 << 53;
+    /// `monitor()`'s own CNEN post (3541-3548), raised and drained inside the
+    /// take that derives it.
+    pub const CNEN: u64 = 1 << 54;
+    /// velcheckB's MRES<0 branch posts both user limits (2903-2905) ahead of
+    /// the tail post every MRES put makes.
+    pub const PUT_HLM_SWAP: u64 = 1 << 55;
+    pub const PUT_LLM_SWAP: u64 = 1 << 56;
 }
 
 /// Internal bookkeeping fields (not directly exposed as PVs).

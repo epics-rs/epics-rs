@@ -464,9 +464,7 @@ impl MotorRecord {
                     // completion syncs and finalizes like a plain stop.
                     self.internal.queued_motion = None;
                     self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
-                    self.mark(m::MIP);
                     self.stat.mip.insert(MipFlags::JOG_STOP);
-                    self.mark(m::MIP);
                 } else if self.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
                     self.stop_jog(&mut effects);
                 } else {
@@ -1033,8 +1031,8 @@ impl MotorRecord {
             // MIP_JOG_REQ in mip (its arming lives in special(), blind to
             // internal clears). Here the request is dropped with its
             // button: JOG_REQ set means a latched, undispatched request.
+            // C never marked the request, so its drop posts nothing.
             self.stat.mip.remove(MipFlags::JOG_REQ);
-            self.mark(m::MIP);
             self.limits.lvio = true;
             self.mark(m::LVIO);
             // C 2104: the refusal returns in-section — pass consumed.
@@ -1094,11 +1092,10 @@ impl MotorRecord {
         // With the JOG bits gone, the deceleration is no longer "a jog"
         // to the enter_do_work LVIO recompute (1466 gates on MIP_JOG,
         // which excludes JOG_STOP) — the latch is preserved while
-        // stopping. The jog direction survives in jog_was_forward.
+        // stopping. The jog direction survives in jog_was_forward. C marks
+        // neither write; MIP posts at the stop completion.
         self.stat.mip.insert(MipFlags::JOG_STOP);
-        self.mark(m::MIP);
         self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
-        self.mark(m::MIP);
         self.set_phase(MotionPhase::JogStopping);
         effects.commands.push(MotorCommand::Stop {
             acceleration: self.jog_accel_egu(),
@@ -2307,11 +2304,11 @@ impl MotorRecord {
                 // cannot inject a stale completion evaluation into the
                 // new motion.
                 let mut effects = ProcessEffects::default();
+                // Unmarked: MIP posts when the GET_INFO pass ends the wait
+                // (1429-1430).
                 if self.stat.mip.contains(MipFlags::DELAY_REQ) {
                     self.stat.mip.remove(MipFlags::DELAY_REQ);
-                    self.mark(m::MIP);
                     self.stat.mip.insert(MipFlags::DELAY_ACK);
-                    self.mark(m::MIP);
                     effects.status_refresh = true;
                 }
                 effects

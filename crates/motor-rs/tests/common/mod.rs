@@ -21,16 +21,25 @@ use motor_rs::device_state::{SharedDeviceState, StampedStatus};
 use motor_rs::device_support::MotorDeviceSupport;
 use motor_rs::flags::MstaFlags;
 
-/// Reports every commanded position as reached.
+/// Reports every commanded position as reached, with the status bits a test
+/// raises.
 pub struct ExactMotor {
     pub position: f64,
+    pub powered: bool,
+    pub gain_support: bool,
+    pub comms_error: bool,
+    /// Reported as not done, e.g. while a jog runs.
+    pub moving: bool,
 }
 
 impl AsynMotor for ExactMotor {
     fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
         Ok(MotorStatus {
             position: self.position,
-            done: true,
+            done: !self.moving,
+            powered: self.powered,
+            gain_support: self.gain_support,
+            comms_error: self.comms_error,
             ..MotorStatus::default()
         })
     }
@@ -43,6 +52,16 @@ impl AsynMotor for ExactMotor {
         _accel: f64,
     ) -> Result<(), AsynError> {
         self.position = position;
+        Ok(())
+    }
+    fn move_velocity(
+        &mut self,
+        _user: &AsynUser,
+        _min_vel: f64,
+        _velocity: f64,
+        _accel: f64,
+    ) -> Result<(), AsynError> {
+        self.moving = true;
         Ok(())
     }
     fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -67,19 +86,25 @@ impl AsynMotor for ExactMotor {
 /// The record (`M1`), its driver, and the status mailbox between them.
 pub struct MotorFixture {
     pub db: PvDatabase,
-    motor: Arc<Mutex<dyn AsynMotor>>,
-    state: SharedDeviceState,
+    motor: Arc<Mutex<ExactMotor>>,
+    pub(crate) state: SharedDeviceState,
     /// The driver's status sequence number; a pass consumes one.
     seq: u64,
     /// Held so the record's `PollCommand` sends succeed.
-    _poll_cmd_rx: tokio::sync::mpsc::Receiver<motor_rs::poll_loop::PollCommand>,
+    pub(crate) _poll_cmd_rx: tokio::sync::mpsc::Receiver<motor_rs::poll_loop::PollCommand>,
 }
 
 impl MotorFixture {
     /// Build `M1` at position 0 and run its startup readback pass. `configure`
     /// sets the per-test fields (deadbands, limits) before device init.
     pub async fn new(configure: impl FnOnce(&mut MotorRecord)) -> Self {
-        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ExactMotor { position: 0.0 }));
+        let motor = Arc::new(Mutex::new(ExactMotor {
+            position: 0.0,
+            powered: false,
+            gain_support: false,
+            comms_error: false,
+            moving: false,
+        }));
         let state = motor_rs::device_state::new_shared_state();
 
         let mut rec = MotorRecord::new();
@@ -96,7 +121,7 @@ impl MotorFixture {
 
         let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
         let mut dev = MotorDeviceSupport::new(
-            motor.clone(),
+            motor.clone() as Arc<Mutex<dyn AsynMotor>>,
             0,
             Duration::from_secs(1),
             poll_cmd_tx,
@@ -143,8 +168,23 @@ impl MotorFixture {
     /// The completion pass: hands the record the driver's "done" status and
     /// processes the readback, which posts DMOV 0→1.
     pub async fn finish_move(&mut self) {
+        self.poll_pass(|_| {}).await;
+        assert_eq!(
+            self.db.get_pv("M1.DMOV").unwrap(),
+            EpicsValue::Short(1),
+            "the readback pass must finish the move"
+        );
+    }
+
+    /// One driver poll, after `edit` changed what the driver reports, and the
+    /// readback pass that consumes it.
+    pub async fn poll_pass(&mut self, edit: impl FnOnce(&mut ExactMotor)) {
         let user = AsynUser::new(0);
-        let status = self.motor.lock().unwrap().poll(&user).unwrap();
+        let status = {
+            let mut motor = self.motor.lock().unwrap();
+            edit(&mut motor);
+            motor.poll(&user).unwrap()
+        };
         self.seq += 1;
         self.state.lock().unwrap().latest_status = Some(StampedStatus {
             seq: self.seq,
@@ -154,11 +194,6 @@ impl MotorFixture {
             .process_record_readback("M1", &mut ProcStack::new())
             .await
             .unwrap();
-        assert_eq!(
-            self.db.get_pv("M1.DMOV").unwrap(),
-            EpicsValue::Short(1),
-            "the readback pass must finish the move"
-        );
     }
 
     /// Both halves of one move.

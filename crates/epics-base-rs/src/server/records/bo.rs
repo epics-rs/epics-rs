@@ -309,9 +309,14 @@ impl Record for BoRecord {
     }
 
     /// The RVAL/RBV block sits outside `if (monitor_mask)`, so a readback
-    /// that moves RBV while VAL holds still posts.
+    /// that moves RBV while VAL holds still posts; shut while both hold, so
+    /// an idle cycle skips the walk.
     fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+        if self.oraw != self.rval || self.orbv != self.rbv {
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+        } else {
+            crate::server::recgbl::EventMask::NONE
+        }
     }
 
     /// `monitor()` decides RVAL and RBV from the record's own `oraw` and

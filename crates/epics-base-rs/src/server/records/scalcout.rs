@@ -553,6 +553,7 @@ impl ScalcoutRecord {
     /// (anjohnson) makes them plain read-only `DBF_STRING` scalars. This port
     /// serves the fixed shape ahead of the upstream merge — the buffer read up
     /// to its NUL — so `caget PAA` on `hi` reads the scalar `hi`.
+    /// Ruled an accepted deviation: C's bug is not the contract.
     fn prev_str_channel(buf: &[u8; PREV_STRING_SIZE]) -> EpicsValue {
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         EpicsValue::String(PvString::from_bytes(buf[..end].to_vec()))

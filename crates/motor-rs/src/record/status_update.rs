@@ -373,17 +373,6 @@ impl MotorRecord {
             self.mark(m::MSTA);
         }
 
-        // C monitor() (3541-3549): when the controller supports closed-loop
-        // gain (GAIN_SUPPORT), CNEN is a readback of the EA_POSITION
-        // (position-maintenance/torque) bit — but the readback lives inside
-        // monitor()'s MARKED(M_MSTA) branch, so it refreshes only on a poll
-        // where MSTA actually changed, not every poll. Gating on msta_changed
-        // keeps a user-written CNEN that the driver has not yet reflected in
-        // EA_POSITION from being reverted a poll early.
-        if msta_changed && msta.contains(MstaFlags::GAIN_SUPPORT) {
-            self.ctrl.cnen = msta.contains(MstaFlags::POSITION);
-        }
-
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
         self.stat.tdir = status.direction;
         if self.stat.tdir != old_tdir {

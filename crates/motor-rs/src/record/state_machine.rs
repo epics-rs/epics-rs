@@ -581,8 +581,8 @@ impl MotorRecord {
         if self.pos.val == self.internal.lval {
             return false;
         }
+        // C 1395 leaves MIP unmarked; do_work's dispatch marks it (2462).
         self.stat.mip = MipFlags::empty();
-        self.mark(m::MIP);
         self.set_phase(MotionPhase::Idle);
         self.plan_absolute_move(effects);
         true

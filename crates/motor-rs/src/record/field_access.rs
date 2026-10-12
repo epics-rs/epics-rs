@@ -1194,13 +1194,12 @@ pub(crate) fn motor_put_field(
                 // clears a parked MIP_JOG_REQ; a press arms it only on an
                 // idle record (mip == MIP_DONE) away from the limit
                 // switch. The armed request parks across Stop/Pause until
-                // the jog dispatch consumes MIP wholesale (2106).
+                // the jog dispatch consumes MIP wholesale (2106). C marks
+                // none of it.
                 if v == 0 {
                     rec.stat.mip.remove(MipFlags::JOG_REQ);
-                    rec.mark(m::MIP);
                 } else if rec.stat.mip.is_empty() && !rec.limits.hls {
                     rec.stat.mip.insert(MipFlags::JOG_REQ);
-                    rec.mark(m::MIP);
                 }
                 rec.last_write = Some(CommandSource::Jogf);
                 Ok(())
@@ -1214,10 +1213,8 @@ pub(crate) fn motor_put_field(
                 // with the low limit switch.
                 if v == 0 {
                     rec.stat.mip.remove(MipFlags::JOG_REQ);
-                    rec.mark(m::MIP);
                 } else if rec.stat.mip.is_empty() && !rec.limits.lls {
                     rec.stat.mip.insert(MipFlags::JOG_REQ);
-                    rec.mark(m::MIP);
                 }
                 rec.last_write = Some(CommandSource::Jogr);
                 Ok(())
@@ -1606,6 +1603,7 @@ fn apply_mres_cascade(rec: &mut MotorRecord) {
     } else {
         rec.limits.dhlm = rec.limits.rllm * rec.conv.mres;
         rec.limits.dllm = rec.limits.rhlm * rec.conv.mres;
+        rec.internal.put_posted |= m::PUT_HLM_SWAP | m::PUT_LLM_SWAP;
     }
     // C 2880-2909: posted from special(), not marked.
     if rec.limits.dhlm != dhlm {

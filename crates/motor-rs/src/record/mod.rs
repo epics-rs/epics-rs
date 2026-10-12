@@ -57,7 +57,7 @@ pub struct MotorRecord {
 
 /// One row per [`m`] bit: C `monitor()`'s `monitor_mask | DBE_VAL_LOG`
 /// posts, then the literal `DBE_VAL_LOG` ones.
-static MONITOR_POSTS: [(&str, CyclePostMask); 54] = {
+static MONITOR_POSTS: [(&str, CyclePostMask); 57] = {
     use CyclePostMask::{MonitorValueLog as M, ValueLog as L};
     [
         ("VAL", M),
@@ -114,16 +114,20 @@ static MONITOR_POSTS: [(&str, CyclePostMask); 54] = {
         ("HLM", L),
         ("LLM", L),
         ("STUP", L),
+        ("CNEN", M),
+        ("HLM", L),
+        ("LLM", L),
     ]
 };
 
-/// C `monitor()`'s fields in its order, RBV and CNEN aside: the five above
-/// its short circuit (3509-3549), then the rest (3553-3643).
-static MONITOR_FIELDS: [&str; 43] = [
+/// C `monitor()`'s fields in its order, RBV aside: the five above its short
+/// circuit (3509-3549), then the rest (3553-3643), then CNEN, which posts only
+/// when the MSTA block derives a change.
+static MONITOR_FIELDS: [&str; 44] = [
     "RRBV", "DRBV", "DIFF", "RDIF", "MSTA", "VAL", "DVAL", "RVAL", "TDIR", "MIP", "HLM", "LLM",
     "SPMG", "RCNT", "RLV", "OFF", "DHLM", "DLLM", "HLS", "RHLS", "RLLS", "LLS", "ATHM", "MRES",
     "ERES", "UEIP", "LVIO", "STOP", "SBAS", "SREV", "UREV", "VELO", "VBAS", "MISS", "MOVN", "DMOV",
-    "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM",
+    "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM", "CNEN",
 ];
 
 impl Default for MotorRecord {
@@ -274,6 +278,14 @@ impl MotorRecord {
         if bits & m::LLS != 0 {
             bits |= if same { m::RLLS } else { m::RHLS };
         }
+        // The MSTA block's position-maintenance readback (3541-3548).
+        if bits & m::MSTA != 0 && self.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+            let pos_maint = self.stat.msta.contains(MstaFlags::POSITION);
+            if pos_maint != self.ctrl.cnen {
+                self.ctrl.cnen = pos_maint;
+                bits |= m::CNEN;
+            }
+        }
         // The short circuit (3550-3551) reads C's own bits only.
         self.internal.monitor_lower_marked =
             bits & m::MONITOR & !(m::UPPER | m::RHLS | m::RLLS | m::UEIP_POSTED) != 0;
@@ -284,7 +296,7 @@ impl MotorRecord {
     /// marks, RBV through the deadband when marked.
     fn monitor_notify_fields(&mut self) -> Vec<(String, EpicsValue)> {
         let rbv = self.internal.mmap & m::RBV != 0;
-        let bits = self.take_monitor_marks() & m::MONITOR;
+        let bits = self.take_monitor_marks() & (m::MONITOR | m::CNEN);
         let mut fields: Vec<(String, EpicsValue)> =
             CycleMarks::of(&MONITOR_POSTS, u128::from(bits))
                 .filter_map(|(name, _)| Some((name.to_string(), self.get_field(name)?)))
@@ -640,10 +652,10 @@ impl Record for MotorRecord {
     /// C `monitor()` posts every field it lists with `monitor_mask` on an
     /// alarm move, marked or not, but the group below its short circuit
     /// only when one of them is marked (motorRecord.cc:3550-3551). RBV is
-    /// the deadband field and CNEN posts only on its own change.
+    /// the deadband field and CNEN posts only when the MSTA block derives it.
     fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
         if self.internal.monitor_lower_marked {
-            &MONITOR_FIELDS
+            &MONITOR_FIELDS[..43]
         } else {
             &MONITOR_FIELDS[..5]
         }

@@ -9,8 +9,10 @@
 mod common;
 
 use common::{MotorFixture, drain};
+use epics_base_rs::server::database::ProcStack;
 use epics_base_rs::server::event_queue::EventReader;
-use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::recgbl::{EventMask, alarm_condition_string};
+use epics_base_rs::server::record::MENU_ALARM_SEVR;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 const PVS: [(&str, &str, DbFieldType); 10] = [
@@ -185,4 +187,273 @@ async fn a_set_mode_val_put_under_spmg_stop_redefines_as_the_oracle_does() {
         put(&fx, field, value).await;
     }
     assert_streams(&mut readers, SET_MODE);
+}
+
+/// `caput M1.MRES -0.001; M1.MRES 0.002` on a fresh record: velcheckB
+/// (2876-2909) posts both user limits once in its MRES<0 branch and again at
+/// its end, then the cycle posts them from load_pos' set_userlimits MARK, and
+/// the poll completing the LOAD_POS posts DMOV back.
+const MRES_FLIP: &str = "\
+M1.HLM 100
+M1.LLM -100
+M1.HLM 100
+M1.LLM -100
+M1.HLM 100
+M1.LLM -100
+M1.OFF 0
+M1.DMOV 0
+M1.DMOV 1
+M1.DLLM -200
+M1.DHLM 200
+M1.HLM 200
+M1.LLM -200
+M1.HLM 200
+M1.LLM -200
+M1.OFF 0
+M1.DMOV 0
+M1.DMOV 1
+";
+
+#[tokio::test]
+async fn a_negative_mres_put_posts_the_user_limits_as_the_oracle_does() {
+    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut readers = subscribe(&fx);
+    for mres in [-0.001, 0.002] {
+        put(&fx, "MRES", mres).await;
+        fx.poll_pass(|_| {}).await;
+    }
+    assert_streams(&mut readers, MRES_FLIP);
+    for (field, v) in [("HLM", 200.0), ("LLM", -200.0), ("OFF", 0.0)] {
+        let pv = format!("M1.{field}");
+        assert_eq!(fx.db.get_pv(&pv).unwrap(), EpicsValue::Double(v), "{pv}");
+    }
+}
+
+/// oracleMotorIoc on motor-status.db, `camonitor -m v|a|l M1.CNEN M1.MSTA`,
+/// `caput M1:GAIN 1; M1:POWERED 1; M1.CNEN 0; M1:POWERED 0; M1:POWERED 1;
+/// M1.CNEN 0; M1:GAIN 0; M1:POWERED 0; M1.CNEN 1`, the longouts setting the
+/// axis's GAIN_SUPPORT and EA_POSITION. CNEN posts from its own put and from
+/// the MSTA block when MSTA is marked and EA_POSITION differs (3541-3548).
+const CNEN: &str = "\
+M1.MSTA 2050
+M1.MSTA 2082
+M1.CNEN Enable
+M1.CNEN Disable
+M1.MSTA 2050
+M1.MSTA 2082
+M1.CNEN Enable
+M1.CNEN Disable
+M1.MSTA 34
+M1.MSTA 2
+M1.CNEN Enable
+";
+
+#[tokio::test]
+async fn cnen_posts_from_its_put_and_the_msta_block_as_the_oracle_does() {
+    let got = cnen_streams(&[
+        "GAIN 1",
+        "POWERED 1",
+        "CNEN 0",
+        "POWERED 0",
+        "POWERED 1",
+        "CNEN 0",
+        "GAIN 0",
+        "POWERED 0",
+        "CNEN 1",
+    ])
+    .await;
+    assert_eq!(got[0], CNEN, "DBE_VALUE");
+    assert_eq!(got[1], "", "DBE_ALARM");
+    assert_eq!(got[2], CNEN, "DBE_LOG");
+}
+
+/// The same IOC, `caput M1:GAIN 1; M1:COMMERR 1; M1.PROC 1; M1:POWERED 1;
+/// M1.PROC 1`: COMM_ERR raises COMM/INVALID once (alarm_sub 3392-3398), so the
+/// EA_POSITION poll is an alarm move and CNEN goes out with the MSTA block's
+/// mask, DBE_ALARM included.
+const CNEN_ALARM_VALUE: &str = "\
+M1.MSTA 2050
+M1.MSTA 2050 COMM INVALID
+M1.MSTA 2082 COMM INVALID
+M1.CNEN Enable COMM INVALID
+";
+const CNEN_ALARM_ALARM: &str = "\
+M1.MSTA 2050 COMM INVALID
+M1.MSTA 2050
+M1.MSTA 2082 COMM INVALID
+M1.CNEN Enable COMM INVALID
+M1.MSTA 2082
+";
+
+#[tokio::test]
+async fn a_cnen_derived_on_an_alarm_move_carries_the_alarm_as_the_oracle_does() {
+    let got = cnen_streams(&["GAIN 1", "COMMERR 1", "PROC 1", "POWERED 1", "PROC 1"]).await;
+    assert_eq!(got[0], CNEN_ALARM_VALUE, "DBE_VALUE");
+    assert_eq!(got[1], CNEN_ALARM_ALARM, "DBE_ALARM");
+    assert_eq!(got[2], CNEN_ALARM_VALUE, "DBE_LOG");
+}
+
+/// Runs the steps (a driver status bit, or a put) on a fresh `M1` and returns
+/// what `camonitor -m v|a|l M1.CNEN M1.MSTA` would print.
+async fn cnen_streams(steps: &[&str]) -> Vec<String> {
+    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let classes = [EventMask::VALUE, EventMask::ALARM, EventMask::LOG];
+    let mut readers: Vec<[EventReader; 2]> = (0u32..)
+        .step_by(2)
+        .zip(classes)
+        .map(|(sid, class)| {
+            [
+                fx.subscribe("MSTA", sid + 1, DbFieldType::ULong, class),
+                fx.subscribe("CNEN", sid + 2, DbFieldType::Enum, class),
+            ]
+        })
+        .collect();
+    let mut got = vec![String::new(); 3];
+    for step in steps {
+        let (what, v) = step.split_once(' ').unwrap();
+        let on = v == "1";
+        match what {
+            "GAIN" => fx.poll_pass(|m| m.gain_support = on).await,
+            "POWERED" => fx.poll_pass(|m| m.powered = on).await,
+            "COMMERR" => fx.poll_pass(|m| m.comms_error = on).await,
+            field => put(&fx, field, if on { 1.0 } else { 0.0 }).await,
+        }
+        // Within a step MSTA posts before CNEN, as the MSTA block does.
+        for (class, rx) in readers.iter_mut().enumerate() {
+            for (pv, rx) in ["M1.MSTA", "M1.CNEN"].into_iter().zip(rx.iter_mut()) {
+                while let Ok(e) = rx.try_recv() {
+                    let v = match e.value().as_value() {
+                        Some(EpicsValue::ULong(v)) => v.to_string(),
+                        Some(EpicsValue::Enum(v)) => ["Disable", "Enable"][usize::from(*v)].into(),
+                        other => panic!("{pv}: {other:?}"),
+                    };
+                    got[class] += &format!("{pv} {v}");
+                    if e.sevr() != 0 {
+                        got[class] += &format!(
+                            " {} {}",
+                            alarm_condition_string(e.stat()),
+                            MENU_ALARM_SEVR[e.sevr() as usize]
+                        );
+                    }
+                    got[class].push('\n');
+                }
+            }
+        }
+    }
+    got
+}
+
+/// `caput M1.JVEL 1; M1.JOGF 1; M1.JOGF 0`, the jog's stop, then
+/// `caput M1.MRES 0.002` and its LOAD_POS: special JOGF (3042-3047) and the
+/// jog-stop request (2153) change MIP without a MARK, so only the dispatch,
+/// postProcess and load_pos post it.
+const MIP: &str = "\
+M1.JOGF 1
+M1.MIP 1
+M1.DMOV 0
+M1.JOGF 0
+M1.MIP 0
+M1.DMOV 1
+M1.MIP 128
+M1.DMOV 0
+M1.MIP 0
+M1.DMOV 1
+";
+
+#[tokio::test]
+async fn mip_posts_from_c_s_marks_only_as_the_oracle_does() {
+    let steps = [
+        "JVEL 1",
+        "JOGF 1",
+        "poll",
+        "JOGF 0",
+        "stopped",
+        "MRES 0.002",
+        "poll",
+    ];
+    let got = mip_streams(&steps).await;
+    assert_eq!(got[0], MIP, "DBE_VALUE");
+    assert_eq!(got[1], "", "DBE_ALARM");
+    assert_eq!(got[2], MIP, "DBE_LOG");
+}
+
+/// `caput M1.DLY 0.2; M1 0.1`: the done pass arms the delay (1445), the
+/// watchdog's callbackFunc turns REQ into ACK (472-473) and its pass sets
+/// MIP_DELAY (1418), neither marked, so MIP posts again only when the
+/// GET_INFO pass ends the wait (1430) and maybeRetry finds it close enough.
+const MIP_DLY: &str = "\
+M1.MIP 32
+M1.DMOV 0
+M1.MIP 1056
+M1.MIP 0
+M1.DMOV 1
+";
+
+#[tokio::test]
+async fn a_dly_wait_posts_mip_from_c_s_marks_only_as_the_oracle_does() {
+    let got = mip_streams(&["DLY 0.2", "VAL 0.1", "poll", "delay", "poll"]).await;
+    assert_eq!(got[0], MIP_DLY, "DBE_VALUE");
+    assert_eq!(got[1], "", "DBE_ALARM");
+    assert_eq!(got[2], MIP_DLY, "DBE_LOG");
+}
+
+impl MotorFixture {
+    /// The poll loop firing the last armed DLY watchdog, and the pass it wakes.
+    async fn expire_delay(&mut self) {
+        use motor_rs::poll_loop::PollCommand;
+        let mut id = None;
+        while let Ok(cmd) = self._poll_cmd_rx.try_recv() {
+            if let PollCommand::ScheduleDelay(d, _) = cmd {
+                id = Some(d);
+            }
+        }
+        self.state.lock().unwrap().expired_delay_id = Some(id.expect("no delay armed"));
+        self.db
+            .process_record_readback("M1", &mut ProcStack::new())
+            .await
+            .unwrap();
+    }
+}
+
+/// Runs the steps (a put, a driver poll, the jog's stop, the DLY watchdog)
+/// and returns each class's JOGF, MIP and DMOV posts.
+async fn mip_streams(steps: &[&str]) -> Vec<String> {
+    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let pvs = [("M1.JOGF", "JOGF"), ("M1.MIP", "MIP"), ("M1.DMOV", "DMOV")];
+    let classes = [EventMask::VALUE, EventMask::ALARM, EventMask::LOG];
+    let mut sid = 0;
+    let mut readers: Vec<Vec<EventReader>> = classes
+        .into_iter()
+        .map(|class| {
+            pvs.iter()
+                .map(|&(_, field)| {
+                    sid += 1;
+                    fx.subscribe(field, sid, DbFieldType::Short, class)
+                })
+                .collect()
+        })
+        .collect();
+    let mut got = vec![String::new(); 3];
+    for &step in steps {
+        match step.split_once(' ') {
+            Some((field, v)) => put(&fx, field, v.parse().unwrap()).await,
+            None if step == "stopped" => fx.poll_pass(|m| m.moving = false).await,
+            None if step == "delay" => fx.expire_delay().await,
+            None => fx.poll_pass(|_| {}).await,
+        }
+        // Within a step the oracle carries JOGF, then MIP, then DMOV.
+        for (class, rx) in readers.iter_mut().enumerate() {
+            for (&(pv, _), rx) in pvs.iter().zip(rx.iter_mut()) {
+                for v in drain(rx) {
+                    let v = match v {
+                        EpicsValue::Short(v) => i32::from(v),
+                        EpicsValue::UShort(v) => i32::from(v),
+                        other => panic!("{pv}: {other:?}"),
+                    };
+                    got[class] += &format!("{pv} {v}\n");
+                }
+            }
+        }
+    }
+    got
 }

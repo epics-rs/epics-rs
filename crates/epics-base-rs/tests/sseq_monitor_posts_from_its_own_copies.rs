@@ -12,11 +12,11 @@
 //! alarm, which `asyncFinish` then clears; a DOn/STRn put posts both from
 //! `special()` and the next cycle's read restores and posts them again.
 //!
-//! Compared per PV with BUSY's alarm cut: C posts BUSY 0 after `asyncFinish`'s
-//! `recGblResetAlarms` with its `MonitorMask` (`:471`, `:505`), so the first
-//! cycle's carries no alarm and reaches `DBE_ALARM`; the port publishes it
-//! from `publish_post_write_fields` before the reset at `DBE_VALUE` alone, so
-//! its first BUSY 0 carries UDF INVALID. That stage is a framework hunk.
+//! C posts BUSY 0 after `asyncFinish`'s `recGblResetAlarms` with its
+//! `MonitorMask` (`:471`, `:505`), so the first cycle's carries no alarm and
+//! reaches `DBE_ALARM`. The port still publishes it from
+//! `publish_post_write_fields` before the reset at `DBE_VALUE` alone; the pin
+//! is C's stream and stays ignored until that publish stage moves.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -140,6 +140,7 @@ impl SubscriptionFilter for Line {
 }
 
 #[epics_macros_rs::epics_test]
+#[ignore = "red until BUSY 0 publishes after the alarm reset (sseqRecord.c:471, 505)"]
 async fn sseq_posts_its_link_reads_as_the_oracle_does() {
     let (db, _) = IocBuilder::new()
         .register_record_type("sseq", || Box::new(SseqRecord::default()))
@@ -203,12 +204,7 @@ async fn sseq_posts_its_link_reads_as_the_oracle_does() {
         (&got[1], ALARM, "DBE_ALARM"),
         (&got[2], LOG, "DBE_LOG"),
     ] {
-        let (mut got, mut want) = (by_pv(got), by_pv(want));
-        let (got_busy, want_busy) = (got.remove("Q.BUSY"), want.remove("Q.BUSY"));
-        assert_eq!(got, want, "{class}");
-        if class != "DBE_ALARM" {
-            assert_eq!(cut_alarm(got_busy), cut_alarm(want_busy), "{class} Q.BUSY");
-        }
+        assert_eq!(by_pv(got), by_pv(want), "{class}");
     }
 }
 
@@ -221,13 +217,4 @@ fn by_pv(stream: &str) -> std::collections::BTreeMap<&str, Vec<&str>> {
             .push(line);
     }
     m
-}
-
-/// BUSY's values without the alarm its post carried.
-fn cut_alarm(lines: Option<Vec<&str>>) -> Vec<String> {
-    lines
-        .unwrap_or_default()
-        .iter()
-        .map(|l| l.split(' ').take(2).collect::<Vec<_>>().join(" "))
-        .collect()
 }

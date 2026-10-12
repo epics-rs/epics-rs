@@ -4223,7 +4223,7 @@ impl Record for AsynRecord {
                 self.aqr = to_i32(&value);
             }
             _ => {
-                return Err(CaError::InvalidValue(format!("unknown field: {name}")));
+                return Err(CaError::FieldNotFound(name.to_string()));
             }
         }
         Ok(())

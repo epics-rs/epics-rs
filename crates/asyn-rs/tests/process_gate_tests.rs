@@ -86,3 +86,41 @@ record(calc, "TEST:ACNT") {
         "a put to pp AOUT must process the asyn record and fire FLNK once"
     );
 }
+
+/// A dbCommon field reaches `put_common` only when the record's own
+/// `put_field` answers `FieldNotFound`; `caput AS.PROC 1` must process.
+#[tokio::test]
+async fn a_proc_put_processes_the_asyn_record() {
+    let db_str = r#"
+record(asyn, "TEST:ASYN") {
+    field(FLNK, "TEST:ACNT")
+}
+record(calc, "TEST:ACNT") {
+    field(INPA, "TEST:ACNT.VAL")
+    field(CALC, "A+1")
+}
+"#;
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("asyn", || {
+            Box::new(asyn_rs::asyn_record::AsynRecord::default())
+        })
+        .register_record_type("calc", || {
+            Box::new(epics_base_rs::server::records::calc::CalcRecord::new("A+1"))
+        })
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    db.put_record_field_from_ca("TEST:ASYN", "PROC", EpicsValue::String("1".into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        server.get("TEST:ACNT").await.unwrap(),
+        EpicsValue::Double(1.0)
+    );
+}

@@ -27,7 +27,7 @@
 //!   into it to resolve channel names and create channels.
 //! - `BridgeChannel` serves single-record PVs (NTScalar, NTEnum, NTScalarArray).
 //! - `GroupChannel` serves multi-record composite PVs from JSON config.
-//! - `BridgeMonitor` / `GroupMonitor` bridge `DbSubscription` events to PVA monitor updates.
+//! - `GroupMonitor` bridges `DbSubscription` events to PVA monitor updates.
 //!
 //! The `ChannelProvider`, `Channel`, and `PvaMonitor` traits are defined in
 //! `qsrv`; `qsrv::pva_adapter::QsrvPvStore` bridges them to the native
@@ -156,9 +156,9 @@ pub use async_trait::async_trait;
 // External users can write `epics_bridge_rs::BridgeProvider` directly.
 #[cfg(feature = "qsrv-core")]
 pub use qsrv::{
-    AccessContext, AccessControl, AllowAllAccess, AnyChannel, AnyMonitor, BridgeChannel,
-    BridgeMonitor, BridgeProvider, Channel, ChannelProvider, ClientCreds, FieldMapping,
-    GroupChannel, GroupMonitor, GroupPvDef, NtType, ProcessMode, PutOptions, PvaMonitor,
+    AccessContext, AccessControl, AllowAllAccess, AnyChannel, BridgeChannel, BridgeProvider,
+    Channel, ChannelProvider, ClientCreds, FieldMapping, GroupChannel, GroupMonitor, GroupPvDef,
+    NtType, ProcessMode, PutOptions, PvaMonitor,
 };
 
 /// The reactor a unit test spawns on.

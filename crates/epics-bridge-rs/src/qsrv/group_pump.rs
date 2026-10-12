@@ -1,5 +1,5 @@
 //! The server-wide QSRV group drain — the port of pvxs's single
-//! `"qsrvGroup"` event pump (`ioc/groupsource.cpp:96`).
+//! `"qsrvGroup"` event pump (`ioc/groupsource.cpp:72-96`).
 //!
 //! # Why one drain
 //!
@@ -12,107 +12,69 @@
 //! a 20-member group at a 10 Hz posting rate put ~400 task wakes/second on
 //! the band every other PV's monitor delivery uses, collapsing group
 //! delivery to ~0.35 Hz and stalling an unrelated scalar monitor for up to
-//! 16.9 s on the RTEMS target. This module is the structural fix: member
-//! events stay queued in their own
-//! [`EvQue`](epics_base_rs::server::event_queue::EvQue)s and ONE drain —
-//! shared by every group subscription on the server — consumes them,
-//! assembles the atomic snapshot and posts the group update. Tasks woken
-//! per member tick: O(members) → O(1).
+//! 16.9 s on the RTEMS target. Here every member subscription of every
+//! group attaches to the pump's one `event_user`
+//! ([`DbEventSource`]), whose one drain thread assembles the atomic
+//! snapshot and posts the group update into the subscription's update ring.
+//! A scan pass over many members wakes that thread once while it is busy.
 //!
 //! # Why the drain is a dedicated thread, not a pool task
 //!
 //! Upstream's pump IS a thread — `db_start_events` creates it — and the
-//! first landing of this module learned why the hard way. It spawned
-//! [`pump_main`] with `runtime::task::spawn`, which on the exec backend is
-//! a task on the Medium callback band: one cooperative worker, released
-//! only when a task's poll RETURNS, and `pump_main`'s poll returns only
-//! when the command channel and every member queue are simultaneously
-//! empty. On the target the `.1 second` scans (EPICS 66, above cbMedium's
-//! 64) refilled the member queues faster than the drain emptied them, so
-//! that poll never returned: the band's only worker never ran another
-//! Medium task (all per-PV monitor forwarding dead) and never slept
-//! (SCHED_FIFO 64 busy on a single core — every thread below it starved,
-//! protocol echo included). One group subscription wedged the whole server,
-//! permanently. A dedicated thread removes the failure class instead of
-//! relocating it: the drain parks on its own
-//! stack, occupies no shared worker, and runs BELOW the connection threads
-//! so even a saturated drain cannot preempt protocol traffic — see
-//! [`QSRV_GROUP_PUMP_PRIORITY`].
+//! first landing of this module learned why the hard way. It spawned the
+//! drain with `runtime::task::spawn`, which on the exec backend is a task
+//! on the Medium callback band: one cooperative worker, released only when
+//! a task's poll RETURNS, and the drain's poll returned only when every
+//! member queue was empty. On the target the `.1 second` scans (EPICS 66,
+//! above cbMedium's 64) refilled the member queues faster than the drain
+//! emptied them, so that poll never returned: the band's only worker never
+//! ran another Medium task (all per-PV monitor forwarding dead) and never
+//! slept (SCHED_FIFO 64 busy on a single core — every thread below it
+//! starved, protocol echo included). One group subscription wedged the
+//! whole server, permanently. A dedicated thread removes the failure class:
+//! the drain parks on its own stack, occupies no shared worker, and runs
+//! BELOW the connection threads so even a saturated drain cannot preempt
+//! protocol traffic — see [`QSRV_GROUP_PUMP_PRIORITY`].
 //!
 //! # Invariant
 //!
-//! * MUST: only the pump task ([`pump_main`]) consumes member subscription
-//!   events and posts group monitor updates; a member event MUST NOT spawn
-//!   or wake a per-member pool task.
-//! * MUST: a registration leaves the live set only through
-//!   [`pump_main`]'s single removal path — a [`PumpCmd::Deregister`] from
-//!   the [`RegistrationHandle`] finalizer, or the pump observing the
-//!   consumer side closed on push. Nothing else may drop a registration's
-//!   member subscriptions or its update queue producer.
-//! * MUST: the drain task exists exactly while `PumpShared::cmd_tx` is
-//!   `Some` — set only by [`GroupPump::register`] (spawning it), cleared
-//!   only by the pump's own exit finalizer, both under the `PumpShared`
-//!   lock, with the command queue drained under that same lock before the
-//!   clear. A `Register` can therefore never land in a channel no live
-//!   pump will read.
-//! * MUST NOT: the drain run while no group subscription exists — C parity
-//!   (forwarding work only under subscription); on last-deregistration the
-//!   thread terminates through the finalizer above.
-//! * MUST: the drain run on its own dedicated OS thread ([`pump_main`]
-//!   under `block_on_sync`), never on a shared callback-band worker — and
-//!   every one of its awaits stay runtime-agnostic (waker-based, no
-//!   reactor, no internal thread-blocking bridge), so the only thread its
-//!   park points ever park is its own.
+//! * MUST: only the drain consumes member subscription events and posts
+//!   group monitor updates; a member event MUST NOT spawn or wake a
+//!   per-member pool task.
+//! * MUST: the drain exists exactly while a member subscription does
+//!   (each [`DbAttachment`] holds it), so no group subscription means no
+//!   drain thread.
+//! * MUST: a group subscription's update ring stays open while its
+//!   [`GroupMonitor`] holds the [`GroupDelivery`], so a quiet group parks
+//!   instead of ending (pvxs keeps an all-const subscription open until
+//!   the client cancels, `groupsource.cpp:241-298`).
 //!
-//! # Drain liveness (who wakes the parked drain thread)
+//! # Update ring (per subscription, C monitor semantics)
 //!
-//! The drain thread parks between polls (`park_on`'s `ThreadWaker`);
-//! every park point of [`pump_main`] keeps its waker in a structure owned
-//! by the sender side, so the unpark cannot be lost:
-//!
-//! 1. the command channel — waker held by the `UnboundedReceiver`'s shared
-//!    channel state, whose `UnboundedSender` lives in `PumpShared` for the
-//!    pump's whole life (cleared only by the exit finalizer, after which
-//!    the thread returns without awaiting again);
-//! 2. member queues — waker held in each polled member's `event_user`
-//!    slot, inside the `Arc<EvQue>` the record's subscriber slot (the
-//!    `EventSink`) keeps alive; a record post flushes it via
-//!    `wake_readers` — the same contract the CA blocking driver's
-//!    per-connection drain loops already park on;
-//! 3. `read_group().await` — the same DB await surface the per-monitor
-//!    poll path already used, unchanged; its awaits are `tokio::sync` /
-//!    `poll_fn` futures (no reactor, no timers), which is what lets the
-//!    same body run under a hosted runtime and under `park_on`;
-//! 4. the update queue never parks the pump: [`UpdatePusher::push`] is
-//!    synchronous and coalesces instead of blocking (below).
-//!
-//! # Update queue (per subscription, C monitor semantics)
-//!
-//! The pump posts assembled updates into a bounded per-registration
-//! [`update_queue`] whose overflow rule is C `db_queue_event_log`'s: while
-//! room remains, distinct updates append; once full, the newest update
-//! REPLACES the queue's tail in place, value newest-wins and marked leaf
-//! sets unioned (pvxs's monitor FIFO squash). Push therefore never blocks,
-//! so one slow subscriber cannot stall the drain for other groups.
+//! The drain posts assembled updates into the subscription's
+//! [`MonitorRing`](epics_pva_rs::server_native::MonitorRing), bounded by
+//! the negotiated `queueSize`: while room remains distinct updates append;
+//! once full the newest REPLACES the tail in place, value newest-wins and
+//! marked leaf sets unioned (pvxs's monitor FIFO squash). A post never
+//! blocks, so one slow subscriber cannot stall the drain for other groups.
 
 // RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the exec-backend
 // suite.
 
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::task::{Poll, Waker};
 
-use epics_base_rs::runtime::task::{
-    StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread,
-};
-use epics_base_rs::server::database::db_access::DbSubscription;
-use epics_base_rs::server::pv::MonitorEvent;
+use epics_base_rs::runtime::task::{StackSizeClass, ThreadPriority};
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::char_view::DollarView;
+use epics_base_rs::server::database::db_access::{DbAttachment, DbEventSource, EventDelivery};
+use epics_base_rs::server::database::filters::FilterChain;
+use epics_base_rs::server::pv::{MonitorEvent, SubscribeRefused};
 use epics_base_rs::server::snapshot::PropertySupport;
+use epics_pva_rs::pvdata::PvField;
+use epics_pva_rs::server_native::{MonitorOutbox, MonitorUpdate};
 
 use super::group::{EventMark, GroupChannel, GroupMonitor, MemberEventKind};
 use super::group_config::GroupPvDef;
-use super::provider::MonitorPoll;
 
 /// The EPICS priority of the `qsrvGroup` drain thread — deliberately ONE
 /// BELOW the PVA connection threads, where pvxs puts its pump one ABOVE.
@@ -136,516 +98,131 @@ use super::provider::MonitorPoll;
 /// newest-wins) instead of protocol liveness.
 const QSRV_GROUP_PUMP_PRIORITY: ThreadPriority = ThreadPriority::Custom(17);
 
-// ---------------------------------------------------------------------------
-// Update queue — pump → monitor, bounded, replace-in-place on overflow
-// ---------------------------------------------------------------------------
-
-struct UpdateState {
-    queue: VecDeque<MonitorPoll>,
-    cap: usize,
-    /// Waker of the consumer parked in [`UpdatePoller::recv`]. Held here —
-    /// inside state the PRODUCER (the pump's registration) keeps alive — so
-    /// the monitor's forward task stays wake-able on the exec backend.
-    consumer_waker: Option<Waker>,
-    consumer_gone: bool,
-    producer_gone: bool,
+/// One group subscription's state on the drain: what every member event
+/// of that subscription needs to assemble and post the group.
+pub(crate) struct GroupDelivery {
+    def: GroupPvDef,
+    member_props: Vec<PropertySupport>,
+    group_channel: GroupChannel,
+    updates: MonitorOutbox<MonitorUpdate>,
 }
 
-/// Producer half, owned by the pump's registration. Dropping it (the
-/// registration leaving the live set) ends the consumer's stream.
-pub(crate) struct UpdatePusher {
-    state: Arc<parking_lot::Mutex<UpdateState>>,
-}
-
-/// Consumer half, owned by the `GroupMonitor`; `recv().await` is what
-/// `GroupMonitor::poll` parks on.
-pub(crate) struct UpdatePoller {
-    state: Arc<parking_lot::Mutex<UpdateState>>,
-}
-
-/// The consumer is gone — the monitor is tearing down. The pump treats this
-/// as the teardown observation and removes the registration through its
-/// single removal path.
-pub(crate) struct UpdateClosed;
-
-/// A bounded pump→monitor update queue with C monitor overflow semantics
-/// (append while room, replace the tail in place once full). `cap` is the
-/// operation's negotiated `queueSize`, clamped ≥ 1.
-pub(crate) fn update_queue(cap: usize) -> (UpdatePusher, UpdatePoller) {
-    let state = Arc::new(parking_lot::Mutex::new(UpdateState {
-        queue: VecDeque::new(),
-        cap: cap.max(1),
-        consumer_waker: None,
-        consumer_gone: false,
-        producer_gone: false,
-    }));
-    (
-        UpdatePusher {
-            state: state.clone(),
-        },
-        UpdatePoller { state },
-    )
-}
-
-/// Union of two marked-leaf sets. `None` means "derive / everything
-/// changed" and absorbs any explicit set.
-fn merge_marks(a: Option<Vec<String>>, b: Option<Vec<String>>) -> Option<Vec<String>> {
-    match (a, b) {
-        (Some(mut a), Some(b)) => {
-            for path in b {
-                if !a.contains(&path) {
-                    a.push(path);
-                }
-            }
-            Some(a)
-        }
-        _ => None,
-    }
-}
-
-impl UpdatePusher {
-    /// Post one assembled group update. Never blocks: while the queue has
-    /// room the update appends; once full it replaces the tail in place —
-    /// value newest-wins, marks unioned (C `db_queue_event_log`'s replace
-    /// branch, pvxs's monitor FIFO squash). `Err(UpdateClosed)` when the
-    /// consumer dropped — nothing is queued, and the caller must route the
-    /// registration through the pump's removal path.
-    fn push(&self, update: MonitorPoll) -> Result<(), UpdateClosed> {
-        let waker = {
-            let mut st = self.state.lock();
-            if st.consumer_gone {
-                return Err(UpdateClosed);
-            }
-            if st.queue.len() < st.cap {
-                st.queue.push_back(update);
-            } else {
-                let tail = st
-                    .queue
-                    .back_mut()
-                    .expect("cap >= 1 means a full queue has a tail");
-                tail.marked = merge_marks(tail.marked.take(), update.marked);
-                tail.value = update.value;
-            }
-            st.consumer_waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-        Ok(())
-    }
-}
-
-impl Drop for UpdatePusher {
-    fn drop(&mut self) {
-        let waker = {
-            let mut st = self.state.lock();
-            st.producer_gone = true;
-            st.consumer_waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
+impl GroupDelivery {
+    pub(crate) fn new(
+        def: GroupPvDef,
+        member_props: Vec<PropertySupport>,
+        group_channel: GroupChannel,
+        updates: MonitorOutbox<MonitorUpdate>,
+    ) -> Self {
+        Self {
+            def,
+            member_props,
+            group_channel,
+            updates,
         }
     }
 }
 
-impl UpdatePoller {
-    /// Await the next assembled group update. `None` ⟺ the producer is
-    /// gone AND the backlog is drained — i.e. this subscription left the
-    /// pump — which `GroupMonitor::poll` surfaces as teardown.
-    pub(crate) async fn recv(&mut self) -> Option<MonitorPoll> {
-        std::future::poll_fn(|cx| {
-            let mut st = self.state.lock();
-            if let Some(update) = st.queue.pop_front() {
-                return Poll::Ready(Some(update));
-            }
-            if st.producer_gone {
-                return Poll::Ready(None);
-            }
-            st.consumer_waker = Some(cx.waker().clone());
-            Poll::Pending
-        })
-        .await
-    }
-}
-
-impl Drop for UpdatePoller {
-    fn drop(&mut self) {
-        self.state.lock().consumer_gone = true;
-        // No producer waker to flush: the pump never parks on this queue
-        // (push is synchronous); it observes `consumer_gone` on its next
-        // push, and the RegistrationHandle finalizer covers the quiet case.
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GroupPump — registry + lifecycle arbiter
-// ---------------------------------------------------------------------------
-
-/// One member subscription inside a registration: which group member index
-/// it belongs to and whether it is the value or the property channel.
-pub(crate) struct MemberSub {
+/// One member subscription's delivery: its group subscription, which
+/// member it belongs to and whether it is the value or property channel.
+pub(crate) struct MemberDelivery {
+    pub(crate) group: Arc<GroupDelivery>,
     pub(crate) member_index: usize,
     pub(crate) kind: MemberEventKind,
-    pub(crate) sub: DbSubscription,
 }
 
-/// Everything the pump needs to drain one group subscription.
-pub(crate) struct RegistrationSpec {
-    pub(crate) def: GroupPvDef,
-    pub(crate) member_props: Vec<PropertySupport>,
-    pub(crate) group_channel: GroupChannel,
-    pub(crate) subs: Vec<MemberSub>,
-    pub(crate) update_tx: UpdatePusher,
-}
-
-struct LiveReg {
-    spec: RegistrationSpec,
-}
-
-enum PumpCmd {
-    Register(u64, Box<RegistrationSpec>),
-    Deregister(u64),
-}
-
-struct PumpShared {
-    /// `Some` ⟺ a pump task is alive and will process every command
-    /// already sent (the lifecycle invariant — see the module docs). Set
-    /// only by [`GroupPump::register`], cleared only by the pump task's
-    /// exit finalizer, both under this lock.
-    cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<PumpCmd>>,
-    next_id: u64,
-}
-
-/// The server-wide group drain registry. One per `BridgeProvider` (== one
-/// per served IOC database — C's one `GroupSource` per server); every group
-/// subscription registers here and the single drain task serves them all.
-pub(crate) struct GroupPump {
-    shared: parking_lot::Mutex<PumpShared>,
-}
-
-/// Detached finalizer for one registration. Dropping it is THE teardown
-/// path: it queues [`PumpCmd::Deregister`] to the live pump (a no-op id if
-/// the pump already removed the registration on consumer-close).
-pub(crate) struct RegistrationHandle {
-    pump: Arc<GroupPump>,
-    id: u64,
-}
-
-impl Drop for RegistrationHandle {
-    fn drop(&mut self) {
-        let shared = self.pump.shared.lock();
-        if let Some(tx) = &shared.cmd_tx {
-            // Send failure means the pump task died abnormally; the
-            // registration's resources died with it, so there is nothing
-            // left to finalize.
-            let _ = tx.send(PumpCmd::Deregister(self.id));
-        }
-        // cmd_tx == None ⟹ no live pump ⟹ the live set is empty ⟹ this
-        // registration was already removed (consumer-close observation).
+impl EventDelivery for MemberDelivery {
+    /// One member event, end to end: resolve the marked leaves, assemble
+    /// the atomic group snapshot, post the update. The body pvxs runs on
+    /// its `qsrvGroup` thread per callback (`groupsource.cpp:307-353`).
+    async fn deliver(&self, event: MonitorEvent) {
+        let group = &*self.group;
+        let mark = match self.kind {
+            MemberEventKind::Value => GroupMonitor::value_event_mark(
+                &group.def,
+                &group.member_props,
+                self.member_index,
+                event.mask(),
+            ),
+            MemberEventKind::Property => GroupMonitor::property_event_mark(
+                &group.def,
+                &group.member_props,
+                self.member_index,
+            ),
+        };
+        let EventMark::Marked(marked) = mark else {
+            return;
+        };
+        // A value event serves its own member from the log; a property
+        // event reads only metadata (`groupsource.cpp:338-340`, `:375-377`).
+        let log =
+            matches!(self.kind, MemberEventKind::Value).then_some((self.member_index, &event));
+        let value = match group.group_channel.read_group_logged(log).await {
+            Ok(v) => v,
+            Err(e) => {
+                // pvxs wraps each group refresh in a try/catch that logs and
+                // returns from the callback WITHOUT posting, leaving the
+                // subscription alive (`groupsource.cpp:350-352`).
+                tracing::warn!(
+                    group = %group.def.name,
+                    error = %e,
+                    "qsrv group drain: member read failed; skipping event, subscription kept open"
+                );
+                return;
+            }
+        };
+        let marked = super::pvif::narrow_enum_value_leaves(marked, &value);
+        // A consumer gone mid-teardown refuses the post; its monitor's drop
+        // detaches the members.
+        group.updates.post(
+            MonitorUpdate {
+                value: epics_pva_rs::server_native::PostValue::Owned(PvField::Structure(value)),
+                marked: Some(marked.into()),
+                type_changed: false,
+                overrun: Vec::new(),
+            },
+            false,
+        );
     }
+}
+
+/// The server-wide group drain. One per `BridgeProvider` (== one per
+/// served IOC database — C's one `GroupSource` per server); every member
+/// subscription of every group attaches here.
+pub(crate) struct GroupPump {
+    source: DbEventSource<MemberDelivery>,
 }
 
 impl GroupPump {
     pub(crate) fn new() -> Arc<Self> {
+        // `Big` stack, not upstream's event-task `Medium` (`dbEvent.c:1117`):
+        // the drain runs each `read_group` + NT-assembly state machine on
+        // this stack, the same audited future the `Big`-stacked connection
+        // threads run for a group GET.
         Arc::new(Self {
-            shared: parking_lot::Mutex::new(PumpShared {
-                cmd_tx: None,
-                next_id: 0,
-            }),
+            source: DbEventSource::new("qsrvGroup", QSRV_GROUP_PUMP_PRIORITY, StackSizeClass::Big),
         })
     }
 
-    /// True while the drain task is alive. Test probe for the lifecycle
-    /// invariant (drain ⟺ ≥ 1 registration, modulo the window in which the
-    /// pump is processing its final deregistration).
+    /// Attach one member subscription to the drain.
+    pub(crate) fn attach(
+        &self,
+        db: &PvDatabase,
+        pv_name: &str,
+        mask: u16,
+        filters: &FilterChain,
+        dollar: Option<DollarView>,
+        delivery: MemberDelivery,
+    ) -> Result<DbAttachment, SubscribeRefused> {
+        self.source
+            .attach(db, pv_name, mask, Some(filters), dollar, delivery)
+    }
+
+    /// True while the drain thread is alive.
     #[cfg(test)]
     pub(crate) fn has_live_drain(&self) -> bool {
-        self.shared.lock().cmd_tx.is_some()
+        self.source.live_drains() > 0
     }
-
-    /// Register one group subscription with the drain, spawning the drain
-    /// task if none is alive. Returns the registration's finalizer handle.
-    pub(crate) fn register(self: &Arc<Self>, spec: RegistrationSpec) -> RegistrationHandle {
-        let mut shared = self.shared.lock();
-        let id = shared.next_id;
-        shared.next_id += 1;
-        let mut cmd = PumpCmd::Register(id, Box::new(spec));
-        if let Some(tx) = &shared.cmd_tx {
-            match tx.send(cmd) {
-                Ok(()) => {
-                    return RegistrationHandle {
-                        pump: self.clone(),
-                        id,
-                    };
-                }
-                // The pump task died abnormally (its receiver is gone
-                // without the finalizer having cleared cmd_tx). Fall
-                // through and spawn a fresh drain.
-                Err(tokio::sync::mpsc::error::SendError(c)) => cmd = c,
-            }
-        }
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(cmd).expect("fresh channel with a live receiver");
-        shared.cmd_tx = Some(tx);
-        let pump = self.clone();
-        // A dedicated thread, NEVER `runtime::task::spawn`: on the exec
-        // backend that is a Medium-band pool task, and a drain whose poll
-        // returns only when every member queue is dry held the band's one
-        // worker forever on the target — the §9.15 server-wide wedge (see
-        // the module docs). Upstream's pump is a thread for the same
-        // reason (`db_start_events`, `groupsource.cpp:96`); its name is
-        // upstream's, and fits RTEMS's 16-byte thread-name cap.
-        //
-        // `Big` stack, not upstream's event-task `Medium` (`dbEvent.c:1117`):
-        // `block_on_sync` pins `pump_main` — including each `read_group` +
-        // NT-assembly state machine — on this stack, the same audited
-        // future the `Big`-stacked connection threads run for a group GET;
-        // C's `Medium` sizes a shallower C callback frame.
-        let spawned = spawn_dedicated_thread(
-            "qsrvGroup".into(),
-            QSRV_GROUP_PUMP_PRIORITY,
-            StackSizeClass::Big,
-            move || {
-                if let Err(e) = block_on_sync(pump_main(pump, rx)) {
-                    // Unreachable by construction: a fresh dedicated thread
-                    // is neither a facility worker nor a current-thread
-                    // runtime. If it ever fires, the exit finalizer never
-                    // ran — the next `register` recovers through its
-                    // send-failure arm.
-                    tracing::error!(error = ?e, "qsrv group drain thread could not block on its pump");
-                }
-            },
-        );
-        if let Err(e) = spawned {
-            // pvxs treats a pump that cannot start as fatal to source setup
-            // (`groupsource.cpp:97` throws). Restore the invariant
-            // (`cmd_tx` `Some` ⟺ live pump) before propagating, so the
-            // failed spawn cannot masquerade as a live drain.
-            shared.cmd_tx = None;
-            panic!("qsrv group drain thread could not be created: {e}");
-        }
-        RegistrationHandle {
-            pump: self.clone(),
-            id,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The drain task
-// ---------------------------------------------------------------------------
-
-enum Wake {
-    Cmd(PumpCmd),
-    /// The command channel returned `None`. Unreachable while this task is
-    /// alive (the `PumpShared` sender lives until this task's own
-    /// finalizer), kept as a defensive exit so a bug cannot busy-spin.
-    CmdClosed,
-    Event {
-        reg_id: u64,
-        sub_pos: usize,
-        /// Boxed so the `Wake` enum stays small (a `MonitorEvent` carries a
-        /// full field snapshot); one box per drained event is noise next to
-        /// the group read it triggers.
-        event: Box<MonitorEvent>,
-    },
-    /// A member subscription's stream ended (its record went away). The
-    /// registration stays — the group keeps serving its other members,
-    /// like the old per-member forwarder simply exiting.
-    SubGone {
-        reg_id: u64,
-        sub_pos: usize,
-    },
-}
-
-/// The single drain. Owns every live registration; the ONLY consumer of
-/// member subscription events and the ONLY poster of group monitor updates.
-async fn pump_main(
-    pump: Arc<GroupPump>,
-    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PumpCmd>,
-) {
-    let mut regs: BTreeMap<u64, LiveReg> = BTreeMap::new();
-    // Round-robin cursor over the flattened (registration, member-sub) scan
-    // order so a hot member cannot starve other members or other groups: the
-    // scan after serving position k starts at k+1. C's pump reads its ring
-    // in strict arrival order; per-subscription FIFOs plus rotation give the
-    // same no-starvation property.
-    let mut cursor: usize = 0;
-    loop {
-        let wake = next_wake(&mut cmd_rx, &mut regs, &mut cursor).await;
-        match wake {
-            Wake::Cmd(PumpCmd::Register(id, spec)) => {
-                regs.insert(id, LiveReg { spec: *spec });
-            }
-            Wake::Cmd(PumpCmd::Deregister(id)) => {
-                // Removing the registration drops its DbSubscriptions
-                // (detaching the member queues — any event still queued
-                // there vanishes with them) and its UpdatePusher (ending
-                // the monitor's update stream).
-                regs.remove(&id);
-                if regs.is_empty() && finalize_if_idle(&pump, &mut cmd_rx, &mut regs) {
-                    return;
-                }
-            }
-            Wake::CmdClosed => {
-                debug_assert!(false, "cmd sender outlives the pump by invariant");
-                return;
-            }
-            Wake::SubGone { reg_id, sub_pos } => {
-                if let Some(reg) = regs.get_mut(&reg_id) {
-                    reg.spec.subs.remove(sub_pos);
-                }
-            }
-            Wake::Event {
-                reg_id,
-                sub_pos,
-                event,
-            } => {
-                process_event(&mut regs, reg_id, sub_pos, *event).await;
-                if regs.is_empty() && finalize_if_idle(&pump, &mut cmd_rx, &mut regs) {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Await the next command or member event. Commands are polled FIRST so a
-/// queued `Deregister` wins over further member events of the same wake —
-/// the event-arriving-during-teardown boundary resolves to teardown.
-///
-/// When this returns `Pending` it has polled EVERY member reader, so the
-/// drain's waker is registered with the command channel and with every
-/// member queue — any of them becoming ready re-wakes (unparks) the drain
-/// thread.
-fn next_wake<'a>(
-    cmd_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<PumpCmd>,
-    regs: &'a mut BTreeMap<u64, LiveReg>,
-    cursor: &'a mut usize,
-) -> impl std::future::Future<Output = Wake> + 'a {
-    std::future::poll_fn(move |cx| {
-        if let Poll::Ready(cmd) = cmd_rx.poll_recv(cx) {
-            return match cmd {
-                Some(cmd) => Poll::Ready(Wake::Cmd(cmd)),
-                None => Poll::Ready(Wake::CmdClosed),
-            };
-        }
-        let order: Vec<(u64, usize)> = regs
-            .iter()
-            .flat_map(|(id, reg)| (0..reg.spec.subs.len()).map(move |pos| (*id, pos)))
-            .collect();
-        let n = order.len();
-        for k in 0..n {
-            let (reg_id, sub_pos) = order[(*cursor + k) % n];
-            let reg = regs.get_mut(&reg_id).expect("id taken from live map");
-            match reg.spec.subs[sub_pos].sub.poll_recv_event(cx) {
-                Poll::Ready(Some(event)) => {
-                    *cursor = (*cursor + k + 1) % n;
-                    return Poll::Ready(Wake::Event {
-                        reg_id,
-                        sub_pos,
-                        event: Box::new(event),
-                    });
-                }
-                Poll::Ready(None) => {
-                    *cursor = (*cursor + k + 1) % n;
-                    return Poll::Ready(Wake::SubGone { reg_id, sub_pos });
-                }
-                Poll::Pending => {}
-            }
-        }
-        Poll::Pending
-    })
-}
-
-/// One member event, end to end: resolve the marked leaves, assemble the
-/// atomic group snapshot, post the update. The body pvxs runs on its
-/// `qsrvGroup` thread per callback (`groupsource.cpp:307-353`).
-async fn process_event(
-    regs: &mut BTreeMap<u64, LiveReg>,
-    reg_id: u64,
-    sub_pos: usize,
-    event: MonitorEvent,
-) {
-    let Some(reg) = regs.get(&reg_id) else {
-        return;
-    };
-    let spec = &reg.spec;
-    let (member_index, kind) = {
-        let ms = &spec.subs[sub_pos];
-        (ms.member_index, ms.kind)
-    };
-    let mark = match kind {
-        MemberEventKind::Value => GroupMonitor::value_event_mark(
-            &spec.def,
-            &spec.member_props,
-            member_index,
-            event.mask(),
-        ),
-        MemberEventKind::Property => {
-            GroupMonitor::property_event_mark(&spec.def, &spec.member_props, member_index)
-        }
-    };
-    let marked = match mark {
-        EventMark::Skip => return,
-        EventMark::Marked(paths) => paths,
-    };
-    let value = match spec.group_channel.read_group().await {
-        Ok(v) => v,
-        Err(e) => {
-            // pvxs wraps each group refresh in a try/catch that logs and
-            // returns from the callback WITHOUT posting, leaving the
-            // subscription alive (`groupsource.cpp:350-352`): a per-event
-            // read failure drops a single update, never the subscription.
-            tracing::warn!(
-                group = %spec.def.name,
-                error = %e,
-                "qsrv group drain: member read failed; skipping event, subscription kept open"
-            );
-            return;
-        }
-    };
-    let marked = super::pvif::narrow_enum_value_leaves(marked, &value);
-    if spec
-        .update_tx
-        .push(MonitorPoll {
-            value,
-            marked: Some(marked),
-        })
-        .is_err()
-    {
-        // Consumer gone — the monitor is tearing down. Remove through the
-        // same path a Deregister takes; the handle's later Deregister for
-        // this id is a no-op.
-        regs.remove(&reg_id);
-    }
-}
-
-/// The exit finalizer — the ONLY place `cmd_tx` is cleared. Runs when the
-/// live set just became empty: under the `PumpShared` lock it drains any
-/// raced command; a raced `Register` keeps the pump alive (returns
-/// `false`), otherwise the pump is marked dead and the task must return.
-/// Because `register` sends under the same lock, no `Register` can land
-/// between this drain and the clear.
-fn finalize_if_idle(
-    pump: &GroupPump,
-    cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PumpCmd>,
-    regs: &mut BTreeMap<u64, LiveReg>,
-) -> bool {
-    debug_assert!(regs.is_empty());
-    let mut shared = pump.shared.lock();
-    loop {
-        match cmd_rx.try_recv() {
-            Ok(PumpCmd::Register(id, spec)) => {
-                regs.insert(id, LiveReg { spec: *spec });
-                return false;
-            }
-            Ok(PumpCmd::Deregister(_)) => continue,
-            Err(_) => break,
-        }
-    }
-    shared.cmd_tx = None;
-    true
 }
 
 #[cfg(test)]
@@ -654,31 +231,11 @@ mod tests {
 
     use std::time::Duration;
 
-    use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::ai::AiRecord;
-    use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
     use crate::qsrv::group_config::parse_group_config;
     use crate::qsrv::provider::PvaMonitor;
-
-    fn upd(tag: i32, mark: &str) -> MonitorPoll {
-        let mut value = PvStructure::new("");
-        value
-            .fields
-            .push(("tag".into(), PvField::Scalar(ScalarValue::Int(tag))));
-        MonitorPoll {
-            value,
-            marked: Some(vec![mark.to_string()]),
-        }
-    }
-
-    fn tag_of(update: &MonitorPoll) -> i32 {
-        match update.value.fields.first() {
-            Some((_, PvField::Scalar(ScalarValue::Int(tag)))) => *tag,
-            other => panic!("expected the tag field, got {other:?}"),
-        }
-    }
 
     async fn wait_drain_stopped(pump: &Arc<GroupPump>) {
         for _ in 0..500 {
@@ -687,7 +244,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("the drain did not terminate after the last deregistration");
+        panic!("the drain did not terminate after the last member detached");
     }
 
     async fn one_member_group(name: &str, rec: &str) -> (Arc<PvDatabase>, GroupPvDef) {
@@ -707,42 +264,46 @@ mod tests {
             .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
     }
 
-    /// Boundary queueSize overflow: distinct updates append up to `cap`;
-    /// past it the newest REPLACES the tail in place — value newest-wins,
-    /// marked sets unioned (C `db_queue_event_log`'s replace branch). Then
-    /// producer-drop ends the stream only AFTER the backlog drains.
+    /// A value event serves its own member from its log, as pvxs reads the
+    /// triggering member through `pDbFieldLog` (`groupsource.cpp:338-340`):
+    /// a write made after the post and before the drain reads stays out of it.
     #[tokio::test]
-    async fn update_queue_overflow_replaces_tail_and_merges_marks() {
-        let (tx, mut rx) = update_queue(2);
-        assert!(tx.push(upd(1, "a")).is_ok());
-        assert!(tx.push(upd(2, "b")).is_ok());
-        // Full: 3 and 4 coalesce into the tail.
-        assert!(tx.push(upd(3, "c")).is_ok());
-        assert!(tx.push(upd(4, "d")).is_ok());
+    async fn a_value_event_serves_its_member_from_its_log() {
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::ScalarValue;
 
-        let first = rx.recv().await.expect("first distinct update");
-        assert_eq!(tag_of(&first), 1);
-        assert_eq!(first.marked, Some(vec!["a".to_string()]));
-
-        let coalesced = rx.recv().await.expect("coalesced tail");
-        assert_eq!(tag_of(&coalesced), 4, "latest value wins");
+        let (db, def) = one_member_group("TL:GRP", "TL:a").await;
+        let pump = GroupPump::new();
+        let mut mon = GroupMonitor::new(db.clone(), def).with_pump(pump.clone());
+        mon.start().await.expect("start");
+        {
+            let rec = db.get_record("TL:a").unwrap();
+            let mut held = rec.write();
+            held.record
+                .put_field("VAL", EpicsValue::Double(5.0))
+                .unwrap();
+            held.notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
+            held.record
+                .put_field("VAL", EpicsValue::Double(6.0))
+                .unwrap();
+        }
+        let polled = tokio::time::timeout(Duration::from_secs(2), mon.poll())
+            .await
+            .expect("the post is delivered")
+            .expect("update");
+        let v = polled.value.fields.iter().find(|(name, _)| name == "v");
         assert_eq!(
-            coalesced.marked,
-            Some(vec!["b".to_string(), "c".to_string(), "d".to_string()]),
-            "marks union across every squashed update"
+            v.map(|(_, f)| f),
+            Some(&PvField::Scalar(ScalarValue::Double(5.0)))
         );
-
-        drop(tx);
-        assert!(
-            rx.recv().await.is_none(),
-            "producer gone + backlog drained = end of stream"
-        );
+        mon.stop().await;
+        wait_drain_stopped(&pump).await;
     }
 
-    /// Boundary zero subscribers: no registration ever happens, so no drain
-    /// task exists — before, during and after member records post. Starting
-    /// one subscription spawns the drain; stopping it terminates the drain
-    /// through the single finalizer.
+    /// Boundary zero subscribers: nothing attaches, so no drain thread
+    /// exists — before, during and after member records post. Starting one
+    /// subscription spawns the drain; stopping it detaches the last member
+    /// and ends the drain.
     #[tokio::test]
     async fn zero_group_subscriptions_run_no_drain() {
         let (db, def) = one_member_group("T0:GRP", "T0:a").await;
@@ -758,7 +319,10 @@ mod tests {
 
         let mut mon = GroupMonitor::new(db.clone(), def).with_pump(pump.clone());
         mon.start().await.expect("start");
-        assert!(pump.has_live_drain(), "first registration spawns the drain");
+        assert!(
+            pump.has_live_drain(),
+            "the first attachment spawns the drain"
+        );
 
         mon.stop().await;
         wait_drain_stopped(&pump).await;
@@ -766,7 +330,7 @@ mod tests {
 
     /// Boundary cross-group fairness: two groups share the one drain; group
     /// A's subscriber never polls while A floods, and group B's delivery
-    /// must still proceed — the update queue coalesces instead of blocking,
+    /// must still proceed — the update ring coalesces instead of blocking,
     /// so a slow subscriber cannot stall the drain for a sibling group.
     #[tokio::test]
     async fn two_groups_share_one_drain_slow_consumer_does_not_block_the_other() {
@@ -793,7 +357,7 @@ mod tests {
 
         // Flood A without ever polling its monitor. The short sleeps let
         // the drain assemble per event rather than EvQue-coalescing the
-        // whole burst, so A's update queue genuinely overflows into
+        // whole burst, so A's update ring genuinely overflows into
         // replace-in-place while its consumer stays stalled.
         for _ in 0..12 {
             post_value(&db, "TF:a");
@@ -825,19 +389,19 @@ mod tests {
     }
 
     /// Boundary last-unsubscribe-while-drain-mid-cycle: tear the only
-    /// subscription down while a posted burst is still draining. The exit
-    /// routes through the pump's single finalizer — the drain terminates —
-    /// and a fresh subscription afterwards restarts it cleanly
+    /// subscription down while a posted burst is still draining. The last
+    /// member's detach ends the drain, and a fresh subscription afterwards
+    /// restarts it cleanly
     /// (resubscribe-after-teardown boundary).
     #[tokio::test]
-    async fn last_unsubscribe_mid_burst_terminates_drain_through_finalizer() {
+    async fn last_unsubscribe_mid_burst_terminates_the_drain() {
         let (db, def) = one_member_group("TM:GRP", "TM:a").await;
         let pump = GroupPump::new();
         let mut mon = GroupMonitor::new(db.clone(), def.clone()).with_pump(pump.clone());
         mon.start().await.expect("start");
 
         // Burst, then stop immediately — the drain is mid-cycle on the
-        // backlog (or about to be) when the Deregister lands.
+        // backlog (or about to be) when the members detach.
         for _ in 0..8 {
             post_value(&db, "TM:a");
         }
@@ -847,7 +411,7 @@ mod tests {
         // Resubscribe-after-teardown restarts cleanly on the same pump.
         let mut mon2 = GroupMonitor::new(db.clone(), def).with_pump(pump.clone());
         mon2.start().await.expect("restart");
-        assert!(pump.has_live_drain(), "re-registration spawns a new drain");
+        assert!(pump.has_live_drain(), "re-attaching spawns a new drain");
         post_value(&db, "TM:a");
         let polled = tokio::time::timeout(Duration::from_secs(2), mon2.poll())
             .await
@@ -859,60 +423,35 @@ mod tests {
     }
 
     /// Boundary event-arriving-during-teardown, consumer side first: the
-    /// monitor's update-queue consumer drops BEFORE any deregistration
-    /// command, and a member event lands in that window. The pump's push
-    /// fails visibly (`UpdateClosed`), routes the registration out through
-    /// the same removal path a Deregister takes, and — as the last one out
-    /// — the drain terminates; the handle's late Deregister is a no-op.
+    /// update ring's reader drops BEFORE the monitor, and a member event
+    /// lands in that window. The drain's post is refused and nothing else
+    /// happens; the monitor's teardown then detaches the member and ends
+    /// the drain.
     #[tokio::test]
-    async fn event_during_teardown_routes_through_the_finalizer() {
+    async fn event_after_the_reader_drops_is_refused_and_teardown_ends_the_drain() {
         let (db, def) = one_member_group("TT:GRP", "TT:a").await;
         let pump = GroupPump::new();
-
-        let sub = DbSubscription::subscribe_with_mask(
-            &db,
-            "TT:a.VAL",
-            0,
-            (EventMask::VALUE | EventMask::ALARM).bits(),
-        )
-        .await
-        .expect("member subscription");
-        let (update_tx, update_rx) = update_queue(4);
-        let handle = pump.register(RegistrationSpec {
-            def: def.clone(),
-            member_props: vec![PropertySupport::NONE],
-            group_channel: GroupChannel::new(db.clone(), def),
-            subs: vec![MemberSub {
-                member_index: 0,
-                kind: MemberEventKind::Value,
-                sub,
-            }],
-            update_tx,
-        });
+        let mut mon = GroupMonitor::new(db.clone(), def).with_pump(pump.clone());
+        mon.start().await.expect("start");
         assert!(pump.has_live_drain());
 
-        // Consumer gone first, then an event arrives while the
-        // registration is still live in the pump.
-        drop(update_rx);
+        drop(mon.take_updates().expect("the ring before it is taken"));
         post_value(&db, "TT:a");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(pump.has_live_drain(), "the member keeps the drain");
 
-        // The pump observes Closed on push and removes the registration —
-        // last one out, so the drain terminates without any Deregister.
+        mon.stop().await;
         wait_drain_stopped(&pump).await;
-
-        // The handle's late Deregister must be a harmless no-op.
-        drop(handle);
-        assert!(!pump.has_live_drain());
     }
 
     /// The §9.15 fatal-regression test — group delivery MUST NOT depend on
     /// the shared callback pool's Medium band.
     ///
-    /// The first pump landing spawned [`pump_main`] with
+    /// The first pump landing spawned its drain with
     /// `runtime::task::spawn`, which on the exec backend is a task on the
     /// Medium callback band: ONE cooperative worker, released only when a
-    /// task's poll RETURNS — and `pump_main`'s poll returns only when the
-    /// command channel and every member queue are simultaneously empty. On
+    /// task's poll RETURNS — and the drain's poll returned only when every
+    /// member queue was empty. On
     /// the target the `.1 second` scans (EPICS 66, above cbMedium's 64)
     /// refilled the member queues faster than the drain emptied them, so the
     /// poll never returned, the band's only worker never ran another Medium

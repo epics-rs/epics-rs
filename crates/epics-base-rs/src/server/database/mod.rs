@@ -3866,6 +3866,17 @@ impl PvDatabase {
 
     /// Internal: synchronous existence check without resolver.
     fn has_name_no_resolve(&self, name: &str) -> bool {
+        self.channel_name_found(name, false)
+    }
+
+    /// `dbChannelCreate`'s existence half, which also judges the `$`
+    /// modifier against the field (`dbChannel.c:486-503`); the search side,
+    /// `dbChannelTest`, does not.
+    pub(crate) fn channel_create_found(&self, name: &str) -> bool {
+        self.channel_name_found(name, true)
+    }
+
+    fn channel_name_found(&self, name: &str, create: bool) -> bool {
         // strip the channel-filter suffix before lookup so a
         // filtered channel (`SP.{"arr":...}` / `REC.{"dbnd":{"d":0.5}}`)
         // resolves to its underlying PV at UDP-search time. This is the
@@ -3906,8 +3917,8 @@ impl PvDatabase {
             return true;
         };
         match field.strip_suffix('$') {
-            Some(core) => self.channel_field_found(&rec, core, true),
-            None => self.channel_field_found(&rec, field, false),
+            Some(core) => self.channel_field_found(&rec, core, create),
+            None => self.names_field(&rec, field),
         }
     }
 
@@ -4683,12 +4694,13 @@ mod tests {
         assert!(!db.has_name("WF.NOSUCH").await);
         assert!(db.has_name("ALIAS_NAME.EGU").await);
         assert!(!db.has_name("ALIAS_NAME.NOSUCH").await);
-        // `$` re-views a DBF_STRING/link field as a char array; anything
-        // else is `S_dbLib_fieldNotFound` (`dbChannel.c:486-505`).
+        // `dbChannelTest` stops at the `$` modifier: whether the field takes
+        // it is `dbChannelCreate`'s question (`dbChannel.c:486-505`), so the
+        // search answers for VAL$ on a DOUBLE as softIocPVX does.
         assert!(db.has_name("TARGET.EGU$").await);
-        assert!(!db.has_name("TARGET.VAL$").await);
-        // ... judged on the type `cvt_dbaddr` leaves: VAL by FTVL.
-        assert!(!db.has_name("WF.VAL$").await);
+        assert!(db.has_name("TARGET.VAL$").await);
+        assert!(db.has_name("WF.VAL$").await);
+        assert!(!db.has_name("TARGET.NOSUCH$").await);
         db.add_record(
             "WS",
             Box::new(crate::server::records::waveform::WaveformRecord::new(

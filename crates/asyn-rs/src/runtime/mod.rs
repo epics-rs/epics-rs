@@ -45,7 +45,8 @@ pub mod task {
     use std::future::Future;
 
     pub use epics_libcom_rs::runtime::task::{
-        Interval, Reactor, TaskHandle, interval, sleep, sleep_until, spawn_blocking, yield_now,
+        Interval, Reactor, TaskHandle, current_thread_waker, interval, sleep, sleep_until,
+        spawn_blocking, yield_now,
     };
 
     /// Start a task on the executor this thread is running under.

@@ -5,7 +5,7 @@
 //! The trait definitions here are temporary — they will move to `epics-pva-rs`
 //! once that crate's native PVA server exposes them directly.
 
-// RTEMS-EXEC-MODEL-ALLOW(21): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(19): checked - these run and pass in the exec-backend
 // suite.
 
 use std::collections::HashMap;
@@ -575,11 +575,6 @@ pub trait Channel: Send + Sync {
 
     /// GetField: return the type description (FieldDesc) for introspection.
     fn get_field(&self) -> impl std::future::Future<Output = BridgeResult<FieldDesc>> + Send;
-
-    /// Create a monitor for this channel.
-    fn create_monitor(
-        &self,
-    ) -> impl std::future::Future<Output = BridgeResult<super::group::AnyMonitor>> + Send;
 }
 
 /// the result of a [`PvaMonitor::poll`] — the snapshot
@@ -671,13 +666,6 @@ impl Channel for AnyChannel {
         match self {
             Self::Single(ch) => ch.get_field().await,
             Self::Group(ch) => ch.get_field().await,
-        }
-    }
-
-    async fn create_monitor(&self) -> BridgeResult<super::group::AnyMonitor> {
-        match self {
-            Self::Single(ch) => ch.create_monitor().await,
-            Self::Group(ch) => ch.create_monitor().await,
         }
     }
 }
@@ -1486,16 +1474,7 @@ impl ChannelProvider for BridgeProvider {
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
         names.extend(self.db.all_alias_names());
-        // A name shadowed by a record is listed once, as the record (pvxs
-        // `defineGroups` ioc/groupconfigprocessor.cpp:177); a group
-        // `createGroups` refused is still listed (see `group_serve`).
-        let existing: std::collections::HashSet<String> = names.iter().cloned().collect();
-        let group_keys: Vec<String> = self.groups.read().keys().cloned().collect();
-        for k in group_keys {
-            if !existing.contains(&k) && self.claims_group(&k).await {
-                names.push(k);
-            }
-        }
+        names.extend(self.group_list().await);
         names.sort();
         names
     }
@@ -1509,6 +1488,54 @@ impl ChannelProvider for BridgeProvider {
 }
 
 impl BridgeProvider {
+    /// pvxs `GroupSource::onSearch`: `name` is a group this provider claims,
+    /// built or not. A record of the same name shadows it.
+    pub async fn group_claimed(&self, name: &str) -> bool {
+        self.enabled && self.claims_group(name).await
+    }
+
+    /// pvxs `GroupSource::onList`: the claimed group names, sorted. A name
+    /// shadowed by a record is the record's (pvxs `defineGroups`
+    /// ioc/groupconfigprocessor.cpp:177); a group `createGroups` refused is
+    /// still listed (see `group_serve`).
+    pub async fn group_list(&self) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let keys: Vec<String> = self.groups.read().keys().cloned().collect();
+        let mut names = Vec::new();
+        for k in keys {
+            if self.claims_group(&k).await {
+                names.push(k);
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// pvxs `GroupSource::onCreate`: the built group `name` for `creds`.
+    pub async fn create_group_channel_with_creds(
+        &self,
+        name: &str,
+        creds: ClientCreds,
+    ) -> BridgeResult<GroupChannel> {
+        if !self.enabled {
+            return Err(BridgeError::ChannelNotFound(name.to_string()));
+        }
+        self.note_channel_created();
+        let def = self
+            .servable_group(name)
+            .await
+            .ok_or_else(|| BridgeError::ChannelNotFound(name.to_string()))?;
+        Ok(self.group_channel(def, creds))
+    }
+
+    fn group_channel(&self, def: GroupPvDef, creds: ClientCreds) -> GroupChannel {
+        GroupChannel::new(self.db.clone(), def)
+            .with_access(AccessContext::with_creds(self.live_access(), creds))
+            .with_pump(self.group_pump.clone())
+    }
+
     /// Whether [`Self::create_channel_with_creds`] would build `name`, asked
     /// of the same constructor without serving a client.
     pub async fn channel_creatable(&self, name: &str) -> bool {
@@ -1565,18 +1592,13 @@ impl BridgeProvider {
             return Err(BridgeError::ChannelNotFound(name.to_string()));
         }
         self.note_channel_created();
-        let access_ctx = AccessContext::with_creds(self.live_access(), creds);
 
         // Check group PVs first — but a group name that collides with
         // a real record is ignored (the record wins), matching pvxs
         // `defineGroups` dbChannelTest (ioc/groupconfigprocessor.cpp:177).
         match self.group_serve(name).await {
             GroupServe::Created(def) => {
-                return Ok(AnyChannel::Group(
-                    GroupChannel::new(self.db.clone(), def)
-                        .with_access(access_ctx)
-                        .with_pump(self.group_pump.clone()),
-                ));
+                return Ok(AnyChannel::Group(self.group_channel(def, creds)));
             }
             // Claimed but never built: no prototype, so the store's
             // descriptor is `None` and the server refuses each op.
@@ -1589,6 +1611,7 @@ impl BridgeProvider {
             ),
             GroupServe::Absent => {}
         }
+        let access_ctx = AccessContext::with_creds(self.live_access(), creds);
 
         // Single record (or `record.FIELD`) channel.
         // Cache by the full requested name so field PVs do not
@@ -2516,45 +2539,6 @@ ASG(ROLE_GATED) {
         );
     }
 
-    /// Read-deny access control: blocks all reads, allows all writes.
-    /// Used to verify monitor enforcement (which is read).
-    struct WriteOnly;
-    #[async_trait::async_trait]
-    impl AccessControl for WriteOnly {
-        async fn can_read(&self, _: &str, _: &str, _: &str) -> bool {
-            false
-        }
-    }
-
-    #[tokio::test]
-    async fn create_monitor_blocks_when_read_denied() {
-        let db = Arc::new(PvDatabase::new());
-        let access = AccessContext::anonymous(Arc::new(WriteOnly));
-        let ch = BridgeChannel::from_cached(
-            db,
-            "PROT".to_string(),
-            "PROT".to_string(),
-            "VAL".to_string(),
-            super::super::pvif::NtType::Scalar,
-            epics_base_rs::types::DbFieldType::Double,
-        )
-        .with_access(access);
-
-        // create_monitor must reject before even constructing the BridgeMonitor.
-        // AnyMonitor doesn't implement Debug so we destructure manually.
-        let result = ch.create_monitor().await;
-        match result {
-            Ok(_) => panic!("expected monitor create denied, got Ok"),
-            Err(e) => {
-                let err = format!("{e}");
-                assert!(
-                    err.contains("monitor create denied"),
-                    "expected monitor denial message, got: {err}"
-                );
-            }
-        }
-    }
-
     /// LiveAccessProxy regression: an AccessContext vended from
     /// `BridgeProvider::live_access()` must observe `set_access_control`
     /// on its very next can_read / can_write call, without channel
@@ -2589,29 +2573,6 @@ ASG(ROLE_GATED) {
         // Swap back to allow-all — proxy still tracks.
         provider.set_access_control(Arc::new(AllowAllAccess));
         assert!(ctx.can_write("X").await);
-    }
-
-    #[tokio::test]
-    async fn bridge_monitor_start_blocks_when_read_denied() {
-        // Defense-in-depth: even if a monitor is constructed via with_access
-        // bypassing create_monitor, start() must still enforce.
-        let db = Arc::new(PvDatabase::new());
-        let access = AccessContext::anonymous(Arc::new(WriteOnly));
-        let mut monitor = super::super::monitor::BridgeMonitor::new(
-            db,
-            "PROT".to_string(),
-            "VAL".to_string(),
-            super::super::pvif::NtType::Scalar,
-        )
-        .with_access(access);
-
-        let result = monitor.start().await;
-        assert!(result.is_err(), "expected monitor start denied");
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("monitor read denied"),
-            "expected start denial, got: {err}"
-        );
     }
 
     /// a QSRV access context built through the legacy

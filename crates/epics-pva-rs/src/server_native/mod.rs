@@ -90,13 +90,13 @@ pub use op_handle::{
 // embedded callers onto `server_native::config::PvaServerConfig` and left every
 // doc reference to the short path unresolvable on those targets.
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, PvaServerConfig};
-pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
+pub use peers::{ChannelReport, MonitorReport, PeerEntry, PeerRegistry, PeerSnapshot};
 #[cfg(tokio_backend)]
 pub use runtime::{PvaServer, ServerReportHandle, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER_SOURCE_NAME};
 pub use shared_pv::{AddPvError, MonitorOutbox, MonitorRing, SharedPV, SharedSource, SquashTail};
 pub use source::{
-    ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, MonitorOptions,
-    MonitorStream, MonitorUpdate, OpError, OpErrorKind, PostValue, RawMonitorEvent,
+    ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, Marks,
+    MonitorOptions, MonitorStream, MonitorUpdate, OpError, OpErrorKind, PostValue, RawMonitorEvent,
     UpstreamMonitor, plain_monitor_updates,
 };

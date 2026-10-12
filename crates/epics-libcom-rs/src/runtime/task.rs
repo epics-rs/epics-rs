@@ -51,20 +51,22 @@ impl std::fmt::Display for NotBlockable {
 
 impl std::error::Error for NotBlockable {}
 
-/// A [`Waker`] that unparks the thread that built it. The single owner of the
-/// "poll-then-park" wake mechanism in this crate: both [`park_on`] (the sync
-/// bridge) and the RTEMS future executor
-/// ([`crate::runtime::background::future_exec`]) drive a future by polling on a
-/// thread and parking it between polls, so both build one of these on their own
-/// thread and rely on the future's cross-thread waker to unpark them.
-pub(crate) struct ThreadWaker(std::thread::Thread);
+/// A [`Waker`] that unparks the thread that built it — the wake half of every
+/// "poll-then-park" driver ([`park_on`], asyn-rs's port reply wait). Get it
+/// through [`current_thread_waker`].
+struct ThreadWaker(std::thread::Thread);
 
-impl ThreadWaker {
-    /// A waker over the *current* thread — call this on the thread that will
-    /// park.
-    pub(crate) fn for_current_thread() -> Waker {
-        Waker::from(Arc::new(ThreadWaker(std::thread::current())))
+/// The waker over the *current* thread, for a driver that polls here and parks
+/// between polls. Built once per thread, so a park costs a refcount, not an
+/// allocation: C's `periodicTask` waits on an `epicsEvent` it created once.
+pub fn current_thread_waker() -> Waker {
+    thread_local! {
+        static WAKER: Waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
     }
+    // Only a park from another thread-local's destructor finds it gone.
+    WAKER
+        .try_with(Waker::clone)
+        .unwrap_or_else(|_| Waker::from(Arc::new(ThreadWaker(std::thread::current()))))
 }
 
 impl Wake for ThreadWaker {
@@ -95,7 +97,7 @@ pub(crate) fn park_on_interruptible<F: Future>(
     mut should_cancel: impl FnMut() -> bool,
 ) -> Option<F::Output> {
     let mut fut = std::pin::pin!(fut);
-    let waker = ThreadWaker::for_current_thread();
+    let waker = current_thread_waker();
     let mut cx = Context::from_waker(&waker);
     loop {
         if should_cancel() {

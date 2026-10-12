@@ -96,7 +96,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
-use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
+use super::callback_executor::{Callback, CallbackHandle, CallbackPriority, Run, TaskEntry};
 
 /// Default band for a general spawned tail. C routes general deferred work
 /// through `callbackRequest` at `priorityMedium` (`callback.h:42`) — the middle
@@ -304,20 +304,18 @@ impl<T: Send + 'static> Task<T> {
         #[cfg(test)]
         self.enqueues.fetch_add(1, Ordering::Relaxed);
 
-        // `Entry` finalizes the task if it is dropped without running — see its
-        // `Drop` — which is what the band does with it once shut down. That is
-        // the only way an entry goes un-run: it holds no ring slot, so a full
-        // ring cannot turn a wake into the silent end of a long-lived task.
-        let mut entry = Entry {
-            task: Some(Arc::clone(self)),
-        };
-        self.callbacks
-            .schedule_task(self.priority, Box::new(move || entry.run()));
+        // The entry is this task's own `Arc`, so a wake allocates nothing under
+        // whatever lock its waker holds. Dropped without running — what the
+        // band does with it once shut down — it cancels the task
+        // (`cancel_unrun`). It holds no ring slot, so a full ring cannot turn
+        // a wake into the silent end of a long-lived task.
+        let entry = TaskEntry::new(Arc::clone(self) as Arc<dyn Run>);
+        self.callbacks.schedule_task(self.priority, entry);
     }
 
     /// Poll the task once on the calling worker, then either publish its
     /// outcome or release the worker.
-    fn run(self: Arc<Self>) {
+    fn poll_once(self: Arc<Self>) {
         // SCHEDULED → RUNNING. Anything else means the task was finalized out
         // from under this ring entry; there is nothing left to poll.
         if self
@@ -443,35 +441,18 @@ impl<T> Drop for Task<T> {
     }
 }
 
-/// One run-queue entry for a task, with the "ran or was dropped" bookkeeping.
-///
-/// A [`Callback`] is a `FnOnce` that the pool drops instead of calling when the
-/// band shuts down (`callback.c:237-284` semantics). Then this
-/// task's only scheduled run is gone and its state is stuck at `SCHEDULED`, so
-/// no later wake would re-enqueue it. `Drop` closes that: an entry that is
-/// dropped un-run finalizes its task as cancelled.
-struct Entry<T> {
-    task: Option<Arc<Task<T>>>,
-}
-
-impl<T: Send + 'static> Entry<T> {
-    fn run(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.run();
-        }
+impl<T: Send + 'static> Run for Task<T> {
+    fn run(self: Arc<Self>) {
+        self.poll_once();
     }
-}
 
-impl<T> Drop for Entry<T> {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.state.store(DONE, Ordering::Release);
-            // Drop the future here rather than leaving it to the task's own
-            // `Drop`, which may not run promptly if a waker still holds a
-            // reference. Its destructors are part of the cancel.
-            let _ = task.future.lock().unwrap().take();
-            task.shared.finalize(Err(JoinError::cancelled()));
-        }
+    fn cancel_unrun(&self) {
+        self.state.store(DONE, Ordering::Release);
+        // Drop the future here rather than leaving it to the task's own
+        // `Drop`, which may not run promptly if a waker still holds a
+        // reference. Its destructors are part of the cancel.
+        let _ = self.future.lock().unwrap().take();
+        self.shared.finalize(Err(JoinError::cancelled()));
     }
 }
 
@@ -655,7 +636,7 @@ where
 }
 
 /// Resolves a handle as cancelled unless [`defuse`](Self::defuse)d — the
-/// blocking-closure counterpart of [`Entry`]'s `Drop`.
+/// blocking-closure counterpart of [`TaskEntry`]'s `Drop`.
 struct FinalizeOnDrop<R> {
     shared: Option<Arc<Shared<R>>>,
 }
@@ -1215,5 +1196,102 @@ mod tests {
         // Worker survived the panic.
         let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, || 5u32);
         assert_eq!(join(jf).unwrap(), 5);
+    }
+
+    /// A wake runs under whatever lock its waker holds — a record's, when a
+    /// post notifies a parked tail — so it must not allocate. Counted on the
+    /// waking thread only, over wakes that each re-queued a parked task.
+    #[test]
+    fn a_wake_of_a_parked_task_allocates_nothing() {
+        let pool = CallbackPool::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_jf, task) = spawn_task(&pool.handle(), CallbackPriority::Medium, {
+            let (notify, woken) = (Arc::clone(&notify), Arc::clone(&woken));
+            async move {
+                loop {
+                    notify.notified().await;
+                    woken.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        });
+        let wait = |cond: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !cond() {
+                assert!(start.elapsed() < T, "the task never got there");
+                std::thread::yield_now();
+            }
+        };
+        // One wake of a task that is parked on `notify`: it re-queues the task.
+        let wake = |round: usize| {
+            wait(&|| task.state.load(Ordering::Acquire) == IDLE);
+            counting::arm();
+            notify.notify_one();
+            let allocs = counting::disarm();
+            wait(&|| woken.load(Ordering::Acquire) == round);
+            allocs
+        };
+        // The first wakes may grow the band's node arena to its working size.
+        for round in 1..=10 {
+            wake(round);
+        }
+        let enqueues = task.enqueues.load(Ordering::Relaxed);
+        let allocs: usize = (11..=110).map(wake).sum();
+        assert_eq!(
+            task.enqueues.load(Ordering::Relaxed) - enqueues,
+            100,
+            "a counted wake did not re-queue a parked task"
+        );
+        assert_eq!(allocs, 0, "allocations in 100 wakes of a parked task");
+    }
+
+    #[test]
+    fn a_task_spawned_onto_a_shut_down_band_resolves_cancelled() {
+        let mut pool = CallbackPool::new();
+        let handle = pool.handle();
+        pool.shutdown();
+        let jf = spawn_future(&handle, CallbackPriority::Medium, async { 1u32 });
+        assert!(join(jf).unwrap_err().is_cancelled());
+    }
+
+    /// The allocations of the thread that armed it, in this test binary.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ARMED: Cell<bool> = const { Cell::new(false) };
+            static ALLOCS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub fn arm() {
+            ALLOCS.with(|n| n.set(0));
+            ARMED.with(|a| a.set(true));
+        }
+
+        pub fn disarm() -> usize {
+            ARMED.with(|a| a.set(false));
+            ALLOCS.with(Cell::get)
+        }
+
+        struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                if ARMED.with(Cell::get) {
+                    ALLOCS.with(|n| n.set(n.get() + 1));
+                }
+                // SAFETY: forwarded unchanged.
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // SAFETY: forwarded unchanged.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: Counting = Counting;
     }
 }

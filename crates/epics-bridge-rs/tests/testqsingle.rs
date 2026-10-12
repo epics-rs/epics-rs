@@ -17,7 +17,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(41): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(39): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -545,7 +545,8 @@ async fn channel_filter_suffix_strips_before_resolution() {
 #[tokio::test]
 async fn arr_channel_filter_applies_to_get_matching_monitor() {
     use epics_base_rs::server::recgbl::EventMask;
-    use epics_bridge_rs::qsrv::provider::{BridgeProvider, PvaMonitor};
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+    use epics_pva_rs::server_native::source::ChannelSource;
 
     let db = Arc::new(PvDatabase::new());
     db.add_record(
@@ -589,20 +590,25 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
         "filtered GET must return the arr slice, not the full array"
     );
 
-    // The monitor event on the same filtered channel carries the
-    // identical slice.
-    let mut mon = ch.create_monitor().await.expect("monitor");
-    mon.start().await.expect("start");
+    // The monitor event on the same filtered channel, from `qsrvSingle`,
+    // carries the identical slice.
+    let mut mon = epics_pva_rs::server::PvDatabaseSource::new(db.clone())
+        .subscribe(r#"TEST:filt_wf.VAL{"arr":{"s":1,"e":3}}"#)
+        .await
+        .expect("monitor");
     {
         let rec = db.get_record("TEST:filt_wf").expect("rec");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
-    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.recv())
         .await
         .expect("monitor event within 2s")
         .expect("snapshot");
+    let PvField::Structure(ev) = ev else {
+        panic!("expected an NT structure, got {ev:?}");
+    };
     assert_eq!(
-        doubles(&ev.value),
+        doubles(&ev),
         get_slice,
         "monitor event slice must match the filtered GET slice"
     );
@@ -995,74 +1001,6 @@ async fn non_val_enum_field_is_ntenum() {
         .await
         .expect("new");
     assert_eq!(desc.nt_type(), NtType::Scalar, ".DESC must stay NTScalar");
-}
-
-/// A client STOP on a single-record monitor disables its
-/// backing value+PROPERTY `DbSubscription`s — the in-process equivalent of
-/// pvxs `MonitorControlOp::onStart(false)` ⇒ `db_event_disable`
-/// (`singlesource.cpp:151`). Posts made while stopped are not delivered;
-/// RESUME (`onStart(true)` ⇒ `db_event_enable`) restores delivery on the
-/// same handles.
-#[tokio::test]
-async fn monitor_stop_disables_backing_subscription() {
-    use epics_base_rs::server::recgbl::EventMask;
-    use epics_bridge_rs::qsrv::provider::{BridgeProvider, PvaMonitor};
-
-    let db = Arc::new(PvDatabase::new());
-    db.add_record("TEST:gate_ai", Box::new(AiRecord::new(1.0)))
-        .await
-        .unwrap();
-    let provider = Arc::new(BridgeProvider::new(db.clone()));
-
-    let any = provider
-        .create_channel_for("TEST:gate_ai", "u", "h")
-        .await
-        .expect("channel resolves");
-    let ch = match any {
-        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
-        _ => panic!("expected single-record channel"),
-    };
-
-    let mut mon = ch.create_monitor().await.expect("monitor");
-    mon.start().await.expect("start");
-    let handles = mon.activation_handles();
-    assert!(
-        !handles.is_empty(),
-        "a started single-record monitor must expose its subscription gate handles"
-    );
-
-    async fn post(db: &Arc<PvDatabase>, mask: EventMask) {
-        let rec = db.get_record("TEST:gate_ai").expect("rec");
-        rec.write().notify_field("VAL", mask);
-    }
-
-    // Active (post-START): a VALUE post is delivered.
-    post(&db, EventMask::VALUE).await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
-        .await
-        .expect("event must be delivered while the monitor is active")
-        .expect("snapshot");
-
-    // STOP: disable both subscriptions. A subsequent post is NOT delivered.
-    for h in &handles {
-        h.set_active(false).await;
-    }
-    post(&db, EventMask::VALUE).await;
-    let stopped = tokio::time::timeout(std::time::Duration::from_millis(300), mon.poll()).await;
-    assert!(
-        stopped.is_err(),
-        "no event may be delivered while the monitor is stopped"
-    );
-
-    // RESUME: re-enable the same handles. A post is delivered again.
-    for h in &handles {
-        h.set_active(true).await;
-    }
-    post(&db, EventMask::VALUE).await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
-        .await
-        .expect("event must be delivered after the monitor resumes")
-        .expect("snapshot");
 }
 
 // ---------------------------------------------------------------------------
@@ -1716,20 +1654,26 @@ async fn a_dollar_put_is_bounded_by_sizv_not_40() {
     );
 }
 
-/// Every value a started monitor on `ch` posts: `put` runs at the first
-/// 300 ms without an event, and the next quiet 300 ms ends the watch.
+/// Every value a `qsrvSingle` monitor on `name` posts: `put` runs at the
+/// first 300 ms without an event, and the next quiet 300 ms ends the watch.
 async fn monitor_values(
-    ch: &BridgeChannel,
+    db: &Arc<PvDatabase>,
+    name: &str,
     put: impl std::future::Future<Output = ()>,
 ) -> Vec<PvField> {
-    use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    let mut mon = ch.create_monitor().await.expect("monitor");
-    mon.start().await.expect("start");
+    use epics_pva_rs::server_native::source::ChannelSource;
+    let mut mon = epics_pva_rs::server::PvDatabaseSource::new(db.clone())
+        .subscribe(name)
+        .await
+        .expect("monitor");
     let mut seen = Vec::new();
     let mut put = Some(Box::pin(put));
     loop {
-        match tokio::time::timeout(std::time::Duration::from_millis(300), mon.poll()).await {
-            Ok(Some(ev)) => seen.push(extract_value(&ev.value).expect("value").clone()),
+        match tokio::time::timeout(std::time::Duration::from_millis(300), mon.recv()).await {
+            Ok(Some(PvField::Structure(ev))) => {
+                seen.push(extract_value(&ev).expect("value").clone())
+            }
+            Ok(Some(ev)) => panic!("expected an NT structure, got {ev:?}"),
             Ok(None) => break,
             Err(_) => match put.take() {
                 Some(p) => p.await,
@@ -1767,10 +1711,10 @@ async fn lso_long_string_monitor_posts_the_text() {
         writer.put(&put).await.expect("put");
     };
     let string = |t: &str| PvField::Scalar(ScalarValue::String(t.into()));
-    // The initial event is the server's read (`monitor.rs` caches none).
+    // The initial event is the server's read; the stream carries none.
     let initial = val.get(&empty_request()).await.expect("get");
     assert_eq!(extract_value(&initial), Some(&string("")));
-    assert_eq!(monitor_values(&val, put).await, vec![string("abc")]);
+    assert_eq!(monitor_values(&db, "LS64", put).await, vec![string("abc")]);
 }
 
 /// The records the `$` pins below read, as `softIocPVX` 1.5.3 loaded them.
@@ -1850,18 +1794,16 @@ async fn a_dollar_monitor_serves_what_softiocpvx_serves() {
         ("LZ:F", text("again"), text("again")),
     ];
     for (name, second, want) in cases {
-        let ch = BridgeChannel::new(db.clone(), &format!("{name}.VAL$"))
-            .await
-            .expect(name);
         let put = dollar_put(&db, name, second);
-        assert_eq!(monitor_values(&ch, put).await, vec![want], "{name}");
+        assert_eq!(
+            monitor_values(&db, &format!("{name}.VAL$"), put).await,
+            vec![want],
+            "{name}"
+        );
     }
-    let ch = BridgeChannel::new(db.clone(), "LZ:C.INPA$")
-        .await
-        .expect("LZ:C.INPA$");
     let put = dollar_put(&db, "LZ:C.INPA", text("LZ:O"));
     assert_eq!(
-        monitor_values(&ch, put).await,
+        monitor_values(&db, "LZ:C.INPA$", put).await,
         vec![text("LZ:O NPP NMS")],
         "LZ:C.INPA$"
     );
@@ -1917,40 +1859,9 @@ async fn a_dollar_arr_slice_serves_what_softiocpvx_serves() {
     }
 }
 
-/// A `$` monitor slices the char image, as its GET does: `softIocPVX`
-/// 1.5.3's `pvxmonitor 'FS.VAL${"arr":{"s":1,"e":3}}'` over `pvxput FS
-/// world`, `FS ab`, `FS x`.
-#[tokio::test]
-async fn a_dollar_arr_monitor_serves_what_softiocpvx_serves() {
-    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
-        .db_string(
-            r#"record(stringin, "FS") { field(VAL, "hello") }"#,
-            &std::collections::HashMap::new(),
-        )
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
-    let ch = BridgeChannel::new(db.clone(), r#"FS.VAL${"arr":{"s":1,"e":3}}"#)
-        .await
-        .expect("channel");
-    use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    let mut mon = ch.create_monitor().await.expect("monitor");
-    mon.start().await.expect("start");
-    for (t, want) in [("world", &b"or\0"[..]), ("ab", b"b\0"), ("x", b"\0")] {
-        dollar_put(&db, "FS", text(t)).await;
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), mon.poll())
-            .await
-            .expect("a monitor update")
-            .expect("open");
-        assert_eq!(extract_value(&ev.value), Some(&chars(want)), "{t}");
-    }
-}
-
 /// A one-element `arr` slice is a scalar channel: `softIocPVX` 1.5.3's
-/// `pvxget` over `FS` = "hello", `W` = `[1,2,3]` and `LS` = "hey", and
-/// `pvxmonitor 'FS.VAL${"arr":{"s":1,"e":1}}'` over `pvxput FS world`,
-/// `FS ab`, `FS x`.
+/// `pvxget` over `FS` = "hello", `W` = `[1,2,3]` and `LS` = "hey". Its
+/// monitor is pinned on `qsrvSingle` (`PvDatabaseSource`).
 #[tokio::test]
 async fn a_one_element_arr_slice_serves_what_softiocpvx_serves() {
     let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
@@ -1993,24 +1904,6 @@ async fn a_one_element_arr_slice_serves_what_softiocpvx_serves() {
         );
         let got = ch.get(&empty_request()).await.expect("get");
         assert_eq!(extract_value(&got), Some(&PvField::Scalar(want)), "{name}");
-    }
-    let ch = BridgeChannel::new(db.clone(), r#"FS.VAL${"arr":{"s":1,"e":1}}"#)
-        .await
-        .expect("channel");
-    use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    let mut mon = ch.create_monitor().await.expect("monitor");
-    mon.start().await.expect("start");
-    for (t, want) in [("world", 111), ("ab", 98), ("x", 0)] {
-        dollar_put(&db, "FS", text(t)).await;
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), mon.poll())
-            .await
-            .expect("a monitor update")
-            .expect("open");
-        assert_eq!(
-            extract_value(&ev.value),
-            Some(&PvField::Scalar(ScalarValue::Byte(want))),
-            "{t}"
-        );
     }
 }
 

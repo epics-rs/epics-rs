@@ -58,12 +58,12 @@
 //! established connections.
 //!
 //! The connection futures run at 18 as well, and that is what
-//! `pva_task_executor` is for. A bare `Reactor::spawn` on `exec_backend` lands
+//! `pva_executor` is for. A bare `Reactor::spawn` on `exec_backend` lands
 //! a future on the process-global callback pool's `Medium` band — 64, where
 //! C's `callbackRequest` work runs — so `serve` first rebinds the reactor it
 //! was handed to this server's own executor. Everything downstream inherits
-//! that through its clone of the reactor, the blocking driver's per-connection
-//! writer task included, since it spawns through the same seam.
+//! that through its clone of the reactor, except each connection's writer
+//! task, which `ConnInit` binds to the server's writer executor.
 //!
 //! # Shutdown: one owner for "may this connection still run"
 //!
@@ -282,9 +282,11 @@ pub struct ReactorPvaServer {
     connections: Arc<ConnTable>,
     poller: Arc<Poller>,
     /// The executor connection futures spawn onto — see
-    /// [`pva_task_executor`](super::blocking::pva_task_executor). `None` on
+    /// [`pva_executor`](super::blocking::pva_executor). `None` on
     /// `tokio_backend`, where the runtime is the executor.
     task_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
+    /// The executor the connections' writer tasks run on.
+    writer_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
     tcp_port: u16,
     shutdown: AtomicBool,
 }
@@ -329,7 +331,8 @@ impl ReactorPvaServer {
         // Started here, not on first accept: a server that cannot run its
         // connections is a `bind` failure, like a poll thread that will not
         // start.
-        let task_exec = super::blocking::pva_task_executor()?;
+        let task_exec = super::blocking::pva_executor(super::blocking::PVA_TASK_EXECUTOR)?;
+        let writer_exec = super::blocking::pva_executor(super::blocking::PVA_WRITER_EXECUTOR)?;
         Ok(Self {
             listener,
             source,
@@ -339,6 +342,7 @@ impl ReactorPvaServer {
             connections: ConnTable::new(),
             poller,
             task_exec,
+            writer_exec,
             tcp_port,
             shutdown: AtomicBool::new(false),
         })
@@ -352,6 +356,14 @@ impl ReactorPvaServer {
     /// of the call site that happens to spawn.
     fn conn_reactor(&self, reactor: &Reactor) -> Reactor {
         match &self.task_exec {
+            Some(exec) => reactor.with_executor(exec),
+            None => reactor.clone(),
+        }
+    }
+
+    /// `reactor` bound to this server's writer executor.
+    fn writer_reactor(&self, reactor: &Reactor) -> Reactor {
+        match &self.writer_exec {
             Some(exec) => reactor.with_executor(exec),
             None => reactor.clone(),
         }
@@ -508,6 +520,7 @@ impl ReactorPvaServer {
             x509_identity: None,
             channel_invalidator: self.channel_invalidator.clone(),
             tx_limit_bytes: tx_limit,
+            writer_reactor: self.writer_reactor(reactor),
         };
         let conn_reactor = reactor.clone();
         let id = slot.id();

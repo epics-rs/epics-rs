@@ -48,15 +48,7 @@ use epics_base_rs::server::snapshot::PropertySupport;
 /// update (UDF -> NO_ALARM changed the alarm, so the record's `monitor()`
 /// OR'd in `DBE_ALARM`) and value+timeStamp on every update after it.
 pub fn event_leaves(mask: EventMask, props: PropertySupport, value_is_enum: bool) -> Vec<String> {
-    // `subscriptionValueCallback` normalization (`singlesource.cpp:86-93`).
-    let mut change = mask;
-    if change.intersects(EventMask::LOG) {
-        change = EventMask::from_bits(change.bits() & !EventMask::LOG.bits()) | EventMask::VALUE;
-    }
-    if change.intersects(EventMask::ALARM) && !change.intersects(EventMask::VALUE) {
-        change |= EventMask::VALUE;
-    }
-
+    let change = normalized(mask);
     let mut leaves: Vec<String> = Vec::new();
 
     if change.intersects(EventMask::PROPERTY) {
@@ -87,6 +79,69 @@ pub fn event_leaves(mask: EventMask, props: PropertySupport, value_is_enum: bool
     }
 
     leaves
+}
+
+/// `subscriptionValueCallback` normalization (`singlesource.cpp:86-93`).
+fn normalized(mask: EventMask) -> EventMask {
+    let mut change = mask;
+    if change.intersects(EventMask::LOG) {
+        change = EventMask::from_bits(change.bits() & !EventMask::LOG.bits()) | EventMask::VALUE;
+    }
+    if change.intersects(EventMask::ALARM) && !change.intersects(EventMask::VALUE) {
+        change |= EventMask::VALUE;
+    }
+    change
+}
+
+/// The three classes [`event_leaves`] reads, after normalization, as an
+/// index into [`EventMarks`].
+const CLASSES: [EventMask; 3] = [EventMask::VALUE, EventMask::ALARM, EventMask::PROPERTY];
+
+fn class_index(mask: EventMask) -> usize {
+    let change = normalized(mask);
+    CLASSES
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| change.intersects(**c))
+        .fold(0, |i, (bit, _)| i | 1 << bit)
+}
+
+/// [`event_leaves`] for every class one subscription's events can carry,
+/// built for its property support and value kind, so a post takes its set
+/// by index instead of building one.
+pub struct EventMarks {
+    props: PropertySupport,
+    value_is_enum: bool,
+    sets: [Option<std::sync::Arc<[String]>>; 1 << CLASSES.len()],
+}
+
+impl EventMarks {
+    pub fn new(props: PropertySupport, value_is_enum: bool) -> Self {
+        let sets = std::array::from_fn(|i| {
+            let mask = CLASSES
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| i & 1 << bit != 0)
+                .fold(EventMask::NONE, |m, (_, c)| m | *c);
+            let leaves = event_leaves(mask, props, value_is_enum);
+            (!leaves.is_empty()).then(|| leaves.into())
+        });
+        Self {
+            props,
+            value_is_enum,
+            sets,
+        }
+    }
+
+    /// Whether this table was built for `props` and `value_is_enum`.
+    pub fn is_for(&self, props: PropertySupport, value_is_enum: bool) -> bool {
+        self.props == props && self.value_is_enum == value_is_enum
+    }
+
+    /// The leaves an event of `mask` marks; `None` when it marks none.
+    pub fn get(&self, mask: EventMask) -> Option<&std::sync::Arc<[String]>> {
+        self.sets[class_index(mask)].as_ref()
+    }
 }
 
 /// `display.form.choices` — the fixed seven-entry menu pvxs publishes for
@@ -167,6 +222,21 @@ pub fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every raw event mask takes the set `event_leaves` builds for it.
+    #[test]
+    fn event_marks_match_event_leaves_for_every_mask() {
+        let props = PropertySupport::NUMERIC;
+        for value_is_enum in [false, true] {
+            let table = EventMarks::new(props, value_is_enum);
+            for bits in 0..0x10 {
+                let mask = EventMask::from_bits(bits);
+                let want = event_leaves(mask, props, value_is_enum);
+                let got = table.get(mask).map(|s| s.to_vec()).unwrap_or_default();
+                assert_eq!(got, want, "mask {bits:#x}, enum {value_is_enum}");
+            }
+        }
+    }
 
     /// The seven leaves `getProperties` never assigns, for ANY record type.
     /// These are what a Delta client must not see on a QSRV GET; the port

@@ -120,6 +120,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-bridge-rs", "tests/qsrv_remote_log.rs"),
     ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_ca_link.rs"),
     ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_pva_link.rs"),
+    ("epics-bridge-rs", "tests/qsrv_rs_sources.rs"),
     ("epics-bridge-rs", "tests/qsrv_ts_filter_probe.rs"),
     ("epics-ca-rs", "src/client/sync_group.rs"),
     ("epics-ca-rs", "src/client/transport.rs"),

@@ -112,9 +112,95 @@ pub struct PvDatabaseSource {
     gate: epics_base_rs::server::access_security::AccessGate,
     /// See [`NativeChannelCache`].
     channels: NativeChannelCache,
+    /// Every record monitor's two subscriptions attach here; see
+    /// [`RecordEvents`].
+    events: Arc<RecordEvents>,
 }
 
 impl PvDatabaseSource {
+    /// A record monitor's update stream and the STOP gate over the two
+    /// subscriptions it owns; a mailbox SharedPV has no gate.
+    async fn open_monitor(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        ctx: crate::server_native::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> Option<(
+        MonitorStream<crate::server_native::source::MonitorUpdate>,
+        Option<crate::server_native::source::MonitorGate>,
+    )> {
+        let db = self.db.clone();
+        let cache = self.channels.clone();
+        let peer = ctx.peer;
+        if !checked.allows_read() {
+            return None;
+        }
+        let name = checked.pv_name().to_string();
+        // Both chains come off the channel object, which owns the
+        // value/property split: the value chain is the SAME instance the
+        // GET path runs, and the property chain is the independent
+        // re-parse pvxs's `pPropertiesChannel` carries.
+        let ch = channel_for(&db, &cache, &name, peer)?;
+        let cn = &ch.cn;
+        let value_filters = &ch.value_filters;
+        let property_filters = &ch.property_filters;
+        // A mailbox SharedPV posts a wholly-assigned value and has no
+        // record events to classify — keep the unmarked default.
+        let PvEntry::Record(rec) = channel_entry(&db, cn).await? else {
+            return self
+                .subscribe_checked_opts(checked, ctx, opts)
+                .await
+                .map(|s| (crate::server_native::source::plain_monitor_updates(s), None));
+        };
+        // The channel's shape is settled ONCE, here, exactly as pvxs
+        // settles it once per `dbChannel`: every event this stream yields
+        // is then rendered in it, so a one-element array field's updates
+        // are the scalars its descriptor advertised.
+        let render = record_channel_render(&rec, cn, value_filters)?;
+
+        let door = MetaDoor::new(
+            db.clone(),
+            rec,
+            cn.field.clone(),
+            render,
+            property_filters.clone(),
+        );
+        let shaped = render.shaper();
+        // A post is held by this monitor's ring or by the server's queue
+        // behind it, each bounded by the negotiated limit.
+        let held = opts.queue_size.saturating_mul(2);
+        let (stream, halves) = attach_record_pair(
+            &self.events,
+            &db,
+            RecordPair {
+                path: &cn.record_path,
+                value_mask: opts.dbe,
+                filters: [value_filters, property_filters],
+                dollar: render.dollar(),
+                limit: opts.queue_size as usize,
+            },
+            || {
+                let mut ring = PostRing::new(held, door.read()?);
+                Some(move |ev| marked_update(&mut ring, shaped(ev), door.nsec_mask, || door.read()))
+            },
+        )
+        .map_err(|why| report_subscribe_refused(why, peer, &name))
+        .ok()
+        .flatten()?;
+        // STOP takes both halves off the record, so posts made while
+        // stopped are never queued: pvxs `onStart(false)` ⇒
+        // `db_event_disable` (`singlesource.cpp:170-179`, `dbEvent.c:524`).
+        let gate = crate::server_native::source::MonitorGate::new(move |active| {
+            let halves = halves.clone();
+            async move {
+                for h in &halves {
+                    h.set_active(active).await;
+                }
+            }
+        });
+        Some((stream, Some(gate)))
+    }
+
     pub fn new(db: Arc<PvDatabase>) -> Self {
         let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(None);
         let gate = Self::build_gate(db.clone(), acf, None);
@@ -122,6 +208,7 @@ impl PvDatabaseSource {
             db,
             gate,
             channels: Default::default(),
+            events: Arc::new(record_events()),
         }
     }
 
@@ -134,6 +221,7 @@ impl PvDatabaseSource {
             db,
             gate,
             channels: Default::default(),
+            events: Arc::new(record_events()),
         }
     }
 
@@ -153,6 +241,7 @@ impl PvDatabaseSource {
             db,
             gate,
             channels: Default::default(),
+            events: Arc::new(record_events()),
         }
     }
 
@@ -363,18 +452,21 @@ impl<'a> LogLeaves<'a> {
 
 /// The leaves a value event assigns — pvxs `IOCSource::get` under
 /// `UpdateType::Value | Alarm` (`iocsource.cpp:338-358`): value, alarm and
-/// timeStamp, nothing a metadata read supplies.
+/// timeStamp, nothing a metadata read supplies. Each is written into the
+/// leaf `v` already holds, so a scalar event allocates nothing.
 fn fill_nt_event(v: &mut PvField, log: &LogLeaves) {
-    let value = match log.value {
-        EpicsValue::Enum(index) => (
-            "value.index",
-            PvField::Scalar(ScalarValue::Int(i32::from(*index))),
+    match log.value {
+        EpicsValue::Enum(index) => {
+            set_scalar(v, "value.index", ScalarValue::Int(i32::from(*index)))
+        }
+        other => set_leaf(
+            v,
+            "value",
+            crate::leaf_convert::epics_value_to_pv_leaf(other),
         ),
-        other => ("value", crate::leaf_convert::epics_value_to_pv_leaf(other)),
-    };
-    set_leaf(v, value.0, value.1);
-    set_leaf(v, "alarm", build_alarm(log.stat, log.sevr, log.amsg));
-    set_leaf(v, "timeStamp", build_timestamp(log.time, log.utag));
+    }
+    fill_alarm(v, log.stat, log.sevr, log.amsg);
+    fill_timestamp(v, log.time, log.utag);
 }
 
 /// The leaves a metadata read assigns — `getProperties` under
@@ -525,6 +617,13 @@ fn set_leaf(v: &mut PvField, path: &str, val: PvField) {
     }
 }
 
+/// [`set_leaf`] for a scalar leaf, written into the scalar `v` holds.
+fn set_scalar(v: &mut PvField, path: &str, val: ScalarValue) {
+    if let Some(PvField::Scalar(slot)) = leaf_mut(v, path) {
+        *slot = val;
+    }
+}
+
 /// Assign a stored `f64` metadata limit at `path`, coerced to the type the
 /// DESCRIPTOR declared for that leaf.
 ///
@@ -657,20 +756,17 @@ fn timestamp_desc() -> FieldDesc {
     }
 }
 
-fn build_alarm(stat: u16, sevr: u16, amsg: &str) -> PvField {
-    let mut a = PvStructure::new("alarm_t");
-    a.fields.push((
-        "severity".into(),
-        PvField::Scalar(ScalarValue::Int(sevr as i32)),
-    ));
+fn fill_alarm(v: &mut PvField, stat: u16, sevr: u16, amsg: &str) {
+    set_scalar(v, "alarm.severity", ScalarValue::Int(sevr as i32));
     // pvxs `iocsource.cpp:187-223`: PVA `alarm.status` carries the alarm
     // *class* (NONE/DEVICE/DRIVER/RECORD/DB/UNDEFINED, 0–6), not the raw
     // EPICS condition code. Map before emitting so native clients never
     // see e.g. `LINK_ALARM = 14` in a field whose NT contract is 0–6.
-    a.fields.push((
-        "status".into(),
-        PvField::Scalar(ScalarValue::Int(alarm_status_class(stat))),
-    ));
+    set_scalar(
+        v,
+        "alarm.status",
+        ScalarValue::Int(alarm_status_class(stat)),
+    );
     // pvxs `iocsource.cpp:230-236`, exactly:
     //     if((options & DBR_AMSG) && meta.amsg[0])
     //         node["alarm.message"] = meta.amsg;
@@ -683,17 +779,20 @@ fn build_alarm(stat: u16, sevr: u16, amsg: &str) -> PvField {
     // its empty amsg falls through here to the "UDF" condition string —
     // which is what pvxs serves for those records too.
     let message = if !amsg.is_empty() {
-        amsg.to_string()
+        amsg
     } else if stat == alarm_status::NO_ALARM {
-        String::new()
+        ""
     } else {
-        alarm_condition_string(stat).to_string()
+        alarm_condition_string(stat)
     };
-    a.fields.push((
-        "message".into(),
-        PvField::Scalar(ScalarValue::String(message.into())),
-    ));
-    PvField::Structure(a)
+    // Into the leaf's own buffer, which keeps the longest message it held —
+    // C's `amsg` is a fixed 40 bytes.
+    if let Some(PvField::Scalar(ScalarValue::String(s))) = leaf_mut(v, "alarm.message") {
+        let mut buf = std::mem::take(s).into_bytes();
+        buf.clear();
+        buf.extend_from_slice(message.as_bytes());
+        *s = buf.into();
+    }
 }
 
 /// Map a raw EPICS `epicsAlarmCondition` (0–21, `alarm.h`) to the PVA
@@ -725,7 +824,7 @@ fn alarm_status_class(condition: u16) -> i32 {
     }
 }
 
-fn build_timestamp(time: WallTime, utag: i32) -> PvField {
+fn fill_timestamp(v: &mut PvField, time: WallTime, utag: i32) {
     // pvxs `iocsource.cpp:240-248`: `timeStamp` carries the record's
     // acquisition time and userTag, NOT the serialization wall-clock.
     // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
@@ -737,18 +836,17 @@ fn build_timestamp(time: WallTime, utag: i32) -> PvField {
     // overwrote the acquisition time with serialization time and zeroed
     // the userTag on every record-backed GET/MONITOR.
     let dur = time.since_unix_epoch();
-    let mut t = PvStructure::new("time_t");
-    t.fields.push((
-        "secondsPastEpoch".into(),
-        PvField::Scalar(ScalarValue::Long(dur.as_secs() as i64)),
-    ));
-    t.fields.push((
-        "nanoseconds".into(),
-        PvField::Scalar(ScalarValue::Int(dur.subsec_nanos() as i32)),
-    ));
-    t.fields
-        .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(utag))));
-    PvField::Structure(t)
+    set_scalar(
+        v,
+        "timeStamp.secondsPastEpoch",
+        ScalarValue::Long(dur.as_secs() as i64),
+    );
+    set_scalar(
+        v,
+        "timeStamp.nanoseconds",
+        ScalarValue::Int(dur.subsec_nanos() as i32),
+    );
+    set_scalar(v, "timeStamp.userTag", ScalarValue::Int(utag));
 }
 
 /// The leaves one QSRV read assigns into its `cloneEmpty()` — the exact set
@@ -975,16 +1073,12 @@ impl ChannelRender {
         }
     }
 
-    /// A monitor's subscription on this channel: a `$` channel's carries
-    /// its view, so the post chain sees the char image and the stream
-    /// is left only the text.
-    fn subscribed(
-        self,
-        sub: epics_base_rs::server::database::db_access::DbSubscription,
-    ) -> epics_base_rs::server::database::db_access::DbSubscription {
+    /// A monitor subscription's `$` view on this channel, so the post chain
+    /// sees the char image and the stream is left only the text.
+    fn dollar(self) -> Option<DollarView> {
         match self {
-            ChannelRender::Dollar(view) => sub.with_dollar_view(view),
-            _ => sub,
+            ChannelRender::Dollar(view) => Some(view),
+            _ => None,
         }
     }
 }
@@ -1448,95 +1542,34 @@ impl ChannelSource for PvDatabaseSource {
     ///
     /// [`crate::nt::event_leaves`] is the single owner of that rule; this
     /// method only supplies the per-event mask it keys on.
-    fn subscribe_checked_opts_marked(
+    async fn subscribe_checked_opts_marked(
         &self,
         checked: epics_base_rs::server::access_security::AccessChecked,
         ctx: crate::server_native::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
-    ) -> impl std::future::Future<
-        Output = Option<MonitorStream<crate::server_native::source::MonitorUpdate>>,
-    > + Send {
-        let db = self.db.clone();
-        let cache = self.channels.clone();
-        let peer = ctx.peer;
-        async move {
-            if !checked.allows_read() {
-                return None;
-            }
-            let name = checked.pv_name().to_string();
-            // Both chains come off the channel object, which owns the
-            // value/property split: the value chain is the SAME instance the
-            // GET path runs, and the property chain is the independent
-            // re-parse pvxs's `pPropertiesChannel` carries.
-            let ch = channel_for(&db, &cache, &name, peer)?;
-            let cn = &ch.cn;
-            let value_filters = &ch.value_filters;
-            let property_filters = &ch.property_filters;
-            // A mailbox SharedPV posts a wholly-assigned value and has no
-            // record events to classify — keep the unmarked default.
-            let PvEntry::Record(rec) = channel_entry(&db, cn).await? else {
-                return self
-                    .subscribe_checked_opts(checked, ctx, opts)
-                    .await
-                    .map(crate::server_native::source::plain_monitor_updates);
-            };
-            // The channel's shape is settled ONCE, here, exactly as pvxs
-            // settles it once per `dbChannel`: every event this stream yields
-            // is then rendered in it, so a one-element array field's updates
-            // are the scalars its descriptor advertised.
-            let render = record_channel_render(&rec, cn, value_filters)?;
+    ) -> Option<MonitorStream<crate::server_native::source::MonitorUpdate>> {
+        self.open_monitor(checked, ctx, opts)
+            .await
+            .map(|(stream, _)| stream)
+    }
 
-            use epics_base_rs::server::database::db_access::DbSubscription;
-            // pvxs's TWO subscriptions, not their union
-            // (`singlesource.cpp:155-167`). The value half carries the
-            // client's resolved `record._options.DBE` (`opts.dbe`, already
-            // reduced to the value classes); the property half is
-            // unconditional — pvxs opens it with `DBE_PROPERTY` whatever
-            // `DBE` said. Each half is a separate subscriber slot with its
-            // own event queue, which is the point: a union subscription let
-            // a queued value post swallow the metadata post that followed
-            // it.
-            let value_sub = DbSubscription::subscribe_with_mask_and_filters(
-                &db,
-                &cn.record_path,
-                0,
-                opts.dbe,
-                Some(value_filters),
-            )
-            .await
-            .map_err(|why| report_subscribe_refused(why, peer, &name))
-            .ok()
-            .map(|sub| render.subscribed(sub))?;
-            let property_sub = DbSubscription::subscribe_with_mask_and_filters(
-                &db,
-                &cn.record_path,
-                0,
-                epics_base_rs::server::recgbl::EventMask::PROPERTY.bits(),
-                Some(property_filters),
-            )
-            .await
-            .map_err(|why| report_subscribe_refused(why, peer, &name))
-            .ok()
-            .map(|sub| render.subscribed(sub))?;
-            let shaped = render.shaper();
-            // Read after both halves are live, so a metadata change racing the
-            // read still arrives as a property post.
-            let door = MetaDoor::new(
-                db.clone(),
-                rec,
-                cn.field.clone(),
-                render,
-                property_filters.clone(),
-            );
-            let mut ring = PostRing::new(opts.queue_size, door.read()?);
-            // The subscriptions ARE the stream: `marked_update` runs as the
-            // server pulls, so no task stands between them.
-            Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
-                value_sub,
-                property_sub,
-                move |ev| marked_update(&mut ring, shaped(ev), door.nsec_mask, || door.read()),
-            )))
-        }
+    async fn subscribe_seeded(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        ctx: crate::server_native::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> Option<
+        crate::server_native::source::SubscriptionSeed<crate::server_native::source::MonitorUpdate>,
+    > {
+        let (updates, on_start) = self
+            .open_monitor(checked.clone(), ctx.clone(), opts)
+            .await?;
+        let initial = self.read_checked(checked, ctx).await;
+        Some(crate::server_native::source::SubscriptionSeed {
+            initial,
+            updates,
+            on_start,
+        })
     }
 
     fn subscribe(
@@ -1544,6 +1577,7 @@ impl ChannelSource for PvDatabaseSource {
         name: &str,
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let db = self.db.clone();
+        let events = self.events.clone();
         let name = name.to_string();
         async move {
             let (cn, filters) = resolve_channel(&db, &name)?;
@@ -1583,51 +1617,44 @@ impl ChannelSource for PvDatabaseSource {
                 }
                 PvEntry::Record(rec) => {
                     let render = record_channel_render(&rec, &cn, &filters)?;
-                    // Subscribe via the public DbSubscription API. The mask
-                    // is the one `DbSubscription::subscribe_filtered` picks
-                    // for the unclassified entry (`db_access.rs:297`); it is
-                    // spelled out here because the filtered constructor is
-                    // the only one that takes a chain, and a filtered name
-                    // must not reach a raw stream.
-                    use epics_base_rs::server::database::db_access::DbSubscription;
+                    // The mask is the one `DbSubscription::subscribe_filtered`
+                    // picks for the unclassified entry (`db_access.rs:297`).
+                    // The metadata is not the event's: it is read once both
+                    // halves are live and reread on each post of the
+                    // `DBE_PROPERTY` half, whose posts yield no value of
+                    // their own.
                     use epics_base_rs::server::recgbl::EventMask;
-                    let sub = DbSubscription::subscribe_with_mask_and_filters(
-                        &db,
-                        &cn.record_path,
-                        0,
-                        (EventMask::VALUE | EventMask::LOG).bits(),
-                        Some(&filters),
-                    )
-                    .await
-                    .ok()
-                    .map(|sub| render.subscribed(sub))?;
-                    // The metadata is not the event's: it is read here and
-                    // reread on each post of a `DBE_PROPERTY` half, whose
-                    // posts yield no value of their own.
                     let (_, property_filters) = resolve_channel(&db, &name)?;
-                    let property_sub = DbSubscription::subscribe_with_mask_and_filters(
-                        &db,
-                        &cn.record_path,
-                        0,
-                        EventMask::PROPERTY.bits(),
-                        Some(&property_filters),
-                    )
-                    .await
-                    .ok()
-                    .map(|sub| render.subscribed(sub))?;
+                    let door = MetaDoor::new(
+                        db.clone(),
+                        rec,
+                        cn.field.clone(),
+                        render,
+                        property_filters.clone(),
+                    );
                     let shaped = render.shaper();
-                    let door =
-                        MetaDoor::new(db.clone(), rec, cn.field.clone(), render, property_filters);
-                    let mut meta = door.read()?;
-                    Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
-                        sub,
-                        property_sub,
-                        move |ev| {
-                            plain_record_field(&mut meta, shaped(ev), door.nsec_mask, || {
-                                door.read()
+                    attach_record_pair(
+                        &events,
+                        &db,
+                        RecordPair {
+                            path: &cn.record_path,
+                            value_mask: (EventMask::VALUE | EventMask::LOG).bits(),
+                            filters: [&filters, &property_filters],
+                            dollar: render.dollar(),
+                            limit: PLAIN_QUEUE_LIMIT,
+                        },
+                        || {
+                            let mut meta = door.read()?;
+                            Some(move |ev| {
+                                plain_record_field(&mut meta, shaped(ev), door.nsec_mask, || {
+                                    door.read()
+                                })
                             })
                         },
-                    )))
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|(stream, _)| stream)
                 }
             }
         }
@@ -1649,6 +1676,154 @@ fn report_subscribe_refused(
     }
 }
 
+/// The source a [`PvDatabaseSource`]'s record monitors attach to: one
+/// `event_user` drained by one thread, pvxs's `qsrvSingle`
+/// (`ioc/singlesource.cpp:396-416`). A post wakes the drain only when it
+/// finds it parked; a private subscription per monitor made every post a
+/// wake of that monitor's reader.
+type RecordEvents = epics_base_rs::server::database::db_access::DbEventSource<RecordDelivery>;
+
+fn record_events() -> RecordEvents {
+    use epics_base_rs::runtime::task::{StackSizeClass, ThreadPriority};
+    epics_base_rs::server::database::db_access::DbEventSource::new(
+        "qsrvSingle",
+        ThreadPriority::Custom(17),
+        StackSizeClass::Medium,
+    )
+}
+
+/// The queue limit of a monitor opened through the plain `subscribe`, which
+/// negotiates none: pvxs's `MonitorOp::limit` default (`servermon.cpp:66`).
+const PLAIN_QUEUE_LIMIT: usize = 4;
+
+/// One record subscription's delivery on the [`RecordEvents`] drain.
+struct RecordDelivery(Box<dyn RecordSink>);
+
+trait RecordSink: Send + Sync {
+    fn deliver(&self, ev: MonitorEvent);
+    fn ended(&self);
+}
+
+impl epics_base_rs::server::database::db_access::EventDelivery for RecordDelivery {
+    fn deliver(&self, ev: MonitorEvent) -> impl std::future::Future<Output = ()> + Send {
+        self.0.deliver(ev);
+        std::future::ready(())
+    }
+
+    fn ended(&self) {
+        self.0.ended();
+    }
+}
+
+/// A monitor's transform, shared by its two halves: a property post must
+/// reach the value half's state. `None` until the monitor is set up.
+type SharedMap<T> =
+    Arc<parking_lot::Mutex<Option<Box<dyn FnMut(MonitorEvent) -> Option<T> + Send>>>>;
+
+/// One half of a record monitor: its entries through the shared transform
+/// into the monitor's ring. Each half holds its own producer endpoint, so
+/// the ring ends once both halves have.
+struct RingHalf<T> {
+    map: SharedMap<T>,
+    out: parking_lot::Mutex<Option<crate::server_native::shared_pv::MonitorOutbox<T>>>,
+}
+
+impl<T: crate::server_native::shared_pv::SquashTail + Send + 'static> RecordSink for RingHalf<T> {
+    fn deliver(&self, ev: MonitorEvent) {
+        let update = match self.map.lock().as_mut() {
+            Some(map) => map(ev),
+            None => None,
+        };
+        if let Some(update) = update
+            && let Some(out) = self.out.lock().as_ref()
+        {
+            out.post(update, false);
+        }
+    }
+
+    fn ended(&self) {
+        self.out.lock().take();
+    }
+}
+
+/// What [`attach_record_pair`] subscribes: the channel's record path, the
+/// value half's mask, the value and property chains, the `$` view and the
+/// ring's limit.
+struct RecordPair<'a> {
+    path: &'a str,
+    value_mask: u16,
+    filters: [&'a FilterChain; 2],
+    dollar: Option<DollarView>,
+    limit: usize,
+}
+
+/// pvxs's TWO subscriptions for one record channel, not their union
+/// (`singlesource.cpp:155-167`): the value half on `value_mask`, the
+/// property half on a bare `DBE_PROPERTY` whatever `DBE` said, each its own
+/// subscriber slot with its own `filters` chain, so a queued value post
+/// cannot swallow the metadata post behind it. Both feed one ring of
+/// `limit`, through the transform `setup` builds. Both halves attach
+/// disabled and are enabled once it is armed (`singlesource.cpp:147-180`),
+/// so the shared drain never waits on one subscribe's record read.
+fn attach_record_pair<T, F>(
+    events: &RecordEvents,
+    db: &PvDatabase,
+    pair: RecordPair<'_>,
+    setup: impl FnOnce() -> Option<F>,
+) -> Result<
+    Option<(
+        MonitorStream<T>,
+        [epics_base_rs::server::database::db_access::SubscriptionActivation; 2],
+    )>,
+    epics_base_rs::server::pv::SubscribeRefused,
+>
+where
+    T: crate::server_native::shared_pv::SquashTail + Send + 'static,
+    F: FnMut(MonitorEvent) -> Option<T> + Send + 'static,
+{
+    use crate::server_native::shared_pv::MonitorRing;
+    let RecordPair {
+        path,
+        value_mask,
+        filters,
+        dollar,
+        limit,
+    } = pair;
+    let (out, ring) = MonitorRing::bounded(limit);
+    let map: SharedMap<T> = Arc::default();
+    let half = |out| {
+        RecordDelivery(Box::new(RingHalf {
+            map: map.clone(),
+            out: parking_lot::Mutex::new(Some(out)),
+        }))
+    };
+    let mask = [
+        value_mask,
+        epics_base_rs::server::recgbl::EventMask::PROPERTY.bits(),
+    ];
+    let value = events.attach_disabled(
+        db,
+        path,
+        mask[0],
+        Some(filters[0]),
+        dollar,
+        half(out.clone()),
+    )?;
+    let property =
+        events.attach_disabled(db, path, mask[1], Some(filters[1]), dollar, half(out))?;
+    let Some(transform) = setup() else {
+        return Ok(None);
+    };
+    *map.lock() = Some(Box::new(transform));
+    value.enable();
+    property.enable();
+    let halves = [value.activation_handle(), property.activation_handle()];
+    Ok(Some((
+        MonitorStream::Ring(ring.holding([value, property])),
+        halves,
+    )))
+}
+
 /// pvxs's per-subscription `currentValue` (`singlesource.cpp:54-67`), kept
 /// as a ring so a post shares its value with the monitor queue instead of
 /// carrying a tree of its own: each event is filled in place into a slot no
@@ -1664,6 +1839,9 @@ fn report_subscribe_refused(
 /// from an event: a slot rewrites them only when it last held an older read.
 struct PostRing {
     meta: Snapshot,
+    /// The leaf set of each event class, for `meta`'s properties and the
+    /// last event's value kind.
+    marks: crate::nt::EventMarks,
     /// Bumped by every [`Self::set_meta`]; a slot carries the generation it
     /// was last given.
     meta_gen: u64,
@@ -1676,6 +1854,10 @@ struct PostRing {
 impl PostRing {
     fn new(queue_limit: u32, meta: Snapshot) -> Self {
         Self {
+            marks: crate::nt::EventMarks::new(
+                meta.properties,
+                matches!(meta.value, EpicsValue::Enum(_)),
+            ),
             meta,
             meta_gen: 1,
             shape: None,
@@ -1688,6 +1870,19 @@ impl PostRing {
     fn set_meta(&mut self, meta: Snapshot) {
         self.meta = meta;
         self.meta_gen += 1;
+    }
+
+    /// The leaves an event of `mask` on a value like `value` marks.
+    fn marks(
+        &mut self,
+        mask: epics_base_rs::server::recgbl::EventMask,
+        value: &EpicsValue,
+    ) -> Option<crate::server_native::Marks> {
+        let is_enum = matches!(value, EpicsValue::Enum(_));
+        if !self.marks.is_for(self.meta.properties, is_enum) {
+            self.marks = crate::nt::EventMarks::new(self.meta.properties, is_enum);
+        }
+        self.marks.get(mask).map(|set| Arc::clone(set).into())
     }
 
     fn post(&mut self, ev: &LogLeaves) -> crate::server_native::PostValue {
@@ -1764,8 +1959,8 @@ impl MetaDoor {
         }
     }
 
-    /// Takes the record's read lock for the read alone, on the monitor's
-    /// server task, which holds no other record lock.
+    /// Takes the record's read lock for the read alone, on the source's
+    /// drain or the subscribing task, neither holding another record lock.
     fn read(&self) -> Option<Snapshot> {
         record_snapshot(&self.db, &self.rec, &self.field, self.render, &self.filters)
     }
@@ -1793,14 +1988,7 @@ fn marked_update(
     }
     let mut held = None;
     let value = logged_value(&ev, &mut held, &mut read_meta)?;
-    let marked = crate::nt::event_leaves(
-        ev.mask(),
-        ring.meta.properties,
-        matches!(value, EpicsValue::Enum(_)),
-    );
-    if marked.is_empty() {
-        return None;
-    }
+    let marked = ring.marks(ev.mask(), value)?;
     Some(crate::server_native::source::MonitorUpdate {
         value: ring.post(&LogLeaves::of_event(&ev, value, nsec_mask)),
         marked: Some(marked),
@@ -2543,6 +2731,17 @@ mod tests {
         }
     }
 
+    /// The `name` sub-structure of the tree `snap` fills.
+    fn event_struct(snap: &Snapshot, name: &str) -> PvStructure {
+        let PvField::Structure(root) = snapshot_to_pv_field(snap) else {
+            panic!("an NT root");
+        };
+        match root.get_field(name) {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("{name} must be a structure, got {other:?}"),
+        }
+    }
+
     /// Names of `desc`'s immediate children, or panic if it is not a struct.
     fn child_names(desc: &FieldDesc) -> Vec<String> {
         let FieldDesc::Structure { fields, .. } = desc else {
@@ -2783,17 +2982,15 @@ mod tests {
     }
 
     #[test]
-    fn build_timestamp_uses_snapshot_acquisition_time_and_user_tag() {
+    fn fill_timestamp_uses_snapshot_acquisition_time_and_user_tag() {
         // pvxs `iocsource.cpp:240-248`: timeStamp carries the record's
         // acquisition time + userTag, not the serialization wall-clock.
         // Inject the exact (secs, nsec); a `SystemTime` rounds 123_456_789 to
-        // 100 ns on Windows before `build_timestamp` ever reads it.
+        // 100 ns on Windows before `fill_timestamp` ever reads it.
         let ts = WallTime::from_unix(1_700_000_000, 123_456_789);
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, ts);
         snap.user_tag = 42;
-        let PvField::Structure(t) = build_timestamp(snap.timestamp, snap.user_tag) else {
-            panic!("timeStamp must be a structure");
-        };
+        let t = event_struct(&snap, "timeStamp");
         assert!(matches!(
             scalar(&t, "secondsPastEpoch"),
             ScalarValue::Long(1_700_000_000)
@@ -3059,17 +3256,13 @@ mod tests {
     }
 
     #[test]
-    fn build_alarm_message_is_condition_string() {
+    fn fill_alarm_message_is_condition_string() {
         // pvxs `iocsource.cpp:226,236`: alarm.message is the condition
         // string for a non-zero status, "" for NO_ALARM.
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
         snap.alarm.status = alarm_status::HIHI_ALARM;
         snap.alarm.severity = 2;
-        let PvField::Structure(a) =
-            build_alarm(snap.alarm.status, snap.alarm.severity, &snap.alarm.amsg)
-        else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&snap, "alarm");
         assert!(matches!(
             scalar(&a, "message"),
             ScalarValue::String(s) if s == "HIHI"
@@ -3077,18 +3270,21 @@ mod tests {
 
         // NO_ALARM keeps an empty message.
         let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(a) = build_alarm(ok.alarm.status, ok.alarm.severity, &ok.alarm.amsg)
-        else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&ok, "alarm");
         assert!(matches!(
             scalar(&a, "message"),
             ScalarValue::String(s) if s.is_empty()
         ));
+
+        // A tree that held "HIHI" and is filled in place again with NO_ALARM
+        // serves "", not the old message's bytes.
+        let mut v = snapshot_to_pv_field(&snap);
+        fill_nt_event(&mut v, &LogLeaves::of_snapshot(&ok));
+        assert_eq!(v, snapshot_to_pv_field(&ok));
     }
 
     #[test]
-    fn build_alarm_prefers_carried_amsg_over_condition_string() {
+    fn fill_alarm_prefers_carried_amsg_over_condition_string() {
         // pvxs `iocsource.cpp:230-236`: a non-empty carried amsg wins over
         // the synthesized condition string. mbboDirect raises UDF with the
         // bespoke "UDFS" (`mbboDirectRecord.c:191`), so an undefined
@@ -3097,11 +3293,7 @@ mod tests {
         snap.alarm.status = alarm_status::UDF_ALARM;
         snap.alarm.severity = 3;
         snap.alarm.amsg = "UDFS".to_string();
-        let PvField::Structure(a) =
-            build_alarm(snap.alarm.status, snap.alarm.severity, &snap.alarm.amsg)
-        else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&snap, "alarm");
         assert!(
             matches!(scalar(&a, "message"), ScalarValue::String(s) if s == "UDFS"),
             "non-empty carried amsg must win over the UDF condition string"
@@ -3114,13 +3306,7 @@ mod tests {
         generic.alarm.status = alarm_status::UDF_ALARM;
         generic.alarm.severity = 3;
         assert!(generic.alarm.amsg.is_empty());
-        let PvField::Structure(a) = build_alarm(
-            generic.alarm.status,
-            generic.alarm.severity,
-            &generic.alarm.amsg,
-        ) else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&generic, "alarm");
         assert!(
             matches!(scalar(&a, "message"), ScalarValue::String(s) if s == "UDF"),
             "empty amsg must fall back to the condition string"
@@ -3128,25 +3314,18 @@ mod tests {
 
         // Empty amsg with NO_ALARM stays "".
         let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(a) = build_alarm(ok.alarm.status, ok.alarm.severity, &ok.alarm.amsg)
-        else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&ok, "alarm");
         assert!(matches!(scalar(&a, "message"), ScalarValue::String(s) if s.is_empty()));
     }
 
     #[test]
-    fn build_alarm_status_is_pva_class_not_raw_condition() {
+    fn fill_alarm_status_is_pva_class_not_raw_condition() {
         // pvxs `iocsource.cpp:187-223`: emit the alarm *class* (0–6), not
         // the raw EPICS condition. A `LINK_ALARM = 14` must surface as
         // class 3 (RECORD), never 14.
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
         snap.alarm.status = alarm_status::LINK_ALARM;
-        let PvField::Structure(a) =
-            build_alarm(snap.alarm.status, snap.alarm.severity, &snap.alarm.amsg)
-        else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&snap, "alarm");
         assert!(
             matches!(scalar(&a, "status"), ScalarValue::Int(3)),
             "LINK_ALARM (14) must map to status class 3 (RECORD)"
@@ -3560,6 +3739,27 @@ mod tests {
              rather than claimed and later failed with `field introspection \
              unavailable`"
         );
+
+        // Boundary: `$` on a field that does not take it. softIocPVX on
+        // `record(ai,"DL:AI")` / a DOUBLE waveform `DL:WF`: `pvxget DL:AI.VAL$`
+        // and `DL:WF.VAL$` → `Refused to create Channel`; `DL:AI.NOSUCH$` gets
+        // no answer.
+        db.add_record(
+            "DL:WF",
+            Box::new(
+                epics_base_rs::server::records::waveform::WaveformRecord::new(
+                    4,
+                    epics_base_rs::types::DbFieldType::Double,
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        for name in ["ORACLE:AI.VAL$", "DL:WF.VAL$"] {
+            assert!(src.searchable(name).await, "{name}");
+            assert!(!src.has_pv(name).await, "{name}");
+        }
+        assert!(!src.searchable("ORACLE:AI.NOSUCH$").await);
 
         // Boundary: a record that does not exist at all — neither gate.
         assert!(!src.searchable("NO:SUCH:RECORD").await);
@@ -4889,6 +5089,77 @@ ASG(DEFAULT) {
         }
     }
 
+    /// STOP takes both subscriptions off the record, so a post made while
+    /// stopped is never queued and RESUME delivers only the next post: pvxs
+    /// `onStart(false)` ⇒ `db_event_disable` (`singlesource.cpp:170-179`,
+    /// `dbEvent.c:524`), which unlinks the event from `mlis`.
+    #[epics_macros_rs::epics_test]
+    async fn a_stopped_record_monitor_drops_posts_until_resumed() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:GATE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:GATE",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let seed = source
+            .subscribe_seeded(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+        let gate = seed.on_start.expect("a record monitor carries a STOP gate");
+        let mut rx = seed.updates;
+        let put = |v: f64| {
+            let db = db.clone();
+            async move {
+                db.put_record_field_from_ca_no_notify("AI:GATE", "VAL", EpicsValue::Double(v))
+                    .await
+                    .expect("put");
+            }
+        };
+        let value = |u: crate::server_native::source::MonitorUpdate| match &*u.value {
+            PvField::Structure(top) => top.get_field("value").cloned(),
+            other => panic!("expected an NTScalar, got {other:?}"),
+        };
+        let quiet = std::time::Duration::from_millis(300);
+        let within = std::time::Duration::from_secs(2);
+
+        gate.set_active(true).await;
+        put(1.0).await;
+        let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+            .await
+            .expect("a started monitor posts")
+            .expect("open");
+        assert_eq!(value(u), Some(PvField::Scalar(ScalarValue::Double(1.0))));
+
+        gate.set_active(false).await;
+        put(2.0).await;
+        gate.set_active(true).await;
+        assert!(
+            epics_base_rs::runtime::task::timeout(quiet, rx.recv())
+                .await
+                .is_err(),
+            "a post made while stopped must not be delivered, on RESUME or after"
+        );
+
+        put(3.0).await;
+        let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+            .await
+            .expect("a resumed monitor posts")
+            .expect("open");
+        assert_eq!(value(u), Some(PvField::Scalar(ScalarValue::Double(3.0))));
+    }
+
     /// The record's post carries its raw stamp (`dbEvent.c:710`); the PVA
     /// monitor serves it split along the `Q:time:tag` mask its channel read
     /// once (pvxs `singlesrcsubscriptionctx.h:28-30`, `iocsource.cpp:239-248`).
@@ -4950,6 +5221,159 @@ ASG(DEFAULT) {
             scalar(ts, "userTag"),
             ScalarValue::Int(t) if t as u32 == raw.subsec_nanos() & mask
         ));
+    }
+
+    /// Every record monitor of one source attaches to its one `qsrvSingle`
+    /// drain (`singlesource.cpp:396-416`), which ends with the last monitor:
+    /// two monitors run one drain thread, and both see their own record.
+    #[epics_macros_rs::epics_test]
+    async fn record_monitors_share_the_sources_one_drain() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        for name in ["AI:A", "AI:B"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let mut streams = Vec::new();
+        for name in ["AI:A", "AI:B"] {
+            let checked = source
+                .access()
+                .check(
+                    name,
+                    &ctx.creds.host,
+                    &ctx.creds.account,
+                    &ctx.creds.method,
+                    "",
+                )
+                .await;
+            streams.push(
+                source
+                    .subscribe_checked_opts_marked(checked, ctx.clone(), Default::default())
+                    .await
+                    .expect("record subscribe"),
+            );
+        }
+        assert_eq!(source.events.live_drains(), 1, "two monitors, one drain");
+
+        for (name, v) in [("AI:A", 1.0), ("AI:B", 2.0)] {
+            db.put_record_field_from_ca_no_notify(name, "VAL", EpicsValue::Double(v))
+                .await
+                .expect("put");
+        }
+        for (rx, v) in streams.iter_mut().zip([1.0, 2.0]) {
+            let update =
+                epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("an update must post within 2s")
+                    .expect("stream open");
+            assert_eq!(
+                extract_put_value_leaf(&update.value),
+                Some(PvField::Scalar(ScalarValue::Double(v)))
+            );
+        }
+
+        drop(streams);
+        for _ in 0..200 {
+            if source.events.live_drains() == 0 {
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the drain outlived its last monitor");
+    }
+
+    /// A subscribe whose metadata read waits behind its record's writer holds
+    /// nothing the shared drain needs: both halves stay disabled until the
+    /// transform is armed (`singlesource.cpp:147-180`), so the record's post
+    /// queues nothing and a second monitor on the source still receives its.
+    #[epics_macros_rs::epics_test]
+    async fn a_subscribe_waiting_on_its_record_does_not_stall_the_drain() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use std::sync::mpsc::channel;
+
+        let db = Arc::new(PvDatabase::new());
+        for name in ["AI:A", "AI:B"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        // One set per record, as iocInit leaves two unlinked records.
+        db.build_lock_sets();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:B",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let mut b = source
+            .subscribe_checked_opts_marked(checked, ctx.clone(), Default::default())
+            .await
+            .expect("record subscribe");
+
+        let rec_a = db.get_record("AI:A").unwrap();
+        let (entered, entered_rx) = channel();
+        let (locked, locked_rx) = channel();
+        let (release, release_rx) = channel::<()>();
+        let (posted, posted_rx) = channel();
+        let subscriber = {
+            let (events, db, rec_a) = (source.events.clone(), db.clone(), rec_a.clone());
+            std::thread::spawn(move || {
+                let chain = FilterChain::new();
+                let stream = attach_record_pair(
+                    &events,
+                    &db,
+                    RecordPair {
+                        path: "AI:A",
+                        value_mask: (EventMask::VALUE | EventMask::ALARM).bits(),
+                        filters: [&chain, &chain],
+                        dollar: None,
+                        limit: 4,
+                    },
+                    || {
+                        entered.send(()).unwrap();
+                        locked_rx.recv().unwrap();
+                        // The GET-door read, behind the writer.
+                        drop(rec_a.read());
+                        Some(|_| None::<PvField>)
+                    },
+                );
+                assert!(matches!(stream, Ok(Some(_))));
+            })
+        };
+        let writer = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            let mut held = rec_a.write();
+            locked.send(()).unwrap();
+            held.notify_field("VAL", EventMask::VALUE);
+            posted.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        // AI:A's post is queued ahead of AI:B's.
+        posted_rx.recv().unwrap();
+        db.get_record("AI:B")
+            .unwrap()
+            .write()
+            .notify_field("VAL", EventMask::VALUE);
+        let update =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), b.recv())
+                .await
+                .map(|u| u.expect("stream open"));
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        subscriber.join().unwrap();
+        update.expect("AI:B's post must reach its monitor within 2s");
     }
 
     /// A metadata change reaches the client through the GET door, not the

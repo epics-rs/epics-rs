@@ -155,8 +155,10 @@ Per-monitor-subscriber spawn structure:
 ```
 
 `PvaServerConfig::monitor_queue_depth` (default 4) is the squash
-threshold; `monitor_high_watermark` (default 64) is the warning
-trigger surfaced via `tracing::warn`.
+threshold. Each op's deepest queue and squash count (pvxs `maxQueue`,
+`nSquash`) are in its channel's `ChannelReport::monitors`; nothing is
+logged. Each connection's writer task runs on the server's `PVASTX`
+executor (pvxs `PVXTCP`), apart from the `PVASTASK` monitor tasks.
 
 ## Auth + connection validation
 

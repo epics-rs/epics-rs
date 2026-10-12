@@ -1005,10 +1005,10 @@ impl EventUser {
             .lock()
             .try_attach(generation, sid, kind, context)
             .expect("a fresh queue must admit its first monitor");
+        // No wake: `ppendsem` is one slot for the whole chain, so a consumer
+        // parked before this queue existed is woken by its first post, and C's
+        // `db_add_event` signals nothing.
         ques.push(que.clone());
-        // A circuit consumer parked before this queue existed is registered on
-        // `firstque` only; re-poll it so it registers here too.
-        ques[0].wake_readers();
         (que, id)
     }
 
@@ -1036,6 +1036,24 @@ impl EventUser {
         // Every queue is parked on `cx`; the next wake is a new pass.
         chain.reading = 0;
         std::task::Poll::Pending
+    }
+
+    /// The context monitor `id` was attached with, for the consumer of its
+    /// [`CircuitEvent::Ended`]: the row outlives that report until the
+    /// monitor's [`EventReader`] drops.
+    pub fn context(&self, id: AttachId) -> Option<DeliveryContext> {
+        let chain = self
+            .ques
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        chain.ques.iter().find_map(|que| {
+            // Queues chained before and after `configure_events_per_que`
+            // can differ in slot count.
+            let q = que.lock();
+            (usize::from(id.slot()) < q.subs.len())
+                .then(|| q.sub(id).map(|sub| sub.context.clone()))
+                .flatten()
+        })
     }
 
     /// C `db_event_flow_ctrl_mode_on` — EVENTS_OFF. Posts now replace each
@@ -2090,8 +2108,9 @@ mod tests {
         assert!(circuit_now(&user).is_pending());
     }
 
-    /// A consumer parked before the quota chained a second queue is woken by
-    /// the chaining, and then drains `firstque` before `nextque`
+    /// A consumer parked before the quota chained a second queue is not woken
+    /// by the chaining (`db_add_event` `dbEvent.c:426-503`) but by the first
+    /// post on the new queue, and then drains `firstque` before `nextque`
     /// (`dbEvent.c:1056-1061`).
     #[epics_macros_rs::epics_test]
     async fn a_chained_queue_reaches_a_parked_consumer() {
@@ -2107,11 +2126,17 @@ mod tests {
             .collect();
         let woken = count.0.load(Ordering::SeqCst);
         let (late, _late_r) = attach(&user, cap as u32, LogKind::Val);
-        assert!(
-            count.0.load(Ordering::SeqCst) > woken,
-            "chaining a queue wakes the parked consumer"
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            woken,
+            "chaining a queue does not wake the parked consumer"
         );
         late.post(ev(99));
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            woken + 1,
+            "the first post on the chained queue wakes it"
+        );
         held[0].0.post(ev(1));
         assert_eq!(circuit_event(&user), (0, 1));
         assert_eq!(circuit_event(&user), (cap as u32, 99));

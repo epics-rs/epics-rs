@@ -195,6 +195,10 @@ pub struct MonitorOutbox<T = PvField> {
 /// carried by [`MonitorStream::Ring`](super::source::MonitorStream).
 pub struct MonitorRing<T = PvField> {
     shared: Arc<MonitorQueueShared<T>>,
+    /// What produces into this ring and must not outlive its reader: a
+    /// source whose producer is a drain shared with other rings (its
+    /// subscriptions) parks them here, so dropping the stream cancels them.
+    _producers: Option<Box<dyn Send + Sync>>,
 }
 
 /// The `PvField` ring — the shape `SharedPV` hands out. Kept as a named
@@ -230,6 +234,12 @@ impl<T> MonitorRing<T> {
     pub fn bounded(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
         make_monitor_queue(limit)
     }
+
+    /// This ring, owning `producers` until it drops.
+    pub fn holding(mut self, producers: impl Send + Sync + 'static) -> Self {
+        self._producers = Some(Box::new(producers));
+        self
+    }
 }
 
 fn make_monitor_queue<T>(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
@@ -255,7 +265,10 @@ fn make_monitor_queue<T>(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
         MonitorOutbox {
             shared: Arc::clone(&shared),
         },
-        MonitorRing { shared },
+        MonitorRing {
+            shared,
+            _producers: None,
+        },
     )
 }
 

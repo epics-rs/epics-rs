@@ -2076,14 +2076,16 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
 /// spawned ~2 forwarder tasks per member onto the shared callback pool, so
 /// the flood put O(members) task wakes per tick between the scalar
 /// monitor's events (16.9 s stalls on target); with the shared drain the
-/// group costs O(1) wakes per tick, and both channels — created through
-/// the provider, so the group rides the provider's shared pump — keep
-/// delivering with bounded latency while the flood runs.
+/// group costs O(1) wakes per tick, and both monitors — the group created
+/// through the provider so it rides the provider's shared pump, the scalar
+/// on `qsrvSingle` as served — keep delivering with bounded latency while
+/// the flood runs.
 #[tokio::test]
 async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::AnyChannel;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use epics_pva_rs::server_native::source::ChannelSource;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -2110,28 +2112,23 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
         .load_group_config(&format!(r#"{{ "TEST:floodgrp": {{ {members} }} }}"#))
         .expect("20-member group loads");
 
-    // Both monitors through the provider, so the group monitor registers
-    // with the provider's shared GroupPump — the as-deployed wiring.
-    let group_ch = provider
+    // The group monitor through the provider, so it registers with the
+    // provider's shared GroupPump — the as-deployed wiring.
+    let group_ch = match provider
         .create_channel_for("TEST:floodgrp", "u", "h")
         .await
-        .expect("group channel");
+        .expect("group channel")
+    {
+        AnyChannel::Group(ch) => ch,
+        other => panic!("expected a group channel, got {:?}", other.channel_name()),
+    };
     let mut group_mon = group_ch.create_monitor().await.expect("group monitor");
     group_mon.start().await.expect("group monitor starts");
 
-    let scalar_ch = match provider
-        .create_channel_for("TEST:flood_scalar", "u", "h")
+    let mut scalar_mon = epics_pva_rs::server::PvDatabaseSource::new(db.clone())
+        .subscribe("TEST:flood_scalar")
         .await
-        .expect("scalar channel")
-    {
-        AnyChannel::Single(ch) => ch,
-        other => panic!(
-            "expected a single-record channel, got {:?}",
-            other.channel_name()
-        ),
-    };
-    let mut scalar_mon = scalar_ch.create_monitor().await.expect("scalar monitor");
-    scalar_mon.start().await.expect("scalar monitor starts");
+        .expect("scalar monitor");
 
     // Flood every group member from a concurrent task until told to stop,
     // yielding per round so the current-thread runtime interleaves it with
@@ -2165,7 +2162,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
             rec.write()
                 .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
         }
-        tokio::time::timeout(Duration::from_secs(2), scalar_mon.poll())
+        tokio::time::timeout(Duration::from_secs(2), scalar_mon.recv())
             .await
             .unwrap_or_else(|_| {
                 panic!("scalar delivery stalled under the group flood (round {round})")
@@ -2184,7 +2181,6 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     assert!(rounds > 0, "the flood actually ran");
 
     group_mon.stop().await;
-    scalar_mon.stop().await;
 }
 
 /// pvxs pushes the built-in `record` Struct onto `groupMembersToAdd`

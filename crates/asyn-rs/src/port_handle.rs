@@ -59,18 +59,8 @@ use crate::user::AsynUser;
 /// needs no reactor and no timer, so a bare parking executor is both sufficient
 /// and incapable of panicking on a runtime-flavour check.
 fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
-    struct ParkWaker(std::thread::Thread);
-    impl Wake for ParkWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
     let mut fut = pin!(fut);
-    let waker = Waker::from(Arc::new(ParkWaker(std::thread::current())));
+    let waker = crate::runtime::task::current_thread_waker();
     let mut cx = Context::from_waker(&waker);
     loop {
         // Polled before the deadline is consulted, so a reply that landed

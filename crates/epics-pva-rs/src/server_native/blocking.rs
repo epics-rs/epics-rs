@@ -221,26 +221,40 @@ pub(super) const PVA_SERVER_PRIORITY: ThreadPriority = ThreadPriority::Custom(18
 /// sat one ladder over from where the rest of it runs and shared its rings
 /// with record tails.
 ///
-/// One worker: the reactor driver's whole claim is that connections cost no
-/// thread, and its futures never block (every socket is a `ReadyStream`). The
-/// blocking driver's per-connection threads are unaffected — this carries the
-/// tasks those threads spawn, the writer task above all.
+/// One worker each: the reactor driver's whole claim is that connections cost
+/// no thread, and its futures never block (every socket is a `ReadyStream`).
+/// The blocking driver's per-connection threads are unaffected — this carries
+/// the tasks those threads spawn.
+///
+/// A server starts two: [`PVA_TASK_EXECUTOR`] for the connection and monitor
+/// tasks, [`PVA_WRITER_EXECUTOR`] for the connections' writer tasks. One scan
+/// pass wakes a monitor task per subscription, and on one FIFO worker a writer
+/// woken by the first frame waited behind all of them.
 ///
 /// `None` on `tokio_backend`: there the runtime is the executor and its band
 /// is the runtime's, so an executor here would be a thread nothing uses.
 #[cfg(exec_backend)]
-pub(super) fn pva_task_executor()
--> std::io::Result<Option<std::sync::Arc<epics_base_rs::runtime::background::DedicatedExecutor>>> {
-    epics_base_rs::runtime::background::DedicatedExecutor::new("PVASTASK", PVA_SERVER_PRIORITY, 1)
+pub(super) fn pva_executor(
+    name: &str,
+) -> std::io::Result<Option<std::sync::Arc<epics_base_rs::runtime::background::DedicatedExecutor>>>
+{
+    epics_base_rs::runtime::background::DedicatedExecutor::new(name, PVA_SERVER_PRIORITY, 1)
         .map(|e| Some(std::sync::Arc::new(e)))
 }
 
 /// See the `exec_backend` twin: on this backend there is no band to choose.
 #[cfg(tokio_backend)]
-pub(super) fn pva_task_executor()
--> std::io::Result<Option<std::sync::Arc<epics_base_rs::runtime::background::DedicatedExecutor>>> {
+pub(super) fn pva_executor(
+    _name: &str,
+) -> std::io::Result<Option<std::sync::Arc<epics_base_rs::runtime::background::DedicatedExecutor>>>
+{
     Ok(None)
 }
+
+/// [`pva_executor`]'s name for the connection and monitor tasks.
+pub(super) const PVA_TASK_EXECUTOR: &str = "PVASTASK";
+/// [`pva_executor`]'s name for the writer tasks (pvxs `PVXTCP`).
+pub(super) const PVA_WRITER_EXECUTOR: &str = "PVASTX";
 
 /// The EPICS priority the UDP SEARCH responder runs at — deliberately **not**
 /// [`PVA_SERVER_PRIORITY`].
@@ -659,10 +673,11 @@ pub struct BlockingPvaServer {
     /// [`shutdown`](Self::shutdown) order, so its `Stop`s never queue behind a
     /// live connection.
     conn_pool: WorkerPool<3>,
-    /// The executor connection futures spawn onto — see
-    /// [`pva_task_executor`]. `None` on
-    /// `tokio_backend`, where the runtime is the executor.
+    /// The executors connection futures and writer tasks spawn onto — see
+    /// [`pva_executor`]. `None` on `tokio_backend`, where the runtime is the
+    /// executor.
     task_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
+    writer_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
     shutdown: AtomicBool,
 }
 
@@ -754,7 +769,8 @@ impl BlockingPvaServer {
         let max_connections = config.max_connections;
         // Started here for the reason the worker pool is: a server that cannot
         // run its connections' tasks is a `bind` failure.
-        let task_exec = pva_task_executor()?;
+        let task_exec = pva_executor(PVA_TASK_EXECUTOR)?;
+        let writer_exec = pva_executor(PVA_WRITER_EXECUTOR)?;
         Ok(Self {
             listener,
             source,
@@ -769,6 +785,7 @@ impl BlockingPvaServer {
             // the connection limit — admission refuses past it.
             conn_pool: WorkerPool::new("PVAS", connection_roster(), max_connections),
             task_exec,
+            writer_exec,
             shutdown: AtomicBool::new(false),
         })
     }
@@ -831,6 +848,17 @@ impl BlockingPvaServer {
         reactor: &epics_base_rs::runtime::task::Reactor,
     ) -> epics_base_rs::runtime::task::Reactor {
         match &self.task_exec {
+            Some(exec) => reactor.with_executor(exec),
+            None => reactor.clone(),
+        }
+    }
+
+    /// `reactor` bound to this server's writer executor (see [`pva_executor`]).
+    fn writer_reactor(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+    ) -> epics_base_rs::runtime::task::Reactor {
+        match &self.writer_exec {
             Some(exec) => reactor.with_executor(exec),
             None => reactor.clone(),
         }
@@ -980,6 +1008,7 @@ impl BlockingPvaServer {
             x509_identity: None,
             channel_invalidator: invalidator,
             tx_limit_bytes: tx_limit_bytes(&stream),
+            writer_reactor: self.writer_reactor(reactor),
         };
         let conn_reactor = reactor.clone();
         conn_worker.run_detached(format!("PVA connection {peer}"), move || {
@@ -1580,6 +1609,7 @@ pub(super) mod tests {
                         x509_identity: None,
                         channel_invalidator: ChannelInvalidator::new(),
                         tx_limit_bytes: TX_LIMIT_FALLBACK,
+                        writer_reactor: crate::test_reactor(),
                     },
                     &registry,
                 )
@@ -1894,6 +1924,7 @@ pub(super) mod tests {
                 x509_identity: None,
                 channel_invalidator: ChannelInvalidator::new(),
                 tx_limit_bytes: TX_LIMIT_FALLBACK,
+                writer_reactor: crate::test_reactor(),
             },
             &ConnRegistry::new(),
         )
@@ -2597,7 +2628,7 @@ pub(super) mod tests {
     /// same accessor `serve` uses.
     ///
     /// pvxs runs its TCP acceptor and connection reactor at `CAServerLow-2`;
-    /// before `pva_task_executor` the accept loop honoured that and every
+    /// before `pva_executor` the accept loop honoured that and every
     /// future it spawned went to the callback pool's middle band instead.
     #[cfg(exec_backend)]
     #[test]
@@ -2623,6 +2654,41 @@ pub(super) mod tests {
             "PVASTASK",
         );
         server.shutdown();
+    }
+
+    /// A queued frame reaches the socket while the task executor is busy.
+    /// One scan pass wakes a monitor task per subscription, and with the
+    /// writer on the same FIFO worker the first frame of the burst waited
+    /// for every one of them. Here the task worker is held outright: the
+    /// connection's first frame must still arrive.
+    #[cfg(exec_backend)]
+    #[test]
+    fn a_frame_reaches_the_peer_while_the_task_executor_is_busy() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        let (server, accept) = start_server(isolated_config());
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        server.conn_reactor(&harness_reactor()).spawn(async move {
+            held_tx.send(()).expect("held");
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the task worker is held");
+
+        let mut client = TcpStream::connect(server.local_addr().expect("addr")).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("read timeout");
+        let mut header = [0u8; crate::proto::PvaHeader::SIZE];
+        let read = client.read_exact(&mut header);
+        release_tx.send(()).expect("release the task worker");
+        read.expect("the first frame arrives while PVASTASK is held");
+        assert_eq!(header[0], 0xCA, "a PVA frame");
+
+        drop(client);
+        stop_and_join(&server, accept);
     }
 
     fn start_server(config: PvaServerConfig) -> (Arc<BlockingPvaServer>, thread::JoinHandle<()>) {

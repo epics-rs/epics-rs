@@ -27,6 +27,8 @@ use epics_base_rs::server::ioc_app::{GroupLoadRequest, IocApplication};
 use epics_bridge_rs::qsrv::run_qsrv_ioc_app;
 #[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::CompositeSource;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -110,6 +112,10 @@ async fn run(args: Args) -> Result<(), String> {
         .collect();
     let port = args.port;
     run_qsrv_ioc_app(app, group_files, move |config, mount| async move {
+        let composite = CompositeSource::new();
+        mount
+            .install_channel_sources(&config.db, &composite)
+            .map_err(CaError::InvalidValue)?;
         PvaServer::from_parts(
             config.db,
             port,
@@ -117,7 +123,7 @@ async fn run(args: Args) -> Result<(), String> {
             config.autosave_config,
             config.autosave_manager,
         )
-        .run_with_source(mount.store)
+        .run_with_source(composite)
         .await
         .map_err(|e| CaError::InvalidValue(e.to_string()))
     })

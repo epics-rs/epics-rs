@@ -989,15 +989,9 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
             }
         }
         (FieldDesc::Structure { fields, .. }, PvField::Structure(s)) => {
-            for (name, child_desc) in fields {
-                let child_val = s
-                    .get_field(name)
-                    .cloned()
-                    .unwrap_or_else(|| default_value_for(child_desc));
-                encode_pv_field(&child_val, child_desc, order, out);
-            }
+            encode_structure_fields(s, fields, order, out);
         }
-        (FieldDesc::StructureArray { struct_id, fields }, PvField::StructureArray(items)) => {
+        (FieldDesc::StructureArray { fields, .. }, PvField::StructureArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
             // each element is preceded by a presence byte —
             // 0x00 for a null (absent) element, 0x01 followed by the
@@ -1009,16 +1003,12 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
             // body carries no id of its own — synthesizing the descriptor
             // from the value's `struct_id` only masked a mismatch that
             // `value_matches_descriptor` now rejects on checked paths.
-            let element_desc = FieldDesc::Structure {
-                struct_id: struct_id.clone(),
-                fields: fields.clone(),
-            };
             for s in items {
                 match s {
                     None => out.put_u8(0x00),
                     Some(s) => {
                         out.put_u8(0x01);
-                        encode_pv_field(&PvField::Structure(s.clone()), &element_desc, order, out);
+                        encode_structure_fields(s, fields, order, out);
                     }
                 }
             }
@@ -1521,6 +1511,22 @@ pub fn changed_bitset_paths(desc: &FieldDesc, changed: &crate::proto::BitSet) ->
     out
 }
 
+/// `s`'s fields in `fields`' order, by reference; a field `s` lacks encodes
+/// as its descriptor default.
+fn encode_structure_fields(
+    s: &PvStructure,
+    fields: &[(String, FieldDesc)],
+    order: ByteOrder,
+    out: &mut Vec<u8>,
+) {
+    for (name, child_desc) in fields {
+        match s.get_field(name) {
+            Some(v) => encode_pv_field(v, child_desc, order, out),
+            None => encode_pv_field(&default_value_for(child_desc), child_desc, order, out),
+        }
+    }
+}
+
 /// Encode the value bytes for `value` consulting `bitset` to know which
 /// fields to emit. Mirrors pvxs `to_wire_valid(buf, value)`.
 ///
@@ -1581,21 +1587,19 @@ pub fn encode_pv_field_with_bitset(
             // Recurse into each child; emit only set ones.
             let mut child_bit = bit_offset + 1;
             for (name, child_desc) in fields {
+                let missing;
                 let child_value = match value {
-                    PvField::Structure(s) => s
-                        .get_field(name)
-                        .cloned()
-                        .unwrap_or_else(|| default_value_for(child_desc)),
-                    _ => default_value_for(child_desc),
+                    PvField::Structure(s) => s.get_field(name),
+                    _ => None,
                 };
-                encode_pv_field_with_bitset(
-                    &child_value,
-                    child_desc,
-                    bitset,
-                    child_bit,
-                    order,
-                    out,
-                );
+                let child_value = match child_value {
+                    Some(v) => v,
+                    None => {
+                        missing = default_value_for(child_desc);
+                        &missing
+                    }
+                };
+                encode_pv_field_with_bitset(child_value, child_desc, bitset, child_bit, order, out);
                 child_bit += child_desc.total_bits();
             }
         }

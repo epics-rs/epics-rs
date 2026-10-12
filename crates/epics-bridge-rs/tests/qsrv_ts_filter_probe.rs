@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
+use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
@@ -70,7 +70,7 @@ async fn a_ts_value_mode_serves_its_probe_type_and_options() {
         .build()
         .await
         .unwrap();
-    let provider = Arc::new(BridgeProvider::new(db));
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
     provider.load_group_config(GROUP).expect("load group");
     assert_eq!(provider.process_groups().await, 1);
 
@@ -80,11 +80,19 @@ async fn a_ts_value_mode_serves_its_probe_type_and_options() {
         ..PvaServerConfig::isolated()
     };
     let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, cfg.tcp_port));
-    let source = QsrvPvStore::new(
+    let store = QsrvPvStore::new(
         epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
         provider,
     );
-    let _server = PvaServer::start(Arc::new(source), cfg).expect("qsrv server starts");
+    let composite = epics_pva_rs::server_native::CompositeSource::new();
+    QsrvMount {
+        store: Arc::new(store),
+        enabled: true,
+        acf: epics_base_rs::server::access_security::new_acf_cell(None),
+    }
+    .install_channel_sources(&db, &composite)
+    .expect("qsrv sources mount");
+    let _server = PvaServer::start(composite, cfg).expect("qsrv server starts");
     let client = PvaClient::builder()
         .server_addr(addr)
         .timeout(Duration::from_secs(5))

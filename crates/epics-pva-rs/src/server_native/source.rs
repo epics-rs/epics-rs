@@ -1948,7 +1948,7 @@ pub struct MonitorUpdate {
     pub value: PostValue,
     /// Explicit changed field paths, or `None` to let the server
     /// derive the changed-bitset.
-    pub marked: Option<Vec<String>>,
+    pub marked: Option<Marks>,
     /// When `true`, this event signals an upstream **descriptor
     /// change** — a subscription boundary, not a value. `value`/`marked`
     /// are meaningless and MUST NOT be encoded under the monitor's
@@ -2039,6 +2039,70 @@ impl From<Arc<PvField>> for PostValue {
     }
 }
 
+/// A post's marked paths: handed over by its producer, or one of the sets a
+/// subscription fixed at subscribe. The server keys its wire changed-bitset
+/// on a `Shared` set's identity, so a set shared across posts is resolved
+/// against the descriptor once, not once per post.
+#[derive(Debug, Clone)]
+pub enum Marks {
+    Owned(Vec<String>),
+    Shared(Arc<[String]>),
+}
+
+impl Marks {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v.to_vec(),
+        }
+    }
+
+    /// Whether `self` and `other` are one shared set.
+    pub fn same_set(&self, other: &Self) -> bool {
+        matches!((self, other), (Self::Shared(a), Self::Shared(b)) if Arc::ptr_eq(a, b))
+    }
+}
+
+impl std::ops::Deref for Marks {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v,
+        }
+    }
+}
+
+impl PartialEq for Marks {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<String>> for Marks {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        **self == **other
+    }
+}
+
+impl From<Vec<String>> for Marks {
+    fn from(v: Vec<String>) -> Self {
+        Self::Owned(v)
+    }
+}
+
+impl FromIterator<String> for Marks {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        Self::Owned(iter.into_iter().collect())
+    }
+}
+
+impl From<Arc<[String]>> for Marks {
+    fn from(v: Arc<[String]>) -> Self {
+        Self::Shared(v)
+    }
+}
+
 impl MonitorUpdate {
     /// A descriptor-change boundary marker. Carries a placeholder value
     /// that consumers MUST NOT encode — the decoded monitor loop emits
@@ -2091,16 +2155,18 @@ impl crate::server_native::shared_pv::SquashTail for MonitorUpdate {
         let lost = self.marked.take();
         let both = match (&lost, &newer.marked) {
             (Some(a), Some(b)) => a.iter().filter(|p| b.contains(p)).cloned().collect(),
-            (None, Some(b)) => b.clone(),
-            (Some(a), None) => a.clone(),
+            (None, Some(b)) => b.to_vec(),
+            (Some(a), None) => a.to_vec(),
             (None, None) => Vec::new(),
         };
         union_paths(&mut self.overrun, &newer.overrun);
         union_paths(&mut self.overrun, &both);
         self.marked = match (lost, newer.marked) {
-            (Some(mut a), Some(b)) => {
+            (Some(a), Some(b)) if a.same_set(&b) => Some(a),
+            (Some(a), Some(b)) => {
+                let mut a = a.into_vec();
                 union_paths(&mut a, &b);
-                Some(a)
+                Some(a.into())
             }
             _ => None,
         };
@@ -2157,7 +2223,7 @@ impl From<SourceRead> for MonitorUpdate {
     fn from(read: SourceRead) -> Self {
         Self {
             value: read.value.into(),
-            marked: read.marked,
+            marked: read.marked.map(Marks::from),
             type_changed: false,
             overrun: Vec::new(),
         }
@@ -2385,88 +2451,9 @@ enum UpstreamSub<T> {
         epics_base_rs::server::database::db_access::DbSubscription,
         UpstreamMap<T>,
     ),
-    /// pvxs's TWO record subscriptions for one single-record channel —
-    /// `ioc/singlesource.cpp:155-167`, under the comment "Two subscription
-    /// are made for pvxs": the value half on the client's resolved `DBE`
-    /// and the property half on a bare `DBE_PROPERTY`, each on its own
-    /// `dbChannel` (`pPropertiesChannel`, built from the same channel name
-    /// at `singlesrcsubscriptionctx.cpp:24`) and therefore its own event
-    /// queue.
-    ///
-    /// The separation is load-bearing, not cosmetic. A by-reference
-    /// channel's subscriber queue latches latest-only
-    /// (`event_queue.rs:436-438`), so a single union subscription collapses
-    /// an arriving `DBE_PROPERTY` post onto the value post already queued
-    /// and the client is told about the metadata change only as extra
-    /// marks on a value update — or, when the value stream is busy, not at
-    /// all. Two queues cannot do that to each other.
-    DbPair {
-        value: epics_base_rs::server::database::db_access::DbSubscription,
-        property: epics_base_rs::server::database::db_access::DbSubscription,
-        map: UpstreamMap<T>,
-    },
     /// Read through `PvSubscription::recv_snapshot`, which reads the PV's
     /// metadata at delivery as `dbGet` does; the event carries none.
     Pv(epics_base_rs::server::pv::PvSubscription, DeliveredMap<T>),
-}
-
-/// Take the next event from either half of a split subscription, value
-/// half first.
-///
-/// The property half needs no mask rewrite, where pvxs's property callback
-/// passes `UpdateType::Property` unconditionally (`singlesource.cpp:100`):
-/// an event's mask is the post narrowed to the subscriber's own select
-/// (`Subscriber::delivered_mask`), and this subscriber's select IS
-/// `DBE_PROPERTY`, so the class is right by construction.
-///
-/// `None` only once BOTH halves have closed — one closed half leaves the
-/// monitor running on the other, as pvxs's two independent subscriptions
-/// do.
-async fn recv_pair(
-    value: &mut epics_base_rs::server::database::db_access::DbSubscription,
-    property: &mut epics_base_rs::server::database::db_access::DbSubscription,
-) -> Option<epics_base_rs::server::pv::MonitorEvent> {
-    use std::task::Poll;
-    std::future::poll_fn(|cx| {
-        let mut open = false;
-        match value.poll_recv_event(cx) {
-            Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
-            Poll::Ready(None) => {}
-            Poll::Pending => open = true,
-        }
-        match property.poll_recv_event(cx) {
-            Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
-            Poll::Ready(None) => {}
-            Poll::Pending => open = true,
-        }
-        if open {
-            Poll::Pending
-        } else {
-            Poll::Ready(None)
-        }
-    })
-    .await
-}
-
-/// [`recv_pair`]'s poll-free twin, with the same value-first order and the
-/// same both-halves rule for `Disconnected`.
-fn try_recv_pair(
-    value: &mut epics_base_rs::server::database::db_access::DbSubscription,
-    property: &mut epics_base_rs::server::database::db_access::DbSubscription,
-) -> Result<epics_base_rs::server::pv::MonitorEvent, epics_base_rs::server::event_queue::TryRecvError>
-{
-    use epics_base_rs::server::event_queue::TryRecvError as QueueErr;
-    let value_err = match value.try_recv_event() {
-        Ok(ev) => return Ok(ev),
-        Err(e) => e,
-    };
-    match property.try_recv_event() {
-        Ok(ev) => Ok(ev),
-        Err(QueueErr::Disconnected) if matches!(value_err, QueueErr::Disconnected) => {
-            Err(QueueErr::Disconnected)
-        }
-        Err(_) => Err(QueueErr::Empty),
-    }
 }
 
 /// `epics-base-rs`'s event queue defines its own `TryRecvError` mirror
@@ -2495,26 +2482,6 @@ impl<T> UpstreamMonitor<T> {
         }
     }
 
-    /// Serve a PVA monitor off pvxs's PAIR of record subscriptions — the
-    /// client's `DBE` value half and the unconditional `DBE_PROPERTY` half
-    /// (`singlesource.cpp:155-167`). Both feed the same per-event
-    /// transform: the class each event carries is its own subscriber's,
-    /// so one `map` classifies both halves without asking which one woke.
-    pub fn from_db_pair(
-        value: epics_base_rs::server::database::db_access::DbSubscription,
-        property: epics_base_rs::server::database::db_access::DbSubscription,
-        map: impl FnMut(epics_base_rs::server::pv::MonitorEvent) -> Option<T> + Send + 'static,
-    ) -> Self {
-        Self {
-            upstream: UpstreamSub::DbPair {
-                value,
-                property,
-                map: Box::new(map),
-            },
-            seed: None,
-        }
-    }
-
     /// Serve a PVA monitor straight off a `ProcessVariable` subscription.
     pub fn from_pv(
         sub: epics_base_rs::server::pv::PvSubscription,
@@ -2539,11 +2506,6 @@ impl<T> UpstreamMonitor<T> {
         loop {
             let mapped = match &mut self.upstream {
                 UpstreamSub::Db(s, map) => map(s.recv_event().await?),
-                UpstreamSub::DbPair {
-                    value,
-                    property,
-                    map,
-                } => map(recv_pair(value, property).await?),
                 UpstreamSub::Pv(s, map) => map(s.recv_snapshot().await?),
             };
             if let Some(v) = mapped {
@@ -2559,11 +2521,6 @@ impl<T> UpstreamMonitor<T> {
         loop {
             let mapped = match &mut self.upstream {
                 UpstreamSub::Db(s, map) => map(s.try_recv_event().map_err(from_queue_err)?),
-                UpstreamSub::DbPair {
-                    value,
-                    property,
-                    map,
-                } => map(try_recv_pair(value, property).map_err(from_queue_err)?),
                 UpstreamSub::Pv(s, map) => map(s.try_recv_snapshot().map_err(from_queue_err)?),
             };
             if let Some(v) = mapped {

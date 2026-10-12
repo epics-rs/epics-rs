@@ -17,7 +17,8 @@
 //!   into it to resolve channel names and create channels.
 //! - [`BridgeChannel`] serves single-record PVs (NTScalar, NTEnum, NTScalarArray).
 //! - [`GroupChannel`] serves multi-record composite PVs from JSON config.
-//! - [`BridgeMonitor`] / [`GroupMonitor`] bridge `DbSubscription` events to PVA monitor updates.
+//! - [`GroupMonitor`] bridges `DbSubscription` events to PVA monitor updates;
+//!   single records are monitored through `qsrvSingle` ([`QsrvMount::install_sources`]).
 //!
 //! The `ChannelProvider`, `Channel`, and `PvaMonitor` traits are defined in
 //! this module. [`pva_adapter::QsrvPvStore`] bridges them to the native
@@ -29,7 +30,6 @@ pub mod group;
 pub mod group_config;
 pub(crate) mod group_pump;
 pub mod iocsh;
-pub mod monitor;
 pub mod provider;
 pub(crate) mod put_status;
 #[cfg(feature = "qsrv-core")]
@@ -38,9 +38,8 @@ pub mod pvif;
 pub(crate) mod trap_write;
 
 pub use channel::{BridgeChannel, ProcessMode, PutOptions};
-pub use group::{AnyMonitor, GroupChannel, GroupMonitor};
+pub use group::{GroupChannel, GroupMonitor};
 pub use group_config::GroupPvDef;
-pub use monitor::BridgeMonitor;
 pub use provider::{
     AccessContext, AccessControl, AcfAccessControl, AllowAllAccess, AnyChannel, BridgeProvider,
     Channel, ChannelProvider, ClientCreds, PvaMonitor, WriteGrant,

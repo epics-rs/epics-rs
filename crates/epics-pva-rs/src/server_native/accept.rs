@@ -166,6 +166,7 @@ pub async fn run_tcp_server_on_listener(
                 let peers_for_task = peers.clone();
                 let conn_invalidator = channel_invalidator.clone();
                 let conn_reactor = reactor.clone();
+                let writer_reactor = reactor.clone();
                 conn_tasks.spawn(async move {
                     // declared first so it drops last: every `return` below
                     // and any panic unwinding out of the connection body
@@ -319,6 +320,7 @@ pub async fn run_tcp_server_on_listener(
                                             x509_identity: x509_id,
                                             channel_invalidator: conn_invalidator,
                                             tx_limit_bytes,
+                                            writer_reactor,
                                         },
                                     )
                                     .await
@@ -353,6 +355,7 @@ pub async fn run_tcp_server_on_listener(
                                     x509_identity: None,
                                     channel_invalidator: conn_invalidator,
                                     tx_limit_bytes,
+                                    writer_reactor,
                                 },
                             )
                             .await

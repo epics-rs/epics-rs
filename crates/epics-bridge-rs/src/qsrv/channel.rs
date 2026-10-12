@@ -14,7 +14,6 @@ use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, convert};
 use epics_pva_rs::server_native::source::RemoteLog;
 
 use super::group_config::GroupMember;
-use super::monitor::BridgeMonitor;
 use super::provider::Channel;
 use super::pvif::{
     self, NtType, View, build_field_desc_for_nt, pv_structure_to_epics, snapshot_to_pv_structure,
@@ -309,6 +308,39 @@ impl MemberChannel {
         Some(view.read_snapshot(snap, &self.value_filters))
     }
 
+    /// Serve a value event's `log` over this member's `snap`, as pvxs reads
+    /// the triggering member through its `pDbFieldLog`
+    /// (`groupsource.cpp:338-340`). The log already ran this member's chain
+    /// and `$` render on the drain, and its stamp is raw.
+    pub(super) fn write_log_over(
+        &self,
+        snap: &mut epics_base_rs::server::snapshot::Snapshot,
+        log: &epics_base_rs::server::pv::MonitorEvent,
+        instance: &epics_base_rs::server::record::RecordInstance,
+        view: View,
+    ) {
+        let served = self.log_value(log, view);
+        log.write_log_over(snap);
+        if let Some(value) = served {
+            snap.value = value;
+        }
+        epics_base_rs::server::snapshot::apply_nsec_mask(snap, instance.qtime_nsec_mask());
+    }
+
+    /// The value a value event's `log` serves under `view`; `None` for a
+    /// log that holds none.
+    pub(super) fn log_value(
+        &self,
+        log: &epics_base_rs::server::pv::MonitorEvent,
+        view: View,
+    ) -> Option<epics_base_rs::types::EpicsValue> {
+        let value = log.value().as_value()?.clone();
+        Some(match view {
+            View::Field => value,
+            View::Dollar(dollar) => dollar.text(value),
+        })
+    }
+
     /// The NT this member serves — the port's `getChannelValueType` asked
     /// with this member's view, so a `$` member is the same long string on
     /// the group surface as on the single-record one.
@@ -360,16 +392,6 @@ impl std::fmt::Debug for MemberChannel {
     }
 }
 
-/// `dbIsValueField(dbChannelFldDes(chan))` for a QSRV channel name (single
-/// channel) or a group member's `+channel` — the fact QSRV's
-/// `IOCSource::initialize` gates `display.form.index` on
-/// (`iocsource.cpp:54`). Peels the filter suffix and `$` modifier first, so
-/// `REC.VAL{"dbnd":…}` and `REC` are VAL while `REC.RVAL` is not.
-pub(super) fn channel_is_value_field(name: &str) -> bool {
-    let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
-    epics_base_rs::server::database::is_value_field(&cn.field)
-}
-
 /// A PVA channel backed by a single EPICS database record.
 ///
 /// a channel binds to `record.FIELD`, not just `record`.
@@ -408,16 +430,6 @@ pub struct BridgeChannel {
     /// [`FilterChain::apply_to_read_value`](epics_base_rs::server::database::filters::FilterChain::apply_to_read_value). PUT writes the raw value
     /// (filters are read-side only).
     channel_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
-    /// An INDEPENDENT re-parse of the same channel-filter suffix, for the
-    /// monitor's PROPERTY subscription. pvxs builds `pPropertiesChannel`
-    /// from `dbChannelName(sInfo->chan)` — the same filtered channel name
-    /// (`singlesrcsubscriptionctx.cpp:24`) — so both the value and property
-    /// dbChannels carry the client's filter, each with its own state
-    /// (`dbChannelCreate` re-parses the suffix per channel,
-    /// `dbChannel.c:471`). Held separately from `channel_filters` so a
-    /// stateful filter (`dbnd` last-sent, `dec` counter) on the value
-    /// subscription never shares state with the property subscription.
-    property_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// Access control context — checked on every get/put.
     access: super::provider::AccessContext,
 }
@@ -444,9 +456,6 @@ impl BridgeChannel {
             channel_filters: std::sync::Arc::new(
                 epics_base_rs::server::database::filters::FilterChain::new(),
             ),
-            property_filters: std::sync::Arc::new(
-                epics_base_rs::server::database::filters::FilterChain::new(),
-            ),
             access: super::provider::AccessContext::allow_all(),
         }
     }
@@ -467,16 +476,11 @@ impl BridgeChannel {
     /// also peels off any trailing pvxs channel-filter JSON
     /// suffix (e.g. `test:ai.VAL{"dbnd":{"d":0.0}}`) via
     /// `split_channel_name` before record/field resolution, and
-    /// stashes the parsed filter chain on the channel so the next
-    /// `create_monitor` attaches it to the subscription.
+    /// stashes the parsed filter chain on the channel for GET.
     pub async fn new(db: Arc<PvDatabase>, name: &str) -> BridgeResult<Self> {
         use epics_base_rs::server::database::filters::{ChannelCreateError, db_channel_create};
-        // Two `dbChannelCreate`s, as pvxs makes them: one for the value
-        // subscription and GET (`channel_filters`), one for the monitor's
-        // PROPERTY subscription (`singlesrcsubscriptionctx.cpp:24`), so a
-        // stateful `dbnd`/`dec` on one never sees the other's events. A NULL
-        // channel refuses the create (`dbChannel.c:513-529`).
-        let create = || {
+        // A NULL channel refuses the create (`dbChannel.c:513-529`).
+        let value = {
             db_channel_create(&db, name).map_err(|e| match e {
                 ChannelCreateError::Filter(e) => BridgeError::ChannelFilterError(e.to_string()),
                 ChannelCreateError::NotFound => {
@@ -493,13 +497,10 @@ impl BridgeChannel {
                         },
                     }
                 }
-            })
+            })?
         };
-        let value = create()?;
-        let property = create()?;
         let parsed = value.name;
         let channel_filters = std::sync::Arc::new(value.chain);
-        let property_filters = std::sync::Arc::new(property.chain);
         // The `$` modifier (C `dbChannel.c:486-505`) is innermost in the
         // channel name (`REC.FIELD$[range]{json}`); `split_channel_name` has
         // already peeled `{json}` and `[range]`, and the parse peels the `$`.
@@ -586,7 +587,6 @@ impl BridgeChannel {
             nt_type,
             value_dbf,
             channel_filters,
-            property_filters,
             access: super::provider::AccessContext::allow_all(),
         })
     }
@@ -885,55 +885,6 @@ impl Channel for BridgeChannel {
     async fn get_field(&self) -> BridgeResult<FieldDesc> {
         let scalar_type = dbf_to_scalar_type(self.value_dbf);
         Ok(build_field_desc_for_nt(self.nt_type, scalar_type))
-    }
-
-    async fn create_monitor(&self) -> BridgeResult<super::group::AnyMonitor> {
-        self.create_monitor_with_value_mask(None).await
-    }
-}
-
-impl BridgeChannel {
-    /// create a monitor with an explicit value-subscription DBE
-    /// mask. Called by `QsrvPvStore::subscribe_checked` after parsing
-    /// `record._options.DBE` from the MONITOR INIT pvRequest. `None`
-    /// uses the pvxs-parity default (`VALUE | ALARM`).
-    pub async fn create_monitor_with_value_mask(
-        &self,
-        value_mask: Option<u16>,
-    ) -> BridgeResult<super::group::AnyMonitor> {
-        // Check read permission up front so a denied client cannot
-        // even obtain a monitor handle. start() also re-checks (defense
-        // in depth: handles created via with_access elsewhere).
-        if !self.access.can_read(&self.pv_name).await {
-            return Err(BridgeError::PutRejected(format!(
-                "monitor create denied for {} (user='{}' host='{}')",
-                self.pv_name, self.access.creds.user, self.access.creds.host
-            )));
-        }
-        let rec = self
-            .db
-            .get_record(&self.record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
-        let mut monitor = BridgeMonitor::new(
-            self.db.clone(),
-            self.record_name.clone(),
-            self.field.clone(),
-            self.nt_type,
-        )
-        .with_view(self.view(&rec)?)
-        .with_access(self.access.clone())
-        // thread the channel's parsed filter chain (from the
-        // pvxs `PV.VAL{...}` JSON suffix) into the monitor so its
-        // subscription installs the filters at the dbChannel level. The
-        // value stream and the PROPERTY stream each get an independent
-        // re-parse of the same suffix (pvxs builds both dbChannels from
-        // the same filtered name, with per-channel filter state).
-        .with_filters(self.channel_filters.clone())
-        .with_property_filters(self.property_filters.clone());
-        if let Some(mask) = value_mask {
-            monitor = monitor.with_value_mask(mask);
-        }
-        Ok(super::group::AnyMonitor::Single(Box::new(monitor)))
     }
 }
 

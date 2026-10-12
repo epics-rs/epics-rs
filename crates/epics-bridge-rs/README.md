@@ -177,7 +177,6 @@ epics-bridge-rs/src/
     pvif.rs               # Snapshot -> NTScalar/NTEnum/NTScalarArray + pvRequest filter
     provider.rs           # ChannelProvider/Channel/PvaMonitor traits + BridgeProvider
     channel.rs            # BridgeChannel (single record) + PutOptions (process/block)
-    monitor.rs            # BridgeMonitor (DbSubscription -> PVA monitor)
     group.rs              # GroupChannel + GroupMonitor + nested field paths
     group_config.rs       # group JSON parser (C++ QSRV format) + info(Q:group)
     group_pump.rs         # the server-wide group drain (pvxs's single pump)
@@ -210,7 +209,7 @@ epics-bridge-rs/src/
 | PDBProvider | BridgeProvider |
 | PDBSinglePV / PDBSingleChannel | BridgeChannel |
 | PDBGroupPV / PDBGroupChannel | GroupChannel |
-| PDBSingleMonitor / BaseMonitor | BridgeMonitor |
+| PDBSingleMonitor / BaseMonitor | epics-pva-rs PvDatabaseSource (qsrvSingle) |
 | PDBGroupMonitor | GroupMonitor |
 | PVIF / PVIFBuilder / ScalarBuilder | pvif module (snapshot_to_nt_*, filter_by_request) |
 | configparse.cpp | group_config module |

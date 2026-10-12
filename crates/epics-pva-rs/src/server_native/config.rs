@@ -331,15 +331,7 @@ pub struct PvaServerConfig {
     /// address family carried the SEARCH. Beacon emission stays on
     /// the v4 path for now; v6 multicast beacons are deferred.
     pub enable_ipv6_udp: bool,
-    /// Per-monitor "high" watermark — emit a `tracing::warn!` when an
-    /// outbound monitor queue grows past this many items. Default:
-    /// `monitor_queue_depth * 3 / 4` (3, for the pvxs per-op default
-    /// depth of 4). Mirrors pvxs
-    /// `MonitorControlOp::setWatermarks` `high` argument; high-mark
-    /// callbacks (`onHighMark`) aren't surfaced yet — the watermark
-    /// drives diagnostics only.
-    pub monitor_high_watermark: usize,
-    /// Per-monitor "low" watermark — companion to `high`, currently
+    /// Per-monitor "low" watermark, currently
     /// unused (pvxs notes the `onLowMark` callback isn't fully
     /// implemented either). Reserved for future flow-control logic.
     pub monitor_low_watermark: usize,
@@ -420,7 +412,6 @@ impl Default for PvaServerConfig {
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
             enable_ipv6_udp: false,
-            monitor_high_watermark: (super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize) * 3 / 4,
             monitor_low_watermark: 0,
             auth_complete: None,
             send_timeout: Duration::from_secs(5),

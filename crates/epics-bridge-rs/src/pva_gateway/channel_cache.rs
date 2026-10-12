@@ -1115,7 +1115,7 @@ impl ChannelCache {
                                 // is filled later by `subscribe_inner` on lag.
                                 let _ = tx_inner.send(epics_pva_rs::server_native::MonitorUpdate {
                                     value: val.into(),
-                                    marked: outcome.marked,
+                                    marked: outcome.marked.map(Into::into),
                                     type_changed: false,
                                     overrun: Vec::new(),
                                 });

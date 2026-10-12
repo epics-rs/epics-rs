@@ -452,15 +452,11 @@ impl View {
         }
     }
 
-    /// A monitor's subscription under this view
-    /// ([`DbSubscription::with_dollar_view`](epics_base_rs::server::database::db_access::DbSubscription::with_dollar_view)).
-    pub(crate) fn subscribed(
-        self,
-        sub: epics_base_rs::server::database::db_access::DbSubscription,
-    ) -> epics_base_rs::server::database::db_access::DbSubscription {
+    /// The `$` view a monitor's subscriptions read their entries through.
+    pub(crate) fn dollar(self) -> Option<DollarView> {
         match self {
-            Self::Field => sub,
-            Self::Dollar(dollar) => sub.with_dollar_view(dollar),
+            Self::Field => None,
+            Self::Dollar(dollar) => Some(dollar),
         }
     }
 }

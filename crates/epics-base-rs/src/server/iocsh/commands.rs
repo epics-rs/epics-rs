@@ -11707,8 +11707,8 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
 record(waveform, "WD") { field(FTVL, "DOUBLE") }"#,
         )
         .expect("db must load");
-        assert!(ctx.block_on(db.has_name("WS.VAL$")));
-        assert!(!ctx.block_on(db.has_name("WD.VAL$")));
+        assert!(db.channel_create_found("WS.VAL$"));
+        assert!(!db.channel_create_found("WD.VAL$"));
     }
 
     /// A device-link put drops the device private, as C `dbPutFieldLink`

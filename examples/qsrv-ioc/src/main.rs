@@ -38,12 +38,12 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::{BareIoc, IocBuilder};
 use epics_base_rs::types::EpicsValue;
-use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
+use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 #[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
-use epics_pva_rs::server_native::ChannelSource;
+use epics_pva_rs::server_native::{ChannelSource, CompositeSource};
 
 #[cfg(tokio_backend)]
 #[epics_base_rs::epics_main]
@@ -89,15 +89,6 @@ async fn main() -> CaResult<()> {
     let provider = Arc::new(provider);
     let store = Arc::new(QsrvPvStore::new(reactor.clone(), provider));
 
-    let pv_list = store.list_pvs().await;
-    eprintln!("qsrv-ioc: dual-protocol IOC");
-    eprintln!("  CA  port: {ca_port}");
-    eprintln!("  PVA port: {pva_port}");
-    eprintln!("  PVs ({}):", pv_list.len());
-    for pv in &pv_list {
-        eprintln!("    {pv}");
-    }
-
     // ── Simulator ──
     spawn_simulator(&reactor, db.clone());
 
@@ -110,6 +101,25 @@ async fn main() -> CaResult<()> {
     // One policy cell for both protocols, so an `asInit` from the shell
     // (or a future ACF reload) gates CA and PVA together.
     let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+    // Singles on `qsrvSingle`, groups on `qsrvGroup`, as every QSRV IOC
+    // mounts them.
+    let composite = CompositeSource::new();
+    QsrvMount {
+        store,
+        enabled: true,
+        acf: acf.clone(),
+    }
+    .install_channel_sources(&db, &composite)
+    .map_err(epics_base_rs::error::CaError::InvalidValue)?;
+
+    let pv_list = composite.list_pvs().await;
+    eprintln!("qsrv-ioc: dual-protocol IOC");
+    eprintln!("  CA  port: {ca_port}");
+    eprintln!("  PVA port: {pva_port}");
+    eprintln!("  PVs ({}):", pv_list.len());
+    for pv in &pv_list {
+        eprintln!("    {pv}");
+    }
     let ca_server =
         CaServer::from_parts(db.clone(), ca_port, None, acf.clone(), None, None).await?;
     let pva_server = PvaServer::from_parts(db, None, acf, None, None);
@@ -118,7 +128,7 @@ async fn main() -> CaResult<()> {
     let ca_handle = reactor.clone().spawn(async move { ca_server.run().await });
 
     let result = pva_server
-        .run_with_source_and_shell(store, |_shell| {
+        .run_with_source_and_shell(composite, |_shell| {
             // iocsh commands (dbl, dbgf, dbpf, etc.) are built-in
         })
         .await;

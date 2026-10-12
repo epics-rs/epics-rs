@@ -293,7 +293,42 @@ enum Queued {
     /// (its `SCHEDULED` state is the claim), so these are bounded by the live
     /// task count and take no ring slot: a wake that the ring could reject
     /// would strand a long-lived task forever.
-    Task(Callback),
+    Task(TaskEntry),
+}
+
+/// A spawned task as its band holds it, so a wake queues the task's own `Arc`
+/// rather than a closure it would have to allocate.
+pub(super) trait Run: Send + Sync {
+    /// Poll the task once.
+    fn run(self: Arc<Self>);
+    /// The entry was dropped without running: the band shut down under it.
+    fn cancel_unrun(&self);
+}
+
+/// A task's run-queue entry. The task's state stays `SCHEDULED` while the
+/// entry exists, so no later wake re-queues it: dropped un-run — queued past
+/// shutdown, left in a band that is torn down, refused by an exhausted arena —
+/// the entry cancels the task, or its handle would never resolve.
+pub(super) struct TaskEntry(Option<Arc<dyn Run>>);
+
+impl TaskEntry {
+    pub(super) fn new(task: Arc<dyn Run>) -> Self {
+        TaskEntry(Some(task))
+    }
+
+    fn run(mut self) {
+        if let Some(task) = self.0.take() {
+            task.run();
+        }
+    }
+}
+
+impl Drop for TaskEntry {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.cancel_unrun();
+        }
+    }
 }
 
 /// One priority band: a bounded lock-free FIFO plus the park slots its workers
@@ -395,15 +430,15 @@ impl PriorityQueue {
     }
 
     /// Queue a spawned future's run-queue entry. Never refused for capacity —
-    /// see [`Queued::Task`]. After shutdown `cb` is dropped un-run, which is
-    /// how the task learns it was cancelled.
-    fn schedule_task(&self, cb: Callback) {
+    /// see [`Queued::Task`]. After shutdown `entry` is dropped un-run, which
+    /// is how the task learns it was cancelled.
+    fn schedule_task(&self, entry: TaskEntry) {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
         if let Err(entry) = self
             .queue
-            .push_task(Queued::Task(cb), || self.parking.wake_one())
+            .push_task(Queued::Task(entry), || self.parking.wake_one())
         {
             // Only reachable with the whole 4 G index space queued; dropping
             // the entry finalizes its task rather than stranding it.
@@ -575,12 +610,11 @@ fn drain_band<const BATCHED: bool>(
         if popped.more {
             pq.parking.wake_one();
         }
-        let cb = match popped.value {
-            Queued::Ring(cb) => cb,
-            Queued::Task(cb) => cb,
-        };
         // callback.c:228 — run the callback owning no band state.
-        run_isolated(FACILITY, cb);
+        match popped.value {
+            Queued::Ring(cb) => run_isolated(FACILITY, cb),
+            Queued::Task(entry) => run_isolated(FACILITY, move || entry.run()),
+        };
     }
 }
 
@@ -605,8 +639,8 @@ impl CallbackHandle {
     /// Queue a spawned future's run-queue entry on `priority`. Unlike
     /// [`request`](Self::request) this cannot fail: the entry takes no ring
     /// slot. The caller guarantees at most one such entry per task.
-    pub(super) fn schedule_task(&self, priority: CallbackPriority, cb: Callback) {
-        self.queues[priority.index()].schedule_task(cb);
+    pub(super) fn schedule_task(&self, priority: CallbackPriority, entry: TaskEntry) {
+        self.queues[priority.index()].schedule_task(entry);
     }
 
     /// Lifetime overflow count for a band — C `queueOverflows`
@@ -894,6 +928,25 @@ impl Drop for CallbackPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A closure as a task entry, for the band tests that only need one run.
+    struct OnceRun(std::sync::Mutex<Option<Callback>>);
+
+    impl OnceRun {
+        fn entry(f: impl FnOnce() + Send + 'static) -> TaskEntry {
+            TaskEntry::new(Arc::new(OnceRun(std::sync::Mutex::new(Some(Box::new(f))))))
+        }
+    }
+
+    impl Run for OnceRun {
+        fn run(self: Arc<Self>) {
+            if let Some(f) = self.0.lock().unwrap().take() {
+                f();
+            }
+        }
+
+        fn cancel_unrun(&self) {}
+    }
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -1687,7 +1740,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         pool.handle().schedule_task(
             CallbackPriority::Low,
-            Box::new(move || tx.send(99u32).unwrap()),
+            OnceRun::entry(move || tx.send(99u32).unwrap()),
         );
         gate_tx.send(()).unwrap();
         assert_eq!(
@@ -1804,11 +1857,33 @@ mod tests {
             pq.request("cbLow", Box::new(|| {})),
             Err(CallbackError::QueueFull)
         );
-        pq.schedule_task(Box::new(|| {}));
+        pq.schedule_task(OnceRun::entry(|| {}));
         assert_eq!(
             pq.stats(false).num_used,
             1,
             "the task entry was charged to the ring"
+        );
+    }
+
+    /// An entry left queued when its band is torn down never ran, so it
+    /// cancels its task.
+    #[test]
+    fn a_task_entry_dropped_with_its_band_cancels_the_task() {
+        struct Flag(AtomicBool);
+        impl Run for Flag {
+            fn run(self: Arc<Self>) {}
+            fn cancel_unrun(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let pq = PriorityQueue::new(1, 1);
+        pq.schedule_task(TaskEntry::new(Arc::clone(&flag) as Arc<dyn Run>));
+        assert!(!flag.0.load(Ordering::SeqCst), "cancelled while queued");
+        drop(pq);
+        assert!(
+            flag.0.load(Ordering::SeqCst),
+            "the un-run entry was dropped silently"
         );
     }
 

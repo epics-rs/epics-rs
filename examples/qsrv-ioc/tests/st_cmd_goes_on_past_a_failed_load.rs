@@ -69,7 +69,10 @@ fn a_failed_load_leaves_the_next_file_and_its_own_records() {
         if plain.starts_with("qsrv-ioc: dual-protocol IOC") {
             in_list = true;
         } else if !in_list {
-            head.push_str(&plain);
+            // C prints this too; whether it beats the banner is a race.
+            if !plain.starts_with("iocRun: ") {
+                head.push_str(&plain);
+            }
         } else if plain.starts_with("    ") {
             pvs.push(plain.trim().to_string());
         } else if plain.starts_with("  PVs") {

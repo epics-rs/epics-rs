@@ -2265,7 +2265,7 @@ impl MonitorPost for crate::server_native::RawMonitorEvent {
 /// walking the descriptor a second time per update.
 struct QueuedUpdate {
     update: crate::server_native::MonitorUpdate,
-    changed: BitSet,
+    changed: Arc<BitSet>,
 }
 
 impl MonitorPost for QueuedUpdate {
@@ -2283,11 +2283,13 @@ impl MonitorPost for QueuedUpdate {
 fn coalesce_queued_update(older: QueuedUpdate, newer: QueuedUpdate) -> QueuedUpdate {
     let update = coalesce_monitor_update(older.update, newer.update);
     let changed = if update.type_changed {
-        BitSet::new()
+        Arc::new(BitSet::new())
+    } else if Arc::ptr_eq(&older.changed, &newer.changed) {
+        older.changed
     } else {
-        let mut changed = older.changed;
+        let mut changed = Arc::unwrap_or_clone(older.changed);
         changed.union_with(&newer.changed);
-        changed
+        Arc::new(changed)
     };
     QueuedUpdate { update, changed }
 }
@@ -2308,23 +2310,24 @@ fn coalesce_queued_update(older: QueuedUpdate, newer: QueuedUpdate) -> QueuedUpd
 ///   Both are pvxs's `queue.back().assign(val)`; neither may degrade to
 ///   last-wins, which discards the leaves only the older post changed.
 ///
-/// `limit` must be >= 1 so a tail always exists to squash into. Returns
-/// whether an overflow squash happened (diagnostic only).
+/// `limit` must be >= 1 so a tail always exists to squash into. Each
+/// append and squash is counted in `stat` (pvxs `maxQueue`/`nSquash`).
 fn push_squash_monitor<T: MonitorPost>(
     pending: &mut std::collections::VecDeque<T>,
     ev: T,
     limit: usize,
+    stat: &crate::server_native::peers::MonitorStat,
     coalesce: impl Fn(T, T) -> T,
-) -> bool {
+) {
     if ev.is_terminal() || pending.len() < limit {
         pending.push_back(ev);
-        false
+        stat.queued(pending.len());
     } else {
         let tail = pending
             .pop_back()
             .expect("len >= limit >= 1 guarantees a tail to squash into");
         pending.push_back(coalesce(tail, ev));
-        true
+        stat.squashed();
     }
 }
 
@@ -2367,18 +2370,37 @@ struct MonitorQueue<'a> {
     /// `(intro, mask)`, so it is computed once here rather than per post.
     /// Empty ⟺ the request selected no leaf, and then no unmarked post is
     /// `real`.
-    unmarked_changed: BitSet,
+    unmarked_changed: Arc<BitSet>,
+    /// The wire bitset of each shared mark set this op has seen, so a set a
+    /// source fixed at subscribe is resolved against `(intro, mask)` once.
+    /// Holding the set keeps its address from being reused by another.
+    shared_changed: Vec<(crate::server_native::Marks, Arc<BitSet>)>,
+    /// The op's report counters.
+    stat: Arc<crate::server_native::peers::MonitorStat>,
 }
 
+/// More distinct shared mark sets than one subscription's event classes;
+/// past it the oldest entry is evicted.
+const SHARED_CHANGED_CAP: usize = 8;
+
 impl<'a> MonitorQueue<'a> {
-    fn new(limit: usize, intro: &'a FieldDesc, mask: &'a BitSet) -> Self {
+    fn new(
+        limit: usize,
+        intro: &'a FieldDesc,
+        mask: &'a BitSet,
+        stat: Arc<crate::server_native::peers::MonitorStat>,
+    ) -> Self {
         Self {
             pending: std::collections::VecDeque::new(),
             limit: limit.max(1),
             first: true,
             intro,
             mask,
-            unmarked_changed: crate::pvdata::encode::canonical_changed_bitset(intro, mask),
+            unmarked_changed: Arc::new(crate::pvdata::encode::canonical_changed_bitset(
+                intro, mask,
+            )),
+            shared_changed: Vec::new(),
+            stat,
         }
     }
 
@@ -2392,6 +2414,7 @@ impl<'a> MonitorQueue<'a> {
         let update = crate::server_native::MonitorUpdate::from(initial);
         let changed = self.wire_changed(&update);
         self.pending.push_back(QueuedUpdate { update, changed });
+        self.stat.queued(self.pending.len());
     }
 
     /// pvxs `doPost`. Returns whether the update was queued (`false` = dropped
@@ -2414,6 +2437,7 @@ impl<'a> MonitorQueue<'a> {
                 changed,
             },
             self.limit,
+            &self.stat,
             coalesce_queued_update,
         );
         true
@@ -2438,16 +2462,32 @@ impl<'a> MonitorQueue<'a> {
     /// makes `gate == wire` an invariant: an admitted update always frames a
     /// non-empty changed-bitset, and a leafless mask frames none because it
     /// queues none.
-    fn wire_changed(&self, ev: &crate::server_native::MonitorUpdate) -> BitSet {
+    fn wire_changed(&mut self, ev: &crate::server_native::MonitorUpdate) -> Arc<BitSet> {
+        use crate::server_native::Marks;
         if ev.type_changed {
-            return BitSet::new();
+            return Arc::new(BitSet::new());
         }
-        match ev.marked.as_ref() {
-            Some(paths) => {
-                crate::pvdata::encode::marked_wire_changed_bitset(self.intro, paths, self.mask)
-            }
-            None => self.unmarked_changed.clone(),
+        let marks = match ev.marked.as_ref() {
+            None => return Arc::clone(&self.unmarked_changed),
+            Some(marks) => marks,
+        };
+        let resolve = |paths: &[String]| {
+            Arc::new(crate::pvdata::encode::marked_wire_changed_bitset(
+                self.intro, paths, self.mask,
+            ))
+        };
+        if let Marks::Owned(paths) = marks {
+            return resolve(paths);
         }
+        if let Some((_, bits)) = self.shared_changed.iter().find(|(m, _)| m.same_set(marks)) {
+            return Arc::clone(bits);
+        }
+        let bits = resolve(marks);
+        if self.shared_changed.len() == SHARED_CHANGED_CAP {
+            self.shared_changed.remove(0);
+        }
+        self.shared_changed.push((marks.clone(), Arc::clone(&bits)));
+        bits
     }
 
     fn is_empty(&self) -> bool {
@@ -2475,7 +2515,6 @@ struct MonitorSubscriberArgs {
     /// Per-op squash threshold (client `record._options.queueSize` or the
     /// server default), computed at INIT.
     queue_depth: usize,
-    high_watermark: usize,
     /// Credential + INIT-pvRequest context for subscribe / get / ACL.
     mon_ctx: crate::server_native::source::ChannelContext,
     window: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -2527,7 +2566,6 @@ fn spawn_monitor_subscriber(
         tx: tx_clone,
         src,
         queue_depth,
-        high_watermark,
         mon_ctx,
         window,
         window_notify,
@@ -2581,6 +2619,9 @@ fn spawn_monitor_subscriber(
 
     let join = reactor.spawn(async move {
         let fin_guard = MonitorFinishGuard::new(mon_fin_tx, mon_fin);
+        // In the report for as long as this task runs.
+        let mon_report = tx_clone.monitor_stat(ioid);
+        let mon_stat = mon_report.stat();
         let order_now = || {
             if out_order_mon.load(std::sync::atomic::Ordering::Relaxed) {
                 ByteOrder::Big
@@ -2706,15 +2747,21 @@ fn spawn_monitor_subscriber(
                                 let squash = |old, new| {
                                     coalesce_raw_monitor_event(&intro_clone, old, new)
                                 };
-                                push_squash_monitor(&mut pending, ev, raw_cap, squash);
+                                push_squash_monitor(&mut pending, ev, raw_cap, &mon_stat, squash);
                                 while let Ok(e) = rx_raw.try_recv() {
-                                    push_squash_monitor(&mut pending, e, raw_cap, squash);
+                                    push_squash_monitor(&mut pending, e, raw_cap, &mon_stat, squash);
                                 }
                             }
                             None => source_open = false,
                         }
                     }
-                    _ = exec_rx.changed() => {}
+                    // The op's `MonitorStartControl` owns the sender: a
+                    // closed watch is ready forever, so stay and this spins.
+                    r = exec_rx.changed() => {
+                        if r.is_err() {
+                            return;
+                        }
+                    }
                     _ = std::future::ready(()), if executing && has_work => {
                         if let Some(initial) = seed_cooked.take() {
                             // Per-event ACL recheck on policy reload — the seed is
@@ -2747,6 +2794,7 @@ fn spawn_monitor_subscriber(
                                 &initial.value,
                                 &changed,
                                 order_now(),
+                                &mut 0,
                             );
                             if tx_clone.send(payload).await.is_err() {
                                 return;
@@ -2827,7 +2875,7 @@ fn spawn_monitor_subscriber(
         // it is not `Send`, and this future is spawned.
         let executing_now = *exec_rx.borrow();
         gate_driver.apply(executing_now).await;
-        let mut queue_over_high = false;
+        let mut frame_size = 0;
         let wm_levels = wm_levels_init;
         let credit = MonitorPipelineCredit {
             window: window.as_ref(),
@@ -2879,7 +2927,8 @@ fn spawn_monitor_subscriber(
         // exactly once, like epics-base `dbChannelRunPreChain`; a gating filter
         // that drops it suppresses the initial frame, a transform mismatch
         // tears the monitor down with an error).
-        let mut pending = MonitorQueue::new(queue_limit, &intro_clone, &mask_clone);
+        let mut pending =
+            MonitorQueue::new(queue_limit, &intro_clone, &mask_clone, mon_stat.clone());
         if let Some(initial) = seed_initial {
             pending.seed(initial);
         }
@@ -2931,7 +2980,12 @@ fn spawn_monitor_subscriber(
                         None => source_open = false,
                     }
                 }
-                _ = exec_rx.changed() => {}
+                // Closed: the op is gone (see the raw loop's arm).
+                r = exec_rx.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
                 // Re-evaluate the gate when an ACK refills the window.
                 _ = wait_credit_refill(refill), if !has_credit => {}
                 _ = std::future::ready(()), if executing && has_credit && !pending.is_empty() => {
@@ -2961,20 +3015,6 @@ fn spawn_monitor_subscriber(
                         }
                         mon_acl_version_at_subscribe_cell
                             .store(live_v, std::sync::atomic::Ordering::Release);
-                    }
-                    // Outbound-queue depth: server diagnostic only.
-                    let outbound_pending = tx_clone.max_capacity() - tx_clone.capacity();
-                    if outbound_pending >= high_watermark && !queue_over_high {
-                        queue_over_high = true;
-                        warn!(
-                            pv = %pv_name,
-                            pending = outbound_pending,
-                            high_watermark,
-                            "monitor outbound queue crossed high watermark"
-                        );
-                    } else if outbound_pending == 0 && queue_over_high {
-                        queue_over_high = false;
-                        debug!(pv = %pv_name, "monitor outbound queue drained");
                     }
                     let value = value.value;
                     // Server-side channel filters: skip when the chain drops this
@@ -3007,8 +3047,14 @@ fn spawn_monitor_subscriber(
                     // There is no third form: the port does not reconstruct a
                     // marked set by diffing snapshots, which pvxs never does.
                     // `changed` is that bitset, computed at enqueue.
-                    let payload =
-                        build_monitor_payload(ioid, &intro_clone, &value, &changed, order_now());
+                    let payload = build_monitor_payload(
+                        ioid,
+                        &intro_clone,
+                        &value,
+                        &changed,
+                        order_now(),
+                        &mut frame_size,
+                    );
                     if tx_clone.send(payload).await.is_err() {
                         return;
                     }
@@ -3646,14 +3692,6 @@ impl SrvTx {
         }
     }
 
-    fn capacity(&self) -> usize {
-        self.tx.capacity()
-    }
-
-    fn max_capacity(&self) -> usize {
-        self.tx.max_capacity()
-    }
-
     fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
@@ -3741,17 +3779,9 @@ impl ChannelTx {
         })
     }
 
-    /// Current free capacity of the underlying writer channel — used by
-    /// the monitor outbound-queue-depth diagnostic. Delegates to the
-    /// wrapped `Sender`; carries no byte accounting.
-    fn capacity(&self) -> usize {
-        self.tx.capacity()
-    }
-
-    /// Total capacity of the underlying writer channel (see
-    /// [`Self::capacity`]).
-    fn max_capacity(&self) -> usize {
-        self.tx.max_capacity()
+    /// Register MONITOR `ioid` in this channel's report.
+    fn monitor_stat(&self, ioid: u32) -> crate::server_native::peers::MonitorStatSlot {
+        self.stat.monitor(ioid)
     }
 }
 
@@ -3861,6 +3891,11 @@ pub(super) struct ConnInit {
     /// [`TCP_TX_LIMIT_MULT`]). The driver reads the accepted socket's
     /// `SO_SNDBUF` and multiplies; [`TX_LIMIT_FALLBACK`] when it cannot.
     pub(super) tx_limit_bytes: usize,
+    /// Where the connection's writer task runs: an executor of its own, so
+    /// a queued frame reaches the socket without waiting for every monitor
+    /// task queued ahead of it — pvxs writes on `PVXTCP` while `qsrvSingle`
+    /// produces.
+    pub(super) writer_reactor: epics_base_rs::runtime::task::Reactor,
 }
 
 pub(super) async fn handle_connection_io(
@@ -3877,6 +3912,7 @@ pub(super) async fn handle_connection_io(
         x509_identity,
         channel_invalidator,
         tx_limit_bytes,
+        writer_reactor,
     } = init;
     let op_timeout = config.op_timeout;
     let idle_timeout = config.idle_timeout;
@@ -3920,7 +3956,7 @@ pub(super) async fn handle_connection_io(
     let peer_entry_writer = peer_entry.clone();
     let last_rx_writer = last_rx.clone();
     let reads_paused_writer = reads_paused.clone();
-    let writer_task = reactor.spawn(async move {
+    let writer_task = writer_reactor.spawn(async move {
         // Dropping this guard — loop break OR abort at the `recv` await —
         // closes the byte budget so producers parked in `TxBudget::acquire`
         // fail instead of waiting on a writer that no longer exists.
@@ -7717,7 +7753,6 @@ async fn handle_op(
                 .get(&ioid)
                 .map(|s| s.monitor_options.queue_size as usize)
                 .unwrap_or(config.monitor_queue_depth);
-            let high_watermark = config.monitor_high_watermark;
             // Read the per-op state back out of the just-inserted `OpState`
             // (its construction consumed the `mask`/window/filter locals) into
             // a self-contained args bundle, so the spawn holds no `ch` borrow.
@@ -7741,7 +7776,6 @@ async fn handle_op(
                     tx: chan_tx.clone(),
                     src: source.clone(),
                     queue_depth,
-                    high_watermark,
                     mon_ctx,
                     window: s.monitor_window.clone(),
                     window_notify: s.monitor_window_notify.clone(),
@@ -8907,14 +8941,20 @@ fn read_changed_bitset(intro: &FieldDesc, mask: &BitSet, marked: Option<&[String
 /// Build a complete MONITOR data frame (header + payload) for a single value
 /// emission. `changed` is the wire changed-bitset ([`read_changed_bitset`]),
 /// which [`MonitorQueue`] computes once per queued update.
+///
+/// The frame is one buffer sized by `size_hint`, the subscription's previous
+/// frame length, which this updates: the writer takes the buffer, so it
+/// cannot be reused, but a frame of the usual size never regrows.
 fn build_monitor_payload(
     ioid: u32,
     intro: &FieldDesc,
     value: &PvField,
     changed: &BitSet,
     order: ByteOrder,
+    size_hint: &mut usize,
 ) -> Vec<u8> {
-    let mut payload = Vec::new();
+    let mut payload = Vec::with_capacity((*size_hint).max(PvaHeader::SIZE));
+    payload.resize(PvaHeader::SIZE, 0);
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
     // PVA monitor data: changed bitset + partial value + overrun bitset.
@@ -8934,11 +8974,11 @@ fn build_monitor_payload(
     // set `servSquash=true` and bump `nSrvSquash` (clientmon.cpp:554-564),
     // a counter that stays 0 against a real pvxs server.
     BitSet::new().write_into(order, &mut payload);
-    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
-    let mut buf = Vec::with_capacity(8 + payload.len());
-    h.write_into(&mut buf);
-    buf.extend_from_slice(&payload);
-    buf
+    let len = (payload.len() - PvaHeader::SIZE) as u32;
+    let h = PvaHeader::application(true, order, Command::Monitor.code(), len);
+    payload[..PvaHeader::SIZE].copy_from_slice(&h.encode());
+    *size_hint = payload.len();
+    payload
 }
 
 /// coalesce two cooked monitor updates when the server
@@ -8996,20 +9036,22 @@ fn coalesce_monitor_update(
         }
     }
     if let (Some(a), Some(b)) = (older.marked.as_ref(), newer.marked.as_ref()) {
-        for p in a {
+        for p in a.iter() {
             if b.contains(p) && !overrun.contains(p) {
                 overrun.push(p.clone());
             }
         }
     }
     let marked = match (older.marked, newer.marked) {
-        (Some(mut a), Some(b)) => {
-            for p in b {
-                if !a.contains(&p) {
-                    a.push(p);
+        (Some(a), Some(b)) if a.same_set(&b) => Some(a),
+        (Some(a), Some(b)) => {
+            let mut a = a.into_vec();
+            for p in b.iter() {
+                if !a.contains(p) {
+                    a.push(p.clone());
                 }
             }
-            Some(a)
+            Some(a.into())
         }
         _ => None,
     };
@@ -9928,7 +9970,7 @@ mod tests {
             coalesce_monitor_update(upd(1, Some(vec!["a", "b"])), upd(2, Some(vec!["b", "c"])));
         assert_eq!(merged.value, val(2), "newer value must win");
         assert_eq!(
-            merged.marked,
+            merged.marked.map(crate::server_native::Marks::into_vec),
             Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
             "Some+Some must union marked paths without duplicating `b`"
         );
@@ -9966,7 +10008,7 @@ mod tests {
         let mk = |tag: i32, marked: Option<&[&str]>, overrun: &[&str]| {
             crate::server_native::MonitorUpdate {
                 value: val(tag).into(),
-                marked: marked.map(s),
+                marked: marked.map(|m| s(m).into()),
                 type_changed: false,
                 overrun: s(overrun),
             }
@@ -10080,7 +10122,7 @@ mod tests {
 
         // No seed: `first` is still set, so the FIRST post is exempt from the
         // mask test even though `alarm.severity` lies outside `field(value)`.
-        let mut q = MonitorQueue::new(4, &intro, &mask);
+        let mut q = MonitorQueue::new(4, &intro, &mask, Default::default());
         assert!(
             q.push(upd(1, &["alarm.severity"])),
             "the first post is always queued (MonitorOp::first)"
@@ -10102,7 +10144,7 @@ mod tests {
 
         // A seeded op consumes the `first` exemption, so its very first stream
         // event is already mask-tested.
-        let mut q = MonitorQueue::new(4, &intro, &mask);
+        let mut q = MonitorQueue::new(4, &intro, &mask, Default::default());
         q.seed(tag(0).into());
         assert!(
             !q.push(upd(1, &["alarm.severity"])),
@@ -10113,7 +10155,7 @@ mod tests {
         // A source that marks nothing posts a wholly-changed value — pvxs's
         // fully-marked Value — so it passes `testmask` for any mask that
         // selects at least one LEAF. `field(value)` does.
-        let mut q = MonitorQueue::new(4, &intro, &mask);
+        let mut q = MonitorQueue::new(4, &intro, &mask, Default::default());
         q.seed(tag(0).into());
         assert!(
             q.push(crate::server_native::MonitorUpdate {
@@ -10127,7 +10169,7 @@ mod tests {
 
         // The terminal boundary is pvxs's null Value (`if(real || !val)`): it
         // must queue regardless of the mask, or the MONITOR FINISH is lost.
-        let mut q = MonitorQueue::new(4, &intro, &mask);
+        let mut q = MonitorQueue::new(4, &intro, &mask, Default::default());
         q.seed(tag(0).into());
         assert!(
             q.push(crate::server_native::MonitorUpdate::type_change()),
@@ -10144,7 +10186,7 @@ mod tests {
         //
         // pvxs delivers all `limit` queued updates and THEN the FINISH;
         // pre-fix the port delivered `limit - 1` and the FINISH.
-        let mut q = MonitorQueue::new(2, &intro, &mask);
+        let mut q = MonitorQueue::new(2, &intro, &mask, Default::default());
         q.seed(tag(0).into());
         assert!(q.push(upd(1, &["value"])), "fills the FIFO to limit=2");
         assert_eq!(tags(&q), vec![tag(0), tag(1)], "FIFO is full");
@@ -10171,7 +10213,7 @@ mod tests {
         // Squash CONTENTS: with limit 2 and the FIFO already full, a
         // masked-out post must not coalesce the real tail. Pre-fix it took a
         // slot and overwrote `value=3` with `value=4`.
-        let mut q = MonitorQueue::new(2, &intro, &mask);
+        let mut q = MonitorQueue::new(2, &intro, &mask, Default::default());
         q.seed(tag(0).into());
         q.push(upd(3, &["value"]));
         assert!(!q.push(upd(4, &["alarm.severity"])), "masked out → dropped");
@@ -10248,7 +10290,7 @@ mod tests {
         };
         let post = || crate::server_native::MonitorUpdate {
             value: PvField::Scalar(ScalarValue::Int(1)).into(),
-            marked: Some(vec!["timeStamp".to_string()]),
+            marked: Some(vec!["timeStamp".to_string()].into()),
             type_changed: false,
             overrun: Vec::new(),
         };
@@ -10264,7 +10306,7 @@ mod tests {
             "no leaf below it is selected"
         );
 
-        let mut q = MonitorQueue::new(4, &intro, &bogus);
+        let mut q = MonitorQueue::new(4, &intro, &bogus, Default::default());
         q.seed(seed.clone().into());
         assert!(
             !q.push(post()),
@@ -10285,7 +10327,7 @@ mod tests {
         // the wire bitset is exactly that leaf.
         let real = crate::pv_request::request_to_mask(&intro, Some(&request("secondsPastEpoch")))
             .expect("a matched leaf selects it");
-        let mut q = MonitorQueue::new(4, &intro, &real);
+        let mut q = MonitorQueue::new(4, &intro, &real, Default::default());
         q.seed(seed.clone().into());
         assert!(
             q.push(post()),
@@ -10314,7 +10356,7 @@ mod tests {
             type_changed: false,
             overrun: Vec::new(),
         };
-        let mut q = MonitorQueue::new(4, &intro, &bogus);
+        let mut q = MonitorQueue::new(4, &intro, &bogus, Default::default());
         q.seed(seed.clone().into());
         assert!(
             !q.push(unmarked()),
@@ -10327,7 +10369,7 @@ mod tests {
 
         // A mask that selects a leaf admits the same unmarked post, and the
         // frame carries that leaf — gate and wire stay one computation.
-        let mut q = MonitorQueue::new(4, &intro, &real);
+        let mut q = MonitorQueue::new(4, &intro, &real, Default::default());
         q.seed(seed.into());
         assert!(
             q.push(unmarked()),
@@ -10340,6 +10382,82 @@ mod tests {
             vec![3],
             "the admitted frame carries exactly the selected leaf"
         );
+    }
+
+    /// A monitor frame is one buffer, sized by the subscription's previous
+    /// frame: a frame of the same size never regrows, and the header carries
+    /// the payload length written after it.
+    #[test]
+    fn a_monitor_frame_is_one_buffer_sized_by_the_last() {
+        let intro = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut s = PvStructure::new("structure");
+        s.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        let value = PvField::Structure(s);
+        let changed = BitSet::all_set(intro.total_bits());
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut hint = 0;
+            let first = build_monitor_payload(7, &intro, &value, &changed, order, &mut hint);
+            assert_eq!(hint, first.len());
+            let second = build_monitor_payload(7, &intro, &value, &changed, order, &mut hint);
+            assert_eq!(second, first);
+            assert_eq!(second.capacity(), first.len(), "sized by the last frame");
+            let h = PvaHeader::decode(&mut std::io::Cursor::new(&second[..])).expect("a header");
+            assert_eq!(h.payload_length as usize, second.len() - PvaHeader::SIZE);
+        }
+    }
+
+    /// A mark set a source shares across posts is resolved against the
+    /// descriptor once per op: every post carrying it takes the same wire
+    /// bitset, which equals what resolving its paths gives; a different set,
+    /// shared or owned, is resolved on its own.
+    #[test]
+    fn a_shared_mark_set_is_resolved_once_per_op() {
+        use crate::server_native::Marks;
+        // { value, alarm { severity, status } } — bits: 0 root, 1 value,
+        // 2 alarm, 3 severity, 4 status.
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let upd = |marked: Marks| crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(0)).into(),
+            marked: Some(marked),
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let value: Arc<[String]> = vec!["value".to_string()].into();
+        let alarm: Arc<[String]> = vec!["alarm".to_string()].into();
+        let all = BitSet::all_set(intro.total_bits());
+        let mut q = MonitorQueue::new(8, &intro, &all, Default::default());
+        assert!(q.push(upd(Arc::clone(&value).into())));
+        assert!(q.push(upd(Arc::clone(&alarm).into())));
+        assert!(q.push(upd(Arc::clone(&value).into())));
+        assert!(q.push(upd(vec!["value".to_string()].into())));
+        let bits: Vec<_> = q.pending.iter().map(|u| Arc::clone(&u.changed)).collect();
+        let want = |paths: &[String]| {
+            crate::pvdata::encode::marked_wire_changed_bitset(&intro, paths, &all)
+        };
+        assert!(Arc::ptr_eq(&bits[0], &bits[2]), "one set, one bitset");
+        assert_eq!(*bits[0], want(&value));
+        assert_eq!(*bits[1], want(&alarm));
+        assert_eq!(*bits[3], want(&value));
+        assert!(!Arc::ptr_eq(&bits[0], &bits[3]), "an owned set is its own");
     }
 
     /// [`coalesce_queued_update`] must leave `changed` equal to what the
@@ -10390,7 +10508,7 @@ mod tests {
 
         // limit 1: every push after the first coalesces into the tail.
         let all = BitSet::all_set(intro.total_bits());
-        let mut q = MonitorQueue::new(1, &intro, &all);
+        let mut q = MonitorQueue::new(1, &intro, &all, Default::default());
         assert!(q.push(upd(1, Some(&["value"]))));
         assert!(q.push(upd(2, Some(&["alarm.status"]))));
         assert_eq!(tail_bits(&q), vec![1, 4], "two declared sets union");
@@ -10403,7 +10521,7 @@ mod tests {
         );
         assert_eq!(tail_bits(&q), gate_bits(&q));
 
-        let mut q = MonitorQueue::new(1, &intro, &all);
+        let mut q = MonitorQueue::new(1, &intro, &all, Default::default());
         assert!(q.push(upd(1, None)));
         assert!(q.push(upd(2, Some(&["alarm.severity"]))));
         assert_eq!(tail_bits(&q), vec![1, 3, 4], "same with the sides swapped");
@@ -10414,7 +10532,7 @@ mod tests {
         let mut mask = BitSet::new();
         mask.set(1);
         mask.set(3);
-        let mut q = MonitorQueue::new(1, &intro, &mask);
+        let mut q = MonitorQueue::new(1, &intro, &mask, Default::default());
         assert!(q.push(upd(1, Some(&["value"]))));
         assert!(q.push(upd(2, Some(&["alarm"]))));
         assert_eq!(tail_bits(&q), vec![1, 3]);
@@ -10455,13 +10573,23 @@ mod tests {
             pending.iter().map(|u| u.value.clone()).collect::<Vec<_>>()
         };
 
+        use crate::server_native::peers::MonitorStat;
+        let counts = |stat: &MonitorStat| {
+            let r = stat.report(0, false);
+            (r.max_queue, r.n_squash)
+        };
+
         // Below the limit: three posts into limit 4 stay distinct, in order.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let mut any_overflow = false;
+        let stat = MonitorStat::default();
         for tag in [1, 2, 3] {
-            any_overflow |= push_squash_monitor(&mut pending, upd(tag), 4, coalesce_monitor_update);
+            push_squash_monitor(&mut pending, upd(tag), 4, &stat, coalesce_monitor_update);
         }
-        assert!(!any_overflow, "three posts below limit 4 must not squash");
+        assert_eq!(
+            counts(&stat),
+            (3, 0),
+            "three posts below limit 4 queue three deep and squash none"
+        );
         assert_eq!(
             values(&pending),
             vec![val(1), val(2), val(3)],
@@ -10471,11 +10599,15 @@ mod tests {
         // At the limit: three posts into limit 2 leave [1, 3] — the newest
         // coalesced into the tail, never queue_limit + 1 distinct posts.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let mut overflow = false;
+        let stat = MonitorStat::default();
         for tag in [1, 2, 3] {
-            overflow |= push_squash_monitor(&mut pending, upd(tag), 2, coalesce_monitor_update);
+            push_squash_monitor(&mut pending, upd(tag), 2, &stat, coalesce_monitor_update);
         }
-        assert!(overflow, "the 3rd post into limit 2 must squash the tail");
+        assert_eq!(
+            counts(&stat),
+            (2, 1),
+            "the 3rd post into limit 2 squashes the tail"
+        );
         assert_eq!(
             values(&pending),
             vec![val(1), val(3)],
@@ -10486,7 +10618,7 @@ mod tests {
         // (latest value wins).
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
         for tag in [1, 2, 3] {
-            push_squash_monitor(&mut pending, upd(tag), 1, coalesce_monitor_update);
+            push_squash_monitor(&mut pending, upd(tag), 1, &stat, coalesce_monitor_update);
         }
         assert_eq!(
             values(&pending),
@@ -10503,14 +10635,20 @@ mod tests {
         // terminal trails it, exactly as pvxs delivers every queued update
         // and then the FINISH.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        push_squash_monitor(&mut pending, upd(2), 1, coalesce_monitor_update);
-        let squashed = push_squash_monitor(
+        let stat = MonitorStat::default();
+        push_squash_monitor(&mut pending, upd(2), 1, &stat, coalesce_monitor_update);
+        push_squash_monitor(
             &mut pending,
             crate::server_native::MonitorUpdate::type_change(),
             1,
+            &stat,
             coalesce_monitor_update,
         );
-        assert!(!squashed, "a terminal never reaches the squash branch");
+        assert_eq!(
+            counts(&stat),
+            (2, 0),
+            "a terminal never reaches the squash branch"
+        );
         assert_eq!(
             pending.len(),
             2,
@@ -10533,8 +10671,10 @@ mod tests {
             type_changed: terminal,
         };
         let mut raw_pending: VecDeque<crate::server_native::RawMonitorEvent> = VecDeque::new();
-        push_squash_monitor(&mut raw_pending, raw(b"a", false), 1, |_old, new| new);
-        push_squash_monitor(&mut raw_pending, raw(b"", true), 1, |_old, new| new);
+        push_squash_monitor(&mut raw_pending, raw(b"a", false), 1, &stat, |_old, new| {
+            new
+        });
+        push_squash_monitor(&mut raw_pending, raw(b"", true), 1, &stat, |_old, new| new);
         assert_eq!(
             raw_pending.len(),
             2,
@@ -10894,12 +11034,6 @@ mod tests {
         assert_eq!(
             PvaServerConfig::default().monitor_queue_limit(),
             crate::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT
-        );
-        // The documented `depth * 3 / 4` relation held for 64/48 and must
-        // still hold now that the depth is the pvxs per-op default.
-        assert_eq!(
-            PvaServerConfig::default().monitor_high_watermark,
-            PvaServerConfig::default().monitor_queue_depth * 3 / 4
         );
 
         // A deployment that raised the per-op default — the same deviation as
@@ -15884,8 +16018,14 @@ mod tests {
 
         let mask = BitSet::all_set(intro.total_bits());
         let changed = read_changed_bitset(&intro, &mask, None);
-        let bytes =
-            build_monitor_payload(ioid, &intro, &PvField::Structure(value), &changed, order);
+        let bytes = build_monitor_payload(
+            ioid,
+            &intro,
+            &PvField::Structure(value),
+            &changed,
+            order,
+            &mut 0,
+        );
         let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         assert_eq!(used, bytes.len());
 
@@ -15941,7 +16081,7 @@ mod tests {
         // must still be empty (pvxs placeholder).
         let marked = vec!["a".to_string()];
         let changed = read_changed_bitset(&intro, &mask, Some(&marked));
-        let bytes = build_monitor_payload(ioid, &intro, &value, &changed, order);
+        let bytes = build_monitor_payload(ioid, &intro, &value, &changed, order, &mut 0);
         let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         assert_eq!(used, bytes.len());
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
@@ -15957,7 +16097,7 @@ mod tests {
         // The plain full-value builder must likewise emit an empty
         // overrun bitset.
         let changed = read_changed_bitset(&intro, &mask, None);
-        let bytes = build_monitor_payload(ioid, &intro, &value, &changed, order);
+        let bytes = build_monitor_payload(ioid, &intro, &value, &changed, order, &mut 0);
         let (frame, _) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -16006,7 +16146,7 @@ mod tests {
         // (bit 1), never `b` (bit 2).
         let marked = vec!["a".to_string()];
         let changed = read_changed_bitset(&intro, &mask, Some(&marked));
-        let narrowed = build_monitor_payload(ioid, &intro, &curr, &changed, order);
+        let narrowed = build_monitor_payload(ioid, &intro, &curr, &changed, order, &mut 0);
         let (frame, _) = try_parse_frame(&narrowed).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -16027,7 +16167,7 @@ mod tests {
         // `store[bit].valid`, and `Value::mark` (data.cpp:256-270) never
         // validates a parent structure, so a root bit cannot appear.
         let changed = read_changed_bitset(&intro, &mask, None);
-        let full = build_monitor_payload(ioid, &intro, &curr, &changed, order);
+        let full = build_monitor_payload(ioid, &intro, &curr, &changed, order, &mut 0);
         let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
         let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -16199,7 +16339,7 @@ mod tests {
         let mask = BitSet::all_set(intro.total_bits());
         // The seed goes through the FIFO as `marked: None`, which the
         // emitter dispatches to `build_monitor_payload`.
-        let mut q = MonitorQueue::new(4, &intro, &mask);
+        let mut q = MonitorQueue::new(4, &intro, &mask, Default::default());
         q.seed(seed.clone().into());
         let ev = q.pop().expect("seed queued");
         assert!(
@@ -16207,7 +16347,8 @@ mod tests {
             "the seed carries no explicit mark set"
         );
 
-        let frame = build_monitor_payload(ioid, &intro, &ev.update.value, &ev.changed, order);
+        let frame =
+            build_monitor_payload(ioid, &intro, &ev.update.value, &ev.changed, order, &mut 0);
         // 8-byte PVA header, then the payload.
         let payload = &frame[8..];
 
@@ -21480,7 +21621,6 @@ mod tests {
                 ),
                 src: src.clone(),
                 queue_depth: 4,
-                high_watermark: 0,
                 mon_ctx: bfr12_anon_ctx(),
                 window: None,
                 window_notify: None,
@@ -21518,6 +21658,297 @@ mod tests {
             "a parked monitor must still relay initial Idle and both edges to \
              its source gate"
         );
+    }
+
+    /// [`GatedQuietSource`] with a raw stream too, so a full mask takes the
+    /// raw fast path and parks in `rx_raw.recv()`.
+    #[derive(Clone)]
+    struct QuietRawSource {
+        quiet: GatedQuietSource,
+        _raw_keepalive: Arc<mpsc::Sender<crate::server_native::RawMonitorEvent>>,
+        raw: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>>,
+    }
+    impl crate::server_native::source::ChannelSource for QuietRawSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            self.quiet.list_pvs().await
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            self.quiet.has_pv(n).await
+        }
+        async fn get_introspection(&self, n: &str) -> Option<FieldDesc> {
+            self.quiet.get_introspection(n).await
+        }
+        async fn get_value(&self, _n: &str) -> Option<PvField> {
+            None
+        }
+        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _n: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+            None
+        }
+        async fn subscribe_raw_seeded(
+            &self,
+            _checked: crate::server_native::source::AccessChecked,
+            _ctx: crate::server_native::source::ChannelContext,
+            _opts: crate::server_native::MonitorOptions,
+        ) -> Option<
+            crate::server_native::source::SubscriptionSeed<crate::server_native::RawMonitorEvent>,
+        > {
+            Some(crate::server_native::source::SubscriptionSeed {
+                initial: None,
+                updates: self.raw.lock().take()?.into(),
+                on_start: None,
+            })
+        }
+    }
+
+    /// Dropping the op's `MonitorStartControl` closes the executing watch.
+    /// A closed watch's `changed()` is ready forever, so a subscriber parked
+    /// on a quiet stream must end on it — not spin in `select!` without
+    /// yielding, which kept `DedicatedExecutor::shutdown` joining PVASTASK.
+    async fn a_closed_exec_watch_ends_the_subscriber(src: DynSource, full_mask: bool) {
+        let intro = three_field_intro();
+        let mut mask = BitSet::with_capacity(intro.total_bits());
+        if full_mask {
+            (0..intro.total_bits()).for_each(|b| mask.set(b));
+        }
+        let (wire_tx, _wire_rx) = test_srv_tx(64);
+        let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let (_join, start_ctl) = spawn_monitor_subscriber(
+            &crate::test_reactor(),
+            MonitorSubscriberArgs {
+                sid: 1,
+                ioid: 2,
+                pv_name: "dut".into(),
+                intro: std::sync::Arc::new(intro.clone()),
+                mask,
+                tx: ChannelTx::new(
+                    wire_tx,
+                    crate::server_native::peers::ChannelStat::new("dut".into()),
+                ),
+                src,
+                queue_depth: 4,
+                mon_ctx: bfr12_anon_ctx(),
+                window: None,
+                window_notify: None,
+                filters: Arc::new(Default::default()),
+                monitor_options: Default::default(),
+                wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                monitor_op_id: 7,
+                wm_levels: None,
+                mon_fin_tx,
+                out_order: fixed_out_order(ByteOrder::Little),
+            },
+        );
+        start_ctl.set(true);
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
+        drop(start_ctl);
+        let fin = epics_base_rs::runtime::task::timeout(
+            std::time::Duration::from_secs(5),
+            mon_fin_rx.recv(),
+        )
+        .await
+        .expect("the subscriber ends once its executing watch closes");
+        assert!(fin.is_some(), "its finish guard reports the exit");
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_closed_exec_watch_ends_a_decoded_subscriber() {
+        let (keep_tx, keep_rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(4);
+        let src: DynSource = Arc::new(GatedQuietSource {
+            intro: three_field_intro(),
+            gate_log: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            _keepalive: Arc::new(keep_tx),
+            keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
+        });
+        a_closed_exec_watch_ends_the_subscriber(src, false).await;
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_closed_exec_watch_ends_a_raw_subscriber() {
+        let (keep_tx, keep_rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(4);
+        let (raw_tx, raw_rx) = mpsc::channel::<crate::server_native::RawMonitorEvent>(4);
+        let src: DynSource = Arc::new(QuietRawSource {
+            quiet: GatedQuietSource {
+                intro: three_field_intro(),
+                gate_log: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                _keepalive: Arc::new(keep_tx),
+                keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
+            },
+            _raw_keepalive: Arc::new(raw_tx),
+            raw: Arc::new(parking_lot::Mutex::new(Some(raw_rx))),
+        });
+        a_closed_exec_watch_ends_the_subscriber(src, true).await;
+    }
+
+    /// pvxs `MonitorStat`: a monitor that is not STARTed accrues into its
+    /// queue (`maxQueue`) and, once the queue is full, squashes into the
+    /// tail (`nSquash`). Both are the channel's report for as long as the op
+    /// lives, and leave it with the op.
+    #[epics_macros_rs::epics_test]
+    async fn a_monitor_reports_its_queue_depth_and_squashes() {
+        use crate::server_native::MonitorReport;
+        let intro = three_field_intro();
+        let (keep_tx, keep_rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
+        let src: DynSource = Arc::new(GatedQuietSource {
+            intro: intro.clone(),
+            gate_log: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            _keepalive: Arc::new(keep_tx.clone()),
+            keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
+        });
+        // The three leaves: a structure-only mask passes no post after the
+        // first (`testmask`).
+        let mut mask = BitSet::with_capacity(intro.total_bits());
+        (1..intro.total_bits()).for_each(|b| mask.set(b));
+        let chan = crate::server_native::peers::ChannelStat::new("dut".into());
+        let (wire_tx, _wire_rx) = test_srv_tx(64);
+        let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let (join, _start_ctl) = spawn_monitor_subscriber(
+            &crate::test_reactor(),
+            MonitorSubscriberArgs {
+                sid: 1,
+                ioid: 2,
+                pv_name: "dut".into(),
+                intro: std::sync::Arc::new(intro.clone()),
+                mask,
+                tx: ChannelTx::new(wire_tx, chan.clone()),
+                src: src.clone(),
+                queue_depth: 2,
+                mon_ctx: bfr12_anon_ctx(),
+                window: None,
+                window_notify: None,
+                filters: Arc::new(Default::default()),
+                monitor_options: Default::default(),
+                wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                monitor_op_id: 7,
+                wm_levels: None,
+                mon_fin_tx,
+                out_order: fixed_out_order(ByteOrder::Little),
+            },
+        );
+        for n in 0..5 {
+            keep_tx
+                .send(three_field_value(n, n, n).into())
+                .await
+                .expect("the subscriber holds the stream");
+        }
+        let want = vec![MonitorReport {
+            ioid: 2,
+            max_queue: 2,
+            n_squash: 3,
+        }];
+        async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+            for _ in 0..400 {
+                if f() {
+                    return;
+                }
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("{what} never happened");
+        }
+        eventually("five posts into a queue of two", || {
+            chan.report(false).monitors == want
+        })
+        .await;
+
+        join.abort();
+        eventually("the op leaves the report", || {
+            chan.report(false).monitors.is_empty()
+        })
+        .await;
+    }
+
+    /// pvxs logs nothing when a connection's outbound queue is deep; neither
+    /// does this server. A STARTed monitor whose peer reads nothing fills the
+    /// writer queue, and the subscriber says nothing about it.
+    ///
+    /// The subscriber runs on a reactor thread, so the capture is the
+    /// process's global dispatcher: nextest gives this test its own process.
+    #[epics_macros_rs::epics_test]
+    async fn a_deep_outbound_queue_logs_nothing() {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let m = event.metadata();
+                if m.target().starts_with("epics_pva_rs") && *m.level() <= tracing::Level::INFO {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(format!("{} {}", m.level(), m.target()));
+                }
+            }
+        }
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(Capture(logged.clone())),
+        )
+        .expect("nextest runs each test in a process of its own");
+
+        let intro = three_field_intro();
+        let (keep_tx, keep_rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
+        let src: DynSource = Arc::new(GatedQuietSource {
+            intro: intro.clone(),
+            gate_log: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            _keepalive: Arc::new(keep_tx.clone()),
+            keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
+        });
+        // The three leaves: a structure-only mask passes no post after the
+        // first (`testmask`).
+        let mut mask = BitSet::with_capacity(intro.total_bits());
+        (1..intro.total_bits()).for_each(|b| mask.set(b));
+        const WIRE_DEPTH: usize = 4;
+        let (wire_tx, wire_rx) = test_srv_tx(WIRE_DEPTH);
+        let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let (join, start_ctl) = spawn_monitor_subscriber(
+            &crate::test_reactor(),
+            MonitorSubscriberArgs {
+                sid: 1,
+                ioid: 2,
+                pv_name: "dut".into(),
+                intro: std::sync::Arc::new(intro.clone()),
+                mask,
+                tx: ChannelTx::new(
+                    wire_tx,
+                    crate::server_native::peers::ChannelStat::new("dut".into()),
+                ),
+                src: src.clone(),
+                queue_depth: 4,
+                mon_ctx: bfr12_anon_ctx(),
+                window: None,
+                window_notify: None,
+                filters: Arc::new(Default::default()),
+                monitor_options: Default::default(),
+                wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                monitor_op_id: 7,
+                wm_levels: None,
+                mon_fin_tx,
+                out_order: fixed_out_order(ByteOrder::Little),
+            },
+        );
+        start_ctl.set(true);
+        for n in 0..2 * WIRE_DEPTH as i32 {
+            keep_tx
+                .send(three_field_value(n, n, n).into())
+                .await
+                .expect("the subscriber holds the stream");
+        }
+        for _ in 0..400 {
+            if wire_rx.len() >= WIRE_DEPTH {
+                break;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(wire_rx.len(), WIRE_DEPTH, "the writer queue is full");
+        join.abort();
+        assert_eq!(*logged.lock().unwrap(), Vec::<String>::new());
     }
 
     /// The guard's `Drop` reports completion to the owner — the mechanism

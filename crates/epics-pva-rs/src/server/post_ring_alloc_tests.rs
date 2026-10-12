@@ -1,7 +1,8 @@
-//! A record monitor's post builds no NT descriptor, no value tree and no
-//! metadata: the subscription's [`PostRing`](super::PostRing) is filled in
-//! place, so a value post allocates exactly what filling its value, alarm and
-//! time leaves allocates.
+//! A record monitor's post builds no NT descriptor, no value tree, no
+//! metadata and no leaf set: the subscription's [`PostRing`](super::PostRing)
+//! is filled in place and its marks were fixed at subscribe, so a scalar
+//! value post allocates nothing. Encoding that tree walks it by reference, so
+//! it allocates nothing beyond the output buffer either.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -14,9 +15,9 @@ use epics_base_rs::server::snapshot::{
 };
 use epics_base_rs::types::EpicsValue;
 
-use super::{LogLeaves, NtShape, PostRing, fill_nt_event, marked_update, snapshot_to_pv_field};
+use super::{LogLeaves, PostRing, marked_update, snapshot_to_pv_field};
 use crate::pvdata::PvField;
-use crate::server_native::{MonitorUpdate, PostValue};
+use crate::server_native::{Marks, MonitorUpdate, PostValue};
 
 thread_local! {
     /// Allocation calls made by this thread. Per thread so concurrently
@@ -95,12 +96,12 @@ fn push(queue: &mut VecDeque<MonitorUpdate>, update: MonitorUpdate) {
 
 /// Bursts longer than the queue, mapped before any is drained — PVASTASK's
 /// batched condition, where the queue is full whenever an event is mapped.
-/// Every post must allocate what its marks and its fill allocate, and nothing
-/// for the tree; every post must share a ring slot.
+/// Every warm post must allocate nothing, share a ring slot, and carry the
+/// one leaf set its event class was given at subscribe.
 fn assert_posts_fill_in_place(snap: impl Fn(u32) -> Snapshot) {
     let mut ring = PostRing::new(LIMIT, snap(0));
     let mut queue = VecDeque::new();
-    let mut spare = crate::pvdata::encode::default_value_for(&NtShape::of(&snap(0)).desc());
+    let mut first_marks: Option<Marks> = None;
     let mut n = 0;
     for round in 0..8 {
         for _ in 0..3 * LIMIT {
@@ -109,15 +110,24 @@ fn assert_posts_fill_in_place(snap: impl Fn(u32) -> Snapshot) {
             let ev = event(s.clone());
             let (update, posted) = allocs(|| marked_update(&mut ring, ev, 0, || None));
             let update = update.expect("a VALUE post marks leaves");
-            let (_, filled) = allocs(|| {
-                let marks = crate::nt::event_leaves(
+            let marks = update
+                .marked
+                .clone()
+                .expect("a record post declares its marks");
+            assert_eq!(
+                *marks,
+                crate::nt::event_leaves(
                     EventMask::VALUE | EventMask::ALARM,
                     s.properties,
                     matches!(s.value, EpicsValue::Enum(_)),
-                );
-                fill_nt_event(&mut spare, &LogLeaves::of_snapshot(&s));
-                marks
-            });
+                ),
+                "post {n}: the shared set is the event class's leaves"
+            );
+            let first = first_marks.get_or_insert(marks.clone());
+            assert!(
+                first.same_set(&marks),
+                "post {n}: every post of one class shares one leaf set"
+            );
             assert!(
                 matches!(update.value, PostValue::Shared(_)),
                 "post {n}: a full queue still leaves the ring a free slot"
@@ -129,10 +139,7 @@ fn assert_posts_fill_in_place(snap: impl Fn(u32) -> Snapshot) {
             );
             // Round 0 builds the slots; from then on the ring is warm.
             if round > 0 {
-                assert_eq!(
-                    posted, filled,
-                    "post {n}: a post allocates exactly its marks and its event fill"
-                );
+                assert_eq!(posted, 0, "post {n}: a warm post allocates nothing");
             }
             push(&mut queue, update);
         }
@@ -252,4 +259,72 @@ fn an_events_own_metadata_changes_no_display_or_control_leaf() {
     want.timestamp = stale.timestamp;
     want.user_tag = stale.user_tag;
     assert_eq!(update.value, snapshot_to_pv_field(&want));
+}
+
+/// Encode `v` under `desc` and `bits` into a buffer sized by a first pass:
+/// the second pass must allocate nothing and write the same bytes.
+fn assert_encodes_by_reference(
+    v: &PvField,
+    desc: &crate::pvdata::FieldDesc,
+    bits: &crate::proto::BitSet,
+) {
+    use crate::proto::ByteOrder;
+    let encode = |out: &mut Vec<u8>| {
+        crate::pvdata::encode::encode_pv_field_with_bitset(v, desc, bits, 0, ByteOrder::Little, out)
+    };
+    let mut first = Vec::new();
+    encode(&mut first);
+    let mut second = Vec::with_capacity(first.len());
+    let ((), n) = allocs(|| encode(&mut second));
+    assert_eq!(n, 0, "encoding a tree by reference allocates nothing");
+    assert_eq!(first, second, "one tree, one encoding");
+}
+
+/// The whole tree (root bit), and a value+alarm+timeStamp delta that walks
+/// the structure leaf by leaf.
+#[test]
+fn an_nt_tree_encodes_by_reference() {
+    let snap = ai(1.5);
+    let desc = super::NtShape::of(&snap).desc();
+    let v = snapshot_to_pv_field(&snap);
+    let mut root = crate::proto::BitSet::new();
+    root.set(0);
+    assert_encodes_by_reference(&v, &desc, &root);
+    let mut delta = crate::proto::BitSet::new();
+    for path in ["value", "alarm", "timeStamp"] {
+        let (start, end) = desc.bit_span_for_path(path).expect("an NT leaf");
+        (start..end).for_each(|b| delta.set(b));
+    }
+    assert_encodes_by_reference(&v, &desc, &delta);
+}
+
+/// A structure array's elements encode in place, not as copies.
+#[test]
+fn a_structure_array_encodes_by_reference() {
+    use crate::pvdata::{FieldDesc, PvStructure, ScalarType, ScalarValue};
+    let fields = vec![("x".to_string(), FieldDesc::Scalar(ScalarType::Int))];
+    let desc = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![(
+            "a".to_string(),
+            FieldDesc::StructureArray {
+                struct_id: "e".into(),
+                fields,
+            },
+        )],
+    };
+    let element = |x| {
+        let mut e = PvStructure::new("e");
+        e.fields
+            .push(("x".into(), PvField::Scalar(ScalarValue::Int(x))));
+        Some(e)
+    };
+    let mut root = PvStructure::new("");
+    root.fields.push((
+        "a".into(),
+        PvField::StructureArray(vec![element(1), None, element(2)]),
+    ));
+    let mut bits = crate::proto::BitSet::new();
+    bits.set(0);
+    assert_encodes_by_reference(&PvField::Structure(root), &desc, &bits);
 }

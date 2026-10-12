@@ -98,10 +98,9 @@ pub(crate) struct ConnEventsView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConnFold {
     pub connected: bool,
-    /// The rights of the last `AccessRightsChanged` sent while connected,
-    /// `true`/`true` before the first. One sent while disconnected (the
-    /// outage's no-rights) is not folded: dbCa reads rights only while
-    /// connected (`dbCa.c:1022-1023`).
+    /// The rights of the last `AccessRightsChanged` sent, `true`/`true`
+    /// before the first. Every connect sends its rights ahead of
+    /// `Connected`, so a connected fold holds that connection's rights.
     pub read: bool,
     pub write: bool,
     /// Connected → `Disconnected` edges sent.
@@ -139,12 +138,11 @@ impl ConnFold {
                 }
                 self.connected = false;
             }
-            ConnectionEvent::AccessRightsChanged { read, write } if self.connected => {
+            ConnectionEvent::AccessRightsChanged { read, write } => {
                 self.read = read;
                 self.write = write;
             }
-            ConnectionEvent::AccessRightsChanged { .. }
-            | ConnectionEvent::NativeTypeChanged { .. } => {}
+            ConnectionEvent::NativeTypeChanged { .. } => {}
         }
         self
     }
@@ -229,8 +227,8 @@ mod conn_fold_tests {
     use super::*;
 
     /// One case per boundary of the fold: a disconnect counts only from
-    /// connected, and rights fold only while connected, so the outage's
-    /// no-rights does not read as a change at the reconnect.
+    /// connected, and the rights are the last ones sent, which for a
+    /// connected fold are the ones its connect sent ahead of `Connected`.
     #[test]
     fn the_fold_counts_edges_and_connected_rights() {
         let (tx, _rx) = ConnEvents::new(4);
@@ -246,11 +244,11 @@ mod conn_fold_tests {
         let _ = tx.send(ConnectionEvent::Disconnected);
         assert_eq!(view.fold().outages, 0, "never connected: no edge");
 
-        let _ = tx.send(ConnectionEvent::Connected);
         let _ = tx.send(ConnectionEvent::AccessRightsChanged {
             read: true,
             write: false,
         });
+        let _ = tx.send(ConnectionEvent::Connected);
         assert_eq!(view.fold(), at(true, true, false, 0));
 
         let _ = tx.send(ConnectionEvent::Disconnected);
@@ -259,10 +257,13 @@ mod conn_fold_tests {
             write: false,
         });
         let _ = tx.send(ConnectionEvent::Disconnected);
-        assert_eq!(
-            view.fold(),
-            at(false, true, false, 1),
-            "one edge; the outage's no-rights is not folded"
-        );
+        assert_eq!(view.fold(), at(false, false, false, 1), "one edge");
+
+        let _ = tx.send(ConnectionEvent::AccessRightsChanged {
+            read: true,
+            write: true,
+        });
+        let _ = tx.send(ConnectionEvent::Connected);
+        assert_eq!(view.fold(), at(true, true, true, 1));
     }
 }

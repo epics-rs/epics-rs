@@ -130,6 +130,8 @@ pub struct CaLink {
     /// Drains `CaChannel::connection_events()` and keeps `connected`
     /// in sync with the real circuit state.
     _conn_task: AbortOnDrop,
+    /// The link's one processor of CP/CPP holders ([`run_processor`]).
+    _process_task: AbortOnDrop,
 }
 
 /// The single owner of a `ca://` link's connection-state transition.
@@ -225,6 +227,12 @@ struct LinkConnState {
     /// (`dbCa.c:847-849`), and the next `dbCaGetLink` re-sets it; this port
     /// leaves it set, so the two disagree only inside that window.
     used_input_native: AtomicBool,
+    /// C `CA_DBPROCESS` in `pca->link_action` (`dbCa.c:155`): set by
+    /// [`Self::request_process`], cleared by [`run_processor`] before it
+    /// processes, so requests raised before the worker runs are one process.
+    process_pending: AtomicBool,
+    /// The `workListEvent` signal (`dbCa.c:160`), sent on the 0→1 edge only.
+    process_wake: epics_base_rs::runtime::sync::Notify,
     db: Arc<RwLock<Option<PvDatabase>>>,
     pv_name: String,
 }
@@ -238,6 +246,8 @@ impl LinkConnState {
             n_disconnect: AtomicU64::new(0),
             connects_seen: AtomicU64::new(0),
             used_input_native: AtomicBool::new(false),
+            process_pending: AtomicBool::new(false),
+            process_wake: epics_base_rs::runtime::sync::Notify::new(),
             db,
             pv_name,
         }
@@ -247,14 +257,38 @@ impl LinkConnState {
         self.flag.load(Ordering::Acquire)
     }
 
+    /// C `addAction(pca, CA_DBPROCESS)` (`dbCa.c:132-161`): the only way a
+    /// CP/CPP holder of this link is processed. A request made while one is
+    /// pending merges into it, as the OR into `link_action` does.
+    fn request_process(&self) {
+        if !self.process_pending.swap(true, Ordering::AcqRel) {
+            self.process_wake.notify_one();
+        }
+    }
+
+    /// One step of [`run_processor`]: take the pending request and, if
+    /// there was one, process the holders. Returns whether it processed.
+    fn process_pending(&self) -> bool {
+        if !self.process_pending.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        // Drop the read guard before dispatching: the dispatch runs record
+        // processing.
+        let db_handle = self.db.read().clone();
+        if let Some(db_handle) = db_handle {
+            db_handle.dispatch_external_cp_targets(&self.pv_name);
+        }
+        true
+    }
+
     /// Mark the link live. Returns `true` on the false→true edge.
     fn mark_connected(&self) -> bool {
         !self.flag.swap(true, Ordering::AcqRel)
     }
 
-    /// Mark the link dead and, on the true→false edge, process every local
-    /// CP/CPP holder of this PV so the holder's failed link read commits
-    /// LINK/INVALID. Returns `true` on the edge.
+    /// Mark the link dead and, on the true→false edge, request the process
+    /// of every local CP/CPP holder of this PV, whose link read then fails
+    /// unless the link has reconnected first. Returns `true` on the edge.
     fn mark_disconnected(&self) -> bool {
         if !self.flag.swap(false, Ordering::AcqRel) {
             return false;
@@ -263,13 +297,7 @@ impl LinkConnState {
         // critical section that clears `isConnected` and queues the CP
         // dispatch (`dbCa.c:820-826`) — one edge, one count, one owner.
         self.n_disconnect.fetch_add(1, Ordering::Relaxed);
-        // Drop the read guard before dispatching: the dispatch runs record
-        // processing, and holding a lock across it is the deadlock shape
-        // `run_monitor` already avoids on the value path.
-        let db_handle = self.db.read().clone();
-        if let Some(db_handle) = db_handle {
-            db_handle.dispatch_external_cp_targets(&self.pv_name);
-        }
+        self.request_process();
         true
     }
 
@@ -305,35 +333,41 @@ impl LinkConnState {
     /// a lag alike: bring the link to `fold`, the state of a receiver that
     /// lost nothing. Every outage the link has not counted is replayed as
     /// the edge it was, dispatch included, so an outage that began and
-    /// ended inside a lag still lands LINK/INVALID on the CP holders; a
-    /// rights change is applied once, when it differs from the cache.
+    /// ended inside a lag still lands LINK/INVALID on the CP holders. A
+    /// connect not yet seen takes its rights without a dispatch, C
+    /// `connectionCallback` reading `ca_read_access` (`dbCa.c:875-876`); a
+    /// later change goes through [`Self::note_access_rights`]. The connect
+    /// is counted, not read off `flag`, which a monitor event may set first.
     /// Returns `true` when `fold` holds a connect not yet refetched for.
     fn sync(&self, fold: ConnFold) -> bool {
         for _ in self.disconnect_count()..fold.outages {
             self.mark_connected();
             self.mark_disconnected();
         }
+        let connects = fold.outages + u64::from(fold.connected);
+        let new_connect = self.connects_seen.swap(connects, Ordering::Relaxed) < connects;
         if fold.connected {
             self.mark_connected();
-            if (fold.read, fold.write) != (self.has_read_access(), self.has_write_access()) {
+            if new_connect {
+                self.read_access.store(fold.read, Ordering::Release);
+                self.write_access.store(fold.write, Ordering::Release);
+            } else if (fold.read, fold.write) != (self.has_read_access(), self.has_write_access()) {
                 self.note_access_rights(fold.read, fold.write);
             }
         }
-        let connects = fold.outages + u64::from(fold.connected);
-        self.connects_seen.swap(connects, Ordering::Relaxed) < connects
+        new_connect
     }
 
     /// C `accessRightsCallback` (`dbCa.c:1014-1040`) as one owned
-    /// transition. Returns `true` iff the CP/CPP holders were dispatched.
+    /// transition. Returns `true` iff the CP/CPP holders' process was requested.
     ///
     /// * **Not connected:** do nothing at all — C returns before touching
     ///   the cached flags (`dbCa.c:1022-1023`, "connectionCallback will
-    ///   handle"). Safe here for the same reason it is in C: the
-    ///   coordinator re-broadcasts the current rights immediately after
-    ///   `Connected` on every (re)connect, so a skipped event is always
-    ///   superseded, and skipping is what keeps a stale rights event
-    ///   queued behind a `Disconnected` from double-dispatching an outage
-    ///   the disconnect edge already dispatched.
+    ///   handle"). [`Self::sync`] is that connection callback: it takes a
+    ///   new connect's rights itself, and skipping here is what keeps a
+    ///   stale rights event queued behind a `Disconnected` from
+    ///   double-dispatching an outage the disconnect edge already
+    ///   dispatched.
     /// * **Connected:** cache both new rights, then dispatch the
     ///   holders UNLESS both read and write are held (`dbCa.c:1029`
     ///   `if (hasReadAccess && hasWriteAccess) goto done`). C processes on
@@ -357,14 +391,7 @@ impl LinkConnState {
         if read && write {
             return false;
         }
-        // Drop the read guard before dispatching — same rule as
-        // `mark_disconnected`: the dispatch runs record processing, and
-        // holding a lock across it is the deadlock shape `run_monitor`
-        // avoids on the value path.
-        let db_handle = self.db.read().clone();
-        if let Some(db_handle) = db_handle {
-            db_handle.dispatch_external_cp_targets(&self.pv_name);
-        }
+        self.request_process();
         true
     }
 }
@@ -688,7 +715,7 @@ impl CaLinkResolver {
             return Ok(existing);
         }
         // The receiver is taken with the channel, before its search starts:
-        // a `Connected` / `AccessRightsChanged` pair published ahead of the
+        // an `AccessRightsChanged` / `Connected` pair published ahead of the
         // watcher is lost for good — `meta` stays empty and the write right
         // stays at its default `true` (C `connectionCallback` scheduling
         // `CA_GET_ATTRIBUTES` and reading `ca_write_access`).
@@ -727,13 +754,13 @@ impl CaLinkResolver {
             meta.clone(),
             pv_name.to_string(),
         ));
+        let process_task = reactor.spawn(run_processor(connected.clone()));
         let monitor_task = reactor.spawn(run_monitor(
             monitor,
             cache.clone(),
             connected.clone(),
             channel.clone(),
             pv_name.to_string(),
-            self.db.clone(),
         ));
         let link = Arc::new(CaLink {
             cache,
@@ -742,6 +769,7 @@ impl CaLinkResolver {
             channel,
             _monitor_task: AbortOnDrop(monitor_task),
             _conn_task: AbortOnDrop(conn_task),
+            _process_task: AbortOnDrop(process_task),
         });
         // Re-check under the write lock so two concurrent first-callers
         // converge on one link (the loser's freshly opened link drops,
@@ -842,6 +870,17 @@ impl CaLinkResolver {
     }
 }
 
+/// C `dbCaTask`'s `CA_DBPROCESS` arm (`dbCa.c:1185-1195`, `:1314-1321`)
+/// for one link: take the pending request, then process every local
+/// CP/CPP holder of the PV. The flag is cleared before processing, so a
+/// request raised during it processes again, as C's re-queue does.
+async fn run_processor(state: Arc<LinkConnState>) {
+    loop {
+        state.process_wake.notified().await;
+        state.process_pending();
+    }
+}
+
 /// Monitor task: drain the subscription, refresh the cache on every
 /// event. Ends when the channel is dropped (`recv` returns `None`).
 ///
@@ -854,7 +893,6 @@ async fn run_monitor(
     connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
     pv_name: String,
-    db: Arc<RwLock<Option<PvDatabase>>>,
 ) {
     while let Some(event) = monitor.recv().await {
         match event {
@@ -879,21 +917,10 @@ async fn run_monitor(
                     native_count,
                 })));
                 // C `dbCa.c eventCallback` refreshes the cached value, then
-                // adds `CA_DBPROCESS` for every CP link (and Passive CPP
-                // link) on this PV (`dbCa.c:891`, `:958-962`); the worker thread
-                // later runs `db_process(prec)` (`dbCa.c:1255`). Drive the
-                // Rust twin: process every local holder of an external
-                // CP/CPP link to this PV. The cache is stored ABOVE first,
-                // so the holder's INP read sees the fresh value — matching
-                // the C ordering (cache update precedes the process request).
-                // No-op when no holder is registered or the DB is not
-                // attached. The read
-                // guard is dropped before the await so the lock is never
-                // held across the process call.
-                let db_handle = db.read().clone();
-                if let Some(db_handle) = db_handle {
-                    db_handle.dispatch_external_cp_targets(&pv_name);
-                }
+                // adds `CA_DBPROCESS` (`dbCa.c:891`, `:958-962`). The cache is
+                // stored ABOVE first, so the holder's INP read sees the fresh
+                // value — the C ordering.
+                connected.request_process();
             }
             // A monitor error event (e.g. a transient server-side
             // problem) leaves the last cached value in place — the
@@ -1516,8 +1543,8 @@ mod tests {
         assert!(!state.note_access_rights(false, false));
         assert!(
             state.has_read_access(),
-            "rights must not change while disconnected — the reconnect \
-             re-delivers the real rights right after Connected"
+            "rights must not change while disconnected — `sync` takes the \
+             reconnect's rights"
         );
 
         assert!(state.mark_connected());
@@ -1551,40 +1578,54 @@ mod tests {
         epics_base_rs::runtime::task::block_on_sync(f).expect("a plain test thread")
     }
 
-    /// The flag as an lset, the way `CaLink::value` gates on it: a dispatch
-    /// made while it is down fails the holder's read.
-    struct FlagLset(Arc<LinkConnState>);
+    /// The flag as an lset, the way `CaLink::value` gates on it: a process
+    /// made while it is down fails the holder's read. Counts the holder's
+    /// processings by its link reads, and with `request_on_read` set raises
+    /// one request from inside the first processing it sees.
+    struct FlagLset {
+        state: Arc<LinkConnState>,
+        reads: AtomicU64,
+        request_on_read: AtomicBool,
+    }
+
+    impl FlagLset {
+        fn read(&self) -> Option<EpicsValue> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.request_on_read.swap(false, Ordering::Relaxed) {
+                self.state.request_process();
+            }
+            self.state.is_set().then_some(EpicsValue::Double(42.5))
+        }
+    }
 
     #[async_trait::async_trait]
     impl epics_base_rs::server::database::LinkSet for FlagLset {
         fn is_connected(&self, _: &str) -> bool {
-            self.0.is_set()
+            self.state.is_set()
         }
         async fn get_value(&self, _: &str) -> Option<EpicsValue> {
-            self.0.is_set().then_some(EpicsValue::Double(42.5))
+            self.read()
         }
         fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
-            self.0.is_set().then_some(EpicsValue::Double(42.5))
+            self.read()
         }
         async fn connect_link(&self, _: &str) {}
     }
 
-    /// An outage that began and ended inside a lag: the receiver sees only
-    /// `Lagged` and what came after, the channel is connected again, and
-    /// the CP holder must still commit LINK/INVALID for it, as C's
-    /// `connectionCallback` processed it (`dbCa.c:820-826`). A resync from
-    /// the channel's current state found nothing to do.
-    #[test]
-    fn an_outage_lost_in_a_lag_still_alarms_the_cp_holder() {
-        use epics_base_rs::runtime::sync::broadcast;
-        use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
+    /// A link state on `UP:PV` and a database whose ai `HOLDER` reads it
+    /// through a CP link served by a [`FlagLset`].
+    fn cp_holder() -> (Arc<LinkConnState>, Arc<FlagLset>, PvDatabase) {
         use epics_base_rs::server::records::ai::AiRecord;
         let db_slot = Arc::new(RwLock::new(None));
         let state = Arc::new(LinkConnState::new(db_slot.clone(), "UP:PV".to_string()));
+        let lset = Arc::new(FlagLset {
+            state: state.clone(),
+            reads: AtomicU64::new(0),
+            request_on_read: AtomicBool::new(false),
+        });
         let db = block(async {
             let db = PvDatabase::new();
-            db.register_link_set("ca", Arc::new(FlagLset(state.clone())))
-                .await;
+            db.register_link_set("ca", lset.clone()).await;
             db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
                 .await
                 .unwrap();
@@ -1605,6 +1646,49 @@ mod tests {
             db
         });
         *db_slot.write() = Some(db.clone());
+        (state, lset, db)
+    }
+
+    /// C `addAction` (`dbCa.c:132-161`) per boundary, with the processor
+    /// stepped by hand: requests raised before it runs are one process, and
+    /// one raised during the process is a second.
+    #[test]
+    fn process_requests_merge_until_the_processor_takes_them() {
+        let (state, lset, db) = cp_holder();
+        let reads = || lset.reads.load(Ordering::Relaxed);
+        assert!(!state.process_pending(), "nothing requested");
+        // What one processing of the holder reads, the unit counted below.
+        let base = reads();
+        db.dispatch_external_cp_targets("UP:PV");
+        let one = reads() - base;
+        assert!(one > 0);
+
+        let base = reads();
+        state.request_process();
+        state.request_process();
+        assert!(state.process_pending());
+        assert_eq!(reads() - base, one, "two requests before the processor ran");
+        assert!(!state.process_pending(), "both were taken");
+
+        lset.request_on_read.store(true, Ordering::Relaxed);
+        state.request_process();
+        assert!(state.process_pending());
+        assert!(state.process_pending(), "the request made while processing");
+        assert_eq!(reads() - base, 3 * one);
+        assert!(!state.process_pending());
+    }
+
+    /// An outage that began and ended inside a lag: the receiver sees only
+    /// `Lagged` and what came after, the channel is connected again, and
+    /// the replayed edge still requests the CP holder's process. The
+    /// processor runs after the reconnect, so the holder reads the
+    /// reconnected link with no alarm, C's outcome when dbCaTask runs after
+    /// `connectionCallback`'s reconnect (`dbCa.c:820-826`, `:1314-1321`).
+    #[test]
+    fn an_outage_lost_in_a_lag_processes_the_cp_holder_after_the_reconnect() {
+        use epics_base_rs::runtime::sync::broadcast;
+        let (state, lset, db) = cp_holder();
+        let reads = || lset.reads.load(Ordering::Relaxed);
         let alarm = || {
             let rec = db.get_record("HOLDER").unwrap();
             let inst = rec.read();
@@ -1612,8 +1696,10 @@ mod tests {
         };
 
         state.sync(fold(true, RW, 0));
+        let before = reads();
         db.dispatch_external_cp_targets("UP:PV");
-        assert_eq!(alarm(), (0, 0), "connected: the holder reads 42.5");
+        let one = reads() - before;
+        let before = reads();
 
         let (tx, mut rx) = broadcast::channel(2);
         for evt in [
@@ -1622,11 +1708,11 @@ mod tests {
                 read: false,
                 write: false,
             },
-            ConnectionEvent::Connected,
             ConnectionEvent::AccessRightsChanged {
                 read: true,
                 write: true,
             },
+            ConnectionEvent::Connected,
         ] {
             tx.send(evt).unwrap();
         }
@@ -1635,13 +1721,15 @@ mod tests {
             block(watch_step(&mut rx, &state, || now)),
             WatchStep::Refetch
         );
-        assert_eq!(
-            alarm(),
-            (LINK_ALARM, 3),
-            "the lost outage processed the holder while the link was down"
-        );
         assert_eq!(state.disconnect_count(), 1);
         assert!(state.is_set());
+
+        assert!(
+            state.process_pending(),
+            "the lost outage requested a process"
+        );
+        assert_eq!(reads(), before + one);
+        assert_eq!(alarm(), (0, 0), "the holder read the reconnected link");
 
         // The retained tail wakes the watcher again; the outage is counted.
         assert_eq!(
@@ -1649,6 +1737,7 @@ mod tests {
             WatchStep::Applied
         );
         assert_eq!(state.disconnect_count(), 1);
+        assert!(!state.process_pending());
     }
 
     /// Stage C6 criterion 4 regression, at the level the invariant is

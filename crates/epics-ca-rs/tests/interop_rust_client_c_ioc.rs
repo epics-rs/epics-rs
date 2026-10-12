@@ -247,11 +247,11 @@ async fn rights_survive_an_unresponsive_circuit(acf: &str) {
             .expect("connection event inside the budget")
             .expect("receiver open, not lagged")
     };
-    assert_eq!(next().await, ConnectionEvent::Connected);
     let granted = match next().await {
         ConnectionEvent::AccessRightsChanged { read, write } => (read, write),
-        other => panic!("softIoc's rights follow Connected, got {other:?}"),
+        other => panic!("softIoc's rights precede Connected, got {other:?}"),
     };
+    assert_eq!(next().await, ConnectionEvent::Connected);
 
     signal(ioc.pid(), "-STOP");
     let down = (next().await, next().await);
@@ -280,7 +280,6 @@ async fn rights_survive_an_unresponsive_circuit(acf: &str) {
         "ca_write_access answers the held permits while the circuit is unresponsive"
     );
 
-    assert_eq!(next().await, ConnectionEvent::Connected);
     assert_eq!(
         next().await,
         ConnectionEvent::AccessRightsChanged {
@@ -289,6 +288,7 @@ async fn rights_survive_an_unresponsive_circuit(acf: &str) {
         },
         "recovery reports the rights softIoc granted, not the outage's no-rights"
     );
+    assert_eq!(next().await, ConnectionEvent::Connected);
     assert_eq!(rights().await, Some(granted));
 }
 

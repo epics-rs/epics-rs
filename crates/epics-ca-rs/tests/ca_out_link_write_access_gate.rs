@@ -229,7 +229,7 @@ async fn a_connected_but_write_denied_link_is_refused() {
 /// receiver must exist before the channel can connect. Both arms read only
 /// after the connect is OVER: `wait_connected` wakes on the state change,
 /// and a second `WaitConnected` is answered by the coordinator after the
-/// handler that sent `Connected` + `AccessRightsChanged` has returned. The
+/// handler that sent `AccessRightsChanged` + `Connected` has returned. The
 /// receiver made with the channel holds both; one taken then — what a
 /// preempted `open` used to do — holds neither, and its write right stayed
 /// at the default `true`.
@@ -259,7 +259,6 @@ async fn a_receiver_taken_with_the_channel_keeps_a_connect_it_lost_the_race_to()
             .expect("the receiver made with the channel holds the connect")
             .ok()
     };
-    assert_eq!(next().await, Some(ConnectionEvent::Connected));
     assert_eq!(
         next().await,
         Some(ConnectionEvent::AccessRightsChanged {
@@ -268,6 +267,7 @@ async fn a_receiver_taken_with_the_channel_keeps_a_connect_it_lost_the_race_to()
         }),
         "the ACF's WRITE rule names a HAG this client is not in"
     );
+    assert_eq!(next().await, Some(ConnectionEvent::Connected));
     assert_eq!(
         late.try_recv(),
         Err(TryRecvError::Empty),

@@ -4073,12 +4073,16 @@ async fn run_coordinator(
                                 let _ = waiter.send(());
                             }
 
-                            // Broadcast connected + access rights events
-                            let _ = ch.conn_tx.send(ConnectionEvent::Connected);
+                            // Rights, then Connected: rsrv sends ACCESS_RIGHTS
+                            // before the CREATE_CHAN reply (`camessage.c:1180`,
+                            // `:1201`) and `nciu::connect` notifies in that order
+                            // (`nciu.cpp:145-158`), so dbCa's rights handler sees
+                            // the channel unconnected and dispatches nothing.
                             let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
                                 read: access.read,
                                 write: access.write,
                             });
+                            let _ = ch.conn_tx.send(ConnectionEvent::Connected);
                             // epics-base `16877577` parity: surface native
                             // DBR type changes so consumers can react before
                             // the next event flows. Only a transition from a
@@ -4362,16 +4366,17 @@ async fn run_coordinator(
                                 if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
                                     snap.state = ChannelState::Connected;
                                 }
-                                let _ = ch.conn_tx.send(ConnectionEvent::Connected);
                                 // The down edge told the receiver no-rights;
                                 // C's connect handlers re-read the held
                                 // permits (`dbCa.c:875-876`,
                                 // `gatePv.cc:395-396`), a receiver has only
-                                // this event to read them from.
+                                // this event to read them from. Ahead of
+                                // `Connected`, as on a first connect.
                                 let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
                                     read: ch.access_rights.read,
                                     write: ch.access_rights.write,
                                 });
+                                let _ = ch.conn_tx.send(ConnectionEvent::Connected);
                                 recovered_cids.push(ch.cid);
                             }
                         }

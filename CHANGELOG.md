@@ -4125,11 +4125,13 @@ layer-by-layer code review across `pva-rs`, `ca-rs`, and `bridge-rs`.
   `configureChannelAccessAddressList`).
 - `casr` iocsh command (RSRV `casr` analog) on `epics_ca_rs::server::iocsh`,
   reading from `Arc<ServerStats>` (connects/disconnects/uptime).
-- `Channel::on_access_rights_change(cb)` callback wrapper.
+- `Channel::on_access_rights_change(cb)` callback wrapper (removed at
+  `ecf39866d`).
 
 **Round 2 (commit `007346e`)**
 - `Channel::on_connection_change(cb)` — libca `ca_change_connection_event`
   analog. Filters Connected / Disconnected events from the broadcast.
+  Removed at `ecf39866d`.
 - `Channel::host_name()` — libca `ca_host_name` analog returning the
   resolved server address.
 - `Channel::receive_watchdog_delay() -> Duration` — libca

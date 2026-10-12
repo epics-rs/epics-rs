@@ -140,8 +140,8 @@ CREATE_CHAN(cid, sid, type, n)   ◀─────
    │
    ▼ ChannelCreated event
 ChannelInner.state = Connected
-broadcast ConnectionEvent::Connected
 broadcast AccessRightsChanged
+broadcast ConnectionEvent::Connected
 restore_for_channel(cid, sid)
    │  (re-issue EVENT_ADD for each
    │   live subscription — no-op on

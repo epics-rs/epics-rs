@@ -190,7 +190,7 @@ test-group = 'pva_listener'
 # confined to one test too. The cap is retained on the evidence of the
 # runs behind it, not on that reason.
 [[profile.default.overrides]]
-filter = 'binary(interop_rust_client_c_ioc) | binary(interop_c_client_rust_ioc) | binary(stress_load) | binary(differential_libca)'
+filter = 'binary(interop_rust_client_c_ioc) | binary(interop_c_client_rust_ioc) | binary(stress_load) | binary(differential_libca) | binary(calink_rights_match_softioc)'
 test-group = 'ca_softioc'
 
 # IOC spawners that have been measured NOT to need serialising. Declared

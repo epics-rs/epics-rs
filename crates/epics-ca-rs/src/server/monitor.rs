@@ -142,8 +142,7 @@ pub(crate) async fn deliver_monitor_event(
         s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
     }
     if m.denied.load(Ordering::Acquire) {
-        m.gate
-            .deliver(|| super::tcp::send_denied_event(m, &event, outbox));
+        m.gate.deliver(|| super::tcp::send_denied_event(m, outbox));
         return;
     }
     // Back-pressure, taken once this event is known to become a frame:

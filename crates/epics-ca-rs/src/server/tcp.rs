@@ -6099,7 +6099,7 @@ pub(crate) async fn run_event_task<W>(
                     }
                     let denied = m.denied.load(Ordering::Acquire);
                     if denied {
-                        send_denied_event(m, &event, &ev_outbox);
+                        send_denied_event(m, &ev_outbox);
                     } else if let Some(delivery) = source {
                         super::monitor::send_event(
                             m.refusal_channel(),
@@ -6425,33 +6425,6 @@ fn send_put_notify_response(
     Ok(())
 }
 
-/// normalise an EVENT_ADD request count for a no-read-access
-/// denial frame. C `read_reply` (`rsrv/camessage.c:504-509`) treats a
-/// zero element count as autosize and substitutes `paddr->no_elements`
-/// — the target's live element count. The `no_read_access_event`
-/// denial path must do the same, otherwise a `count == 0` monitor on
-/// a plain DBR type (`DBR_DOUBLE`, …) produces a zero-payload
-/// `CA_PROTO_EVENT_ADD`. That shape is the historical
-/// subscription-cancel-confirmation no-op: the CA client drops it
-/// before reading the `ECA_NORDACCESS` status (C `cac.cpp`
-/// eventRespAction returns on `m_postsize == 0`; this port's
-/// `client/transport.rs` mirrors that), so the denied monitor would
-/// silently appear to hang.
-///
-/// A non-zero request count is returned unchanged (explicit counts
-/// are already framed at the requested shape). `actual_count` is the
-/// target's live element count, used only for the autosize case.
-fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
-    if requested_count == 0 {
-        // Autosize: at least one element so the denial frame carries
-        // a nonzero DBR body. A target reporting zero live elements
-        // still gets a single-element zero-filled payload.
-        actual_count.max(1)
-    } else {
-        requested_count
-    }
-}
-
 /// C `send_err` then `log_header` for a message the receive gate refused.
 pub(crate) fn report_gate_error(
     outbox: &Outbox,
@@ -6550,12 +6523,11 @@ pub(crate) fn print_forcing_disconnect(peer: SocketAddr) {
 /// C `read_reply` without read access (`camessage.c:534-535`): a monitor
 /// entry is answered with `no_read_access_event`. While denied the subscriber
 /// is disabled, so what reaches here is the single-event post the access
-/// change queued, and entries queued before it.
-pub(crate) fn send_denied_event(
-    m: &CircuitMonitor,
-    event: &epics_base_rs::server::pv::MonitorEvent,
-    outbox: &Outbox,
-) {
+/// change queued, and entries queued before it. The frame is sized from the
+/// subscription's own count, so an autosize request is denied with count 0
+/// (`event_add_action` `camessage.c:1853-1858`, `no_read_access_event`
+/// `:473-475`), not read_reply's `no_elements`.
+pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &Outbox) {
     if refuse_unframeable_update(
         outbox,
         m.refusal_channel(),
@@ -6566,17 +6538,13 @@ pub(crate) fn send_denied_event(
     ) {
         return;
     }
-    let count = no_read_access_count(
-        m.data_count,
-        event.value().as_value().map_or(0, |v| v.count()),
-    );
     let _ = send_no_read_access_event(
         outbox,
         m.refusal_channel(),
         StatusEvent {
             cmd: CA_PROTO_EVENT_ADD,
             data_type: m.data_type,
-            count,
+            count: m.data_count,
             available: m.sub_id,
             eca_status: ECA_NORDACCESS,
         },
@@ -6592,10 +6560,6 @@ pub(crate) fn send_denied_event(
 /// dbChannel_get failures — preserving the requested count and DBR
 /// type so libca-style clients see the correct callback metadata even
 /// on the error path.
-///
-/// callers on the EVENT_ADD denial path must pass a `count`
-/// already normalised through [`no_read_access_count`] so an autosize
-/// (`count == 0`) request does not produce a zero-payload frame.
 /// C `read_reply` on a subscription update whose `dbChannel_get` failed
 /// (`camessage.c:545-561`): a zeroed update, count 0 when autosized, with
 /// `m_cid = ECA_GETFAIL`. The subscription stays.
@@ -7045,7 +7009,7 @@ async fn deliver_record_field_event(
         s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
     }
     if m.denied.load(Ordering::Acquire) {
-        m.gate.deliver(|| send_denied_event(m, &event, outbox));
+        m.gate.deliver(|| send_denied_event(m, outbox));
         return;
     }
     if refuse_unframeable_update(
@@ -7153,6 +7117,58 @@ async fn deliver_record_field_event(
 /// `dbGet` reads them (`dbAccess.c:336-414`); the event supplies value,
 /// alarm, time and utag only.
 #[cfg(test)]
+mod denied_event_frame {
+    use super::*;
+    use epics_base_rs::types::{DBR_DOUBLE, DBR_TIME_DOUBLE};
+
+    /// A count-0 EVENT_ADD without read access is answered with count 0 and a
+    /// `dbr_size_n(type, 0)` body. softIoc R7.0.10 with `RULE(1,NONE)`, a raw
+    /// client's reply on an ai and a 4-element waveform alike:
+    ///
+    /// ```text
+    /// dbr=6:  cmd=1 postsize=0  type=6  count=0 cid(status)=0x170
+    /// dbr=20: cmd=1 postsize=16 type=20 count=0 cid(status)=0x170 body=0*16
+    /// ```
+    #[epics_macros_rs::epics_test]
+    async fn an_autosize_denial_is_count_0_with_a_zero_count_body() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "X") { field(VAL, "1.5") }
+record(waveform, "W") { field(FTVL, "DOUBLE") field(NELM, "4") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        for name in ["X", "W"] {
+            for (data_type, postsize) in [(DBR_DOUBLE, 0), (DBR_TIME_DOUBLE, 16)] {
+                let target = ChannelTarget::RecordField {
+                    record: db.get_record(name).unwrap(),
+                    field: "VAL".into(),
+                };
+                let m = super::delivery_reads_options::monitor(&db, target, data_type);
+                let (outbox, mut drain) = crate::server::outbox::channel();
+                send_denied_event(&m, &outbox);
+                let frame = drain.try_next().expect("one frame");
+                let word = |i: usize| u16::from_be_bytes([frame[i], frame[i + 1]]);
+                assert_eq!(
+                    (word(0), word(2), word(4), word(6)),
+                    (CA_PROTO_EVENT_ADD, postsize, data_type, 0),
+                    "{name} dbr={data_type}"
+                );
+                assert_eq!(
+                    u32::from_be_bytes(frame[8..12].try_into().unwrap()),
+                    ECA_NORDACCESS
+                );
+                assert_eq!(frame.len(), 16 + postsize as usize);
+                assert!(frame[16..].iter().all(|&b| b == 0));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod delivery_reads_options {
     use super::*;
     use epics_base_rs::server::pv::MonitorEvent;
@@ -7178,7 +7194,11 @@ mod delivery_reads_options {
         db
     }
 
-    fn monitor(db: &Arc<PvDatabase>, target: ChannelTarget, data_type: u16) -> CircuitMonitor {
+    pub(super) fn monitor(
+        db: &Arc<PvDatabase>,
+        target: ChannelTarget,
+        data_type: u16,
+    ) -> CircuitMonitor {
         CircuitMonitor {
             target,
             db: db.clone(),
@@ -11091,68 +11111,6 @@ mod single_write_all_framing_tests {
         let frame = &frames[0];
         let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
         assert_eq!(count, 4, "autosize (count==0) keeps the live count");
-    }
-}
-
-#[cfg(test)]
-mod ex_r6_no_read_access_count_tests {
-    //! an autosize (`count == 0`) no-read-access EVENT_ADD
-    //! denial must be sized to a nonzero DBR body. A zero-payload
-    //! `CA_PROTO_EVENT_ADD` is the historical subscription-cancel
-    //! confirmation no-op; the CA client drops it before reading the
-    //! `ECA_NORDACCESS` status, so a denied autosize monitor would
-    //! silently appear to hang.
-    use super::no_read_access_count;
-    use epics_base_rs::types::{DbFieldType, dbr_buffer_size};
-
-    /// Autosize (`requested_count == 0`) must normalise to the
-    /// target's live element count — mirrors C `read_reply`
-    /// substituting `paddr->no_elements` (`camessage.c:504-509`).
-    #[test]
-    fn ex_r6_autosize_normalises_to_actual_count() {
-        assert_eq!(no_read_access_count(0, 7), 7);
-        // A scalar (1 element) autosize denial still gets a body.
-        assert_eq!(no_read_access_count(0, 1), 1);
-        // A target reporting zero live elements is floored at one so
-        // the frame is never zero-payload.
-        assert_eq!(no_read_access_count(0, 0), 1);
-    }
-
-    /// An explicit non-zero request count is framed unchanged — the
-    /// caller already asked for a definite shape.
-    #[test]
-    fn ex_r6_explicit_count_passes_through() {
-        assert_eq!(no_read_access_count(3, 7), 3);
-        assert_eq!(no_read_access_count(1, 100), 1);
-    }
-
-    /// The defect proof: with the pre-fix raw `count == 0`, the
-    /// `dbr_buffer_size` of a plain DBR type (`DBR_DOUBLE`) is zero,
-    /// producing the cancel-ack-shaped frame. After normalisation the
-    /// payload is strictly positive, so the client's status-error
-    /// path runs. `DBR_DOUBLE == 6` is a plain (non-STS) type, so its
-    /// metadata size is zero — the value bytes are the whole payload.
-    #[test]
-    fn ex_r6_normalised_count_yields_nonzero_plain_dbr_payload() {
-        const DBR_DOUBLE: u16 = 6;
-        // Pre-fix shape: raw autosize count 0 → zero-payload frame
-        // (indistinguishable from an EVENT_CANCEL ack).
-        assert_eq!(
-            dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, 0),
-            0,
-            "regression baseline: a raw count==0 plain-DBR denial is \
-             zero-payload — the cancel-ack shape later normalised"
-        );
-        // After normalisation the denial frame carries a real
-        // DBR body, so the client sees the ECA_NORDACCESS status.
-        let normalised = no_read_access_count(0, 4) as usize;
-        let payload = dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, normalised);
-        assert!(
-            payload > 0,
-            "a normalised autosize denial must have a nonzero \
-             DBR payload so the client does not drop it as a cancel-ack"
-        );
-        assert_eq!(payload, 4 * DbFieldType::Double.element_size());
     }
 }
 

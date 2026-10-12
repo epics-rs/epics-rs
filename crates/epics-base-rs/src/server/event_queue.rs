@@ -1318,8 +1318,9 @@ pub fn attach_with(
 /// see is freed by a later writer, never by their guard's drop.
 pub struct SubscriberList<S> {
     map: RetiringSwap<SubscriberMap<S>>,
-    /// Never below the map's length: an add raises it before its store and a
-    /// remove lowers it after, so a zero read means the map is empty.
+    /// Never below the published map's length — [`Self::publish`] raises it
+    /// before the store and lowers it after — so a reader that sees 0 sees an
+    /// empty map. A nonzero count does not say the map holds anyone.
     count: AtomicUsize,
     /// Serialises the copy-modify-store; a cycle thread never takes it.
     writer: parking_lot::Mutex<()>,
@@ -1368,11 +1369,17 @@ impl<S> Default for SubscriberList<S> {
 
 impl<S: Clone> SubscriberList<S> {
     /// The current map, for one phase on this thread.
+    ///
+    /// A post loads it inside the record hold that wrote the value; loaded
+    /// after the release, a late post can queue an older value behind a newer
+    /// one. Every cycle thread runs [`crate::sync::prime_current_thread`]
+    /// first, or its first load allocates.
     pub fn load(&self) -> RetireGuard<'_, SubscriberMap<S>> {
         self.map.load()
     }
 
-    /// No map load: the cycle's "anyone watching" test.
+    /// No map load: the cycle's "anyone watching" test. `true` means the map
+    /// is empty; `false` does not mean it holds anyone.
     pub fn is_empty(&self) -> bool {
         self.count.load(Ordering::Acquire) == 0
     }
@@ -1393,15 +1400,17 @@ impl<S: Clone> SubscriberList<S> {
         entries.push((field, sub));
         entries.extend_from_slice(&cur.entries[at..]);
         drop(cur);
-        self.count.fetch_add(1, Ordering::Release);
-        self.map.store(Arc::new(SubscriberMap { entries }));
+        let freed = self.publish(entries, 1, 0);
+        drop(_w);
+        drop(freed);
     }
 
     /// Remove every monitor `keep` refuses, returning them so their drops run
-    /// after the writer mutex is released. No store when nothing goes.
+    /// after the writer mutex is released, as do the drops of the maps the
+    /// store frees. No store when nothing goes.
     pub fn retain(&self, mut keep: impl FnMut(u16, &S) -> bool) -> Vec<S> {
         let mut gone = Vec::new();
-        {
+        let _freed = {
             let _w = self.writer.lock();
             let cur = self.map.load();
             let kept: Vec<bool> = cur.entries.iter().map(|(f, s)| keep(*f, s)).collect();
@@ -1417,10 +1426,34 @@ impl<S: Clone> SubscriberList<S> {
                 }
             }
             drop(cur);
-            self.map.store(Arc::new(SubscriberMap { entries }));
-            self.count.fetch_sub(gone.len(), Ordering::Release);
-        }
+            self.publish(entries, 0, gone.len())
+        };
         gone
+    }
+
+    /// Store `entries` with the count raised by `added` before and lowered by
+    /// `removed` after, which keeps it at or above the map's length.
+    fn publish(
+        &self,
+        entries: Vec<(u16, S)>,
+        added: usize,
+        removed: usize,
+    ) -> crate::sync::Freed<SubscriberMap<S>> {
+        self.count.fetch_add(added, Ordering::Release);
+        #[cfg(test)]
+        self.midpoint();
+        let freed = self.map.store_deferred(Arc::new(SubscriberMap { entries }));
+        #[cfg(test)]
+        self.midpoint();
+        self.count.fetch_sub(removed, Ordering::Release);
+        freed
+    }
+
+    /// The count and the published map's length between `publish`'s steps.
+    #[cfg(test)]
+    fn midpoint(&self) {
+        let seen = (self.count.load(Ordering::Acquire), self.map.load().len());
+        subscriber_list_tests::MIDPOINTS.with(|m| m.borrow_mut().push(seen));
     }
 }
 
@@ -1431,6 +1464,28 @@ mod subscriber_list_tests {
     use std::thread::{self, ThreadId};
 
     type Drops = Arc<StdMutex<Vec<(u32, ThreadId)>>>;
+
+    thread_local! {
+        pub(super) static MIDPOINTS: std::cell::RefCell<Vec<(usize, usize)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Between the count update and the store of every add and removal, the
+    /// count is at or above the published map's length.
+    #[test]
+    fn the_count_never_falls_below_the_published_map() {
+        let drops = Drops::default();
+        let list = SubscriberList::default();
+        for id in 0..3 {
+            list.add(id as u16, probe(id, &drops));
+        }
+        drop(list.retain(|f, _| f != 1));
+        drop(list.retain(|_, _| false));
+        let seen = MIDPOINTS.with(|m| m.take());
+        assert_eq!(seen.len(), 10);
+        assert!(seen.iter().all(|(count, len)| count >= len), "{seen:?}");
+        assert!(list.is_empty() && list.load().is_empty());
+    }
 
     /// Each clone is its own value, so freeing a map version shows up as
     /// drops of that version's copies, on the thread that freed it.
@@ -1562,6 +1617,37 @@ mod subscriber_list_tests {
         assert!(!list.is_empty());
         assert_eq!(list.retain(|_, _| false).len(), 300);
         assert!(list.is_empty());
+    }
+
+    /// A removed monitor's last reference sits in the map the removal
+    /// replaced; the store that frees that map drops it after the writer
+    /// mutex is released, from `add` and from `retain` alike.
+    #[test]
+    fn a_freed_map_drops_after_the_writer_mutex_is_released() {
+        struct Chk;
+        static LIST: std::sync::OnceLock<&'static SubscriberList<Arc<Chk>>> =
+            std::sync::OnceLock::new();
+        static LOCKED_AT_DROP: StdMutex<Vec<bool>> = StdMutex::new(Vec::new());
+        impl Drop for Chk {
+            fn drop(&mut self) {
+                if let Some(list) = LIST.get() {
+                    LOCKED_AT_DROP.lock().unwrap().push(list.writer.is_locked());
+                }
+            }
+        }
+        let list = *LIST.get_or_init(|| Box::leak(Box::default()));
+        // add's store frees the map that held the first.
+        list.add(0, Arc::new(Chk));
+        drop(list.retain(|_, _| false));
+        list.add(0, Arc::new(Chk));
+        assert_eq!(LOCKED_AT_DROP.lock().unwrap().len(), 1);
+        // A guard keeps the second's map past add's sweep, so retain frees it.
+        let guard = list.load();
+        drop(list.retain(|_, _| false));
+        list.add(0, Arc::new(Chk));
+        drop(guard);
+        drop(list.retain(|_, _| false));
+        assert_eq!(*LOCKED_AT_DROP.lock().unwrap(), [false, false]);
     }
 
     /// A reader loading and walking the map while a writer adds and removes

@@ -143,37 +143,49 @@ impl<T> RetiringSwap<T> {
     /// the overflow list when all four are held, and every retired value no
     /// reader holds is freed here, on this thread, after the writer mutex is
     /// released. A store never waits for a reader.
+    pub fn store(&self, value: Arc<T>) {
+        drop(self.store_deferred(value));
+    }
+
+    /// [`Self::store`], handing the values it would free back to the caller,
+    /// who drops them once it has released its own locks.
     ///
     /// A count of 1 is final: after the swap no reader can reach the value,
     /// and the swap has already turned every reader's debt on it into a
     /// counted reference.
-    pub fn store(&self, value: Arc<T>) {
-        let mut freed: [Option<Arc<T>>; RING] = std::array::from_fn(|_| None);
-        let mut freed_overflow = Vec::new();
-        {
-            let mut retired = self.retired.lock();
-            let displaced = self.cell.swap(value);
-            for (slot, out) in retired.ring.iter_mut().zip(freed.iter_mut()) {
-                if slot.as_ref().is_some_and(|a| Arc::strong_count(a) == 1) {
-                    *out = slot.take();
-                }
-            }
-            let mut i = 0;
-            while i < retired.overflow.len() {
-                if Arc::strong_count(&retired.overflow[i]) == 1 {
-                    freed_overflow.push(retired.overflow.swap_remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            match retired.ring.iter_mut().find(|s| s.is_none()) {
-                Some(free) => *free = Some(displaced),
-                None => retired.overflow.push(displaced),
+    pub fn store_deferred(&self, value: Arc<T>) -> Freed<T> {
+        let mut freed = Freed {
+            ring: std::array::from_fn(|_| None),
+            overflow: Vec::new(),
+        };
+        let mut retired = self.retired.lock();
+        let displaced = self.cell.swap(value);
+        for (slot, out) in retired.ring.iter_mut().zip(freed.ring.iter_mut()) {
+            if slot.as_ref().is_some_and(|a| Arc::strong_count(a) == 1) {
+                *out = slot.take();
             }
         }
-        drop(freed);
-        drop(freed_overflow);
+        let mut i = 0;
+        while i < retired.overflow.len() {
+            if Arc::strong_count(&retired.overflow[i]) == 1 {
+                freed.overflow.push(retired.overflow.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        match retired.ring.iter_mut().find(|s| s.is_none()) {
+            Some(free) => *free = Some(displaced),
+            None => retired.overflow.push(displaced),
+        }
+        freed
     }
+}
+
+/// Retired values no reader holds, freed when this is dropped.
+#[must_use = "dropping this frees the retired values here"]
+pub struct Freed<T> {
+    ring: [Option<Arc<T>>; RING],
+    overflow: Vec<Arc<T>>,
 }
 
 #[cfg(test)]

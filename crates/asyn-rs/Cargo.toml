@@ -121,6 +121,10 @@ name = "device_support_brings_the_shell_commands"
 required-features = ["epics"]
 
 [[test]]
+name = "asyn_monitor_posts_its_read_fields"
+required-features = ["epics"]
+
+[[test]]
 name = "enum_property_post_mask"
 required-features = ["epics"]
 

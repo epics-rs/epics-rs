@@ -28,8 +28,8 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDeclaration, FieldMetadataOverride, ProcessOutcome, Record,
-    RecordProcessResult, ScanType,
+    AlarmSeverity, CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDeclaration,
+    FieldMetadataOverride, ProcessOutcome, Record, RecordProcessResult, ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -644,6 +644,65 @@ pub struct AsynRecord {
     // record's `asynRecordDevice` device support, which is the framework's
     // `get_ioint_info` seam; see [`io_intr`].
     io_intr: Arc<IoIntrScan>,
+
+    // C `asynRecPvt.old` (asynRecord.c:147-208), the half `monitor()`'s
+    // `POST_IF_NEW` compares against.
+    monitor_old: MonitorOld,
+    // The [`MONITOR_POSTS`] bits the last `done:` decided, drained by the
+    // framework's one take per cycle. Only `done:` sets them, so an init or
+    // put-path take finds nothing and cannot advance `monitor_old`.
+    monitor_marks: u128,
+}
+
+/// The `oldValues` copies of the fields C `monitor()` posts with `POST_IF_NEW`
+/// (asynRecord.c:1020-1030). Zeroed like C's `calloc`ed `asynRecPvt`; only
+/// `REMEMBER_STATE` (:335-338) and `POST_IF_NEW` itself advance them.
+#[derive(Default)]
+struct MonitorOld {
+    nrrd: i32,
+    nord: i32,
+    nowt: i32,
+    nawt: i32,
+    spr: i32,
+    ucmd: i32,
+    acmd: i32,
+    eomr: i32,
+    i32inp: i32,
+    ui32inp: u32,
+    f64inp: f64,
+}
+
+/// C `monitor()`'s posts in its order (asynRecord.c:1006-1031), each with
+/// `recGblResetAlarms | DBE_VALUE | DBE_LOG`: the input buffer and TINP on a
+/// reading TMOD, then the eleven `POST_IF_NEW`s.
+static MONITOR_POSTS: [(&str, CyclePostMask); 14] = [
+    ("AINP", CyclePostMask::MonitorValueLog),
+    ("BINP", CyclePostMask::MonitorValueLog),
+    ("TINP", CyclePostMask::MonitorValueLog),
+    ("NRRD", CyclePostMask::MonitorValueLog),
+    ("NORD", CyclePostMask::MonitorValueLog),
+    ("NOWT", CyclePostMask::MonitorValueLog),
+    ("NAWT", CyclePostMask::MonitorValueLog),
+    ("SPR", CyclePostMask::MonitorValueLog),
+    ("UCMD", CyclePostMask::MonitorValueLog),
+    ("ACMD", CyclePostMask::MonitorValueLog),
+    ("EOMR", CyclePostMask::MonitorValueLog),
+    ("I32INP", CyclePostMask::MonitorValueLog),
+    ("UI32INP", CyclePostMask::MonitorValueLog),
+    ("F64INP", CyclePostMask::MonitorValueLog),
+];
+
+const MONITOR_CLAIMED: [&str; 14] = [
+    "AINP", "BINP", "TINP", "NRRD", "NORD", "NOWT", "NAWT", "SPR", "UCMD", "ACMD", "EOMR",
+    "I32INP", "UI32INP", "F64INP",
+];
+
+/// C `POST_IF_NEW` (asynRecord.c:210-214): whether `cur` moved off `old`, with
+/// `old` advanced to it.
+fn post_if_new<T: PartialEq + Copy>(cur: T, old: &mut T) -> bool {
+    let moved = cur != *old;
+    *old = cur;
+    moved
 }
 
 impl Default for AsynRecord {
@@ -741,6 +800,8 @@ impl Default for AsynRecord {
             old_trace_file_id: Arc::new(Mutex::new(None)),
             post_slot: Arc::new(Mutex::new(PostSlot::default())),
             io_intr: Arc::new(IoIntrScan::new()),
+            monitor_old: MonitorOld::default(),
+            monitor_marks: 0,
         }
     }
 }
@@ -4684,6 +4745,7 @@ impl Record for AsynRecord {
         );
         if !went_async {
             self.io_intr.clear_sample();
+            self.monitor();
         }
         outcome
     }
@@ -4727,29 +4789,25 @@ impl Record for AsynRecord {
         true
     }
 
-    /// C `monitor()` (asynRecord.c:1006-1030) splits into two groups, and the
-    /// split is the whole point of this hook: the input buffers are posted with
-    /// a bare `db_post_events` on every read cycle (`:1012-1019`), *above* the
-    /// `POST_IF_NEW` block that guards everything else on a change. A device
-    /// that answers the same string every scan therefore still fires one AINP
-    /// (or BINP) and one TINP monitor per scan — which is what an operator
-    /// watching a steady reading expects to see refresh (R18-86).
-    ///
-    /// Which input buffer is posted is C's `ifmt` choice at `:1014-1017`: ASCII
-    /// reads land in `ainp`, Hybrid and Binary in `iptr` (BINP). TINP is posted
-    /// either way. Non-read transfer modes post neither, so the set is exactly
-    /// C's three static shapes.
-    fn force_posted_fields(&self) -> &'static [&'static str] {
-        match TransferMode::from_u16(self.tmod as u16) {
-            TransferMode::Read | TransferMode::WriteRead => {
-                if self.ifmt == ASYN_FMT_ASCII {
-                    &["AINP", "TINP"]
-                } else {
-                    &["BINP", "TINP"]
-                }
-            }
-            _ => &[],
-        }
+    fn cycle_hooks(&self) -> CycleHooks {
+        CycleHooks::CYCLE_POSTED.union(CycleHooks::CONTEXT)
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        CycleMarks::of(&MONITOR_POSTS, std::mem::take(&mut self.monitor_marks))
+    }
+
+    /// A process cycle posts only what `monitor()` names: ERRS and the
+    /// `monitorStatus` set post through [`Self::publish`], and VAL never posts.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&MONITOR_CLAIMED)
+    }
+
+    /// `monitor()` decides these from its own old copies, never from a
+    /// published one: a put posts NRRD itself, and C's next cycle re-posts it
+    /// when `REMEMBER_STATE` did not run.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &MONITOR_CLAIMED
     }
 
     /// The `SPC_DBADDR` octet buffers: C `cvt_dbaddr` (asynRecord.c:948-955)
@@ -4791,6 +4849,41 @@ impl Record for AsynRecord {
 }
 
 impl AsynRecord {
+    /// C `monitor()` (asynRecord.c:1006-1031), run from `done:`: the input
+    /// buffer the IFMT selects (`:1014-1017`) and TINP on every reading cycle,
+    /// unconditionally, then the `POST_IF_NEW` block against `monitor_old`.
+    fn monitor(&mut self) {
+        let mut bits = 0u128;
+        if matches!(
+            TransferMode::from_u16(self.tmod as u16),
+            TransferMode::Read | TransferMode::WriteRead
+        ) {
+            bits |= if self.ifmt == ASYN_FMT_ASCII {
+                0b101
+            } else {
+                0b110
+            };
+        }
+        let old = &mut self.monitor_old;
+        let moved = [
+            post_if_new(self.nrrd, &mut old.nrrd),
+            post_if_new(self.nord, &mut old.nord),
+            post_if_new(self.nowt, &mut old.nowt),
+            post_if_new(self.nawt, &mut old.nawt),
+            post_if_new(self.spr, &mut old.spr),
+            post_if_new(self.ucmd, &mut old.ucmd),
+            post_if_new(self.acmd, &mut old.acmd),
+            post_if_new(self.eomr, &mut old.eomr),
+            post_if_new(self.i32inp, &mut old.i32inp),
+            post_if_new(self.ui32inp, &mut old.ui32inp),
+            post_if_new(self.f64inp, &mut old.f64inp),
+        ];
+        for (bit, moved) in moved.into_iter().enumerate() {
+            bits |= (moved as u128) << (bit + 3);
+        }
+        self.monitor_marks = bits;
+    }
+
     /// The body of C's `process()` — every arm of its `state` chain. The
     /// `done:` epilogue that closes the interrupt-cell invariant lives in the
     /// [`Record::process`] wrapper that calls this.
@@ -4849,6 +4942,11 @@ impl AsynRecord {
             self.report_not_connected();
             return Ok(ProcessOutcome::complete());
         };
+        // C `REMEMBER_STATE` (asynRecord.c:335-338), `stateIdle` only: a put to
+        // one of these between cycles posts from its put, not again from
+        // `monitor()`. A portless record skips it, so C re-posts such a put.
+        let old = &mut self.monitor_old;
+        (old.ucmd, old.acmd, old.nowt, old.nrrd) = (self.ucmd, self.acmd, self.nowt, self.nrrd);
 
         // C `process()`, inside the `stateIdle` arm: "If we got value from
         // interrupt no need to read" (asynRecord.c:340-341) —

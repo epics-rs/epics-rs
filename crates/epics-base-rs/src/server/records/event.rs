@@ -151,8 +151,15 @@ impl Record for EventRecord {
     }
 
     /// `monitor()` posts VAL alone (`eventRecord.c:157-165`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::EVENT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
     }
 
     fn has_array_monitor_post(&self) -> bool {

@@ -6,9 +6,9 @@ mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDesc, MonitorValueClasses, MonitorValueGate, ParsedLink,
-    ProcessAction, ProcessActions, ProcessOutcome, Record, RecordProcessResult, ResolvedInputLinks,
-    parse_link_v2,
+    CycleMarks, CyclePostMask, FieldDesc, FieldIx, MonitorValueClasses, MonitorValueGate,
+    ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, RecordProcessResult,
+    ResolvedInputLinks, parse_link_v2,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -57,7 +57,13 @@ pub struct MotorRecord {
 
 /// One row per [`m`] bit: C `monitor()`'s `monitor_mask | DBE_VAL_LOG`
 /// posts, then the literal `DBE_VAL_LOG` ones.
-static MONITOR_POSTS: [(&str, CyclePostMask); 57] = {
+static MONITOR_POSTS: [(FieldIx, CyclePostMask); 57] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::MOTOR_FIELDS,
+        MONITOR_POSTS_NAMED,
+    );
+
+const MONITOR_POSTS_NAMED: [(&str, CyclePostMask); 57] = {
     use CyclePostMask::{MonitorValueLog as M, ValueLog as L};
     [
         ("VAL", M),
@@ -151,8 +157,8 @@ static MONITOR_ORDER: [u8; 44] = {
     let mut i = 0;
     while i < MONITOR_FIELDS.len() {
         let mut row = 0;
-        while !(matches!(MONITOR_POSTS[row].1, CyclePostMask::MonitorValueLog)
-            && same(MONITOR_POSTS[row].0, MONITOR_FIELDS[i]))
+        while !(matches!(MONITOR_POSTS_NAMED[row].1, CyclePostMask::MonitorValueLog)
+            && same(MONITOR_POSTS_NAMED[row].0, MONITOR_FIELDS[i]))
         {
             row += 1;
         }
@@ -328,26 +334,21 @@ impl MotorRecord {
     /// marks, RBV through the deadband when marked.
     /// `process_motor_info`'s UEIP precedes `monitor()`, whose RBV block
     /// precedes the rest.
-    fn monitor_notify_fields(&mut self) -> Vec<(String, EpicsValue)> {
+    fn monitor_notify_fields(&mut self) -> Vec<FieldIx> {
         let rbv = self.internal.mmap & m::RBV != 0;
         let bits = self.take_monitor_marks() & (m::MONITOR | m::CNEN);
         let mut fields = Vec::new();
-        let mut post = |rec: &Self, row: usize| {
-            let name = MONITOR_POSTS[row].0;
-            if let Some(value) = rec.get_field(name) {
-                fields.push((name.to_string(), value));
-            }
-        };
+        let mut post = |row: usize| fields.push(MONITOR_POSTS[row].0);
         if bits & m::UEIP_POSTED != 0 {
-            post(self, m::UEIP_POSTED.trailing_zeros() as usize);
+            post(m::UEIP_POSTED.trailing_zeros() as usize);
         }
         if rbv {
             self.internal.mmap |= m::RBV;
-            post(self, m::RBV.trailing_zeros() as usize);
+            post(m::RBV.trailing_zeros() as usize);
         }
         for &row in &MONITOR_ORDER {
             if bits & 1 << row != 0 {
-                post(self, usize::from(row));
+                post(usize::from(row));
             }
         }
         fields
@@ -698,11 +699,15 @@ impl Record for MotorRecord {
     /// alarm move, marked or not, but the group below its short circuit
     /// only when one of them is marked (motorRecord.cc:3550-3551). RBV is
     /// the deadband field and CNEN posts only when the MSTA block derives it.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+    fn alarm_cycle_monitored_fields(&self) -> epics_base_rs::server::record::DeclaredFields {
+        static MONITORED: [FieldIx; 44] = epics_base_rs::server::record::declared_set(
+            dbd_generated::MOTOR_FIELDS,
+            MONITOR_FIELDS,
+        );
         if self.internal.monitor_lower_marked {
-            &MONITOR_FIELDS[..43]
+            &MONITORED[..43]
         } else {
-            &MONITOR_FIELDS[..5]
+            &MONITORED[..5]
         }
     }
 
@@ -853,7 +858,7 @@ impl Record for MotorRecord {
 
 #[cfg(test)]
 mod tests {
-    use epics_base_rs::server::record::FieldDeclaration;
+    use epics_base_rs::server::record::{FieldDeclaration, field_at};
 
     use super::*;
 
@@ -991,17 +996,24 @@ mod tests {
         let RecordProcessResult::AsyncPendingNotify(fields) = outcome.result else {
             panic!("first process() of a fresh move must be the move-start notification");
         };
+        let fields: Vec<(&str, EpicsValue)> = fields
+            .into_iter()
+            .map(|ix| {
+                let name = field_at(dbd_generated::MOTOR_FIELDS, ix).unwrap().name;
+                (name, rec.get_field(name).unwrap())
+            })
+            .collect();
         let mip = rec.stat.mip.bits() as i16;
         assert!(
             fields
                 .iter()
-                .any(|(n, v)| n == "MIP" && *v == EpicsValue::Short(mip)),
+                .any(|(n, v)| *n == "MIP" && *v == EpicsValue::Short(mip)),
             "move-start notify must carry MIP: {fields:?}"
         );
         assert!(
             fields
                 .iter()
-                .any(|(n, v)| n == "RCNT" && *v == EpicsValue::Short(rec.retry.rcnt)),
+                .any(|(n, v)| *n == "RCNT" && *v == EpicsValue::Short(rec.retry.rcnt)),
             "move-start notify must carry RCNT: {fields:?}"
         );
     }

@@ -701,15 +701,25 @@ struct MarkingRecord {
     val: i32,
 }
 
-static POSTS: [(&str, epics_base_rs::server::record::CyclePostMask); 2] = [
-    (
-        "A",
-        epics_base_rs::server::record::CyclePostMask::MonitorValueLog,
-    ),
-    ("B", epics_base_rs::server::record::CyclePostMask::Value),
-];
-const MARKED_ONLY: [&str; 2] = ["A", "B"];
-const POSTED: [&str; 3] = ["VAL", "A", "B"];
+static POSTS: [(
+    epics_base_rs::server::record::FieldIx,
+    epics_base_rs::server::record::CyclePostMask,
+); 2] = epics_base_rs::server::record::declared_post_table(
+    epics_base_rs::server::record::dbd_generated::SEQ_FIELDS,
+    [
+        (
+            "SELN",
+            epics_base_rs::server::record::CyclePostMask::MonitorValueLog,
+        ),
+        ("DO0", epics_base_rs::server::record::CyclePostMask::Value),
+    ],
+);
+const MARKED_ONLY: [&str; 2] = ["SELN", "DO0"];
+static POSTED: [epics_base_rs::server::record::FieldIx; 3] =
+    epics_base_rs::server::record::declared_set(
+        epics_base_rs::server::record::dbd_generated::SEQ_FIELDS,
+        ["VAL", "SELN", "DO0"],
+    );
 
 fn take_marks(rec: &mut MarkingRecord) -> epics_base_rs::server::record::CycleMarks {
     epics_base_rs::server::record::CycleMarks::of(&POSTS, std::mem::take(&mut rec.val) as u128)
@@ -724,17 +734,18 @@ fn post_attributes_forward_the_marks_and_the_claimed_set() {
     let mut rec = MarkingRecord { val: 0b10 };
     assert!(rec.cycle_hooks().has(CycleHooks::CYCLE_POSTED));
     assert_eq!(rec.fields_posted_only_when_marked(), &MARKED_ONLY);
-    assert_eq!(rec.process_posted_fields(), Some(&POSTED[..]));
-    assert_eq!(
-        rec.take_cycle_posted_fields().collect::<Vec<_>>(),
-        [POSTS[1]]
+    assert!(
+        rec.process_posted_fields()
+            .is_some_and(|set| std::ptr::eq(set, &POSTED[..]))
     );
+    let taken: Vec<_> = rec.take_cycle_posted_fields().collect();
+    assert_eq!(taken, [POSTS[1]]);
     assert!(rec.take_cycle_posted_fields().is_empty());
 
     let mut plain = SoftLonginRecord { val: 0 };
     assert_eq!(plain.cycle_hooks(), CycleHooks::NONE);
     assert!(plain.fields_posted_only_when_marked().is_empty());
-    assert_eq!(plain.process_posted_fields(), None);
+    assert!(plain.process_posted_fields().is_none());
     assert!(plain.take_cycle_posted_fields().is_empty());
 }
 

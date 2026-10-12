@@ -31,7 +31,10 @@ fn int64in_metadata_override(
 // Alarm threshold fields (HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV) are intentionally absent
 // from the field list so they route to RecordInstance::common.analog_alarm via
 // put_common_field, matching the path used by longin/ao/ai.
-const INT64IN_POSTED: [&str; 1] = ["VAL"];
+static INT64IN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::INT64IN_FIELDS,
+    ["VAL"],
+);
 
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `int64inRecord.c:144` is

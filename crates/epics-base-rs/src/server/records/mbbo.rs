@@ -494,8 +494,15 @@ impl Record for MbboRecord {
     }
 
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
-        static VAL_POST: [(&str, crate::server::record::CyclePostMask); 1] =
+        const VAL_POST_NAMED: [(&str, crate::server::record::CyclePostMask); 1] =
             [("VAL", crate::server::record::CyclePostMask::ValueLog)];
+        static VAL_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::MBBO_FIELDS,
+            VAL_POST_NAMED,
+        );
         crate::server::record::CycleMarks::of(
             &VAL_POST,
             u128::from(std::mem::take(&mut self.label_post)),
@@ -710,8 +717,15 @@ impl Record for MbboRecord {
     }
 
     /// `monitor()` posts VAL, RVAL and RBV alone (`mbboRecord.c:394-416`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "RVAL", "RBV"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::MBBO_FIELDS,
+                    ["VAL", "RVAL", "RBV"],
+                )
+            },
+        )
     }
 
     /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`

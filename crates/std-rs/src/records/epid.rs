@@ -468,7 +468,7 @@ impl EpidRecord {
 /// bit order of `EpidRecord::update_monitors`. `:376` REASSIGNS `monitor_mask =
 /// DBE_LOG|DBE_VALUE`, so unlike VAL they carry no alarm bits. `CT` is
 /// `DBF_NOACCESS` (`epidRecord.dbd:226`) and has no CA-visible field.
-const MONITOR_POSTS: [(&str, CyclePostMask); 7] = [
+const MONITOR_POSTS_NAMED: [(&str, CyclePostMask); 7] = [
     ("OVAL", CyclePostMask::ValueLog),
     ("P", CyclePostMask::ValueLog),
     ("I", CyclePostMask::ValueLog),
@@ -479,6 +479,13 @@ const MONITOR_POSTS: [(&str, CyclePostMask); 7] = [
 ];
 
 const PROCESS_POSTED: [&str; 8] = ["VAL", "OVAL", "P", "I", "D", "DT", "ERR", "CVAL"];
+static MONITOR_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 7] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::EPID_FIELDS,
+        MONITOR_POSTS_NAMED,
+    );
+static PROCESS_POSTED_SET: [epics_base_rs::server::record::FieldIx; 8] =
+    epics_base_rs::server::record::declared_set(dbd_generated::EPID_FIELDS, PROCESS_POSTED);
 
 impl Record for EpidRecord {
     fn record_type(&self) -> &'static str {
@@ -701,8 +708,8 @@ impl Record for EpidRecord {
     }
 
     /// `monitor()` posts VAL and its secondaries alone.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&PROCESS_POSTED)
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(&PROCESS_POSTED_SET)
     }
 
     /// The secondaries post from their own old copies, so a put that moved one

@@ -658,7 +658,7 @@ impl OldStr {
 /// The rest are C `monitor()`'s, in its order (asynRecord.c:1006-1031), each
 /// with `recGblResetAlarms | DBE_VALUE | DBE_LOG`: the input buffer and TINP
 /// on a reading TMOD, then the eleven `POST_IF_NEW`s.
-static ASYN_POSTS: [(&str, CyclePostMask); 90] = [
+const ASYN_POSTS_NAMED: [(&str, CyclePostMask); 90] = [
     ("ERRS", CyclePostMask::ValueLog),
     ("TMSK", CyclePostMask::ValueLog),
     ("TB0", CyclePostMask::ValueLog),
@@ -750,6 +750,11 @@ static ASYN_POSTS: [(&str, CyclePostMask); 90] = [
     ("UI32INP", CyclePostMask::MonitorValueLog),
     ("F64INP", CyclePostMask::MonitorValueLog),
 ];
+static ASYN_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 90] =
+    epics_base_rs::server::record::declared_post_table(
+        epics_base_rs::server::record::dbd_generated::ASYN_FIELDS,
+        ASYN_POSTS_NAMED,
+    );
 
 /// [`ASYN_POSTS`] entries ahead of `monitor()`'s.
 const HELD_POSTS: u32 = 76;
@@ -5259,8 +5264,13 @@ impl Record for AsynRecord {
     /// A process cycle posts only what `monitor()` names: ERRS and the
     /// `monitorStatus` set post from their marks (`mark`), and VAL
     /// never posts.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&MONITOR_CLAIMED)
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        static CLAIMED: [epics_base_rs::server::record::FieldIx; 14] =
+            epics_base_rs::server::record::declared_set(
+                epics_base_rs::server::record::dbd_generated::ASYN_FIELDS,
+                MONITOR_CLAIMED,
+            );
+        Some(&CLAIMED)
     }
 
     /// `monitor()` decides these from its own old copies, never from a
@@ -5502,6 +5512,19 @@ impl Drop for AsynRecord {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    /// A take's marks by declared name.
+    fn named(marks: CycleMarks) -> Vec<(&'static str, CyclePostMask)> {
+        marks
+            .map(|(ix, mask)| {
+                let desc = epics_base_rs::server::record::field_at(
+                    epics_base_rs::server::record::dbd_generated::ASYN_FIELDS,
+                    ix,
+                );
+                (desc.expect("declared").name, mask)
+            })
+            .collect()
+    }
     use epics_base_rs::server::record::RecordProcessResult;
 
     /// `asynRecord.c:994-1004`: `*precision = 0` for every field, then a
@@ -7342,7 +7365,7 @@ mod tests {
                 rec.errs, "asynManager::queueRequest asynUser not associated with a port",
                 "{field}"
             );
-            let posts: Vec<_> = rec.take_cycle_posted_fields().collect();
+            let posts = named(rec.take_cycle_posted_fields());
             assert_eq!(posts, [("ERRS", CyclePostMask::ValueLog)], "{field}");
         }
     }
@@ -10272,7 +10295,11 @@ mod tests {
         let db = PvDatabase::new();
         rec.async_ctx = Some(("AS".to_string(), db.async_handle()));
         rec.process().unwrap();
-        assert!(rec.take_process_posted_fields().names("ERRS"));
+        assert!(
+            named(rec.take_process_posted_fields())
+                .iter()
+                .any(|&(name, _)| name == "ERRS")
+        );
         assert_eq!(rec.errs, "Not connect to a port");
 
         rec.process().unwrap();
@@ -11547,7 +11574,9 @@ A.OEOS
         // string, so the operator's screen loses the stale message.
         rec.reset_error();
         assert!(
-            rec.take_cycle_posted_fields().names("ERRS"),
+            named(rec.take_cycle_posted_fields())
+                .iter()
+                .any(|&(name, _)| name == "ERRS"),
             "resetError's clear must post"
         );
     }

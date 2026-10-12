@@ -1488,10 +1488,14 @@ impl Record for AcalcoutRecord {
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "DLYA".to_string(),
-                    EpicsValue::UShort(1),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(vec![
+                    const {
+                        crate::server::record::declared_field_ix(
+                            crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+                            "DLYA",
+                        )
+                    },
+                ]),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
@@ -2457,12 +2461,19 @@ impl Record for AcalcoutRecord {
     /// C's process-cycle `db_post_events` set (`afterCalc`, `monitor()`, the
     /// NUSE clamp, the DLYA toggle). AMASK, NEWM and CACT are written every
     /// cycle and only ever read, so the set is closed rather than blacklisted.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&[
-            "VAL", "AVAL", "OAV", "OVAL", "AMEM", "NUSE", "DLYA", "A", "B", "C", "D", "E", "F",
-            "G", "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II",
-            "JJ", "KK", "LL",
-        ])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+                    [
+                        "VAL", "AVAL", "OAV", "OVAL", "AMEM", "NUSE", "DLYA", "A", "B", "C", "D",
+                        "E", "F", "G", "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF",
+                        "GG", "HH", "II", "JJ", "KK", "LL",
+                    ],
+                )
+            },
+        )
     }
 
     /// Scalar inputs `A..L` are re-posted on a cycle whose
@@ -2471,8 +2482,13 @@ impl Record for AcalcoutRecord {
     /// `(*pnew != *pprev) || (monitor_mask & DBE_ALARM)`
     /// (aCalcoutRecord.c:1024-1029). The array inputs (`newm`-gated) and `OVAL`
     /// (change-gated) are NOT in this set, so they are omitted.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+                ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"],
+            )
+        }
     }
 
     fn alarm_cycle_posts_value_log(&self) -> bool {
@@ -2546,7 +2562,7 @@ impl Record for AcalcoutRecord {
         /// NUSE then AMEM, one entry per mask (`CyclePostMask` order), then
         /// each array's NEWM post, then `monitor()`'s AVAL and OAV, one entry
         /// per [`AVAL_OAV_MASKS`] row, then `special()`'s CLCV and OCLV.
-        static POSTS: [(&str, CyclePostMask); 14 + ARR_NAMES.len()] = {
+        const POSTS_NAMED: [(&str, CyclePostMask); 14 + ARR_NAMES.len()] = {
             use CyclePostMask::{MonitorValueLog, Value, ValueLog};
             let mut table = [("NUSE", Value); 14 + ARR_NAMES.len()];
             table[1] = ("NUSE", ValueLog);
@@ -2607,6 +2623,13 @@ impl Record for AcalcoutRecord {
         bits |= u64::from(std::mem::take(&mut self.aval_oav_posts)) << (6 + ARR_NAMES.len());
         // C `special()` (`aCalcoutRecord.c:478`, `:490`), a literal DBE_VALUE.
         bits |= std::mem::take(&mut self.calc_posts) << (12 + ARR_NAMES.len());
+        static POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 14 + ARR_NAMES.len()] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+            POSTS_NAMED,
+        );
         CycleMarks::of(&POSTS, u128::from(bits))
     }
 
@@ -2615,8 +2638,12 @@ impl Record for AcalcoutRecord {
     /// `monitor()` — so the post carries the previous stamp and the alarm not
     /// yet reset.
     fn take_process_posted_fields(&mut self) -> CycleMarks {
-        static AMASK_POSTS: [(&str, CyclePostMask); ARR_NAMES.len()] =
-            crate::server::record::uniform_post_table(&ARR_NAMES, CyclePostMask::ValueLog);
+        static AMASK_POSTS: [(crate::server::record::FieldIx, CyclePostMask); ARR_NAMES.len()] =
+            crate::server::record::uniform_post_table(
+                crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+                &ARR_NAMES,
+                CyclePostMask::ValueLog,
+            );
         CycleMarks::of(
             &AMASK_POSTS,
             u128::from(std::mem::take(&mut self.amask_posts)),
@@ -2646,6 +2673,13 @@ impl Record for AcalcoutRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The declared name a post table entry `ix` stands for.
+    fn name(ix: crate::server::record::FieldIx) -> &'static str {
+        crate::server::record::field_at(crate::server::record::dbd_generated::ACALCOUT_FIELDS, ix)
+            .expect("declared")
+            .name
+    }
     use crate::server::record::FieldDeclaration;
 
     /// NEWM bits past LL mark nothing: a put of any value posts only the
@@ -2655,7 +2689,10 @@ mod tests {
         for newm in [0x1000, 0x2000, 0x4000, u32::MAX] {
             let mut rec = AcalcoutRecord::new();
             rec.put_field("NEWM", EpicsValue::ULong(newm)).unwrap();
-            let marked: Vec<_> = rec.take_cycle_posted_fields().collect();
+            let marked: Vec<_> = rec
+                .take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect();
             let want: Vec<_> = if newm == u32::MAX {
                 ARR_NAMES
                     .iter()
@@ -3060,7 +3097,8 @@ mod tests {
         assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(32)));
         assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));
         assert!(
-            !rec.take_cycle_posted_fields().any(|(f, _)| f == "AMEM"),
+            !rec.take_cycle_posted_fields()
+                .any(|(f, _)| name(f) == "AMEM"),
             "amem == pmem, so monitor() posts nothing (:1044)"
         );
     }
@@ -3170,7 +3208,9 @@ mod tests {
             "pmem = amem, right there (:699)"
         );
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("AMEM", CyclePostMask::ValueLog)],
             "C's literal DBE_VALUE|DBE_LOG (:698)"
         );
@@ -3183,7 +3223,8 @@ mod tests {
             "the second put finds it allocated"
         );
         assert!(
-            !rec.take_cycle_posted_fields().any(|(f, _)| f == "AMEM"),
+            !rec.take_cycle_posted_fields()
+                .any(|(f, _)| name(f) == "AMEM"),
             "and posts nothing"
         );
     }
@@ -3312,7 +3353,9 @@ mod tests {
             "and the clamped value stays"
         );
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("NUSE", CyclePostMask::Value)],
             "posted with C's literal DBE_VALUE (:497)"
         );
@@ -3348,7 +3391,9 @@ mod tests {
 
         assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(4)));
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("NUSE", CyclePostMask::ValueLog)],
             "C's init post is DBE_VALUE|DBE_LOG (:189)"
         );

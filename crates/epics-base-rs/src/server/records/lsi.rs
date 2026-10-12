@@ -435,7 +435,14 @@ impl Record for LsiRecord {
 
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask};
-        static LEN_POST: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::ValueLog)];
+        const LEN_POST_NAMED: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::ValueLog)];
+        static LEN_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::LSI_FIELDS,
+            LEN_POST_NAMED,
+        );
         CycleMarks::of(&LEN_POST, std::mem::take(&mut self.len_marked) as u128)
     }
 
@@ -447,8 +454,15 @@ impl Record for LsiRecord {
 
     /// C `monitor()` posts VAL and LEN alone (lsiRecord.c:204-223); the
     /// OVAL/OLEN copy it makes is never posted.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "LEN"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::LSI_FIELDS,
+                    ["VAL", "LEN"],
+                )
+            },
+        )
     }
 
     fn monitor_always_post(&self) -> (bool, bool) {

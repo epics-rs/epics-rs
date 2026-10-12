@@ -804,8 +804,15 @@ impl Record for AiRecord {
 
     /// `monitor()` posts VAL and RVAL alone (`aiRecord.c:448-467`); INIT,
     /// which `process()` clears (`:170`), posts nothing.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "RVAL"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::AI_FIELDS,
+                    ["VAL", "RVAL"],
+                )
+            },
+        )
     }
 
     /// C `if(prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`

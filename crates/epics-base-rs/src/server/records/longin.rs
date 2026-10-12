@@ -19,7 +19,10 @@ fn longin_metadata_override(
         })
 }
 
-const LONGIN_POSTED: [&str; 1] = ["VAL"];
+static LONGIN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::LONGIN_FIELDS,
+    ["VAL"],
+);
 
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `longinRecord.c:148` is

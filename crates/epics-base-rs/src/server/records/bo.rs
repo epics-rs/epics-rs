@@ -326,8 +326,15 @@ impl Record for BoRecord {
     }
 
     /// `monitor()` posts VAL, RVAL and RBV alone (`boRecord.c:398-421`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "RVAL", "RBV"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::BO_FIELDS,
+                    ["VAL", "RVAL", "RBV"],
+                )
+            },
+        )
     }
 
     /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }`

@@ -208,8 +208,15 @@ impl Record for DfanoutRecord {
     }
 
     /// `monitor()` posts VAL alone (`dfanoutRecord.c:283-298`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::DFANOUT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
     }
 
     /// C `dfanoutRecord.c::init_record` (:96-111) ends without touching

@@ -72,8 +72,15 @@ impl Record for PermissiveRecord {
     }
 
     /// `monitor()` posts VAL and WFLG alone (`permissiveRecord.c:90-117`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "WFLG"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::PERMISSIVE_FIELDS,
+                    ["VAL", "WFLG"],
+                )
+            },
+        )
     }
 
     fn record_type(&self) -> &'static str {
@@ -128,7 +135,15 @@ impl Record for PermissiveRecord {
 
     /// `permissiveRecord.c:111-114`: `monitor_mask|DBE_VALUE|DBE_LOG`.
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
-        static WFLG_POST: [(&str, CyclePostMask); 1] = [("WFLG", CyclePostMask::MonitorValueLog)];
+        const WFLG_POST_NAMED: [(&str, CyclePostMask); 1] =
+            [("WFLG", CyclePostMask::MonitorValueLog)];
+        static WFLG_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::PERMISSIVE_FIELDS,
+            WFLG_POST_NAMED,
+        );
         CycleMarks::of(&WFLG_POST, std::mem::take(&mut self.wflg_marked) as u128)
     }
 

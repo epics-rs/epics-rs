@@ -332,16 +332,25 @@ impl Record for CalcRecord {
     /// C `monitor()` posts every input A..U when the alarm moved, changed or
     /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
     /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:418-420).
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &CALC_INPUT_FIELDS
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::CALC_FIELDS,
+                CALC_INPUT_FIELDS,
+            )
+        }
     }
 
     /// C `monitor()` posts A..U against LA..LU, the record's own copies
     /// (calcRecord.c:415-423); `advance_prev_inputs` made the comparison.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
-        static POSTS: [(&str, CyclePostMask); crate::calc::CALC_NARGS] =
-            uniform_post_table(&CALC_INPUT_FIELDS, CyclePostMask::MonitorValueLog);
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); crate::calc::CALC_NARGS] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::CALC_FIELDS,
+                &CALC_INPUT_FIELDS,
+                CyclePostMask::MonitorValueLog,
+            );
         CycleMarks::of(&POSTS, u128::from(std::mem::take(&mut self.input_changes)))
     }
 
@@ -351,11 +360,14 @@ impl Record for CalcRecord {
 
     /// `monitor()` posts VAL and A..U alone; LA..LU are written, never
     /// posted (calcRecord.c:415-423).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        static POSTED: [&str; 22] = [
-            "VAL", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
-            "Q", "R", "S", "T", "U",
-        ];
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        static POSTED: [crate::server::record::FieldIx; 22] = crate::server::record::declared_set(
+            crate::server::record::dbd_generated::CALC_FIELDS,
+            [
+                "VAL", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+                "P", "Q", "R", "S", "T", "U",
+            ],
+        );
         Some(&POSTED)
     }
 

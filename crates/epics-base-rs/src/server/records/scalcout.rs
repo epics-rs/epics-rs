@@ -812,7 +812,7 @@ impl Record for ScalcoutRecord {
         use crate::server::record::{CycleMarks, CyclePostMask};
         // `monitor()`'s string posts carry `monitor_mask|DBE_VALUE|DBE_LOG`.
         const S: CyclePostMask = CyclePostMask::MonitorValueLog;
-        static POSTS: [(&str, CyclePostMask); 16] = [
+        const POSTS_NAMED: [(&str, CyclePostMask); 16] = [
             ("CLCV", CyclePostMask::Value),
             ("OCLV", CyclePostMask::Value),
             ("SVAL", S),
@@ -831,6 +831,13 @@ impl Record for ScalcoutRecord {
             ("LL", S),
         ];
         let strings = std::mem::take(&mut self.string_posts);
+        static POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 16] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::SCALCOUT_FIELDS,
+            POSTS_NAMED,
+        );
         CycleMarks::of(
             &POSTS,
             u128::from(std::mem::take(&mut self.calc_posts) | strings << 2),
@@ -840,8 +847,13 @@ impl Record for ScalcoutRecord {
     /// C `monitor()` posts every input A..L when the alarm moved, changed or
     /// not: `if ((*pnew != *pprev) || (monitor_mask&DBE_ALARM))` with
     /// `monitor_mask|DBE_VALUE|DBE_LOG` (`sCalcoutRecord.c:855-856`).
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &crate::server::records::calc::CALC_INPUT_FIELDS[..12]
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::SCALCOUT_FIELDS,
+                ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"],
+            )
+        }
     }
 
     fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
@@ -878,11 +890,19 @@ impl Record for ScalcoutRecord {
     /// fields must not hand a subscriber events C does not send. Declaring C's
     /// set — rather than blacklisting the two — keeps that true for any field
     /// added later.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&[
-            "VAL", "SVAL", "OVAL", "OSV", "DLYA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
-            "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
-        ])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SCALCOUT_FIELDS,
+                    [
+                        "VAL", "SVAL", "OVAL", "OSV", "DLYA", "A", "B", "C", "D", "E", "F", "G",
+                        "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH",
+                        "II", "JJ", "KK", "LL",
+                    ],
+                )
+            },
+        )
     }
 
     // C recScalcout.c IVOA=set_to_IVOV: oval = ivov (and osv = isvv
@@ -1061,10 +1081,14 @@ impl Record for ScalcoutRecord {
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "DLYA".to_string(),
-                    EpicsValue::Short(1),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(vec![
+                    const {
+                        crate::server::record::declared_field_ix(
+                            crate::server::record::dbd_generated::SCALCOUT_FIELDS,
+                            "DLYA",
+                        )
+                    },
+                ]),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
@@ -1715,6 +1739,13 @@ impl Record for ScalcoutRecord {
 mod tests {
     use super::*;
 
+    /// The declared name a post table entry `ix` stands for.
+    fn name(ix: crate::server::record::FieldIx) -> &'static str {
+        crate::server::record::field_at(crate::server::record::dbd_generated::SCALCOUT_FIELDS, ix)
+            .expect("declared")
+            .name
+    }
+
     #[test]
     fn link_status_fields_read_derived_constant_and_reject_put() {
         use crate::server::record::RecordInstance;
@@ -1917,7 +1948,8 @@ mod tests {
             .unwrap();
         let sval_posts = |rec: &mut ScalcoutRecord| {
             rec.take_cycle_posted_fields()
-                .filter(|&(f, _)| f == "SVAL")
+                .filter(|&(f, _)| name(f) == "SVAL")
+                .map(|(f, m)| (name(f), m))
                 .collect::<Vec<_>>()
         };
         rec.process().unwrap();

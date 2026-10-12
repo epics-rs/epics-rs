@@ -352,8 +352,12 @@ impl Record for MbboDirectRecord {
     }
 
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
-        static BIT_POSTS: [(&str, CyclePostMask); 32] =
-            uniform_post_table(&BIT_NAMES, CyclePostMask::MonitorValueLog);
+        static BIT_POSTS: [(crate::server::record::FieldIx, CyclePostMask); 32] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::MBBO_DIRECT_FIELDS,
+                &BIT_NAMES,
+                CyclePostMask::MonitorValueLog,
+            );
         CycleMarks::of(&BIT_POSTS, std::mem::take(&mut self.bits_changed) as u128)
     }
 
@@ -370,8 +374,13 @@ impl Record for MbboDirectRecord {
         &CLAIMED
     }
 
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &BIT_NAMES
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::MBBO_DIRECT_FIELDS,
+                BIT_NAMES,
+            )
+        }
     }
 
     fn alarm_cycle_posts_value_log(&self) -> bool {
@@ -480,12 +489,15 @@ impl Record for MbboDirectRecord {
 
     /// `monitor()` posts VAL, B0-B1F, RVAL and RBV alone
     /// (`mbboDirectRecord.c:305-340`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        static POSTED: [&str; 35] = [
-            "VAL", "RVAL", "RBV", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA",
-            "BB", "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17",
-            "B18", "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
-        ];
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        static POSTED: [crate::server::record::FieldIx; 35] = crate::server::record::declared_set(
+            crate::server::record::dbd_generated::MBBO_DIRECT_FIELDS,
+            [
+                "VAL", "RVAL", "RBV", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9",
+                "BA", "BB", "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15",
+                "B16", "B17", "B18", "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+            ],
+        );
         Some(&POSTED)
     }
 

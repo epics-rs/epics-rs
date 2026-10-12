@@ -305,8 +305,15 @@ impl Record for TimestampRecord {
     }
 
     /// C `monitor()` posts VAL and RVAL alone (`timestampRecord.c:158-162`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "RVAL"])
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(
+            &const {
+                epics_base_rs::server::record::declared_set(
+                    dbd_generated::TIMESTAMP_FIELDS,
+                    ["VAL", "RVAL"],
+                )
+            },
+        )
     }
 }
 

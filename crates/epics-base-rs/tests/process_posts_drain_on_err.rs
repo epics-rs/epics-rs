@@ -71,7 +71,11 @@ impl Record for MarkRecord {
         Ok(ProcessOutcome::complete())
     }
     fn take_process_posted_fields(&mut self) -> CycleMarks {
-        static X_POST: [(&str, CyclePostMask); 1] = [("X", CyclePostMask::Value)];
+        static X_POST: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 1] =
+            epics_base_rs::server::record::declared_post_table(
+                FIELDS,
+                [("X", CyclePostMask::Value)],
+            );
         self.drains += 1;
         CycleMarks::of(&X_POST, u128::from(std::mem::take(&mut self.marked)))
     }

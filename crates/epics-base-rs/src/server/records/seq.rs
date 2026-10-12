@@ -108,7 +108,7 @@ pub(crate) fn set_seq_dly_limit(value: f64) {
     init = seq_init_record,
     take_cycle_posted_fields = seq_monitor_posts,
     fields_posted_only_when_marked = SEQ_CLAIMED,
-    process_posted_fields = SEQ_POSTED,
+    process_posted_fields = SEQ_POSTED_SET,
     // seq's VAL is a `pp(TRUE)` "trigger" — C `process()` posts VAL only with
     // alarm events (`if (events) db_post_events(&prec->val, events)`,
     // seqRecord.c:227-229), never DBE_VALUE/DBE_LOG. So a run of `caput VAL`
@@ -393,6 +393,11 @@ const SEQ_POSTED: [&str; 18] = [
     "DOB", "DOC", "DOD", "DOE", "DOF",
 ];
 
+static SEQ_POSTED_SET: [crate::server::record::FieldIx; 18] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::SEQ_FIELDS,
+    SEQ_POSTED,
+);
+
 /// SELN and DO0..DOF, each decided against the record's own copy.
 const SEQ_CLAIMED: &[&str] = SEQ_POSTED.split_at(1).1;
 
@@ -401,9 +406,16 @@ const SEQ_CLAIMED: &[&str] = SEQ_POSTED.split_at(1).1;
 /// Taken once per cycle at its close, which is where `asyncFinish` runs.
 fn seq_monitor_posts(rec: &mut SeqRecord) -> crate::server::record::CycleMarks {
     use crate::server::record::{CycleMarks, CyclePostMask};
-    static POSTS: [(&str, CyclePostMask); 1] = [("SELN", CyclePostMask::MonitorValueLog)];
+    const POSTS_NAMED: [(&str, CyclePostMask); 1] = [("SELN", CyclePostMask::MonitorValueLog)];
     let moved = rec.seln != rec.oldn;
     rec.oldn = rec.seln;
+    static POSTS: [(
+        crate::server::record::FieldIx,
+        crate::server::record::CyclePostMask,
+    ); 1] = crate::server::record::declared_post_table(
+        crate::server::record::dbd_generated::SEQ_FIELDS,
+        POSTS_NAMED,
+    );
     CycleMarks::of(&POSTS, u128::from(moved))
 }
 

@@ -38,26 +38,35 @@ const STS_SUC: i16 = 2;
 
 /// `valuePut`'s and `valueSync`'s `db_post_events` ahead of the forward link,
 /// in C order.
-static POSTS: [(&str, CyclePostMask); 4] = [
-    ("SENT", CyclePostMask::Value),
-    ("VAL", CyclePostMask::Value),
-    ("STS", CyclePostMask::Value),
-    ("WAIT", CyclePostMask::Value),
-];
+static POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 4] =
+    epics_base_rs::server::record::declared_post_table(
+        FIELDS,
+        [
+            ("SENT", CyclePostMask::Value),
+            ("VAL", CyclePostMask::Value),
+            ("STS", CyclePostMask::Value),
+            ("WAIT", CyclePostMask::Value),
+        ],
+    );
 const POST_SENT: u64 = 1;
 const POST_SYNC_VAL: u64 = 1 << 1;
 const POST_SYNC_STS: u64 = 1 << 2;
 const POST_WAIT: u64 = 1 << 3;
 
 /// `valuePut`'s posts after the forward link (`throttleRecord.c:592-612`).
-static TAIL: [(&str, CyclePostMask); 3] = [
-    ("STS", CyclePostMask::Value),
-    ("SENT", CyclePostMask::ResetValueLog),
-    ("SENT", CyclePostMask::ResetAlarm),
-];
+static TAIL: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 3] =
+    epics_base_rs::server::record::declared_post_table(
+        FIELDS,
+        [
+            ("STS", CyclePostMask::Value),
+            ("SENT", CyclePostMask::ResetValueLog),
+            ("SENT", CyclePostMask::ResetAlarm),
+        ],
+    );
 
 /// `process()`'s WAIT=True post (`throttleRecord.c:287`).
-static PROCESS_POSTS: [(&str, CyclePostMask); 1] = [("WAIT", CyclePostMask::Value)];
+static PROCESS_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 1] =
+    epics_base_rs::server::record::declared_post_table(FIELDS, [("WAIT", CyclePostMask::Value)]);
 
 /// C throttle's cycle with the drive limits reduced to a rejection.
 #[derive(Default)]
@@ -244,8 +253,12 @@ impl Record for Throttle {
     fn process_passive_fields(&self) -> &'static [&'static str] {
         &["VAL"]
     }
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "WAIT", "SENT", "STS"])
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(
+            &const {
+                epics_base_rs::server::record::declared_set(FIELDS, ["VAL", "WAIT", "SENT", "STS"])
+            },
+        )
     }
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
         &["WAIT", "SENT", "STS"]

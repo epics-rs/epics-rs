@@ -115,8 +115,8 @@ impl Record for WideMarkRecord {
         Ok(ProcessOutcome::complete_no_emit())
     }
     fn take_process_posted_fields(&mut self) -> CycleMarks {
-        static POSTS: [(&str, CyclePostMask); N] =
-            epics_base_rs::server::record::uniform_post_table(&NAMES, CyclePostMask::Value);
+        static POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); N] =
+            epics_base_rs::server::record::uniform_post_table(FIELDS, &NAMES, CyclePostMask::Value);
         let all = (1u128 << N) - 1;
         CycleMarks::of(
             &POSTS,

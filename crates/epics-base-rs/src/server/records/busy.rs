@@ -144,8 +144,15 @@ impl Record for BusyRecord {
     }
 
     /// `monitor()` posts VAL, RVAL and RBV alone (`busyRecord.c:357-383`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "RVAL", "RBV"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::BUSY_FIELDS,
+                    ["VAL", "RVAL", "RBV"],
+                )
+            },
+        )
     }
 
     /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }` and

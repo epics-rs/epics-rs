@@ -20,13 +20,17 @@ const THROTTLE_SYNC_PROCESS: i16 = 1; // throttleSYNC_PROC
 
 /// `valuePut`'s and `valueSync`'s `db_post_events` ahead of the forward link,
 /// in C order (`throttleRecord.c:568-584`, `:637-652`).
-static POSTS: [(&str, CyclePostMask); 5] = [
-    ("SENT", CyclePostMask::Value),
-    ("VAL", CyclePostMask::Value),
-    ("STS", CyclePostMask::Value),
-    ("SYNC", CyclePostMask::Value),
-    ("WAIT", CyclePostMask::Value),
-];
+static POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 5] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::THROTTLE_FIELDS,
+        [
+            ("SENT", CyclePostMask::Value),
+            ("VAL", CyclePostMask::Value),
+            ("STS", CyclePostMask::Value),
+            ("SYNC", CyclePostMask::Value),
+            ("WAIT", CyclePostMask::Value),
+        ],
+    );
 const POST_SENT: u64 = 1;
 const POST_SYNC_VAL: u64 = 1 << 1;
 const POST_SYNC_STS: u64 = 1 << 2;
@@ -36,18 +40,26 @@ const POST_WAIT: u64 = 1 << 4;
 /// `valuePut`'s posts after the forward link: STS (`throttleRecord.c:592`),
 /// then SENT with VALUE|LOG when it moved, the reset's alarm bits alone
 /// otherwise (:606-612).
-static TAIL: [(&str, CyclePostMask); 3] = [
-    ("STS", CyclePostMask::Value),
-    ("SENT", CyclePostMask::ResetValueLog),
-    ("SENT", CyclePostMask::ResetAlarm),
-];
+static TAIL: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 3] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::THROTTLE_FIELDS,
+        [
+            ("STS", CyclePostMask::Value),
+            ("SENT", CyclePostMask::ResetValueLog),
+            ("SENT", CyclePostMask::ResetAlarm),
+        ],
+    );
 
 /// `process()`'s own posts ahead of `enterValue` (`throttleRecord.c:251-287`).
-static PROCESS_POSTS: [(&str, CyclePostMask); 3] = [
-    ("VAL", CyclePostMask::ValueLog),
-    ("DRVLS", CyclePostMask::Value),
-    ("WAIT", CyclePostMask::Value),
-];
+static PROCESS_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 3] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::THROTTLE_FIELDS,
+        [
+            ("VAL", CyclePostMask::ValueLog),
+            ("DRVLS", CyclePostMask::Value),
+            ("WAIT", CyclePostMask::Value),
+        ],
+    );
 const PROCESS_POST_VAL: u64 = 1;
 const PROCESS_POST_DRVLS: u64 = 1 << 1;
 const PROCESS_POST_WAIT: u64 = 1 << 2;
@@ -818,8 +830,15 @@ impl Record for ThrottleRecord {
 
     /// C posts VAL, WAIT, SENT, STS and DRVLS from a process cycle, the last
     /// four only where it calls `db_post_events` on them.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "WAIT", "SENT", "STS", "DRVLS"])
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(
+            &const {
+                epics_base_rs::server::record::declared_set(
+                    dbd_generated::THROTTLE_FIELDS,
+                    ["VAL", "WAIT", "SENT", "STS", "DRVLS"],
+                )
+            },
+        )
     }
 
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {

@@ -526,7 +526,13 @@ fn post_cycle_marks_in(
                 }
             }
         };
-        instance.notify_field_in(burst, sf, mask);
+        let Some(desc) = crate::server::record::field_at(
+            crate::server::record::FieldDeclaration::field_list(&*instance.record),
+            sf,
+        ) else {
+            continue;
+        };
+        instance.notify_field_in(burst, desc.name, mask);
     }
 }
 
@@ -974,7 +980,7 @@ fn commit_special_reset_alarm(
     use crate::server::recgbl::EventMask;
     let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
     crate::server::database::processing::alarm_field_posts(&instance.common, &alarm_result)
-        .for_each(|af, mask| instance.notify_field_in(burst, af, mask));
+        .for_each(|desc, mask| instance.notify_declared(Some(burst), desc, mask));
     if alarm_result.alarm_changed || alarm_result.amsg_changed {
         EventMask::ALARM
     } else {

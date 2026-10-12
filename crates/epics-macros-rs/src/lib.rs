@@ -320,7 +320,7 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `#[record(type = "longin", process_posted_fields = LONGIN_POSTED)]` —
 ///   the closed set the record's C `process()` + `monitor()` post:
 ///   `Record::process_posted_fields` answers `Some` of the named
-///   `&'static [&'static str]`
+///   `[&'static FieldDesc; N]`, e.g. a `declared_set`
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -774,7 +774,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     };
     let process_posted_method = match &attrs.process_posted_fields {
         Some(path) => quote! {
-            fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+            fn process_posted_fields(&self) -> Option<#krate::server::record::DeclaredFields> {
                 Some(&#path)
             }
         },

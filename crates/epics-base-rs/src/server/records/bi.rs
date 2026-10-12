@@ -161,8 +161,15 @@ impl Record for BiRecord {
     }
 
     /// `monitor()` posts VAL and RVAL alone (`biRecord.c:283-305`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "RVAL"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::BI_FIELDS,
+                    ["VAL", "RVAL"],
+                )
+            },
+        )
     }
 
     /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }`

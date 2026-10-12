@@ -32,7 +32,11 @@ struct Mover {
     marked: u64,
 }
 
-static MOVER_POSTS: [(&str, CyclePostMask); 1] = [("DMOV", CyclePostMask::ValueLog)];
+static MOVER_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 1] =
+    epics_base_rs::server::record::declared_post_table(
+        MOVER_FIELDS,
+        [("DMOV", CyclePostMask::ValueLog)],
+    );
 
 static MOVER_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Double, false),
@@ -47,10 +51,9 @@ impl Record for Mover {
         if self.dmov == 1 {
             self.dmov = 0;
             Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "DMOV".to_string(),
-                    EpicsValue::Short(0),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(vec![
+                    const { declared_field_ix(MOVER_FIELDS, "DMOV") },
+                ]),
                 actions: Vec::new(),
                 device_did_compute: false,
                 post_write_fields: Vec::new(),

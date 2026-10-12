@@ -5,7 +5,10 @@ use epics_macros_rs::EpicsRecord;
 /// 1=Specified, 2=Mask.
 const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 
-const FANOUT_POSTED: [&str; 2] = ["VAL", "SELN"];
+static FANOUT_POSTED: [crate::server::record::FieldIx; 2] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::FANOUT_FIELDS,
+    ["VAL", "SELN"],
+);
 
 /// `fanout` record — forward-link fan-out.
 ///

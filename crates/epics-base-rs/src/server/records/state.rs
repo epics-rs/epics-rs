@@ -70,8 +70,15 @@ impl Record for StateRecord {
     }
 
     /// `monitor()` posts VAL alone (`stateRecord.c:120-129`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::STATE_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
     }
 
     fn record_type(&self) -> &'static str {

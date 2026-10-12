@@ -568,12 +568,12 @@ const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
 /// C `monitor()`'s posts (`compressRecord.c:105-110`): NUSE when it moved,
 /// NUSE when only the alarm did, then VAL.
 /// `monitor()` from a cycle: NUSE with `monitor_mask | DBE_VALUE | DBE_LOG`.
-static CYCLE_POSTS: [(&str, crate::server::record::CyclePostMask); 1] = [(
+const CYCLE_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 1] = [(
     "NUSE",
     crate::server::record::CyclePostMask::MonitorValueLog,
 )];
 
-static RESET_POSTS: [(&str, crate::server::record::CyclePostMask); 3] = [
+const RESET_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 3] = [
     ("NUSE", crate::server::record::CyclePostMask::ResetValueLog),
     (
         "NUSE",
@@ -648,8 +648,22 @@ impl Record for CompressRecord {
     /// A put's drain takes the `special()` posts; a cycle takes NUSE's mark.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         if std::mem::take(&mut self.nuse_moved) {
+            static CYCLE_POSTS: [(
+                crate::server::record::FieldIx,
+                crate::server::record::CyclePostMask,
+            ); 1] = crate::server::record::declared_post_table(
+                crate::server::record::dbd_generated::COMPRESS_FIELDS,
+                CYCLE_POSTS_NAMED,
+            );
             return crate::server::record::CycleMarks::of(&CYCLE_POSTS, 1);
         }
+        static RESET_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 3] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::COMPRESS_FIELDS,
+            RESET_POSTS_NAMED,
+        );
         crate::server::record::CycleMarks::of(
             &RESET_POSTS,
             u128::from(std::mem::take(&mut self.reset_posts)),
@@ -657,8 +671,15 @@ impl Record for CompressRecord {
     }
 
     /// `monitor()` posts VAL and NUSE alone (`compressRecord.c:101-111`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "NUSE"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::COMPRESS_FIELDS,
+                    ["VAL", "NUSE"],
+                )
+            },
+        )
     }
 
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
@@ -666,8 +687,13 @@ impl Record for CompressRecord {
     }
 
     /// The `alarm_mask ||` half of NUSE's test (`compressRecord.c:105`).
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &["NUSE"]
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::COMPRESS_FIELDS,
+                ["NUSE"],
+            )
+        }
     }
 
     fn alarm_cycle_posts_value_log(&self) -> bool {

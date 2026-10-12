@@ -237,8 +237,15 @@ impl Record for HistogramRecord {
     }
 
     /// `monitor()` posts VAL alone (`histogramRecord.c:282-297`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::HISTOGRAM_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {

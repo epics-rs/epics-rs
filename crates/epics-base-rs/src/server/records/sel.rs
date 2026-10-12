@@ -256,8 +256,15 @@ impl Record for SelRecord {
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
 
     /// `monitor()` posts VAL, SELN and A..L alone (`selRecord.c:321-338`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&SEL_MONITORED)
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SEL_FIELDS,
+                    SEL_MONITORED,
+                )
+            },
+        )
     }
 
     /// SELN against NLST and A..L against LA..LL, with `monitor_mask |
@@ -265,8 +272,12 @@ impl Record for SelRecord {
     /// the comparisons.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
-        static POSTS: [(&str, CyclePostMask); SEL_MAX + 1] =
-            uniform_post_table(&SEL_MARKED, CyclePostMask::MonitorValueLog);
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); SEL_MAX + 1] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::SEL_FIELDS,
+                &SEL_MARKED,
+                CyclePostMask::MonitorValueLog,
+            );
         CycleMarks::of(
             &POSTS,
             u128::from(std::mem::take(&mut self.monitored_changes)),

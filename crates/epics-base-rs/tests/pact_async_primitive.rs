@@ -559,10 +559,9 @@ impl Record for PendingNotifyWriteSource {
     }
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome {
-            result: RecordProcessResult::AsyncPendingNotify(vec![(
-                "VAL".to_string(),
-                EpicsValue::Long(1),
-            )]),
+            result: RecordProcessResult::AsyncPendingNotify(vec![
+                const { epics_base_rs::server::record::declared_field_ix(NOTIFY_SRC_FIELDS, "VAL") },
+            ]),
             actions: vec![ProcessAction::WriteDbLink {
                 link_field: "LNK",
                 value: EpicsValue::Long(42),

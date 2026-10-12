@@ -265,8 +265,15 @@ impl Record for LongoutRecord {
     }
 
     /// `monitor()` posts VAL alone (`longoutRecord.c:371-395`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::LONGOUT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

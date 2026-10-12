@@ -1835,8 +1835,21 @@ impl Record for WaveformRecord {
     /// field tail) and never returns to 0. The port was posting that reset.
     /// `pwf->udf = 0` on the next line is the same shape; the walk already
     /// excludes UDF for every record type.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "NORD", "BUSY", "HASH"])
+    ///
+    /// Each kind's set indexes its own table; aai/aao declare no BUSY and
+    /// subArray no HASH.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        use crate::server::record::{dbd_generated as t, declared_set};
+        Some(match self.kind {
+            ArrayKind::Waveform => {
+                &const { declared_set(t::WAVEFORM_FIELDS, ["VAL", "NORD", "BUSY", "HASH"]) }
+            }
+            ArrayKind::Aai => &const { declared_set(t::AAI_FIELDS, ["VAL", "NORD", "HASH"]) },
+            ArrayKind::Aao => &const { declared_set(t::AAO_FIELDS, ["VAL", "NORD", "HASH"]) },
+            ArrayKind::SubArray => {
+                &const { declared_set(t::SUB_ARRAY_FIELDS, ["VAL", "NORD", "BUSY"]) }
+            }
+        })
     }
 
     /// C `devSASoft.c::read_sa` (118-120) runs `subset()` only when the

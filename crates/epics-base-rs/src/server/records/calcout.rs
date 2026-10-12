@@ -761,8 +761,13 @@ impl Record for CalcoutRecord {
     /// C `monitor()` posts every input A..U when the alarm moved, changed or
     /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
     /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcoutRecord.c:681-682).
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &crate::server::records::calc::CALC_INPUT_FIELDS
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::CALCOUT_FIELDS,
+                crate::server::records::calc::CALC_INPUT_FIELDS,
+            )
+        }
     }
 
     fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
@@ -802,8 +807,15 @@ impl Record for CalcoutRecord {
 
     /// `monitor()` posts VAL, A..U and OVAL alone (`calcoutRecord.c:660-691`);
     /// DLYA posts from `process()` through [`Self::take_process_posted_fields`].
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&CALCOUT_PROCESS_POSTED)
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::CALCOUT_FIELDS,
+                    CALCOUT_PROCESS_POSTED,
+                )
+            },
+        )
     }
 
     /// C `calcoutRecord.c:687-690` posts OVAL with `monitor_mask | DBE_VALUE |
@@ -838,7 +850,14 @@ impl Record for CalcoutRecord {
 
     fn take_process_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask};
-        static DLYA_POST: [(&str, CyclePostMask); 1] = [("DLYA", CyclePostMask::Value)];
+        const DLYA_POST_NAMED: [(&str, CyclePostMask); 1] = [("DLYA", CyclePostMask::Value)];
+        static DLYA_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::CALCOUT_FIELDS,
+            DLYA_POST_NAMED,
+        );
         CycleMarks::of(&DLYA_POST, u128::from(std::mem::take(&mut self.dlya_moved)))
     }
 
@@ -1799,7 +1818,7 @@ impl Record for CalcoutRecord {
         use crate::server::record::{CycleMarks, CyclePostMask};
         /// Link `i`'s value then status at `2i`, `2i + 1`; OUT's status is
         /// OUTV. CLCV and OCLV follow at [`CLCV_POST`].
-        static PUT_POSTS: [(&str, CyclePostMask); CLCV_POST + 2] = {
+        const PUT_POSTS_NAMED: [(&str, CyclePostMask); CLCV_POST + 2] = {
             let mut table = [("", CyclePostMask::Value); CLCV_POST + 2];
             let mut i = 0;
             while i < CALCOUT_LINK_VALUE_FIELDS.len() {
@@ -1815,6 +1834,13 @@ impl Record for CalcoutRecord {
             table[CLCV_POST + 1].0 = "OCLV";
             table
         };
+        static PUT_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); CLCV_POST + 2] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::CALCOUT_FIELDS,
+            PUT_POSTS_NAMED,
+        );
         CycleMarks::of(&PUT_POSTS, u128::from(std::mem::take(&mut self.put_posts)))
     }
 

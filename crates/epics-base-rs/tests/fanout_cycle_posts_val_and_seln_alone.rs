@@ -166,6 +166,11 @@ async fn fanout_cycle_posts_val_and_seln_alone_as_softioc_does() {
 fn fanout_closes_its_cycle_posts_to_val_and_seln() {
     assert_eq!(
         FanoutRecord::default().process_posted_fields(),
-        Some(&["VAL", "SELN"][..])
+        Some(
+            &epics_base_rs::server::record::declared_set(
+                epics_base_rs::server::record::dbd_generated::FANOUT_FIELDS,
+                ["VAL", "SELN"],
+            )[..]
+        )
     );
 }

@@ -467,7 +467,7 @@ const SWAIT_MONITORED: [&str; 25] = [
 ];
 
 /// `special()`'s CALC posts, then the input pairs `monitor()` marks.
-static SWAIT_POSTS: [(&str, crate::server::record::CyclePostMask); 27] = {
+const SWAIT_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 27] = {
     use crate::server::record::CyclePostMask::{MonitorValue, Value};
     let mut t = [("", MonitorValue); 27];
     t[0] = ("CLCV", Value);
@@ -617,12 +617,26 @@ impl Record for SwaitRecord {
             }
         }
         self.input_changes = 0;
+        static SWAIT_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 27] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::SWAIT_FIELDS,
+            SWAIT_POSTS_NAMED,
+        );
         CycleMarks::of(&SWAIT_POSTS, u128::from(calc | inputs << 3))
     }
 
     /// `monitor()` posts VAL and the A..L / LA..LL pairs alone.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&SWAIT_MONITORED)
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SWAIT_FIELDS,
+                    SWAIT_MONITORED,
+                )
+            },
+        )
     }
 
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {

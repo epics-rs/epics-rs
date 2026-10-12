@@ -62,8 +62,8 @@ pub use menu_choices::{
 pub use menu_scan::{MenuScan, SCAN_1ST_PERIODIC, menu_scan};
 pub use pini::PiniMode;
 pub use record_instance::{
-    AlarmAck, AmbientWriteOriginScope, DeferredNotify, DeferredNotifyPut, NotifyWaitSet, PactExit,
-    ProcessCompletion, RecordCell, RecordInstance, RecordMut, RecordRef,
+    AlarmAck, AmbientWriteOriginScope, DeferredNotify, DeferredNotifyPut, FieldIx, NotifyWaitSet,
+    PactExit, ProcessCompletion, RecordCell, RecordInstance, RecordMut, RecordRef,
     ambient_write_origin_scope,
 };
 pub(crate) use record_instance::{
@@ -73,20 +73,21 @@ pub(crate) use record_instance::{
 pub use record_trait::{
     AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,
     ConstantInitLink, CycleCell, CycleHooks, CycleList, CycleMarks, CyclePostMask, CycleRead,
-    CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
-    FORCE_GENERAL, FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
-    InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses,
-    MonitorValueGate, OutTarget, OutView, Pact, PostName, PostedValue, ProcessAction,
-    ProcessActions, ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record,
-    RecordProcessResult, ResolvedInputLinks, SimmCells, SlotMut, SlotRef, Special, SubroutineFn,
-    ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
-    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
+    CycleValue, DeadbandCells, DeclaredFields, DelayedCallbackOutcome,
+    EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots, FORCE_GENERAL, FieldDeclaration, FieldDesc,
+    FieldMetadataOverride, FieldSlot, InputFetchPolicy, InputLinkRequest, LinkRead, LinkReadAs,
+    MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate, OutTarget, OutView, Pact,
+    PostName, PostTable, PostedValue, ProcessAction, ProcessActions, ProcessContext,
+    ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks,
+    SimmCells, SlotMut, SlotRef, Special, SubroutineFn, ValuePostGate, ValueView,
+    arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value,
+    dbput_coerce_value, declared_field_ix, declared_post_table, declared_set, field_at,
     input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
     put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{
     SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, put_string_precision,
-    seed_trackers_from_val, served_element_size, value_gate,
+    seed_trackers_from_val, served_element_size,
 };
 pub use scan::{ScanList, ScanType, SimModeScan};
 pub use sparse_text::SparseText;

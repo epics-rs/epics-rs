@@ -46,8 +46,12 @@ const OUTPUT_EVENT_FIELDS: [&str; 2 * NUM_ARGS] = [
 ];
 
 /// `monitor()`'s output posts, `monitor_mask|DBE_VALUE|DBE_LOG` each.
-static OUTPUT_EVENT_POSTS: [(&str, CyclePostMask); 2 * NUM_ARGS] =
-    crate::server::record::uniform_post_table(&OUTPUT_EVENT_FIELDS, CyclePostMask::MonitorValueLog);
+static OUTPUT_EVENT_POSTS: [(crate::server::record::FieldIx, CyclePostMask); 2 * NUM_ARGS] =
+    crate::server::record::uniform_post_table(
+        crate::server::record::dbd_generated::A_SUB_FIELDS,
+        &OUTPUT_EVENT_FIELDS,
+        CyclePostMask::MonitorValueLog,
+    );
 
 fn asub_output_event_fields() -> &'static [&'static str] {
     &OUTPUT_EVENT_FIELDS
@@ -57,11 +61,16 @@ fn asub_output_event_fields() -> &'static [&'static str] {
 /// `EFLG != NEVER`: `VAL` plus [`asub_output_event_fields`]. `VAL` belongs in
 /// it because the deadband post is a post and the framework routes it through
 /// the same gate; the `EFLG == NEVER` arm is `VAL` alone.
-fn asub_posted_fields() -> &'static [&'static str] {
-    &POSTED_FIELDS
+fn asub_posted_fields() -> crate::server::record::DeclaredFields {
+    static POSTED: [crate::server::record::FieldIx; 1 + 2 * NUM_ARGS] =
+        crate::server::record::declared_set(
+            crate::server::record::dbd_generated::A_SUB_FIELDS,
+            POSTED_FIELDS,
+        );
+    &POSTED
 }
 
-static POSTED_FIELDS: [&str; 1 + 2 * NUM_ARGS] = {
+const POSTED_FIELDS: [&str; 1 + 2 * NUM_ARGS] = {
     let mut t = ["VAL"; 1 + 2 * NUM_ARGS];
     let mut i = 0;
     while i < 2 * NUM_ARGS {
@@ -941,11 +950,16 @@ impl Record for ASubRecord {
         }
     }
 
-    fn force_posted_fields(&self) -> &'static [&'static str] {
+    fn force_posted_fields(&self) -> crate::server::record::DeclaredFields {
         // EFLG=ALWAYS: C `monitor()` posts every `vala[i]`/`neva[i]` each
         // process regardless of change — the framework's force-post path.
+        static OUTPUT_EVENTS: [crate::server::record::FieldIx; 2 * NUM_ARGS] =
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::A_SUB_FIELDS,
+                OUTPUT_EVENT_FIELDS,
+            );
         if self.eflg == EFLG_ALWAYS {
-            asub_output_event_fields()
+            &OUTPUT_EVENTS
         } else {
             &[]
         }
@@ -966,9 +980,14 @@ impl Record for ASubRecord {
     /// `VAL` alone, the other two arms also admit the output pairs. They
     /// differ only in whether an UNCHANGED pair still posts, which is
     /// [`Record::force_posted_fields`].
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
         Some(if self.eflg == EFLG_NEVER {
-            &["VAL"]
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::A_SUB_FIELDS,
+                    ["VAL"],
+                )
+            }
         } else {
             asub_posted_fields()
         })
@@ -1464,7 +1483,19 @@ mod tests {
         // Default ON CHANGE: neither force-post nor suppress.
         assert_eq!(rec.eflg, EFLG_ON_CHANGE);
         assert!(rec.force_posted_fields().is_empty());
-        let posted = rec.process_posted_fields().expect("aSub closes the set");
+        let names = |set: &[crate::server::record::FieldIx]| {
+            set.iter()
+                .map(|&ix| {
+                    crate::server::record::field_at(
+                        crate::server::record::dbd_generated::A_SUB_FIELDS,
+                        ix,
+                    )
+                    .expect("declared")
+                    .name
+                })
+                .collect::<Vec<_>>()
+        };
+        let posted = names(rec.process_posted_fields().expect("aSub closes the set"));
         assert_eq!(posted.len(), NUM_ARGS * 2 + 1);
         assert!(posted.contains(&"VAL"));
         assert!(posted.contains(&"VALA"));
@@ -1478,10 +1509,10 @@ mod tests {
             .unwrap();
         assert_eq!(rec.get_field("EFLG"), Some(EpicsValue::Short(2)));
         assert_eq!(rec.force_posted_fields().len(), NUM_ARGS * 2);
-        assert!(rec.force_posted_fields().contains(&"VALA"));
-        assert!(rec.force_posted_fields().contains(&"NEVU"));
+        assert!(names(rec.force_posted_fields()).contains(&"VALA"));
+        assert!(names(rec.force_posted_fields()).contains(&"NEVU"));
         assert_eq!(
-            rec.process_posted_fields().map(<[&str]>::len),
+            rec.process_posted_fields().map(<[_]>::len),
             Some(NUM_ARGS * 2 + 1)
         );
 
@@ -1489,7 +1520,7 @@ mod tests {
         rec.put_field("EFLG", EpicsValue::Short(EFLG_NEVER))
             .unwrap();
         assert!(rec.force_posted_fields().is_empty());
-        assert_eq!(rec.process_posted_fields(), Some(&["VAL"][..]));
+        assert_eq!(rec.process_posted_fields().map(names), Some(vec!["VAL"]));
     }
 
     /// EFLG loads from a `.db` menu label (C `field(EFLG,"ALWAYS")`).

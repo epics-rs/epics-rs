@@ -15,7 +15,8 @@ use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{CycleMarks, CyclePostMask, FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-static POSTS: [(&str, CyclePostMask); 1] = [("VAL", CyclePostMask::ValueLog)];
+static POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 1] =
+    epics_base_rs::server::record::declared_post_table(FIELDS, [("VAL", CyclePostMask::ValueLog)]);
 
 static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
 

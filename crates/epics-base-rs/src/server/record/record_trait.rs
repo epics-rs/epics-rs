@@ -4,6 +4,7 @@ use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, Scalar, c_parse};
 
 use super::CommonFields;
 use super::alarm::{AlarmLimit, AlarmSeverity};
+use super::record_instance::FieldIx;
 use super::scan::ScanType;
 use crate::server::device_support::DsetInit;
 
@@ -1057,7 +1058,7 @@ pub enum CyclePostMask {
 /// order, which is the order two marks of one field are posted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleMarks {
-    table: &'static [(&'static str, CyclePostMask)],
+    table: PostTable,
     bits: u128,
 }
 
@@ -1068,7 +1069,7 @@ impl CycleMarks {
     };
 
     /// Bit `i` of `bits` marks `table[i]`.
-    pub fn of(table: &'static [(&'static str, CyclePostMask)], bits: u128) -> Self {
+    pub fn of(table: PostTable, bits: u128) -> Self {
         debug_assert!(
             table.len() >= u128::BITS as usize || bits >> table.len() == 0,
             "a mark past the end of its post table"
@@ -1078,13 +1079,6 @@ impl CycleMarks {
 
     pub fn is_empty(self) -> bool {
         self.bits == 0
-    }
-
-    /// Whether a mark names `field`. Out of line, so a per-field walk keeps
-    /// the take in memory rather than holding its 128 bits in registers.
-    #[inline(never)]
-    pub fn names(&self, field: &str) -> bool {
-        { *self }.any(|(name, _)| name == field)
     }
 
     /// The marks ahead of the first marked `Reset*` entry, and the rest.
@@ -1113,7 +1107,7 @@ impl CycleMarks {
     }
 
     /// The post table the bits index.
-    pub(crate) fn table(self) -> &'static [(&'static str, CyclePostMask)] {
+    pub(crate) fn table(self) -> PostTable {
         self.table
     }
 
@@ -1133,7 +1127,7 @@ impl CycleMarks {
 }
 
 impl Iterator for CycleMarks {
-    type Item = (&'static str, CyclePostMask);
+    type Item = (FieldIx, CyclePostMask);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.bits == 0 {
@@ -1145,36 +1139,105 @@ impl Iterator for CycleMarks {
     }
 }
 
-/// A [`CycleMarks`] table posting each of `names` with `mask`.
-pub const fn uniform_post_table<const N: usize>(
-    names: &[&'static str],
-    mask: CyclePostMask,
-) -> [(&'static str, CyclePostMask); N] {
-    assert!(names.len() == N && N <= u128::BITS as usize);
-    let mut table = [("", mask); N];
+/// A record's set of its own declared fields by [`FieldIx`], resolved when
+/// the type is compiled: membership is an index compare, never a name read.
+pub type DeclaredFields = &'static [FieldIx];
+
+/// A [`CycleMarks`] post table: each entry a declared field and its mask.
+pub type PostTable = &'static [(FieldIx, CyclePostMask)];
+
+const fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `name`'s [`FieldIx`] in a type whose own table is `own`, found as
+/// `field_desc_in` finds it: the own table, then `dbCommon`. An undeclared
+/// name fails the build.
+///
+/// An index, not a `&FieldDesc`: a reference built here points at a copy of
+/// the table, never at the table a record serves.
+pub const fn declared_field_ix(own: &'static [FieldDesc], name: &str) -> FieldIx {
+    let common: &'static [FieldDesc] = super::dbd_generated::DB_COMMON_FIELDS;
+    let mut i = 0;
+    while i < own.len() {
+        if same_name(own[i].name, name) {
+            return FieldIx((common.len() + i) as u16);
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < common.len() {
+        if same_name(common[i].name, name) {
+            return FieldIx(i as u16);
+        }
+        i += 1;
+    }
+    panic!("a declared-field set names a field its table does not declare")
+}
+
+/// The declaration at `ix` in a type whose own table is `own`.
+pub fn field_at(own: &'static [FieldDesc], ix: FieldIx) -> Option<&'static FieldDesc> {
+    let common = super::dbd_generated::DB_COMMON_FIELDS;
+    let i = usize::from(ix.0);
+    common
+        .get(i)
+        .or_else(|| own.get(i.checked_sub(common.len())?))
+}
+
+/// `names` resolved against `own` at compile time, for a [`DeclaredFields`].
+pub const fn declared_set<const N: usize>(
+    own: &'static [FieldDesc],
+    names: [&str; N],
+) -> [FieldIx; N] {
+    let mut out = [FieldIx::UNDECLARED; N];
     let mut i = 0;
     while i < N {
-        table[i] = (names[i], mask);
+        out[i] = declared_field_ix(own, names[i]);
+        i += 1;
+    }
+    out
+}
+
+/// A [`PostTable`] from `entries`, resolved against `own` at compile time.
+pub const fn declared_post_table<const N: usize>(
+    own: &'static [FieldDesc],
+    entries: [(&str, CyclePostMask); N],
+) -> [(FieldIx, CyclePostMask); N] {
+    assert!(N <= u128::BITS as usize);
+    let mut out = [(FieldIx::UNDECLARED, CyclePostMask::Value); N];
+    let mut i = 0;
+    while i < N {
+        out[i] = (declared_field_ix(own, entries[i].0), entries[i].1);
+        i += 1;
+    }
+    out
+}
+
+/// A [`PostTable`] posting each of `names` with `mask`.
+pub const fn uniform_post_table<const N: usize>(
+    own: &'static [FieldDesc],
+    names: &[&str],
+    mask: CyclePostMask,
+) -> [(FieldIx, CyclePostMask); N] {
+    assert!(names.len() == N && N <= u128::BITS as usize);
+    let mut table = [(FieldIx::UNDECLARED, mask); N];
+    let mut i = 0;
+    while i < N {
+        table[i] = (declared_field_ix(own, names[i]), mask);
         i += 1;
     }
     table
-}
-
-/// The [`ValuePostGate`] a record declared for `field`, or `None` when `field`
-/// is not one of its secondary value-mask fields.
-///
-/// The single lookup for [`Record::fields_posted_with_value_mask`], shared by
-/// every monitor loop (both `process_record_*` paths, the deferred-completion
-/// path, and `RecordInstance::process_local`) so they cannot drift apart on how
-/// a secondary field is gated.
-pub(crate) fn value_gate(
-    value_masked: &'static [(&'static str, ValuePostGate)],
-    field: &str,
-) -> Option<ValuePostGate> {
-    value_masked
-        .iter()
-        .find(|(name, _)| *name == field)
-        .map(|(_, gate)| *gate)
 }
 
 /// [`Record::set_input_link_slots`] answered off the record's own link texts,
@@ -1229,16 +1292,13 @@ impl AuxPostMask {
         }
     }
 
-    /// Which of the three declarations holds `field`, first match: 1, 2, 3,
-    /// or 0 for none. Read once per field, when its entry is made.
-    pub(crate) fn class_of(&self, field: &str) -> u8 {
+    /// The three declarations, in class order: a field's class is 1 + the
+    /// index of the first that holds it, 0 for none.
+    pub(crate) fn lists(&self) -> [&'static [&'static str]; 3] {
         [self.value_only, self.monitor_masked, self.no_alarm_bits]
-            .iter()
-            .position(|list| list.contains(&field))
-            .map_or(0, |i| i as u8 + 1)
     }
 
-    /// The mask a change-detected post of a `class_of` field carries.
+    /// The mask a change-detected post of a field of `class` carries.
     /// `alarm_bits` is this cycle's `recGblResetAlarms` result; `deadband_mask`
     /// is VAL's own monitor mask (those alarm bits, plus `DBE_VALUE` when MDEL
     /// crossed and `DBE_LOG` when ADEL crossed).
@@ -2313,9 +2373,10 @@ pub enum RecordProcessResult {
     /// Current cycle skips alarm/timestamp/snapshot/OUT/FLNK.
     /// ProcessActions (if any) are still executed.
     AsyncPending,
-    /// Async pending, but notify these intermediate field changes immediately.
-    /// Used by motor records to flush DMOV=0 before the move completes.
-    AsyncPendingNotify(Vec<(String, EpicsValue)>),
+    /// Async pending, but notify these intermediate field changes immediately,
+    /// each read from the record. Used by motor records to flush DMOV=0
+    /// before the move completes.
+    AsyncPendingNotify(Vec<FieldIx>),
     /// Completed synchronously (PACT cleared, unlike `AsyncPending`), but the
     /// record produced no new value to publish this cycle — the framework must
     /// skip the value-publication epilogue (UDF clear / timestamp / monitor /
@@ -4288,7 +4349,7 @@ pub trait Record: Send + Sync + 'static {
     /// field(s) on an alarm transition (aiRecord.c `monitor()` posts
     /// VAL with `monitor_mask` and RVAL only when it changed), which
     /// the deadband-field post already covers.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+    fn alarm_cycle_monitored_fields(&self) -> DeclaredFields {
         &[]
     }
 
@@ -4333,7 +4394,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default: empty — most record types post a field only when it
     /// changed (or on an alarm transition), which the existing gates cover.
-    fn force_posted_fields(&self) -> &'static [&'static str] {
+    fn force_posted_fields(&self) -> DeclaredFields {
         &[]
     }
 
@@ -4438,7 +4499,7 @@ pub trait Record: Send + Sync + 'static {
     /// deviation; see the post site in `collect_subscriber_posts`.
     ///
     /// Default: empty — most record types have no LOG-only sweep.
-    fn log_swept_fields(&self) -> &'static [&'static str] {
+    fn log_swept_fields(&self) -> DeclaredFields {
         &[]
     }
 
@@ -4669,7 +4730,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Fields inside the list keep their normal treatment (change detection,
     /// [`Self::value_only_change_fields`] mask, deadband, `log_swept_fields`).
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+    fn process_posted_fields(&self) -> Option<DeclaredFields> {
         None
     }
 

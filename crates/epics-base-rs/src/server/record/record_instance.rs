@@ -20,8 +20,9 @@ use super::common_fields::{BkptFlag, CommonFields};
 use super::link::{ParsedLink, parse_link_v2};
 use super::menu_choices::MenuBound;
 use super::record_trait::{
-    AuxPostMask, CommonFieldPutResult, EnumSlots, FieldDeclaration, FieldDesc, InputLinkRequest,
-    LinkReadAs, PostName, PostedValue, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    AuxPostMask, CommonFieldPutResult, DeclaredFields, EnumSlots, FieldDeclaration, FieldDesc,
+    InputLinkRequest, LinkReadAs, PostName, PostedValue, ProcessSnapshot, Record,
+    RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -2682,7 +2683,7 @@ impl PutAddr {
 /// per-entry read cost ao's monitor_cycle 5 instructions per cycle.
 mod posted {
     use super::*;
-    use crate::server::record::{CyclePostMask, ValuePostGate, value_gate};
+    use crate::server::record::{DeclaredFields, PostTable, ValuePostGate};
 
     /// What a published value is filed under: a declared field's [`FieldIx`],
     /// or a spelling no declaration matches exactly. A declared field posted
@@ -2703,7 +2704,7 @@ mod posted {
     /// one turns over. The walk tests bits.
     #[derive(Debug, Clone, Copy, Default)]
     pub(super) struct Roles {
-        /// [`value_gate`] of the field.
+        /// The field's [`Record::fields_posted_with_value_mask`] gate.
         pub(super) gate: Option<ValuePostGate>,
         /// The field's [`AuxPostMask`] class.
         aux: u8,
@@ -2713,29 +2714,32 @@ mod posted {
     }
 
     impl Roles {
-        /// `name`'s roles under `plan` and `lists`. Reads names, so it runs
-        /// only when an entry is made or a list turns over.
-        pub(super) fn of(name: &str, plan: &MonitorPlan, lists: &Lists) -> Self {
+        /// A field's roles, `fixed` from the type's lists and the rest by its
+        /// declaration `member` under `lists`. Runs only when an entry is made
+        /// or a list turns over.
+        pub(super) fn of(member: Option<FieldIx>, fixed: FixedRoles, lists: &Lists) -> Self {
             let mut roles = Self {
-                gate: value_gate(plan.value_masked, name),
-                aux: plan.aux_post.class_of(name),
+                gate: fixed.gate,
+                aux: fixed.aux,
                 ..Self::default()
             };
-            roles.settle(name, lists);
+            roles.settle(member, lists);
             roles
         }
 
-        fn settle(&mut self, name: &str, lists: &Lists) {
-            let has = |list: &[&str], bit| if names_contain(list, name) { bit } else { 0 };
+        fn settle(&mut self, member: Option<FieldIx>, lists: &Lists) {
+            let has = |list: DeclaredFields, bit| if holds(list, member) { bit } else { 0 };
             self.lists =
                 has(lists.forced, FORCED) | has(lists.fanout, FANOUT) | has(lists.swept, SWEPT);
-            self.marks = lists
-                .marks
-                .iter()
-                .take(u128::BITS as usize)
-                .enumerate()
-                .filter(|(_, (mark, _))| name_bytes_eq(mark, name))
-                .fold(0, |bits, (i, _)| bits | 1 << i);
+            self.marks = member.map_or(0, |member| {
+                lists
+                    .marks
+                    .iter()
+                    .take(u128::BITS as usize)
+                    .enumerate()
+                    .filter(|(_, (mark, _))| *mark == member)
+                    .fold(0, |bits, (i, _)| bits | 1 << i)
+            });
         }
 
         /// [`Record::force_posted_fields`] holds the field.
@@ -2767,10 +2771,10 @@ mod posted {
     /// identity: a static list is settled once.
     #[derive(Debug, Clone, Copy)]
     pub(super) struct Lists {
-        pub(super) forced: &'static [&'static str],
-        pub(super) fanout: &'static [&'static str],
-        pub(super) swept: &'static [&'static str],
-        pub(super) marks: &'static [(&'static str, CyclePostMask)],
+        pub(super) forced: DeclaredFields,
+        pub(super) fanout: DeclaredFields,
+        pub(super) swept: DeclaredFields,
+        pub(super) marks: PostTable,
     }
 
     impl Lists {
@@ -2893,11 +2897,12 @@ mod posted {
                 )
         }
 
-        fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut Published)> {
+        /// Every entry with the index a declared-field set holds it by.
+        fn iter_mut(&mut self) -> impl Iterator<Item = (Option<FieldIx>, &mut Published)> {
             self.declared
                 .iter_mut()
-                .map(|(_, p)| (p.desc.map_or("", |d| d.name), p))
-                .chain(self.named.iter_mut().map(|(name, p)| (&**name, p)))
+                .map(|(ix, p)| (Some(*ix), p))
+                .chain(self.named.iter_mut().map(|(_, p)| (None, p)))
         }
     }
 
@@ -2962,7 +2967,7 @@ mod posted {
     /// against.
     #[derive(Debug)]
     pub(super) struct PostedSet {
-        list: Option<&'static [&'static str]>,
+        list: Option<DeclaredFields>,
         deadband: bool,
         lists: Lists,
     }
@@ -2984,28 +2989,28 @@ mod posted {
             field: &str,
             value: PostedValue,
             desc: Option<&'static FieldDesc>,
-            prev_bit: Option<u8>,
-            plan: &MonitorPlan,
+            member: Option<FieldIx>,
+            fixed: FixedRoles,
         ) -> Published {
             Published {
                 value,
                 desc,
                 upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
-                prev_bit,
-                roles: Roles::of(field, plan, &self.lists),
-                posted: self.contains(field),
+                prev_bit: fixed.prev_bit,
+                roles: Roles::of(member, fixed, &self.lists),
+                posted: self.contains(member),
             }
         }
 
         /// A monitor's roles, settled as an entry's.
-        pub(super) fn roles_of(&self, field: &str, plan: &MonitorPlan) -> Roles {
-            Roles::of(field, plan, &self.lists)
+        pub(super) fn roles_of(&self, member: Option<FieldIx>, fixed: FixedRoles) -> Roles {
+            Roles::of(member, fixed, &self.lists)
         }
 
         /// Whether every entry is already settled against `list`, the
         /// record's answer now.
         #[inline(always)]
-        pub(super) fn is_settled(&self, list: Option<&'static [&'static str]>) -> bool {
+        pub(super) fn is_settled(&self, list: Option<DeclaredFields>) -> bool {
             match (list, self.list) {
                 (Some(list), Some(posted)) => std::ptr::eq(list, posted),
                 (list, posted) => list.is_none() && posted.is_none(),
@@ -3015,15 +3020,15 @@ mod posted {
         /// Settle `log` and the deadband membership against `list`.
         pub(super) fn resettle(
             &mut self,
-            list: Option<&'static [&'static str]>,
-            deadband_field: &'static str,
+            list: Option<DeclaredFields>,
+            deadband: Option<FieldIx>,
             log: &mut PostedLog,
         ) {
             self.list = list;
-            for (field, published) in log.iter_mut() {
-                published.posted = self.contains(field);
+            for (member, published) in log.iter_mut() {
+                published.posted = self.contains(member);
             }
-            self.deadband = list.is_none_or(|list| names_contain(list, deadband_field));
+            self.deadband = list.is_none_or(|list| holds(list, deadband));
         }
 
         /// Whether every entry's roles are settled against `lists`.
@@ -3043,20 +3048,21 @@ mod posted {
             &mut self,
             lists: Lists,
             log: &mut PostedLog,
-            monitors: impl Iterator<Item = (&'m str, &'m mut Roles)>,
+            monitors: impl Iterator<Item = (Option<FieldIx>, &'m mut Roles)>,
         ) {
             self.lists = lists;
-            for (field, published) in log.iter_mut() {
-                published.roles.settle(field, &lists);
+            for (member, published) in log.iter_mut() {
+                published.roles.settle(member, &lists);
             }
-            for (field, roles) in monitors {
-                roles.settle(field, &lists);
+            for (member, roles) in monitors {
+                roles.settle(member, &lists);
             }
         }
 
-        /// `field`'s membership in the list of the last settle.
-        pub(super) fn contains(&self, field: &str) -> bool {
-            self.list.is_some_and(|list| names_contain(list, field))
+        /// The membership of the field declared `member` in the list of the
+        /// last settle.
+        pub(super) fn contains(&self, member: Option<FieldIx>) -> bool {
+            self.list.is_some_and(|list| holds(list, member))
         }
 
         /// The deadband field's membership in the list of the last settle.
@@ -4071,6 +4077,15 @@ impl FieldSubscriber {
         }
     }
 
+    /// The index a declared-field set holds this monitor's field by; a
+    /// spelling no declaration matches is in none.
+    fn member(&self) -> Option<FieldIx> {
+        match &self.name {
+            SubName::Declared(_) => Some(self.ix),
+            SubName::Named(_) => None,
+        }
+    }
+
     /// The field's published-log key.
     fn key(&self) -> PostKey<'_> {
         match &self.name {
@@ -4134,6 +4149,11 @@ fn name_bytes_eq(a: &str, b: &str) -> bool {
     #[cfg(test)]
     NAME_BYTE_COMPARES.with(|n| n.set(n.get() + 1));
     a == b
+}
+
+/// Whether `list` holds the field at `member`.
+fn holds(list: DeclaredFields, member: Option<FieldIx>) -> bool {
+    member.is_some_and(|member| list.contains(&member))
 }
 
 /// Whether a declared name list holds `field`, by bytes.
@@ -4492,6 +4512,43 @@ const S_DB_BAD_SUB: i64 = (511 << 16) | 35;
 /// returns a `long`), and a failed cycle either way.
 const SUBROUTINE_STATUS_ERROR: i64 = -3;
 
+/// A field's answers from the type's fixed name lists: its
+/// [`Record::fields_posted_with_value_mask`] gate, its [`AuxPostMask`] class
+/// and its [`Record::prev_compared_inputs`] bit.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct FixedRoles {
+    gate: Option<crate::server::record::ValuePostGate>,
+    aux: u8,
+    prev_bit: Option<u8>,
+}
+
+impl FixedRoles {
+    /// By name: once per declared field when the plan is built, and on every
+    /// lookup of a field no table declares.
+    fn by_name(
+        name: &str,
+        value_masked: &[(&'static str, crate::server::record::ValuePostGate)],
+        aux: &AuxPostMask,
+        prev_compared: &[&'static str],
+    ) -> Self {
+        Self {
+            gate: value_masked
+                .iter()
+                .find(|(field, _)| name_bytes_eq(field, name))
+                .map(|(_, gate)| *gate),
+            aux: aux
+                .lists()
+                .iter()
+                .position(|list| names_contain(list, name))
+                .map_or(0, |i| i as u8 + 1),
+            prev_bit: prev_compared
+                .iter()
+                .position(|field| name_bytes_eq(field, name))
+                .map(|bit| bit as u8),
+        }
+    }
+}
+
 /// What a record TYPE answers to the type-static questions C `monitor()`
 /// asks about it — the deadband field and its mask narrowings, the value
 /// gate, and whether the record posts its value at all. Every answer is a
@@ -4541,6 +4598,11 @@ pub(crate) struct MonitorPlan {
     pub(crate) forced_secondary: bool,
     /// The change-detected aux fields' mask resolver.
     pub(crate) aux_post: AuxPostMask,
+    /// [`Record::prev_compared_inputs`]' names.
+    prev_compared: &'static [&'static str],
+    /// The [`FixedRoles`] of every declared field a fixed list names, so a
+    /// declared field's are found by index.
+    fixed: Box<[(FieldIx, FixedRoles)]>,
     /// [`Record::fields_posted_only_when_marked`]: the fields whose post
     /// decisions the type owns, so the framework keeps no published copy of
     /// them ([`RecordInstance::record_value_post`]).
@@ -4551,6 +4613,8 @@ pub(crate) struct MonitorPlan {
     walk_skip_bits: FieldBits,
     /// The `HASH` field's declaration, for the array types' hash post.
     hash_desc: Option<&'static FieldDesc>,
+    /// The `VAL` field's declaration, C's `indvalFlddes`.
+    val_desc: Option<&'static FieldDesc>,
     /// [`Record::field_list`], which [`FieldIx`] indexes past `dbCommon`.
     fields: &'static [FieldDesc],
     /// [`Record::cycle_hooks`].
@@ -4571,11 +4635,26 @@ impl MonitorPlan {
 
     /// The declaration at `ix`.
     fn desc_at(&self, ix: FieldIx) -> Option<&'static FieldDesc> {
-        let common = super::dbd_generated::DB_COMMON_FIELDS;
-        let i = usize::from(ix.0);
-        common
-            .get(i)
-            .or_else(|| self.fields.get(i.checked_sub(common.len())?))
+        crate::server::record::field_at(self.fields, ix)
+    }
+
+    /// The deadband field's index when it is spelled as declared.
+    fn deadband_member(&self) -> Option<FieldIx> {
+        self.deadband_declared.map(|_| self.deadband_ix)
+    }
+
+    /// The [`FixedRoles`] of the field filed under `key`.
+    fn fixed_roles(&self, key: PostKey<'_>) -> FixedRoles {
+        match key {
+            PostKey::Ix(ix) => self
+                .fixed
+                .iter()
+                .find(|(at, _)| *at == ix)
+                .map_or_else(FixedRoles::default, |(_, roles)| *roles),
+            PostKey::Named(name) => {
+                FixedRoles::by_name(name, self.value_masked, &self.aux_post, self.prev_compared)
+            }
+        }
     }
 
     /// Whether a post filed under `key` stores nothing: the deadband field,
@@ -4596,6 +4675,18 @@ impl MonitorPlan {
         let value_masked = record.fields_posted_with_value_mask();
         let claimed = record.fields_posted_only_when_marked();
         let event_posted = record.event_posted_fields();
+        let aux_post = AuxPostMask::of(record);
+        let prev_compared = record.prev_compared_inputs().0;
+        let mut fixed: Vec<(FieldIx, FixedRoles)> = Vec::new();
+        let named = value_masked.iter().map(|(name, _)| *name);
+        let named = named.chain(aux_post.lists().into_iter().flatten().copied());
+        for name in named.chain(prev_compared.iter().copied()) {
+            let ix = FieldIx::of(record, declared_desc(field_desc_of(record, name), name));
+            if ix != FieldIx::UNDECLARED && fixed.iter().all(|(at, _)| *at != ix) {
+                let roles = FixedRoles::by_name(name, value_masked, &aux_post, prev_compared);
+                fixed.push((ix, roles));
+            }
+        }
         Self {
             posts_value_monitor: record.process_posts_value_monitor(),
             alarm_alone_posts_value: record.alarm_alone_posts_value(),
@@ -4642,13 +4733,16 @@ impl MonitorPlan {
                             | crate::server::record::ValuePostGate::Guarded
                     )
                 }),
-            aux_post: AuxPostMask::of(record),
+            aux_post,
+            prev_compared,
+            fixed: fixed.into(),
             claimed,
             claimed_bits: FieldBits::of(record, |desc| claimed.contains(&desc.name)),
             walk_skip_bits: FieldBits::of(record, |desc| {
                 walk_skip_term(desc.name, deadband_field, event_posted)
             }),
             hash_desc: declared_desc(field_desc_of(record, "HASH"), "HASH"),
+            val_desc: declared_desc(field_desc_of(record, "VAL"), "VAL"),
             fields: record.field_list(),
             hooks: record.cycle_hooks(),
             subroutine_kind: SubroutineKind::of(record.record_type()),
@@ -5111,12 +5205,20 @@ impl RecordInstance {
         use crate::server::recgbl::EventMask;
         use crate::server::record::CyclePostMask;
         let mut burst = PostBurst::new();
-        for (field, mask) in self.record.take_process_posted_fields() {
+        for (ix, mask) in self.record.take_process_posted_fields() {
+            let Some(desc) = self.monitor_plan.desc_at(ix) else {
+                continue;
+            };
             // No change detector reads a marked-only field's published value,
             // so with no subscriber C's `db_post_events` leaves nothing to do —
             // and an entry in `last_posted` would have the walk read the
             // whole array every later cycle.
-            if names_contain(self.monitor_plan.claimed, field) && !self.has_subscriber(field) {
+            if self.monitor_plan.claimed_bits.has(ix)
+                && !self
+                    .subscribers
+                    .iter()
+                    .any(|sub| sub.watches_key(PostKey::Ix(ix)))
+            {
                 continue;
             }
             let mask = match mask {
@@ -5129,17 +5231,7 @@ impl RecordInstance {
                 | CyclePostMask::ResetValueLog
                 | CyclePostMask::ResetValueLogOnAlarm => EventMask::VALUE | EventMask::LOG,
             };
-            self.post_put_field(
-                Some(&mut burst),
-                field,
-                mask,
-                0,
-                (
-                    |inst: &Self| inst.field_desc(field),
-                    |inst: &Self| inst.resolve_field_upper(field),
-                ),
-                None,
-            );
+            self.notify_declared(Some(&mut burst), desc, mask);
         }
     }
 
@@ -6125,20 +6217,10 @@ impl RecordInstance {
         }
     }
 
-    /// What a post of `field` carries: nothing for a reference-log field,
-    /// which is never read for it, else `read`. The kind is the published
-    /// entry's, settled when the field was first published, and only a field
-    /// never published asks its declaration (`desc`).
-    fn post_payload(
-        &self,
-        field: &str,
-        desc: impl FnOnce(&Self) -> Option<&'static FieldDesc>,
-        read: impl FnOnce(&Self) -> Option<EpicsValue>,
-    ) -> Option<PostedValue> {
-        self.post_payload_at(self.post_key(field), desc, read)
-    }
-
-    /// [`Self::post_payload`] of the field filed under `key`.
+    /// What a post of the field filed under `key` carries: nothing for a
+    /// reference-log field, which is never read for it, else `read`. The kind
+    /// is the published entry's, settled when the field was first published,
+    /// and only a field never published asks its declaration (`desc`).
     fn post_payload_at(
         &self,
         key: PostKey<'_>,
@@ -6165,7 +6247,7 @@ impl RecordInstance {
         }
     }
 
-    /// [`Self::post_payload`] for a subscribed field the walk reaches before
+    /// [`Self::post_payload_at`] for a subscribed field the walk reaches before
     /// its first post, kept out of the walk's per-entry code.
     #[cold]
     #[inline(never)]
@@ -6188,14 +6270,6 @@ impl RecordInstance {
             self.record.monitor_deadband_field(),
             self.record.event_posted_fields(),
         )
-    }
-
-    fn prev_compared_bit(&self, field: &str) -> Option<u8> {
-        let names = self.record.prev_compared_inputs().0;
-        names
-            .iter()
-            .position(|name| name_bytes_eq(name, field))
-            .map(|bit| bit as u8)
     }
 
     /// SINGLE OWNER of `last_posted`: record that `value` has been published
@@ -6221,7 +6295,7 @@ impl RecordInstance {
     /// `last_posted` entry's `posted` and the deadband membership settled
     /// against it.
     #[inline]
-    fn settle_posted(&mut self) -> Option<&'static [&'static str]> {
+    fn settle_posted(&mut self) -> Option<DeclaredFields> {
         let list = self.record.process_posted_fields();
         if !self.posted.is_settled(list) {
             self.resettle_posted(list);
@@ -6231,10 +6305,10 @@ impl RecordInstance {
 
     #[cold]
     #[inline(never)]
-    fn resettle_posted(&mut self, list: Option<&'static [&'static str]>) {
+    fn resettle_posted(&mut self, list: Option<DeclaredFields>) {
         self.posted.resettle(
             list,
-            self.monitor_plan.deadband_field,
+            self.monitor_plan.deadband_member(),
             &mut self.last_posted,
         );
         self.settle_sub_walk();
@@ -6251,13 +6325,10 @@ impl RecordInstance {
     #[cold]
     #[inline(never)]
     fn resettle_roles(&mut self, lists: Lists) {
-        let monitors = self.subscribers.iter_mut().map(|sub| {
-            let field = match &sub.name {
-                SubName::Declared(desc) => desc.name,
-                SubName::Named(name) => &**name,
-            };
-            (field, &mut sub.roles)
-        });
+        let monitors = self
+            .subscribers
+            .iter_mut()
+            .map(|sub| (sub.member(), &mut sub.roles));
         self.posted
             .resettle_lists(lists, &mut self.last_posted, monitors);
     }
@@ -6281,16 +6352,16 @@ impl RecordInstance {
             self.skipped_posted.set(key, value);
             return;
         }
-        let desc = match key {
-            PostKey::Ix(ix) => self.monitor_plan.desc_at(ix),
-            PostKey::Named(_) => self.field_desc(field),
+        let (desc, member) = match key {
+            PostKey::Ix(ix) => (self.monitor_plan.desc_at(ix), Some(ix)),
+            PostKey::Named(_) => (self.field_desc(field), None),
         };
         let published = self.posted.publish(
             field,
             value,
             desc,
-            self.prev_compared_bit(field),
-            &self.monitor_plan,
+            member,
+            self.monitor_plan.fixed_roles(key),
         );
         self.last_posted.insert(key, published);
         if !self.unwatched() {
@@ -9699,7 +9770,7 @@ impl RecordInstance {
                 // search runs only for one never posted since.
                 let prev_bit = match published {
                     Some(p) => p.prev_bit,
-                    None => self.prev_compared_bit(field),
+                    None => self.monitor_plan.fixed_roles(key).prev_bit,
                 };
                 match (prev_bit, &val) {
                     (Some(bit), _) => prev_changed & (1 << bit) != 0,
@@ -9911,14 +9982,14 @@ impl RecordInstance {
     /// field's published value lives, so change-detecting it here compared
     /// against a cache nothing maintains and re-posted the PREVIOUS readback at
     /// every move start.
-    pub(crate) fn collect_notify_posts(
-        &mut self,
-        fields: Vec<(String, EpicsValue)>,
-    ) -> ProcessSnapshot {
-        let deadband_field = self.record.monitor_deadband_field();
+    pub(crate) fn collect_notify_posts(&mut self, fields: Vec<FieldIx>) -> ProcessSnapshot {
+        let deadband = self.monitor_plan.deadband_member();
         let mut posts = ProcessSnapshot::new();
-        for (name, val) in fields {
-            if name == deadband_field {
+        for ix in fields {
+            let Some(desc) = self.monitor_plan.desc_at(ix) else {
+                continue;
+            };
+            if Some(ix) == deadband {
                 // The record's own value, not the notify's copy of it: C posts
                 // the field itself (`db_post_events(pmr, &pmr->rbv, ...)`).
                 let (include_val, include_archive, _) = self.value_include_classes();
@@ -9929,13 +10000,19 @@ impl RecordInstance {
             }
             // A reference-log field has no published copy to compare the
             // record's value against, so the record's notify posts it.
-            let Some(posted) = self.post_payload(&name, |i| i.field_desc(&name), |_| Some(val))
+            let key = PostKey::Ix(ix);
+            let Some(posted) =
+                self.post_payload_at(key, |_| Some(desc), |i| i.record.get_field(desc.name))
             else {
                 continue;
             };
-            if posted == PostedValue::Ref || self.posted_value(&name) != Some(&posted) {
-                self.record_value_post(&name, posted.clone());
-                posts.push((name.into(), posted, EventMask::VALUE | EventMask::LOG));
+            if posted == PostedValue::Ref || self.posted_value_at(key) != Some(&posted) {
+                self.record_value_post_as(key, desc.name, posted.clone());
+                posts.push((
+                    PostName::Declared(desc),
+                    posted,
+                    EventMask::VALUE | EventMask::LOG,
+                ));
             }
         }
         posts
@@ -9982,17 +10059,28 @@ impl RecordInstance {
         let alarm_result = recgbl::rec_gbl_reset_alarms(&mut self.common);
         let mut posts = ProcessSnapshot::new();
         crate::server::database::alarm_field_posts(&self.common, &alarm_result).for_each(
-            |field, mask| {
-                if let Some(value) =
-                    self.post_payload(field, |i| i.field_desc(field), |i| i.resolve_field(field))
-                {
-                    posts.push((field.into(), value, mask));
+            |desc, mask| {
+                if let Some(value) = self.post_payload_at(
+                    self.monitor_plan.key_of(desc),
+                    |_| Some(desc),
+                    |i| i.resolve_field_upper_at(desc.name, Some(desc)),
+                ) {
+                    posts.push((PostName::Declared(desc), value, mask));
                 }
             },
         );
-        if let Some(val) = self.post_payload("VAL", |i| i.field_desc("VAL"), |i| i.record.val()) {
+        let declared = self.monitor_plan.val_desc;
+        let key = match declared {
+            Some(desc) => self.monitor_plan.key_of(desc),
+            None => self.post_key("VAL"),
+        };
+        if let Some(val) = self.post_payload_at(
+            key,
+            |i| declared.or_else(|| i.field_desc("VAL")),
+            |i| i.record.val(),
+        ) {
             posts.push((
-                "VAL".into(),
+                post_name(declared, "VAL"),
                 val,
                 EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
             ));
@@ -11105,7 +11193,6 @@ impl RecordInstance {
         let plan = &self.monitor_plan;
         for at in 0..self.subscribers.len() {
             let sub = &self.subscribers[at];
-            let field = sub.field();
             let key = sub.key();
             let (walk_skip, claimed) = match key {
                 PostKey::Ix(ix) => (plan.walk_skip_bits.has(ix), plan.claimed_bits.has(ix)),
@@ -11127,7 +11214,7 @@ impl RecordInstance {
             } else {
                 SubWalk::Unpublished
             };
-            let posted = self.posted.contains(field);
+            let posted = self.posted.contains(sub.member());
             let sub = &mut self.subscribers[at];
             sub.walk = walk;
             sub.posted = posted;
@@ -11201,6 +11288,27 @@ impl RecordInstance {
     /// Notify subscribers of a specific field, filtering by event mask.
     pub fn notify_field(&mut self, field: &str, mask: crate::server::recgbl::EventMask) {
         self.notify_field_with_origin(field, mask, 0);
+    }
+
+    /// [`Self::notify_field`] of the field declared `desc`, filed by it
+    /// rather than by its name; `burst` `None` is a post that is its own.
+    pub(crate) fn notify_declared(
+        &mut self,
+        burst: Option<&mut PostBurst>,
+        desc: &'static FieldDesc,
+        mask: crate::server::recgbl::EventMask,
+    ) {
+        self.post_put_field(
+            burst,
+            desc.name,
+            mask,
+            0,
+            (
+                |_: &Self| Some(desc),
+                |inst: &Self| inst.resolve_field_upper_at(desc.name, Some(desc)),
+            ),
+            Some(desc),
+        );
     }
 
     /// [`Self::notify_field`] posting into the caller's `burst`.
@@ -11504,12 +11612,13 @@ impl RecordInstance {
             active: true,
         };
         let declared = declared_desc(desc, field);
+        let ix = FieldIx::of(self.record.as_ref(), declared.or(desc));
         let entry = FieldSubscriber {
             name: match declared {
                 Some(desc) => SubName::Declared(desc),
                 None => SubName::Named(field.into()),
             },
-            ix: FieldIx::of(self.record.as_ref(), declared.or(desc)),
+            ix,
             declared: self.declared_field_type(field),
             long_string: self.record.field_is_long_string(field),
             walk: SubWalk::Skip,
@@ -11520,7 +11629,10 @@ impl RecordInstance {
                 .iter()
                 .position(|name| *name == field)
                 .map_or(u16::MAX, |at| at as u16),
-            roles: self.posted.roles_of(field, &self.monitor_plan),
+            roles: self.posted.roles_of(
+                declared.map(|_| ix),
+                self.monitor_plan.fixed_roles(self.post_key(field)),
+            ),
             sub: subscriber,
         };
         // C `ellAdd`: attach order is post order — except that a claimed
@@ -12892,8 +13004,8 @@ mod metadata_cache_tests {
         fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             FORCE_POST_FIELDS
         }
-        fn force_posted_fields(&self) -> &'static [&'static str] {
-            &["DIFF"]
+        fn force_posted_fields(&self) -> crate::server::record::DeclaredFields {
+            &const { crate::server::record::declared_set(FORCE_POST_FIELDS, ["DIFF"]) }
         }
     }
 
@@ -13014,8 +13126,8 @@ mod metadata_cache_tests {
         fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             LOG_SWEEP_FIELDS
         }
-        fn log_swept_fields(&self) -> &'static [&'static str] {
-            &["S1"]
+        fn log_swept_fields(&self) -> crate::server::record::DeclaredFields {
+            &const { crate::server::record::declared_set(LOG_SWEEP_FIELDS, ["S1"]) }
         }
     }
 
@@ -13179,8 +13291,8 @@ mod metadata_cache_tests {
         fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             ALARMING_LOG_SWEEP_FIELDS
         }
-        fn log_swept_fields(&self) -> &'static [&'static str] {
-            &["S1"]
+        fn log_swept_fields(&self) -> crate::server::record::DeclaredFields {
+            &const { crate::server::record::declared_set(ALARMING_LOG_SWEEP_FIELDS, ["S1"]) }
         }
         fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
             Some(self)
@@ -14483,7 +14595,11 @@ mod claimed_field_tests {
         crate::server::record::FieldDesc::new("VAL", DbFieldType::Double, false),
         crate::server::record::FieldDesc::new("SENT", DbFieldType::Double, false),
     ];
-    static SENT_POST: [(&str, CyclePostMask); 1] = [("SENT", CyclePostMask::MonitorValueLog)];
+    static SENT_POST: [(crate::server::record::FieldIx, CyclePostMask); 1] =
+        crate::server::record::declared_post_table(
+            FIELDS,
+            [("SENT", CyclePostMask::MonitorValueLog)],
+        );
 
     /// Throttle's shape: `process()` marks SENT and leaves VAL unmoved.
     #[derive(Default)]
@@ -14834,6 +14950,127 @@ mod mlis_tests {
         assert_eq!(drained(&mut reader), [EventMask::VALUE.bits()]);
     }
 
+    /// A declared field's fixed-list answers — value-mask gate, aux class,
+    /// previous-copy bit — come by index and equal what its name finds.
+    #[test]
+    fn a_declared_fields_fixed_roles_read_no_name_bytes() {
+        use crate::server::records::{
+            calcout::CalcoutRecord, event::EventRecord, transform::TransformRecord,
+        };
+        let records: [Box<dyn Record>; 4] = [
+            Box::new(AoRecord::default()),
+            Box::new(CalcoutRecord::default()),
+            Box::new(EventRecord::default()),
+            Box::new(TransformRecord::default()),
+        ];
+        for record in records {
+            let plan = MonitorPlan::of(record.as_ref());
+            let declared = super::super::dbd_generated::DB_COMMON_FIELDS
+                .iter()
+                .chain(record.field_list());
+            let mut found = 0;
+            for (i, desc) in declared.enumerate() {
+                NAME_BYTE_COMPARES.with(|n| n.set(0));
+                let by_ix = plan.fixed_roles(PostKey::Ix(FieldIx(i as u16)));
+                assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0, "{}", desc.name);
+                assert_eq!(
+                    by_ix,
+                    plan.fixed_roles(PostKey::Named(desc.name)),
+                    "{}",
+                    desc.name
+                );
+                found += usize::from(by_ix != FixedRoles::default());
+            }
+            assert!(found > 0, "{}", record.record_type());
+        }
+    }
+
+    /// A pending pass's notify posts the record's own value of each field it
+    /// names, found by index, and only a changed one.
+    #[test]
+    fn an_async_notify_posts_by_index_and_reads_no_name_bytes() {
+        use crate::server::record::{dbd_generated::CALCOUT_FIELDS, declared_field_ix};
+        use crate::server::records::calcout::CalcoutRecord;
+        let mut inst = RecordInstance::new("CO:NFY".to_string(), CalcoutRecord::default());
+        let mut reader = attach(&mut inst, "A", EventMask::VALUE);
+        const A: FieldIx = declared_field_ix(CALCOUT_FIELDS, "A");
+        inst.record.put_field("A", EpicsValue::Double(3.0)).unwrap();
+        NAME_BYTE_COMPARES.with(|n| n.set(0));
+        let posts = inst.collect_notify_posts(vec![A]);
+        assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0);
+        assert_eq!(posts.len(), 1);
+        inst.notify_from_snapshot(&posts);
+        let values: Vec<_> = std::iter::from_fn(|| reader.try_recv().ok())
+            .map(|ev| ev.value().as_value().cloned())
+            .collect();
+        assert_eq!(values, [Some(EpicsValue::Double(3.0))]);
+        assert_eq!(inst.collect_notify_posts(vec![A]).len(), 0, "unchanged");
+    }
+
+    /// The per-instance sets — forced, alarm fan-out, the marks and the closed
+    /// process set — settle every published entry and monitor by index.
+    #[test]
+    fn a_declared_set_settle_reads_no_name_bytes() {
+        use crate::server::records::{asub_record::ASubRecord, calcout::CalcoutRecord};
+        let mut calcout = RecordInstance::new("CO:SET".to_string(), CalcoutRecord::default());
+        let mut asub = RecordInstance::new("AS:SET".to_string(), ASubRecord::default());
+        asub.record
+            .put_field("EFLG", EpicsValue::Short(2))
+            .expect("EFLG ALWAYS");
+        for (inst, fields) in [
+            (&mut calcout, &["VAL", "A", "L", "DLYA", "DESC"][..]),
+            (&mut asub, &["VAL", "VALA", "NEVU", "A"][..]),
+        ] {
+            let _readers: Vec<_> = fields
+                .iter()
+                .map(|field| attach(inst, field, EventMask::VALUE))
+                .collect();
+            for field in fields {
+                inst.record_value_post(field, PostedValue::Val(EpicsValue::Double(0.0)));
+            }
+            let lists = Lists {
+                forced: inst.record.force_posted_fields(),
+                fanout: inst.record.alarm_cycle_monitored_fields(),
+                swept: inst.record.log_swept_fields(),
+                marks: inst.record.take_process_posted_fields().table(),
+            };
+            let closed = inst.record.process_posted_fields();
+            NAME_BYTE_COMPARES.with(|n| n.set(0));
+            inst.resettle_roles(lists);
+            inst.resettle_posted(closed);
+            assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0, "{}", inst.name);
+            // Each monitor carries the roles and membership its entry does.
+            let entry = |inst: &RecordInstance, field: &str| {
+                let sub = inst
+                    .subscribers
+                    .iter()
+                    .find(|sub| sub.field() == field)
+                    .expect("attached");
+                let roles = &sub.roles;
+                (roles.forced(), roles.fanout(), roles.marks != 0, sub.posted)
+            };
+            let want: &[(&str, (bool, bool, bool, bool))] = if fields.contains(&"DLYA") {
+                &[
+                    ("VAL", (false, false, false, true)),
+                    ("A", (false, true, false, true)),
+                    ("L", (false, true, false, true)),
+                    ("DLYA", (false, false, true, false)),
+                    ("DESC", (false, false, false, false)),
+                ]
+            } else {
+                &[
+                    ("VAL", (false, false, false, true)),
+                    ("VALA", (true, false, false, true)),
+                    ("NEVU", (true, false, false, true)),
+                    ("A", (false, false, false, false)),
+                ]
+            };
+            for &(field, roles) in want {
+                assert_eq!(entry(inst, field), roles, "{} {field}", inst.name);
+            }
+        }
+    }
+
     /// A cycle's declared-field posts — the deadband VAL, the forced OVAL and
     /// RVAL — find their monitors, and pass the others, by pointer alone.
     #[test]
@@ -14863,9 +15100,10 @@ mod mlis_tests {
         }
     }
 
-    /// Monitored bo, ao and stringout cycles and put-time posts walk, match,
-    /// publish and reap by index and pointer: the deadband VAL, a `dbCommon`
-    /// field the walk always skips, the secondaries RVAL/OVAL, a non-pp field
+    /// Monitored bo, ao, stringout and calcout cycles and put-time posts walk,
+    /// match, publish and reap by index and pointer from the first publish:
+    /// the deadband VAL, a `dbCommon` field the walk always skips, the
+    /// secondaries RVAL/OVAL, a calcout input, the alarm posts, a non-pp field
     /// and a `prop(YES)` put's record-wide post read no name byte, and no
     /// lookup takes a name.
     #[epics_macros_rs::epics_test]
@@ -14874,7 +15112,11 @@ mod mlis_tests {
             .db_string(
                 r#"record(bo, "BO:PTR") {}
                 record(ao, "AO:PTR") { field(MDEL, "-1") }
-                record(stringout, "SO:PTR") {}"#,
+                record(stringout, "SO:PTR") {}
+                record(calcout, "CO:PTR") { field(CALC, "A+B") }
+                record(calcout, "CD:PTR") { field(CALC, "A") field(ODLY, "0.2") }
+                record(calc, "CP:PTR") {}
+                record(calc, "CF:PTR") { field(FLNK, "CP:PTR") }"#,
                 &Default::default(),
             )
             .unwrap()
@@ -14885,6 +15127,9 @@ mod mlis_tests {
             ("BO:PTR", &["VAL", "RVAL", "SEVR", "HIGH"][..]),
             ("AO:PTR", &["VAL", "RVAL", "OVAL", "SEVR", "HOPR"][..]),
             ("SO:PTR", &["VAL", "SEVR", "DESC"][..]),
+            ("CO:PTR", &["VAL", "A"][..]),
+            ("CD:PTR", &["DLYA"][..]),
+            ("CP:PTR", &["VAL", "SEVR"][..]),
         ];
         let mut readers = Vec::new();
         for (name, fields) in watch {
@@ -14907,13 +15152,14 @@ mod mlis_tests {
         };
         let d = EpicsValue::Double;
         let s = |v: &str| EpicsValue::String(v.into());
+        // From the first publish: settling a field's roles reads no name.
+        NAME_BYTE_COMPARES.with(|n| n.set(0));
         put("BO:PTR", "VAL", d(1.0)).await;
         put("BO:PTR", "HIGH", d(1.0)).await;
         put("AO:PTR", "VAL", d(1.0)).await;
         put("AO:PTR", "HOPR", d(1.0)).await;
         put("SO:PTR", "VAL", s("a")).await;
         put("SO:PTR", "DESC", s("a")).await;
-        NAME_BYTE_COMPARES.with(|n| n.set(0));
         for v in [0.0, 1.0, 0.0] {
             put("BO:PTR", "VAL", d(v)).await;
             put("AO:PTR", "VAL", d(v + 2.0)).await;
@@ -14924,6 +15170,25 @@ mod mlis_tests {
         put("BO:PTR", "HIGH", d(2.0)).await;
         put("AO:PTR", "HOPR", d(2.0)).await;
         put("SO:PTR", "DESC", s("b")).await;
+        for v in [1.0, 2.0] {
+            put("CO:PTR", "A", d(v)).await;
+            put("CO:PTR", "B", d(v)).await;
+        }
+        // The ODLY start marks DLYA.
+        put("CD:PTR", "A", d(1.0)).await;
+        // A target held active past a completed cycle refuses the forward
+        // link's entries until the MAX_LOCK raise posts the alarm fields and VAL.
+        {
+            let rec = db.get_record("CP:PTR").unwrap();
+            let mut inst = rec.write();
+            inst.common.udf = 0;
+            inst.common.sevr = AlarmSeverity::NoAlarm;
+            inst.common.stat = crate::server::recgbl::alarm_status::NO_ALARM;
+            inst.enter_pact();
+        }
+        for _ in 0..11 {
+            put("CF:PTR", "PROC", d(1.0)).await;
+        }
         assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0);
         for reader in &mut readers {
             assert!(!drained(reader).is_empty());
@@ -15149,6 +15414,11 @@ mod posted_settle_tests {
         inst.last_posted.get(key).unwrap().posted()
     }
 
+    static TOGGLES_FIELDS: &[crate::server::record::FieldDesc] = &[
+        crate::server::record::FieldDesc::new("VAL", DbFieldType::Double, false),
+        crate::server::record::FieldDesc::new("X", DbFieldType::Double, false),
+    ];
+
     /// A closed list that answers by state, as scaler's channel count or
     /// aSub's EFLG does, over a field the type does not claim.
     struct Toggles {
@@ -15168,8 +15438,15 @@ mod posted_settle_tests {
         fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
             Err(CaError::FieldNotFound(name.to_string()))
         }
-        fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-            Some(if self.closed { &["VAL"] } else { &["VAL", "X"] })
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
+            TOGGLES_FIELDS
+        }
+        fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+            Some(if self.closed {
+                &const { crate::server::record::declared_set(TOGGLES_FIELDS, ["VAL"]) }
+            } else {
+                &const { crate::server::record::declared_set(TOGGLES_FIELDS, ["VAL", "X"]) }
+            })
         }
     }
 

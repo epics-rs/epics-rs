@@ -2494,13 +2494,17 @@ impl TableRecord {
 // ===========================================================================
 
 /// `special()`'s literal-`DBE_VALUE` posts, in [`TableRecord::special_posts`] bit order.
-static SPECIAL_POSTS: [(&str, CyclePostMask); 5] = [
-    ("SET", CyclePostMask::Value),
-    ("SYNC", CyclePostMask::Value),
-    ("INIT", CyclePostMask::Value),
-    ("ZERO", CyclePostMask::Value),
-    ("READ", CyclePostMask::Value),
-];
+static SPECIAL_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 5] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::TABLE_FIELDS,
+        [
+            ("SET", CyclePostMask::Value),
+            ("SYNC", CyclePostMask::Value),
+            ("INIT", CyclePostMask::Value),
+            ("ZERO", CyclePostMask::Value),
+            ("READ", CyclePostMask::Value),
+        ],
+    );
 
 /// Record-internal monitor posts that C `tableRecord.c` emits with a
 /// literal `DBE_VALUE` — never `DBE_LOG`. `monitor()` posts the thirteen
@@ -2541,6 +2545,19 @@ const TABLE_VALUE_ONLY_FIELDS: &[&str] = &[
 const TABLE_PROCESS_POSTED: &[&str] = TABLE_VALUE_ONLY_FIELDS
     .split_at(TABLE_VALUE_ONLY_FIELDS.len() - 2)
     .0;
+static TABLE_PROCESS_POSTED_SET: [epics_base_rs::server::record::FieldIx;
+    TABLE_PROCESS_POSTED.len()] = {
+    let mut set = [epics_base_rs::server::record::FieldIx::UNDECLARED; TABLE_PROCESS_POSTED.len()];
+    let mut i = 0;
+    while i < set.len() {
+        set[i] = epics_base_rs::server::record::declared_field_ix(
+            dbd_generated::TABLE_FIELDS,
+            TABLE_PROCESS_POSTED[i],
+        );
+        i += 1;
+    }
+    set
+};
 
 /// Angle-class fields for which C `tableRecord.c::get_units` reports the
 /// angular engineering units `aegu` (tableRecord.c:758-768); every other
@@ -3325,8 +3342,8 @@ impl Record for TableRecord {
 
     /// C writes VAL, UDF and the motor readbacks, speeds and limits without
     /// posting them.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(TABLE_PROCESS_POSTED)
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(&TABLE_PROCESS_POSTED_SET)
     }
 
     /// C `tableRecord.c::special()` posts SET on an `SSET`/`SUSE` write, and
@@ -3487,6 +3504,13 @@ impl Record for TableRecord {
 #[allow(clippy::excessive_precision, clippy::needless_range_loop)]
 mod tests {
     use super::*;
+
+    /// The declared name a post table entry `ix` stands for.
+    fn name(ix: epics_base_rs::server::record::FieldIx) -> &'static str {
+        epics_base_rs::server::record::field_at(dbd_generated::TABLE_FIELDS, ix)
+            .expect("declared")
+            .name
+    }
 
     /// The link a read result names is never looked at: the cycle resumes
     /// from the read [`Resume`] holds, so no name is compared on the way.
@@ -4293,7 +4317,10 @@ mod tests {
             ("READ", Some("READ")),
         ] {
             t.on_put(field);
-            let posts: Vec<_> = t.take_cycle_posted_fields().collect();
+            let posts: Vec<_> = t
+                .take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect();
             let want: Vec<_> = want
                 .map(|f| (f, CyclePostMask::Value))
                 .into_iter()

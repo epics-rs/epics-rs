@@ -312,13 +312,24 @@ fn test_process_idle_no_change() {
 // C `scalerRecord.c:770-772` — `monitor()` sweeps the active channels
 // S1..Snch with DBE_LOG. Whether a cycle reaches `monitor()` at all is the
 // `:470` outcome `process()` returns, so the set does not depend on `ss`.
+fn swept(rec: &ScalerRecord) -> Vec<&'static str> {
+    rec.log_swept_fields().iter().map(|&ix| name(ix)).collect()
+}
+
+/// The scaler field a declared set or post table entry `ix` stands for.
+fn name(ix: epics_base_rs::server::record::FieldIx) -> &'static str {
+    epics_base_rs::server::record::field_at(scaler_rs::records::dbd_generated::SCALER_FIELDS, ix)
+        .expect("declared")
+        .name
+}
+
 #[test]
 fn test_log_swept_fields_active_channels_only() {
     let mut rec = ScalerRecord::default();
     rec.nch = 3;
     for ss in [0, 1, 2] {
         rec.ss = ss;
-        assert_eq!(rec.log_swept_fields(), &["S1", "S2", "S3"], "ss {ss}");
+        assert_eq!(swept(&rec), ["S1", "S2", "S3"], "ss {ss}");
     }
 
     // nch is clamped to the channel cap, never out of bounds.
@@ -395,7 +406,7 @@ fn test_idle_cycle_that_starts_autocount_emits_and_sweeps() {
     let outcome = rec.process().unwrap();
     assert_eq!(rec.ss, 2, "the auto-count block re-armed ss after :470");
     assert!(emits(&outcome), "ss IDLE at :470");
-    assert_eq!(rec.log_swept_fields(), &["S1", "S2"]);
+    assert_eq!(swept(&rec), ["S1", "S2"]);
 }
 
 #[test]
@@ -939,7 +950,10 @@ fn test_waiting_cycle_marks_t_and_every_channel() {
     rec.s = [1; MAX_SCALER_CHANNELS];
     rec.t = 1.0;
     rec.process().unwrap();
-    let marked: Vec<&str> = rec.take_process_posted_fields().map(|(f, _)| f).collect();
+    let marked: Vec<&str> = rec
+        .take_process_posted_fields()
+        .map(|(f, _)| name(f))
+        .collect();
     let mut expected: Vec<String> = (1..=MAX_SCALER_CHANNELS).map(|i| format!("S{i}")).collect();
     expected.push("T".to_string());
     assert_eq!(marked, expected);
@@ -1125,7 +1139,10 @@ fn test_autocount_freq_is_not_a_process_mark() {
     ))));
     rec.process().unwrap();
     assert_eq!(rec.ss, 2, "the auto-count started");
-    let marked: Vec<&str> = rec.take_process_posted_fields().map(|(f, _)| f).collect();
+    let marked: Vec<&str> = rec
+        .take_process_posted_fields()
+        .map(|(f, _)| name(f))
+        .collect();
     assert_eq!(marked, ["S1", "T"]);
     assert_eq!(rec.freq, 1.25e7, "the driver's clock adopted");
 }

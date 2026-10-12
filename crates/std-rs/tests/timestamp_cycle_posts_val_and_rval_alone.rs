@@ -168,6 +168,11 @@ fn timestamp_closes_its_cycle_posts_to_val_and_rval() {
     use epics_base_rs::server::record::Record;
     assert_eq!(
         std_rs::TimestampRecord::default().process_posted_fields(),
-        Some(&["VAL", "RVAL"][..])
+        Some(
+            &epics_base_rs::server::record::declared_set(
+                std_rs::records::dbd_generated::TIMESTAMP_FIELDS,
+                ["VAL", "RVAL"],
+            )[..]
+        )
     );
 }

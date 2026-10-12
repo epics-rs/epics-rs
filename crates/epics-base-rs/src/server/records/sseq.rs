@@ -57,7 +57,7 @@ const STR_FIELDS: [&str; NUM_STEPS] = [
 /// view (`DBE_VALUE|DBE_LOG`) and derived view (`DBE_VALUE`) for a numeric
 /// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`; then
 /// a `DLYn` put's DLY1 post at [`DLY1_POST`].
-static VALUE_WRITE_POSTS: [(&str, CyclePostMask); DLY1_POST + 1] = {
+const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); DLY1_POST + 1] = {
     let mut table = [("", CyclePostMask::Value); DLY1_POST + 1];
     let mut i = 0;
     while i < NUM_STEPS {
@@ -1251,6 +1251,13 @@ impl Record for SseqRecord {
     /// Every post of a `DOn`/`STRn` is one the record's own writer made
     /// (`mark_value_write`), with that C call site's mask and comparison.
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        static VALUE_WRITE_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); DLY1_POST + 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::SSEQ_FIELDS,
+            VALUE_WRITE_POSTS_NAMED,
+        );
         CycleMarks::of(
             &VALUE_WRITE_POSTS,
             u128::from(std::mem::take(&mut self.pending_posts)),
@@ -1266,8 +1273,15 @@ impl Record for SseqRecord {
     /// C's process path posts these and nothing else (`asyncFinish` :474-505,
     /// `processCallback` :654-699, WTGn :343/:559/:728); `DTn`/`LTn`, which
     /// `checkLinks` writes silently, never post.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&PROCESS_POSTED_FIELDS)
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SSEQ_FIELDS,
+                    PROCESS_POSTED_FIELDS,
+                )
+            },
+        )
     }
 
     /// C `sseqRecord.c:1155` posts the re-quantized DLY1 with a bare
@@ -2066,6 +2080,13 @@ impl Record for SseqRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The declared name a post table entry `ix` stands for.
+    fn name(ix: crate::server::record::FieldIx) -> &'static str {
+        crate::server::record::field_at(crate::server::record::dbd_generated::SSEQ_FIELDS, ix)
+            .expect("declared")
+            .name
+    }
     use crate::server::record::FieldDeclaration;
 
     #[test]
@@ -2421,7 +2442,9 @@ mod tests {
 
         rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("STR1", CyclePostMask::Value)],
             "a DOn put posts only the DERIVED STRn (dbPut posts DOn itself)"
         );
@@ -2435,7 +2458,9 @@ mod tests {
         rec.put_field("STRA", EpicsValue::String("5".into()))
             .unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("DOA", CyclePostMask::Value)],
             "a STRn put posts only the derived DOn = atof(s)"
         );
@@ -2443,7 +2468,9 @@ mod tests {
         // C's DLYn special posts DLY1 whichever DLY was written.
         rec.special("DLY3", true).unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("DLY1", CyclePostMask::Value)],
         );
         rec.special("LNK1", true).unwrap();
@@ -2460,7 +2487,9 @@ mod tests {
         rec.put_field_internal("DO1", EpicsValue::Double(3.7))
             .unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![
                 ("DO1", CyclePostMask::ValueLog),
                 ("STR1", CyclePostMask::Value)
@@ -2471,7 +2500,9 @@ mod tests {
         rec.put_field_internal("DO2", EpicsValue::String("abc".into()))
             .unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("STR2", CyclePostMask::ValueLog)],
             "string arm: s with DBE_VALUE|DBE_LOG; dov stayed 0.0 (atof(\"abc\")), \
              and C posts it only `if (d != plinkGroup->dov)`"

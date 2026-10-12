@@ -946,8 +946,15 @@ impl Record for PrintfRecord {
     }
 
     /// `printfRecord.c:399-401` posts VAL and LEN, both unconditionally.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "LEN"])
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::PRINTF_FIELDS,
+                    ["VAL", "LEN"],
+                )
+            },
+        )
     }
 
     /// VAL posts on every cycle, and LEN rides the walk's marks.
@@ -965,7 +972,15 @@ impl Record for PrintfRecord {
     /// `db_post_events(prec, &prec->len, events | DBE_VALUE | DBE_LOG)`.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask};
-        static LEN_POST: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::MonitorValueLog)];
+        const LEN_POST_NAMED: [(&str, CyclePostMask); 1] =
+            [("LEN", CyclePostMask::MonitorValueLog)];
+        static LEN_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::PRINTF_FIELDS,
+            LEN_POST_NAMED,
+        );
         CycleMarks::of(&LEN_POST, u128::from(std::mem::take(&mut self.len_posted)))
     }
 

@@ -298,8 +298,14 @@ const PROCESS_POSTED: [&str; 80] = [
 ];
 /// `PROCESS_POSTED` past VAL, each a mark; VAL goes through
 /// `monitor_value_changed`.
-const MONITOR_POSTS: [(&str, CyclePostMask); 79] =
-    uniform_post_table(PROCESS_POSTED.split_at(1).1, CyclePostMask::MonitorValueLog);
+static MONITOR_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 79] =
+    uniform_post_table(
+        dbd_generated::MCA_FIELDS,
+        PROCESS_POSTED.split_at(1).1,
+        CyclePostMask::MonitorValueLog,
+    );
+static PROCESS_POSTED_SET: [epics_base_rs::server::record::FieldIx; 80] =
+    epics_base_rs::server::record::declared_set(dbd_generated::MCA_FIELDS, PROCESS_POSTED);
 /// The MMAP bit of each `MONITOR_POSTS` entry ahead of the regions.
 const MONITOR_BITS: [u32; 14] = [
     cycle::M_BG,
@@ -984,8 +990,8 @@ impl Record for McaRecord {
         PROCESS_POSTED.split_at(1).1
     }
 
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&PROCESS_POSTED)
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(&PROCESS_POSTED_SET)
     }
 
     /// C `mcaAlarm` (`:962-1003`) — the analog ladder runs on `IDTIM`, the

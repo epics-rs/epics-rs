@@ -203,16 +203,27 @@ impl Record for SubRecord {
     }
 
     /// `monitor()` posts VAL and `A..U` alone.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&SUB_MONITORED)
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SUB_FIELDS,
+                    SUB_MONITORED,
+                )
+            },
+        )
     }
 
     /// Each moved input with `monitor_mask | DBE_VALUE | DBE_LOG`
     /// (`subRecord.c:405`); `process()` made the comparisons.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
-        static POSTS: [(&str, CyclePostMask); INP_ARG_MAX] =
-            uniform_post_table(&VAL_NAMES, CyclePostMask::MonitorValueLog);
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); INP_ARG_MAX] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::SUB_FIELDS,
+                &VAL_NAMES,
+                CyclePostMask::MonitorValueLog,
+            );
         CycleMarks::of(&POSTS, u128::from(std::mem::take(&mut self.input_changes)))
     }
 

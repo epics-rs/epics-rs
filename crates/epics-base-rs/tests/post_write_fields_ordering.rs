@@ -92,10 +92,9 @@ impl Record for FlagSource {
                 ..ProcessOutcome::complete_with(vec![write])
             },
             Arm::AsyncNotify => ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "VAL".to_string(),
-                    EpicsValue::Long(7),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(vec![
+                    const { epics_base_rs::server::record::declared_field_ix(SRC_FIELDS, "VAL") },
+                ]),
                 actions: vec![write],
                 device_did_compute: false,
                 post_write_fields: clear,

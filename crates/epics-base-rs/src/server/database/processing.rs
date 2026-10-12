@@ -790,7 +790,7 @@ fn publish_alarm_cycle(
     snapshot: &crate::server::record::ProcessSnapshot,
     alarm_posts: AlarmPosts,
 ) {
-    alarm_posts.for_each(|field, mask| instance.notify_field(field, mask));
+    alarm_posts.for_each(|desc, mask| instance.notify_declared(None, desc, mask));
     // A value-class post advances the record's already-published state
     // (`RecordInstance::record_value_post`), so this is a `&mut` operation.
     instance.notify_from_snapshot(snapshot);
@@ -836,17 +836,25 @@ pub struct AlarmPosts {
 impl AlarmPosts {
     /// Each post in the order `recGblResetAlarms` makes them — `SEVR`, `STAT`,
     /// `AMSG`, `ACKS` — with its own C mask.
-    pub fn for_each(&self, mut f: impl FnMut(&'static str, crate::server::recgbl::EventMask)) {
+    pub fn for_each(
+        &self,
+        mut f: impl FnMut(&'static crate::server::record::FieldDesc, crate::server::recgbl::EventMask),
+    ) {
         use crate::server::recgbl::EventMask;
+        use crate::server::record::{dbd_generated::DB_COMMON_FIELDS as COMMON, declared_field_ix};
+        const SEVR: usize = declared_field_ix(&[], "SEVR").0 as usize;
+        const STAT: usize = declared_field_ix(&[], "STAT").0 as usize;
+        const AMSG: usize = declared_field_ix(&[], "AMSG").0 as usize;
+        const ACKS: usize = declared_field_ix(&[], "ACKS").0 as usize;
         if self.sevr {
-            f("SEVR", EventMask::VALUE);
+            f(&COMMON[SEVR], EventMask::VALUE);
         }
         if !self.stat_mask.is_empty() {
-            f("STAT", self.stat_mask);
-            f("AMSG", self.stat_mask);
+            f(&COMMON[STAT], self.stat_mask);
+            f(&COMMON[AMSG], self.stat_mask);
         }
         if self.acks {
-            f("ACKS", EventMask::VALUE);
+            f(&COMMON[ACKS], EventMask::VALUE);
         }
     }
 
@@ -864,7 +872,7 @@ impl AlarmPosts {
     /// The posts as a list, for the callers that hold them.
     pub fn to_vec(self) -> Vec<(&'static str, crate::server::recgbl::EventMask)> {
         let mut out = Vec::new();
-        self.for_each(|field, mask| out.push((field, mask)));
+        self.for_each(|desc, mask| out.push((desc.name, mask)));
         out
     }
 }

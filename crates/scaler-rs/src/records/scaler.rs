@@ -6,8 +6,8 @@ use super::dbd_generated;
 use crate::device_support::scaler_asyn::ScalerDriver;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome,
-    Record,
+    CycleMarks, CyclePostMask, DeclaredFields, FieldDesc, FieldIx, FieldMetadataOverride,
+    PostTable, ProcessAction, ProcessOutcome, Record, declared_post_table, declared_set,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -199,7 +199,7 @@ pub struct ScalerRecord {
     /// its `after == false` pre-pass — which the framework runs on EVERY put
     /// (`field_io.rs:937`) — retires the previous put's list, and each `after`
     /// arm records exactly what C's matching case posts.
-    side_effect_posts: &'static [(&'static str, CyclePostMask)],
+    side_effect_posts: PostTable,
 
     /// The forward-link decision C makes *inside* `process()`.
     ///
@@ -587,7 +587,10 @@ impl ScalerRecord {
             }
             // C:530, after the :470 epilogue.
             if old_freq != self.freq {
-                static FREQ_POST: [(&str, CyclePostMask); 1] = [("FREQ", CyclePostMask::Value)];
+                static FREQ_POST: [(FieldIx, CyclePostMask); 1] = declared_post_table(
+                    dbd_generated::SCALER_FIELDS,
+                    [("FREQ", CyclePostMask::Value)],
+                );
                 actions.push(ProcessAction::PostAfterEpilogue(CycleMarks::of(
                     &FREQ_POST, 1,
                 )));
@@ -651,11 +654,11 @@ macro_rules! channel_tables {
     ($first:literal $($n:literal)*) => {
         static SN_FIELD_NAMES: [&str; MAX_SCALER_CHANNELS] =
             [concat!("S", $first) $(, concat!("S", $n))*];
-        static DG_POSTS_BY_CHANNEL: [[(&str, CyclePostMask); 2]; MAX_SCALER_CHANNELS] = [
+        static DG_POSTS_NAMED: [[(&str, CyclePostMask); 2]; MAX_SCALER_CHANNELS] = [
             [(concat!("D", $first), CyclePostMask::Value), (concat!("G", $first), CyclePostMask::Value)]
             $(, [(concat!("D", $n), CyclePostMask::Value), (concat!("G", $n), CyclePostMask::Value)])*
         ];
-        static PR_POSTS_BY_CHANNEL: [[(&str, CyclePostMask); 1]; MAX_SCALER_CHANNELS] =
+        static PR_POSTS_NAMED: [[(&str, CyclePostMask); 1]; MAX_SCALER_CHANNELS] =
             [[(concat!("PR", $first), CyclePostMask::Value)] $(, [(concat!("PR", $n), CyclePostMask::Value)])*];
         static VALUE_ONLY_FIELDS: [&str; 6 + 4 * MAX_SCALER_CHANNELS - 1] = [
             "CNT", "T", "VAL", "PR1", "TP", "FREQ",
@@ -665,7 +668,7 @@ macro_rules! channel_tables {
         static PROCESS_POSTED_FIELDS: [&str; 1 + MAX_SCALER_CHANNELS] = [
             "VAL", concat!("S", $first) $(, concat!("S", $n))*
         ];
-        static PROCESS_POSTS: [(&str, CyclePostMask); POST_T + 1] = [
+        static PROCESS_POSTS_NAMED: [(&str, CyclePostMask); POST_T + 1] = [
             ("CNT", CyclePostMask::Value), ("PR1", CyclePostMask::Value),
             ("TP", CyclePostMask::Value), ("FREQ", CyclePostMask::Value),
             (concat!("S", $first), CyclePostMask::Value)
@@ -681,21 +684,53 @@ const POST_FREQ: usize = 3;
 const POST_S1: usize = 4;
 const POST_T: usize = POST_S1 + MAX_SCALER_CHANNELS;
 
+/// The tables a post or a declared-field set reads, resolved at compile time.
+static SN_SET: [FieldIx; MAX_SCALER_CHANNELS] =
+    declared_set(dbd_generated::SCALER_FIELDS, SN_FIELD_NAMES);
+static PROCESS_POSTED_SET: [FieldIx; 1 + MAX_SCALER_CHANNELS] =
+    declared_set(dbd_generated::SCALER_FIELDS, PROCESS_POSTED_FIELDS);
+static PROCESS_POSTS: [(FieldIx, CyclePostMask); POST_T + 1] =
+    declared_post_table(dbd_generated::SCALER_FIELDS, PROCESS_POSTS_NAMED);
+static DG_POSTS_BY_CHANNEL: [[(FieldIx, CyclePostMask); 2]; MAX_SCALER_CHANNELS] = {
+    let mut t = [[(FieldIx::UNDECLARED, CyclePostMask::Value); 2]; MAX_SCALER_CHANNELS];
+    let mut i = 0;
+    while i < MAX_SCALER_CHANNELS {
+        t[i] = declared_post_table(dbd_generated::SCALER_FIELDS, DG_POSTS_NAMED[i]);
+        i += 1;
+    }
+    t
+};
+static PR_POSTS_BY_CHANNEL: [[(FieldIx, CyclePostMask); 1]; MAX_SCALER_CHANNELS] = {
+    let mut t = [[(FieldIx::UNDECLARED, CyclePostMask::Value); 1]; MAX_SCALER_CHANNELS];
+    let mut i = 0;
+    while i < MAX_SCALER_CHANNELS {
+        t[i] = declared_post_table(dbd_generated::SCALER_FIELDS, PR_POSTS_NAMED[i]);
+        i += 1;
+    }
+    t
+};
+
 channel_tables!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64);
 
 /// C's `special()` posts, every one a literal `DBE_VALUE`: TP's (`:673-676`),
 /// PR1's (`:682-687`, TP alone when TP came out 0), and per channel the
 /// `DG_POSTS_BY_CHANNEL` and `PR_POSTS_BY_CHANNEL` ones.
-static TP_POSTS: [(&str, CyclePostMask); 3] = [
-    ("PR1", CyclePostMask::Value),
-    ("D1", CyclePostMask::Value),
-    ("G1", CyclePostMask::Value),
-];
-static PR1_POSTS: [(&str, CyclePostMask); 3] = [
-    ("TP", CyclePostMask::Value),
-    ("D1", CyclePostMask::Value),
-    ("G1", CyclePostMask::Value),
-];
+static TP_POSTS: [(FieldIx, CyclePostMask); 3] = declared_post_table(
+    dbd_generated::SCALER_FIELDS,
+    [
+        ("PR1", CyclePostMask::Value),
+        ("D1", CyclePostMask::Value),
+        ("G1", CyclePostMask::Value),
+    ],
+);
+static PR1_POSTS: [(FieldIx, CyclePostMask); 3] = declared_post_table(
+    dbd_generated::SCALER_FIELDS,
+    [
+        ("TP", CyclePostMask::Value),
+        ("D1", CyclePostMask::Value),
+        ("G1", CyclePostMask::Value),
+    ],
+);
 /// C `scalerRecord.c:735` writes the literal `*precision = 2` for `VERS`, the
 /// record-support version number.
 const SCALER_VERS_PRECISION: i16 = 2;
@@ -1421,8 +1456,8 @@ impl Record for ScalerRecord {
     /// `monitor_mask` is never read, so the alarm bit is dropped and a client
     /// subscribed to `Sn` with `DBE_ALARM` receives nothing on a severity
     /// transition.
-    fn log_swept_fields(&self) -> &'static [&'static str] {
-        &SN_FIELD_NAMES[..self.active_channels()]
+    fn log_swept_fields(&self) -> DeclaredFields {
+        &SN_SET[..self.active_channels()]
     }
 
     /// Every C scaler post outside the idle `monitor()` sweep is a literal
@@ -1457,8 +1492,8 @@ impl Record for ScalerRecord {
     /// ahead of `monitor()`, which `PROCESS_POSTS` marks where C posts, or
     /// after the epilogue (FREQ `:530`), which `dset_start_autocount` hands
     /// the framework as a `PostAfterEpilogue` action.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&PROCESS_POSTED_FIELDS[..1 + self.active_channels()])
+    fn process_posted_fields(&self) -> Option<DeclaredFields> {
+        Some(&PROCESS_POSTED_SET[..1 + self.active_channels()])
     }
 
     fn take_process_posted_fields(&mut self) -> CycleMarks {
@@ -1608,8 +1643,11 @@ mod menu_choice_tests {
 
 #[cfg(test)]
 mod channel_table_tests {
-    use super::{MAX_SCALER_CHANNELS, PROCESS_POSTED_FIELDS, SCALER_STATE_IDLE, ScalerRecord};
-    use epics_base_rs::server::record::Record;
+    use super::{
+        FieldIx, MAX_SCALER_CHANNELS, PROCESS_POSTED_FIELDS, SCALER_STATE_IDLE, ScalerRecord,
+        dbd_generated,
+    };
+    use epics_base_rs::server::record::{Record, field_at};
     use std::collections::BTreeSet;
 
     /// Each `nch` slice holds exactly its channels' names: the empty record,
@@ -1644,15 +1682,20 @@ mod channel_table_tests {
                 ]);
                 posted.insert(format!("S{i}"));
             }
-            assert_eq!(rec.log_swept_fields(), sn, "nch {nch}");
+            let names = |set: &[FieldIx]| {
+                set.iter()
+                    .map(|&ix| field_at(dbd_generated::SCALER_FIELDS, ix).unwrap().name)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(names(rec.log_swept_fields()), sn, "nch {nch}");
             let got = rec.value_only_change_fields();
             assert_eq!(
                 (got.len(), set(got)),
                 (value_only.len(), value_only),
                 "nch {nch}"
             );
-            let got = rec.process_posted_fields().unwrap();
-            assert_eq!((got.len(), set(got)), (posted.len(), posted), "nch {nch}");
+            let got = names(rec.process_posted_fields().unwrap());
+            assert_eq!((got.len(), set(&got)), (posted.len(), posted), "nch {nch}");
         }
     }
 }

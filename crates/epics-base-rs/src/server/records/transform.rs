@@ -17,7 +17,7 @@ const NUM_CHANNELS: usize = 16; // A-P
 
 /// The sixteen channel value fields, in `A..P` order — the set C's `monitor()`
 /// walks (`transformRecord.c:797-806`) and the only fields it posts.
-const CHANNEL_FIELDS: &[&str] = &[
+const CHANNEL_FIELDS: [&str; NUM_CHANNELS] = [
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
 ];
 
@@ -1153,7 +1153,7 @@ impl Record for TransformRecord {
     /// that literal. No transform field ever carries an alarm bit, so a
     /// `DBE_ALARM`-only subscriber on `.A` is notified on no cycle at all.
     fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
-        CHANNEL_FIELDS
+        &CHANNEL_FIELDS
     }
 
     /// C `transformRecord.c::monitor()` (`:786-809`) is the record's ONLY
@@ -1167,22 +1167,33 @@ impl Record for TransformRecord {
     /// `.VAL` monitor: the deadband post fires whenever ANY class fired, and
     /// on an alarm cycle the alarm bits alone are enough — so a transform
     /// whose input went INVALID was posting `.VAL` where C posts nothing.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(CHANNEL_FIELDS)
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::TRANSFORM_FIELDS,
+                    CHANNEL_FIELDS,
+                )
+            },
+        )
     }
 
     /// `monitor()`'s A..P posts, with C's literal `DBE_VALUE|DBE_LOG` (`:794`)
     /// overwriting `recGblResetAlarms`'s mask, and `special()`'s CAV..CPV post
     /// (`:693`), the same mask.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
-        static POSTS: [(&str, CyclePostMask); POSTED_FIELDS.len()] =
-            crate::server::record::uniform_post_table(POSTED_FIELDS, CyclePostMask::ValueLog);
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); POSTED_FIELDS.len()] =
+            crate::server::record::uniform_post_table(
+                crate::server::record::dbd_generated::TRANSFORM_FIELDS,
+                POSTED_FIELDS,
+                CyclePostMask::ValueLog,
+            );
         crate::server::record::CycleMarks::of(&POSTS, std::mem::take(&mut self.posts) as u128)
     }
 
     /// C keeps LA..LP and never compares against the published value.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
-        CHANNEL_FIELDS
+        &CHANNEL_FIELDS
     }
 
     /// Transform's UDF is C's `ptran->udf`: cleared at the top of every

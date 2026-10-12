@@ -134,7 +134,11 @@ fn a_held_tcp_port_is_retried_on_a_new_one() {
     let (tried, stderr) = boot_past_a_held_port(|port| {
         TcpListener::bind(("127.0.0.1", port)).expect("hold the TCP port")
     });
-    assert_eq!(tried.len(), 2, "one steal, then a clean boot: {tried:?}");
+    // Another process on the box may take a later candidate too.
+    assert!(
+        tried.len() >= 2,
+        "the held port, then a clean boot: {tried:?}"
+    );
     assert_ne!(tried[0], tried[1]);
     assert_eq!(stderr, CLEAN_STDERR);
 }
@@ -144,7 +148,11 @@ fn a_held_udp_port_is_retried_on_a_new_one() {
     let (tried, stderr) = boot_past_a_held_port(|port| {
         UdpSocket::bind(("127.0.0.1", port)).expect("hold the UDP port")
     });
-    assert_eq!(tried.len(), 2, "one steal, then a clean boot: {tried:?}");
+    // Another process on the box may take a later candidate too.
+    assert!(
+        tried.len() >= 2,
+        "the held port, then a clean boot: {tried:?}"
+    );
     assert_ne!(tried[0], tried[1]);
     assert_eq!(stderr, CLEAN_STDERR);
 }

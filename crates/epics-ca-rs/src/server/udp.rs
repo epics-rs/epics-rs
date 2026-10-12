@@ -1193,6 +1193,46 @@ mod mr_r8_responder_plan_tests {
 mod responder_bind_tests {
     use super::*;
 
+    /// `bind` until it stops answering EADDRINUSE, at most eight times. The
+    /// port these tests take is chosen on one socket and then bound on
+    /// another, so any other process on the box can hold it in between; that
+    /// is a lost race of the rig, retried on a fresh number.
+    fn bind_retrying_addr_in_use(mut bind: impl FnMut() -> CaResult<BoundUdp>) -> BoundUdp {
+        for _ in 0..8 {
+            match bind() {
+                Err(epics_base_rs::error::CaError::Io(e))
+                    if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                r => return r.expect("bind responders"),
+            }
+        }
+        panic!("eight chosen ports in a row were already in use");
+    }
+
+    /// The bundle-bind error path itself: a port another socket holds
+    /// exclusively fails the bind with EADDRINUSE, naming the address.
+    #[test]
+    fn a_held_port_fails_the_responder_bind_with_addr_in_use() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _g = rt.enter();
+
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("hold a port");
+        let port = held.local_addr().expect("held addr").port();
+        match bind_udp_responders(port, vec![Ipv4Addr::LOCALHOST], &[]) {
+            Err(epics_base_rs::error::CaError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+                assert!(
+                    e.to_string().contains(&format!("127.0.0.1:{port}")),
+                    "the error names the address: {e}"
+                );
+            }
+            Err(e) => panic!("expected EADDRINUSE, got {e}"),
+            Ok(_) => panic!("a port held exclusively must not bind"),
+        }
+    }
+
     /// Boundary — port 0: an ephemeral responder must own its port
     /// exclusively. The reuse flags exist so a well-known CA port can be
     /// co-bound (caRepeater, a second IOC); on an ephemeral bind they let
@@ -1309,7 +1349,7 @@ mod responder_bind_tests {
             }
         }
 
-        let bound = bind_udp_responders(0, intf, &[]).expect("bind ephemeral bundle");
+        let bound = bind_retrying_addr_in_use(|| bind_udp_responders(0, intf.clone(), &[]));
         assert_ne!(bound.port(), 0, "an ephemeral bind reports its real port");
 
         for responder in &bound.responders {
@@ -1348,11 +1388,13 @@ mod responder_bind_tests {
 
         // Take an ephemeral port first, then re-bind that same number as
         // a *fixed* port so the test never guesses at a free one.
-        let probe = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("probe bind");
-        let port = probe.port();
-        drop(probe);
-
-        let bound = bind_udp_responders(port, vec![Ipv4Addr::LOCALHOST], &[]).expect("fixed bind");
+        let mut port = 0;
+        let bound = bind_retrying_addr_in_use(|| {
+            let probe = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("probe bind");
+            port = probe.port();
+            drop(probe);
+            bind_udp_responders(port, vec![Ipv4Addr::LOCALHOST], &[])
+        });
         assert_eq!(bound.port(), port);
 
         let peer = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");

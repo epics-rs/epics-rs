@@ -2436,9 +2436,41 @@ pub const EPICS_TIME_EVENT_DEVICE_TIME: i16 = -2;
 /// pointer. Owning it charged one malloc and one free per posted field per
 /// cycle. Subscriber-driven posts, whose names come from the subscription map,
 /// are the owned case.
+/// What one post carries of its field's value, by the field's
+/// [`LogKind`](crate::server::event_queue::LogKind): a value only for a
+/// field whose log copies one. A 40-byte string or an array fails C's
+/// `useValque` (`dbEvent.c:493-500`, `DB_EVENT_LOG_STRINGS` undefined), so
+/// its log is a reference read at delivery and the post copies nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PostedValue {
+    Val(EpicsValue),
+    Ref,
+}
+
+impl PostedValue {
+    /// The post of a walk's read: a copy of `read`, or a reference for a
+    /// field the walk does not read (`None`). Out of line, so each post site
+    /// in the hot walk is a call.
+    #[inline(never)]
+    pub(crate) fn of_read(read: &Option<EpicsValue>) -> Self {
+        match read {
+            Some(val) => Self::Val(val.clone()),
+            None => Self::Ref,
+        }
+    }
+
+    /// The value posted, `None` for a field read at delivery.
+    pub fn as_value(&self) -> Option<&EpicsValue> {
+        match self {
+            Self::Val(v) => Some(v),
+            Self::Ref => None,
+        }
+    }
+}
+
 pub type FieldPost = (
     std::borrow::Cow<'static, str>,
-    EpicsValue,
+    PostedValue,
     crate::server::recgbl::EventMask,
 );
 
@@ -3055,8 +3087,8 @@ pub trait Record: Send + Sync + 'static {
     /// (e.g. the motor record: VELO's display range is VMAX/VBAS, not
     /// HLM/LLM — `motorRecord.cc:3247-3250`).
     ///
-    /// Applied on both the GET path (`snapshot_for_field`) and the
-    /// monitor path (`make_monitor_snapshot`), AFTER the cached
+    /// Applied to every served read (`snapshot_for_field`), a monitor
+    /// update's delivery read included, AFTER the cached
     /// record-level metadata — and computed live on each call, so an
     /// override derived from non-cached fields can never go stale.
     /// `field` is uppercase, as declared in [`FieldDeclaration::field_list`].

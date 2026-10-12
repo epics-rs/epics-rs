@@ -22,7 +22,7 @@ use super::link::{ParsedLink, parse_link_v2};
 use super::menu_choices::MenuBound;
 use super::record_trait::{
     AuxPostMask, CommonFieldPutResult, EnumSlots, FieldDeclaration, FieldDesc, InputLinkRequest,
-    LinkReadAs, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    LinkReadAs, PostedValue, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -619,8 +619,8 @@ impl PactExit {
 /// Cached metadata for a record.
 ///
 /// Stores the result of `populate_display_info` / `populate_control_info` /
-/// `populate_enum_info` so subsequent `snapshot_for_field` /
-/// `make_monitor_snapshot` calls can skip rebuilding the metadata. The
+/// `populate_enum_info` so subsequent `snapshot_for_field` calls can skip
+/// rebuilding the metadata. The
 /// cache is invalidated whenever a metadata-class field is written
 /// (EGU, PREC, HOPR, LOPR, alarm limits, DRVH/DRVL, state strings).
 ///
@@ -2357,7 +2357,7 @@ mod posted {
     /// of copying the key.
     #[derive(Debug)]
     pub(super) struct Published {
-        pub(super) value: EpicsValue,
+        pub(super) value: PostedValue,
         pub(super) desc: Option<&'static FieldDesc>,
         pub(super) name: Option<&'static str>,
         pub(super) upper: bool,
@@ -2396,7 +2396,7 @@ mod posted {
         pub(super) fn publish(
             &self,
             field: &str,
-            value: EpicsValue,
+            value: PostedValue,
             desc: Option<&'static FieldDesc>,
             prev_bit: Option<u8>,
         ) -> Published {
@@ -3404,7 +3404,7 @@ pub struct RecordInstance {
     /// discarded. Same owner and same read accessor as `last_posted`; the two
     /// differ only in whether the walk can act on the field, which is what the
     /// gate asks. Linear, because the set is the static skip list.
-    skipped_posted: Vec<(String, EpicsValue)>,
+    skipped_posted: Vec<(String, PostedValue)>,
     /// Owner of every `last_posted` entry's `posted`; see [`PostedSet`].
     posted: PostedSet,
     /// The live store for a field the record's `.dbd` DECLARES but the record
@@ -3506,8 +3506,8 @@ pub struct RecordInstance {
     /// records loaded without info(...) clauses.
     pub info: HashMap<String, String>,
     /// Cached metadata (display/control/enums) — `None` means stale or
-    /// not yet built. Populated lazily by `snapshot_for_field` /
-    /// `make_monitor_snapshot` and invalidated by `invalidate_metadata_cache`
+    /// not yet built. Populated lazily by `snapshot_for_field` and
+    /// invalidated by `invalidate_metadata_cache`
     /// whenever a metadata-class field (EGU/PREC/HOPR/LOPR/limit/state)
     /// is written.
     ///
@@ -3613,12 +3613,17 @@ pub(crate) struct MonitorPlan {
     /// `deadband_field`'s declaration, so the post reads a non-VAL deadband
     /// field without a name scan.
     pub(crate) deadband_desc: Option<&'static FieldDesc>,
+    /// The deadband field's log is a reference ([`posts_by_ref`]): its post
+    /// carries no value and never reads the field.
+    pub(crate) deadband_ref: bool,
     /// The deadband field is in [`Record::value_only_change_fields`] or
     /// [`Record::fields_posted_with_monitor_mask`]: C posts it without
     /// `DBE_LOG`.
     pub(crate) log_suppressed: bool,
     /// [`Record::fields_posted_with_value_mask`].
     pub(crate) value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
+    /// Bit `i`: `value_masked[i]`'s log is a reference ([`posts_by_ref`]).
+    pub(crate) value_masked_ref: u64,
     /// `value_masked` holds a [`ValuePostGate::OnChangeForced`] field — the
     /// only reader of [`Record::take_secondary_value_mask`], so a type without
     /// one is never asked for it.
@@ -3637,6 +3642,8 @@ pub(crate) struct MonitorPlan {
 impl MonitorPlan {
     pub(crate) fn of(record: &dyn Record) -> Self {
         let deadband_field = record.monitor_deadband_field();
+        let deadband_desc = field_desc_of(record, deadband_field);
+        let value_masked = record.fields_posted_with_value_mask();
         Self {
             posts_value_monitor: record.process_posts_value_monitor(),
             alarm_alone_posts_value: record.alarm_alone_posts_value(),
@@ -3645,12 +3652,26 @@ impl MonitorPlan {
                 array_monitor_post: record.has_array_monitor_post(),
             },
             deadband_field,
-            deadband_desc: field_desc_of(record, deadband_field),
+            deadband_desc,
+            deadband_ref: posts_by_ref(deadband_desc, || {
+                if deadband_field == "VAL" {
+                    record.val()
+                } else {
+                    record.get_field(deadband_field)
+                }
+            }),
             log_suppressed: record.value_only_change_fields().contains(&deadband_field)
                 || record
                     .fields_posted_with_monitor_mask()
                     .contains(&deadband_field),
-            value_masked: record.fields_posted_with_value_mask(),
+            value_masked,
+            value_masked_ref: value_masked
+                .iter()
+                .enumerate()
+                .filter(|(_, (name, _))| {
+                    posts_by_ref(field_desc_of(record, name), || record.get_field(name))
+                })
+                .fold(0, |bits, (i, _)| bits | 1 << i),
             forced_secondary: record
                 .fields_posted_with_value_mask()
                 .iter()
@@ -3661,6 +3682,21 @@ impl MonitorPlan {
             hooks: record.cycle_hooks(),
             subroutine_kind: SubroutineKind::of(record.record_type()),
         }
+    }
+}
+
+/// Whether a post of the field `desc` declares carries no value: C's
+/// `useValque` fails for it (`dbEvent.c:493-500`), so its log is a reference
+/// read at delivery. A type with no field table declares a field by the value
+/// it stores (`stored`); one it cannot read posts nothing.
+fn posts_by_ref(
+    desc: Option<&'static FieldDesc>,
+    stored: impl FnOnce() -> Option<EpicsValue>,
+) -> bool {
+    use crate::server::event_queue::LogKind;
+    match desc {
+        Some(_) => LogKind::of_field(desc, || None) == LogKind::Ref,
+        None => stored().is_some_and(|v| LogKind::of_value(&v) == LogKind::Ref),
     }
 }
 
@@ -4082,6 +4118,7 @@ impl RecordInstance {
                 mask,
                 0,
                 (
+                    |inst: &Self| inst.field_desc(field),
                     |inst: &Self| inst.resolve_field_upper(field),
                     |inst: &Self| inst.walk_skips(field),
                 ),
@@ -4148,7 +4185,7 @@ impl RecordInstance {
         // was set by `check_deadband_ext` this cycle.
         if self.array_hash_changed {
             if let Some(h) = self.resolve_field("HASH") {
-                snapshot.push(("HASH".into(), h, EventMask::VALUE));
+                snapshot.push(("HASH".into(), PostedValue::Val(h), EventMask::VALUE));
             }
         }
         // NO `.UDF` post. C `monitor()` never posts UDF, and neither does
@@ -4510,15 +4547,23 @@ impl RecordInstance {
     #[inline]
     fn slot_link(&self, i: usize) -> &Arc<ParsedLink> {
         #[cfg(debug_assertions)]
-        let field = self.link_slots.field_at(i);
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.link_text(field).as_deref().unwrap_or(""),
-            self.link_slots.text_at(i),
-            "{}.{field}: link text changed without a put through \
-             put_declared_field",
-            self.name
-        );
+        {
+            // The lent text, so a checked cycle allocates no more than a
+            // release one; a type that lends none, or an unset link the
+            // override store may hold, takes the owned read.
+            let field = self.link_slots.field_at(i);
+            let held = match self.record.link_text_ref(field) {
+                Some(text) if !text.is_empty() => Cow::Borrowed(text),
+                _ => Cow::Owned(self.link_text(field).unwrap_or_default()),
+            };
+            debug_assert_eq!(
+                held,
+                self.link_slots.text_at(i),
+                "{}.{field}: link text changed without a put through \
+                 put_declared_field",
+                self.name
+            );
+        }
         self.link_slots.at(i)
     }
 
@@ -5018,8 +5063,10 @@ impl RecordInstance {
 
     /// The value of `field` already published to its `DBE_VALUE`/`DBE_LOG`
     /// subscribers, or `None` when the framework has never published one.
-    /// The read side of the `last_posted` contract — see the field's docs.
-    pub(crate) fn posted_value(&self, field: &str) -> Option<&EpicsValue> {
+    /// A reference-log field's entry holds no value: C keeps no published
+    /// copy of it. The read side of the `last_posted` contract — see the
+    /// field's docs.
+    pub(crate) fn posted_value(&self, field: &str) -> Option<&PostedValue> {
         if let Some(published) = self.last_posted.get(field) {
             return Some(&published.value);
         }
@@ -5027,6 +5074,44 @@ impl RecordInstance {
             .iter()
             .find(|(name, _)| name == field)
             .map(|(_, value)| value)
+    }
+
+    /// What a post of `field` carries: nothing for a reference-log field,
+    /// which is never read for it, else `read`. The kind is the published
+    /// entry's, settled when the field was first published, and only a field
+    /// never published asks its declaration (`desc`).
+    fn post_payload(
+        &self,
+        field: &str,
+        desc: impl FnOnce(&Self) -> Option<&'static FieldDesc>,
+        read: impl FnOnce(&Self) -> Option<EpicsValue>,
+    ) -> Option<PostedValue> {
+        match self.posted_value(field) {
+            Some(PostedValue::Ref) => Some(PostedValue::Ref),
+            Some(PostedValue::Val(_)) => read(self).map(PostedValue::Val),
+            None => match desc(self) {
+                desc @ Some(_) if posts_by_ref(desc, || None) => Some(PostedValue::Ref),
+                Some(_) => read(self).map(PostedValue::Val),
+                // A type with no field table declares a field by its value.
+                None => read(self).map(|v| {
+                    if crate::server::event_queue::LogKind::of_value(&v)
+                        == crate::server::event_queue::LogKind::Ref
+                    {
+                        PostedValue::Ref
+                    } else {
+                        PostedValue::Val(v)
+                    }
+                }),
+            },
+        }
+    }
+
+    /// [`Self::post_payload`] for a subscribed field the walk reaches before
+    /// its first post, kept out of the walk's per-entry code.
+    #[cold]
+    #[inline(never)]
+    fn first_post_payload(&self, field: &str) -> Option<PostedValue> {
+        self.post_payload(field, |i| i.field_desc(field), |i| i.resolve_field(field))
     }
 
     /// Whether `collect_subscriber_posts`'s walk discards `field` before it
@@ -5065,7 +5150,7 @@ impl RecordInstance {
     ///
     /// The deadband field is the exception: its published value is MLST/ALST,
     /// which [`Self::deadband_post`] owns, so a post of it stores nothing.
-    pub(crate) fn record_value_post(&mut self, field: &str, value: EpicsValue) {
+    pub(crate) fn record_value_post(&mut self, field: &str, value: PostedValue) {
         self.record_value_post_as(field, |inst| inst.walk_skips(field), value);
     }
 
@@ -5098,7 +5183,7 @@ impl RecordInstance {
         &mut self,
         field: &str,
         walk_skip: impl FnOnce(&Self) -> bool,
-        value: EpicsValue,
+        value: PostedValue,
     ) {
         if field == self.record.monitor_deadband_field() {
             return;
@@ -5262,9 +5347,8 @@ impl RecordInstance {
     }
 
     /// Returns the cached MetadataSnapshot, building and storing it on
-    /// the first call (or after invalidation). Used by both
-    /// `snapshot_for_field` and `make_monitor_snapshot` so the populate
-    /// cost is paid at most once per metadata-stable interval.
+    /// the first call (or after invalidation), so the populate cost is paid
+    /// at most once per metadata-stable interval.
     fn cached_metadata(&self) -> MetadataSnapshot {
         // Fast path: cache hit
         if let Ok(guard) = self.metadata_cache.lock()
@@ -6266,9 +6350,9 @@ impl RecordInstance {
     /// ([`Self::declared_field_type`]) — the single owner of "what type this
     /// field goes on the wire as", run by the CA create-channel path
     /// ([`Self::client_field_value`]), the GET path
-    /// ([`Self::snapshot_for_field`]) and the MONITOR path
-    /// ([`Self::make_monitor_snapshot`]), so all three announce and serve the
-    /// same type.
+    /// ([`Self::snapshot_for_field`]) and the MONITOR path (a post's log,
+    /// [`Self::declared_view`]), so all three announce and serve the same
+    /// type.
     ///
     /// The projection is [`EpicsValue::convert_to`], the one value-coercion
     /// owner — the same routine `dbGet` converts through. Never re-derive a
@@ -6397,7 +6481,7 @@ impl RecordInstance {
         // the CA create-channel path announced from `client_field_value` and
         // the same one the monitor path posts.
         let value = self.client_field_value(field)?;
-        Some(self.served_field_snapshot(field, value, backing))
+        Some(self.finish_field_snapshot(field, value, backing))
     }
 
     /// Which of this record's own link fields, if any, supplies `field`'s
@@ -6443,28 +6527,12 @@ impl RecordInstance {
         backing: LinkBacking<'_>,
     ) -> Option<super::super::snapshot::Snapshot> {
         let value = self.channel_field_value(field, string_view)?;
-        Some(self.served_field_snapshot(field, value, backing))
+        Some(self.finish_field_snapshot(field, value, backing))
     }
 
-    /// A GET door's snapshot: [`Self::finish_field_snapshot`] with the
-    /// `Q:time:tag` nsec split pvxs applies to every read
-    /// (`iocsource.cpp:239-248`). A monitor post carries the raw stamp, as
-    /// `db_create_field_log` copies `prec->time` (`dbEvent.c:713`); the PVA
-    /// consumer splits it with the mask its subscription read once.
-    fn served_field_snapshot(
-        &self,
-        field: &str,
-        value: EpicsValue,
-        backing: LinkBacking<'_>,
-    ) -> super::super::snapshot::Snapshot {
-        let mut snap = self.finish_field_snapshot(field, value, backing);
-        crate::server::snapshot::apply_nsec_mask(&mut snap, self.qtime_nsec_mask());
-        snap
-    }
-
-    /// The one finishing pipeline behind both `Snapshot` producers
-    /// ([`Self::snapshot_for_field`] for GET, [`Self::make_monitor_snapshot`]
-    /// for updates). Every step that shapes a served snapshot — alarm/utag
+    /// The one finishing pipeline behind every `Snapshot` a read serves
+    /// ([`Self::snapshot_for_field`] and the doors around it); a post carries
+    /// only a log, and its reader finishes the delivery read here. Every step that shapes a served snapshot — alarm/utag
     /// carry, the metadata cache, per-field routing and RSET overrides, menu
     /// enums, property support — runs here, so the two paths cannot drift
     /// apart.
@@ -6484,10 +6552,10 @@ impl RecordInstance {
         // mirroring pvxs `iocsource.cpp:245` (`auto utag = meta.utag;`).
         // The 64-bit `epicsUTag` narrows to the int32 NT wire field by
         // truncating to the low 32 bits — pvxs assigns the same uint64
-        // straight into the `Int32` `timeStamp.userTag`. A GET door's
+        // straight into the `Int32` `timeStamp.userTag`. A PVA reader's
         // `Q:time:tag` split overrides this when configured, matching
         // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
-        // (:246-247 — the test and its assignment).
+        // (:246-247 — the test and its assignment); CA serves it raw.
         snap.user_tag = self.common.utag as i32;
         // Carry the record's committed alarm message (`common.amsg`) so a
         // PVA read serves `alarm.message` from the record's own amsg
@@ -8499,12 +8567,29 @@ impl RecordInstance {
             {
                 continue;
             }
-            let read = match published {
-                Some(p) if p.upper => self.resolve_field_upper_at(field, p.desc),
-                _ => self.resolve_field(field),
-            };
-            let Some(val) = read else {
-                continue;
+            // A reference-log field is never read for its post: `val` is
+            // `None` for it, and the post is made from `posted` alone. `prev`
+            // is the published value a read one compares against.
+            let (val, prev) = match published {
+                Some(p) => match &p.value {
+                    PostedValue::Ref => (None, None),
+                    PostedValue::Val(prev) => {
+                        let val = if p.upper {
+                            self.resolve_field_upper_at(field, p.desc)
+                        } else {
+                            self.resolve_field(field)
+                        };
+                        if val.is_none() {
+                            continue;
+                        }
+                        (val, Some(prev))
+                    }
+                },
+                None => match self.first_post_payload(field) {
+                    Some(PostedValue::Val(val)) => (Some(val), None),
+                    Some(PostedValue::Ref) => (None, None),
+                    None => continue,
+                },
             };
             // Only a field never published, or one keyed off its declared
             // spelling, copies its name into a post.
@@ -8518,11 +8603,17 @@ impl RecordInstance {
                 Some(p) => p.prev_bit,
                 None => self.prev_compared_bit(field),
             };
-            let changed = match prev_bit {
-                Some(bit) => prev_changed & (1 << bit) != 0,
-                None => match published.map(|p| &p.value) {
-                    Some(prev) => prev != &val,
-                    None => self.posted_value(field).is_none_or(|prev| prev != &val),
+            // C keeps no published copy of a reference-log field to compare
+            // against; only its record's own old copy (`prev_bit`) or a mark
+            // posts it.
+            let changed = match (prev_bit, &val) {
+                (Some(bit), _) => prev_changed & (1 << bit) != 0,
+                (None, None) => false,
+                (None, Some(val)) => match prev {
+                    Some(prev) => prev != val,
+                    None => self
+                        .posted_value(field)
+                        .is_none_or(|prev| prev.as_value() != Some(val)),
                 },
             };
             if let Some(gate) = value_gate(value_masked, field) {
@@ -8541,18 +8632,18 @@ impl RecordInstance {
                     ValuePostGate::OnChange | ValuePostGate::OnChangeForced => false,
                 };
                 if post {
-                    snapshot.push((name(), val.clone(), deadband_mask));
+                    snapshot.push((name(), PostedValue::of_read(&val), deadband_mask));
                 }
             } else if changed && !marked_only.contains(&field.as_str()) {
                 snapshot.push((
                     name(),
-                    val.clone(),
+                    PostedValue::of_read(&val),
                     aux_post.mask_for(field, alarm_bits, deadband_mask),
                 ));
             } else if force_fields.contains(&field.as_str()) {
                 // C `monitor()` posts a statically re-marked field with
                 // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                snapshot.push((name(), val.clone(), aux_mask));
+                snapshot.push((name(), PostedValue::of_read(&val), aux_mask));
             } else if any_marks && cycle_marks.names(field) {
                 // One event per MARK, each with the mask of the C call site that
                 // made it (`CyclePostMask`) — a field marked twice (aCalcout's
@@ -8570,13 +8661,13 @@ impl RecordInstance {
                         CyclePostMask::MonitorValue => deadband_mask | EventMask::VALUE,
                         CyclePostMask::MonitorLog => deadband_mask | EventMask::LOG,
                     };
-                    snapshot.push((name(), val.clone(), mask));
+                    snapshot.push((name(), PostedValue::of_read(&val), mask));
                 }
             } else if alarm_fanout.contains(&field.as_str()) {
                 // C motor `monitor()` (motorRecord.cc:3456-3646) posts every listed
                 // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber
                 // observes the alarm moment on any of them.
-                snapshot.push((name(), val.clone(), alarm_fanout_mask));
+                snapshot.push((name(), PostedValue::of_read(&val), alarm_fanout_mask));
             }
             // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
             // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
@@ -8607,7 +8698,11 @@ impl RecordInstance {
             // path is separately served by the change post (C's `updateCounts()`
             // DBE_VALUE at `:582`).
             if log_swept.contains(&field.as_str()) {
-                snapshot.push((name(), val, EventMask::LOG | alarm_bits));
+                snapshot.push((
+                    name(),
+                    PostedValue::of_read(&val),
+                    EventMask::LOG | alarm_bits,
+                ));
             }
         }
         if let Some(forced_mask) = forced_mask.filter(|_| secondary_fired != 0) {
@@ -8664,8 +8759,13 @@ impl RecordInstance {
                 ValuePostGate::OnChangeForced => forced_mask,
                 _ => deadband_mask,
             };
-            let Some(val) = self.resolve_field(name) else {
-                continue;
+            let val = if self.monitor_plan.value_masked_ref & (1 << index) != 0 {
+                PostedValue::Ref
+            } else {
+                let Some(val) = self.resolve_field(name) else {
+                    continue;
+                };
+                PostedValue::Val(val)
             };
             if self
                 .subscribers
@@ -8715,9 +8815,15 @@ impl RecordInstance {
                 self.deadband_post(&mut posts, EventMask::NONE, include_val, include_archive);
                 continue;
             }
-            if self.posted_value(&name).is_none_or(|prev| prev != &val) {
-                self.record_value_post(&name, val.clone());
-                posts.push((name.into(), val, EventMask::VALUE | EventMask::LOG));
+            // A reference-log field has no published copy to compare the
+            // record's value against, so the record's notify posts it.
+            let Some(posted) = self.post_payload(&name, |i| i.field_desc(&name), |_| Some(val))
+            else {
+                continue;
+            };
+            if posted == PostedValue::Ref || self.posted_value(&name) != Some(&posted) {
+                self.record_value_post(&name, posted.clone());
+                posts.push((name.into(), posted, EventMask::VALUE | EventMask::LOG));
             }
         }
         posts
@@ -8765,12 +8871,14 @@ impl RecordInstance {
         let mut posts = ProcessSnapshot::new();
         crate::server::database::alarm_field_posts(&self.common, &alarm_result).for_each(
             |field, mask| {
-                if let Some(value) = self.resolve_field(field) {
+                if let Some(value) =
+                    self.post_payload(field, |i| i.field_desc(field), |i| i.resolve_field(field))
+                {
                     posts.push((field.into(), value, mask));
                 }
             },
         );
-        if let Some(val) = self.record.val() {
+        if let Some(val) = self.post_payload("VAL", |i| i.field_desc("VAL"), |i| i.record.val()) {
             posts.push((
                 "VAL".into(),
                 val,
@@ -9092,10 +9200,15 @@ impl RecordInstance {
             snapshot.push_unwatched(mask);
             return mask;
         }
-        let value = if field == "VAL" {
-            self.record.val()
+        // A reference-log field's post carries no value: it is read at
+        // delivery, as C's `dbfl_type_ref` log is.
+        let value = if self.monitor_plan.deadband_ref {
+            Some(PostedValue::Ref)
+        } else if field == "VAL" {
+            self.record.val().map(PostedValue::Val)
         } else {
             self.resolve_field_upper_at(field, self.monitor_plan.deadband_desc)
+                .map(PostedValue::Val)
         };
         if let Some(value) = value {
             snapshot.push((field.into(), value, mask));
@@ -9116,33 +9229,6 @@ impl RecordInstance {
         [self.common.mlst, self.common.alst] = last_posted;
         self.array_hash_changed = classes.hash_changed;
         (classes.value, classes.archive)
-    }
-
-    /// Build a Snapshot for a given value, populated with the record's display
-    /// metadata and the link metadata `backing` carries. Uses
-    /// the metadata cache so the populate cost is paid at most once per
-    /// metadata-stable interval (cf. `cached_metadata`).
-    ///
-    /// There is deliberately no `backing`-less form. One existed, defaulting to
-    /// [`LinkBacking::none`], and it made "nothing was resolved" the thing a
-    /// caller says by saying nothing — which is how the `DBE_PROPERTY` sweep
-    /// came to post `CALC.A` with the calc's own precision (see
-    /// `link_backed_metadata_is_read_live.rs`). A caller with nothing to
-    /// resolve still writes `LinkBacking::none()`, and then it is a claim a
-    /// reviewer can see and check.
-    pub fn make_monitor_snapshot(
-        &self,
-        field: &str,
-        value: EpicsValue,
-        backing: LinkBacking<'_>,
-    ) -> super::super::snapshot::Snapshot {
-        // A monitor update is posted from the record's own change-detection
-        // loop, which hands over the STORED variant. Project it onto the
-        // field's declared type here, at the same owner the GET path and the
-        // CA create-channel path use, or a client that was told `DBR_ENUM` at
-        // create time would be posted a `DBR_SHORT` update.
-        let value = self.project_to_declared_type(field, value);
-        self.finish_field_snapshot(field, value, backing)
     }
 
     /// The record's half of every field log a post makes now
@@ -9172,8 +9258,8 @@ impl RecordInstance {
     /// *menu*, `form.choices`, is published for every field). The metadata
     /// cache is per-record, so a channel on `REC.RVAL` of a record carrying
     /// `info(Q:form, "Hex")` used to report Hex where pvxs reports Default.
-    /// Both `Snapshot` producers (`snapshot_for_field` for GET,
-    /// `make_monitor_snapshot` for updates) run this one owner, so
+    /// Every served `Snapshot`, a monitor update's delivery read included,
+    /// runs this one owner, so
     /// `DisplayInfo::form` means exactly one thing on every path: the form
     /// index that applies to THIS field.
     fn apply_field_metadata_override(
@@ -9883,7 +9969,7 @@ impl RecordInstance {
                 // utag and a scalar value; a wider one is read at delivery
                 // (`dbEvent.c:704-730`). No metadata rides on a post: the
                 // consumer reads it when it serves a class that carries it.
-                let value = self.declared_view(field, value);
+                let value = value.as_value().map(|v| self.declared_view(field, v));
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.
@@ -9899,7 +9985,8 @@ impl RecordInstance {
                         // Server-side filter chain (3.15.7). Empty chain
                         // is identity, so no behaviour change for the
                         // common no-filter case.
-                        let Some(event) = sub.filtered_log(head, &value, origin, mask) else {
+                        let Some(event) = sub.filtered_log(head, value.as_deref(), origin, mask)
+                        else {
                             continue;
                         };
                         // C `db_queue_event_log`: append, or replace this
@@ -9966,6 +10053,7 @@ impl RecordInstance {
             mask,
             origin,
             (
+                |inst: &Self| inst.field_desc(field),
                 |inst: &Self| inst.resolve_field(field),
                 |inst: &Self| inst.walk_skips(field),
             ),
@@ -9988,6 +10076,7 @@ impl RecordInstance {
             mask,
             origin,
             (
+                |inst: &Self| inst.field_desc(field),
                 |inst: &Self| inst.resolve_field(field),
                 |inst: &Self| inst.walk_skips(field),
             ),
@@ -10008,6 +10097,7 @@ impl RecordInstance {
             mask,
             0,
             (
+                |_: &Self| at.field.desc,
                 |inst: &Self| inst.resolve_field_upper_at(field, at.field.desc),
                 |_: &Self| at.walk_skip,
             ),
@@ -10026,11 +10116,12 @@ impl RecordInstance {
         mask: crate::server::recgbl::EventMask,
         origin: u64,
         access: (
+            impl FnOnce(&Self) -> Option<&'static FieldDesc>,
             impl FnOnce(&Self) -> Option<EpicsValue>,
             impl FnOnce(&Self) -> bool,
         ),
     ) {
-        let (read, walk_skip) = access;
+        let (desc, read, walk_skip) = access;
         // A poster that carries no origin of its own inherits the ambient
         // one (0 outside any scope): this is how every post inside an
         // SNL writer's synchronous put+process cascade gets the writer's
@@ -10061,7 +10152,8 @@ impl RecordInstance {
         if !subscribed && (!publishes_value || field == self.record.monitor_deadband_field()) {
             return;
         }
-        let Some(value) = read(self) else {
+        // A reference-log field is not read: its post carries no value.
+        let Some(value) = self.post_payload(field, desc, read) else {
             return;
         };
         // With no subscriber the post is value-class (the return above), and
@@ -10072,7 +10164,7 @@ impl RecordInstance {
         }
         {
             let head = self.log_head();
-            let logged = self.declared_view(field, &value);
+            let logged = value.as_value().map(|v| self.declared_view(field, v));
             let mut own;
             let burst = match burst {
                 Some(burst) => burst,
@@ -10097,7 +10189,8 @@ impl RecordInstance {
                     // existing subscribers see no behaviour
                     // change. A filter returning `None` silences
                     // this event for this subscriber only.
-                    let Some(event) = sub.filtered_log(head, &logged, origin, mask) else {
+                    let Some(event) = sub.filtered_log(head, logged.as_deref(), origin, mask)
+                    else {
                         continue;
                     };
                     // Same single post owner as the snapshot path.
@@ -10207,8 +10300,13 @@ impl RecordInstance {
         // subscribed, so it is what was last published, and a change since
         // then is still owed to the field's other subscribers.
         if self.posted_value(field).is_none() {
-            if let Some(val) = self.resolve_field(field) {
-                self.record_value_post(field, val);
+            let seed = if kind == crate::server::event_queue::LogKind::Ref {
+                Some(PostedValue::Ref)
+            } else {
+                self.resolve_field(field).map(PostedValue::Val)
+            };
+            if let Some(seed) = seed {
+                self.record_value_post(field, seed);
             }
         }
         Ok(reader)
@@ -10797,17 +10895,6 @@ mod metadata_cache_tests {
                 "Q:form must not reach ai.{non_val} — pvxs applies it to VAL only"
             );
         }
-
-        // The monitor producer shares the same per-field owner.
-        let update = inst.make_monitor_snapshot("RVAL", EpicsValue::Long(7), LinkBacking::none());
-        assert_eq!(
-            update.display.expect("ai display").form,
-            0,
-            "a monitor update on a non-VAL field carries the default form too"
-        );
-        let update =
-            inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
-        assert_eq!(update.display.expect("ai display").form, 4);
     }
 
     #[test]
@@ -10871,13 +10958,11 @@ mod metadata_cache_tests {
         assert_eq!(ai_instance().qtime_nsec_mask(), 0);
     }
 
-    /// End-to-end on the snapshot: `nsec:lsb:31` publishes
-    /// `nanoseconds & ~mask` (0, since nanoseconds < 1e9 < 2^31) and
-    /// `userTag = nanoseconds & mask` (pvxs `iocsource.cpp:239-248`). The
-    /// old `(1..=30)` clamp served the raw nanoseconds and the record's
-    /// utag instead.
+    /// The GET door serves the raw stamp and utag whatever `Q:time:tag`
+    /// says, as rsrv's `dbGetField` does; the split is pvxs's alone
+    /// (`iocsource.cpp:239-248`), made by each PVA reader.
     #[test]
-    fn qtime_nsec_lsb_31_is_served_not_ignored() {
+    fn qtime_tag_get_door_serves_the_raw_stamp() {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
         // 123_456_700, not …789: Windows `SystemTime` is a FILETIME with 100 ns
@@ -10889,8 +10974,8 @@ mod metadata_cache_tests {
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
         let snap = inst.snapshot_for_field("VAL").unwrap();
-        assert_eq!(snap.user_tag, 123_456_700);
-        assert_eq!(snap.timestamp.subsec_nanos(), 0);
+        assert_eq!(snap.user_tag, 5);
+        assert_eq!(snap.timestamp.subsec_nanos(), 123_456_700);
         assert_eq!(snap.timestamp.unix_secs(), 42);
     }
 
@@ -10902,15 +10987,15 @@ mod metadata_cache_tests {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
         // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
-        // see qtime_nsec_lsb_31_is_served_not_ignored for the FILETIME reason.
+        // see qtime_tag_get_door_serves_the_raw_stamp for the FILETIME reason.
         inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
-        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
-        assert_eq!(mon.user_tag, 5);
-        assert_eq!(mon.timestamp.subsec_nanos(), 123_456_700);
-        assert_eq!(mon.timestamp.unix_secs(), 42);
+        let mon = inst.log_head();
+        assert_eq!(mon.utag, 5);
+        assert_eq!(mon.time.subsec_nanos(), 123_456_700);
+        assert_eq!(mon.time.unix_secs(), 42);
     }
 
     /// The mirror boundary: a tag pvxs's `strncmp` rejects must leave the
@@ -10922,7 +11007,7 @@ mod metadata_cache_tests {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
         // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
-        // see qtime_nsec_lsb_31_is_served_not_ignored for the FILETIME reason.
+        // see qtime_tag_get_door_serves_the_raw_stamp for the FILETIME reason.
         inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "NSEC:LSB:4");
@@ -10937,7 +11022,7 @@ mod metadata_cache_tests {
 
     /// the served `timeStamp.userTag` defaults to the record's `utag`
     /// (pvxs `iocsource.cpp:245`), on both the GET (`snapshot_for_field`)
-    /// and MONITOR (`make_monitor_snapshot`) paths. Pre-fix both hard-set
+    /// and MONITOR (a post's `log_head`) paths. Pre-fix both hard-set
     /// it to 0, dropping the record's tag. A bit-31 utag also pins the
     /// `u64 -> i32` narrowing: the low 32 bits' pattern is preserved
     /// (no clamp), matching pvxs assigning `epicsUTag` into the `Int32`
@@ -10956,9 +11041,9 @@ mod metadata_cache_tests {
             "GET path must serve the record's utag as timeStamp.userTag"
         );
 
-        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
         assert_eq!(
-            mon.user_tag, want,
+            inst.log_head().utag,
+            want,
             "MONITOR path must carry the record's utag too"
         );
     }
@@ -11201,25 +11286,6 @@ mod metadata_cache_tests {
         assert!(wf.properties.units && wf.properties.graphic_double);
     }
 
-    #[test]
-    fn make_monitor_snapshot_uses_cache() {
-        let inst = ai_instance();
-        assert!(inst.metadata_cache.lock().unwrap().is_none());
-
-        // make_monitor_snapshot should also populate the cache
-        let snap = inst.make_monitor_snapshot("VAL", EpicsValue::Double(42.0), LinkBacking::none());
-        assert!(snap.display.is_some());
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
-
-        // Subsequent call hits cache
-        let snap2 =
-            inst.make_monitor_snapshot("VAL", EpicsValue::Double(43.0), LinkBacking::none());
-        let d1 = snap.display.unwrap();
-        let d2 = snap2.display.unwrap();
-        assert_eq!(d1.units, d2.units);
-        assert_eq!(d1.precision, d2.precision);
-    }
-
     /// Stub record with a per-field metadata override on SPD only —
     /// models a C RSET whose get_units/get_graphic_double key on
     /// dbGetFieldIndex (e.g. motorRecord.cc:3156-3361).
@@ -11301,14 +11367,6 @@ mod metadata_cache_tests {
             ),
             (9.0, 8.0, -8.0, -9.0)
         );
-        let c = snap.control.unwrap();
-        assert_eq!((c.upper_ctrl_limit, c.lower_ctrl_limit), (4.0, 1.0));
-
-        // SPD via the monitor path: identical override.
-        let snap = inst.make_monitor_snapshot("SPD", EpicsValue::Double(2.0), LinkBacking::none());
-        let d = snap.display.unwrap();
-        assert_eq!(d.units, "mm/sec");
-        assert_eq!((d.upper_disp_limit, d.lower_disp_limit), (5.0, 0.5));
         let c = snap.control.unwrap();
         assert_eq!((c.upper_ctrl_limit, c.lower_ctrl_limit), (4.0, 1.0));
     }
@@ -13254,12 +13312,15 @@ mod skipped_posted_tests {
     fn a_skipped_field_post_leaves_the_gate_armed() {
         for field in ["SEVR", "STAT", "AMSG", "ACKS", "UDF"] {
             let mut inst = calc();
-            inst.record_value_post(field, EpicsValue::Long(1));
+            inst.record_value_post(field, PostedValue::Val(EpicsValue::Long(1)));
             assert!(
                 inst.last_posted.is_empty(),
                 "{field} reached the walk's input"
             );
-            assert_eq!(inst.posted_value(field), Some(&EpicsValue::Long(1)));
+            assert_eq!(
+                inst.posted_value(field),
+                Some(&PostedValue::Val(EpicsValue::Long(1)))
+            );
         }
     }
 
@@ -13268,7 +13329,7 @@ mod skipped_posted_tests {
     #[test]
     fn a_deadband_field_post_stores_nothing() {
         let mut inst = calc();
-        inst.record_value_post("VAL", EpicsValue::Double(1.0));
+        inst.record_value_post("VAL", PostedValue::Val(EpicsValue::Double(1.0)));
         inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
         assert!(inst.last_posted.is_empty() && inst.skipped_posted.is_empty());
         assert_eq!(inst.posted_value("VAL"), None);
@@ -13330,9 +13391,12 @@ mod skipped_posted_tests {
     #[test]
     fn a_walkable_field_post_disarms_the_gate() {
         let mut inst = calc();
-        inst.record_value_post("PREC", EpicsValue::Long(3));
+        inst.record_value_post("PREC", PostedValue::Val(EpicsValue::Long(3)));
         assert!(!inst.last_posted.is_empty());
-        assert_eq!(inst.posted_value("PREC"), Some(&EpicsValue::Long(3)));
+        assert_eq!(
+            inst.posted_value("PREC"),
+            Some(&PostedValue::Val(EpicsValue::Long(3)))
+        );
     }
 
     /// The skipped store is still a map: a second post advances the value in
@@ -13340,10 +13404,13 @@ mod skipped_posted_tests {
     #[test]
     fn a_second_skipped_post_advances_in_place() {
         let mut inst = calc();
-        inst.record_value_post("SEVR", EpicsValue::Long(1));
-        inst.record_value_post("SEVR", EpicsValue::Long(2));
+        inst.record_value_post("SEVR", PostedValue::Val(EpicsValue::Long(1)));
+        inst.record_value_post("SEVR", PostedValue::Val(EpicsValue::Long(2)));
         assert_eq!(inst.skipped_posted.len(), 1);
-        assert_eq!(inst.posted_value("SEVR"), Some(&EpicsValue::Long(2)));
+        assert_eq!(
+            inst.posted_value("SEVR"),
+            Some(&PostedValue::Val(EpicsValue::Long(2)))
+        );
     }
 
     /// `add_subscriber` seeds the published value through the owner, so

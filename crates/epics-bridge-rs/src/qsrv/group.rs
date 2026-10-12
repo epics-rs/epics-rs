@@ -3021,8 +3021,8 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
 /// Build a `timeStamp` PvStructure directly from the record snapshot.
 ///
 /// The nanosecond / userTag split for `info(Q:time:tag, "nsec:lsb:N")`
-/// is applied once, at the record level, when the snapshot is built
-/// (`epics_base_rs` `record_instance.rs` via `apply_nsec_mask`), so
+/// is applied once, when the member's snapshot is read
+/// (`MemberChannel::snapshot_in` via `apply_nsec_mask`), so
 /// `snapshot.timestamp` already carries the masked nanoseconds and
 /// `snapshot.user_tag` already carries the split bits / `common.utag`.
 /// The group encoder therefore serves them verbatim and must not remask
@@ -3102,7 +3102,7 @@ mod tests {
 
     /// a group `meta` timeStamp serves the record snapshot's userTag and
     /// nanoseconds verbatim. The `Q:time:tag` nsec-LSB split is applied
-    /// once at the record level (`record_instance.rs`
+    /// once, by the member read (`MemberChannel::snapshot_in`
     /// `apply_nsec_mask`), so the group encoder must not remask —
     /// pvxs derives the split from the record, never from group JSON
     /// (`ioc/iocsource.cpp:240-248`). `Snapshot.user_tag` defaults to the

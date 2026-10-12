@@ -76,7 +76,7 @@ pub use record_trait::{
     CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
     FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
     InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses,
-    MonitorValueGate, OutTarget, Pact, ProcessAction, ProcessActions, ProcessContext,
+    MonitorValueGate, OutTarget, Pact, PostedValue, ProcessAction, ProcessActions, ProcessContext,
     ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks,
     SimmCells, Special, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
     calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,

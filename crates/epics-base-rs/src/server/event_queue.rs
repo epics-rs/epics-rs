@@ -1153,6 +1153,8 @@ impl Drop for EventReader {
 pub struct EventSink {
     que: Arc<EvQue>,
     id: AttachId,
+    /// The slot's [`LogKind`], fixed at attach.
+    kind: LogKind,
 }
 
 impl EventSink {
@@ -1170,6 +1172,11 @@ impl EventSink {
     /// This subscription's slot — what its producer row is removed by.
     pub fn id(&self) -> AttachId {
         self.id
+    }
+
+    /// The kind every log posted here holds, fixed at attach.
+    pub fn kind(&self) -> LogKind {
+        self.kind
     }
 
     /// The reader is gone — the producer row can be reaped. Replaces
@@ -1217,6 +1224,7 @@ pub fn attach_with(
         EventSink {
             que: que.clone(),
             id,
+            kind,
         },
         EventReader { que, id },
     )

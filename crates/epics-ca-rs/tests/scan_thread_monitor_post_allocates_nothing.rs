@@ -76,6 +76,10 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 const N_AO: usize = 20;
+/// stringin and waveform records whose VAL is monitored: a 40-byte string and
+/// an array fail `useValque` (`dbEvent.c:493-500`), so each post is a
+/// reference log and copies nothing.
+const N_REF: usize = 20;
 
 fn db() -> String {
     let mut db = String::from(
@@ -87,7 +91,14 @@ record(waveform, "WF") { field(SCAN, ".1 second") field(FTVL, "DOUBLE") field(NE
     );
     for i in 0..N_AO {
         db.push_str(&format!(
-            "record(ao, \"AO{i}\") {{ field(SCAN, \".1 second\") field(OMSL, \"closed_loop\") field(DOL, \"TICK\") }}\n"
+            "record(ao, \"AO{i}\") {{ field(SCAN, \".1 second\") field(OMSL, \"closed_loop\") field(DOL, \"TICK\") field(OUT, \"SINK{i}\") }}\n\
+             record(ao, \"SINK{i}\") {{ }}\n"
+        ));
+    }
+    for i in 0..N_REF {
+        db.push_str(&format!(
+            "record(stringin, \"SI{i}\") {{ field(SCAN, \".1 second\") field(VAL, \"s{i}\") field(MPST, \"Always\") }}\n\
+             record(waveform, \"WF{i}\") {{ field(SCAN, \".1 second\") field(FTVL, \"DOUBLE\") field(NELM, \"8\") field(MPST, \"Always\") }}\n"
         ));
     }
     db
@@ -283,6 +294,12 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
         .expect("seed WF");
 
     let unwatched = window(&db).await;
+    // An ao driving its OUT link allocates nothing per process either.
+    assert_eq!(
+        unwatched.milli_per_tick(),
+        (0, 0),
+        "scan-0.1 (allocs, frees) x1000 per tick, nothing monitored"
+    );
 
     let client = CaClient::new().await.expect("client");
     let mut tick_mon = monitor(&client, "TICK").await;
@@ -360,6 +377,47 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
             .all(|v| *v == EpicsValue::DoubleArray(vec![1.0, 2.0].into())),
         "{got:?}"
     );
+
+    // `dec` is a pre-chain filter: it runs on the log as posted, a reference
+    // for a waveform, and copies nothing (`dbnd.c:75`, `sync.c:150`).
+    let mut dec = monitor(&client, r#"WF.VAL{"dec":{"n":2}}"#).await;
+    let with_dec = window(&db).await;
+    assert_eq!(
+        with_dec.milli_per_tick(),
+        unwatched.milli_per_tick(),
+        "scan-0.1 (allocs, frees) x1000 per tick, with a dec subscriber vs none"
+    );
+    let got = drain(&mut dec);
+    assert!(got.len() >= 5, "dec posted {}", got.len());
+    assert!(
+        got.iter()
+            .all(|v| *v == EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())),
+        "{got:?}"
+    );
+
+    // Twenty stringin and twenty waveform VAL monitors: each post is a
+    // reference with no value, read at delivery on the server's thread.
+    let mut refs = Vec::new();
+    for i in 0..N_REF {
+        refs.push((monitor(&client, &format!("SI{i}")).await, i, true));
+        refs.push((monitor(&client, &format!("WF{i}")).await, i, false));
+    }
+    let with_refs = window(&db).await;
+    assert_eq!(
+        with_refs.milli_per_tick(),
+        unwatched.milli_per_tick(),
+        "scan-0.1 (allocs, frees) x1000 per tick, with {N_REF} stringin and {N_REF} waveform monitors vs none"
+    );
+    for (mon, i, si) in &mut refs {
+        let got = drain(mon);
+        assert!(got.len() >= 10, "SI/WF{i} posted {} times", got.len());
+        if *si {
+            assert!(
+                got.iter()
+                    .all(|v| *v == EpicsValue::String(format!("s{i}").into()))
+            );
+        }
+    }
 
     // A stringin VAL subscriber reads the live field at delivery.
     let mut si = monitor(&client, "SI").await;

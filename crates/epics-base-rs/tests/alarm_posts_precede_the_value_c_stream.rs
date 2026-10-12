@@ -66,9 +66,20 @@ impl SubscriptionFilter for Record {
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
         let e = &event.event;
+        // AMSG's log is a reference (a 40-byte string fails `useValque`);
+        // the field it would read is the amsg the log copied.
+        let amsg;
+        let value = match e.value().as_value() {
+            Some(v) => v.clone(),
+            None if self.pv.ends_with(".AMSG") => {
+                amsg = EpicsValue::String(e.amsg().into());
+                amsg
+            }
+            None => panic!("{}: a reference log", self.pv),
+        };
         self.stream.lock().unwrap().push(camonitor_parts(
             &self.pv,
-            e.value().as_value().expect("a by-value log"),
+            &value,
             e.stat(),
             e.sevr(),
             &self.enums,

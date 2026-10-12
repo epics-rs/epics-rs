@@ -65,16 +65,15 @@ async fn a_numeric_dol_or_siol_read_builds_no_source_render() {
         .build()
         .await
         .unwrap();
-    // The b74df5911 counts, which no source class may raise. Each is one
-    // allocation per process in a release build; the rest is the debug
-    // build's slot text check, which SIOL reads through since its parse
-    // moved into the slot (AO's DOL already did).
+    // The b74df5911 counts, which no source class may raise: one allocation
+    // per process, the release build's, since the debug build's slot text
+    // check compares the lent text.
     for (rec, per_process) in [
-        ("AO_M", 3),
-        ("AO_B", 3),
-        ("AO_A", 3),
-        ("AI_M", 2),
-        ("AI_A", 2),
+        ("AO_M", 1),
+        ("AO_B", 1),
+        ("AO_A", 1),
+        ("AI_M", 1),
+        ("AI_A", 1),
     ] {
         assert_eq!(
             allocs_over_1000(&db, rec).await,

@@ -642,6 +642,7 @@ impl Record for AoRecord {
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
         match link_field {
+            "DOL" => Some(&self.dol),
             "SIML" => Some(&self.siml),
             "SIOL" => Some(&self.siol),
             _ => None,

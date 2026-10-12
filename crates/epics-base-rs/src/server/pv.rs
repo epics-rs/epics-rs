@@ -424,19 +424,6 @@ impl MonitorEvent {
         }
     }
 
-    /// [`Self::posted`] with the value copied whatever its width, for a
-    /// filter chain to run on.
-    fn copied(
-        head: LogHead<'_>,
-        value: &EpicsValue,
-        origin: u64,
-        mask: crate::server::recgbl::EventMask,
-    ) -> Self {
-        Self {
-            log: PostLog::new(head, LogData::holding(value.clone()), origin, mask),
-        }
-    }
-
     pub(crate) fn into_log(self) -> PostLog {
         self.log
     }
@@ -670,25 +657,31 @@ impl Subscriber {
     }
 
     /// C `db_create_event_log` then `dbChannelRunPreChain`: this monitor's
-    /// log of `head` and `value`, or `None` when a filter drops it. A monitor
-    /// with a filter chain gets the value copied whatever its width — C's
-    /// `arr` copies a reference log too (`arr.c`), and the chain has no field
-    /// to read here; the copy is the filter's cost.
+    /// log of `head` and `value` (`None` for a post that carries none), of
+    /// the kind fixed at attach, or `None` when
+    /// a filter drops it. The pre chain runs on that log as it is, copying
+    /// nothing (`dbnd.c:75` reads only a `dbfl_type_val`, `sync.c:150`); the
+    /// post chain's copies (`arr`, `ts`) are the consumer's.
     pub(crate) fn filtered_log(
         &self,
         head: LogHead<'_>,
-        value: &EpicsValue,
+        value: Option<&EpicsValue>,
         origin: u64,
         mask: crate::server::recgbl::EventMask,
     ) -> Option<MonitorEvent> {
         use crate::server::database::filters::FilteredMonitorEvent;
+        let value = match (self.sink.kind(), value) {
+            (crate::server::event_queue::LogKind::Val, Some(value)) => {
+                NativeValue::of(value).map_or(LogData::Ref, LogData::Val)
+            }
+            _ => LogData::Ref,
+        };
+        let event = MonitorEvent::of_log(PostLog::new(head, value, origin, mask));
         if self.filters.is_empty() {
-            return Some(MonitorEvent::posted(head, value, origin, mask));
+            return Some(event);
         }
         self.filters
-            .apply(FilteredMonitorEvent::new(MonitorEvent::copied(
-                head, value, origin, mask,
-            )))
+            .apply(FilteredMonitorEvent::new(event))
             .map(|fe| fe.event)
     }
 
@@ -698,7 +691,9 @@ impl Subscriber {
     /// before `db_event_disable`.
     pub(crate) fn post_single(&self, snapshot: Arc<Snapshot>) {
         let mask = crate::server::recgbl::EventMask::from_bits(self.mask);
-        if let Some(event) = self.filtered_log(LogHead::of(&snapshot), &snapshot.value, 0, mask) {
+        if let Some(event) =
+            self.filtered_log(LogHead::of(&snapshot), Some(&snapshot.value), 0, mask)
+        {
             self.post(&mut PostBurst::new(), event);
         }
     }
@@ -1151,7 +1146,7 @@ impl ProcessVariable {
             // `dbnd` deadband not crossed); the event's mask tells value
             // filters whether to pass through (446e0d4a).
             let Some(event) =
-                sub.filtered_log(LogHead::of(&snapshot), &snapshot.value, origin, mask)
+                sub.filtered_log(LogHead::of(&snapshot), Some(&snapshot.value), origin, mask)
             else {
                 continue;
             };

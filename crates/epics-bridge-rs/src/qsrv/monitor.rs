@@ -81,6 +81,9 @@ pub struct BridgeMonitor {
     /// and on each PROPERTY event, which is all pvxs re-reads them on
     /// (`singlesource.cpp:100`). A value event writes its log over a copy.
     options: Option<epics_base_rs::server::snapshot::Snapshot>,
+    /// The record's `Q:time:tag` split, read with the options: pvxs splits
+    /// every update it serves (`iocsource.cpp:239-248`), the log is raw.
+    nsec_mask: u64,
     /// GET-door reads made by [`Self::read_options`].
     #[cfg(test)]
     options_reads: usize,
@@ -116,6 +119,7 @@ impl BridgeMonitor {
             ),
             running: false,
             options: None,
+            nsec_mask: 0,
             #[cfg(test)]
             options_reads: 0,
             initial_snapshot: None,
@@ -182,6 +186,7 @@ impl BridgeMonitor {
             self.options_reads += 1;
         }
         let record = self.db.get_record(&self.record_name)?;
+        self.nsec_mask = record.read().qtime_nsec_mask();
         let mut options = self
             .db
             .channel_snapshot_for_field(&record, &self.field, false)?;
@@ -409,6 +414,7 @@ impl PvaMonitor for BridgeMonitor {
                 self.options.clone()?
             };
             ev.write_log_over(&mut snapshot);
+            epics_base_rs::server::snapshot::apply_nsec_mask(&mut snapshot, self.nsec_mask);
             if let super::pvif::View::Dollar(view) = self.view {
                 let value = std::mem::replace(
                     &mut snapshot.value,

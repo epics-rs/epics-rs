@@ -166,20 +166,15 @@ fn get_and_monitor_serve_what_create_channel_announced() {
                 get.value
             ));
         }
-        // The monitor path, fed the raw stored variant the record would post.
+        // The monitor path: a post's log projects the raw stored variant.
         let Some(stored) = inst.resolve_field(field) else {
             continue;
         };
-        let posted = inst.make_monitor_snapshot(
-            field,
-            stored,
-            epics_base_rs::server::database::LinkBacking::none(),
-        );
-        if served_code(&inst, field, &posted.value) != announced {
+        let posted = inst.project_to_declared_type(field, stored);
+        if served_code(&inst, field, &posted) != announced {
             disagree.push(format!(
-                "{record}.{field}: create-channel says {announced}, MONITOR posts {} ({:?})",
-                served_code(&inst, field, &posted.value),
-                posted.value
+                "{record}.{field}: create-channel says {announced}, MONITOR posts {} ({posted:?})",
+                served_code(&inst, field, &posted),
             ));
         }
     }

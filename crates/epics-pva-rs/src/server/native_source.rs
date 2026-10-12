@@ -891,6 +891,10 @@ fn record_snapshot(
     filters: &FilterChain,
 ) -> Option<Snapshot> {
     let mut snap = db.channel_snapshot_for_field(rec, field, false)?;
+    // pvxs splits the `Q:time:tag` bits out of every read it serves
+    // (`iocsource.cpp:239-248`); the record serves rsrv's raw stamp.
+    let nsec_mask = rec.read().qtime_nsec_mask();
+    epics_base_rs::server::snapshot::apply_nsec_mask(&mut snap, nsec_mask);
     render.read(&mut snap, filters);
     Some(snap)
 }

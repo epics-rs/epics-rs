@@ -302,7 +302,10 @@ impl MemberChannel {
         view: View,
         backing: epics_base_rs::server::database::LinkBacking<'_>,
     ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
-        let snap = instance.channel_snapshot_for_field(&self.field, false, backing)?;
+        let mut snap = instance.channel_snapshot_for_field(&self.field, false, backing)?;
+        // pvxs splits every read it serves (`iocsource.cpp:239-248`); rsrv
+        // never does, so the record serves the raw stamp.
+        epics_base_rs::server::snapshot::apply_nsec_mask(&mut snap, instance.qtime_nsec_mask());
         Some(view.read_snapshot(snap, &self.value_filters))
     }
 
@@ -831,13 +834,16 @@ impl Channel for BridgeChannel {
 
         // Through the database, which resolves a link-backed field's metadata
         // from the LINK TARGET's record — a second lock this holds none of.
-        let snapshot = self
+        let mut snapshot = self
             .db
             .channel_snapshot_for_field(&rec, &self.field, false)
             .ok_or_else(|| BridgeError::FieldNotFound {
                 record: self.record_name.clone(),
                 field: self.field.clone(),
             })?;
+        // pvxs's `Q:time:tag` split (`iocsource.cpp:239-248`).
+        let nsec_mask = rec.read().qtime_nsec_mask();
+        epics_base_rs::server::snapshot::apply_nsec_mask(&mut snapshot, nsec_mask);
 
         // Apply the channel-filter chain in READ context. pvxs wraps
         // every QSRV GET in a `LocalFieldLog` and runs the field-log

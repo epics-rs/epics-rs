@@ -14,7 +14,7 @@ pub struct AlarmInfo {
     /// Alarm message string (`DBR_AMSG` / dbCommon `AMSG`). The record's
     /// committed `common.amsg`, populated by the per-record snapshot
     /// builders that hold the record's `CommonFields`
-    /// (`snapshot_for_field`, `make_monitor_snapshot`); empty on the
+    /// (`snapshot_for_field`); empty on the
     /// minimal `Snapshot::new` path and for non-record channels. PVA's
     /// `build_alarm` prefers a non-empty amsg over the synthesized
     /// condition string, mirroring pvxs `iocsource.cpp:230-236`.

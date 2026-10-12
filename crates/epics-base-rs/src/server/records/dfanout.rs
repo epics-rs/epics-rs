@@ -352,6 +352,14 @@ impl Record for DfanoutRecord {
         Ok(())
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match link_field {
+            "DOL" => Some(&self.dol),
+            "SELL" => Some(&self.sell),
+            _ => None,
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),

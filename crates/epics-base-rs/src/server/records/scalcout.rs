@@ -195,6 +195,12 @@ pub struct ScalcoutRecord {
     put_report: Option<PutReport>,
     /// CLCV (bit 0) / OCLV (bit 1) owed by the last CALC/OCAL `special()`.
     calc_posts: u64,
+    /// POSV — C `field(POSV,DBF_STRING)`, `SPC_NOMOD`: the OSV `monitor()`
+    /// last posted (`sCalcoutRecord.c:847-851`).
+    posv: PvString,
+    /// SVAL (bit 0), OSV (bit 1) and AA..LL (bits 2..) posts the last
+    /// `monitor()` made, each against the record's own previous copy.
+    string_posts: u64,
 }
 
 impl Default for ScalcoutRecord {
@@ -230,6 +236,8 @@ impl Default for ScalcoutRecord {
             link_gen: LinkStatusGen::default(),
             put_report: None,
             calc_posts: 0,
+            posv: PvString::new(),
+            string_posts: 0,
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             pa: [0.0; 12],
@@ -428,14 +436,29 @@ impl ScalcoutRecord {
         }
     }
 
-    /// C `monitor()` (`sCalcoutRecord.c:842-846`): SVAL is posted when it
-    /// differs from PSVL, and PSVL then takes its value. The framework owns the
-    /// post (SVAL is change-detected against its last posted value, which is the
-    /// same test); this owns the copy, at the same point — the end of every cycle
-    /// that reaches `monitor()`. The ODLY-scheduling cycle is not one of them: C
-    /// `return(0)`s at `:407`, so PSVL lags SVAL for the length of the delay.
-    fn sync_psvl(&mut self) {
-        self.psvl.clone_from(&self.sval);
+    /// C `monitor()`'s string posts (`sCalcoutRecord.c:842-863`): SVAL against
+    /// PSVL and OSV against POSV, each copy then advanced, and AA..LL against
+    /// PAA..PLL, which `process` snapshotted. Decided here, at the end of every
+    /// cycle that reaches `monitor()`, and posted by the framework from
+    /// [`Record::take_cycle_posted_fields`]. The ODLY-scheduling cycle is not
+    /// one of them: C `return(0)`s at `:407`, so PSVL lags SVAL for the length
+    /// of the delay.
+    fn monitor_strings(&mut self) {
+        let mut posts = 0;
+        if c_str(self.sval.as_bytes()) != c_str(self.psvl.as_bytes()) {
+            posts |= 1;
+            self.psvl.clone_from(&self.sval);
+        }
+        if c_str(self.osv.as_bytes()) != c_str(self.posv.as_bytes()) {
+            posts |= 1 << 1;
+            self.posv.clone_from(&self.osv);
+        }
+        for (i, (new, prev)) in self.str_vals.iter().zip(&self.prev_str_vals).enumerate() {
+            if c_str(new.as_bytes()) != c_str(prev) {
+                posts |= 1 << (2 + i);
+            }
+        }
+        self.string_posts = posts;
     }
 
     /// C `sCalcoutRecord.c::special:463-471` (and the same two lines in
@@ -622,6 +645,13 @@ const SCALCOUT_PREV_STR_NAMES: [&str; 12] = [
 /// scalar `DBF_STRING` channel served over each (calc#42).
 const PREV_STRING_SIZE: usize = 40;
 
+/// The bytes C's `strncmp(a, b, STRING_SIZE)` compares: up to the first NUL,
+/// at most 40.
+fn c_str(s: &[u8]) -> &[u8] {
+    let s = &s[..s.len().min(PREV_STRING_SIZE)];
+    s.iter().position(|&b| b == 0).map_or(s, |n| &s[..n])
+}
+
 /// C `sCalcoutRecord.c::fetch_values`' second loop (890-941): INAA..LL → AA..LL.
 /// Order is C's `sFldnames` order, i.e. the `str_vals` index order.
 static SCALCOUT_STRING_INPUT_LINKS: &[(&str, &str)] = &[
@@ -769,14 +799,39 @@ impl Record for ScalcoutRecord {
     /// else would post them.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask};
-        static CALC_POSTS: [(&str, CyclePostMask); 2] = [
+        // `monitor()`'s string posts carry `monitor_mask|DBE_VALUE|DBE_LOG`.
+        const S: CyclePostMask = CyclePostMask::MonitorValueLog;
+        static POSTS: [(&str, CyclePostMask); 16] = [
             ("CLCV", CyclePostMask::Value),
             ("OCLV", CyclePostMask::Value),
+            ("SVAL", S),
+            ("OSV", S),
+            ("AA", S),
+            ("BB", S),
+            ("CC", S),
+            ("DD", S),
+            ("EE", S),
+            ("FF", S),
+            ("GG", S),
+            ("HH", S),
+            ("II", S),
+            ("JJ", S),
+            ("KK", S),
+            ("LL", S),
         ];
+        let strings = std::mem::take(&mut self.string_posts);
         CycleMarks::of(
-            &CALC_POSTS,
-            u128::from(std::mem::take(&mut self.calc_posts)),
+            &POSTS,
+            u128::from(std::mem::take(&mut self.calc_posts) | strings << 2),
         )
+    }
+
+    /// C posts these only from `monitor()`'s comparisons with the record's own
+    /// copies, never from a change the framework sees.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &[
+            "SVAL", "OSV", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
+        ]
     }
 
     /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.
@@ -850,7 +905,7 @@ impl Record for ScalcoutRecord {
         if self.awaiting_out {
             self.awaiting_out = false;
             self.cached_should_output = false;
-            self.sync_psvl();
+            self.monitor_strings();
             return Ok(ProcessOutcome::complete());
         }
 
@@ -859,7 +914,7 @@ impl Record for ScalcoutRecord {
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             self.exec_output_data();
-            self.sync_psvl();
+            self.monitor_strings();
             // C `:429-431` — the delayed `execOutput` reaches the same
             // `writeValue`, so the continuation can itself go async.
             if let Some(outcome) = self.issue_wait_put() {
@@ -993,7 +1048,7 @@ impl Record for ScalcoutRecord {
             // the write, not the DOPT switch that precedes it.
             self.exec_output_data();
         }
-        self.sync_psvl();
+        self.monitor_strings();
         if let Some(outcome) = self.issue_wait_put() {
             return Ok(outcome);
         }
@@ -1787,6 +1842,32 @@ mod tests {
             rec.multi_output_links().is_empty(),
             "SVAL changed but VAL did not — C's On-Change test is numeric only"
         );
+    }
+
+    /// C `monitor()` posts SVAL only when it differs from PSVL
+    /// (`sCalcoutRecord.c:842-846`), with `monitor_mask|DBE_VALUE|DBE_LOG`.
+    #[test]
+    fn sval_is_posted_from_its_own_previous_copy() {
+        use crate::server::record::CyclePostMask;
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("AA".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.take_cycle_posted_fields();
+        rec.put_field("AA", EpicsValue::String("first".into()))
+            .unwrap();
+        let sval_posts = |rec: &mut ScalcoutRecord| {
+            rec.take_cycle_posted_fields()
+                .filter(|&(f, _)| f == "SVAL")
+                .collect::<Vec<_>>()
+        };
+        rec.process().unwrap();
+        assert_eq!(
+            sval_posts(&mut rec),
+            [("SVAL", CyclePostMask::MonitorValueLog)]
+        );
+        rec.process().unwrap();
+        assert_eq!(sval_posts(&mut rec), [], "SVAL equals PSVL");
     }
 
     #[test]

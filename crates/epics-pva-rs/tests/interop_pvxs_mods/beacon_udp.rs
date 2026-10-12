@@ -165,6 +165,15 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         drop(s);
         p
     };
+    // The server's own search port: on the beacon port its wildcard UDP
+    // collector would share a REUSEPORT group with the client's and take a
+    // unicast beacon by hash.
+    let search_port: u16 = {
+        let s = std::net::UdpSocket::bind((local_v4, 0)).unwrap();
+        let p = s.local_addr().unwrap().port();
+        drop(s);
+        p
+    };
     let pva_port: u16 = {
         let l = std::net::TcpListener::bind((local_v4, 0)).unwrap();
         let p = l.local_addr().unwrap().port();
@@ -195,7 +204,7 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
             format!("{local_v4}:{beacon_port}"),
         )
         .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-        .env("EPICS_PVAS_BROADCAST_PORT", beacon_port.to_string())
+        .env("EPICS_PVAS_BROADCAST_PORT", search_port.to_string())
         // softIocPVX bundles a CA server too — keep it off the
         // default ports so we don't fight other IOCs on the host.
         .env("EPICS_CAS_SERVER_PORT", "0")
@@ -206,6 +215,35 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         .stderr(std::process::Stdio::from(
             std::fs::File::create(&stderr_path).expect("stderr"),
         ));
+
+    // Rust client listening on the same broadcast port, so pvxs's beacons
+    // reach our UDP collector.
+    //
+    // This used to reach the client by mutating the process environment and
+    // justify it with two claims, both false: that nextest serialises
+    // within-binary tests (it runs each in its OWN process, which is a
+    // different thing and says nothing about `cargo test`), and that the
+    // test is single-threaded (it is `flavor = "multi_thread"`, under a
+    // libtest harness that runs tests as threads). `set_var`'s contract is
+    // that no other thread may touch the environment concurrently, and every
+    // sibling test here reads it — `PvaClient`/`PvaServer` for their EPICS_*
+    // config, `pvxs_command` for the library path. So a concurrent run was
+    // both a lost setting and a data race on `environ`.
+    //
+    // The builder takes all three directly and documents each as replacing
+    // what `new()` parsed from env, so nothing is left to share. It also pins
+    // this client to its own search engine rather than the process-wide
+    // shared one, which is the second thing a sibling could have taken from
+    // it.
+    let client = epics_pva_rs::client_native::PvaClient::builder()
+        .timeout(Duration::from_secs(5))
+        .broadcast_port(beacon_port)
+        .auto_addr_list(false)
+        .addr_list(Vec::new())
+        .build();
+    // Listening before softIocPVX starts: pvxs sends one beacon at start
+    // and the next 15 s later (server.cpp beaconIntervalShort).
+    let mut rx = client.discover().await.expect("client.discover()");
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -233,43 +271,7 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         );
     }
 
-    // Rust client listening on the same broadcast port, so pvxs's beacons
-    // reach our UDP collector.
-    //
-    // This used to reach the client by mutating the process environment and
-    // justify it with two claims, both false: that nextest serialises
-    // within-binary tests (it runs each in its OWN process, which is a
-    // different thing and says nothing about `cargo test`), and that the
-    // test is single-threaded (it is `flavor = "multi_thread"`, under a
-    // libtest harness that runs tests as threads). `set_var`'s contract is
-    // that no other thread may touch the environment concurrently, and every
-    // sibling test here reads it — `PvaClient`/`PvaServer` for their EPICS_*
-    // config, `pvxs_command` for the library path. So a concurrent run was
-    // both a lost setting and a data race on `environ`.
-    //
-    // The builder takes all three directly and documents each as replacing
-    // what `new()` parsed from env, so nothing is left to share. It also pins
-    // this client to its own search engine rather than the process-wide
-    // shared one, which is the second thing a sibling could have taken from
-    // it.
-    let client = epics_pva_rs::client_native::PvaClient::builder()
-        .timeout(Duration::from_secs(5))
-        .broadcast_port(beacon_port)
-        .auto_addr_list(false)
-        .addr_list(Vec::new())
-        .build();
-    let mut rx = match client.discover().await {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("client.discover() failed: {e:?}");
-        }
-    };
-
     // Wait up to 4 s for the first Discovered event from pvxs.
-    // softIocPVX bursts beacons every 200 ms by default for the
-    // initial period — should see one well within 4 s.
     let discovered = tokio::time::timeout(Duration::from_secs(4), rx.recv()).await;
 
     let _ = child.kill();

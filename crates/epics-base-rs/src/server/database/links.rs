@@ -992,6 +992,21 @@ impl PvDatabase {
     /// read routes through the lset's lazy-open path: the first read
     /// opens the CA link and returns `None` until the monitor connects,
     /// then serves the cached value — exactly C `dbCaGetLink`.
+    /// C `dbGetLink` from inside `init_record`: a local DB link's value,
+    /// read without processing. Any other link delivers nothing at init.
+    pub(super) fn read_link_at_init(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<EpicsValue> {
+        let crate::server::record::ParsedLink::Db(db) = link else {
+            return None;
+        };
+        match self.read_db_target(db) {
+            TargetValue::Record(value, ..) | TargetValue::NoRecord(value) => value,
+            TargetValue::External => None,
+        }
+    }
+
     fn read_db_link_value(&self, db: &crate::server::record::DbLink) -> Option<EpicsValue> {
         let target = db.target();
         // A filtered target that is NOT local stays whole: C hands

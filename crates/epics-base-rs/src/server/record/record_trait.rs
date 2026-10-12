@@ -6621,6 +6621,16 @@ pub trait Record: Send + Sync + 'static {
     /// Additive, framework-set-hook pattern. Default: ignore.
     fn init_links(&mut self, _common: &crate::server::record::CommonFields) {}
 
+    /// The links C's `init_record(prec, 1)` reads with `dbGetLink`, as (link
+    /// field, value field) pairs. At `iocInit`, after every record's pass 0,
+    /// the framework reads each once without processing and stores it through
+    /// [`Self::put_field_internal`] before `init_record(1)`. Only a local DB
+    /// link delivers: a CA link is not connected yet at init in C either, and
+    /// a constant link's `getValue` writes nothing.
+    fn init_link_reads(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// Called by the framework before process() to indicate whether device
     /// support's read() already performed the record's compute step.
     /// Override in records that have a built-in compute (e.g., epid PID)

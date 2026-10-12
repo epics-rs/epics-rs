@@ -3506,10 +3506,20 @@ impl PvDatabase {
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
     fn init_deferred_record(&self, name: &str, rec_arc: &Arc<RecordCell>, reached: bool) {
+        let init_reads = if reached {
+            self.read_init_links(rec_arc)
+        } else {
+            Vec::new()
+        };
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
             let instance = &mut *guard;
             if reached {
+                for (field, value) in init_reads {
+                    if let Err(e) = instance.record.put_field_internal(field, value) {
+                        eprintln!("init link read into {name}.{field} failed: {e}");
+                    }
+                }
                 instance.run_init_pass1(name);
             }
             super::database::processing::seed_constant_links(instance);
@@ -3534,6 +3544,29 @@ impl PvDatabase {
             inst.record.init_links(&inst.common);
         }
         self.rec_gbl_init_constant_links(rec_arc);
+    }
+
+    /// The values of `rec_arc`'s [`Record::init_link_reads`], read with no
+    /// lock of its own held, so a link to the record itself reads it too.
+    ///
+    /// [`Record::init_link_reads`]: crate::server::record::Record::init_link_reads
+    fn read_init_links(&self, rec_arc: &Arc<RecordCell>) -> Vec<(&'static str, EpicsValue)> {
+        let links: Vec<_> = {
+            let instance = rec_arc.read();
+            instance
+                .record
+                .init_link_reads()
+                .iter()
+                .filter_map(|&(link, field)| Some((instance.link_text(link)?, field)))
+                .collect()
+        };
+        links
+            .into_iter()
+            .filter_map(|(text, field)| {
+                let link = crate::server::record::parse_link_v2(&text);
+                Some((field, self.read_link_at_init(&link)?))
+            })
+            .collect()
     }
 
     /// Verify that `name` is not currently registered in any of the

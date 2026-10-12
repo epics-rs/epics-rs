@@ -68,9 +68,8 @@ impl Delivery {
     /// An update of `read` written over by its own log.
     #[cfg(test)]
     pub(crate) fn of_read(read: Snapshot) -> Self {
-        let log = MonitorEvent::from_snapshot(
-            std::sync::Arc::new(read.clone()),
-            0,
+        let log = MonitorEvent::read_log(
+            &mut read.clone(),
             epics_base_rs::server::recgbl::EventMask::VALUE,
         );
         Self {
@@ -307,15 +306,14 @@ mod tests {
 
         let (outbox, mut drain): (Outbox, OutboxDrain) = crate::server::outbox::channel();
 
-        let snapshot = Snapshot::new(
+        let mut snapshot = Snapshot::new(
             EpicsValue::Long(42),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let event = MonitorEvent::from_snapshot(
-            std::sync::Arc::new(snapshot),
-            0,
+        let event = MonitorEvent::read_log(
+            &mut snapshot,
             epics_base_rs::server::recgbl::EventMask::VALUE,
         );
 

@@ -6314,15 +6314,39 @@ impl RecordInstance {
     /// `DBR_CHAR` address read the same buffer differently, so each channel
     /// projects for itself, and a `String` here would already have lost `LEN`.
     pub fn project_to_declared_type(&self, field: &str, value: EpicsValue) -> EpicsValue {
-        match self.declared_field_type(field) {
-            Some(DbFieldType::String)
+        match self.declared_projection(field, &value) {
+            Some(declared) => value.into_type(declared),
+            None => value,
+        }
+    }
+
+    /// [`Self::project_to_declared_type`] of a borrowed `value`, copying it
+    /// only when the projection changes it: a post whose log reads a wide
+    /// field by reference must not copy it to find that out.
+    fn declared_view<'v>(&self, field: &str, value: &'v EpicsValue) -> Cow<'v, EpicsValue> {
+        match self.declared_projection(field, value) {
+            Some(declared) => Cow::Owned(value.clone().into_type(declared)),
+            None => Cow::Borrowed(value),
+        }
+    }
+
+    /// The type [`Self::project_to_declared_type`] converts `value` to, or
+    /// `None` when it already serves as it is.
+    fn declared_projection(&self, field: &str, value: &EpicsValue) -> Option<DbFieldType> {
+        match self.declared_field_type(field)? {
+            DbFieldType::String
                 if matches!(value, EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
                     && self.record.field_is_long_string(field) =>
             {
-                value
+                None
             }
-            Some(declared) => value.into_type(declared),
-            None => value,
+            declared
+                if value.db_field_type() == declared
+                    && !matches!(value, EpicsValue::EnumWithChoices { .. }) =>
+            {
+                None
+            }
+            declared => Some(declared),
         }
     }
 
@@ -6402,7 +6426,7 @@ impl RecordInstance {
         // the CA create-channel path announced from `client_field_value` and
         // the same one the monitor path posts.
         let value = self.client_field_value(field)?;
-        Some(self.finish_field_snapshot(field, value, backing))
+        Some(self.served_field_snapshot(field, value, backing))
     }
 
     /// Which of this record's own link fields, if any, supplies `field`'s
@@ -6448,17 +6472,31 @@ impl RecordInstance {
         backing: LinkBacking<'_>,
     ) -> Option<super::super::snapshot::Snapshot> {
         let value = self.channel_field_value(field, string_view)?;
-        Some(self.finish_field_snapshot(field, value, backing))
+        Some(self.served_field_snapshot(field, value, backing))
+    }
+
+    /// A GET door's snapshot: [`Self::finish_field_snapshot`] with the
+    /// `Q:time:tag` nsec split pvxs applies to every read
+    /// (`iocsource.cpp:239-248`). A monitor post carries the raw stamp, as
+    /// `db_create_field_log` copies `prec->time` (`dbEvent.c:713`); the PVA
+    /// consumer splits it with the mask its subscription read once.
+    fn served_field_snapshot(
+        &self,
+        field: &str,
+        value: EpicsValue,
+        backing: LinkBacking<'_>,
+    ) -> super::super::snapshot::Snapshot {
+        let mut snap = self.finish_field_snapshot(field, value, backing);
+        crate::server::snapshot::apply_nsec_mask(&mut snap, self.qtime_nsec_mask());
+        snap
     }
 
     /// The one finishing pipeline behind both `Snapshot` producers
     /// ([`Self::snapshot_for_field`] for GET, [`Self::make_monitor_snapshot`]
     /// for updates). Every step that shapes a served snapshot — alarm/utag
     /// carry, the metadata cache, per-field routing and RSET overrides, menu
-    /// enums, property support, the `Q:time:tag` nsec split — runs here, so
-    /// the two paths cannot drift apart. Upstream pvxs PR #189 is exactly
-    /// that drift: its subscription callback served unmasked nanoseconds
-    /// while its GET path applied the nsec mask.
+    /// enums, property support — runs here, so the two paths cannot drift
+    /// apart.
     fn finish_field_snapshot(
         &self,
         field: &str,
@@ -6475,8 +6513,8 @@ impl RecordInstance {
         // mirroring pvxs `iocsource.cpp:245` (`auto utag = meta.utag;`).
         // The 64-bit `epicsUTag` narrows to the int32 NT wire field by
         // truncating to the low 32 bits — pvxs assigns the same uint64
-        // straight into the `Int32` `timeStamp.userTag`. The `Q:time:tag`
-        // nsec-LSB split below overrides this when configured, matching
+        // straight into the `Int32` `timeStamp.userTag`. A GET door's
+        // `Q:time:tag` split overrides this when configured, matching
         // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
         // (:246-247 — the test and its assignment).
         snap.user_tag = self.common.utag as i32;
@@ -6520,16 +6558,6 @@ impl RecordInstance {
         // settled value, so they cannot disagree.
         self.assign_property_support(field, &mut snap);
 
-        // apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
-        // `iocsource.cpp:239-248` publishes `nanoseconds & ~nsecMask` and
-        // moves `nanoseconds & nsecMask` into `timeStamp.userTag`. The
-        // split is applied to both `snap.timestamp` and `snap.user_tag` so
-        // downstream encoders (NTScalar `timeStamp`, QSRV groups) all see
-        // the same shape. A zero mask (tag absent or unparseable) is a
-        // no-op inside the helper, exactly as pvxs's `if(info.nsecMask)`
-        // gate is.
-        crate::server::snapshot::apply_nsec_mask(&mut snap, self.qtime_nsec_mask());
-
         snap
     }
 
@@ -6553,7 +6581,7 @@ impl RecordInstance {
     /// match and leave the timestamp alone. There is no bounds clamp
     /// either: any `dig` `epicsParseInt32` accepts is shifted verbatim, so
     /// `nsec:lsb:31` yields the `0x7FFF_FFFF` mask pvxs actually serves.
-    fn qtime_nsec_mask(&self) -> u64 {
+    pub fn qtime_nsec_mask(&self) -> u64 {
         let Some(rest) = self
             .get_info("Q:time:tag")
             .and_then(|v| v.strip_prefix("nsec:lsb:"))
@@ -8611,23 +8639,14 @@ impl RecordInstance {
                 snapshot.push((name(), val, EventMask::LOG | alarm_bits));
             }
         }
-        // A guarded secondary post lands whether or not the field has a
-        // subscriber, exactly as C calls `db_post_events` (aoRecord.c:541);
-        // the ones nobody watches are dropped below, after the published
-        // values have advanced.
-        if let Some(forced_mask) = forced_mask {
-            for (index, (name, gate)) in value_masked.iter().enumerate() {
-                if secondary_fired & (1 << index) == 0 {
-                    continue;
-                }
-                let mask = match gate {
-                    ValuePostGate::OnChangeForced => forced_mask,
-                    _ => deadband_mask,
-                };
-                if let Some(val) = self.resolve_field(name) {
-                    snapshot.push((Cow::Borrowed(name), val, mask));
-                }
-            }
+        if let Some(forced_mask) = forced_mask.filter(|_| secondary_fired != 0) {
+            self.post_forced_secondaries(
+                snapshot,
+                value_masked,
+                secondary_fired,
+                forced_mask,
+                deadband_mask,
+            );
         }
         // Every post the cycle made is published whether or not anyone
         // watches the field: advance the published values first, then hand on
@@ -8648,6 +8667,45 @@ impl RecordInstance {
                     .get(field.as_ref())
                     .is_some_and(|subs| !subs.is_empty())
         });
+    }
+
+    /// The secondary posts `collect_subscriber_posts` decided fired. A guarded
+    /// secondary post lands whether or not the field has a subscriber, as C
+    /// calls `db_post_events` (aoRecord.c:536-549); one nobody watches only
+    /// advances its published value, since pushed it would spill the snapshot
+    /// to the heap for a post `retain` drops. Out of line: inlined, it cost
+    /// every unmonitored ai/calc cycle 6-9 instructions it never runs.
+    #[inline(never)]
+    fn post_forced_secondaries(
+        &mut self,
+        snapshot: &mut ProcessSnapshot,
+        value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
+        fired: u64,
+        forced_mask: EventMask,
+        deadband_mask: EventMask,
+    ) {
+        use crate::server::record::ValuePostGate;
+        for (index, (name, gate)) in value_masked.iter().enumerate() {
+            if fired & (1 << index) == 0 {
+                continue;
+            }
+            let mask = match gate {
+                ValuePostGate::OnChangeForced => forced_mask,
+                _ => deadband_mask,
+            };
+            let Some(val) = self.resolve_field(name) else {
+                continue;
+            };
+            if self
+                .subscribers
+                .get(*name)
+                .is_some_and(|subs| !subs.is_empty())
+            {
+                snapshot.push((Cow::Borrowed(name), val, mask));
+            } else {
+                self.record_value_post(name, val);
+            }
+        }
     }
 
     /// The posts an `AsyncPendingNotify` pass publishes — the single owner both
@@ -9141,11 +9199,23 @@ impl RecordInstance {
         value: EpicsValue,
         backing: LinkBacking<'_>,
     ) -> Option<super::super::snapshot::Snapshot> {
+        if self.post_refused(field, backing) {
+            return None;
+        }
         // A monitor update is posted from the record's own change-detection
         // loop, which hands over the STORED variant. Project it onto the
         // field's declared type here, at the same owner the GET path and the
         // CA create-channel path use, or a client that was told `DBR_ENUM` at
         // create time would be posted a `DBR_SHORT` update.
+        let value = self.project_to_declared_type(field, value);
+        Some(self.finish_field_snapshot(field, value, backing))
+    }
+
+    /// Whether a post of `field` under `backing` is refused: the window
+    /// [`Self::make_monitor_snapshot`] describes, in which a subscriber that
+    /// attached mid-cycle takes its first event from the next cycle, as C's
+    /// `db_add_event` under `dbScanLock` would (`dbEvent.c:730`).
+    fn post_refused(&self, field: &str, backing: LinkBacking<'_>) -> bool {
         // The poster's obligation, checked rather than trusted: a link-backed
         // field carries its target's units/precision/limits, and only a caller
         // holding no record lock can resolve them. A `LinkBacking::none()`
@@ -9164,19 +9234,26 @@ impl RecordInstance {
              at a point where it holds no record lock",
             self.name
         );
-        // The window above. Cheap enum test first — a declined backing only
-        // ever comes from the poster door, so every other caller pays one
-        // discriminant compare and never the field lookup.
-        if backing.is_declined()
+        // Cheap enum test first — a declined backing only ever comes from the
+        // poster door, so every other caller pays one discriminant compare
+        // and never the field lookup.
+        backing.is_declined()
             && self
                 .record
                 .link_backed_metadata_field(&upper_field(field))
                 .is_some()
-        {
-            return None;
+    }
+
+    /// The record's half of every field log a post makes now
+    /// (`db_create_field_log`, `dbEvent.c:704-713`).
+    fn log_head(&self) -> crate::server::pv::LogHead<'_> {
+        crate::server::pv::LogHead {
+            stat: self.common.stat,
+            sevr: self.common.sevr as u16,
+            amsg: self.common.amsg.as_str(),
+            time: self.common.time.into(),
+            utag: self.common.utag as i32,
         }
-        let value = self.project_to_declared_type(field, value);
-        Some(self.finish_field_snapshot(field, value, backing))
     }
 
     /// Apply a record's per-field metadata override (C RSET
@@ -9900,20 +9977,19 @@ impl RecordInstance {
         // The cycle's posts are one burst: no reader wakes before the last
         // is queued, as none could take C's `dbScanLock` until it was.
         let mut burst = crate::server::event_queue::PostBurst::new();
+        let head = self.log_head();
 
         for (field, value, posting_mask) in snapshot.iter() {
             let posting_mask = *posting_mask;
             if let Some(subs) = self.subscribers.get(field.as_ref()) {
-                // Build a full snapshot once per field (with display
-                // metadata) and hand every subscriber a reference to that one
-                // snapshot — C posts the fixed-size `db_field_log` and reads
-                // the wide value by reference at delivery (`camessage.c:516`),
-                // so a per-subscriber deep copy of an array value is a port
-                // deviation, not parity.
-                let Some(snap) = self.make_monitor_snapshot(field, value.clone(), backing) else {
+                // Each subscriber's log copies the record's alarm, time and
+                // utag and a scalar value; a wider one is read at delivery
+                // (`dbEvent.c:704-730`). No metadata rides on a post: the
+                // consumer reads it when it serves a class that carries it.
+                if self.post_refused(field, backing) {
                     continue;
-                };
-                let mon_snap = Arc::new(snap);
+                }
+                let value = self.declared_view(field, value);
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.
@@ -9929,7 +10005,7 @@ impl RecordInstance {
                         // Server-side filter chain (3.15.7). Empty chain
                         // is identity, so no behaviour change for the
                         // common no-filter case.
-                        let Some(event) = sub.filtered_log(&mon_snap, origin, mask) else {
+                        let Some(event) = sub.filtered_log(head, &value, origin, mask) else {
                             continue;
                         };
                         // C `db_queue_event_log`: append, or replace this
@@ -10147,16 +10223,16 @@ impl RecordInstance {
             self.record_value_post_as(field, walk_skip, value);
             return;
         }
-        let posted = publishes_value.then(|| value.clone());
         // A refused post publishes nothing, so it must not advance
         // `last_posted` either, or the next cycle's change detector would
         // treat the value as already delivered and the subscriber would never
-        // see it: `posted` dies with this return.
-        let Some(snap) = self.make_monitor_snapshot(field, value, backing) else {
+        // see it.
+        if self.post_refused(field, backing) {
             return;
-        };
+        }
         {
-            let mon_snap = Arc::new(snap);
+            let head = self.log_head();
+            let logged = self.declared_view(field, &value);
             let mut own;
             let burst = match burst {
                 Some(burst) => burst,
@@ -10181,7 +10257,7 @@ impl RecordInstance {
                     // existing subscribers see no behaviour
                     // change. A filter returning `None` silences
                     // this event for this subscriber only.
-                    let Some(event) = sub.filtered_log(&mon_snap, origin, mask) else {
+                    let Some(event) = sub.filtered_log(head, &logged, origin, mask) else {
                         continue;
                     };
                     // Same single post owner as the snapshot path.
@@ -10196,7 +10272,7 @@ impl RecordInstance {
         // an empty `mlis` — C still leaves `monitor()`'s `*_lst` state
         // advanced by the cycle that ran, so the post, not the delivery, is
         // what counts.
-        if let Some(value) = posted {
+        if publishes_value {
             self.record_value_post_as(field, walk_skip, value);
         }
     }
@@ -10981,14 +11057,11 @@ mod metadata_cache_tests {
         assert_eq!(snap.timestamp.unix_secs(), 42);
     }
 
-    /// The monitor path applies the same `Q:time:tag` nsec split as GET.
-    /// Pre-fix, `make_monitor_snapshot` skipped `apply_nsec_mask`, so a
-    /// monitor update on a `nsec:lsb:N` record posted the raw nanoseconds
-    /// and the record utag while a GET of the same channel served the
-    /// split — upstream pvxs PR #189 is the same defect in its
-    /// `subscriptionCallback`.
+    /// A monitor post carries the raw stamp and utag whatever `Q:time:tag`
+    /// says, as `db_create_field_log` copies `prec->time` (`dbEvent.c:710`);
+    /// the split is the PVA consumer's, from the mask its subscription read.
     #[test]
-    fn qtime_nsec_mask_applies_on_the_monitor_path() {
+    fn qtime_nsec_mask_leaves_the_monitor_post_raw() {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
         // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
@@ -11000,8 +11073,8 @@ mod metadata_cache_tests {
         let mon = inst
             .make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none())
             .expect("nothing was declined: the backing is unresolved, not declined");
-        assert_eq!(mon.user_tag, 123_456_700);
-        assert_eq!(mon.timestamp.subsec_nanos(), 0);
+        assert_eq!(mon.user_tag, 5);
+        assert_eq!(mon.timestamp.subsec_nanos(), 123_456_700);
         assert_eq!(mon.timestamp.unix_secs(), 42);
     }
 

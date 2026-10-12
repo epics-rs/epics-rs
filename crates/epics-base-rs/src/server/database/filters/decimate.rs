@@ -71,14 +71,8 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev(v: f64, mask: EventMask) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(
-                EpicsValue::Double(v),
-                0,
-                0,
-                SystemTime::UNIX_EPOCH,
-            )),
-            0,
+        FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
             mask,
         ))
     }

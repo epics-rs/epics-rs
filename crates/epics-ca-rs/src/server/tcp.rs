@@ -7217,7 +7217,7 @@ mod delivery_reads_options {
         snap.alarm.severity = severity;
         snap.timestamp = epics_base_rs::types::WallTime::from_unix(1_700_000_000, 500);
         snap.user_tag = 5;
-        MonitorEvent::from_snapshot(Arc::new(snap), 0, EventMask::VALUE)
+        MonitorEvent::read_log(&mut snap, EventMask::VALUE)
     }
 
     async fn deliver(m: &CircuitMonitor, event: MonitorEvent) -> Snapshot {
@@ -7319,7 +7319,7 @@ mod delivery_reads_options {
         let pv = Arc::new(ProcessVariable::new("S".into(), EpicsValue::Double(0.0)));
         let m = monitor(&db, ChannelTarget::SimplePv(pv.clone()), DBR_CLASS_NAME);
         let (outbox, mut drain) = crate::server::outbox::channel();
-        let event = MonitorEvent::from_snapshot(Arc::new(pv.snapshot()), 0, EventMask::VALUE);
+        let event = MonitorEvent::read_log(&mut pv.snapshot(), EventMask::VALUE);
         crate::server::monitor::deliver_monitor_event(&m, event, &outbox).await;
         let frame = drain.try_next().expect("one frame");
         assert_eq!(&frame[16..56], &[0u8; 40][..]);
@@ -7354,7 +7354,7 @@ record(stringin, "SI") { field(SIMM, "YES") field(SIOL, "abc") field(SIMS, "MAJO
             let mut snap = get_full_snapshot(&db, &target).unwrap();
             snap.alarm.ackt = Some(0);
             snap.alarm.acks = Some(0);
-            let event = MonitorEvent::from_snapshot(Arc::new(snap), 0, EventMask::ALARM);
+            let event = MonitorEvent::read_log(&mut snap, EventMask::ALARM);
             let m = monitor(&db, target, epics_base_rs::types::DBR_STSACK_STRING);
             let (outbox, mut drain) = crate::server::outbox::channel();
             deliver_record_field_event(&m, event, &outbox).await;

@@ -6,7 +6,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::EventMask;
@@ -77,8 +76,8 @@ fn bo(v: u16) -> Snapshot {
     snap
 }
 
-fn event(snap: Snapshot) -> MonitorEvent {
-    MonitorEvent::from_snapshot(Arc::new(snap), 0, EventMask::VALUE | EventMask::ALARM)
+fn event(mut snap: Snapshot) -> MonitorEvent {
+    MonitorEvent::read_log(&mut snap, EventMask::VALUE | EventMask::ALARM)
 }
 
 /// The server's queue, as `push_squash_monitor` keeps it: below the limit a
@@ -108,7 +107,7 @@ fn assert_posts_fill_in_place(snap: impl Fn(u32) -> Snapshot) {
             n += 1;
             let s = snap(n);
             let ev = event(s.clone());
-            let (update, posted) = allocs(|| marked_update(&mut ring, ev, || None));
+            let (update, posted) = allocs(|| marked_update(&mut ring, ev, 0, || None));
             let update = update.expect("a VALUE post marks leaves");
             let (_, filled) = allocs(|| {
                 let marks = crate::nt::event_leaves(
@@ -193,7 +192,7 @@ fn only_a_property_post_reads_metadata() {
     for n in 0..20 {
         let mut s = ai(f64::from(n));
         s.display.as_mut().expect("display").units = "WRONG".into();
-        let update = marked_update(&mut ring, event(s), || {
+        let update = marked_update(&mut ring, event(s), 0, || {
             reads += 1;
             None
         })
@@ -205,8 +204,8 @@ fn only_a_property_post_reads_metadata() {
 
     let mut egu = ai(0.0);
     egu.display.as_mut().expect("display").units = "um".into();
-    let property = MonitorEvent::from_snapshot(Arc::new(ai(0.0)), 0, EventMask::PROPERTY);
-    let update = marked_update(&mut ring, property, || {
+    let property = MonitorEvent::read_log(&mut ai(0.0), EventMask::PROPERTY);
+    let update = marked_update(&mut ring, property, 0, || {
         reads += 1;
         Some(egu.clone())
     })
@@ -217,7 +216,7 @@ fn only_a_property_post_reads_metadata() {
     push(&mut queue, update);
     for n in 0..2 * LIMIT {
         let update =
-            marked_update(&mut ring, event(ai(f64::from(n))), || None).expect("a value post");
+            marked_update(&mut ring, event(ai(f64::from(n))), 0, || None).expect("a value post");
         assert_eq!(units(&update.value), want, "every slot takes the new read");
         push(&mut queue, update);
     }
@@ -243,7 +242,7 @@ fn an_events_own_metadata_changes_no_display_or_control_leaf() {
     let c = stale.control.as_mut().expect("control");
     c.upper_ctrl_limit = 99.0;
     c.lower_ctrl_limit = -99.0;
-    let update = marked_update(&mut ring, event(stale.clone()), || {
+    let update = marked_update(&mut ring, event(stale.clone()), 0, || {
         panic!("a value post reads no metadata")
     })
     .expect("a value post");

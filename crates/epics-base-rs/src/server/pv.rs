@@ -279,6 +279,29 @@ impl LogData {
 /// C `DB_AMSG_SIZE`: the message and its NUL.
 const AMSG_SIZE: usize = 40;
 
+/// The poster's side of a field log: what `db_create_field_log` copies off
+/// the record (`dbEvent.c:704-713`), borrowed until the log copies it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LogHead<'a> {
+    pub(crate) stat: u16,
+    pub(crate) sevr: u16,
+    pub(crate) amsg: &'a str,
+    pub(crate) time: WallTime,
+    pub(crate) utag: i32,
+}
+
+impl<'a> LogHead<'a> {
+    pub(crate) fn of(snapshot: &'a Snapshot) -> Self {
+        Self {
+            stat: snapshot.alarm.status,
+            sevr: snapshot.alarm.severity,
+            amsg: &snapshot.alarm.amsg,
+            time: snapshot.timestamp,
+            utag: snapshot.user_tag,
+        }
+    }
+}
+
 /// C `db_field_log` as `db_create_event_log` fills it (`dbEvent.c:702-730`):
 /// fixed size, so an event queue holds it in its own ring and a post copies
 /// into storage made at attach.
@@ -307,24 +330,24 @@ pub struct PostLog {
 
 impl PostLog {
     fn new(
-        snapshot: &Snapshot,
+        head: LogHead<'_>,
         value: LogData,
         origin: u64,
         mask: crate::server::recgbl::EventMask,
     ) -> Self {
         let mut amsg = [0u8; AMSG_SIZE];
-        let text = snapshot.alarm.amsg.as_str();
+        let text = head.amsg;
         let mut n = text.len().min(AMSG_SIZE - 1);
         while !text.is_char_boundary(n) {
             n -= 1;
         }
         amsg[..n].copy_from_slice(&text.as_bytes()[..n]);
         Self {
-            stat: snapshot.alarm.status,
-            sevr: snapshot.alarm.severity,
+            stat: head.stat,
+            sevr: head.sevr,
             amsg,
-            time: snapshot.timestamp,
-            utag: snapshot.user_tag,
+            time: head.time,
+            utag: head.utag,
             mask,
             origin,
             value,
@@ -380,31 +403,33 @@ impl MonitorEvent {
         origin: u64,
         mask: crate::server::recgbl::EventMask,
     ) -> Self {
-        let value = NativeValue::of(&snapshot.value).map_or(LogData::Ref, LogData::Val);
-        Self {
-            log: PostLog::new(snapshot, value, origin, mask),
-        }
+        Self::posted(LogHead::of(snapshot), &snapshot.value, origin, mask)
     }
 
-    /// [`Self::post_log`] with the value copied whatever its width, for a
-    /// filter chain to run on.
-    fn copied(snapshot: &Snapshot, origin: u64, mask: crate::server::recgbl::EventMask) -> Self {
-        let value = LogData::holding(snapshot.value.clone());
-        Self {
-            log: PostLog::new(snapshot, value, origin, mask),
-        }
-    }
-
-    /// An event holding `snapshot`'s value, alarm, time and utag, its value
-    /// copied whatever its width.
-    pub fn from_snapshot(
-        snapshot: Arc<Snapshot>,
+    /// [`Self::post_log`] of `head` and `value`.
+    pub(crate) fn posted(
+        head: LogHead<'_>,
+        value: &EpicsValue,
         origin: u64,
         mask: crate::server::recgbl::EventMask,
     ) -> Self {
-        let mut log = PostLog::new(&snapshot, LogData::Ref, origin, mask);
-        log.value = LogData::holding(Arc::unwrap_or_clone(snapshot).value);
-        Self { log }
+        let value = NativeValue::of(value).map_or(LogData::Ref, LogData::Val);
+        Self {
+            log: PostLog::new(head, value, origin, mask),
+        }
+    }
+
+    /// [`Self::posted`] with the value copied whatever its width, for a
+    /// filter chain to run on.
+    fn copied(
+        head: LogHead<'_>,
+        value: &EpicsValue,
+        origin: u64,
+        mask: crate::server::recgbl::EventMask,
+    ) -> Self {
+        Self {
+            log: PostLog::new(head, LogData::holding(value.clone()), origin, mask),
+        }
     }
 
     pub(crate) fn into_log(self) -> PostLog {
@@ -514,7 +539,7 @@ impl MonitorEvent {
     pub fn read_log(read: &mut Snapshot, mask: crate::server::recgbl::EventMask) -> Self {
         let value = LogData::holding(std::mem::replace(&mut read.value, EpicsValue::Long(0)));
         Self {
-            log: PostLog::new(read, value, 0, mask),
+            log: PostLog::new(LogHead::of(read), value, 0, mask),
         }
     }
 
@@ -640,23 +665,24 @@ impl Subscriber {
     }
 
     /// C `db_create_event_log` then `dbChannelRunPreChain`: this monitor's
-    /// log of `snapshot`, or `None` when a filter drops it. A monitor with a
-    /// filter chain gets the value copied whatever its width — C's `arr`
-    /// copies a reference log too (`arr.c`), and the chain has no field to
-    /// read here; the copy is the filter's cost.
+    /// log of `head` and `value`, or `None` when a filter drops it. A monitor
+    /// with a filter chain gets the value copied whatever its width — C's
+    /// `arr` copies a reference log too (`arr.c`), and the chain has no field
+    /// to read here; the copy is the filter's cost.
     pub(crate) fn filtered_log(
         &self,
-        snapshot: &Snapshot,
+        head: LogHead<'_>,
+        value: &EpicsValue,
         origin: u64,
         mask: crate::server::recgbl::EventMask,
     ) -> Option<MonitorEvent> {
         use crate::server::database::filters::FilteredMonitorEvent;
         if self.filters.is_empty() {
-            return Some(MonitorEvent::post_log(snapshot, origin, mask));
+            return Some(MonitorEvent::posted(head, value, origin, mask));
         }
         self.filters
             .apply(FilteredMonitorEvent::new(MonitorEvent::copied(
-                snapshot, origin, mask,
+                head, value, origin, mask,
             )))
             .map(|fe| fe.event)
     }
@@ -667,7 +693,7 @@ impl Subscriber {
     /// before `db_event_disable`.
     pub(crate) fn post_single(&self, snapshot: Arc<Snapshot>) {
         let mask = crate::server::recgbl::EventMask::from_bits(self.mask);
-        if let Some(event) = self.filtered_log(&snapshot, 0, mask) {
+        if let Some(event) = self.filtered_log(LogHead::of(&snapshot), &snapshot.value, 0, mask) {
             self.post(&mut PostBurst::new(), event);
         }
     }
@@ -1119,7 +1145,9 @@ impl ProcessVariable {
             // The channel-filter chain may suppress this event (e.g.
             // `dbnd` deadband not crossed); the event's mask tells value
             // filters whether to pass through (446e0d4a).
-            let Some(event) = sub.filtered_log(&snapshot, origin, mask) else {
+            let Some(event) =
+                sub.filtered_log(LogHead::of(&snapshot), &snapshot.value, origin, mask)
+            else {
                 continue;
             };
             // C `db_queue_event_log`: the queue appends, or replaces this

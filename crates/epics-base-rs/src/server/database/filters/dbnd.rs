@@ -205,14 +205,8 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev(v: f64, mask: EventMask) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(
-                EpicsValue::Double(v),
-                0,
-                0,
-                SystemTime::UNIX_EPOCH,
-            )),
-            0,
+        FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
             mask,
         ))
     }
@@ -422,17 +416,13 @@ mod tests {
     #[test]
     fn non_numeric_passes() {
         let f = DeadbandFilter::absolute(1.0);
-        let snap = Snapshot::new(
+        let mut snap = Snapshot::new(
             EpicsValue::String("hello".into()),
             0,
             0,
             SystemTime::UNIX_EPOCH,
         );
-        let event = FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(snap),
-            0,
-            EventMask::VALUE,
-        ));
+        let event = FilteredMonitorEvent::new(MonitorEvent::read_log(&mut snap, EventMask::VALUE));
         assert!(f.apply(event).is_some());
     }
 }

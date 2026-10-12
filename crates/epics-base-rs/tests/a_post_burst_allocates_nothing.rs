@@ -170,14 +170,13 @@ fn a_val_post_allocates_nothing_on_any_arm() {
 }
 
 fn owned(v: f64) -> MonitorEvent {
-    MonitorEvent::from_snapshot(
-        Arc::new(Snapshot::new(
+    MonitorEvent::read_log(
+        &mut Snapshot::new(
             EpicsValue::DoubleArray(vec![v; 64].into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
-        )),
-        0,
+        ),
         EventMask::VALUE,
     )
 }

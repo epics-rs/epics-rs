@@ -1770,9 +1770,8 @@ mod tests {
         use crate::server::pv::MonitorEvent;
         use crate::server::recgbl::EventMask;
         use crate::server::snapshot::Snapshot;
-        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            Arc::new(Snapshot::new(v, 0, 0, std::time::SystemTime::UNIX_EPOCH)),
-            0,
+        FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(v, 0, 0, std::time::SystemTime::UNIX_EPOCH),
             EventMask::VALUE,
         ))
     }

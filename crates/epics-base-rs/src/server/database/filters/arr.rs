@@ -226,14 +226,13 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev_array(v: Vec<f64>) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(
+        FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(
                 EpicsValue::DoubleArray(v.into()),
                 0,
                 0,
                 SystemTime::UNIX_EPOCH,
-            )),
-            0,
+            ),
             EventMask::VALUE,
         ))
     }
@@ -347,14 +346,8 @@ mod tests {
     #[test]
     fn scalar_passes_unchanged() {
         let f = ArrayFilter::new(ArrayFilterConfig::default());
-        let ev = FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(
-                EpicsValue::Double(3.14),
-                0,
-                0,
-                SystemTime::UNIX_EPOCH,
-            )),
-            0,
+        let ev = FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(EpicsValue::Double(3.14), 0, 0, SystemTime::UNIX_EPOCH),
             EventMask::VALUE,
         ));
         let out = f.apply(ev).unwrap();
@@ -385,14 +378,13 @@ mod tests {
     fn mr_r25_uint64_array_is_sliced() {
         let big = u64::MAX; // > i64::MAX, must survive the slice
         let f = ArrayFilter::new(ArrayFilterConfig::new(1, 1, 2));
-        let ev = FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(
+        let ev = FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(
                 EpicsValue::UInt64Array(vec![0, big, big - 1, 7].into()),
                 0,
                 0,
                 SystemTime::UNIX_EPOCH,
-            )),
-            0,
+            ),
             EventMask::VALUE,
         ));
         let out = f.apply(ev).unwrap();

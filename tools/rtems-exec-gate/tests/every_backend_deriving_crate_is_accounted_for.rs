@@ -171,10 +171,18 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/put_failure_status_is_the_layer_not_the_error.rs",
     ),
     ("epics-ca-rs", "tests/put_native_type_conversion.rs"),
+    (
+        "epics-ca-rs",
+        "tests/qtime_tag_monitor_serves_the_raw_stamp.rs",
+    ),
     ("epics-ca-rs", "tests/rate_limit_parity.rs"),
     ("epics-ca-rs", "tests/rsrv_error_ctx_is_the_record_name.rs"),
     ("epics-ca-rs", "tests/rsrv_error_frame_matches_softioc.rs"),
     ("epics-ca-rs", "tests/scalar_string_write_needs_a_nul.rs"),
+    (
+        "epics-ca-rs",
+        "tests/scan_thread_monitor_post_allocates_nothing.rs",
+    ),
     (
         "epics-ca-rs",
         "tests/softioc_a_ca_put_never_waits_on_the_console.rs",

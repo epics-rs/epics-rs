@@ -72,11 +72,7 @@ mod tests {
     fn ev(utag: i32, mask: EventMask) -> FilteredMonitorEvent {
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, SystemTime::UNIX_EPOCH);
         snap.user_tag = utag;
-        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(snap),
-            0,
-            mask,
-        ))
+        FilteredMonitorEvent::new(MonitorEvent::read_log(&mut snap, mask))
     }
 
     fn read_ev(utag: i32) -> FilteredMonitorEvent {

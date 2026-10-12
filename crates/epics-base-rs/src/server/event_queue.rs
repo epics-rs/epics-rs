@@ -1230,14 +1230,8 @@ mod tests {
     use crate::types::EpicsValue;
 
     fn ev(v: i32) -> MonitorEvent {
-        MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(
-                EpicsValue::Long(v),
-                0,
-                0,
-                std::time::SystemTime::UNIX_EPOCH,
-            )),
-            0,
+        MonitorEvent::read_log(
+            &mut Snapshot::new(EpicsValue::Long(v), 0, 0, std::time::SystemTime::UNIX_EPOCH),
             EventMask::VALUE,
         )
     }
@@ -1735,14 +1729,13 @@ mod tests {
     fn wide(v: i32) -> MonitorEvent {
         let mut arr = vec![0.0f64; 32];
         arr[0] = v as f64;
-        MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(
+        MonitorEvent::read_log(
+            &mut Snapshot::new(
                 EpicsValue::DoubleArray(arr.into()),
                 0,
                 0,
                 std::time::SystemTime::UNIX_EPOCH,
-            )),
-            0,
+            ),
             EventMask::VALUE,
         )
     }

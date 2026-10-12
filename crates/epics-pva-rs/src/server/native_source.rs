@@ -343,15 +343,20 @@ impl<'a> LogLeaves<'a> {
         }
     }
 
-    /// `ev`'s leaves, its value being `value` ([`logged_value`]).
-    fn of_event(ev: &'a MonitorEvent, value: &'a EpicsValue) -> Self {
+    /// `ev`'s leaves, its value being `value` ([`logged_value`]). The log
+    /// carries the record's raw stamp, as `db_create_field_log` copies it
+    /// (`dbEvent.c:710`); `nsec_mask` is the channel's `Q:time:tag` split,
+    /// which pvxs applies to the served `timeStamp` (`iocsource.cpp:239-248`).
+    fn of_event(ev: &'a MonitorEvent, value: &'a EpicsValue, nsec_mask: u64) -> Self {
+        let (time, utag) =
+            epics_base_rs::server::snapshot::split_nsec(ev.time(), ev.utag(), nsec_mask);
         Self {
             value,
             stat: ev.stat(),
             sevr: ev.sevr(),
             amsg: ev.amsg(),
-            time: ev.time(),
-            utag: ev.utag(),
+            time,
+            utag,
         }
     }
 }
@@ -1512,20 +1517,20 @@ impl ChannelSource for PvDatabaseSource {
             let shaped = render.shaper();
             // Read after both halves are live, so a metadata change racing the
             // read still arrives as a property post.
-            let door = MetaDoor {
-                db: db.clone(),
+            let door = MetaDoor::new(
+                db.clone(),
                 rec,
-                field: cn.field.clone(),
+                cn.field.clone(),
                 render,
-                filters: property_filters.clone(),
-            };
+                property_filters.clone(),
+            );
             let mut ring = PostRing::new(opts.queue_size, door.read()?);
             // The subscriptions ARE the stream: `marked_update` runs as the
             // server pulls, so no task stands between them.
             Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
                 value_sub,
                 property_sub,
-                move |ev| marked_update(&mut ring, shaped(ev), || door.read()),
+                move |ev| marked_update(&mut ring, shaped(ev), door.nsec_mask, || door.read()),
             )))
         }
     }
@@ -1607,18 +1612,17 @@ impl ChannelSource for PvDatabaseSource {
                     .ok()
                     .map(|sub| render.subscribed(sub))?;
                     let shaped = render.shaper();
-                    let door = MetaDoor {
-                        db: db.clone(),
-                        rec,
-                        field: cn.field.clone(),
-                        render,
-                        filters: property_filters,
-                    };
+                    let door =
+                        MetaDoor::new(db.clone(), rec, cn.field.clone(), render, property_filters);
                     let mut meta = door.read()?;
                     Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
                         sub,
                         property_sub,
-                        move |ev| plain_record_field(&mut meta, shaped(ev), || door.read()),
+                        move |ev| {
+                            plain_record_field(&mut meta, shaped(ev), door.nsec_mask, || {
+                                door.read()
+                            })
+                        },
                     )))
                 }
             }
@@ -1732,9 +1736,30 @@ struct MetaDoor {
     field: String,
     render: ChannelRender,
     filters: FilterChain,
+    /// The record's `Q:time:tag` mask, resolved once as pvxs resolves
+    /// `MappingInfo::nsecMask` once per channel (`typeutils.cpp:79-88`).
+    nsec_mask: u64,
 }
 
 impl MetaDoor {
+    fn new(
+        db: Arc<PvDatabase>,
+        rec: Arc<epics_base_rs::server::record::RecordCell>,
+        field: String,
+        render: ChannelRender,
+        filters: FilterChain,
+    ) -> Self {
+        let nsec_mask = rec.read().qtime_nsec_mask();
+        Self {
+            db,
+            rec,
+            field,
+            render,
+            filters,
+            nsec_mask,
+        }
+    }
+
     /// Takes the record's read lock for the read alone, on the monitor's
     /// server task, which holds no other record lock.
     fn read(&self) -> Option<Snapshot> {
@@ -1753,6 +1778,7 @@ impl MetaDoor {
 fn marked_update(
     ring: &mut PostRing,
     ev: MonitorEvent,
+    nsec_mask: u64,
     mut read_meta: impl FnMut() -> Option<Snapshot>,
 ) -> Option<crate::server_native::source::MonitorUpdate> {
     use epics_base_rs::server::recgbl::EventMask;
@@ -1772,7 +1798,7 @@ fn marked_update(
         return None;
     }
     Some(crate::server_native::source::MonitorUpdate {
-        value: ring.post(&LogLeaves::of_event(&ev, value)),
+        value: ring.post(&LogLeaves::of_event(&ev, value, nsec_mask)),
         marked: Some(marked),
         type_changed: false,
         overrun: Vec::new(),
@@ -1785,6 +1811,7 @@ fn marked_update(
 fn plain_record_field(
     meta: &mut Snapshot,
     ev: MonitorEvent,
+    nsec_mask: u64,
     mut read_meta: impl FnMut() -> Option<Snapshot>,
 ) -> Option<PvField> {
     use epics_base_rs::server::recgbl::EventMask;
@@ -1797,7 +1824,11 @@ fn plain_record_field(
     let mut held = None;
     let value = logged_value(&ev, &mut held, &mut read_meta)?;
     let shape = NtShape::new(value, meta.properties);
-    Some(fresh_tree(shape, meta, &LogLeaves::of_event(&ev, value)))
+    Some(fresh_tree(
+        shape,
+        meta,
+        &LogLeaves::of_event(&ev, value, nsec_mask),
+    ))
 }
 
 /// `ev`'s value, kept in `held` when the log has no copy to lend: a scalar
@@ -4854,6 +4885,69 @@ ASG(DEFAULT) {
         }
     }
 
+    /// The record's post carries its raw stamp (`dbEvent.c:710`); the PVA
+    /// monitor serves it split along the `Q:time:tag` mask its channel read
+    /// once (pvxs `singlesrcsubscriptionctx.h:28-30`, `iocsource.cpp:239-248`).
+    #[epics_macros_rs::epics_test]
+    async fn a_qtime_tag_record_monitor_serves_the_split_stamp() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:QTAG", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:QTAG").unwrap();
+        rec.write().set_info("Q:time:tag", "nsec:lsb:20");
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:QTAG",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let mut rx = source
+            .subscribe_checked_opts_marked(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+        // A tag set after subscribe is not the channel's: pvxs reads it once.
+        rec.write().set_info("Q:time:tag", "nsec:lsb:4");
+
+        db.put_record_field_from_ca_no_notify("AI:QTAG", "VAL", EpicsValue::Double(2.0))
+            .await
+            .expect("put");
+        let update =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an update must post within 2s")
+                .expect("stream open");
+
+        let raw = WallTime::from(rec.read().common.time);
+        let mask = (1u32 << 20) - 1;
+        let PvField::Structure(top) = &*update.value else {
+            panic!("an NTScalar is a structure");
+        };
+        let Some(PvField::Structure(ts)) = top.get_field("timeStamp") else {
+            panic!("an NTScalar carries timeStamp");
+        };
+        assert!(matches!(
+            scalar(ts, "secondsPastEpoch"),
+            ScalarValue::Long(s) if s == raw.unix_secs() as i64
+        ));
+        assert!(matches!(
+            scalar(ts, "nanoseconds"),
+            ScalarValue::Int(n) if n as u32 == raw.subsec_nanos() & !mask
+        ));
+        assert!(matches!(
+            scalar(ts, "userTag"),
+            ScalarValue::Int(t) if t as u32 == raw.subsec_nanos() & mask
+        ));
+    }
+
     /// A metadata change reaches the client through the GET door, not the
     /// event: `EGU` posts `DBE_PROPERTY`, the property half rereads, and both
     /// that post and every value post after it carry the new units.
@@ -5023,14 +5117,8 @@ ASG(DEFAULT) {
         use epics_base_rs::server::snapshot::Snapshot;
 
         let mk = |mask: EventMask| {
-            epics_base_rs::server::pv::MonitorEvent::from_snapshot(
-                std::sync::Arc::new(Snapshot::new(
-                    EpicsValue::Double(1.0),
-                    0,
-                    0,
-                    std::time::SystemTime::now(),
-                )),
-                0,
+            epics_base_rs::server::pv::MonitorEvent::read_log(
+                &mut Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
                 mask,
             )
         };
@@ -5040,11 +5128,11 @@ ASG(DEFAULT) {
             Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
         );
         assert!(
-            marked_update(&mut ring, mk(EventMask::from_bits(0)), || None).is_none(),
+            marked_update(&mut ring, mk(EventMask::from_bits(0)), 0, || None).is_none(),
             "a class that marks no leaf has no wire meaning — C assigns none \
              either, so it must not reach the client as an update"
         );
-        let value = marked_update(&mut ring, mk(EventMask::VALUE), || None)
+        let value = marked_update(&mut ring, mk(EventMask::VALUE), 0, || None)
             .expect("a DBE_VALUE post is an update");
         assert!(
             value

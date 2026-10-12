@@ -48,8 +48,8 @@ fn a_gr_update_allocates_nothing_beyond_the_read() {
         upper_disp_limit: 10.0,
         ..Default::default()
     });
-    let posted = Snapshot::new(EpicsValue::Double(2.5), 3, 1, std::time::UNIX_EPOCH);
-    let event = MonitorEvent::from_snapshot(std::sync::Arc::new(posted), 0, EventMask::VALUE);
+    let mut posted = Snapshot::new(EpicsValue::Double(2.5), 3, 1, std::time::UNIX_EPOCH);
+    let event = MonitorEvent::read_log(&mut posted, EventMask::VALUE);
     let mut dst = Vec::with_capacity(256);
     let before = ALLOCS.with(Cell::get);
     let delivery = with_live_options(DBR_GR_DOUBLE, event, || Some(read)).expect("a read");

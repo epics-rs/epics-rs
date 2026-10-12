@@ -224,9 +224,8 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn make_event(t: impl Into<WallTime>) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-            std::sync::Arc::new(Snapshot::new(EpicsValue::Double(1.0), 0, 0, t)),
-            0,
+        FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(EpicsValue::Double(1.0), 0, 0, t),
             EventMask::VALUE,
         ))
     }

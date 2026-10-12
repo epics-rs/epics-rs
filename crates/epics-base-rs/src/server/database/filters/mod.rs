@@ -384,13 +384,8 @@ mod tests {
     }
 
     fn make_event(v: f64) -> FilteredMonitorEvent {
-        let snapshot = std::sync::Arc::new(Snapshot::new(
-            EpicsValue::Double(v),
-            0,
-            0,
-            SystemTime::UNIX_EPOCH,
-        ));
-        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(snapshot, 0, EventMask::VALUE))
+        let mut snapshot = Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH);
+        FilteredMonitorEvent::new(MonitorEvent::read_log(&mut snapshot, EventMask::VALUE))
     }
 
     /// Empty chain is the identity — every event passes unchanged.

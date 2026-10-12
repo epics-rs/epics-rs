@@ -265,16 +265,23 @@ pub struct Snapshot {
 /// `nsec:lsb:20` mask (`0x000F_FFFF`), `nanoseconds` keeps wall-clock
 /// precision down to ~1 µs while the userTag carries a 20-bit event id.
 pub fn apply_nsec_mask(snap: &mut Snapshot, nsec_mask: u64) {
+    (snap.timestamp, snap.user_tag) = split_nsec(snap.timestamp, snap.user_tag, nsec_mask);
+}
+
+/// [`apply_nsec_mask`] on a bare `(time, utag)` pair, for a consumer holding
+/// a field log rather than a [`Snapshot`].
+pub fn split_nsec(time: WallTime, utag: i32, nsec_mask: u64) -> (WallTime, i32) {
     if nsec_mask == 0 {
-        return;
+        return (time, utag);
     }
     // pvxs holds `nsecMask` as `uint64_t` and applies it to the
     // `epicsUInt32` `nsec`, so only the low 32 bits can ever take effect.
     let mask = nsec_mask as u32;
-    let secs = snap.timestamp.unix_secs();
-    let nanos = snap.timestamp.subsec_nanos();
-    snap.user_tag = (nanos & mask) as i32;
-    snap.timestamp = WallTime::from_unix(secs, nanos & !mask);
+    let nanos = time.subsec_nanos();
+    (
+        WallTime::from_unix(time.unix_secs(), nanos & !mask),
+        (nanos & mask) as i32,
+    )
 }
 
 impl Snapshot {

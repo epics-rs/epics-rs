@@ -339,9 +339,8 @@ fn pv_field_to_filter_event(
     use std::time::SystemTime;
 
     let val = crate::leaf_convert::pv_leaf_to_epics_value(value)?;
-    Some(FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-        std::sync::Arc::new(Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH)),
-        0,
+    Some(FilteredMonitorEvent::new(MonitorEvent::read_log(
+        &mut Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
         EventMask::VALUE,
     )))
 }

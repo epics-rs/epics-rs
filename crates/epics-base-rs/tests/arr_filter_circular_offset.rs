@@ -77,14 +77,13 @@ fn through_arr(values: Vec<f64>, start: i64, end: i64) -> Vec<f64> {
         incr: 1,
         end,
     };
-    let event = FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
-        std::sync::Arc::new(Snapshot::new(
+    let event = FilteredMonitorEvent::new(MonitorEvent::read_log(
+        &mut Snapshot::new(
             EpicsValue::DoubleArray(values.into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
-        )),
-        0,
+        ),
         EventMask::VALUE,
     ));
     let out = ArrayFilter::new(cfg).apply(event).unwrap();

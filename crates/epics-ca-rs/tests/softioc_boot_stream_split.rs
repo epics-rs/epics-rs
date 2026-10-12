@@ -17,6 +17,9 @@ use std::io::Write;
 use std::net::{TcpListener, UdpSocket};
 use std::process::{Command, Stdio};
 
+#[path = "common/softioc_verdict.rs"]
+mod softioc_verdict;
+
 /// Replace the describe and the date after its `Git:` / `build date/time:`
 /// label, the two arms `genVersionHeader.pl` has.
 fn mask_vcs_stamp(lines: &[&str]) -> Vec<String> {
@@ -41,9 +44,7 @@ fn mask_vcs_stamp(lines: &[&str]) -> Vec<String> {
 }
 
 /// `softioc-rs -d <db>` on `port` fed `iocInit`, `exit`; its stdout and
-/// stderr, or `None` when it names `port` as taken by someone else: C's
-/// `Configured TCP port was unavailable.` for the TCP listener, the
-/// `udp.rs` bind error for the search responder.
+/// stderr, or `None` when it names `port` as taken by someone else.
 fn boot(db: &std::path::Path, port: u16) -> Option<(String, String)> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
         .arg("-d")
@@ -71,9 +72,7 @@ fn boot(db: &std::path::Path, port: u16) -> Option<(String, String)> {
     let out = child.wait_with_output().expect("softioc-rs output");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let stolen = stderr.contains("Configured TCP port was unavailable.")
-        || stderr.contains(&format!("bind 127.0.0.1:{port}: Address already in use"));
-    (!stolen).then_some((stdout, stderr))
+    (!softioc_verdict::rs_ioc_port_was_taken(&stderr, port)).then_some((stdout, stderr))
 }
 
 #[test]

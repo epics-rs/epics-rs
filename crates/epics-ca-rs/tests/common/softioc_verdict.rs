@@ -1,5 +1,6 @@
-//! The verdict a spawned C `softIoc`'s console carries about the port it was
-//! given — the retry trigger for `common::spawn_softioc`, and nothing else.
+#![allow(dead_code)] // Included by `#[path]` into suites that use only some of it.
+//! The verdict a spawned IOC's console carries about the port it was given —
+//! the retry trigger for a test that names that port, and nothing else.
 //!
 //! Its own file rather than a section of `common/mod.rs` so the test that
 //! pins it against C's real console text can include this and NOT the
@@ -58,4 +59,28 @@ pub fn softioc_verdict(console: &str) -> SoftIocVerdict {
     } else {
         SoftIocVerdict::Silent
     }
+}
+
+/// An epics-rs IOC's report that `port` belonged to somebody else — the retry
+/// trigger for a test that names the port of `softioc-rs` or
+/// `realtime-ca-ioc`.
+///
+/// Both bind after `iocRun`, so the report follows it and a test judges the
+/// console only once its attempt is over. softioc-rs prints C's
+/// [`PORT_WAS_TAKEN`] for the TCP listener and serves on a dynamic one as C
+/// does, or names the address its search responder could not bind and exits
+/// 1; realtime-ca-ioc names the port on either bind arm and exits 1. The
+/// errno text is required on the lines that carry one: realtime-ca-ioc's TCP
+/// arm also covers a `local_addr` failure, which is no steal.
+pub fn rs_ioc_port_was_taken(console: &str, port: u16) -> bool {
+    let udp = format!(":{port}: Address already in use");
+    let rt_tcp = format!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: ");
+    let rt_udp =
+        format!("realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: ");
+    console.lines().any(|l| {
+        l.contains(PORT_WAS_TAKEN)
+            || (l.contains("CA server UDP search responder bind ") && l.contains(&udp))
+            || ((l.starts_with(&rt_tcp) || l.starts_with(&rt_udp))
+                && l.contains("Address already in use"))
+    })
 }

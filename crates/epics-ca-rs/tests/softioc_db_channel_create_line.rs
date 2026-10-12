@@ -26,30 +26,31 @@ use std::time::{Duration, Instant};
 
 const FILTER_LINE: &str = "dbChannelCreate: Channel filter 'bad' not found";
 
-fn port_free_for_udp_and_tcp() -> u16 {
-    loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            return port;
-        }
-    }
-}
+#[path = "common/softioc_verdict.rs"]
+mod softioc_verdict;
 
 struct Ioc {
     child: Child,
     stdin: ChildStdin,
     lines: mpsc::Receiver<String>,
     port: u16,
+    /// Every line read so far, the evidence a lost port is judged on.
+    console: Vec<String>,
+}
+
+impl Drop for Ioc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Ioc {
-    /// softioc-rs on `db`, returned once it printed `iocRun`.
-    fn start(db: &str) -> Ioc {
+    /// softioc-rs on `db` and `port`, returned once it printed `iocRun`.
+    fn start(db: &str, port: u16) -> Ioc {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.db");
         std::fs::write(&path, db).expect("write db");
-        let port = port_free_for_udp_and_tcp();
         // stdout and stderr share one pipe, as on C's console, so the order
         // lines are read in is the order they were written: errlog's line
         // is on stderr and the dbpf echo on stdout, and `errlogVprintf`
@@ -76,11 +77,14 @@ impl Ioc {
             }
         });
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut console = Vec::new();
         loop {
             let line = lines
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("softioc-rs never printed iocRun");
-            if line.contains("iocRun: All initialization complete") {
+            let up = line.contains("iocRun: All initialization complete");
+            console.push(line);
+            if up {
                 break;
             }
         }
@@ -91,30 +95,45 @@ impl Ioc {
             stdin,
             lines,
             port,
+            console,
         }
     }
 
+    /// softioc-rs binds its CA server after `iocRun`, so its report of a
+    /// lost port can arrive at any point of a run.
+    fn lost_port(&self) -> bool {
+        softioc_verdict::rs_ioc_port_was_taken(&self.console.join("\n"), self.port)
+    }
+
     /// Run one shell command and return what it printed up to the line
-    /// containing `until`.
-    fn command(&mut self, cmd: &str, until: &str) -> Vec<String> {
-        writeln!(self.stdin, "{cmd}").expect("write command");
+    /// containing `until`, or `None` when the IOC lost its port meanwhile.
+    fn command(&mut self, cmd: &str, until: &str) -> Option<Vec<String>> {
         let mut heard = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while let Ok(line) = self
-            .lines
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
-            let done = line.contains(until);
-            heard.push(line);
-            if done {
-                return heard;
+        if writeln!(self.stdin, "{cmd}").is_ok() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Ok(line) = self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                let done = line.contains(until);
+                self.console.push(line.clone());
+                heard.push(line);
+                if done {
+                    return Some(heard);
+                }
             }
+        }
+        // Whatever is still queued is evidence too.
+        self.console.extend(self.lines.try_iter());
+        if self.lost_port() {
+            return None;
         }
         panic!("`{cmd}` never printed {until:?}; heard:\n{heard:#?}");
     }
 
-    /// Everything printed until the shell exits.
-    fn finish(mut self) -> Vec<String> {
+    /// Everything printed until the shell exits, or `None` when the IOC lost
+    /// its port.
+    fn finish(mut self) -> Option<Vec<String>> {
         let _ = writeln!(self.stdin, "exit");
         let mut heard = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -122,11 +141,10 @@ impl Ioc {
             .lines
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         {
+            self.console.push(line.clone());
             heard.push(line);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        heard
+        (!self.lost_port()).then_some(heard)
     }
 }
 
@@ -137,37 +155,47 @@ fn filter_lines(heard: &[String]) -> usize {
         .count()
 }
 
-#[tokio::test]
-async fn ca_create_with_an_unknown_filter_prints_the_line_once() {
-    let ioc = Ioc::start("record(ai, \"Y\") { field(VAL, \"2\") }\n");
-    // SAFETY: the only test in this binary that sets the environment, before
-    // `CaClient::new` snapshots it.
-    unsafe {
-        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{}", ioc.port));
-        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
-    }
-    let client = epics_ca_rs::client::CaClient::new()
-        .await
-        .expect("CA client");
-    let ch = client.create_channel(r#"Y.VAL{"bad":{}}"#);
-    assert!(
-        ch.wait_connected(Duration::from_secs(1)).await.is_err(),
-        "a channel with an unknown filter connected"
-    );
-    drop(ch);
-    drop(client);
-    let heard = ioc.finish();
+#[test]
+fn ca_create_with_an_unknown_filter_prints_the_line_once() {
+    let heard = named_port::on_a_named_port(|port| {
+        let ioc = Ioc::start("record(ai, \"Y\") { field(VAL, \"2\") }\n", port);
+        // SAFETY: the only test in this binary that sets the environment,
+        // before `CaClient::new` snapshots it.
+        unsafe {
+            std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let client = epics_ca_rs::client::CaClient::new()
+                .await
+                .expect("CA client");
+            let ch = client.create_channel(r#"Y.VAL{"bad":{}}"#);
+            assert!(
+                ch.wait_connected(Duration::from_secs(1)).await.is_err(),
+                "a channel with an unknown filter connected"
+            );
+        });
+        drop(rt);
+        ioc.finish()
+    });
     assert_eq!(filter_lines(&heard), 1, "heard:\n{heard:#?}");
 }
 
 #[test]
 fn a_link_put_with_an_unknown_filter_prints_the_line_before_its_echo() {
-    let mut ioc = Ioc::start(
-        "record(ai, \"Y\") { field(VAL, \"2\") }\n\
-         record(ao, \"Z\") { field(DTYP, \"Soft Channel\") field(OUT, \"Y\") }\n",
-    );
-    let heard = ioc.command(r#"dbpf Z.OUT 'Y.VAL{"bad":{}}'"#, "DBF_STRING");
-    ioc.finish();
+    let heard = named_port::on_a_named_port(|port| {
+        let mut ioc = Ioc::start(
+            "record(ai, \"Y\") { field(VAL, \"2\") }\n\
+             record(ao, \"Z\") { field(DTYP, \"Soft Channel\") field(OUT, \"Y\") }\n",
+            port,
+        );
+        let heard = ioc.command(r#"dbpf Z.OUT 'Y.VAL{"bad":{}}'"#, "DBF_STRING")?;
+        ioc.finish().map(|_| heard)
+    });
     assert_eq!(filter_lines(&heard), 1, "heard:\n{heard:#?}");
 }
 
@@ -175,12 +203,15 @@ fn a_link_put_with_an_unknown_filter_prints_the_line_before_its_echo() {
 /// (`dbAccess.c:1107`, `:1196`).
 #[test]
 fn an_async_inp_put_with_an_unknown_filter_prints_two_lines_and_the_refusal() {
-    let mut ioc = Ioc::start(
-        "record(ai, \"Y\") { field(VAL, \"2\") }\n\
-         record(ai, \"X\") { field(DTYP, \"Async Soft Channel\") field(INP, \"Y\") }\n",
-    );
-    let heard = ioc.command(r#"dbpf X.INP 'Y.VAL{"bad":{}}'"#, "DBF_STRING");
-    ioc.finish();
+    let heard = named_port::on_a_named_port(|port| {
+        let mut ioc = Ioc::start(
+            "record(ai, \"Y\") { field(VAL, \"2\") }\n\
+             record(ai, \"X\") { field(DTYP, \"Async Soft Channel\") field(INP, \"Y\") }\n",
+            port,
+        );
+        let heard = ioc.command(r#"dbpf X.INP 'Y.VAL{"bad":{}}'"#, "DBF_STRING")?;
+        ioc.finish().map(|_| heard)
+    });
     let refusal = heard.iter().position(|l| {
         l.contains(
             "recGblRecordError: devAiSoftCallback (add_record) link target not found \

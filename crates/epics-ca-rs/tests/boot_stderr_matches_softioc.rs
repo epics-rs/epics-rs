@@ -20,28 +20,19 @@ use std::time::{Duration, Instant};
 const SOFTIOC_BOOT_STDERR: &str = "Starting iocInit\niocRun: All initialization complete\n";
 const DB: &str = "record(ai, \"X:AI\") { field(VAL, \"1\") }\n";
 
-fn port_free_for_udp_and_tcp() -> u16 {
-    loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            return port;
-        }
-    }
-}
+#[path = "common/softioc_verdict.rs"]
+mod softioc_verdict;
 
-/// `bin` with the db and C's environment, its stderr in a file under `dir`.
-fn spawn(bin: &str, args: &[&std::ffi::OsStr], dir: &std::path::Path) -> Child {
+/// `bin` with the db and C's environment on `port`, its stderr in a file
+/// under `dir`.
+fn spawn(bin: &str, args: &[&std::ffi::OsStr], dir: &std::path::Path, port: u16) -> Child {
     let err = std::fs::File::create(dir.join("stderr")).unwrap();
     let mut cmd = Command::new(bin);
     for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("EPICS_")) {
         cmd.env_remove(k);
     }
     cmd.args(args)
-        .env(
-            "EPICS_CA_SERVER_PORT",
-            port_free_for_udp_and_tcp().to_string(),
-        )
+        .env("EPICS_CA_SERVER_PORT", port.to_string())
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
         .stdin(Stdio::null())
@@ -75,19 +66,27 @@ fn boot_stderr(mut child: Child, dir: &std::path::Path, settle: Duration) -> Str
     read()
 }
 
+/// [`boot_stderr`] of `bin` on a port it is named, retried on a fresh one
+/// when the IOC reports that one taken.
+fn named_boot_stderr(bin: &str, args: &[&std::ffi::OsStr], dir: &std::path::Path) -> String {
+    named_port::on_a_named_port(|port| {
+        let stderr = boot_stderr(spawn(bin, args, dir, port), dir, Duration::from_millis(500));
+        (!softioc_verdict::rs_ioc_port_was_taken(&stderr, port)).then_some(stderr)
+    })
+}
+
 #[cfg(tokio_backend)]
 #[test]
 fn softioc_rs_boot_stderr_is_softiocs() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("x.db");
     std::fs::write(&db, DB).unwrap();
-    let child = spawn(
-        env!("CARGO_BIN_EXE_softioc-rs"),
-        &["-d".as_ref(), db.as_os_str()],
-        dir.path(),
-    );
     assert_eq!(
-        boot_stderr(child, dir.path(), Duration::from_millis(500)),
+        named_boot_stderr(
+            env!("CARGO_BIN_EXE_softioc-rs"),
+            &["-d".as_ref(), db.as_os_str()],
+            dir.path()
+        ),
         SOFTIOC_BOOT_STDERR
     );
 }
@@ -98,13 +97,12 @@ fn realtime_ca_ioc_boot_stderr_is_softiocs() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("x.db");
     std::fs::write(&db, DB).unwrap();
-    let child = spawn(
-        env!("CARGO_BIN_EXE_realtime-ca-ioc"),
-        &[db.as_os_str()],
-        dir.path(),
-    );
     assert_eq!(
-        boot_stderr(child, dir.path(), Duration::from_millis(500)),
+        named_boot_stderr(
+            env!("CARGO_BIN_EXE_realtime-ca-ioc"),
+            &[db.as_os_str()],
+            dir.path()
+        ),
         SOFTIOC_BOOT_STDERR
     );
 }

@@ -9,33 +9,21 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// A port number nothing on the box holds for UDP or for TCP. The two are
-/// separate spaces, and the server needs both: a number free only for TCP can
-/// already be another test's UDP socket, and softioc-rs then fails its search
-/// responder bind with `EADDRINUSE` and exits (C's `tryBind` gives up on that
-/// interface the same way).
-fn port_free_for_udp_and_tcp() -> u16 {
-    loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            return port;
-        }
-    }
-}
+#[path = "common/softioc_verdict.rs"]
+mod softioc_verdict;
 
-/// What one softioc-rs on `db` printed, and the `dbgf H` line that showed
-/// 3.5 if any did. Ready is `iocRun: All initialization complete`, which C
-/// and the port both print; the port binds its CA server after it, so a bind
-/// lost to another process shows up as the child exiting while H is polled.
+/// What one softioc-rs on `db` and `port` printed, and the `dbgf H` line that
+/// showed 3.5 if any did. Ready is `iocRun: All initialization complete`,
+/// which C and the port both print; the port binds its CA server after it, so
+/// a bind lost to another process shows up as the child exiting while H is
+/// polled.
 struct Attempt {
     read: Option<String>,
-    lost_bind: bool,
     heard: Vec<String>,
 }
 
-fn read_h_over_ca(db: &std::path::Path) -> Attempt {
-    let port = port_free_for_udp_and_tcp().to_string();
+fn read_h_over_ca(db: &std::path::Path, port: u16) -> Attempt {
+    let port = port.to_string();
     let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
         .arg("-d")
         .arg(db)
@@ -100,12 +88,7 @@ fn read_h_over_ca(db: &std::path::Path) -> Attempt {
     let _ = writeln!(stdin, "exit");
     let _ = child.kill();
     let _ = child.wait();
-    let lost_bind = heard.iter().any(|l| l.contains("Address already in use"));
-    Attempt {
-        read,
-        lost_bind,
-        heard,
-    }
+    Attempt { read, heard }
 }
 
 #[test]
@@ -118,19 +101,14 @@ fn a_ca_link_to_a_served_record_reads_its_value() {
     )
     .expect("write db");
 
-    // No port can be reserved across the spawn, so a lost bind is answered
-    // with a fresh port.
-    for _ in 0..5 {
-        let attempt = read_h_over_ca(&db);
-        if attempt.lost_bind && attempt.read.is_none() {
-            continue;
-        }
-        let heard = attempt.heard;
-        assert!(
-            attempt.read.is_some(),
-            "H never read X over CA; heard:\n{heard:#?}"
-        );
-        return;
-    }
-    panic!("softioc-rs lost its port bind five times");
+    let attempt = named_port::on_a_named_port(|port| {
+        let attempt = read_h_over_ca(&db, port);
+        (!softioc_verdict::rs_ioc_port_was_taken(&attempt.heard.join("\n"), port))
+            .then_some(attempt)
+    });
+    let heard = attempt.heard;
+    assert!(
+        attempt.read.is_some(),
+        "H never read X over CA; heard:\n{heard:#?}"
+    );
 }

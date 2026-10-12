@@ -4269,11 +4269,13 @@ mod error_echo_dispatch_tests {
 
         let mut ver = CaHeader::new(CA_PROTO_VERSION);
         ver.count = crate::protocol::CA_MINOR_VERSION;
-        client
-            .write_all(&ver.to_bytes())
-            .await
-            .expect("write the barrier VERSION frame");
-        client.flush().await.expect("flush");
+        match client.write_all(&ver.to_bytes()).await {
+            Ok(()) => client.flush().await.expect("flush"),
+            // The loop already closed on the frame under test and dropped its
+            // end; its verdict is on `event_rx` all the same.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("write the barrier VERSION frame: {e:?}"),
+        }
 
         let verdict =
             match tokio::time::timeout(crate::test_budget::FACT_BUDGET, event_rx.recv()).await {

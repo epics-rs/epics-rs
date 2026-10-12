@@ -56,6 +56,7 @@ fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
 /// helpers cannot drift out of step with the test that uses them.
 #[cfg(exec_backend)]
 mod exec_model {
+    use crate::softioc_verdict::rs_ioc_port_was_taken;
     use std::io::Read as _;
     use std::net::TcpListener;
     use std::process::{Child, Command, Stdio};
@@ -68,25 +69,6 @@ mod exec_model {
     /// happens on the first search tick, well under a second; the margin is for a
     /// loaded CI box.
     const DIAL_BUDGET: Duration = crate::budget::FACT_BUDGET;
-
-    /// `realtime-ca-ioc`'s report that the number it was told to use belonged
-    /// to somebody else.
-    ///
-    /// Both bind arms name the port and exit 1 (`realtime-ca-ioc.rs:1212` for
-    /// the TCP listener, `:1220` for the UDP search responder), so either can
-    /// be the one that loses the race — the server binds both on the same
-    /// number. The errno text is part of the discriminator on purpose: the TCP
-    /// arm also covers `local_addr` failing, which is the one that fails on
-    /// RTEMS, and treating that as a steal would spend every candidate and
-    /// then report a race that never happened.
-    fn port_was_taken(console: &str, port: u16) -> bool {
-        let tcp = format!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: ");
-        let udp =
-            format!("realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: ");
-        console.lines().any(|l| {
-            (l.starts_with(&tcp) || l.starts_with(&udp)) && l.contains("Address already in use")
-        })
-    }
 
     /// An IOC that came up on the port it was told to use, and the console it
     /// is still writing to.
@@ -113,7 +95,7 @@ mod exec_model {
     /// The tests below cannot ask the kernel for the port: two of them assert
     /// that the number the boot line named is the number served, which no
     /// kernel pick can express. So the number is a candidate, and losing it is
-    /// a retry — see the `named-port` crate. [`port_was_taken`] is the only
+    /// a retry — see the `named-port` crate. [`rs_ioc_port_was_taken`] is the only
     /// thing that retries; a panic, any other exit, and the budget expiring all
     /// fail here, with the console, because none of them gets better on a
     /// different port.
@@ -157,7 +139,7 @@ mod exec_model {
                     "realtime-ca-ioc panicked during init:\n{console}"
                 );
                 if booted.child.0.try_wait().expect("poll the child").is_some() {
-                    if port_was_taken(&console, port) {
+                    if rs_ioc_port_was_taken(&console, port) {
                         return None;
                     }
                     panic!("realtime-ca-ioc exited during init:\n{console}");
@@ -827,6 +809,9 @@ mod exec_model {
         accept.join().expect("the accept thread exits on shutdown");
     }
 }
+
+#[path = "common/softioc_verdict.rs"]
+mod softioc_verdict;
 
 #[path = "common/budget.rs"]
 mod budget;

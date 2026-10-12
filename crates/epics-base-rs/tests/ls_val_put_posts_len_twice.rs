@@ -25,7 +25,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 fn drain(rx: &mut EventReader) -> Vec<(EpicsValue, u16)> {
     let mut out = Vec::new();
     while let Ok(e) = rx.try_recv() {
-        out.push((e.snapshot.value.clone(), e.snapshot.alarm.severity));
+        out.push((e.value().as_value().cloned().unwrap(), e.sevr()));
     }
     out
 }

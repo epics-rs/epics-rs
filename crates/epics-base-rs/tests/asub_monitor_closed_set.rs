@@ -181,7 +181,7 @@ async fn asub_val_posts_in_every_eflg_arm() {
         let e = val_rx
             .try_recv()
             .unwrap_or_else(|e| panic!("EFLG={eflg}: aSubRecord.c:415 posts VAL on val != oval, outside the EFLG switch ({e:?})"));
-        assert_eq!(e.snapshot.value, EpicsValue::Long(3));
+        assert_eq!(e.value().as_value().cloned().unwrap(), EpicsValue::Long(3));
     }
 }
 
@@ -272,7 +272,13 @@ async fn asub_on_change_compares_vala_against_ovla() {
     assert_eq!(count(&mut rx), 0, "OVLA caught up: silent");
     put(2.5).await.unwrap();
     put(1.5).await.unwrap();
-    assert_eq!(count(&mut rx), 2, "each put posts");
+    assert_eq!(
+        rx.queue().ncollapse(rx.id()),
+        1,
+        "each put posts; VALA is SPC_DBADDR, so the second by-reference log \
+         drops onto the first (dbEvent.c:794-800)"
+    );
+    assert_eq!(count(&mut rx), 1);
     process(&db, "Y").await;
     assert_eq!(count(&mut rx), 0, "VALA 1.5 == OVLA 1.5: silent");
 }

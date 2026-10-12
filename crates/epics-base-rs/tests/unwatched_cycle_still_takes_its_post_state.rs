@@ -67,7 +67,7 @@ async fn an_unwatched_first_transform_cycle_spends_its_first_post() {
     process(&db, "T").await;
     let mut posts = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        posts.push(ev.mask);
+        posts.push(ev.mask());
     }
     assert!(
         posts.is_empty(),

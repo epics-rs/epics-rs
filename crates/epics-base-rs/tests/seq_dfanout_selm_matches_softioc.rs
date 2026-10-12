@@ -137,7 +137,7 @@ fn watch(db: &PvDatabase, rec: &str) -> EventReader {
 
 fn drain(rx: &mut EventReader) -> Vec<i32> {
     std::iter::from_fn(|| rx.try_recv().ok())
-        .map(|e| e.snapshot.value.to_f64().unwrap() as i32)
+        .map(|e| e.value().as_value().cloned().unwrap().to_f64().unwrap() as i32)
         .collect()
 }
 

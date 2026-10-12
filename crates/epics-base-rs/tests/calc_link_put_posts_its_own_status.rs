@@ -46,7 +46,7 @@ const WATCHED: [(&str, [&str; 3]); 4] = [
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
     let mut out = Vec::new();
     while let Ok(e) = rx.try_recv() {
-        out.push(e.snapshot.value.clone());
+        out.push(e.value().as_value().cloned().unwrap());
     }
     out
 }

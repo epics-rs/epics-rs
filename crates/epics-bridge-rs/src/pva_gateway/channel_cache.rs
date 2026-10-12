@@ -1114,7 +1114,7 @@ impl ChannelCache {
                                 // upstream changedBitSet verbatim). `overrun`
                                 // is filled later by `subscribe_inner` on lag.
                                 let _ = tx_inner.send(epics_pva_rs::server_native::MonitorUpdate {
-                                    value: val,
+                                    value: val.into(),
                                     marked: outcome.marked,
                                     type_changed: false,
                                     overrun: Vec::new(),

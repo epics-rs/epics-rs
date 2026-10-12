@@ -347,8 +347,11 @@ fn subscribe(db: &PvDatabase, rec: &str, field: &str, mask: EventMask) -> EventR
 fn drain(rx: &mut EventReader) -> Vec<Post> {
     let mut out = Vec::new();
     while let Ok(e) = rx.try_recv() {
-        let s = &e.snapshot;
-        out.push((s.value.to_f64().unwrap(), s.alarm.status, s.alarm.severity));
+        out.push((
+            e.value().as_value().and_then(EpicsValue::to_f64).unwrap(),
+            e.stat(),
+            e.sevr(),
+        ));
     }
     out
 }
@@ -451,8 +454,8 @@ fn drain_stamps(rx: &mut EventReader) -> Vec<(f64, SystemTime)> {
     let mut out = Vec::new();
     while let Ok(e) = rx.try_recv() {
         out.push((
-            e.snapshot.value.to_f64().unwrap(),
-            e.snapshot.timestamp.into(),
+            e.value().as_value().and_then(EpicsValue::to_f64).unwrap(),
+            e.time().into(),
         ));
     }
     out

@@ -339,11 +339,11 @@ fn pv_field_to_filter_event(
     use std::time::SystemTime;
 
     let val = crate::leaf_convert::pv_leaf_to_epics_value(value)?;
-    Some(FilteredMonitorEvent::new(MonitorEvent {
-        snapshot: std::sync::Arc::new(Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH)),
-        origin: 0,
-        mask: EventMask::VALUE,
-    }))
+    Some(FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
+        std::sync::Arc::new(Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH)),
+        0,
+        EventMask::VALUE,
+    )))
 }
 
 /// bridge a filter-chain-transformed `FilteredMonitorEvent`
@@ -416,7 +416,11 @@ fn apply_monitor_filter_chain(
             // type EXACTLY — scalar type, or array element type. A
             // struct_id-only check let a type-changed NT `value` member
             // reach the encoder's coercing fallback.
-            match apply_filter_transform(value, &transformed.event.snapshot.value) {
+            let posted = transformed.event.value();
+            match posted
+                .as_value()
+                .and_then(|v| apply_filter_transform(value, v))
+            {
                 Some(tv) if transformed_leaf_fits_descriptor(&tv, intro) => {
                     MonitorFilterOutcome::Transformed(tv)
                 }
@@ -2979,7 +2983,7 @@ fn spawn_monitor_subscriber(
                     let value = match apply_monitor_filter_chain(&filters, &value, &intro_clone) {
                         MonitorFilterOutcome::Pass => value,
                         MonitorFilterOutcome::Drop => continue,
-                        MonitorFilterOutcome::Transformed(tv) => tv,
+                        MonitorFilterOutcome::Transformed(tv) => tv.into(),
                         MonitorFilterOutcome::DescriptorMismatch => {
                             let err = build_monitor_error(
                                 ioid,
@@ -9914,7 +9918,7 @@ mod tests {
     fn br_fr12_coalesce_monitor_update_marked_boundaries() {
         let val = |tag: i32| PvField::Scalar(ScalarValue::Int(tag));
         let upd = |tag: i32, marked: Option<Vec<&str>>| crate::server_native::MonitorUpdate {
-            value: val(tag),
+            value: val(tag).into(),
             marked: marked.map(|v| v.into_iter().map(str::to_string).collect()),
             type_changed: false,
             overrun: Vec::new(),
@@ -9962,7 +9966,7 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         let mk = |tag: i32, marked: Option<&[&str]>, overrun: &[&str]| {
             crate::server_native::MonitorUpdate {
-                value: val(tag),
+                value: val(tag).into(),
                 marked: marked.map(s),
                 type_changed: false,
                 overrun: s(overrun),
@@ -10062,7 +10066,7 @@ mod tests {
         mask.set(1);
 
         let upd = |tag: i32, marked: &[&str]| crate::server_native::MonitorUpdate {
-            value: PvField::Scalar(ScalarValue::Int(tag)),
+            value: PvField::Scalar(ScalarValue::Int(tag)).into(),
             marked: Some(marked.iter().map(|s| s.to_string()).collect()),
             type_changed: false,
             overrun: Vec::new(),
@@ -10070,7 +10074,7 @@ mod tests {
         let tags = |q: &MonitorQueue| {
             q.pending
                 .iter()
-                .map(|u| u.update.value.clone())
+                .map(|u| (*u.update.value).clone())
                 .collect::<Vec<PvField>>()
         };
         let tag = |t: i32| PvField::Scalar(ScalarValue::Int(t));
@@ -10114,7 +10118,7 @@ mod tests {
         q.seed(tag(0).into());
         assert!(
             q.push(crate::server_native::MonitorUpdate {
-                value: tag(1),
+                value: tag(1).into(),
                 marked: None,
                 type_changed: false,
                 overrun: Vec::new(),
@@ -10244,7 +10248,7 @@ mod tests {
             )],
         };
         let post = || crate::server_native::MonitorUpdate {
-            value: PvField::Scalar(ScalarValue::Int(1)),
+            value: PvField::Scalar(ScalarValue::Int(1)).into(),
             marked: Some(vec!["timeStamp".to_string()]),
             type_changed: false,
             overrun: Vec::new(),
@@ -10306,7 +10310,7 @@ mod tests {
         // full-rate DATA frames with an empty changed-bitset where pvxs sends
         // nothing.
         let unmarked = || crate::server_native::MonitorUpdate {
-            value: PvField::Scalar(ScalarValue::Int(1)),
+            value: PvField::Scalar(ScalarValue::Int(1)).into(),
             marked: None,
             type_changed: false,
             overrun: Vec::new(),
@@ -10365,7 +10369,7 @@ mod tests {
             ],
         };
         let upd = |tag: i32, marked: Option<&[&str]>| crate::server_native::MonitorUpdate {
-            value: PvField::Scalar(ScalarValue::Int(tag)),
+            value: PvField::Scalar(ScalarValue::Int(tag)).into(),
             marked: marked.map(|m| m.iter().map(|s| s.to_string()).collect()),
             type_changed: false,
             overrun: Vec::new(),
@@ -10443,7 +10447,7 @@ mod tests {
         use std::collections::VecDeque;
         let val = |tag: i32| PvField::Scalar(ScalarValue::Int(tag));
         let upd = |tag: i32| crate::server_native::MonitorUpdate {
-            value: val(tag),
+            value: val(tag).into(),
             marked: None,
             type_changed: false,
             overrun: Vec::new(),

@@ -576,9 +576,12 @@ async fn process_event(
         (ms.member_index, ms.kind)
     };
     let mark = match kind {
-        MemberEventKind::Value => {
-            GroupMonitor::value_event_mark(&spec.def, &spec.member_props, member_index, event.mask)
-        }
+        MemberEventKind::Value => GroupMonitor::value_event_mark(
+            &spec.def,
+            &spec.member_props,
+            member_index,
+            event.mask(),
+        ),
         MemberEventKind::Property => {
             GroupMonitor::property_event_mark(&spec.def, &spec.member_props, member_index)
         }

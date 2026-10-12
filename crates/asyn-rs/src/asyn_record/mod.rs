@@ -10018,6 +10018,30 @@ mod tests {
             Some(errs_on_the_wire(&format!("port {port_name} not connected"))),
             "a refused put must fire the ERRS monitor with the refusal text"
         );
+        // ERRS is a char array, queued by reference: the read above can run
+        // ahead of the refusal's deferred post, which then queues one more
+        // entry. Once the poster has disarmed, everything boundary 1 posted
+        // is queued; drain it so boundary 2 sees only its own posts.
+        let poster = {
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            Arc::clone(&rec.post_slot)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while poster.lock().unwrap().armed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poster never disarmed"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        while errs_sub.try_recv_event().is_ok() {}
 
         // Boundary 2 — the same text again. C guards the post on
         // `strncmp(errs, old.errs)` (:2044): a record retrying a down port must

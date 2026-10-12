@@ -66,7 +66,7 @@ async fn an_unchanged_input_posts_when_the_alarm_moves(db: PvDatabase, rec: &str
 
     let mut masks = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        masks.push(ev.mask);
+        masks.push(ev.mask());
     }
     assert_eq!(
         masks.len(),

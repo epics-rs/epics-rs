@@ -82,16 +82,16 @@ async fn a_subscriber_arriving_after_unsubscribed_cycles_still_gets_the_targets_
     db.process_record("CALC").await.unwrap();
 
     let event = rx.try_recv().expect("A posts to its new subscriber");
+    // Metadata is read at delivery, through the GET door, over the log.
+    let mut delivered = db.channel_snapshot_for_field(&rec, "A", false).unwrap();
+    event.write_log_over(&mut delivered);
     assert_eq!(
-        event.snapshot.precision(),
+        delivered.precision(),
         Some(1),
         "A is link-backed: the post must carry SRC's precision, never CALC's own"
     );
     assert_eq!(
-        event
-            .snapshot
-            .units()
-            .map(|u| u.as_str_lossy().into_owned()),
+        delivered.units().map(|u| u.as_str_lossy().into_owned()),
         Some("mm".to_string()),
         "and SRC's units, which only a resolved backing can supply"
     );

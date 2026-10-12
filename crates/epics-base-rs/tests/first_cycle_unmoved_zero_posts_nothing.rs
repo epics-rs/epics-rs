@@ -35,7 +35,7 @@ fn subscribe_value(db: &PvDatabase, name: &str) -> EventReader {
 fn value_posts(rx: &mut EventReader) -> usize {
     let mut n = 0;
     while let Ok(ev) = rx.try_recv() {
-        if ev.mask.contains(EventMask::VALUE) {
+        if ev.mask().contains(EventMask::VALUE) {
             n += 1;
         }
     }

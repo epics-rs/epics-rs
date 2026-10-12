@@ -11,7 +11,7 @@
 //! Tracks overflow events via a counter, corresponding to C++ BaseMonitor's
 //! `inoverflow` flag and overflow BitSet.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -77,6 +77,13 @@ pub struct BridgeMonitor {
     /// array on every metadata change, corrupting the client's cached slice.
     property_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     running: bool,
+    /// The channel's options as last read through the GET door: at start
+    /// and on each PROPERTY event, which is all pvxs re-reads them on
+    /// (`singlesource.cpp:100`). A value event writes its log over a copy.
+    options: Option<epics_base_rs::server::snapshot::Snapshot>,
+    /// GET-door reads made by [`Self::read_options`].
+    #[cfg(test)]
+    options_reads: usize,
     /// Initial complete snapshot sent on first poll() after start().
     initial_snapshot: Option<PvStructure>,
     /// Number of monitor events lost due to overflow.
@@ -108,6 +115,9 @@ impl BridgeMonitor {
                 epics_base_rs::server::database::filters::FilterChain::new(),
             ),
             running: false,
+            options: None,
+            #[cfg(test)]
+            options_reads: 0,
             initial_snapshot: None,
             overflow_count: Arc::new(AtomicU64::new(0)),
             access: AccessContext::allow_all(),
@@ -163,6 +173,22 @@ impl BridgeMonitor {
     /// Get the number of overflow events (events lost due to queue full).
     pub fn overflow_count(&self) -> u64 {
         self.overflow_count.load(Ordering::Relaxed)
+    }
+
+    /// Read the channel's options through the GET door, on this thread.
+    fn read_options(&mut self) -> Option<epics_base_rs::server::snapshot::Snapshot> {
+        #[cfg(test)]
+        {
+            self.options_reads += 1;
+        }
+        let record = self.db.get_record(&self.record_name)?;
+        let mut options = self
+            .db
+            .channel_snapshot_for_field(&record, &self.field, false)?;
+        // Every event writes its own value over it.
+        options.value = epics_base_rs::types::EpicsValue::Long(0);
+        self.options = Some(options.clone());
+        Some(options)
     }
 
     /// The DBE mask the value subscription runs with: the client's
@@ -320,6 +346,10 @@ impl PvaMonitor for BridgeMonitor {
 
         self.subscription = Some(sub);
         self.property_subscription = Some(property_sub);
+        // After the subscriptions, so a property change racing start is
+        // either in this read or queued as a PROPERTY event.
+        self.read_options()
+            .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
         self.running = true;
         Ok(())
     }
@@ -347,35 +377,44 @@ impl PvaMonitor for BridgeMonitor {
         // metadata as freshly changed on every value event.
         let value_mask = self.value_mask();
         loop {
-            let (mut snapshot, change) = match (
+            let (ev, change) = match (
                 self.subscription.as_mut(),
                 self.property_subscription.as_mut(),
             ) {
                 (Some(value_sub), Some(prop_sub)) => tokio::select! {
                     ev = value_sub.recv_event() => {
                         let ev = ev?;
-                        let change = value_event_change(ev.mask, value_mask);
-                        (ev.snapshot, change)
+                        let change = value_event_change(ev.mask(), value_mask);
+                        (ev, change)
                     }
                     ev = prop_sub.recv_event() => {
                         // pvxs passes `UpdateType::Property` unconditionally
                         // for a property event (`singlesource.cpp:100`) — the
                         // event's own DBE mask is not consulted.
-                        (ev?.snapshot, EventMask::PROPERTY)
+                        (ev?, EventMask::PROPERTY)
                     }
                 },
                 (Some(value_sub), None) => {
                     let ev = value_sub.recv_event().await?;
-                    let change = value_event_change(ev.mask, value_mask);
-                    (ev.snapshot, change)
+                    let change = value_event_change(ev.mask(), value_mask);
+                    (ev, change)
                 }
                 _ => return None,
             };
+            // A value event reads value, alarm, time and utag only; the
+            // options are re-read on a property event alone.
+            let mut snapshot = if change.intersects(EventMask::PROPERTY) {
+                self.read_options()?
+            } else {
+                self.options.clone()?
+            };
+            ev.write_log_over(&mut snapshot);
             if let super::pvif::View::Dollar(view) = self.view {
-                let snap = std::sync::Arc::make_mut(&mut snapshot);
-                let value =
-                    std::mem::replace(&mut snap.value, epics_base_rs::types::EpicsValue::Long(0));
-                snap.value = view.text(value);
+                let value = std::mem::replace(
+                    &mut snapshot.value,
+                    epics_base_rs::types::EpicsValue::Long(0),
+                );
+                snapshot.value = view.text(value);
             }
             // A single-record channel's NT IS the root, so the mapped node
             // has an empty prefix. pvxs's `SingleInfo` carries a default
@@ -412,6 +451,7 @@ impl PvaMonitor for BridgeMonitor {
         self.subscription = None;
         self.property_subscription = None;
         self.running = false;
+        self.options = None;
         self.initial_snapshot = None;
     }
 }
@@ -420,6 +460,7 @@ impl PvaMonitor for BridgeMonitor {
 mod tests {
     use super::*;
     use epics_base_rs::server::records::ai::AiRecord;
+    use epics_pva_rs::pvdata::{PvField, ScalarValue};
     use std::time::Duration;
 
     /// Lifecycle invariants:
@@ -712,6 +753,62 @@ mod tests {
             "the posted value stays complete; the marked set is what narrows"
         );
 
+        mon.stop().await;
+    }
+
+    /// A value event reads no options: N value posts after start leave the
+    /// one GET-door read `start` made.
+    #[tokio::test]
+    async fn value_events_read_no_options() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("MON_NOOPT", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let mut mon =
+            BridgeMonitor::new(db.clone(), "MON_NOOPT".into(), "VAL".into(), NtType::Scalar);
+        mon.start().await.expect("start ok");
+        for _ in 0..4 {
+            db.get_record("MON_NOOPT")
+                .expect("rec exists")
+                .write()
+                .notify_field("VAL", EventMask::VALUE);
+            tokio::time::timeout(Duration::from_millis(500), mon.poll())
+                .await
+                .expect("VALUE event must wake poll within 500ms")
+                .expect("event delivered");
+        }
+        assert_eq!(mon.options_reads, 1);
+        mon.stop().await;
+    }
+
+    /// `caput X.EGU` reaches the monitor as a property event carrying the
+    /// new units, read at delivery.
+    #[tokio::test]
+    async fn an_egu_put_delivers_the_new_units() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("MON_EGU", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let mut mon =
+            BridgeMonitor::new(db.clone(), "MON_EGU".into(), "VAL".into(), NtType::Scalar);
+        mon.start().await.expect("start ok");
+        db.put_pv(
+            "MON_EGU.EGU",
+            epics_base_rs::types::EpicsValue::String("mm".into()),
+        )
+        .await
+        .unwrap();
+        let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+            .await
+            .expect("the EGU put must wake poll within 500ms")
+            .expect("event delivered");
+        let Some(PvField::Structure(display)) = snap.value.get_field("display") else {
+            panic!("expected display structure");
+        };
+        let Some(PvField::Scalar(ScalarValue::String(units))) = display.get_field("units") else {
+            panic!("expected display.units");
+        };
+        assert_eq!(units.to_string(), "mm");
         mon.stop().await;
     }
 

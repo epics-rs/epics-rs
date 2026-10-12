@@ -24,7 +24,17 @@ use epics_base_rs::types::EpicsValue;
 
 /// Render one monitor event as `camonitor -tn` prints it.
 fn camonitor_line(pv: &str, snap: &Snapshot, enums: &[String]) -> String {
-    let value = match &snap.value {
+    camonitor_parts(
+        pv,
+        &snap.value,
+        snap.alarm.status,
+        snap.alarm.severity,
+        enums,
+    )
+}
+
+fn camonitor_parts(pv: &str, value: &EpicsValue, stat: u16, sevr: u16, enums: &[String]) -> String {
+    let value = match value {
         EpicsValue::Double(v) if v.fract() == 0.0 => format!("{}", *v as i64),
         EpicsValue::Double(v) => format!("{v}"),
         EpicsValue::UChar(v) => format!("{v}"),
@@ -32,11 +42,11 @@ fn camonitor_line(pv: &str, snap: &Snapshot, enums: &[String]) -> String {
         EpicsValue::String(s) => s.to_string(),
         other => panic!("{pv}: no camonitor rendering for {other:?}"),
     };
-    let stat = match snap.alarm.status {
+    let stat = match stat {
         0 => "",
         s => alarm_condition_string(s),
     };
-    let sevr = match snap.alarm.severity {
+    let sevr = match sevr {
         0 => "",
         s => MENU_ALARM_SEVR[s as usize],
     };
@@ -56,9 +66,12 @@ impl SubscriptionFilter for Record {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        self.stream.lock().unwrap().push(camonitor_line(
+        let e = &event.event;
+        self.stream.lock().unwrap().push(camonitor_parts(
             &self.pv,
-            &event.event.snapshot,
+            e.value().as_value().expect("a by-value log"),
+            e.stat(),
+            e.sevr(),
             &self.enums,
         ));
         Some(event)

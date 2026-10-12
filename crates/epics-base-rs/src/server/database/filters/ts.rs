@@ -171,20 +171,17 @@ impl SubscriptionFilter for TimestampFilter {
     }
 
     fn apply(&self, mut event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        // One `make_mut` for the whole filter: it copies the snapshot only
-        // when another subscriber still holds the same `Arc`, and every arm
-        // below writes through the same unique reference.
-        let snap = std::sync::Arc::make_mut(&mut event.event.snapshot);
-        match self.mode {
+        let time = event.event.time();
+        let value = match self.mode {
             TsMode::Generate => {
-                // Replace the snapshot timestamp with "now" — what
+                // Replace the event's timestamp with "now" — what
                 // the original C `generate()` does.
-                snap.timestamp = crate::runtime::time::now_wall();
+                event.event.set_time(crate::runtime::time::now_wall());
+                return Some(event);
             }
             TsMode::Double => {
-                let (sec, nsec) = ts_parts(snap.timestamp, self.epoch);
-                let v = sec as f64 + (nsec as f64) * 1e-9;
-                snap.value = EpicsValue::Double(v);
+                let (sec, nsec) = ts_parts(time, self.epoch);
+                EpicsValue::Double(sec as f64 + (nsec as f64) * 1e-9)
             }
             TsMode::Seconds => {
                 // C `ts_seconds` (ts.c:196-203) sets `field_type =
@@ -192,36 +189,27 @@ impl SubscriptionFilter for TimestampFilter {
                 // (+POSIX offset for the Unix epoch). `sec as u32` matches
                 // C's `epicsUInt32` storage — it wraps mod 2^32 (year
                 // 2106), exactly as C does.
-                let (sec, _) = ts_parts(snap.timestamp, self.epoch);
-                snap.value = EpicsValue::ULong(sec as u32);
+                let (sec, _) = ts_parts(time, self.epoch);
+                EpicsValue::ULong(sec as u32)
             }
             TsMode::Nanoseconds => {
                 // C `ts_nanos` (ts.c:205-212) sets `DBF_ULONG` and writes
                 // the `epicsUInt32` `nsec` (always < 1e9).
-                let (_, nsec) = ts_parts(snap.timestamp, self.epoch);
-                snap.value = EpicsValue::ULong(nsec);
+                let (_, nsec) = ts_parts(time, self.epoch);
+                EpicsValue::ULong(nsec)
             }
             TsMode::Array => {
                 // C `ts_array` (ts.c:223-235) produces a 2-element
                 // `DBF_ULONG` array `[secPastEpoch, nsec]` of `epicsUInt32`.
-                let (sec, nsec) = ts_parts(snap.timestamp, self.epoch);
-                snap.value = EpicsValue::ULongArray(vec![sec as u32, nsec].into());
+                let (sec, nsec) = ts_parts(time, self.epoch);
+                EpicsValue::ULongArray(vec![sec as u32, nsec].into())
             }
-            TsMode::StringEpics => {
-                snap.value = EpicsValue::String(format_epics_string(snap.timestamp).into());
-            }
-            TsMode::StringIso => {
-                snap.value = EpicsValue::String(format_iso_string(snap.timestamp).into());
-            }
-        }
-        if self.mode != TsMode::Generate {
-            // `dbGet` keeps the options the log's new type allows
-            // (`dbAccess.c:341-348,387-394`).
-            snap.properties = snap.properties.narrowed_to_field(
-                self.final_field_type(crate::types::DbFieldType::Double),
-                false,
-            );
-        }
+            TsMode::StringEpics => EpicsValue::String(format_epics_string(time).into()),
+            TsMode::StringIso => EpicsValue::String(format_iso_string(time).into()),
+        };
+        // The options this type allows are narrowed where the log is read,
+        // by `MonitorEvent::write_log_over` (`dbAccess.c:341-348,387-394`).
+        event.event.replace_value(value);
         Some(event)
     }
 }
@@ -236,11 +224,11 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn make_event(t: impl Into<WallTime>) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: std::sync::Arc::new(Snapshot::new(EpicsValue::Double(1.0), 0, 0, t)),
-            origin: 0,
-            mask: EventMask::VALUE,
-        })
+        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
+            std::sync::Arc::new(Snapshot::new(EpicsValue::Double(1.0), 0, 0, t)),
+            0,
+            EventMask::VALUE,
+        ))
     }
 
     /// The default `Generate` mode rewrites snapshot timestamp to "now".
@@ -249,7 +237,7 @@ mod tests {
         let f = TimestampFilter::new();
         let before: WallTime = SystemTime::now().into();
         let out = f.apply(make_event(SystemTime::UNIX_EPOCH)).unwrap();
-        let stamped = out.event.snapshot.timestamp;
+        let stamped = out.event.time();
         assert!(
             stamped >= before.saturating_sub(Duration::from_millis(1)),
             "stamp must reflect current wall clock"
@@ -268,9 +256,9 @@ mod tests {
     fn restamps_alarm_events_too() {
         let f = TimestampFilter::new();
         let mut ev = make_event(SystemTime::UNIX_EPOCH);
-        ev.event.mask = EventMask::ALARM;
+        ev.event.set_mask(EventMask::ALARM);
         let out = f.apply(ev).unwrap();
-        assert!(out.event.snapshot.timestamp > WallTime::UNIX_EPOCH);
+        assert!(out.event.time() > WallTime::UNIX_EPOCH);
     }
 
     /// `num=sec` with `epoch=epics`: a wall time at EPICS-epoch+10s
@@ -280,7 +268,7 @@ mod tests {
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + 10);
         let f = TimestampFilter::with_mode_epoch(TsMode::Seconds, TsEpoch::Epics);
         let out = f.apply(make_event(ts)).unwrap();
-        match out.event.snapshot.value.clone() {
+        match out.event.value().as_value().cloned().unwrap() {
             // C `ts_seconds` sets DBF_ULONG (epicsUInt32).
             EpicsValue::ULong(v) => assert_eq!(v, 10),
             other => panic!("expected ULong(10), got {other:?}"),
@@ -294,7 +282,7 @@ mod tests {
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + 10);
         let f = TimestampFilter::with_mode_epoch(TsMode::Seconds, TsEpoch::Unix);
         let out = f.apply(make_event(ts)).unwrap();
-        match out.event.snapshot.value.clone() {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::ULong(v) => assert_eq!(v as u64, EPICS_UNIX_EPOCH_OFFSET_SECS + 10),
             other => panic!("expected ULong, got {other:?}"),
         }
@@ -308,7 +296,7 @@ mod tests {
         let ts = WallTime::from_unix(EPICS_UNIX_EPOCH_OFFSET_SECS, 123_456_789);
         let f = TimestampFilter::with_mode(TsMode::Nanoseconds);
         let out = f.apply(make_event(ts)).unwrap();
-        match out.event.snapshot.value.clone() {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::ULong(v) => assert_eq!(v, 123_456_789),
             other => panic!("expected ULong(123456789), got {other:?}"),
         }
@@ -320,7 +308,7 @@ mod tests {
         let ts = WallTime::from_unix(EPICS_UNIX_EPOCH_OFFSET_SECS + 5, 250_000_000);
         let f = TimestampFilter::with_mode_epoch(TsMode::Double, TsEpoch::Epics);
         let out = f.apply(make_event(ts)).unwrap();
-        match out.event.snapshot.value.clone() {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::Double(v) => {
                 assert!((v - 5.25).abs() < 1e-9, "expected 5.25, got {v}");
             }
@@ -334,7 +322,7 @@ mod tests {
         let ts = WallTime::from_unix(EPICS_UNIX_EPOCH_OFFSET_SECS + 7, 500_000_000);
         let f = TimestampFilter::with_mode(TsMode::Array);
         let out = f.apply(make_event(ts)).unwrap();
-        match out.event.snapshot.value.clone() {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::ULongArray(v) => {
                 assert_eq!(v, vec![7u32, 500_000_000]);
             }
@@ -354,7 +342,7 @@ mod tests {
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + big);
         let f = TimestampFilter::with_mode_epoch(TsMode::Seconds, TsEpoch::Unix);
         let out = f.apply(make_event(ts)).unwrap();
-        match out.event.snapshot.value.clone() {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::ULong(v) => {
                 assert_eq!(v as u64, EPICS_UNIX_EPOCH_OFFSET_SECS + big);
                 assert!(v > i32::MAX as u32, "post-2038 value not truncated");
@@ -376,7 +364,7 @@ mod tests {
         let ts = SystemTime::UNIX_EPOCH + Duration::new(secs_since_unix, 123_456_000);
         let f = TimestampFilter::with_mode(TsMode::StringEpics);
         let out = f.apply(make_event(ts)).unwrap();
-        match out.event.snapshot.value.clone() {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::String(s) => {
                 let s = s.as_str_lossy();
                 assert!(s.ends_with(".123456"), "must keep microseconds: {s}");
@@ -425,9 +413,10 @@ mod tests {
             .apply(make_event(ts))
             .unwrap()
             .event
-            .snapshot
-            .value
-            .clone()
+            .value()
+            .as_value()
+            .cloned()
+            .unwrap()
         {
             EpicsValue::String(s) => s.as_str_lossy().into_owned(),
             other => panic!("expected String, got {other:?}"),
@@ -467,9 +456,10 @@ mod tests {
             .apply(make_event(ts))
             .unwrap()
             .event
-            .snapshot
-            .value
-            .clone()
+            .value()
+            .as_value()
+            .cloned()
+            .unwrap()
         {
             EpicsValue::String(s) => s.as_str_lossy().into_owned(),
             other => panic!("expected String, got {other:?}"),

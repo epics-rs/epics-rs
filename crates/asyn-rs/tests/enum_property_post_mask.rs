@@ -141,7 +141,7 @@ fn drive_table_change(handle: &PortHandle, choices: Vec<EnumEntry>) {
 fn drain(reader: &mut EventReader) -> Vec<(EventMask, EpicsValue)> {
     let mut out = Vec::new();
     while let Ok(ev) = reader.try_recv() {
-        out.push((ev.mask, ev.snapshot.value.clone()));
+        out.push((ev.mask(), ev.value().as_value().cloned().unwrap()));
     }
     out
 }

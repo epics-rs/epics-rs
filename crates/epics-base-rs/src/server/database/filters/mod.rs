@@ -238,28 +238,26 @@ impl FilterChain {
     }
 
     /// [`Self::apply_single_value`] on a whole snapshot, whose timestamp a
-    /// `ts` value mode reads and whose properties it narrows.
+    /// `ts` value mode reads: the chain runs on a log of the read and is
+    /// written back over it, narrowing its options to the log's type.
     fn apply_single(
         &self,
-        snap: crate::server::snapshot::Snapshot,
+        mut snap: crate::server::snapshot::Snapshot,
         read_context: bool,
         mask: EventMask,
     ) -> Option<crate::server::snapshot::Snapshot> {
         use crate::server::pv::MonitorEvent;
-        let event = MonitorEvent {
-            snapshot: std::sync::Arc::new(snap),
-            origin: 0,
-            mask,
-        };
+        if self.filters.is_empty() {
+            return Some(snap);
+        }
+        let log = MonitorEvent::read_log(&mut snap, mask);
         let wrapped = if read_context {
-            FilteredMonitorEvent::new_read(event)
+            FilteredMonitorEvent::new_read(log)
         } else {
-            FilteredMonitorEvent::new(event)
+            FilteredMonitorEvent::new(log)
         };
-        let filtered = self.apply(wrapped)?;
-        // Sole owner on this path (the snapshot was wrapped above and never
-        // shared), so `unwrap_or_clone` moves rather than copies.
-        Some(std::sync::Arc::unwrap_or_clone(filtered.event.snapshot))
+        self.apply(wrapped)?.event.write_log_over(&mut snap);
+        Some(snap)
     }
 
     /// [`Self::apply_to_read_value`] on the field's snapshot, the read log
@@ -392,11 +390,7 @@ mod tests {
             0,
             SystemTime::UNIX_EPOCH,
         ));
-        FilteredMonitorEvent::new(MonitorEvent {
-            snapshot,
-            origin: 0,
-            mask: EventMask::VALUE,
-        })
+        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(snapshot, 0, EventMask::VALUE))
     }
 
     /// Empty chain is the identity — every event passes unchanged.
@@ -404,7 +398,9 @@ mod tests {
     fn empty_chain_passes_through() {
         let chain = FilterChain::new();
         let out = chain.apply(make_event(1.0)).expect("empty chain passes");
-        assert!(matches!(out.event.snapshot.value, EpicsValue::Double(v) if v == 1.0));
+        assert!(
+            matches!(out.event.value().as_value().cloned().unwrap(), EpicsValue::Double(v) if v == 1.0)
+        );
     }
 
     /// Each filter sees the event in registration order.

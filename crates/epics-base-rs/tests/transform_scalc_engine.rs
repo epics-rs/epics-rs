@@ -176,7 +176,10 @@ async fn r11_c14_a_put_to_the_val_dummy_still_posts() {
         .unwrap();
 
     let e = val_rx.try_recv().expect("dbPut posts the field it wrote");
-    assert_eq!(e.snapshot.value, EpicsValue::Double(42.0));
+    assert_eq!(
+        e.value().as_value().cloned().unwrap(),
+        EpicsValue::Double(42.0)
+    );
     assert!(
         val_rx.try_recv().is_err(),
         "and posts it exactly once (R11-C10)"

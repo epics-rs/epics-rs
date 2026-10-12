@@ -477,6 +477,8 @@ async fn bind_sockets(
     udp_port: u16,
     tcp_port: u16,
 ) -> CaResult<(crate::server::tcp::BoundTcp, crate::server::udp::BoundUdp)> {
+    // `rsrv_init` reports its sizing variables first (`caservertask.c:510-530`).
+    epics_base_rs::server::event_queue::configure_events_per_que();
     let tcp = crate::server::tcp::bind_tcp_listeners(tcp_port).await?;
     let cfg = addr_list::from_env()?;
     let udp = crate::server::udp::bind_udp_responders(udp_port, cfg.intf_addrs, &cfg.mcast_addrs)?;

@@ -215,7 +215,7 @@ fn dbr_long(value: &EpicsValue) -> Option<u32> {
 fn drain(inputs: &mut [EventReader], values: &mut [u32; MAX_SCALER_CHANNELS]) {
     for (input, value) in inputs.iter_mut().zip(values.iter_mut()) {
         while let Ok(ev) = input.try_recv() {
-            if let Some(v) = dbr_long(&ev.snapshot.value) {
+            if let Some(v) = ev.value().as_value().and_then(dbr_long) {
                 *value = v;
             }
         }

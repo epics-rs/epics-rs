@@ -21,7 +21,9 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::RecordCell;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -41,24 +43,44 @@ async fn build() -> Arc<PvDatabase> {
         .0
 }
 
-fn subscribe(db: &PvDatabase, field: &str, sid: u32, ftype: DbFieldType) -> EventReader {
-    let inst = db.get_record("SQ").unwrap();
-    let mut g = inst.write();
-    g.add_subscriber(
-        field,
-        sid,
-        ftype,
-        (EventMask::VALUE | EventMask::ALARM).bits(),
-    )
-    .unwrap()
+/// A monitor and the field its client reads a by-reference log from.
+struct Mon {
+    rx: EventReader,
+    rec: Arc<RecordCell>,
+    field: String,
+}
+
+impl Mon {
+    fn try_recv(&mut self) -> Option<(EpicsValue, MonitorEvent)> {
+        let ev = self.rx.try_recv().ok()?;
+        let value = ev.delivered_value(&self.rec.read(), &self.field).unwrap();
+        Some((value, ev))
+    }
+}
+
+fn subscribe(db: &PvDatabase, field: &str, sid: u32, ftype: DbFieldType) -> Mon {
+    let rec = db.get_record("SQ").unwrap();
+    let rx = rec
+        .write()
+        .add_subscriber(
+            field,
+            sid,
+            ftype,
+            (EventMask::VALUE | EventMask::ALARM).bits(),
+        )
+        .unwrap();
+    Mon {
+        rx,
+        rec,
+        field: field.to_string(),
+    }
 }
 
 /// (value, status, severity) of every event queued so far.
-fn drain(rx: &mut EventReader) -> Vec<(EpicsValue, u16, u16)> {
+fn drain(rx: &mut Mon) -> Vec<(EpicsValue, u16, u16)> {
     let mut out = Vec::new();
-    while let Ok(e) = rx.try_recv() {
-        let s = &e.snapshot;
-        out.push((s.value.clone(), s.alarm.status, s.alarm.severity));
+    while let Some((value, e)) = rx.try_recv() {
+        out.push((value, e.stat(), e.sevr()));
     }
     out
 }
@@ -126,7 +148,7 @@ record(sseq, "SQ") { field(PREC, "2") field(DOL1, "SRC") field(DOL2, "7") }
         ("STR2", DbFieldType::String),
         ("VAL", DbFieldType::Long),
     ];
-    let mut rxs: Vec<EventReader> = fields
+    let mut rxs: Vec<Mon> = fields
         .iter()
         .enumerate()
         .map(|(i, (f, t))| subscribe(&db, f, i as u32 + 1, *t))
@@ -185,7 +207,7 @@ record(sseq, "SQ2") { field(PREC, "2") field(DOL1, "SRC") field(DOL2, "7") field
         .0;
     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
     let inst = db.get_record("SQ2").unwrap();
-    let mut rx = inst
+    let rx = inst
         .write()
         .add_subscriber(
             "DO1",
@@ -194,6 +216,11 @@ record(sseq, "SQ2") { field(PREC, "2") field(DOL1, "SRC") field(DOL2, "7") field
             (EventMask::VALUE | EventMask::ALARM).bits(),
         )
         .unwrap();
+    let mut rx = Mon {
+        rx,
+        rec: inst,
+        field: "DO1".into(),
+    };
     drain(&mut rx);
     db.put_record_field_from_ca("SQ2", "PROC", EpicsValue::Short(1))
         .await

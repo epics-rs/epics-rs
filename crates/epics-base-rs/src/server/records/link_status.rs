@@ -475,7 +475,7 @@ mod tests {
         let mut drain = |i: usize| {
             let mut got = Vec::new();
             while let Ok(ev) = rx[i].try_recv() {
-                got.push(ev.snapshot.value.clone());
+                got.push(ev.value().as_value().cloned().unwrap());
             }
             got
         };

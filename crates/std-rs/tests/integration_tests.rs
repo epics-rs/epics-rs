@@ -1491,7 +1491,7 @@ record(ao, "K") { field(VAL, "1") field(OUT, "TC.SYNC NPP") }
         .unwrap();
     let mut sts = Vec::new();
     while let Ok(e) = rx.try_recv() {
-        sts.push(e.snapshot.value.to_f64().unwrap());
+        sts.push(e.value().as_value().and_then(EpicsValue::to_f64).unwrap());
     }
     assert_eq!(sts, [1.0, 1.0]);
 }

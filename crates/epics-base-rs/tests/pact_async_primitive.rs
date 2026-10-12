@@ -202,9 +202,12 @@ async fn post_fields_applies_and_posts_async_update() {
         .try_recv()
         .expect("post_fields must post a monitor event for the field");
     assert!(
-        matches!(event.snapshot.value, EpicsValue::Long(7)),
+        matches!(
+            event.value().as_value().cloned().unwrap(),
+            EpicsValue::Long(7)
+        ),
         "monitor event payload should carry the posted value, got {:?}",
-        event.snapshot.value
+        event.value().as_value().cloned().unwrap()
     );
 
     assert_eq!(

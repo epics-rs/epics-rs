@@ -75,7 +75,9 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
     process(&db, "P1").await;
     let first = aa_rx.try_recv().expect("AA moved on the first process");
     assert_eq!(
-        first.snapshot.value,
+        first
+            .delivered_value(&db.get_record("P1").unwrap().read(), "AA")
+            .unwrap(),
         EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0].into())
     );
 
@@ -86,11 +88,13 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
         .try_recv()
         .expect("AMASK bit 0 is set again, so afterCalc posts AA again (:294-298)");
     assert_eq!(
-        second.snapshot.value,
+        second
+            .delivered_value(&db.get_record("P1").unwrap().read(), "AA")
+            .unwrap(),
         EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0].into())
     );
     assert_eq!(
-        second.mask,
+        second.mask(),
         EventMask::VALUE | EventMask::LOG,
         "C posts the flagged array with a literal DBE_VALUE|DBE_LOG"
     );
@@ -282,18 +286,15 @@ async fn the_aftercalc_post_carries_the_previous_stamp_and_alarm() {
         process(&db, "AC").await;
         let a = aa.try_recv().expect("afterCalc posts AA");
         let v = val.try_recv().expect("VAL moved");
-        assert_eq!(a.snapshot.timestamp, prev_stamp, "cycle {cycle}: AA stamp");
-        let alarm = (a.snapshot.alarm.status, a.snapshot.alarm.severity);
+        assert_eq!(a.time(), prev_stamp, "cycle {cycle}: AA stamp");
+        let alarm = (a.stat(), a.sevr());
         assert_eq!(
             alarm,
             if cycle == 0 { (17, 3) } else { (0, 0) },
             "cycle {cycle}: AA alarm"
         );
-        assert_ne!(
-            v.snapshot.timestamp, prev_stamp,
-            "cycle {cycle}: VAL is stamped"
-        );
-        prev_stamp = v.snapshot.timestamp;
+        assert_ne!(v.time(), prev_stamp, "cycle {cycle}: VAL is stamped");
+        prev_stamp = v.time();
         for (f, rx) in &mut silent {
             assert!(rx.try_recv().is_err(), "cycle {cycle}: AC.{f} posted");
         }
@@ -328,12 +329,8 @@ fn the_aftercalc_post_through_process_local_carries_the_previous_stamp() {
         let alarm = (inst.common.stat, inst.common.sevr as u16);
         inst.process_local().unwrap();
         let e = aa.try_recv().expect("afterCalc posts AA");
-        assert_eq!(e.snapshot.timestamp, stamp, "cycle {cycle}: AA stamp");
-        assert_eq!(
-            (e.snapshot.alarm.status, e.snapshot.alarm.severity),
-            alarm,
-            "cycle {cycle}: AA alarm"
-        );
+        assert_eq!(e.time(), stamp, "cycle {cycle}: AA stamp");
+        assert_eq!((e.stat(), e.sevr()), alarm, "cycle {cycle}: AA alarm");
         let after: WallTime = inst.common.time.into();
         assert_ne!(after, stamp, "cycle {cycle}: the cycle stamped the record");
         std::thread::sleep(std::time::Duration::from_millis(5));

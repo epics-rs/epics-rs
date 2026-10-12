@@ -247,7 +247,8 @@ pub struct DbSubscription {
     /// (C `evSubscrip` + `event_read`). An in-process consumer is its own C
     /// `event_user`, so nothing else shares its queue.
     reader: EventReader,
-    pv_name: String,
+    /// Boxed: a subscription is held inline in PVA's monitor enums.
+    channel: Box<Channel>,
     /// If non-zero, events with this origin are silently skipped.
     /// Used to filter out self-triggered events from the same writer.
     ignore_origin: u64,
@@ -258,6 +259,15 @@ pub struct DbSubscription {
     /// What is done to each event as it is read; `None` for most
     /// channels, which have neither.
     read: Option<Box<PostStage>>,
+}
+
+/// The channel a subscription reads through at delivery.
+struct Channel {
+    pv_name: String,
+    /// Upper-cased.
+    field: String,
+    /// The GET door [`DbSubscription::recv_snapshot`] reads options through.
+    db: PvDatabase,
 }
 
 /// A subscription's read-time work, C's post chain on its `dbChannel`, run
@@ -290,19 +300,17 @@ impl PostStage {
     /// ([`DollarView::read_request`](crate::server::database::char_view::DollarView::read_request)).
     pub fn read_request(&self, mut event: MonitorEvent, n_request: usize) -> Option<MonitorEvent> {
         let image = self.dollar.map(|view| {
-            let snap = std::sync::Arc::make_mut(&mut event.snapshot);
-            let value = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-            snap.value = view.render(value);
-            (view, snap.value.clone())
+            let image = view.render(event.replace_value(EpicsValue::Long(0)));
+            event.replace_value(image.clone());
+            (view, image)
         });
         if !self.post.is_empty() {
             use crate::server::database::filters::FilteredMonitorEvent;
             event = self.post.apply(FilteredMonitorEvent::new(event))?.event;
         }
         if let Some((view, image)) = image {
-            let snap = std::sync::Arc::make_mut(&mut event.snapshot);
-            let log = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-            snap.value = view.read_request(image, log, n_request);
+            let log = event.replace_value(EpicsValue::Long(0));
+            event.replace_value(view.read_request(image, log, n_request));
         }
         Some(event)
     }
@@ -312,6 +320,11 @@ impl PostStage {
         self.dollar.is_some()
     }
 }
+
+/// A queued update whose delivery read failed: the `dbGet` error a C
+/// monitor turns into an `ECA_GETFAIL` event, never a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetFailed;
 
 /// Detachable enable/disable handle for one [`DbSubscription`], holding
 /// only the record back-reference + the subscriber's slot id (an `Arc` +
@@ -396,7 +409,11 @@ impl DbSubscription {
             reader
         };
         Ok(Self {
-            pv_name: pv_name.to_string(),
+            channel: Box::new(Channel {
+                pv_name: pv_name.to_string(),
+                field,
+                db: db.clone(),
+            }),
             ignore_origin,
             id: reader.id(),
             record: rec,
@@ -418,11 +435,19 @@ impl DbSubscription {
     }
 
     /// The event as read, `None` where it is skipped: the one place
-    /// `ignore_origin`, the `$` view and the post chain apply, for every
-    /// reader.
-    fn read_event(&self, event: MonitorEvent) -> Option<MonitorEvent> {
-        if self.ignore_origin != 0 && event.origin == self.ignore_origin {
+    /// `ignore_origin`, the read of a log that holds no value (C
+    /// `dbfl_type_ref`, read through `dbChannelField` at delivery), the `$`
+    /// view and the post chain apply, for every reader. A field the read
+    /// cannot reach leaves the log without a value.
+    fn read_event(&self, mut event: MonitorEvent) -> Option<MonitorEvent> {
+        if self.ignore_origin != 0 && event.origin() == self.ignore_origin {
             return None;
+        }
+        if event.value().as_value().is_none() {
+            let read = event.delivered_value(&self.record.read(), &self.channel.field);
+            if let Some(value) = read {
+                event.set_value(value);
+            }
         }
         match self.read.as_deref() {
             Some(read) => read.read(event),
@@ -490,9 +515,31 @@ impl DbSubscription {
     }
 
     /// Non-blocking [`Self::recv_snapshot`].
-    pub fn try_recv_snapshot(&mut self) -> Result<crate::server::snapshot::Snapshot, TryRecvError> {
-        self.try_next_event()
-            .map(|e| std::sync::Arc::unwrap_or_clone(e.snapshot))
+    pub fn try_recv_snapshot(
+        &mut self,
+    ) -> Result<Result<crate::server::snapshot::Snapshot, GetFailed>, TryRecvError> {
+        let event = self.try_next_event()?;
+        Ok(self.delivered(&event))
+    }
+
+    /// `event` as `dbGet` reads it: the options from the record now, on this
+    /// thread (`getOptions`, `dbAccess.c:336-414`), the value, alarm, time
+    /// and utag from the log. A field the read cannot reach is a failed get,
+    /// as `dbGet`'s error is to `event_read`.
+    fn delivered(
+        &self,
+        event: &MonitorEvent,
+    ) -> Result<crate::server::snapshot::Snapshot, GetFailed> {
+        if event.value().as_value().is_none() {
+            return Err(GetFailed);
+        }
+        let channel = &self.channel;
+        let mut snapshot = channel
+            .db
+            .channel_snapshot_for_field(&self.record, &channel.field, false)
+            .ok_or(GetFailed)?;
+        event.write_log_over(&mut snapshot);
+        Ok(snapshot)
     }
 
     /// Non-blocking [`Self::recv_event`].
@@ -501,25 +548,37 @@ impl DbSubscription {
     }
 
     /// Wait for the next value change. Returns the new value as f64.
-    /// Silently skips events matching `ignore_origin`.
+    /// Silently skips events matching `ignore_origin`, and events whose
+    /// field could not be read.
     pub async fn recv_f64(&mut self) -> Option<f64> {
-        let event = self.next_event().await?;
-        event.snapshot.value.to_f64()
+        loop {
+            let event = self.next_event().await?;
+            if let Some(value) = event.value().as_value() {
+                return value.to_f64();
+            }
+        }
     }
 
     /// Wait for the next value change. Returns the raw EpicsValue.
-    /// Silently skips events matching `ignore_origin`.
+    /// Silently skips events matching `ignore_origin`, and events whose
+    /// field could not be read.
     pub async fn recv(&mut self) -> Option<EpicsValue> {
-        let event = self.next_event().await?;
-        Some(event.snapshot.value.clone())
+        loop {
+            let event = self.next_event().await?;
+            if let Some(value) = event.value().as_value() {
+                return Some(value.clone());
+            }
+        }
     }
 
     /// Wait for the next change, returning the full Snapshot with metadata.
     /// Includes alarm, display, control, and enum info — not just the value.
     /// Silently skips events matching `ignore_origin`.
-    pub async fn recv_snapshot(&mut self) -> Option<crate::server::snapshot::Snapshot> {
+    pub async fn recv_snapshot(
+        &mut self,
+    ) -> Option<Result<crate::server::snapshot::Snapshot, GetFailed>> {
         let event = self.next_event().await?;
-        Some(std::sync::Arc::unwrap_or_clone(event.snapshot))
+        Some(self.delivered(&event))
     }
 
     /// Wait for the next change, returning the full [`MonitorEvent`] —
@@ -565,7 +624,7 @@ impl DbSubscription {
     }
 
     pub fn pv_name(&self) -> &str {
-        &self.pv_name
+        &self.channel.pv_name
     }
 }
 
@@ -645,8 +704,12 @@ impl DbMultiMonitor {
             for sub in &mut self.subs {
                 match sub.try_next_event() {
                     Ok(event) => {
-                        let val = event.snapshot.value.to_f64().unwrap_or(0.0);
-                        return (sub.pv_name.clone(), val);
+                        let val = event
+                            .value()
+                            .as_value()
+                            .and_then(EpicsValue::to_f64)
+                            .unwrap_or(0.0);
+                        return (sub.channel.pv_name.clone(), val);
                     }
                     Err(_) => continue,
                 }
@@ -656,5 +719,34 @@ impl DbMultiMonitor {
             // blocking connection thread that has no runtime.
             crate::runtime::task::sleep_background(Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_read_tests {
+    use super::*;
+
+    /// A queued update of a field the delivery read cannot reach is a failed
+    /// get (`camessage.c:545-560`), not a made-up value.
+    #[epics_macros_rs::epics_test]
+    async fn a_failed_delivery_read_is_a_failed_get() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "X",
+            Box::new(crate::server::records::ai::AiRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
+        let mut sub = DbSubscription::subscribe(&db, "X.NOSUCH").await.unwrap();
+        let posted = crate::server::snapshot::Snapshot::new(
+            EpicsValue::Double(2.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        sub.record
+            .read()
+            .post_single_event("NOSUCH", sub.id, std::sync::Arc::new(posted));
+        assert!(matches!(sub.try_recv_snapshot(), Ok(Err(GetFailed))));
     }
 }

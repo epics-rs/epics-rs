@@ -89,12 +89,12 @@ impl SubscriptionFilter for Stream {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        let snap = &event.event.snapshot;
+        let ev = &event.event;
         self.lines.lock().unwrap().push(format!(
             "{} {} {}",
             self.pv,
-            snap.value.to_f64().unwrap(),
-            snap.alarm.severity
+            ev.value().as_value().and_then(|v| v.to_f64()).unwrap(),
+            ev.sevr()
         ));
         Some(event)
     }

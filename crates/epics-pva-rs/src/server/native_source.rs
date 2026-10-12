@@ -19,6 +19,7 @@ use epics_base_rs::server::database::char_view::{DollarView, PvaDollar, long_str
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
 use epics_base_rs::server::database::filters::{ChannelName, FilterChain, db_channel_create};
 use epics_base_rs::server::database::{PvDatabase, PvEntry};
+use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{EpicsValue, WallTime};
@@ -229,19 +230,7 @@ impl PvDatabaseSource {
 /// counts at once (no `display.form`, `uint8_t` `hysteresis`, `double`
 /// limits on integer records, and a full numeric `display`/`control`/
 /// `valueAlarm` on string records).
-fn nt_scalar_for(snap: &Snapshot) -> NTScalar {
-    // Same single owner as the value leaf (`crate::leaf_convert`), so the
-    // NT's `value` member and the type its limits are cut from agree by
-    // construction.
-    let (value_type, is_array) =
-        match crate::leaf_convert::epics_value_to_field_desc_leaf(&snap.value) {
-            FieldDesc::Scalar(t) => (t, false),
-            FieldDesc::ScalarArray(t) => (t, true),
-            // `epics_value_to_field_desc_leaf` returns only those two variants
-            // for an `EpicsValue`; a string scalar is the conservative shape if
-            // that ever changes.
-            _ => (ScalarType::String, false),
-        };
+fn nt_scalar(value_type: ScalarType, is_array: bool) -> NTScalar {
     let mut nt = if is_array {
         NTScalar::array(value_type)
     } else {
@@ -254,34 +243,150 @@ fn nt_scalar_for(snap: &Snapshot) -> NTScalar {
     nt
 }
 
+/// What fixes a channel's NT value tree: the value leaf's shape and the
+/// property leaves the channel serves. Every snapshot with one `NtShape`
+/// fills the same leaves, so a tree filled from one is a correct start for
+/// the next — what lets [`PostRing`] fill in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NtShape {
+    value: NtValue,
+    properties: epics_base_rs::server::snapshot::PropertySupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NtValue {
+    /// pvxs single-record QSRV builds an NTEnum prototype whenever the
+    /// backing DBR type is DBR_ENUM (`ioc/singlesource.cpp:200-204`), and
+    /// `NTEnum::build()` defines `value` as an `enum_t { index, choices }`
+    /// (`src/nt.cpp:121-131`). A Rust `EpicsValue::Enum` *is* that DBR_ENUM
+    /// scalar, so it surfaces as `epics:nt/NTEnum:1.0`, not as a bare
+    /// numeric NTScalar.
+    Enum,
+    Scalar(ScalarType),
+    Array(ScalarType),
+}
+
+impl NtShape {
+    fn of(snap: &Snapshot) -> Self {
+        Self::new(&snap.value, snap.properties)
+    }
+
+    /// The shape a `value` takes on a channel serving `properties`.
+    fn new(
+        value: &EpicsValue,
+        properties: epics_base_rs::server::snapshot::PropertySupport,
+    ) -> Self {
+        // Same single owner as the value leaf (`crate::leaf_convert`), so the
+        // NT's `value` member and the type its limits are cut from agree by
+        // construction.
+        let value = match value {
+            EpicsValue::Enum(_) => NtValue::Enum,
+            v => match crate::leaf_convert::epics_value_to_field_desc_leaf(v) {
+                FieldDesc::Scalar(t) => NtValue::Scalar(t),
+                FieldDesc::ScalarArray(t) => NtValue::Array(t),
+                // `epics_value_to_field_desc_leaf` returns only those two
+                // variants for an `EpicsValue`; a string scalar is the
+                // conservative shape if that ever changes.
+                _ => NtValue::Scalar(ScalarType::String),
+            },
+        };
+        Self { value, properties }
+    }
+
+    fn desc(self) -> FieldDesc {
+        match self.value {
+            NtValue::Enum => nt_enum_desc(),
+            NtValue::Scalar(t) => nt_scalar(t, false).build(),
+            NtValue::Array(t) => nt_scalar(t, true).build(),
+        }
+    }
+}
+
 fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
-    // pvxs single-record QSRV builds an NTEnum prototype whenever the
-    // backing DBR type is DBR_ENUM (`ioc/singlesource.cpp:200-204`), and
-    // `NTEnum::build()` defines `value` as an `enum_t { index, choices }`
-    // (`src/nt.cpp:121-131`). A Rust `EpicsValue::Enum` *is* that DBR_ENUM
-    // scalar, so it must surface as `epics:nt/NTEnum:1.0` carrying the
-    // discoverable `value.choices`, not as a bare numeric NTScalar.
-    if let EpicsValue::Enum(v) = &snap.value {
-        return build_nt_enum(i32::from(*v), snap);
-    }
-    fill_nt_scalar(&nt_scalar_for(snap).build(), snap)
+    let mut v = crate::pvdata::encode::default_value_for(&NtShape::of(snap).desc());
+    fill_nt(&mut v, snap);
+    v
 }
 
+/// The value and the introspection are one [`NtShape`], so they stay in
+/// lockstep (pvxs `ioc/singlesource.cpp:200-204`, `src/nt.cpp:121-131`).
 fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
-    // Mirror `snapshot_to_pv_field`: a DBR_ENUM scalar advertises the
-    // NTEnum descriptor (`epics:nt/NTEnum:1.0`) so value and introspection
-    // stay in lockstep (pvxs `ioc/singlesource.cpp:200-204`, `src/nt.cpp:121-131`).
-    if matches!(&snap.value, EpicsValue::Enum(_)) {
-        return nt_enum_desc();
-    }
-    nt_scalar_for(snap).build()
+    NtShape::of(snap).desc()
 }
 
-/// Populate the NTScalar shape `desc` declares from `snap`.
+/// Fill every leaf `snap` serves into `v`, a tree of `NtShape::of(snap)`.
+fn fill_nt(v: &mut PvField, snap: &Snapshot) {
+    fill_nt_meta(v, NtShape::of(snap), snap);
+    fill_nt_event(v, &LogLeaves::of_snapshot(snap));
+}
+
+/// The leaves a log carries: the value, alarm and time `dbGet` reads off a
+/// field log rather than the record (`dbAccess.c:936-1020`).
+struct LogLeaves<'a> {
+    value: &'a EpicsValue,
+    stat: u16,
+    sevr: u16,
+    amsg: &'a str,
+    time: WallTime,
+    utag: i32,
+}
+
+impl<'a> LogLeaves<'a> {
+    fn of_snapshot(snap: &'a Snapshot) -> Self {
+        Self {
+            value: &snap.value,
+            stat: snap.alarm.status,
+            sevr: snap.alarm.severity,
+            amsg: &snap.alarm.amsg,
+            time: snap.timestamp,
+            utag: snap.user_tag,
+        }
+    }
+
+    /// `ev`'s leaves, its value being `value` ([`logged_value`]).
+    fn of_event(ev: &'a MonitorEvent, value: &'a EpicsValue) -> Self {
+        Self {
+            value,
+            stat: ev.stat(),
+            sevr: ev.sevr(),
+            amsg: ev.amsg(),
+            time: ev.time(),
+            utag: ev.utag(),
+        }
+    }
+}
+
+/// The leaves a value event assigns — pvxs `IOCSource::get` under
+/// `UpdateType::Value | Alarm` (`iocsource.cpp:338-358`): value, alarm and
+/// timeStamp, nothing a metadata read supplies.
+fn fill_nt_event(v: &mut PvField, log: &LogLeaves) {
+    let value = match log.value {
+        EpicsValue::Enum(index) => (
+            "value.index",
+            PvField::Scalar(ScalarValue::Int(i32::from(*index))),
+        ),
+        other => ("value", crate::leaf_convert::epics_value_to_pv_leaf(other)),
+    };
+    set_leaf(v, value.0, value.1);
+    set_leaf(v, "alarm", build_alarm(log.stat, log.sevr, log.amsg));
+    set_leaf(v, "timeStamp", build_timestamp(log.time, log.utag));
+}
+
+/// The leaves a metadata read assigns — `getProperties` under
+/// `UpdateType::Property` (`iocsource.cpp:334-336`) plus the form menu
+/// `IOCSource::initialize` sets — from `meta`, into a tree of `shape`.
+fn fill_nt_meta(v: &mut PvField, shape: NtShape, meta: &Snapshot) {
+    match shape.value {
+        NtValue::Enum => fill_nt_enum_meta(v, meta),
+        NtValue::Scalar(_) | NtValue::Array(_) => fill_nt_scalar_meta(v, meta),
+    }
+}
+
+/// Populate the NTScalar tree `v`'s metadata leaves from `snap`.
 ///
-/// The DESCRIPTOR is the shape's only owner: this starts from
-/// [`default_value_for`](crate::pvdata::encode::default_value_for) — which
-/// already produces a value matching `desc` leaf for leaf — and overwrites
+/// The DESCRIPTOR is the shape's only owner: `v` starts as
+/// [`default_value_for`](crate::pvdata::encode::default_value_for) of it —
+/// a value matching the descriptor leaf for leaf — and this overwrites
 /// only the leaves this channel serves, coercing each to the type the
 /// descriptor declared. A leaf the shape does not carry (`display.limitLow`
 /// on a string NT) is simply not found, which is exactly pvxs's own
@@ -311,21 +416,11 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
 /// `*Severity`, `hysteresis`. They are declared, and zero, and the GET reply
 /// leaves them unmarked (`read_checked`), so no client reads a zero as
 /// authoritative.
-fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
-    let mut v = crate::pvdata::encode::default_value_for(desc);
-
-    set_leaf(
-        &mut v,
-        "value",
-        crate::leaf_convert::epics_value_to_pv_leaf(&snap.value),
-    );
-    set_leaf(&mut v, "alarm", build_alarm(snap));
-    set_leaf(&mut v, "timeStamp", build_timestamp(snap));
-
+fn fill_nt_scalar_meta(v: &mut PvField, snap: &Snapshot) {
     let d = snap.display.clone().unwrap_or_default();
     let c = snap.control.clone().unwrap_or_default();
     for leaf in crate::nt::property_leaves(snap.properties) {
-        write_property_leaf(&mut v, leaf, &d, &c);
+        write_property_leaf(v, leaf, &d, &c);
     }
 
     // `IOCSource::initialize` (`iocsource.cpp:39-65`) fills the form menu and
@@ -335,12 +430,12 @@ fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
     // `display.form` for any non-VAL field (`record_instance.rs:5165-5169`),
     // which is `iocsource.cpp:53`'s `dbIsValueField` gate.
     set_leaf(
-        &mut v,
+        v,
         "display.form.index",
         PvField::Scalar(ScalarValue::Int(i32::from(d.form))),
     );
     set_leaf(
-        &mut v,
+        v,
         "display.form.choices",
         PvField::ScalarArray(
             crate::nt::FORM_CHOICES
@@ -349,20 +444,19 @@ fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
                 .collect(),
         ),
     );
-    v
 }
 
 /// Assign the one leaf `leaf` names, from wherever its value is stored.
 ///
 /// Split from [`property_leaves`](crate::nt::property_leaves) because the two
 /// answer different questions — that one says WHICH leaves this channel
-/// serves, this one says what each HOLDS — and joined by `fill_nt_scalar`
+/// serves, this one says what each HOLDS — and joined by `fill_nt_scalar_meta`
 /// walking the first and asking this for the value. Returns whether the leaf
 /// was recognised, which is what `every_property_leaf_has_a_writer` asserts
 /// over every property mask: a leaf added to `property_leaves` with no arm
 /// here would otherwise reach a client marked but never written.
 ///
-/// `value.choices` is the NTEnum shape's leaf, filled by [`build_nt_enum`]
+/// `value.choices` is the NTEnum shape's leaf, filled by [`fill_nt_enum_meta`]
 /// from the snapshot's own enum block; it is recognised and skipped so that
 /// coverage assertion stays exact.
 fn write_property_leaf(
@@ -495,11 +589,15 @@ fn nt_enum_desc() -> FieldDesc {
     }
 }
 
-/// Build an NTEnum value from a DBR_ENUM snapshot. `value.choices` comes
+/// Fill an NTEnum tree's metadata leaves. `value.choices` comes
 /// from `Snapshot.enums.strings` (pvxs fills it from the DBR enum metadata,
 /// `ioc/iocsource.cpp:274-285`); an enum snapshot with no choice metadata
 /// yields an empty `choices` array, matching pvxs when the menu is empty.
-fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
+///
+/// pvxs NTEnum `display` is the anonymous `Struct("display", {description})`
+/// — description only, no limits/units/precision, narrower than the NTScalar
+/// display.
+fn fill_nt_enum_meta(v: &mut PvField, snap: &Snapshot) {
     // `value.choices` is `getProperties`' DBR_ENUM_STRS leaf
     // (`iocsource.cpp:277-285`), so the fill reads the same option bit
     // `property_leaves` reads to mark it rather than "do we happen to hold a
@@ -515,35 +613,18 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
                 .collect()
         })
         .unwrap_or_default();
-
-    let mut value = PvStructure::new("enum_t");
-    value
-        .fields
-        .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
-    value
-        .fields
-        .push(("choices".into(), PvField::ScalarArray(choices)));
-
-    // pvxs NTEnum `display` is the anonymous `Struct("display", {description})`
-    // (description only, no limits/units/precision — narrower than the NTScalar display).
-    let mut display = PvStructure::new("");
     let description = snap
         .display
         .as_ref()
         .map(|d| d.description.clone())
         .unwrap_or_default();
-    display.fields.push((
-        "description".into(),
-        PvField::Scalar(ScalarValue::String(description)),
-    ));
 
-    let mut s = PvStructure::new("epics:nt/NTEnum:1.0");
-    s.fields.push(("value".into(), PvField::Structure(value)));
-    s.fields.push(("alarm".into(), build_alarm(snap)));
-    s.fields.push(("timeStamp".into(), build_timestamp(snap)));
-    s.fields
-        .push(("display".into(), PvField::Structure(display)));
-    PvField::Structure(s)
+    set_leaf(v, "value.choices", PvField::ScalarArray(choices));
+    set_leaf(
+        v,
+        "display.description",
+        PvField::Scalar(ScalarValue::String(description)),
+    );
 }
 
 fn alarm_desc() -> FieldDesc {
@@ -571,11 +652,11 @@ fn timestamp_desc() -> FieldDesc {
     }
 }
 
-fn build_alarm(snap: &Snapshot) -> PvField {
+fn build_alarm(stat: u16, sevr: u16, amsg: &str) -> PvField {
     let mut a = PvStructure::new("alarm_t");
     a.fields.push((
         "severity".into(),
-        PvField::Scalar(ScalarValue::Int(snap.alarm.severity as i32)),
+        PvField::Scalar(ScalarValue::Int(sevr as i32)),
     ));
     // pvxs `iocsource.cpp:187-223`: PVA `alarm.status` carries the alarm
     // *class* (NONE/DEVICE/DRIVER/RECORD/DB/UNDEFINED, 0–6), not the raw
@@ -583,7 +664,7 @@ fn build_alarm(snap: &Snapshot) -> PvField {
     // see e.g. `LINK_ALARM = 14` in a field whose NT contract is 0–6.
     a.fields.push((
         "status".into(),
-        PvField::Scalar(ScalarValue::Int(alarm_status_class(snap.alarm.status))),
+        PvField::Scalar(ScalarValue::Int(alarm_status_class(stat))),
     ));
     // pvxs `iocsource.cpp:230-236`, exactly:
     //     if((options & DBR_AMSG) && meta.amsg[0])
@@ -596,12 +677,12 @@ fn build_alarm(snap: &Snapshot) -> PvField {
     // other record raises UDF via plain `recGblSetSevr` (empty namsg), so
     // its empty amsg falls through here to the "UDF" condition string —
     // which is what pvxs serves for those records too.
-    let message = if !snap.alarm.amsg.is_empty() {
-        snap.alarm.amsg.clone()
-    } else if snap.alarm.status == alarm_status::NO_ALARM {
+    let message = if !amsg.is_empty() {
+        amsg.to_string()
+    } else if stat == alarm_status::NO_ALARM {
         String::new()
     } else {
-        alarm_condition_string(snap.alarm.status).to_string()
+        alarm_condition_string(stat).to_string()
     };
     a.fields.push((
         "message".into(),
@@ -639,7 +720,7 @@ fn alarm_status_class(condition: u16) -> i32 {
     }
 }
 
-fn build_timestamp(snap: &Snapshot) -> PvField {
+fn build_timestamp(time: WallTime, utag: i32) -> PvField {
     // pvxs `iocsource.cpp:240-248`: `timeStamp` carries the record's
     // acquisition time and userTag, NOT the serialization wall-clock.
     // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
@@ -650,7 +731,7 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
     // `meta.time.nsec & info.nsecMask` for userTag). Using `now()` here
     // overwrote the acquisition time with serialization time and zeroed
     // the userTag on every record-backed GET/MONITOR.
-    let dur = snap.timestamp.since_unix_epoch();
+    let dur = time.since_unix_epoch();
     let mut t = PvStructure::new("time_t");
     t.fields.push((
         "secondsPastEpoch".into(),
@@ -660,10 +741,8 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
         "nanoseconds".into(),
         PvField::Scalar(ScalarValue::Int(dur.subsec_nanos() as i32)),
     ));
-    t.fields.push((
-        "userTag".into(),
-        PvField::Scalar(ScalarValue::Int(snap.user_tag)),
-    ));
+    t.fields
+        .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(utag))));
     PvField::Structure(t)
 }
 
@@ -788,12 +867,26 @@ async fn channel_snapshot(
             // own. A `$` channel reads the field's own value too: its char
             // image and its text are both cut from that ([`PvaDollar::render`]).
             let render = record_channel_render(&rec, cn, filters)?;
-            let mut snap = db.channel_snapshot_for_field(&rec, &cn.field, false)?;
-            render.read(&mut snap, filters);
-            return Some(snap);
+            return record_snapshot(db, &rec, &cn.field, render, filters);
         }
     };
     read_snapshot_chain(filters, &mut snap);
+    Some(snap)
+}
+
+/// [`channel_snapshot`]'s record arm, which takes no `await`: a record
+/// monitor reads its metadata here at subscribe and on each `DBE_PROPERTY`
+/// post, as pvxs's property callback reads `getProperties`
+/// (`singlesource.cpp:97-102`).
+fn record_snapshot(
+    db: &PvDatabase,
+    rec: &Arc<epics_base_rs::server::record::RecordCell>,
+    field: &str,
+    render: ChannelRender,
+    filters: &FilterChain,
+) -> Option<Snapshot> {
+    let mut snap = db.channel_snapshot_for_field(rec, field, false)?;
+    render.read(&mut snap, filters);
     Some(snap)
 }
 
@@ -837,6 +930,18 @@ enum ChannelRender {
 }
 
 impl ChannelRender {
+    /// The event rewrite every post on this channel takes before its fill.
+    fn shaper(self) -> fn(MonitorEvent) -> MonitorEvent {
+        match self {
+            ChannelRender::LongStringText => long_string_shaped,
+            ChannelRender::Dollar(d) if d.scalar() => scalar_shaped,
+            ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => std::convert::identity,
+            ChannelRender::Dollar(_) => long_string_shaped,
+            ChannelRender::Shaped(ChannelShape::Scalar) => scalar_shaped,
+            ChannelRender::Shaped(ChannelShape::Array) => std::convert::identity,
+        }
+    }
+
     /// A read of the channel through its chain `filters`: rendered ahead
     /// of the chain, finished and shaped after it, as `dbChannelGet` reads
     /// the log the chain made of the render, and the chain's `arr` may have
@@ -1404,19 +1509,23 @@ impl ChannelSource for PvDatabaseSource {
             .map_err(|why| report_subscribe_refused(why, peer, &name))
             .ok()
             .map(|sub| render.subscribed(sub))?;
+            let shaped = render.shaper();
+            // Read after both halves are live, so a metadata change racing the
+            // read still arrives as a property post.
+            let door = MetaDoor {
+                db: db.clone(),
+                rec,
+                field: cn.field.clone(),
+                render,
+                filters: property_filters.clone(),
+            };
+            let mut ring = PostRing::new(opts.queue_size, door.read()?);
             // The subscriptions ARE the stream: `marked_update` runs as the
             // server pulls, so no task stands between them.
             Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
                 value_sub,
                 property_sub,
-                match render {
-                    ChannelRender::LongStringText => marked_update_long_string,
-                    ChannelRender::Dollar(d) if d.scalar() => marked_update_scalar,
-                    ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => marked_update,
-                    ChannelRender::Dollar(_) => marked_update_long_string,
-                    ChannelRender::Shaped(ChannelShape::Scalar) => marked_update_scalar,
-                    ChannelRender::Shaped(ChannelShape::Array) => marked_update,
-                },
+                move |ev| marked_update(&mut ring, shaped(ev), || door.read()),
             )))
         }
     }
@@ -1483,16 +1592,33 @@ impl ChannelSource for PvDatabaseSource {
                     .await
                     .ok()
                     .map(|sub| render.subscribed(sub))?;
-                    Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
+                    // The metadata is not the event's: it is read here and
+                    // reread on each post of a `DBE_PROPERTY` half, whose
+                    // posts yield no value of their own.
+                    let (_, property_filters) = resolve_channel(&db, &name)?;
+                    let property_sub = DbSubscription::subscribe_with_mask_and_filters(
+                        &db,
+                        &cn.record_path,
+                        0,
+                        EventMask::PROPERTY.bits(),
+                        Some(&property_filters),
+                    )
+                    .await
+                    .ok()
+                    .map(|sub| render.subscribed(sub))?;
+                    let shaped = render.shaper();
+                    let door = MetaDoor {
+                        db: db.clone(),
+                        rec,
+                        field: cn.field.clone(),
+                        render,
+                        filters: property_filters,
+                    };
+                    let mut meta = door.read()?;
+                    Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
                         sub,
-                        match render {
-                            ChannelRender::LongStringText => event_field_long_string,
-                            ChannelRender::Dollar(d) if d.scalar() => event_field_scalar,
-                            ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => event_field,
-                            ChannelRender::Dollar(_) => event_field_long_string,
-                            ChannelRender::Shaped(ChannelShape::Scalar) => event_field_scalar,
-                            ChannelRender::Shaped(ChannelShape::Array) => event_field,
-                        },
+                        property_sub,
+                        move |ev| plain_record_field(&mut meta, shaped(ev), || door.read()),
                     )))
                 }
             }
@@ -1515,62 +1641,186 @@ fn report_subscribe_refused(
     }
 }
 
-/// The per-event transform the record-backed marked-monitor bridge task used
-/// to apply. A free `fn` so it can be a [`UpstreamMonitor`] map pointer.
+/// pvxs's per-subscription `currentValue` (`singlesource.cpp:54-67`), kept
+/// as a ring so a post shares its value with the monitor queue instead of
+/// carrying a tree of its own: each event is filled in place into a slot no
+/// queued post still holds.
+///
+/// `cap` is the negotiated queue limit plus one. When the next event is
+/// mapped the queue holds at most `limit` posts — a squash frees the tail's
+/// slot only after that push — so a free slot exists by construction. Slots
+/// are built on first need rather than at subscribe, so a client's
+/// `queueSize` preallocates nothing it does not fill.
+///
+/// The metadata leaves come from `meta`, the channel's GET-door read, never
+/// from an event: a slot rewrites them only when it last held an older read.
+struct PostRing {
+    meta: Snapshot,
+    /// Bumped by every [`Self::set_meta`]; a slot carries the generation it
+    /// was last given.
+    meta_gen: u64,
+    shape: Option<NtShape>,
+    slots: Vec<(Arc<PvField>, u64)>,
+    next: usize,
+    cap: usize,
+}
+
+impl PostRing {
+    fn new(queue_limit: u32, meta: Snapshot) -> Self {
+        Self {
+            meta,
+            meta_gen: 1,
+            shape: None,
+            slots: Vec::new(),
+            next: 0,
+            cap: (queue_limit as usize).saturating_add(1),
+        }
+    }
+
+    fn set_meta(&mut self, meta: Snapshot) {
+        self.meta = meta;
+        self.meta_gen += 1;
+    }
+
+    fn post(&mut self, ev: &LogLeaves) -> crate::server_native::PostValue {
+        let shape = NtShape::new(ev.value, self.meta.properties);
+        if self.shape != Some(shape) {
+            self.slots.clear();
+            self.next = 0;
+            self.shape = Some(shape);
+        }
+        let n = self.slots.len();
+        let free = (0..n)
+            .map(|k| (self.next + k) % n)
+            .find(|&i| Arc::get_mut(&mut self.slots[i].0).is_some());
+        let i = match free {
+            Some(i) => i,
+            None if n < self.cap => {
+                let tree = crate::pvdata::encode::default_value_for(&shape.desc());
+                self.slots.push((Arc::new(tree), 0));
+                n
+            }
+            // Only a consumer holding more posts than it negotiated gets here.
+            None => return fresh_tree(shape, &self.meta, ev).into(),
+        };
+        let (slot, slot_gen) = &mut self.slots[i];
+        let v = Arc::get_mut(slot).expect("a free slot is unshared");
+        if *slot_gen != self.meta_gen {
+            fill_nt_meta(v, shape, &self.meta);
+            *slot_gen = self.meta_gen;
+        }
+        fill_nt_event(v, ev);
+        self.next = i + 1;
+        Arc::clone(slot).into()
+    }
+}
+
+/// A tree of `shape` holding `meta`'s metadata and `ev`'s value, alarm and
+/// time.
+fn fresh_tree(shape: NtShape, meta: &Snapshot, ev: &LogLeaves) -> PvField {
+    let mut v = crate::pvdata::encode::default_value_for(&shape.desc());
+    fill_nt_meta(&mut v, shape, meta);
+    fill_nt_event(&mut v, ev);
+    v
+}
+
+/// A record channel's metadata door, as a record monitor holds it: the
+/// channel's own record, field, render and property-half filter chain.
+struct MetaDoor {
+    db: Arc<PvDatabase>,
+    rec: Arc<epics_base_rs::server::record::RecordCell>,
+    field: String,
+    render: ChannelRender,
+    filters: FilterChain,
+}
+
+impl MetaDoor {
+    /// Takes the record's read lock for the read alone, on the monitor's
+    /// server task, which holds no other record lock.
+    fn read(&self) -> Option<Snapshot> {
+        record_snapshot(&self.db, &self.rec, &self.field, self.render, &self.filters)
+    }
+}
+
+/// The per-event transform of a record-backed marked monitor.
+///
+/// A `DBE_PROPERTY` post rereads the metadata through `read_meta`; a value
+/// post takes only value, alarm and time from the event (pvxs
+/// `IOCSource::get`, `iocsource.cpp:334-358`).
 ///
 /// `None` (the bridge's `continue`) is an event whose `DBE_*` class marks no
 /// leaf — no wire meaning, since C would have assigned none either.
 fn marked_update(
-    ev: epics_base_rs::server::pv::MonitorEvent,
+    ring: &mut PostRing,
+    ev: MonitorEvent,
+    mut read_meta: impl FnMut() -> Option<Snapshot>,
 ) -> Option<crate::server_native::source::MonitorUpdate> {
+    use epics_base_rs::server::recgbl::EventMask;
+    if ev.mask().intersects(EventMask::PROPERTY)
+        && let Some(meta) = read_meta()
+    {
+        ring.set_meta(meta);
+    }
+    let mut held = None;
+    let value = logged_value(&ev, &mut held, &mut read_meta)?;
     let marked = crate::nt::event_leaves(
-        ev.mask,
-        ev.snapshot.properties,
-        matches!(&ev.snapshot.value, EpicsValue::Enum(_)),
+        ev.mask(),
+        ring.meta.properties,
+        matches!(value, EpicsValue::Enum(_)),
     );
     if marked.is_empty() {
         return None;
     }
     Some(crate::server_native::source::MonitorUpdate {
+        value: ring.post(&LogLeaves::of_event(&ev, value)),
         marked: Some(marked),
-        ..crate::server_native::source::MonitorUpdate::from(snapshot_to_pv_field(&ev.snapshot))
+        type_changed: false,
+        overrun: Vec::new(),
     })
 }
 
-/// The unmarked transform of the two plain `subscribe` bridge tasks: every
-/// event yields its snapshot as a `PvField`, none are filtered.
-fn event_field(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
-    Some(snapshot_to_pv_field(&ev.snapshot))
+/// The plain record `subscribe`'s transform: a `DBE_PROPERTY` post (from
+/// the property half) rereads the metadata and yields nothing; a value post
+/// yields the whole value, its metadata from the last read.
+fn plain_record_field(
+    meta: &mut Snapshot,
+    ev: MonitorEvent,
+    mut read_meta: impl FnMut() -> Option<Snapshot>,
+) -> Option<PvField> {
+    use epics_base_rs::server::recgbl::EventMask;
+    if ev.mask().intersects(EventMask::PROPERTY) {
+        if let Some(m) = read_meta() {
+            *meta = m;
+        }
+        return None;
+    }
+    let mut held = None;
+    let value = logged_value(&ev, &mut held, &mut read_meta)?;
+    let shape = NtShape::new(value, meta.properties);
+    Some(fresh_tree(shape, meta, &LogLeaves::of_event(&ev, value)))
 }
 
-/// [`marked_update`] and [`event_field`] for a [`ChannelShape::Scalar`]
-/// channel — a one-element array field, whose events carry the buffer the
-/// record posted and whose descriptor advertises the element.
-///
-/// Two transforms rather than one carrying the shape: `UpstreamMonitor`'s map
-/// is a plain `fn` pointer, and the shape is a per-channel constant chosen
-/// once at subscribe time, so selecting the pointer IS carrying it.
-fn marked_update_scalar(
-    ev: epics_base_rs::server::pv::MonitorEvent,
-) -> Option<crate::server_native::source::MonitorUpdate> {
-    marked_update(scalar_shaped(ev))
+/// `ev`'s value, kept in `held` when the log has no copy to lend: a scalar
+/// by value, or a `dbfl_type_ref` log's field, read at delivery through the
+/// channel's door as `dbGet` reads it (`dbAccess.c:936-940`). `None` when
+/// that read fails.
+fn logged_value<'a>(
+    ev: &'a MonitorEvent,
+    held: &'a mut Option<EpicsValue>,
+    door: impl FnOnce() -> Option<Snapshot>,
+) -> Option<&'a EpicsValue> {
+    use epics_base_rs::server::pv::LogValue;
+    Some(match ev.value() {
+        LogValue::Owned(v) => v,
+        LogValue::Val(v) => held.insert(v),
+        LogValue::Ref => held.insert(door()?.value),
+    })
 }
 
-fn event_field_scalar(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
-    event_field(scalar_shaped(ev))
-}
-
-/// [`marked_update`] and [`event_field`] for a
-/// [`ChannelRender::LongStringText`] channel, and for a text `$` channel,
-/// whose subscription already cut the image.
-fn marked_update_long_string(
-    ev: epics_base_rs::server::pv::MonitorEvent,
-) -> Option<crate::server_native::source::MonitorUpdate> {
-    marked_update(long_string_shaped(ev))
-}
-
-fn event_field_long_string(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
-    event_field(long_string_shaped(ev))
+/// A mailbox PV's monitor transform: every delivered read yields its whole
+/// value, the PV's metadata read at delivery included.
+fn event_field(snap: Snapshot) -> Option<PvField> {
+    Some(snapshot_to_pv_field(&snap))
 }
 
 /// `ev` with its snapshot's elements decoded to the text, in a new `Snapshot`
@@ -1579,28 +1829,28 @@ fn long_string_shaped(
     mut ev: epics_base_rs::server::pv::MonitorEvent,
 ) -> epics_base_rs::server::pv::MonitorEvent {
     if matches!(
-        ev.snapshot.value,
-        EpicsValue::CharArray(_) | EpicsValue::UCharArray(_)
+        ev.value().as_value(),
+        Some(EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
     ) {
-        let mut snap = (*ev.snapshot).clone();
-        snap.value = long_string_text(std::mem::replace(&mut snap.value, EpicsValue::Long(0)));
-        ev.snapshot = std::sync::Arc::new(snap);
+        let value = ev.replace_value(EpicsValue::Long(0));
+        ev.replace_value(long_string_text(value));
     }
     ev
 }
 
 /// `ev` with its snapshot collapsed to the one element the channel serves.
 ///
-/// A new `Snapshot` rather than a mutation: `MonitorEvent::snapshot` is the
-/// `Arc` every other subscriber this post reached is holding, and a channel's
-/// shape is not theirs to inherit.
+/// `replace_value` copies the post first: every other subscriber it reached
+/// still holds it, and a channel's shape is not theirs to inherit.
 fn scalar_shaped(
     mut ev: epics_base_rs::server::pv::MonitorEvent,
 ) -> epics_base_rs::server::pv::MonitorEvent {
-    if let Some(value) = ChannelShape::Scalar.collapsed(&ev.snapshot.value) {
-        let mut snap = (*ev.snapshot).clone();
-        snap.value = value;
-        ev.snapshot = std::sync::Arc::new(snap);
+    let collapsed = ev
+        .value()
+        .as_value()
+        .and_then(|v| ChannelShape::Scalar.collapsed(v));
+    if let Some(value) = collapsed {
+        ev.replace_value(value);
     }
     ev
 }
@@ -1934,6 +2184,10 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
 
 #[allow(unused_imports)]
 use crate::error::PvaError;
+
+#[cfg(test)]
+#[path = "post_ring_alloc_tests.rs"]
+mod post_ring_alloc_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2502,7 +2756,7 @@ mod tests {
         let ts = WallTime::from_unix(1_700_000_000, 123_456_789);
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, ts);
         snap.user_tag = 42;
-        let PvField::Structure(t) = build_timestamp(&snap) else {
+        let PvField::Structure(t) = build_timestamp(snap.timestamp, snap.user_tag) else {
             panic!("timeStamp must be a structure");
         };
         assert!(matches!(
@@ -2776,7 +3030,9 @@ mod tests {
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
         snap.alarm.status = alarm_status::HIHI_ALARM;
         snap.alarm.severity = 2;
-        let PvField::Structure(a) = build_alarm(&snap) else {
+        let PvField::Structure(a) =
+            build_alarm(snap.alarm.status, snap.alarm.severity, &snap.alarm.amsg)
+        else {
             panic!("alarm must be a structure");
         };
         assert!(matches!(
@@ -2786,7 +3042,8 @@ mod tests {
 
         // NO_ALARM keeps an empty message.
         let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(a) = build_alarm(&ok) else {
+        let PvField::Structure(a) = build_alarm(ok.alarm.status, ok.alarm.severity, &ok.alarm.amsg)
+        else {
             panic!("alarm must be a structure");
         };
         assert!(matches!(
@@ -2805,7 +3062,9 @@ mod tests {
         snap.alarm.status = alarm_status::UDF_ALARM;
         snap.alarm.severity = 3;
         snap.alarm.amsg = "UDFS".to_string();
-        let PvField::Structure(a) = build_alarm(&snap) else {
+        let PvField::Structure(a) =
+            build_alarm(snap.alarm.status, snap.alarm.severity, &snap.alarm.amsg)
+        else {
             panic!("alarm must be a structure");
         };
         assert!(
@@ -2820,7 +3079,11 @@ mod tests {
         generic.alarm.status = alarm_status::UDF_ALARM;
         generic.alarm.severity = 3;
         assert!(generic.alarm.amsg.is_empty());
-        let PvField::Structure(a) = build_alarm(&generic) else {
+        let PvField::Structure(a) = build_alarm(
+            generic.alarm.status,
+            generic.alarm.severity,
+            &generic.alarm.amsg,
+        ) else {
             panic!("alarm must be a structure");
         };
         assert!(
@@ -2830,7 +3093,8 @@ mod tests {
 
         // Empty amsg with NO_ALARM stays "".
         let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(a) = build_alarm(&ok) else {
+        let PvField::Structure(a) = build_alarm(ok.alarm.status, ok.alarm.severity, &ok.alarm.amsg)
+        else {
             panic!("alarm must be a structure");
         };
         assert!(matches!(scalar(&a, "message"), ScalarValue::String(s) if s.is_empty()));
@@ -2843,7 +3107,9 @@ mod tests {
         // class 3 (RECORD), never 14.
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
         snap.alarm.status = alarm_status::LINK_ALARM;
-        let PvField::Structure(a) = build_alarm(&snap) else {
+        let PvField::Structure(a) =
+            build_alarm(snap.alarm.status, snap.alarm.severity, &snap.alarm.amsg)
+        else {
             panic!("alarm must be a structure");
         };
         assert!(
@@ -3323,6 +3589,61 @@ mod tests {
             monitor_double(&updated),
             Some(2.0),
             "simple-PV monitor must observe the PUT, not only the initial snapshot"
+        );
+    }
+
+    /// A mailbox PV's monitor reads the PV's metadata at delivery, as its
+    /// GET does: metadata installed after subscribe reaches the next update.
+    #[epics_macros_rs::epics_test]
+    async fn a_simple_pv_monitor_reads_its_metadata_at_delivery() {
+        use epics_base_rs::server::pv::PvMetadata;
+        use epics_base_rs::server::snapshot::DisplayInfo;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("SIMPLE:META", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let src = PvDatabaseSource::new(db.clone());
+        let mut rx = src
+            .subscribe_ctx("SIMPLE:META", make_ctx("127.0.0.1", "anon", "ca"))
+            .await
+            .expect("subscribe to simple PV");
+        rx.recv().await.expect("initial monitor snapshot");
+
+        db.find_pv("SIMPLE:META")
+            .await
+            .expect("the PV")
+            .set_metadata(PvMetadata {
+                display: Some(DisplayInfo {
+                    units: "um".into(),
+                    ..Default::default()
+                }),
+                control: None,
+                enums: None,
+            });
+        src.put_value_ctx(
+            "SIMPLE:META",
+            pv_double(2.0),
+            make_ctx("127.0.0.1", "anon", "ca"),
+        )
+        .await
+        .expect("PUT must succeed");
+        let updated =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("monitor must receive the PUT update within 2s")
+                .expect("monitor stream still open");
+        let PvField::Structure(root) = &updated else {
+            panic!("an NTScalar root")
+        };
+        let units = match root.get_field("display") {
+            Some(PvField::Structure(d)) => d.get_field("units").cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            units,
+            Some(PvField::Scalar(ScalarValue::String("um".into()))),
+            "the update carries the metadata read at delivery"
         );
     }
 
@@ -4533,6 +4854,76 @@ ASG(DEFAULT) {
         }
     }
 
+    /// A metadata change reaches the client through the GET door, not the
+    /// event: `EGU` posts `DBE_PROPERTY`, the property half rereads, and both
+    /// that post and every value post after it carry the new units.
+    #[epics_macros_rs::epics_test]
+    async fn an_egu_put_reaches_updates_through_the_metadata_door() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:EGU", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:EGU",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let mut rx = source
+            .subscribe_checked_opts_marked(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+        let units = |u: &crate::server_native::MonitorUpdate| {
+            let PvField::Structure(root) = &*u.value else {
+                panic!("an NTScalar root")
+            };
+            match root.get_field("display").and_then(|d| match d {
+                PvField::Structure(d) => d.get_field("units"),
+                _ => None,
+            }) {
+                Some(PvField::Scalar(ScalarValue::String(s))) => s.to_string(),
+                other => panic!("display.units: {other:?}"),
+            }
+        };
+        let next = async |rx: &mut MonitorStream<crate::server_native::MonitorUpdate>| {
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an update must post within 2s")
+                .expect("stream open")
+        };
+
+        db.put_record_field_from_ca_no_notify("AI:EGU", "EGU", EpicsValue::String("mm".into()))
+            .await
+            .expect("put EGU");
+        let property = next(&mut rx).await;
+        assert!(
+            property
+                .marked
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|l| l == "display.units")),
+            "the EGU post marks display.units"
+        );
+        assert_eq!(units(&property), "mm");
+
+        db.put_record_field_from_ca_no_notify("AI:EGU", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("put VAL");
+        let value = next(&mut rx).await;
+        assert_eq!(
+            units(&value),
+            "mm",
+            "a value post keeps the last read's units"
+        );
+    }
+
     /// The event-class rule keys on the event's OWN mask, so the alarm triple
     /// rides `DBE_ALARM` only. Measured on `softIocPVX`: a driven `longin`
     /// posts value+alarm+timeStamp on update 1 (UDF -> NO_ALARM changed the
@@ -4631,23 +5022,30 @@ ASG(DEFAULT) {
         use epics_base_rs::server::recgbl::EventMask;
         use epics_base_rs::server::snapshot::Snapshot;
 
-        let mk = |mask: EventMask| epics_base_rs::server::pv::MonitorEvent {
-            snapshot: std::sync::Arc::new(Snapshot::new(
-                EpicsValue::Double(1.0),
+        let mk = |mask: EventMask| {
+            epics_base_rs::server::pv::MonitorEvent::from_snapshot(
+                std::sync::Arc::new(Snapshot::new(
+                    EpicsValue::Double(1.0),
+                    0,
+                    0,
+                    std::time::SystemTime::now(),
+                )),
                 0,
-                0,
-                std::time::SystemTime::now(),
-            )),
-            origin: 0,
-            mask,
+                mask,
+            )
         };
 
+        let mut ring = PostRing::new(
+            4,
+            Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
+        );
         assert!(
-            marked_update(mk(EventMask::from_bits(0))).is_none(),
+            marked_update(&mut ring, mk(EventMask::from_bits(0)), || None).is_none(),
             "a class that marks no leaf has no wire meaning — C assigns none \
              either, so it must not reach the client as an update"
         );
-        let value = marked_update(mk(EventMask::VALUE)).expect("a DBE_VALUE post is an update");
+        let value = marked_update(&mut ring, mk(EventMask::VALUE), || None)
+            .expect("a DBE_VALUE post is an update");
         assert!(
             value
                 .marked

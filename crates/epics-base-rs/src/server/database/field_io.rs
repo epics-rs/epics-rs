@@ -4703,21 +4703,22 @@ mod tests {
         let ev = prop_rx
             .try_recv()
             .expect("DBE_PROPERTY subscriber receives the property event");
+        // Units are read at delivery, from the PV, over the posted log.
+        let mut delivered = pv.snapshot();
+        ev.write_log_over(&mut delivered);
         assert_eq!(
-            ev.snapshot
+            delivered
                 .display
                 .clone()
                 .expect("event carries metadata")
                 .units,
             "V"
         );
+        assert_eq!(ev.sevr(), MAJOR, "upstream severity preserved");
+        assert_eq!(ev.stat(), HIGH, "upstream status preserved");
         assert_eq!(
-            ev.snapshot.alarm.severity, MAJOR,
-            "upstream severity preserved"
-        );
-        assert_eq!(ev.snapshot.alarm.status, HIGH, "upstream status preserved");
-        assert_eq!(
-            ev.snapshot.timestamp, upstream_ts,
+            ev.time(),
+            upstream_ts,
             "control-DBR timestamp preserved, not a fresh wall clock"
         );
 

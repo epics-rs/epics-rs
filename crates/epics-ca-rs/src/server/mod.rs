@@ -16,6 +16,8 @@ pub mod beacon;
 pub mod blocking;
 #[cfg(tokio_backend)]
 pub mod ca_server;
+#[cfg(test)]
+mod delivery_alloc_tests;
 pub(crate) mod frame;
 #[cfg(tokio_backend)]
 pub mod introspection;
@@ -55,18 +57,16 @@ use epics_base_rs::server::ioc_app::IocRunConfig;
 /// `requested_count` is `dbGet`'s `nRequest` (0 for autosize); the wire
 /// pads to a fixed request count, as C `read_reply` does.
 pub(super) fn apply_long_string(
-    snap: &mut epics_base_rs::server::snapshot::Snapshot,
+    v: epics_base_rs::types::EpicsValue,
     no_elements: u32,
     nul_at_count: bool,
     requested_count: u32,
-) {
+) -> epics_base_rs::types::EpicsValue {
     let n = match requested_count {
         0 => no_elements,
         r => r.min(no_elements),
     };
-    let v = std::mem::replace(&mut snap.value, epics_base_rs::types::EpicsValue::Long(0));
-    snap.value =
-        epics_base_rs::server::database::char_view::posted_char_view(v, n as usize, nul_at_count);
+    epics_base_rs::server::database::char_view::posted_char_view(v, n as usize, nul_at_count)
 }
 
 /// Convert a long-string *record* field's snapshot value from
@@ -86,14 +86,16 @@ pub(super) fn apply_long_string(
 /// The carrier holds `LEN` elements, and `dbGet` reads `min(LEN, 1)`
 /// (`get_array_info` against the capacity of 1, `dbAccess.c:936-1001`), so
 /// an empty carrier is no element, not `""`.
-pub(super) fn apply_native_long_string(snap: &mut epics_base_rs::server::snapshot::Snapshot) {
+pub(super) fn apply_native_long_string(
+    v: epics_base_rs::types::EpicsValue,
+) -> epics_base_rs::types::EpicsValue {
     use epics_base_rs::types::EpicsValue;
-    snap.value = match std::mem::replace(&mut snap.value, EpicsValue::Long(0)) {
+    match v {
         EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) if b.is_empty() => {
             EpicsValue::StringArray(Vec::new().into())
         }
         v => epics_base_rs::server::database::char_view::long_string_text(v),
-    };
+    }
 }
 
 /// How a channel presents a long-string field on the CA wire. `$`-access
@@ -123,18 +125,18 @@ pub(super) enum LongStringMode {
 /// Apply the boundary conversion selected by `mode` to a delivery
 /// snapshot before DBR encoding.
 pub(super) fn apply_long_string_mode(
-    snap: &mut epics_base_rs::server::snapshot::Snapshot,
+    v: epics_base_rs::types::EpicsValue,
     mode: LongStringMode,
     requested_count: u32,
-) {
+) -> epics_base_rs::types::EpicsValue {
     match mode {
         LongStringMode::DollarChar {
             no_elements,
             nul_at_count,
             ..
-        } => apply_long_string(snap, no_elements, nul_at_count, requested_count),
-        LongStringMode::NativeString => apply_native_long_string(snap),
-        LongStringMode::Plain => {}
+        } => apply_long_string(v, no_elements, nul_at_count, requested_count),
+        LongStringMode::NativeString => apply_native_long_string(v),
+        LongStringMode::Plain => v,
     }
 }
 
@@ -210,21 +212,22 @@ impl DeliveryStage {
             Some(post) if post.reads_chars() => return post.read_request(event, n_request),
             Some(post) => {
                 let mut event = post.read(event)?;
-                if event.snapshot.value.count() as usize > n_request {
-                    std::sync::Arc::make_mut(&mut event.snapshot)
-                        .value
-                        .truncate(n_request);
+                if event.value().as_value().map_or(0, |v| v.count() as usize) > n_request {
+                    let mut value = event.replace_value(epics_base_rs::types::EpicsValue::Long(0));
+                    value.truncate(n_request);
+                    event.replace_value(value);
                 }
                 event
             }
             None => event,
         };
         if self.long_string_mode != LongStringMode::Plain {
-            apply_long_string_mode(
-                std::sync::Arc::make_mut(&mut event.snapshot),
+            let value = event.replace_value(epics_base_rs::types::EpicsValue::Long(0));
+            event.replace_value(apply_long_string_mode(
+                value,
                 self.long_string_mode,
                 requested_count,
-            );
+            ));
         }
         Some(event)
     }
@@ -237,13 +240,17 @@ impl DeliveryStage {
         requested_count: u32,
         mask: u16,
     ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
-        let event = epics_base_rs::server::pv::MonitorEvent {
-            snapshot: std::sync::Arc::new(snapshot),
-            origin: 0,
-            mask: epics_base_rs::server::recgbl::EventMask::from_bits(mask),
-        };
-        self.prepare(event, requested_count)
-            .map(|event| std::sync::Arc::unwrap_or_clone(event.snapshot))
+        if self.is_identity() {
+            return Some(snapshot);
+        }
+        let mut snapshot = snapshot;
+        let log = epics_base_rs::server::pv::MonitorEvent::read_log(
+            &mut snapshot,
+            epics_base_rs::server::recgbl::EventMask::from_bits(mask),
+        );
+        self.prepare(log, requested_count)?
+            .write_log_over(&mut snapshot);
+        Some(snapshot)
     }
 }
 

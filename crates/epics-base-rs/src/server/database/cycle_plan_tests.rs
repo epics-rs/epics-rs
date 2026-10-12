@@ -835,9 +835,16 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
         last_time = time;
         for (rec, field, rx) in &mut readers {
             while let Ok(ev) = rx.try_recv() {
+                // A wide field's log is read at delivery, as a client reads it.
+                let value = ev.value().as_value().cloned().or_else(|| {
+                    let cell = db.get_record(rec).unwrap();
+                    let inst = cell.read();
+                    inst.channel_field_value(field, false)
+                });
                 out.push(format!(
                     "step {i} post {rec}.{field} {:?} mask={:?}",
-                    ev.snapshot.value, ev.mask
+                    value.unwrap(),
+                    ev.mask()
                 ));
             }
         }

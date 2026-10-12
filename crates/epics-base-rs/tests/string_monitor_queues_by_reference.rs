@@ -32,10 +32,16 @@
 //! never the oldest.
 
 use epics_base_rs::server::database::PvDatabase;
+use std::sync::Arc;
+
+use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::event_queue::EventReader;
+use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::RecordCell;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
+use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// The three values every test posts, in order. The last is what a C client
@@ -49,19 +55,41 @@ async fn process(db: &PvDatabase, rec: &str) {
         .unwrap();
 }
 
-fn subscribe(db: &PvDatabase, rec: &str, field: &str, sid: u32, ty: DbFieldType) -> EventReader {
-    let inst = db.get_record(rec).unwrap();
-    let mut g = inst.write();
-    g.add_subscriber(field, sid, ty, EventMask::VALUE.bits())
-        .expect("the subscription must be accepted")
+/// A monitor and the field its client reads a by-reference log from.
+struct Mon {
+    rx: EventReader,
+    rec: Arc<RecordCell>,
+    field: String,
 }
 
-/// Everything queued for this reader, drained. The reader is never touched
-/// between the posts, which is the undrained C monitor these tests model.
-fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
+impl Mon {
+    fn try_recv(&mut self) -> Option<(EpicsValue, MonitorEvent)> {
+        let ev = self.rx.try_recv().ok()?;
+        let value = ev.delivered_value(&self.rec.read(), &self.field).unwrap();
+        Some((value, ev))
+    }
+}
+
+fn subscribe(db: &PvDatabase, rec: &str, field: &str, sid: u32, ty: DbFieldType) -> Mon {
+    let inst = db.get_record(rec).unwrap();
+    let rx = inst
+        .write()
+        .add_subscriber(field, sid, ty, EventMask::VALUE.bits())
+        .expect("the subscription must be accepted");
+    Mon {
+        rx,
+        rec: inst,
+        field: field.to_string(),
+    }
+}
+
+/// Everything queued for this reader, drained and read as a client reads
+/// it. The reader is never touched between the posts, which is the
+/// undrained C monitor these tests model.
+fn drain(rx: &mut Mon) -> Vec<EpicsValue> {
     let mut out = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        out.push(ev.snapshot.value.clone());
+    while let Some((value, _)) = rx.try_recv() {
+        out.push(value);
     }
     out
 }
@@ -92,12 +120,12 @@ async fn three_posts_to_a_string_monitor_deliver_one_latest_event() {
          newest value, because C's reference reads the live field at delivery"
     );
     assert!(
-        rx.queue().latest_only(rx.id()),
+        rx.rx.queue().latest_only(rx.rx.id()),
         "the subscription must be latched by-reference, not merely coalesced \
          by chance"
     );
     assert_eq!(
-        rx.queue().ncollapse(rx.id()),
+        rx.rx.queue().ncollapse(rx.rx.id()),
         2,
         "two of the three posts were absorbed by the early-drop"
     );
@@ -155,7 +183,40 @@ async fn a_numeric_scalar_monitor_still_queues_every_post() {
         "a DBF_DOUBLE field fits union native_value, so C queues each post"
     );
     assert!(
-        !rx.queue().latest_only(rx.id()),
+        !rx.rx.queue().latest_only(rx.rx.id()),
         "and the subscription is never latched into keep-only-the-latest"
     );
+}
+
+/// The kind is the field's declaration, fixed at attach: a waveform VAL is
+/// `SPC_DBADDR` whatever NELM says or what is posted, so its monitor is by
+/// reference from the first post.
+#[epics_macros_rs::epics_test]
+async fn a_waveform_monitor_is_by_reference_from_attach() {
+    let db = PvDatabase::new();
+    db.add_record("WF", Box::new(WaveformRecord::new(1, DbFieldType::Double)))
+        .await
+        .unwrap();
+    let rx = subscribe(&db, "WF", "VAL", 1, DbFieldType::Double);
+    assert!(rx.rx.queue().latest_only(rx.rx.id()));
+}
+
+/// A by-reference monitor holds one entry however many posts it absorbed,
+/// and an in-process consumer reads the field at delivery: the newest value.
+#[epics_macros_rs::epics_test]
+async fn a_db_subscription_reads_a_queued_reference_live() {
+    let db = PvDatabase::new();
+    db.add_record("SI:LIVE", Box::new(StringinRecord::new("")))
+        .await
+        .unwrap();
+    let mut sub = DbSubscription::subscribe(&db, "SI:LIVE").await.unwrap();
+    for s in STRINGS {
+        db.put_pv("SI:LIVE", EpicsValue::String((*s).into()))
+            .await
+            .unwrap();
+        process(&db, "SI:LIVE").await;
+    }
+    let got = sub.try_recv_snapshot().expect("one entry queued").unwrap();
+    assert_eq!(got.value, EpicsValue::String(STRINGS[2].into()));
+    assert!(sub.try_recv_snapshot().is_err(), "and only one");
 }

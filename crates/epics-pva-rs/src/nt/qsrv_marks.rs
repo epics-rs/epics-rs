@@ -136,7 +136,7 @@ pub fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
     // `display.precision` is the `DBR_PRECISION` slot (`get_precision`), which
     // is independent of `DBR_GR_DOUBLE` (`get_graphic_double`): a record type
     // can supply one without the other. Gate precision on its own slot so the
-    // served value (already filled by `fill_nt_scalar`) reaches the wire.
+    // served value (already filled by `fill_nt_scalar_meta`) reaches the wire.
     //
     // pvxs agrees as of 1.5.3: `getProperties` used to nest this assignment
     // INSIDE the `DBR_GR_DOUBLE` branch, dropping precision for any field that

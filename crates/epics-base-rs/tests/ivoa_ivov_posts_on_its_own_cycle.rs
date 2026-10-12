@@ -120,7 +120,10 @@ async fn one_cycle(
 
     let mut posts = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        posts.push(ev.snapshot.value.clone());
+        posts.push(
+            ev.delivered_value(&db.get_record("R").unwrap().read(), "VAL")
+                .unwrap(),
+        );
     }
     let sevr = db.get_record("R").unwrap().read().common.sevr;
     (sevr, posts)

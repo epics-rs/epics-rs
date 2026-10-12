@@ -195,65 +195,367 @@ pub type ReadHook = Arc<
         + Sync,
 >;
 
-/// A monitor event sent to subscribers when a PV value changes.
-/// Carries a full Snapshot so GR/CTRL metadata (PREC, EGU, limits) is available.
+/// C `union native_value` (`db_field_log.h:42-53`): one scalar no wider than
+/// 8 bytes, with its type. `DB_EVENT_LOG_STRINGS` is undefined, so a string
+/// is never one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NativeValue {
+    Short(i16),
+    Float(f32),
+    Enum(u16),
+    Char(u8),
+    Long(i32),
+    Double(f64),
+    Int64(i64),
+    UInt64(u64),
+    UShort(u16),
+    ULong(u32),
+    UChar(u8),
+}
+
+impl NativeValue {
+    fn of(value: &EpicsValue) -> Option<Self> {
+        Some(match *value {
+            EpicsValue::Short(v) => Self::Short(v),
+            EpicsValue::Float(v) => Self::Float(v),
+            EpicsValue::Enum(v) => Self::Enum(v),
+            EpicsValue::Char(v) => Self::Char(v),
+            EpicsValue::Long(v) => Self::Long(v),
+            EpicsValue::Double(v) => Self::Double(v),
+            EpicsValue::Int64(v) => Self::Int64(v),
+            EpicsValue::UInt64(v) => Self::UInt64(v),
+            EpicsValue::UShort(v) => Self::UShort(v),
+            EpicsValue::ULong(v) => Self::ULong(v),
+            EpicsValue::UChar(v) => Self::UChar(v),
+            _ => return None,
+        })
+    }
+
+    fn value(self) -> EpicsValue {
+        match self {
+            Self::Short(v) => EpicsValue::Short(v),
+            Self::Float(v) => EpicsValue::Float(v),
+            Self::Enum(v) => EpicsValue::Enum(v),
+            Self::Char(v) => EpicsValue::Char(v),
+            Self::Long(v) => EpicsValue::Long(v),
+            Self::Double(v) => EpicsValue::Double(v),
+            Self::Int64(v) => EpicsValue::Int64(v),
+            Self::UInt64(v) => EpicsValue::UInt64(v),
+            Self::UShort(v) => EpicsValue::UShort(v),
+            Self::ULong(v) => EpicsValue::ULong(v),
+            Self::UChar(v) => EpicsValue::UChar(v),
+        }
+    }
+}
+
+/// What a [`PostLog`] holds of the field's value (`db_field_log.h:112-132`).
+#[derive(Debug, Clone)]
+pub(crate) enum LogData {
+    /// `dbfl_type_val`: a scalar copied into the log.
+    Val(NativeValue),
+    /// `dbfl_type_ref` with `dtor == NULL`: nothing copied, the consumer
+    /// reads the live field at delivery.
+    Ref,
+    /// `dbfl_type_ref` with a `dtor`: a copy a filter made (`arr`), freed
+    /// with the log.
+    Owned(Box<EpicsValue>),
+}
+
+impl LogData {
+    /// `value` held by the log: by value when it fits `native_value`, else
+    /// the copy.
+    fn holding(value: EpicsValue) -> Self {
+        match NativeValue::of(&value) {
+            Some(v) => Self::Val(v),
+            None => Self::Owned(Box::new(value)),
+        }
+    }
+
+    pub(crate) fn is_ref(&self) -> bool {
+        matches!(self, Self::Ref)
+    }
+}
+
+/// C `DB_AMSG_SIZE`: the message and its NUL.
+const AMSG_SIZE: usize = 40;
+
+/// C `db_field_log` as `db_create_event_log` fills it (`dbEvent.c:702-730`):
+/// fixed size, so an event queue holds it in its own ring and a post copies
+/// into storage made at attach.
+#[derive(Debug, Clone)]
+pub struct PostLog {
+    stat: u16,
+    sevr: u16,
+    /// NUL-terminated, cut to `AMSG_SIZE - 1` bytes on a char boundary
+    /// (`strncpy` + `pbuffer[DB_AMSG_SIZE-1] = '\0'`, `dbAccess.c:368-373`).
+    amsg: [u8; AMSG_SIZE],
+    time: WallTime,
+    utag: i32,
+    /// The `DBE_*` class(es) this post carries FOR THIS SUBSCRIBER — the
+    /// poster's mask intersected with the subscriber's `select`
+    /// (`pLog->mask = caEventMask & pevent->select`, `dbEvent.c:896-900`),
+    /// produced by `Subscriber::delivered_mask`, the delivery gate, so the
+    /// two cannot drift apart. When a post replaces a queued one the masks
+    /// OR (see the event queue's documented deviations).
+    mask: crate::server::recgbl::EventMask,
+    /// Origin writer id; a subscription with the same `ignore_origin`
+    /// skips it. Tagged by the `put_*_post` tier and inherited inside a
+    /// `put_*_process` cascade through `AmbientWriteOriginScope`; 0 outside.
+    origin: u64,
+    pub(crate) value: LogData,
+}
+
+impl PostLog {
+    fn new(
+        snapshot: &Snapshot,
+        value: LogData,
+        origin: u64,
+        mask: crate::server::recgbl::EventMask,
+    ) -> Self {
+        let mut amsg = [0u8; AMSG_SIZE];
+        let text = snapshot.alarm.amsg.as_str();
+        let mut n = text.len().min(AMSG_SIZE - 1);
+        while !text.is_char_boundary(n) {
+            n -= 1;
+        }
+        amsg[..n].copy_from_slice(&text.as_bytes()[..n]);
+        Self {
+            stat: snapshot.alarm.status,
+            sevr: snapshot.alarm.severity,
+            amsg,
+            time: snapshot.timestamp,
+            utag: snapshot.user_tag,
+            mask,
+            origin,
+            value,
+        }
+    }
+
+    pub(crate) fn mask(&self) -> crate::server::recgbl::EventMask {
+        self.mask
+    }
+
+    /// Fold in the classes of a post this log absorbed.
+    pub(crate) fn set_mask_or(&mut self, mask: crate::server::recgbl::EventMask) {
+        self.mask |= mask;
+    }
+}
+
+/// One monitor update as a consumer takes it off the queue: a [`PostLog`].
 #[derive(Debug, Clone)]
 pub struct MonitorEvent {
-    /// The posted value, **shared** with every other subscriber this post
-    /// reached.
-    ///
-    /// C never copies a wide value into an event at all. `db_create_field_log`
-    /// stores anything wider than `union native_value` by reference
-    /// (`dbfl_type_ref`, `dtor == NULL`, so `dbfl_has_copy` is false), and the
-    /// value is read at DELIVERY: `read_reply` reserves the payload inside the
-    /// client's existing send buffer (`cas_copy_in_header`,
-    /// `camessage.c:516`) and `dbGet` converts straight from the record's live
-    /// field into it (`dbAccess.c:1020`, the `!dbfl_has_copy(pfl)` arm). One
-    /// array, N events pointing at it, zero retained copies.
-    ///
-    /// The port cannot read the record at delivery — the event outlives the
-    /// record lock — so it snapshots once at post time. `Arc` is what makes
-    /// that snapshot C's single array instead of one owned copy per
-    /// subscriber: `record_instance` built `make_monitor_snapshot` once and
-    /// then deep-cloned it per subscriber, so a 1 MiB waveform with four
-    /// monitors cost 4 MiB retained where C costs four ~100-byte field logs.
-    /// Measured consequence on `x86_64-wrs-vxworks`: `memory allocation of
-    /// 1048576 bytes failed` and `signal 6` at fan-out 4, while the same four
-    /// clients without array monitors survived at a HIGHER MEM_USED
-    /// (213,311,488 B vs the 211,804,160 B the aborting run died at) — the
-    /// fan-out was the discriminator, not the memory level.
-    pub snapshot: Arc<Snapshot>,
-    /// Origin writer ID. When non-zero, subscribers with the same
-    /// `ignore_origin` can filter out self-triggered events.
-    /// Used to prevent sequencer write-back loops.
-    ///
-    /// **Scope**: tagged explicitly by the `put_*_post` tier
-    /// (`put_pv_and_post_with_origin`, records and simple PVs alike), and
-    /// inherited by every post inside the `put_*_process` tier's
-    /// synchronous put+process cascade through the thread-local ambient
-    /// write origin (`AmbientWriteOriginScope`) — both record funnels
-    /// (`notify_field_with_origin`, `notify_from_snapshot`) and the
-    /// simple-PV funnel (`ProcessVariable::deliver`) apply the same
-    /// inheritance rule. Posts from work a cascade merely spawned (async
-    /// record completions, driver pollers) run outside any scope and stay
-    /// origin 0.
-    pub origin: u64,
-    /// The `DBE_*` event class(es) this post carries FOR THIS SUBSCRIBER
-    /// — the poster's mask intersected with the subscriber's `select`,
-    /// never the poster's mask alone. C stamps exactly that on the field
-    /// log (`pLog->mask = caEventMask & pevent->select`,
-    /// `dbEvent.c:896-900`) and pvxs narrows per event from
-    /// `pDbFieldLog->mask` (`groupsource.cpp:331-337`). The intersection
-    /// is produced by `Subscriber::delivered_mask`, which is also the
-    /// delivery gate, so the two cannot drift apart. Carrying it on the
-    /// event lets subscribers narrow what they decode (e.g. a QSRV group
-    /// monitor updating only alarm leaves on a `DBE_ALARM`-only event)
-    /// and lets the `.{dbnd}`/`.{sync}`/`.{dec}` pre-chain filters see the
-    /// classes the client actually asked for.
-    /// When events coalesce under a slow consumer, masks accumulate by
-    /// OR — the surviving snapshot is the newest, the mask reports every
-    /// class that changed since the last delivered event.
-    pub mask: crate::server::recgbl::EventMask,
+    log: PostLog,
+}
+
+/// A monitor event's value, as C's `db_field_log` holds it
+/// (`db_field_log.h:112-132`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogValue<'a> {
+    /// A scalar no wider than C's `union native_value`, by value
+    /// (`dbfl_type_val`).
+    Val(EpicsValue),
+    /// A copy the log holds: a filter's (`arr`), or a consumer's read.
+    Owned(&'a EpicsValue),
+    /// No copy: read the live field at delivery (`dbfl_type_ref`).
+    Ref,
+}
+
+impl LogValue<'_> {
+    /// The value the event holds, `None` for a field read at delivery.
+    pub fn as_value(&self) -> Option<&EpicsValue> {
+        match self {
+            LogValue::Val(v) => Some(v),
+            LogValue::Owned(v) => Some(v),
+            LogValue::Ref => None,
+        }
+    }
+}
+
+impl MonitorEvent {
+    /// The log a producer posts for `snapshot`: its value copied only when
+    /// it fits `native_value`, else read at delivery (`dbEvent.c:719-730`).
+    /// Allocates nothing.
+    pub fn post_log(
+        snapshot: &Snapshot,
+        origin: u64,
+        mask: crate::server::recgbl::EventMask,
+    ) -> Self {
+        let value = NativeValue::of(&snapshot.value).map_or(LogData::Ref, LogData::Val);
+        Self {
+            log: PostLog::new(snapshot, value, origin, mask),
+        }
+    }
+
+    /// [`Self::post_log`] with the value copied whatever its width, for a
+    /// filter chain to run on.
+    fn copied(snapshot: &Snapshot, origin: u64, mask: crate::server::recgbl::EventMask) -> Self {
+        let value = LogData::holding(snapshot.value.clone());
+        Self {
+            log: PostLog::new(snapshot, value, origin, mask),
+        }
+    }
+
+    /// An event holding `snapshot`'s value, alarm, time and utag, its value
+    /// copied whatever its width.
+    pub fn from_snapshot(
+        snapshot: Arc<Snapshot>,
+        origin: u64,
+        mask: crate::server::recgbl::EventMask,
+    ) -> Self {
+        let mut log = PostLog::new(&snapshot, LogData::Ref, origin, mask);
+        log.value = LogData::holding(Arc::unwrap_or_clone(snapshot).value);
+        Self { log }
+    }
+
+    pub(crate) fn into_log(self) -> PostLog {
+        self.log
+    }
+
+    pub(crate) fn of_log(log: PostLog) -> Self {
+        Self { log }
+    }
+
+    /// The posted value.
+    pub fn value(&self) -> LogValue<'_> {
+        match &self.log.value {
+            LogData::Val(v) => LogValue::Val(v.value()),
+            LogData::Owned(v) => LogValue::Owned(v),
+            LogData::Ref => LogValue::Ref,
+        }
+    }
+
+    pub fn stat(&self) -> u16 {
+        self.log.stat
+    }
+
+    pub fn sevr(&self) -> u16 {
+        self.log.sevr
+    }
+
+    pub fn amsg(&self) -> &str {
+        let n = self
+            .log
+            .amsg
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(AMSG_SIZE);
+        // `PostLog::new` cut on a char boundary.
+        std::str::from_utf8(&self.log.amsg[..n]).unwrap_or_default()
+    }
+
+    pub fn time(&self) -> WallTime {
+        self.log.time
+    }
+
+    pub fn utag(&self) -> i32 {
+        self.log.utag
+    }
+
+    pub fn mask(&self) -> crate::server::recgbl::EventMask {
+        self.log.mask
+    }
+
+    pub fn origin(&self) -> u64 {
+        self.log.origin
+    }
+
+    /// Pre-chain filters rewrite their subscriber's log in place
+    /// (`dbChannelRunPreChain`, `dbEvent.c:901`).
+    pub fn set_time(&mut self, time: WallTime) {
+        self.log.time = time;
+    }
+
+    pub fn set_utag(&mut self, utag: i32) {
+        self.log.utag = utag;
+    }
+
+    pub fn set_mask(&mut self, mask: crate::server::recgbl::EventMask) {
+        self.log.mask = mask;
+    }
+
+    /// Swap in `value`, handing back the one it replaces. The log must hold
+    /// a value: a consumer gives a read-at-delivery log its read first
+    /// ([`Self::set_value`]).
+    pub fn replace_value(&mut self, value: EpicsValue) -> EpicsValue {
+        match std::mem::replace(&mut self.log.value, LogData::holding(value)) {
+            LogData::Val(v) => v.value(),
+            LogData::Owned(v) => *v,
+            LogData::Ref => {
+                debug_assert!(false, "replace_value on a log read at delivery");
+                EpicsValue::Long(0)
+            }
+        }
+    }
+
+    /// Give the log `value`, a read of the field made at delivery.
+    pub fn set_value(&mut self, value: EpicsValue) {
+        self.log.value = LogData::holding(value);
+    }
+
+    /// The value a consumer of `record`'s `field` delivers for this log: its
+    /// own, or for a log that holds none the field read now, as
+    /// `dbChannelGet` reads a `dbfl_type_ref` log (`dbChannel.h`
+    /// `dbfl_pfield`). `None` when the field cannot be read.
+    pub fn delivered_value(
+        &self,
+        record: &crate::server::record::RecordInstance,
+        field: &str,
+    ) -> Option<EpicsValue> {
+        match self.value() {
+            LogValue::Val(v) => Some(v),
+            LogValue::Owned(v) => Some(v.clone()),
+            LogValue::Ref => record.channel_field_value(field, false),
+        }
+    }
+
+    /// C `db_create_read_log` filled from `read`: the log a GET's filter
+    /// chain runs on (`dbChannelGet`), handed back to the read by
+    /// [`Self::write_log_over`]. The value moves out of `read` until then.
+    pub fn read_log(read: &mut Snapshot, mask: crate::server::recgbl::EventMask) -> Self {
+        let value = LogData::holding(std::mem::replace(&mut read.value, EpicsValue::Long(0)));
+        Self {
+            log: PostLog::new(read, value, 0, mask),
+        }
+    }
+
+    /// Append this log's DBR `dbr_type` wire body to `dst` — `dbGet` into
+    /// the reserved reply space (`dbAccess.c:1017-1018`) — for a class that
+    /// reads no option ([`crate::types::encode_log_dbr_into`]). A log with
+    /// no value of its own fails, as a `dbGet` with no field would.
+    pub fn encode_dbr_into(&self, dst: &mut Vec<u8>, dbr_type: u16) -> crate::error::CaResult<()> {
+        let value = self.value();
+        let Some(value) = value.as_value() else {
+            return Err(crate::error::CaError::GetConvertFailed(
+                "a field log read at delivery has no value of its own".into(),
+            ));
+        };
+        crate::types::encode_log_dbr_into(
+            dst,
+            dbr_type,
+            value,
+            self.stat(),
+            self.sevr(),
+            self.time(),
+        )
+    }
+
+    /// Write this log's value, alarm, time and utag over `base`, a read of
+    /// the channel made at delivery; every other option, ACKT/ACKS included,
+    /// stays `base`'s (`getOptions`, `dbAccess.c:336-414`), narrowed to the
+    /// log's type as a `ts` filter's `pfl->field_type` narrows it
+    /// (`dbAccess.c:341-348,387-394`). A log read at delivery keeps `base`'s
+    /// value.
+    pub fn write_log_over(&self, base: &mut Snapshot) {
+        if let Some(v) = self.value().as_value() {
+            base.properties = base.properties.narrowed_to_field(v.db_field_type(), false);
+            base.value = v.clone();
+        }
+        base.alarm.status = self.stat();
+        base.alarm.severity = self.sevr();
+        self.amsg().clone_into(&mut base.alarm.amsg);
+        base.timestamp = self.time();
+        base.user_tag = self.utag();
+    }
 }
 
 /// A subscriber waiting for PV value updates — C `evSubscrip`'s producer-side
@@ -337,25 +639,35 @@ impl Subscriber {
         self.sink.id()
     }
 
+    /// C `db_create_event_log` then `dbChannelRunPreChain`: this monitor's
+    /// log of `snapshot`, or `None` when a filter drops it. A monitor with a
+    /// filter chain gets the value copied whatever its width — C's `arr`
+    /// copies a reference log too (`arr.c`), and the chain has no field to
+    /// read here; the copy is the filter's cost.
+    pub(crate) fn filtered_log(
+        &self,
+        snapshot: &Snapshot,
+        origin: u64,
+        mask: crate::server::recgbl::EventMask,
+    ) -> Option<MonitorEvent> {
+        use crate::server::database::filters::FilteredMonitorEvent;
+        if self.filters.is_empty() {
+            return Some(MonitorEvent::post_log(snapshot, origin, mask));
+        }
+        self.filters
+            .apply(FilteredMonitorEvent::new(MonitorEvent::copied(
+                snapshot, origin, mask,
+            )))
+            .map(|fe| fe.event)
+    }
+
     /// C `db_post_single_event`: queue `snapshot` for this monitor alone,
     /// under its `select` (`db_create_event_log`) and through its pre-chain.
     /// `active` does not gate it; C posts before `db_event_enable` and
     /// before `db_event_disable`.
     pub(crate) fn post_single(&self, snapshot: Arc<Snapshot>) {
-        use crate::server::database::filters::FilteredMonitorEvent;
-        let event = MonitorEvent {
-            snapshot,
-            origin: 0,
-            mask: crate::server::recgbl::EventMask::from_bits(self.mask),
-        };
-        let filtered = if self.filters.is_empty() {
-            Some(event)
-        } else {
-            self.filters
-                .apply(FilteredMonitorEvent::new(event))
-                .map(|fe| fe.event)
-        };
-        if let Some(event) = filtered {
+        let mask = crate::server::recgbl::EventMask::from_bits(self.mask);
+        if let Some(event) = self.filtered_log(&snapshot, 0, mask) {
             self.post(&mut PostBurst::new(), event);
         }
     }
@@ -646,6 +958,21 @@ impl ProcessVariable {
         snap
     }
 
+    /// `event` as a GET at delivery reads it: options from this PV now
+    /// (`getOptions`, `dbAccess.c:336-414`), value, alarm, time and utag
+    /// from the log.
+    fn delivered(&self, event: &MonitorEvent) -> Snapshot {
+        let mut snap = Snapshot::new(EpicsValue::Long(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
+        if let Some(m) = self.posted_meta.read().as_ref() {
+            snap.alarm.ackt = m.alarm.ackt;
+            snap.alarm.acks = m.alarm.acks;
+        }
+        event.write_log_over(&mut snap);
+        // Properties narrow to the value's type, so the log goes in first.
+        self.apply_metadata(&mut snap);
+        snap
+    }
+
     /// Build the snapshot served on a one-shot client GET
     /// (`CA_PROTO_READ` / `CA_PROTO_READ_NOTIFY`).
     ///
@@ -759,15 +1086,9 @@ impl ProcessVariable {
     /// the per-subscriber channel-filter chain, and the slow-consumer
     /// coalesce-overflow accounting are applied identically — one event
     /// class differs per caller, nothing else. The snapshot is built once
-    /// by the caller (one timestamp per logical event) and SHARED with every
-    /// subscriber — C's one array behind N field logs. A per-subscription
-    /// filter that rewrites the value pays for its own copy, and only then
-    /// (`Arc::make_mut`), which is also C: the filter chain runs
-    /// per-subscription and a filter that changes the value makes its own
-    /// field log.
+    /// by the caller (one timestamp per logical event); each subscriber gets
+    /// a fixed field log of it, a wide value read at delivery.
     fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot, origin: u64) {
-        use crate::server::database::filters::FilteredMonitorEvent;
-        let snapshot = Arc::new(snapshot);
         // Same ambient-origin inheritance as the record funnels
         // (`notify_field_with_origin` / `notify_from_snapshot`): a post
         // carrying no origin of its own inherits the current thread's
@@ -795,22 +1116,10 @@ impl ProcessVariable {
             let Some(mask) = sub.delivered_mask(post) else {
                 continue;
             };
-            let event = MonitorEvent {
-                snapshot: Arc::clone(&snapshot),
-                origin,
-                mask,
-            };
             // The channel-filter chain may suppress this event (e.g.
             // `dbnd` deadband not crossed); the event's mask tells value
             // filters whether to pass through (446e0d4a).
-            let filtered = if sub.filters.is_empty() {
-                Some(event)
-            } else {
-                sub.filters
-                    .apply(FilteredMonitorEvent::new(event))
-                    .map(|fe| fe.event)
-            };
-            let Some(event) = filtered else {
+            let Some(event) = sub.filtered_log(&snapshot, origin, mask) else {
                 continue;
             };
             // C `db_queue_event_log`: the queue appends, or replaces this
@@ -831,17 +1140,16 @@ impl ProcessVariable {
     pub fn post_alarm(&self, severity: u16, status: u16) {
         use crate::server::recgbl::EventMask;
         let value = self.value.read().clone();
-        let mut snapshot = Snapshot::new(value, status, severity, crate::runtime::time::now_wall());
-        self.apply_metadata(&mut snapshot);
+        let snapshot = Snapshot::new(value, status, severity, crate::runtime::time::now_wall());
         // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
         self.deliver(EventMask::ALARM | EventMask::LOG, snapshot, 0);
     }
 
     /// Post a `DBE_PROPERTY` monitor event carrying the decoded upstream
     /// CTRL event `snapshot` — its value plus the upstream status /
-    /// severity and timestamp — overlaid with the installed shadow
-    /// metadata, so downstream property-change monitors re-read the units /
-    /// precision / limits / enum labels with the *upstream* alarm state.
+    /// severity and timestamp — so downstream property-change monitors
+    /// re-read the installed units / precision / limits / enum labels at
+    /// delivery with the *upstream* alarm state.
     ///
     /// Used by the CA / PVA gateway when an upstream `DBE_PROPERTY` event
     /// fires (metadata changed) after it has refreshed the shadow PV via
@@ -856,9 +1164,8 @@ impl ProcessVariable {
     /// its own); pass `status`/`severity` from the upstream CTRL payload.
     /// Property events are a distinct class from value/alarm: only
     /// `DBE_PROPERTY` subscribers receive them.
-    pub async fn post_property(&self, mut snapshot: Snapshot) {
+    pub async fn post_property(&self, snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
-        self.apply_metadata(&mut snapshot);
         self.deliver(EventMask::PROPERTY, snapshot, 0);
     }
 
@@ -866,8 +1173,7 @@ impl ProcessVariable {
     /// `origin` (0 = untagged).
     fn notify_subscribers(&self, value: EpicsValue, origin: u64) {
         use crate::server::recgbl::EventMask;
-        let mut snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
-        self.apply_metadata(&mut snapshot);
+        let snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
         // VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
         self.deliver(EventMask::VALUE | EventMask::LOG, snapshot, origin);
     }
@@ -875,11 +1181,10 @@ impl ProcessVariable {
     /// Notify all subscribers using a pre-built Snapshot (value + alarm +
     /// timestamp). Used by `set_snapshot` to propagate the upstream alarm
     /// and IOC timestamp without synthesising a new zero-alarm local-time
-    /// snapshot. Installed shadow metadata fills any metadata field the
-    /// gateway snapshot left absent (see [`Self::apply_metadata`]).
-    fn notify_subscribers_from_snapshot(&self, mut snapshot: Snapshot) {
+    /// snapshot. A field log carries no metadata: the reader takes the
+    /// installed metadata at delivery.
+    fn notify_subscribers_from_snapshot(&self, snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
-        self.apply_metadata(&mut snapshot);
         // C gateway fires postEvent(VALUE|ALARM|LOG) for every
         // upstream event (gateVc.cc:374-376); match it so DBE_LOG
         // archivers and DBE_ALARM-only monitors receive gateway snapshot posts.
@@ -949,7 +1254,8 @@ impl ProcessVariable {
         if subs.len() >= cap {
             return Err(SubscribeRefused::CapReached);
         }
-        let (sink, reader) = crate::server::event_queue::attach_with(user, sid, context);
+        let kind = crate::server::event_queue::LogKind::of_value(&self.value.read());
+        let (sink, reader) = crate::server::event_queue::attach_with(user, sid, kind, context);
         subs.push(Subscriber {
             sid,
             data_type,
@@ -1134,10 +1440,8 @@ impl PvSubscription {
     /// carrying the latest value, because further posts replaced that entry in
     /// place rather than appending (`db_queue_event_log`, `dbEvent.c:812-827`).
     pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
-        // Free when this reader holds the last reference to the shared
-        // snapshot, which is the single-subscriber case; a copy only when
-        // another subscriber still holds it.
-        Some(Arc::unwrap_or_clone(self.reader.recv().await?.snapshot))
+        let event = self.reader.recv().await?;
+        Some(self.pv.delivered(&event))
     }
 
     /// Non-blocking [`Self::recv_snapshot`]. Delegates to
@@ -1147,9 +1451,8 @@ impl PvSubscription {
     /// Lets a PVA monitor source that adapts this stream be polled from a
     /// blocking drain loop with no reactor present.
     pub fn try_recv_snapshot(&mut self) -> Result<Snapshot, TryRecvError> {
-        self.reader
-            .try_recv()
-            .map(|e| Arc::unwrap_or_clone(e.snapshot))
+        let event = self.reader.try_recv()?;
+        Ok(self.pv.delivered(&event))
     }
 
     /// Await the next change as the full [`MonitorEvent`] — snapshot plus the
@@ -1294,7 +1597,7 @@ mod mask_gate_tests {
         pv.set_snapshot(snapshot());
         let ev = rx.try_recv().expect("value-class post delivered");
         assert_eq!(
-            ev.mask,
+            ev.mask(),
             EventMask::VALUE,
             "delivered mask must be post & select, not the poster's full class set"
         );
@@ -1306,7 +1609,11 @@ mod mask_gate_tests {
             .expect("subscriber added");
         pv.set_snapshot(snapshot());
         let ev = rx_alarm.try_recv().expect("alarm-class post delivered");
-        assert_eq!(ev.mask, EventMask::ALARM, "narrowed for an ALARM-only sub");
+        assert_eq!(
+            ev.mask(),
+            EventMask::ALARM,
+            "narrowed for an ALARM-only sub"
+        );
     }
 
     /// The consequence the narrowing exists for: a `.{dbnd}` pre-chain
@@ -1443,7 +1750,7 @@ mod mask_gate_tests {
     }
 
     /// Every delivered event carries its post's `DBE_*` class — the
-    /// per-event mask C attaches to the field log (`db_field_log.mask`)
+    /// per-event mask C attaches to the field log (`db_field_log.mask()`)
     /// and pvxs narrows monitor decoding with (`groupsource.cpp:331-337`).
     #[epics_macros_rs::epics_test]
     async fn monitor_event_carries_post_class_mask() {
@@ -1454,13 +1761,13 @@ mod mask_gate_tests {
             .expect("subscriber added");
         pv.set(EpicsValue::Double(1.0));
         assert_eq!(
-            rx.try_recv().expect("value event").mask,
+            rx.try_recv().expect("value event").mask(),
             EventMask::VALUE | EventMask::LOG,
             "value post carries VALUE|LOG"
         );
         pv.post_alarm(2, 3);
         assert_eq!(
-            rx.try_recv().expect("alarm event").mask,
+            rx.try_recv().expect("alarm event").mask(),
             EventMask::ALARM | EventMask::LOG,
             "alarm post carries ALARM|LOG"
         );
@@ -1500,16 +1807,16 @@ mod mask_gate_tests {
         }
         let delivered = last.expect("the tail entry is delivered");
         assert_eq!(
-            delivered.snapshot.value.to_f64(),
+            delivered.value().as_value().and_then(EpicsValue::to_f64),
             Some(99.0),
             "the tail entry carries the newest value"
         );
         assert!(
             delivered
-                .mask
+                .mask()
                 .contains(EventMask::VALUE | EventMask::ALARM | EventMask::LOG),
             "the displaced alarm class survives in the delivered mask (got {:?})",
-            delivered.mask
+            delivered.mask()
         );
     }
 
@@ -1599,17 +1906,17 @@ mod metadata_tests {
             .expect("subscriber added");
 
         pv.set(EpicsValue::Double(2.0));
-        assert_eq!(rx.try_recv().expect("plain set posts").origin, 0);
+        assert_eq!(rx.try_recv().expect("plain set posts").origin(), 0);
 
         pv.set_with_origin(EpicsValue::Double(3.0), 77);
-        assert_eq!(rx.try_recv().expect("tagged set posts").origin, 77);
+        assert_eq!(rx.try_recv().expect("tagged set posts").origin(), 77);
 
         {
             let _scope = crate::server::record::ambient_write_origin_scope(88);
             pv.set(EpicsValue::Double(4.0));
         }
         assert_eq!(
-            rx.try_recv().expect("ambient-scoped set posts").origin,
+            rx.try_recv().expect("ambient-scoped set posts").origin(),
             88,
             "an originless simple-PV post inside an ambient scope must inherit it"
         );
@@ -1635,62 +1942,21 @@ mod metadata_tests {
         );
     }
 
-    /// A CTRL-type monitor must see the installed limits on every value
-    /// event, not only the initial GET — value posts carry the metadata.
+    /// `PvSubscription::recv_snapshot` reads the PV's metadata when the
+    /// event is read, not when it was posted.
     #[epics_macros_rs::epics_test]
-    async fn installed_metadata_rides_value_posts() {
-        const DBE_VALUE: u16 = 1;
-        let pv = pv();
+    async fn a_queued_value_is_read_with_the_metadata_installed_since() {
+        let pv = Arc::new(pv());
+        let mut sub = PvSubscription::subscribe(pv.clone()).await.unwrap();
+        pv.set(EpicsValue::Double(1.5));
         pv.set_metadata(meta());
-        let mut rx = pv
-            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .expect("subscriber added");
-        pv.set(EpicsValue::Double(2.0));
-        let ev = rx.try_recv().expect("value event delivered");
-        assert_eq!(
-            ev.snapshot
-                .display
-                .clone()
-                .expect("metadata on value post")
-                .units,
-            "degC"
-        );
+        let snap = sub.try_recv_snapshot().expect("set posts the value");
+        assert_eq!(snap.value, EpicsValue::Double(1.5));
+        assert_eq!(snap.display.expect("installed display").units, "degC");
     }
 
-    /// `apply_metadata` only supplies fields the caller left absent: a
-    /// gateway snapshot that already carries its own display wins.
-    #[epics_macros_rs::epics_test]
-    async fn apply_metadata_does_not_clobber_caller_metadata() {
-        const DBE_VALUE: u16 = 1;
-        let pv = pv();
-        pv.set_metadata(meta()); // installed units = degC
-        let mut rx = pv
-            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .expect("subscriber added");
-        let mut snap = Snapshot::new(
-            EpicsValue::Double(3.0),
-            0,
-            0,
-            std::time::SystemTime::UNIX_EPOCH,
-        );
-        snap.display = Some(DisplayInfo {
-            units: "volts".into(),
-            ..Default::default()
-        });
-        pv.set_snapshot(snap);
-        let ev = rx.try_recv().expect("snapshot delivered");
-        assert_eq!(
-            ev.snapshot
-                .display
-                .clone()
-                .expect("caller display kept")
-                .units,
-            "volts"
-        );
-    }
-
-    /// `post_property` reaches DBE_PROPERTY subscribers (carrying the
-    /// metadata) and not DBE_VALUE-only subscribers.
+    /// `post_property` reaches DBE_PROPERTY subscribers and not
+    /// DBE_VALUE-only subscribers.
     #[epics_macros_rs::epics_test]
     async fn post_property_reaches_only_property_subscribers() {
         const DBE_VALUE: u16 = 1;
@@ -1710,17 +1976,9 @@ mod metadata_tests {
             std::time::SystemTime::UNIX_EPOCH,
         ))
         .await;
-        let ev = prop_rx
+        prop_rx
             .try_recv()
             .expect("DBE_PROPERTY subscriber receives property post");
-        assert_eq!(
-            ev.snapshot
-                .display
-                .clone()
-                .expect("property post carries metadata")
-                .units,
-            "degC"
-        );
         assert!(
             val_rx.try_recv().is_err(),
             "DBE_VALUE-only subscriber must not receive a property post"
@@ -1756,22 +2014,15 @@ mod metadata_tests {
         .await;
         let ev = prop_rx.try_recv().expect("property post delivered");
         assert_eq!(
-            ev.snapshot.alarm.severity, MAJOR,
+            ev.sevr(),
+            MAJOR,
             "property post must carry the upstream MAJOR severity, not NO_ALARM"
         );
-        assert_eq!(ev.snapshot.alarm.status, HIGH, "upstream status preserved");
+        assert_eq!(ev.stat(), HIGH, "upstream status preserved");
         assert_eq!(
-            ev.snapshot.timestamp, upstream_ts,
+            ev.time(),
+            upstream_ts,
             "property post must keep the upstream timestamp, not a fresh wall clock"
-        );
-        // Shadow metadata is still overlaid onto the upstream snapshot.
-        assert_eq!(
-            ev.snapshot
-                .display
-                .clone()
-                .expect("property post carries shadow metadata")
-                .units,
-            "degC"
         );
     }
 }

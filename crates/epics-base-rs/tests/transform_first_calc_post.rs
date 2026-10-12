@@ -65,12 +65,16 @@ async fn the_first_cycle_posts_every_channel_though_none_moved() {
     process(&db).await;
 
     assert_eq!(
-        a.try_recv().map(|e| e.snapshot.value.clone()).ok(),
+        a.try_recv()
+            .map(|e| e.value().as_value().cloned().unwrap())
+            .ok(),
         Some(EpicsValue::Double(5.0)),
         "firstCalcPosted == 0 posts A whether or not it moved"
     );
     assert_eq!(
-        b.try_recv().map(|e| e.snapshot.value.clone()).ok(),
+        b.try_recv()
+            .map(|e| e.value().as_value().cloned().unwrap())
+            .ok(),
         Some(EpicsValue::Double(0.0)),
         "and every other channel with it, at its unchanged value"
     );
@@ -109,7 +113,7 @@ async fn a_put_to_a_posts_from_the_put_and_from_its_cycle() {
             .unwrap();
         let mut got = Vec::new();
         while let Ok(e) = a.try_recv() {
-            got.push(e.snapshot.value.clone());
+            got.push(e.value().as_value().cloned().unwrap());
         }
         assert_eq!(got, vec![EpicsValue::Double(v); 2], "caput T.A {v}");
         process(&db).await;

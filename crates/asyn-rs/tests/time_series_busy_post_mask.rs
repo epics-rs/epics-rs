@@ -148,12 +148,12 @@ async fn arming_posts_busy_with_dbe_value_and_dbe_log_only() {
         .try_recv()
         .expect("BUSY changed 0 -> 1, so C's `if (pwf->busy != busy)` fires");
     assert_eq!(
-        event.snapshot.value,
+        event.value().as_value().cloned().unwrap(),
         EpicsValue::Short(1),
         "the armed value is what C stores before posting"
     );
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE | EventMask::LOG,
         "devAsynXXXTimeSeries.h:156 passes a literal DBE_VALUE|DBE_LOG; the \
          alarm bit this cycle belongs to VAL's post, not to BUSY's"
@@ -169,14 +169,20 @@ async fn disarming_posts_busy_with_the_same_literal_mask() {
 
     caput_rarm(&db, 1).await.unwrap();
     let arm = rx.try_recv().expect("arm event");
-    assert_eq!(arm.snapshot.value, EpicsValue::Short(1));
+    assert_eq!(
+        arm.value().as_value().cloned().unwrap(),
+        EpicsValue::Short(1)
+    );
 
     // RARM = 2 is C's "stop": `busy = 0`.
     caput_rarm(&db, 2).await.unwrap();
     let disarm = rx.try_recv().expect("BUSY changed 1 -> 0");
-    assert_eq!(disarm.snapshot.value, EpicsValue::Short(0));
     assert_eq!(
-        disarm.mask,
+        disarm.value().as_value().cloned().unwrap(),
+        EpicsValue::Short(0)
+    );
+    assert_eq!(
+        disarm.mask(),
         EventMask::VALUE | EventMask::LOG,
         "the same literal, on a cycle whose alarm did not move"
     );
@@ -233,9 +239,12 @@ async fn the_first_arm_of_a_one_element_series_posts_nord_with_the_literal_mask(
     let ev = nord
         .try_recv()
         .expect("NORD moved 1 -> 0 on the arming commit");
-    assert_eq!(ev.snapshot.value, EpicsValue::ULong(0));
     assert_eq!(
-        ev.mask,
+        ev.value().as_value().cloned().unwrap(),
+        EpicsValue::ULong(0)
+    );
+    assert_eq!(
+        ev.mask(),
         EventMask::VALUE | EventMask::LOG,
         "waveformRecord.c:148 / devAsynXXXTimeSeries.h:152 pass the literal"
     );
@@ -269,8 +278,11 @@ async fn the_dsets_rarm_reset_posts_nothing() {
     let put = rarm
         .try_recv()
         .expect("dbPut's field tail posts the client's own write");
-    assert_eq!(put.snapshot.value, EpicsValue::Short(1));
-    assert_eq!(put.mask, EventMask::VALUE | EventMask::LOG);
+    assert_eq!(
+        put.value().as_value().cloned().unwrap(),
+        EpicsValue::Short(1)
+    );
+    assert_eq!(put.mask(), EventMask::VALUE | EventMask::LOG);
 
     assert_eq!(
         db.get_pv(&format!("{REC}.RARM")).unwrap(),

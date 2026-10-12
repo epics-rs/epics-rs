@@ -39,7 +39,7 @@ const FIELDS: [(&str, DbFieldType); 6] = [
 fn drain(rx: &mut EventReader) -> Vec<f64> {
     let mut got = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        got.push(ev.snapshot.value.to_f64().unwrap());
+        got.push(ev.value().as_value().cloned().unwrap().to_f64().unwrap());
     }
     got
 }

@@ -4,7 +4,125 @@ use super::frame::{FrameBuf, size_dbr_reply};
 use super::outbox::{Credit, Outbox};
 use crate::protocol::*;
 use epics_base_rs::server::pv::MonitorEvent;
-use epics_base_rs::types::encode_dbr_into;
+use epics_base_rs::server::snapshot::Snapshot;
+use epics_base_rs::types::EpicsValue;
+
+/// What one update encodes, as `dbGet` encodes it (`dbAccess.c:909`): the
+/// log alone, or — once `read` is set — the channel read at delivery with
+/// the log written over it, whose status, severity, amsg, time and utag are
+/// the log's and every other option the channel's (`getOptions`,
+/// `dbAccess.c:336-414`).
+pub(crate) struct Delivery {
+    log: MonitorEvent,
+    read: Option<Snapshot>,
+}
+
+impl Delivery {
+    /// The log alone: the encode reads value, alarm and time only.
+    pub(crate) fn log(log: MonitorEvent) -> Self {
+        Self { log, read: None }
+    }
+
+    /// The update after this channel's post chain and long-string
+    /// conversion, `None` where the chain drops it.
+    pub(crate) fn prepare(
+        self,
+        stage: &super::DeliveryStage,
+        requested_count: u32,
+    ) -> Option<Self> {
+        if stage.is_identity() {
+            return Some(self);
+        }
+        let Self { log, read } = self;
+        match read {
+            None => stage.prepare(log, requested_count).map(Self::log),
+            Some(read) => {
+                let read = stage.prepare_snapshot(read, requested_count, log.mask().bits())?;
+                Some(Self {
+                    log,
+                    read: Some(read),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn encode_dbr_into(
+        &self,
+        dst: &mut Vec<u8>,
+        data_type: u16,
+    ) -> epics_base_rs::error::CaResult<()> {
+        match &self.read {
+            None => self.log.encode_dbr_into(dst, data_type),
+            Some(read) => epics_base_rs::types::encode_dbr_into(dst, data_type, read),
+        }
+    }
+
+    /// The element count the encode carries.
+    pub(crate) fn count(&self) -> u32 {
+        match &self.read {
+            None => self.log.value().as_value().map_or(0, |v| v.count()),
+            Some(read) => read.value.count(),
+        }
+    }
+
+    /// An update of `read` written over by its own log.
+    #[cfg(test)]
+    pub(crate) fn of_read(read: Snapshot) -> Self {
+        let log = MonitorEvent::from_snapshot(
+            std::sync::Arc::new(read.clone()),
+            0,
+            epics_base_rs::server::recgbl::EventMask::VALUE,
+        );
+        Self {
+            log,
+            read: Some(read),
+        }
+    }
+
+    /// The channel read this update encodes, if it reads one.
+    #[cfg(test)]
+    pub(crate) fn read(&self) -> Option<&Snapshot> {
+        self.read.as_ref()
+    }
+}
+
+/// `event` as `dbGet` encodes it for `data_type`. `live` is the channel
+/// read; it runs only when the encode consults an option — GR/CTRL, STSACK,
+/// CLASS_NAME, or a conversion through precision, enum strings or
+/// `put_enum_str` — or the log holds no value, and `None` from it is a
+/// failed get.
+pub(crate) fn with_live_options(
+    data_type: u16,
+    event: MonitorEvent,
+    live: impl FnOnce() -> Option<Snapshot>,
+) -> Option<Delivery> {
+    let reads = (event.value().as_value()).is_none_or(|v| reads_options(data_type, v));
+    if !reads {
+        return Some(Delivery::log(event));
+    }
+    let mut read = live()?;
+    event.write_log_over(&mut read);
+    Some(Delivery {
+        log: event,
+        read: Some(read),
+    })
+}
+
+/// Whether `encode_dbr_into` reads anything but value, alarm, time and utag
+/// for a `data_type` request of `value`.
+fn reads_options(data_type: u16, value: &EpicsValue) -> bool {
+    use epics_base_rs::types::DbFieldType;
+    use epics_base_rs::types::{DBR_CLASS_NAME, DBR_STSACK_STRING};
+    if matches!(data_type, 21..=34 | DBR_STSACK_STRING | DBR_CLASS_NAME) {
+        return true;
+    }
+    let is_string = matches!(value, EpicsValue::String(_) | EpicsValue::StringArray(_));
+    match epics_base_rs::types::native_type_for_dbr(data_type) {
+        Ok(DbFieldType::String) => !is_string,
+        Ok(DbFieldType::Enum) => is_string,
+        _ => false,
+    }
+}
 
 /// Deliver one queued entry of a `SimplePv` monitor — the `user_sub` C's
 /// `event_read` calls for it.
@@ -37,6 +155,17 @@ pub(crate) async fn deliver_monitor_event(
     // reading from growing the server without limit. C's `event_task`
     // blocks in the socket send the same way.
     let credit = outbox.reserve().await;
+    let Some(delivery) = with_live_options(m.data_type, event, || m.live_options()) else {
+        super::tcp::send_get_fail_event(
+            outbox,
+            m.refusal_channel(),
+            m.data_type,
+            m.data_count,
+            m.sub_id,
+            m.reply,
+        );
+        return;
+    };
     // C `db_cancel_event` nulls `user_sub` under LOCKEVQUE before
     // `event_cancel_reply` writes the delete-confirmed echo, so this
     // frame either precedes the echo or never exists. `deliver` is
@@ -49,7 +178,7 @@ pub(crate) async fn deliver_monitor_event(
             m.data_type,
             m.data_count,
             m.sub_id,
-            &event,
+            delivery,
             outbox,
             credit,
             &m.stage,
@@ -74,7 +203,7 @@ pub(crate) fn send_event(
     data_type: u16,
     data_count: u32,
     sub_id: u32,
-    event: &MonitorEvent,
+    delivery: Delivery,
     outbox: &Outbox,
     // Spent on the delivery below. `Credit::none()` from callers that already
     // run under the connection loop's own bound — see `super::outbox`.
@@ -88,25 +217,16 @@ pub(crate) fn send_event(
     let (req_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     // The channel's post chain and long-string boundary conversion
     // (`$` → CHAR[40]+NUL, or a long-string record field → scalar
-    // DBR_STRING). The snapshot is copied only when the stage writes.
-    let prepared;
-    let snapshot: &epics_base_rs::server::snapshot::Snapshot = if stage.is_identity() {
-        &event.snapshot
-    } else {
-        match stage.prepare(event.clone(), data_count) {
-            Some(event) => {
-                prepared = event;
-                &prepared.snapshot
-            }
-            None => return,
-        }
+    // DBR_STRING).
+    let Some(delivery) = delivery.prepare(stage, data_count) else {
+        return;
     };
     // One buffer with the header space reserved at the front, and the payload
     // encoded straight into it — C `cas_copy_in_header` reserving inside the
     // client's send buffer and `dbGet` converting into that space
     // (`camessage.c:511` → `dbAccess.c:1017-1018`). See `server::frame`.
     let mut frame = FrameBuf::acquire(outbox.pool(), 0);
-    if encode_dbr_into(frame.dst(), data_type, snapshot).is_err() {
+    if delivery.encode_dbr_into(frame.dst(), data_type).is_err() {
         super::tcp::send_get_fail_event(outbox, chan, data_type, data_count, sub_id, reply);
         return;
     }
@@ -115,12 +235,7 @@ pub(crate) fn send_event(
     // fixed single element). A SimplePv channel carries no record_type, so
     // its CLASS_NAME body is 40 zero bytes, matching an IOC's synthetic
     // channels.
-    let element_count = size_dbr_reply(
-        &mut frame,
-        data_type,
-        snapshot.value.count() as u32,
-        data_count,
-    );
+    let element_count = size_dbr_reply(&mut frame, data_type, delivery.count(), data_count);
     frame.align_payload();
 
     let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -198,11 +313,11 @@ mod tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let event = MonitorEvent {
-            snapshot: std::sync::Arc::new(snapshot),
-            origin: 0,
-            mask: epics_base_rs::server::recgbl::EventMask::VALUE,
-        };
+        let event = MonitorEvent::from_snapshot(
+            std::sync::Arc::new(snapshot),
+            0,
+            epics_base_rs::server::recgbl::EventMask::VALUE,
+        );
 
         // data_count = 0 means autosize (use snapshot's actual count);
         // matches every producer caller.
@@ -211,7 +326,7 @@ mod tests {
             DBR_LONG,
             0,
             7,
-            &event,
+            Delivery::log(event),
             &outbox,
             Credit::none(),
             &crate::server::DeliveryStage::plain(),
@@ -303,6 +418,7 @@ mod tests {
             let context: epics_base_rs::server::event_queue::DeliveryContext =
                 Arc::new(crate::server::tcp::CircuitMonitor {
                     target: crate::server::tcp::ChannelTarget::SimplePv(pv.clone()),
+                    db: Arc::new(epics_base_rs::server::database::PvDatabase::new()),
                     cid: 0,
                     sub_id: 1,
                     data_type: DBR_DOUBLE,

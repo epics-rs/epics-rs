@@ -697,6 +697,27 @@ pub fn encode_dbr_into(
     Ok(())
 }
 
+/// `dbGet` of a field log alone (`dbAccess.c:909`): the plain, STS and TIME
+/// classes, whose encode reads value, status, severity and time and no
+/// option of the channel.
+pub fn encode_log_dbr_into(
+    dst: &mut Vec<u8>,
+    dbr_type: u16,
+    value: &EpicsValue,
+    status: u16,
+    severity: u16,
+    time: WallTime,
+) -> CaResult<()> {
+    let native = super::native_type_for_dbr(dbr_type)?;
+    match dbr_type {
+        0..=6 => {}
+        7..=13 => write_sts_meta(dst, native, status, severity),
+        14..=20 => write_time_meta(dst, native, status, severity, time),
+        _ => return Err(CaError::UnsupportedType(dbr_type)),
+    }
+    convert_and_serialize_into(native, value, dst)
+}
+
 /// Append GR (graphic/display) metadata — the real snapshot values, not the
 /// zeroed layout `serialize_gr_ctrl` emits.
 fn write_gr_meta(

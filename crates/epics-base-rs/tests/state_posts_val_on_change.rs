@@ -50,7 +50,12 @@ async fn state_posts_val_only_on_a_change_staterecord_c_115() {
             .await
             .unwrap();
         while let Ok(event) = rx.try_recv() {
-            posts.push(event.snapshot.value.to_string());
+            posts.push(
+                event
+                    .delivered_value(&db.get_record("ST").unwrap().read(), "VAL")
+                    .unwrap()
+                    .to_string(),
+            );
         }
     }
     assert_eq!(posts, ["run", "stop", "", "abcdefghijklmnopqrs"]);
@@ -98,7 +103,12 @@ async fn an_alarm_only_change_posts_no_val_staterecord_c_118() {
             .await
             .unwrap();
         while let Ok(event) = rx.try_recv() {
-            posts.push(event.snapshot.value.to_string());
+            posts.push(
+                event
+                    .delivered_value(&db.get_record("ST").unwrap().read(), "VAL")
+                    .unwrap()
+                    .to_string(),
+            );
         }
     }
     assert_eq!(posts, ["x"]);
@@ -137,7 +147,12 @@ async fn an_alarm_only_change_posts_no_val_permissiverecord_c_107() {
             .await
             .unwrap();
         while let Ok(event) = rx.try_recv() {
-            posts.push(event.snapshot.value.to_string());
+            posts.push(
+                event
+                    .delivered_value(&db.get_record("PM").unwrap().read(), "VAL")
+                    .unwrap()
+                    .to_string(),
+            );
         }
     }
     assert_eq!(posts, ["1"]);

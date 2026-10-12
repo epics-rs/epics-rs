@@ -124,13 +124,14 @@ async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
         .try_recv()
         .expect("the collapsed entry is still queued");
     assert_eq!(
-        held.mask,
+        held.mask(),
         EventMask::ALARM | EventMask::VALUE | EventMask::LOG,
         "monitor()'s monitor_mask|DBE_VALUE|DBE_LOG, with afterCalc's displaced \
          DBE_VALUE|DBE_LOG OR-ed in by the queue"
     );
     assert_eq!(
-        held.snapshot.value,
+        held.delivered_value(&db.get_record("A").unwrap().read(), "AA")
+            .unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())
     );
     assert!(both_rx.try_recv().is_err());
@@ -146,7 +147,7 @@ async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
         .try_recv()
         .expect("monitor() posts the NEWM-flagged AA with the alarm bit (:1031-1036)");
     assert_eq!(
-        only.mask,
+        only.mask(),
         EventMask::ALARM,
         "monitor() posts monitor_mask|DBE_VALUE|DBE_LOG, but the log this \
          subscription receives carries `caEventMask & pevent->select` \
@@ -177,7 +178,7 @@ async fn w10_a5_an_amask_only_array_posts_a_literal_value_log() {
 
     let post = cc_rx.try_recv().expect("CC was stored into: AMASK bit 2");
     assert_eq!(
-        post.mask,
+        post.mask(),
         EventMask::VALUE | EventMask::LOG,
         "afterCalc posts DBE_VALUE|DBE_LOG literally, alarm transition or not"
     );

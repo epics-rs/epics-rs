@@ -80,12 +80,12 @@ impl Cam {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         let mut out = Vec::new();
         for (m, pv, rx) in &mut self.subs {
+            let (rec, field) = pv.split_once('.').unwrap();
             while let Ok(e) = rx.try_recv() {
-                let s = &e.snapshot;
-                out.push(format!(
-                    "{m} {pv} {} {} {}",
-                    s.value, s.alarm.status, s.alarm.severity
-                ));
+                let value = e
+                    .delivered_value(&self.db.get_record(rec).unwrap().read(), field)
+                    .unwrap();
+                out.push(format!("{m} {pv} {value} {} {}", e.stat(), e.sevr()));
             }
         }
         out

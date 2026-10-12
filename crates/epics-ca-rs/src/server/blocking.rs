@@ -4307,7 +4307,7 @@ mod tests {
                 r.data_type,
                 r.data_count,
                 r.sub_id,
-                &event,
+                crate::server::monitor::Delivery::log(event),
                 &outbox,
                 crate::server::outbox::Credit::none(),
                 &crate::server::DeliveryStage::plain(),

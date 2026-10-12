@@ -46,13 +46,13 @@ impl SubscriptionFilter for UserTagFilter {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        if event.read_context || event.event.mask.intersects(EventMask::PROPERTY) {
+        if event.read_context || event.event.mask().intersects(EventMask::PROPERTY) {
             return Some(event);
         }
         if self.first.swap(false, Ordering::AcqRel) {
             return Some(event);
         }
-        let utag = event.event.snapshot.user_tag;
+        let utag = event.event.utag();
         if (utag & self.mask) != self.value {
             None
         } else {
@@ -72,11 +72,11 @@ mod tests {
     fn ev(utag: i32, mask: EventMask) -> FilteredMonitorEvent {
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, SystemTime::UNIX_EPOCH);
         snap.user_tag = utag;
-        FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: std::sync::Arc::new(snap),
-            origin: 0,
+        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
+            std::sync::Arc::new(snap),
+            0,
             mask,
-        })
+        ))
     }
 
     fn read_ev(utag: i32) -> FilteredMonitorEvent {

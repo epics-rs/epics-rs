@@ -90,12 +90,12 @@ async fn r9_72_changed_input_posts_dbe_value_without_dbe_log() {
 
     let event = rx.try_recv().expect("a changed input A must post");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE,
         "C posts a changed swait input with `monitor_mask | DBE_VALUE`; VAL \
          moved 7 -> 8 with ADEL=1000, so monitor_mask holds DBE_VALUE (MDEL \
          crossed) and no DBE_LOG — got {:?}",
-        event.mask
+        event.mask()
     );
 }
 
@@ -112,11 +112,11 @@ async fn r9_72_input_post_carries_log_when_vals_adel_crossed() {
 
     let event = rx.try_recv().expect("a changed input A must post");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE | EventMask::LOG,
         "ADEL=0 puts DBE_LOG into VAL's monitor_mask on any change; the input \
          post inherits it — got {:?}",
-        event.mask
+        event.mask()
     );
 }
 
@@ -144,11 +144,11 @@ async fn r9_72_calc_input_post_still_forces_dbe_log() {
 
     let event = rx.try_recv().expect("a changed input A must post");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE | EventMask::LOG,
         "calcRecord.c:420 posts a changed input with `monitor_mask | \
          DBE_VALUE | DBE_LOG` — the forced LOG stays, ADEL crossing or not — \
          got {:?}",
-        event.mask
+        event.mask()
     );
 }

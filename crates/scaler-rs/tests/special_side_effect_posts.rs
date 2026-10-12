@@ -112,7 +112,7 @@ async fn b18_a_rate_write_posts_no_tp() {
         .try_recv()
         .expect("the put's own post announces the field that was written");
     assert_eq!(
-        event.snapshot.value.to_f64(),
+        event.value().as_value().cloned().unwrap().to_f64(),
         Some(60.0),
         "and it carries the CLAMPED value, not the 100 that was written"
     );
@@ -130,7 +130,7 @@ async fn r10_62_a_tp_write_posts_pr1_d1_and_g1() {
 
     let pr1 = pr1_rx.try_recv().expect("C:673 posts PR1");
     assert_eq!(
-        pr1.snapshot.value.to_f64(),
+        pr1.value().as_value().cloned().unwrap().to_f64(),
         Some(2.0e7),
         "PR1 = TP * FREQ (2 s at 10 MHz)"
     );
@@ -151,7 +151,7 @@ async fn r10_62_a_preset_write_posts_that_channels_gate_and_direction() {
     assert!(d5_rx.try_recv().is_ok(), "C:705 posts D5");
     let g5 = g5_rx.try_recv().expect("C:706 posts G5");
     assert_eq!(
-        g5.snapshot.value.to_f64(),
+        g5.value().as_value().cloned().unwrap().to_f64(),
         Some(1.0),
         "the gate C just forced on"
     );
@@ -167,7 +167,7 @@ async fn r10_62_a_gate_write_posts_the_preset_it_defaults() {
 
     let pr3 = pr3_rx.try_recv().expect("C:719 posts the defaulted PR3");
     assert_eq!(
-        pr3.snapshot.value.to_f64(),
+        pr3.value().as_value().cloned().unwrap().to_f64(),
         Some(1000.0),
         "C:718 gives an unset preset the 1000-count default"
     );

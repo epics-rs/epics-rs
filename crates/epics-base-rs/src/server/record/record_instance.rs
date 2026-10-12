@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::server::database::LinkBacking;
 use crate::server::event_queue::{EventReader, EventUser, PostBurst};
-use crate::server::pv::{MonitorEvent, SubscribeRefused, Subscriber};
+use crate::server::pv::{SubscribeRefused, Subscriber};
 use crate::server::recgbl::EventMask;
 use crate::server::snapshot::{
     ControlInfo, DisplayInfo, EnumInfo, EnumStringForm, PropertySupport,
@@ -9870,7 +9870,7 @@ impl RecordInstance {
     /// Notify subscribers from a snapshot (call outside lock).
     /// Each entry carries its own posting mask: only subscribers whose
     /// mask intersects that field's mask are notified, and the delivered
-    /// [`MonitorEvent`] reports that intersection — C
+    /// [`MonitorEvent`](crate::server::pv::MonitorEvent) reports that intersection — C
     /// `db_post_events(prec, &field, mask)` per-field granularity, then
     /// `pLog->mask = caEventMask & pevent->select` per subscriber.
     ///
@@ -9892,8 +9892,6 @@ impl RecordInstance {
 
     #[inline(never)]
     fn deliver_snapshot(&self, snapshot: &ProcessSnapshot, backing: LinkBacking<'_>) {
-        use crate::server::database::filters::FilteredMonitorEvent;
-
         // Same ambient-origin inheritance as `notify_field_with_origin`:
         // a process cycle driven by an in-process writer's put tags its
         // posts with the writer's origin, so the writer's own filtered
@@ -9928,22 +9926,10 @@ impl RecordInstance {
                     // posting mask means nothing changed and ands to zero,
                     // so it skips there rather than needing a check here.
                     if let Some(mask) = sub.delivered_mask(posting_mask) {
-                        let event = MonitorEvent {
-                            snapshot: mon_snap.clone(),
-                            origin,
-                            mask,
-                        };
                         // Server-side filter chain (3.15.7). Empty chain
                         // is identity, so no behaviour change for the
                         // common no-filter case.
-                        let filtered = if sub.filters.is_empty() {
-                            Some(event)
-                        } else {
-                            sub.filters
-                                .apply(FilteredMonitorEvent::new(event))
-                                .map(|fe| fe.event)
-                        };
-                        let Some(event) = filtered else {
+                        let Some(event) = sub.filtered_log(&mon_snap, origin, mask) else {
                             continue;
                         };
                         // C `db_queue_event_log`: append, or replace this
@@ -10122,7 +10108,6 @@ impl RecordInstance {
         ),
     ) {
         let (read, walk_skip) = access;
-        use crate::server::database::filters::FilteredMonitorEvent;
         // A poster that carries no origin of its own inherits the ambient
         // one (0 outside any scope): this is how every post inside an
         // SNL writer's synchronous put+process cascade gets the writer's
@@ -10189,11 +10174,6 @@ impl RecordInstance {
                 // Same single owner as the snapshot path: gate and
                 // narrow are one operation (C `dbEvent.c:896-900`).
                 if let Some(mask) = sub.delivered_mask(mask) {
-                    let event = MonitorEvent {
-                        snapshot: mon_snap.clone(),
-                        origin,
-                        mask,
-                    };
                     // Server-side filter chain (3.15.7). Empty
                     // chain (the default for every subscriber
                     // until a `.{filter:opts}` PV-name suffix
@@ -10201,14 +10181,7 @@ impl RecordInstance {
                     // existing subscribers see no behaviour
                     // change. A filter returning `None` silences
                     // this event for this subscriber only.
-                    let filtered = if sub.filters.is_empty() {
-                        Some(event)
-                    } else {
-                        sub.filters
-                            .apply(FilteredMonitorEvent::new(event))
-                            .map(|fe| fe.event)
-                    };
-                    let Some(event) = filtered else {
+                    let Some(event) = sub.filtered_log(&mon_snap, origin, mask) else {
                         continue;
                     };
                     // Same single post owner as the snapshot path.
@@ -10293,7 +10266,10 @@ impl RecordInstance {
         if live >= cap {
             return Err(SubscribeRefused::CapReached);
         }
-        let (sink, reader) = crate::server::event_queue::attach_with(user, sid, context);
+        let kind = crate::server::event_queue::LogKind::of_field(self.field_desc(field), || {
+            self.resolve_field(field)
+        });
+        let (sink, reader) = crate::server::event_queue::attach_with(user, sid, kind, context);
         let subscriber = Subscriber {
             sid,
             data_type,

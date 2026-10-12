@@ -84,8 +84,14 @@ record(longout, "W2") { field(OUT, "T.SUSE") }
         let mut out = Vec::new();
         for (m, field, rx) in &mut self.subs {
             while let Ok(e) = rx.try_recv() {
-                let s = &e.snapshot;
-                out.push(format!("{m} T.{field} {}", as_dbr_string(s)));
+                // Enum strings are read at delivery, over the posted log.
+                let rec = self.db.get_record("T").unwrap();
+                let mut s = self
+                    .db
+                    .channel_snapshot_for_field(&rec, field, false)
+                    .unwrap();
+                e.write_log_over(&mut s);
+                out.push(format!("{m} T.{field} {}", as_dbr_string(&s)));
             }
         }
         out

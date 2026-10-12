@@ -781,10 +781,12 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     let event = amsg_rx
         .try_recv()
         .expect("AMSG-only change must produce an event on DBE_ALARM-class subscribers");
+    let value = event
+        .delivered_value(&db.get_record("DST_AMSG").unwrap().read(), "AMSG")
+        .unwrap();
     assert!(
-        matches!(event.snapshot.value, EpicsValue::String(ref s) if s == "msg2"),
-        "AMSG event payload should be the new message, got {:?}",
-        event.snapshot.value
+        matches!(value, EpicsValue::String(ref s) if s == "msg2"),
+        "AMSG event payload should be the new message, got {value:?}"
     );
 }
 
@@ -848,11 +850,11 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
 
     let event = val_rx.try_recv().expect("cycle 1 must post a VAL event");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
         "value change + alarm raise in one pass: VAL's event mask must \
          carry all three classes, got {:?}",
-        event.mask
+        event.mask()
     );
 
     // Subscribe AMSG after cycle 1 so last_posted seeds at "msg1".
@@ -878,20 +880,20 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
         .try_recv()
         .expect("alarm movement must post VAL even when the deadband is silent");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::ALARM,
         "amsg-only pass: VAL posts with DBE_ALARM alone (C recGbl.c:212 \
          val_mask), got {:?}",
-        event.mask
+        event.mask()
     );
 
     let event = amsg_rx.try_recv().expect("amsg-only change must post AMSG");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::ALARM,
         "AMSG posts with stat_mask = DBE_ALARM (C recGbl.c:194/210-211), \
          got {:?}",
-        event.mask
+        event.mask()
     );
 }
 
@@ -999,12 +1001,21 @@ async fn test_caput_to_udf_field_posts_udf_event() {
     // the SIGNED `EpicsValue::Char` here pinned the storage variant the record
     // happened to hold, which is exactly the type-from-the-value defect.
     assert!(
-        matches!(event.snapshot.value, EpicsValue::UChar(1)),
+        matches!(
+            event.value().as_value().cloned().unwrap(),
+            EpicsValue::UChar(1)
+        ),
         "the .UDF event must carry the value the client wrote, got {:?}",
-        event.snapshot.value
+        event.value().as_value().cloned().unwrap()
     );
     assert_eq!(
-        event.snapshot.value.dbr_type().ca_wire_type(),
+        event
+            .value()
+            .as_value()
+            .cloned()
+            .unwrap()
+            .dbr_type()
+            .ca_wire_type(),
         DbFieldType::Char as u16,
         "a DBF_UCHAR field goes on the CA wire as DBR_CHAR"
     );
@@ -7254,15 +7265,21 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
         // NORD is DBF_ULONG on waveform/aai/aao and DBF_LONG on subArray
         // (subArrayRecord.dbd.pod:394).
         let nord_is_3 = match kind {
-            ArrayKind::SubArray => matches!(event.snapshot.value, EpicsValue::Long(3)),
-            _ => matches!(event.snapshot.value, EpicsValue::ULong(3)),
+            ArrayKind::SubArray => matches!(
+                event.value().as_value().cloned().unwrap(),
+                EpicsValue::Long(3)
+            ),
+            _ => matches!(
+                event.value().as_value().cloned().unwrap(),
+                EpicsValue::ULong(3)
+            ),
         };
         assert!(
             nord_is_3,
             "{name}: NORD payload should reflect post-set_val length (3), got {:?}",
-            event.snapshot.value
+            event.value().as_value().cloned().unwrap()
         );
-        let ts = event.snapshot.timestamp;
+        let ts = event.time();
         assert!(
             ts != WallTime::UNIX_EPOCH,
             "{name}: NORD event timestamp must not be the epoch sentinel"
@@ -7381,9 +7398,9 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
         .try_recv()
         .expect("AUX change must produce a post-completion event");
     assert!(
-        matches!(event.snapshot.value, EpicsValue::Double(v) if v == 2.0),
+        matches!(event.value().as_value().cloned().unwrap(), EpicsValue::Double(v) if v == 2.0),
         "AUX event payload should reflect post-change value, got {:?}",
-        event.snapshot.value
+        event.value().as_value().cloned().unwrap()
     );
 
     // And another no-op cycle after the change must again be silent.
@@ -7470,15 +7487,19 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
         .try_recv()
         .expect("NORD event must be delivered after put_pv_and_post (side-effect of VAL)");
     assert!(
-        matches!(nord_event.snapshot.value, EpicsValue::ULong(4)),
+        matches!(
+            nord_event.value().as_value().cloned().unwrap(),
+            EpicsValue::ULong(4)
+        ),
         "NORD event should reflect post-put length (4), got {:?}",
-        nord_event.snapshot.value
+        nord_event.value().as_value().cloned().unwrap()
     );
     // VAL and NORD events must carry the SAME timestamp — both
     // observed the put within one critical section so they reflect
     // the same wall-clock snapshot.
     assert_eq!(
-        val_event.snapshot.timestamp, nord_event.snapshot.timestamp,
+        val_event.time(),
+        nord_event.time(),
         "VAL and NORD side-effect events must share the put's timestamp"
     );
 
@@ -7650,10 +7671,10 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
         .try_recv()
         .expect("VAL event must be delivered at async completion");
     assert!(
-        event.snapshot.timestamp >= post_sleep,
+        event.time() >= post_sleep,
         "completion event timestamp ({:?}) must be ≥ post-sleep ({post_sleep:?}) — \
          apply_timestamp must run at async completion, not at process start",
-        event.snapshot.timestamp
+        event.time()
     );
 }
 
@@ -7893,7 +7914,10 @@ async fn test_compress_res_write_posts_val_monitor() {
     let event = val_rx
         .try_recv()
         .expect("RES write must trigger a VAL monitor event");
-    if let EpicsValue::DoubleArray(v) = &event.snapshot.value {
+    if let EpicsValue::DoubleArray(v) = &event
+        .delivered_value(&db.get_record("CMP_RES").unwrap().read(), "VAL")
+        .unwrap()
+    {
         // Post-reset: NUSE=0, so VAL should be all zeros (or empty
         // depending on PBUF). Either way, none of {1.0, 2.0, 3.0}
         // should still be present.
@@ -7902,7 +7926,10 @@ async fn test_compress_res_write_posts_val_monitor() {
             "post-reset VAL must be all zeros; got {v:?}"
         );
     } else {
-        panic!("VAL must be DoubleArray, got {:?}", event.snapshot.value);
+        panic!(
+            "VAL must be DoubleArray, got {:?}",
+            event.value().as_value().cloned().unwrap()
+        );
     }
 
     // RES itself reset back to 0.
@@ -8227,7 +8254,7 @@ async fn test_histogram_sdel_watchdog_posts_val() {
             .await
             .expect("SDEL watchdog must post VAL within one period")
             .expect("subscription alive");
-    match &event.snapshot.value {
+    match &event.delivered_value(&rec.read(), "VAL").unwrap() {
         EpicsValue::ULongArray(v) => assert_eq!(
             v,
             &vec![1, 0],
@@ -8250,7 +8277,7 @@ async fn test_histogram_sdel_watchdog_posts_val() {
             .await
             .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
             .expect("subscription alive");
-    match &event.snapshot.value {
+    match &event.delivered_value(&rec.read(), "VAL").unwrap() {
         EpicsValue::ULongArray(v) => assert_eq!(v, &vec![1, 1]),
         other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
     }

@@ -3652,18 +3652,8 @@ pub(crate) async fn dispatch_message(
                 snapshot.value.truncate(requested_count as usize);
             }
 
-            // For DBR_STSACK_STRING populate ackt/acks from the record so
-            // alarm-handler clients see the current acknowledge state.
             if requested_type == epics_base_rs::types::DBR_STSACK_STRING {
-                if let ChannelTarget::RecordField { record, .. } = &entry.target {
-                    let inst = record.read();
-                    if let Some(EpicsValue::Short(v)) = inst.resolve_field("ACKT") {
-                        snapshot.alarm.ackt = Some(v as u16);
-                    }
-                    if let Some(EpicsValue::Short(v)) = inst.resolve_field("ACKS") {
-                        snapshot.alarm.acks = Some(v as u16);
-                    }
-                }
+                read_ack_state(&entry.target, &mut snapshot.alarm);
             }
 
             // For DBR_CLASS_NAME (38) substitute the record's recordType
@@ -5651,6 +5641,7 @@ pub(crate) async fn register_subscription(
     // this client's negotiated version and echoes this header if unbuildable.
     let monitor = Arc::new(CircuitMonitor {
         target: target.clone(),
+        db: state.db.clone(),
         cid: entry_cid,
         sub_id,
         data_type: requested_type,
@@ -6074,10 +6065,16 @@ pub(crate) async fn run_event_task<W>(
                     break;
                 }
             }
-            EventStep::Delivered(context, mut event) => {
+            EventStep::Delivered(context, event) => {
                 let Some(m) = context.downcast_ref::<CircuitMonitor>() else {
                     continue;
                 };
+                // Read before the gate, which a cancel can hold this thread
+                // in; `None` is a failed get, framed inside it.
+                let source =
+                    super::monitor::with_live_options(m.data_type, (*event).clone(), || {
+                        m.live_options()
+                    });
                 // The gate spans BUILD AND SOCKET WRITE here, not just the
                 // enqueue as on the async path: this driver's frames reach the
                 // socket through `write_frame` under the send lock, so that —
@@ -6103,22 +6100,13 @@ pub(crate) async fn run_event_task<W>(
                     let denied = m.denied.load(Ordering::Acquire);
                     if denied {
                         send_denied_event(m, &event, &ev_outbox);
-                    } else {
-                        // CA-268: a record-field DBR_CLASS_NAME monitor carries
-                        // the record's type string (C `event_add_action`); the
-                        // async `deliver_record_field_event` sets it per event.
-                        if m.data_type == epics_base_rs::types::DBR_CLASS_NAME {
-                            if let ChannelTarget::RecordField { record, .. } = &m.target {
-                                std::sync::Arc::make_mut(&mut event.snapshot).class_name =
-                                    Some(record.read().record.record_type().to_string());
-                            }
-                        }
+                    } else if let Some(delivery) = source {
                         super::monitor::send_event(
                             m.refusal_channel(),
                             m.data_type,
                             m.data_count,
                             m.sub_id,
-                            &event,
+                            delivery,
                             &ev_outbox,
                             // `ev_outbox` is this task's private one-delivery
                             // scratch buffer, drained to the socket under the
@@ -6126,6 +6114,15 @@ pub(crate) async fn run_event_task<W>(
                             // credit — is already this producer's bound.
                             crate::server::outbox::Credit::none(),
                             &m.stage,
+                            m.reply,
+                        );
+                    } else {
+                        send_get_fail_event(
+                            &ev_outbox,
+                            m.refusal_channel(),
+                            m.data_type,
+                            m.data_count,
+                            m.sub_id,
                             m.reply,
                         );
                     }
@@ -6228,17 +6225,12 @@ fn send_monitor_snapshot(
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
     reply: ReplyContext,
 ) -> CaResult<()> {
-    let event = epics_base_rs::server::pv::MonitorEvent {
-        snapshot: Arc::new(snapshot.clone()),
-        origin: 0,
-        mask: epics_base_rs::server::recgbl::EventMask::VALUE,
-    };
     super::monitor::send_event(
         RefusalChannel { cid: 0, pv: "" },
         data_type,
         requested_count,
         sub_id,
-        &event,
+        super::monitor::Delivery::of_read(snapshot.clone()),
         writer,
         crate::server::outbox::Credit::none(),
         &super::DeliveryStage::plain(),
@@ -6574,7 +6566,10 @@ pub(crate) fn send_denied_event(
     ) {
         return;
     }
-    let count = no_read_access_count(m.data_count, event.snapshot.value.count());
+    let count = no_read_access_count(
+        m.data_count,
+        event.value().as_value().map_or(0, |v| v.count()),
+    );
     let _ = send_no_read_access_event(
         outbox,
         m.refusal_channel(),
@@ -6938,6 +6933,8 @@ pub(crate) struct ReplyContext {
 /// ([`EventReader::enable`](epics_base_rs::server::event_queue::EventReader::enable)).
 pub(crate) struct CircuitMonitor {
     pub(crate) target: ChannelTarget,
+    /// The database a record-field delivery reads its options from.
+    pub(crate) db: Arc<PvDatabase>,
     /// The client's id for the channel, which a refusal carries.
     pub(crate) cid: u32,
     pub(crate) sub_id: u32,
@@ -6953,7 +6950,43 @@ pub(crate) struct CircuitMonitor {
     pub(crate) ended: AtomicBool,
 }
 
+/// A `DBR_STSACK_STRING`'s ACKS and ACKT, which `getOptions` reads from the
+/// record whatever the field log holds (`dbAccess.c:361-362`).
+fn read_ack_state(target: &ChannelTarget, alarm: &mut epics_base_rs::server::snapshot::AlarmInfo) {
+    if let ChannelTarget::RecordField { record, .. } = target {
+        let inst = record.read();
+        if let Some(EpicsValue::Short(v)) = inst.resolve_field("ACKT") {
+            alarm.ackt = Some(v as u16);
+        }
+        if let Some(EpicsValue::Short(v)) = inst.resolve_field("ACKS") {
+            alarm.acks = Some(v as u16);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) static LIVE_OPTION_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl CircuitMonitor {
+    /// The channel's options at delivery, through the door the monitor's
+    /// initial value takes; a monitor never reads through a gateway read
+    /// hook (`SimplePv::read_snapshot`). CLASS_NAME is the record's type.
+    pub(crate) fn live_options(&self) -> Option<epics_base_rs::server::snapshot::Snapshot> {
+        #[cfg(test)]
+        LIVE_OPTION_READS.fetch_add(1, Ordering::Relaxed);
+        let mut snap = get_full_snapshot(&self.db, &self.target)?;
+        if self.data_type == epics_base_rs::types::DBR_STSACK_STRING {
+            read_ack_state(&self.target, &mut snap.alarm);
+        }
+        if self.data_type == epics_base_rs::types::DBR_CLASS_NAME {
+            if let ChannelTarget::RecordField { record, .. } = &self.target {
+                snap.class_name = Some(record.read().record.record_type().to_string());
+            }
+        }
+        Some(snap)
+    }
+
     pub(crate) fn refusal_channel(&self) -> RefusalChannel<'_> {
         RefusalChannel {
             cid: self.cid,
@@ -6989,8 +7022,8 @@ pub(crate) async fn run_circuit_monitors(
             ChannelTarget::SimplePv(_) => {
                 super::monitor::deliver_monitor_event(m, event, &outbox).await
             }
-            ChannelTarget::RecordField { record, .. } => {
-                deliver_record_field_event(m, record, event, &outbox).await
+            ChannelTarget::RecordField { .. } => {
+                deliver_record_field_event(m, event, &outbox).await
             }
         }
     }
@@ -6999,8 +7032,7 @@ pub(crate) async fn run_circuit_monitors(
 /// Deliver one queued entry of a record-field monitor.
 async fn deliver_record_field_event(
     m: &CircuitMonitor,
-    record: &RecordCell,
-    mut event: epics_base_rs::server::pv::MonitorEvent,
+    event: epics_base_rs::server::pv::MonitorEvent,
     outbox: &Outbox,
 ) {
     // One subscription update committed for delivery this cycle
@@ -7026,26 +7058,30 @@ async fn deliver_record_field_event(
     ) {
         return;
     }
-    // CA-268 monitor parity: populate class_name on every emitted
-    // event so a `ca_create_subscription` against DBR_CLASS_NAME
-    // sees the record_type string instead of an empty 40-byte pad.
-    if m.data_type == epics_base_rs::types::DBR_CLASS_NAME {
-        std::sync::Arc::make_mut(&mut event.snapshot).class_name =
-            Some(record.read().record.record_type().to_string());
-    }
-    // The post chain and the long-string conversion. Both this and the
-    // CLASS_NAME override are per-subscription rewrites of a snapshot every
-    // other subscriber shares, so they take the copy-on-write path — and
-    // only when they have something to write, so an identity stage (the
-    // common case) never copies.
-    let Some(event) = m.stage.prepare(event, m.data_count) else {
+    let Some(delivery) = super::monitor::with_live_options(m.data_type, event, || m.live_options())
+    else {
+        send_get_fail_event(
+            outbox,
+            m.refusal_channel(),
+            m.data_type,
+            m.data_count,
+            m.sub_id,
+            m.reply,
+        );
+        return;
+    };
+    // The post chain and the long-string conversion, a per-subscription
+    // rewrite of a snapshot every other subscriber shares, so it takes the
+    // copy-on-write path — and only when it has something to write, so an
+    // identity stage (the common case) never copies.
+    let Some(delivery) = delivery.prepare(&m.stage, m.data_count) else {
         return;
     };
     // Header space reserved up front, payload encoded straight into
     // it — see `server::frame` for the C `cas_copy_in_header` shape
     // this ports.
     let mut frame = FrameBuf::acquire(outbox.pool(), 0);
-    if encode_dbr_into(frame.dst(), m.data_type, &event.snapshot).is_err() {
+    if delivery.encode_dbr_into(frame.dst(), m.data_type).is_err() {
         send_get_fail_event(
             outbox,
             m.refusal_channel(),
@@ -7059,12 +7095,7 @@ async fn deliver_record_field_event(
     // CA-268: an EVENT_ADD with explicit `count=1` on a waveform
     // gets one element, not the live N; `size_dbr_reply` owns the
     // request-count rule.
-    let element_count = size_dbr_reply(
-        &mut frame,
-        m.data_type,
-        event.snapshot.value.count() as u32,
-        m.data_count,
-    );
+    let element_count = size_dbr_reply(&mut frame, m.data_type, delivery.count(), m.data_count);
     frame.align_payload();
 
     let mut ev = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -7118,6 +7149,261 @@ async fn deliver_record_field_event(
 /// The connection loop's handle on its [`run_circuit_monitors`] task.
 /// Dropping it aborts the task, for the reason [`WriteNotifyQueue`]'s drop
 /// does.
+/// The options a record-field update encodes are read at delivery, as
+/// `dbGet` reads them (`dbAccess.c:336-414`); the event supplies value,
+/// alarm, time and utag only.
+#[cfg(test)]
+mod delivery_reads_options {
+    use super::*;
+    use epics_base_rs::server::pv::MonitorEvent;
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::snapshot::Snapshot;
+    use epics_base_rs::types::{
+        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_DOUBLE, DBR_GR_DOUBLE, DBR_STS_DOUBLE,
+        DBR_TIME_DOUBLE, DBR_TIME_STRING, EpicsValue, decode_dbr,
+    };
+
+    async fn ai_db() -> Arc<PvDatabase> {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "X",
+            Box::new(epics_base_rs::server::records::ai::AiRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
+        db.put_pv("X.PREC", EpicsValue::Short(4)).await.unwrap();
+        db.put_pv("X.EGU", EpicsValue::String("mm".into()))
+            .await
+            .unwrap();
+        db
+    }
+
+    fn monitor(db: &Arc<PvDatabase>, target: ChannelTarget, data_type: u16) -> CircuitMonitor {
+        CircuitMonitor {
+            target,
+            db: db.clone(),
+            cid: 0,
+            sub_id: 1,
+            data_type,
+            data_count: 0,
+            denied: Arc::new(AtomicBool::new(false)),
+            gate: crate::server::outbox::MonitorGate::open(),
+            stage: super::super::DeliveryStage::plain(),
+            reply: ReplyContext {
+                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
+                client_minor: CA_MINOR_VERSION,
+            },
+            stats: None,
+            ended: AtomicBool::new(false),
+        }
+    }
+
+    fn field(db: &PvDatabase) -> ChannelTarget {
+        ChannelTarget::RecordField {
+            record: db.get_record("X").unwrap(),
+            field: "VAL".into(),
+        }
+    }
+
+    /// X's live snapshot with what the poster saw: PREC 0, EGU "in", and
+    /// the value, alarm, time and utag given.
+    fn posted(db: &PvDatabase, value: f64, status: u16, severity: u16) -> MonitorEvent {
+        let mut snap = get_full_snapshot(db, &field(db)).unwrap();
+        let display = snap.display.as_mut().unwrap();
+        display.precision = 0;
+        display.units = "in".into();
+        snap.value = EpicsValue::Double(value);
+        snap.alarm.status = status;
+        snap.alarm.severity = severity;
+        snap.timestamp = epics_base_rs::types::WallTime::from_unix(1_700_000_000, 500);
+        snap.user_tag = 5;
+        MonitorEvent::from_snapshot(Arc::new(snap), 0, EventMask::VALUE)
+    }
+
+    async fn deliver(m: &CircuitMonitor, event: MonitorEvent) -> Snapshot {
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        match &m.target {
+            ChannelTarget::SimplePv(_) => {
+                crate::server::monitor::deliver_monitor_event(m, event, &outbox).await
+            }
+            ChannelTarget::RecordField { .. } => {
+                deliver_record_field_event(m, event, &outbox).await
+            }
+        }
+        let frame = drain.try_next().expect("one frame");
+        assert_eq!(u16::from_be_bytes([frame[0], frame[1]]), CA_PROTO_EVENT_ADD);
+        let count = u16::from_be_bytes([frame[6], frame[7]]) as usize;
+        decode_dbr(m.data_type, &frame[16..], count).unwrap()
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_ctrl_update_carries_the_records_prec_not_the_events() {
+        let db = ai_db().await;
+        let m = monitor(&db, field(&db), DBR_CTRL_DOUBLE);
+        let got = deliver(&m, posted(&db, 1.5, 0, 0)).await;
+        assert_eq!(got.precision(), Some(4));
+        assert_eq!(got.value, EpicsValue::Double(1.5));
+    }
+
+    /// A value-mode `ts` log is a DBF_ULONG, so `dbGet` turns DBR_PRECISION
+    /// off and keeps units and limits (`dbAccess.c:387-394`). softIoc
+    /// R7.0.10, `caget -d DBR_CTRL_DOUBLE 'T.VAL{"ts":{"num":"sec"}}'` on an
+    /// ai with PREC 3, EGU mm, HOPR 10, LOPR -10: `Units: mm`,
+    /// `Precision: 0`, `Hi disp limit: 10`; `{"num":"dbl"}`: `Precision: 3`.
+    #[epics_macros_rs::epics_test]
+    async fn a_ts_seconds_ctrl_update_carries_no_prec() {
+        use epics_base_rs::server::database::filters::{
+            FilterChain,
+            ts::{TimestampFilter, TsMode},
+        };
+        let db = ai_db().await;
+        db.put_pv("X.HOPR", EpicsValue::Double(10.0)).await.unwrap();
+        for (mode, prec) in [(TsMode::Seconds, 0), (TsMode::Double, 4)] {
+            let mut chain = FilterChain::new();
+            chain.push(Arc::new(TimestampFilter::with_mode(mode)));
+            let mut m = monitor(&db, field(&db), DBR_CTRL_DOUBLE);
+            m.stage =
+                super::super::DeliveryStage::new(chain, super::super::LongStringMode::Plain, 1);
+            let got = deliver(&m, posted(&db, 1.5, 0, 0)).await;
+            assert_eq!(got.precision(), Some(prec), "{mode:?}");
+            let display = got.display.as_ref().unwrap();
+            assert_eq!(display.units, "mm", "{mode:?}");
+            assert_eq!(display.upper_disp_limit, 10.0, "{mode:?}");
+        }
+    }
+
+    /// A string conversion reads the record's PREC too (`getDoubleString`).
+    #[epics_macros_rs::epics_test]
+    async fn a_time_string_update_formats_with_the_records_prec() {
+        let db = ai_db().await;
+        let m = monitor(&db, field(&db), DBR_TIME_STRING);
+        let got = deliver(&m, posted(&db, 1.5, 0, 0)).await;
+        assert_eq!(got.value, EpicsValue::String("1.5000".into()));
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_time_update_reads_nothing_from_the_record() {
+        let db = ai_db().await;
+        let m = monitor(&db, field(&db), DBR_TIME_DOUBLE);
+        let before = LIVE_OPTION_READS.load(Ordering::Relaxed);
+        for v in 0..5 {
+            deliver(&m, posted(&db, f64::from(v), 0, 0)).await;
+        }
+        assert_eq!(LIVE_OPTION_READS.load(Ordering::Relaxed) - before, 0);
+    }
+
+    /// `caput X.EGU` posts no DBE_PROPERTY on an ai, yet the next GR update
+    /// carries the new units, as `getOptions` reads them at delivery.
+    #[epics_macros_rs::epics_test]
+    async fn a_gr_update_after_an_egu_put_carries_the_new_units() {
+        let db = ai_db().await;
+        let m = monitor(&db, field(&db), DBR_GR_DOUBLE);
+        let event = posted(&db, 2.0, 0, 0);
+        db.put_pv("X.EGU", EpicsValue::String("km".into()))
+            .await
+            .unwrap();
+        let got = deliver(&m, event).await;
+        assert_eq!(
+            got.units().map(|u| u.as_str_lossy().into_owned()),
+            Some("km".into())
+        );
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_class_name_update_carries_the_record_type_and_a_simple_pv_none() {
+        let db = ai_db().await;
+        let m = monitor(&db, field(&db), DBR_CLASS_NAME);
+        let got = deliver(&m, posted(&db, 2.0, 0, 0)).await;
+        assert_eq!(got.class_name.as_deref(), Some("ai"));
+
+        let pv = Arc::new(ProcessVariable::new("S".into(), EpicsValue::Double(0.0)));
+        let m = monitor(&db, ChannelTarget::SimplePv(pv.clone()), DBR_CLASS_NAME);
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        let event = MonitorEvent::from_snapshot(Arc::new(pv.snapshot()), 0, EventMask::VALUE);
+        crate::server::monitor::deliver_monitor_event(&m, event, &outbox).await;
+        let frame = drain.try_next().expect("one frame");
+        assert_eq!(&frame[16..56], &[0u8; 40][..]);
+    }
+
+    /// A STSACK update carries the record's ACKT/ACKS (`dbAccess.c:361-362`),
+    /// whatever the event holds. softIoc R7.0.10, `caget -d
+    /// DBR_STSACK_STRING` after PINI on the same records:
+    ///
+    /// ```text
+    /// X   Status: HIHI  Severity: MAJOR    Ack transient?: YES  Ack severity: MAJOR
+    /// SI  Status: LINK  Severity: INVALID  Ack transient?: YES  Ack severity: INVALID
+    /// ```
+    #[epics_macros_rs::epics_test]
+    async fn a_stsack_update_carries_the_records_ackt_and_acks() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "X") { field(HIHI, "5") field(HHSV, "MAJOR") field(VAL, "10") }
+record(stringin, "SI") { field(SIMM, "YES") field(SIOL, "abc") field(SIMS, "MAJOR") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        for (name, want) in [("X", (1, 2)), ("SI", (1, 3))] {
+            db.process_record(name).await.unwrap();
+            let target = ChannelTarget::RecordField {
+                record: db.get_record(name).unwrap(),
+                field: "VAL".into(),
+            };
+            let mut snap = get_full_snapshot(&db, &target).unwrap();
+            snap.alarm.ackt = Some(0);
+            snap.alarm.acks = Some(0);
+            let event = MonitorEvent::from_snapshot(Arc::new(snap), 0, EventMask::ALARM);
+            let m = monitor(&db, target, epics_base_rs::types::DBR_STSACK_STRING);
+            let (outbox, mut drain) = crate::server::outbox::channel();
+            deliver_record_field_event(&m, event, &outbox).await;
+            let frame = drain.try_next().expect("one frame");
+            let word = |i: usize| u16::from_be_bytes([frame[16 + i], frame[17 + i]]);
+            assert_eq!((word(4), word(6)), want, "{name} ackt/acks");
+        }
+    }
+
+    /// Value, status, severity and time are the posted ones on every class,
+    /// whatever the record holds by delivery.
+    #[epics_macros_rs::epics_test]
+    async fn value_alarm_and_time_are_the_events_on_every_class() {
+        let db = ai_db().await;
+        let event = posted(&db, 7.0, 3, 1);
+        db.put_pv("X.VAL", EpicsValue::Double(9.0)).await.unwrap();
+        for data_type in [
+            DBR_DOUBLE,
+            DBR_STS_DOUBLE,
+            DBR_TIME_DOUBLE,
+            DBR_GR_DOUBLE,
+            DBR_CTRL_DOUBLE,
+        ] {
+            let m = monitor(&db, field(&db), data_type);
+            let got = deliver(&m, event.clone()).await;
+            assert_eq!(got.value, EpicsValue::Double(7.0), "{data_type}");
+            if data_type != DBR_DOUBLE {
+                assert_eq!(
+                    (got.alarm.status, got.alarm.severity),
+                    (3, 1),
+                    "{data_type}"
+                );
+            }
+            if data_type == DBR_TIME_DOUBLE {
+                assert_eq!(got.timestamp, event.time());
+            }
+        }
+        // utag rides no CA DBR, so it is held at the source.
+        let m = monitor(&db, field(&db), DBR_CTRL_DOUBLE);
+        let source =
+            crate::server::monitor::with_live_options(m.data_type, event, || m.live_options())
+                .unwrap();
+        let read = source
+            .read()
+            .expect("a CTRL update encodes the channel read");
+        assert_eq!(read.user_tag, 5);
+    }
+}
+
 struct CircuitMonitors {
     task: epics_base_rs::runtime::task::TaskAbortHandle,
 }
@@ -13380,6 +13666,7 @@ mod access_change_walk_tests {
     use crate::protocol::{CA_MINOR_VERSION, CA_PROTO_VERSION, pad_string};
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::event_queue::CircuitEvent;
+    use epics_base_rs::server::pv::LogValue;
     use epics_base_rs::types::EpicsValue;
     use futures_util::FutureExt;
 
@@ -13400,9 +13687,11 @@ mod access_change_walk_tests {
                     let m = context
                         .downcast_ref::<CircuitMonitor>()
                         .expect("a CA monitor");
-                    match event.snapshot.value {
-                        EpicsValue::Double(v) => (m.denied.load(Ordering::Acquire), v),
-                        ref v => panic!("unexpected value {v:?}"),
+                    match event.value() {
+                        LogValue::Val(EpicsValue::Double(v)) => {
+                            (m.denied.load(Ordering::Acquire), v)
+                        }
+                        v => panic!("unexpected value {v:?}"),
                     }
                 }
                 CircuitEvent::Ended(_) => panic!("monitor ended"),

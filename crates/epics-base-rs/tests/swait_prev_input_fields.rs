@@ -97,18 +97,19 @@ async fn r9_75_la_posts_with_the_inputs_monitor_mask() {
     let ev_a = rx_a.try_recv().expect("changed input A must post");
     let ev_la = rx_la.try_recv().expect("the advanced LA must post too");
     assert_eq!(
-        ev_la.snapshot.value,
+        ev_la.value().as_value().cloned().unwrap(),
         EpicsValue::Double(8.0),
         "C posts LA *after* `*pprev = *pnew`, so the posted value is the new one"
     );
     assert_eq!(
-        ev_la.mask,
+        ev_la.mask(),
         EventMask::VALUE,
         "LA rides the input's `monitor_mask | DBE_VALUE` — got {:?}",
-        ev_la.mask
+        ev_la.mask()
     );
     assert_eq!(
-        ev_la.mask, ev_a.mask,
+        ev_la.mask(),
+        ev_a.mask(),
         "C posts the input and its previous-value field with the identical mask"
     );
 }

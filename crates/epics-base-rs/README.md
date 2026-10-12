@@ -226,7 +226,7 @@ ch.put_f64_process(25.0).await?;
 let v = ch.get_f64().await;
 
 let mut sub = DbSubscription::subscribe(&db, "TEMP").await.unwrap();
-while let Some(snap) = sub.recv_snapshot().await {
+while let Some(Ok(snap)) = sub.recv_snapshot().await {
     println!("{:?}", snap.value);
 }
 ```

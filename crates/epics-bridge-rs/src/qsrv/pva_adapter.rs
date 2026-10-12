@@ -508,7 +508,7 @@ fn spawn_db_monitor_updates(
                 poll = monitor.poll() => {
                     let Some(poll) = poll else { break };
                     let update = epics_pva_rs::server_native::MonitorUpdate {
-                        value: PvField::Structure(poll.value),
+                        value: PvField::Structure(poll.value).into(),
                         marked: poll.marked,
                         type_changed: false,
                         // direct DB poll loop — no lag/loss accounting here, so no overrun

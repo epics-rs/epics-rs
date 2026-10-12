@@ -115,7 +115,9 @@ async fn softioc_pin(case: &str) {
     let mut got = String::new();
     for (pv, mut out, mut rx, enums) in subs {
         while let Ok(ev) = rx.try_recv() {
-            out.push(camonitor_line(pv, &ev.snapshot, &enums));
+            let mut s = Snapshot::new(EpicsValue::Long(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
+            ev.write_log_over(&mut s);
+            out.push(camonitor_line(pv, &s, &enums));
         }
         for line in out {
             got.push_str(&line);
@@ -236,7 +238,10 @@ async fn transform_put_to_a_constant_inp_reseeds_and_posts_value_log() {
 
     assert_eq!(field(&db, "T", "B").await, EpicsValue::Double(7.0));
     let event = b_rx.try_recv().expect("the re-seed must post B");
-    assert_eq!(event.snapshot.value, EpicsValue::Double(7.0));
+    assert_eq!(
+        event.value().as_value().cloned().unwrap(),
+        EpicsValue::Double(7.0)
+    );
 }
 
 /// The value post follows the link the put left, as C's `plink->type ==
@@ -260,7 +265,7 @@ async fn transform_reseed_post_follows_the_link_the_put_left() {
     }
     let mut got = Vec::new();
     while let Ok(ev) = b_rx.try_recv() {
-        got.push(ev.snapshot.value.to_f64().unwrap());
+        got.push(ev.value().as_value().cloned().unwrap().to_f64().unwrap());
     }
     assert_eq!(got, [7.0, 7.0, 3.0]);
 }

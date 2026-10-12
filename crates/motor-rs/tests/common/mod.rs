@@ -186,7 +186,7 @@ impl MotorFixture {
 pub fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
     let mut out = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        out.push(event.snapshot.value.clone());
+        out.push(event.value().as_value().cloned().unwrap());
     }
     out
 }

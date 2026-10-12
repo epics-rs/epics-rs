@@ -369,18 +369,18 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     // The posted values must be the reconciled ones, not stale.
     let expected_pr1 = QuantizingDriver::quantize(12_500_000); // NINT(1.0*1.25e7)
     assert_eq!(
-        pr1_evt.snapshot.value.clone(),
+        pr1_evt.value().as_value().cloned().unwrap(),
         // PR1 is DBF_ULONG (scalerRecord.dbd:945) -> native EpicsValue::ULong.
         EpicsValue::ULong(expected_pr1),
         "posted PR1 must be the driver-programmed (quantized) preset"
     );
     assert_eq!(
-        freq_evt.snapshot.value.clone(),
+        freq_evt.value().as_value().cloned().unwrap(),
         EpicsValue::Double(QuantizingDriver::DRIVER_FREQ),
         "posted FREQ must be the driver's actual clock"
     );
     let expected_tp = expected_pr1 as f64 / QuantizingDriver::DRIVER_FREQ;
-    match tp_evt.snapshot.value.clone() {
+    match tp_evt.value().as_value().cloned().unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - expected_tp).abs() < 1e-12,
             "posted TP must be recomputed from effective PR1/FREQ: got {v}, want {expected_tp}"
@@ -465,15 +465,15 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
         "FREQ change must reach a DBE_VALUE subscriber after the driver adopted its clock (C:430)",
     );
     assert!(
-        evt.mask.contains(EventMask::VALUE),
+        evt.mask().contains(EventMask::VALUE),
         "FREQ post must carry DBE_VALUE, got {:?}",
-        evt.mask
+        evt.mask()
     );
     assert!(
-        !evt.mask.contains(EventMask::LOG),
+        !evt.mask().contains(EventMask::LOG),
         "FREQ value-change post must NOT carry DBE_LOG (C posts a literal DBE_VALUE, \
          scalerRecord.c:430); got {:?}",
-        evt.mask
+        evt.mask()
     );
 
     // The DBE_LOG-only subscriber must see nothing — the value-change post
@@ -566,7 +566,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
          old_pr1 must be captured BEFORE the :409-410 guard",
     );
     let expected_tp = 10_000_001_f64 / freq; // pr1 / freq, C:426
-    match tp_evt.snapshot.value.clone() {
+    match tp_evt.value().as_value().cloned().unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - expected_tp).abs() < 1e-12,
             "TP must be recomputed from the guard-adjusted PR1/FREQ: got {v}, want {expected_tp}"

@@ -70,7 +70,10 @@ async fn sseq_val_posts_every_process_including_the_unchanged_repeat() {
         got.len()
     );
 
-    let values: Vec<EpicsValue> = got.iter().map(|e| e.snapshot.value.clone()).collect();
+    let values: Vec<EpicsValue> = got
+        .iter()
+        .map(|e| e.value().as_value().cloned().unwrap())
+        .collect();
     assert_eq!(
         values,
         vec![
@@ -84,11 +87,11 @@ async fn sseq_val_posts_every_process_including_the_unchanged_repeat() {
 
     for (i, e) in got.iter().enumerate() {
         assert!(
-            e.mask.contains(EventMask::VALUE),
+            e.mask().contains(EventMask::VALUE),
             "post {i} carries DBE_VALUE (asyncFinish's unconditional bit)"
         );
         assert!(
-            !e.mask.contains(EventMask::LOG),
+            !e.mask().contains(EventMask::LOG),
             "post {i} must NOT carry DBE_LOG — asyncFinish's mask is \
              DBE_VALUE | recGblResetAlarms (alarm bits only), never the \
              archive class, so a DBE_LOG-only archiver sees no per-process VAL"

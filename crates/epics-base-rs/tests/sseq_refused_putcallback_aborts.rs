@@ -198,7 +198,7 @@ async fn a_refused_put_callback_aborts_the_whole_sequence() {
     // C posts ABORT=1 at the refusal and ABORT=0 from `asyncFinish` (:477).
     let mut saw_raise = false;
     while let Ok(ev) = abort_rx.try_recv() {
-        if ev.snapshot.value == EpicsValue::Short(1) {
+        if ev.value().as_value().cloned().unwrap() == EpicsValue::Short(1) {
             saw_raise = true;
         }
     }
@@ -285,7 +285,7 @@ async fn an_admitted_put_callback_still_waits_and_completes() {
     );
     let mut saw_wait = false;
     while let Ok(ev) = wtg_rx.try_recv() {
-        if ev.snapshot.value == EpicsValue::Short(1) {
+        if ev.value().as_value().cloned().unwrap() == EpicsValue::Short(1) {
             saw_wait = true;
         }
     }

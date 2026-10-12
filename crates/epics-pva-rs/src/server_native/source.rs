@@ -1945,7 +1945,7 @@ pub trait ChannelSource: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct MonitorUpdate {
     /// The full snapshot value for this event.
-    pub value: PvField,
+    pub value: PostValue,
     /// Explicit changed field paths, or `None` to let the server
     /// derive the changed-bitset.
     pub marked: Option<Vec<String>>,
@@ -1990,13 +1990,62 @@ pub struct MonitorUpdate {
     pub overrun: Vec<String>,
 }
 
+/// A post's value: handed over by its producer, or shared with a source that
+/// keeps pvxs's per-subscription `currentValue` (`singlesource.cpp:54-67`)
+/// and fills it in place. A queued `Shared` post pins its slot, so the source
+/// never overwrites a value the queue still holds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PostValue {
+    Owned(PvField),
+    Shared(Arc<PvField>),
+}
+
+impl PostValue {
+    /// The value by move; a `Shared` one is copied only while its source
+    /// still holds the slot.
+    pub fn into_owned(self) -> PvField {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => Arc::unwrap_or_clone(v),
+        }
+    }
+}
+
+impl std::ops::Deref for PostValue {
+    type Target = PvField;
+    fn deref(&self) -> &PvField {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v,
+        }
+    }
+}
+
+impl PartialEq<PvField> for PostValue {
+    fn eq(&self, other: &PvField) -> bool {
+        **self == *other
+    }
+}
+
+impl From<PvField> for PostValue {
+    fn from(v: PvField) -> Self {
+        Self::Owned(v)
+    }
+}
+
+impl From<Arc<PvField>> for PostValue {
+    fn from(v: Arc<PvField>) -> Self {
+        Self::Shared(v)
+    }
+}
+
 impl MonitorUpdate {
     /// A descriptor-change boundary marker. Carries a placeholder value
     /// that consumers MUST NOT encode — the decoded monitor loop emits
     /// `MONITOR FINISH` on `type_changed` before any value read.
     pub fn type_change() -> Self {
         Self {
-            value: PvField::Null,
+            value: PvField::Null.into(),
             marked: None,
             type_changed: true,
             overrun: Vec::new(),
@@ -2010,7 +2059,7 @@ impl From<PvField> for MonitorUpdate {
     /// overrun: a freshly produced value reports no lost intermediate.
     fn from(value: PvField) -> Self {
         Self {
-            value,
+            value: value.into(),
             marked: None,
             type_changed: false,
             overrun: Vec::new(),
@@ -2107,7 +2156,7 @@ impl From<SourceRead> for MonitorUpdate {
     /// source declared for the read.
     fn from(read: SourceRead) -> Self {
         Self {
-            value: read.value,
+            value: read.value.into(),
             marked: read.marked,
             type_changed: false,
             overrun: Vec::new(),
@@ -2316,17 +2365,26 @@ impl<T> From<mpsc::Receiver<T>> for MonitorStream<T> {
 /// subscriber slot — exactly what dropping the bridge task's captured
 /// subscription did.
 pub struct UpstreamMonitor<T> {
-    upstream: UpstreamSub,
-    /// `None` = this event marks nothing and is skipped (the bridge's
-    /// `continue`). A plain `fn`, not a boxed closure: all three transforms
-    /// are pure functions of the event.
-    map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+    upstream: UpstreamSub<T>,
     /// Connect-time value delivered before the subscription's own events.
     seed: Option<T>,
 }
 
-enum UpstreamSub {
-    Db(epics_base_rs::server::database::db_access::DbSubscription),
+/// A subscription's transform. `None` = this event marks nothing and is
+/// skipped (the bridge's `continue`). Boxed once per subscription, not a
+/// `fn`: a transform may own per-subscription state, the value it fills in
+/// place.
+type UpstreamMap<T> = Box<dyn FnMut(epics_base_rs::server::pv::MonitorEvent) -> Option<T> + Send>;
+
+/// A mailbox PV's transform, of the read its subscription makes at delivery.
+type DeliveredMap<T> =
+    Box<dyn FnMut(epics_base_rs::server::snapshot::Snapshot) -> Option<T> + Send>;
+
+enum UpstreamSub<T> {
+    Db(
+        epics_base_rs::server::database::db_access::DbSubscription,
+        UpstreamMap<T>,
+    ),
     /// pvxs's TWO record subscriptions for one single-record channel —
     /// `ioc/singlesource.cpp:155-167`, under the comment "Two subscription
     /// are made for pvxs": the value half on the client's resolved `DBE`
@@ -2345,8 +2403,11 @@ enum UpstreamSub {
     DbPair {
         value: epics_base_rs::server::database::db_access::DbSubscription,
         property: epics_base_rs::server::database::db_access::DbSubscription,
+        map: UpstreamMap<T>,
     },
-    Pv(epics_base_rs::server::pv::PvSubscription),
+    /// Read through `PvSubscription::recv_snapshot`, which reads the PV's
+    /// metadata at delivery as `dbGet` does; the event carries none.
+    Pv(epics_base_rs::server::pv::PvSubscription, DeliveredMap<T>),
 }
 
 /// Take the next event from either half of a split subscription, value
@@ -2426,11 +2487,10 @@ impl<T> UpstreamMonitor<T> {
     /// Serve a PVA monitor straight off a record subscription.
     pub fn from_db(
         sub: epics_base_rs::server::database::db_access::DbSubscription,
-        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+        map: impl FnMut(epics_base_rs::server::pv::MonitorEvent) -> Option<T> + Send + 'static,
     ) -> Self {
         Self {
-            upstream: UpstreamSub::Db(sub),
-            map,
+            upstream: UpstreamSub::Db(sub, Box::new(map)),
             seed: None,
         }
     }
@@ -2443,11 +2503,14 @@ impl<T> UpstreamMonitor<T> {
     pub fn from_db_pair(
         value: epics_base_rs::server::database::db_access::DbSubscription,
         property: epics_base_rs::server::database::db_access::DbSubscription,
-        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+        map: impl FnMut(epics_base_rs::server::pv::MonitorEvent) -> Option<T> + Send + 'static,
     ) -> Self {
         Self {
-            upstream: UpstreamSub::DbPair { value, property },
-            map,
+            upstream: UpstreamSub::DbPair {
+                value,
+                property,
+                map: Box::new(map),
+            },
             seed: None,
         }
     }
@@ -2455,11 +2518,10 @@ impl<T> UpstreamMonitor<T> {
     /// Serve a PVA monitor straight off a `ProcessVariable` subscription.
     pub fn from_pv(
         sub: epics_base_rs::server::pv::PvSubscription,
-        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+        map: impl FnMut(epics_base_rs::server::snapshot::Snapshot) -> Option<T> + Send + 'static,
     ) -> Self {
         Self {
-            upstream: UpstreamSub::Pv(sub),
-            map,
+            upstream: UpstreamSub::Pv(sub, Box::new(map)),
             seed: None,
         }
     }
@@ -2475,12 +2537,16 @@ impl<T> UpstreamMonitor<T> {
             return Some(v);
         }
         loop {
-            let ev = match &mut self.upstream {
-                UpstreamSub::Db(s) => s.recv_event().await?,
-                UpstreamSub::DbPair { value, property } => recv_pair(value, property).await?,
-                UpstreamSub::Pv(s) => s.recv_event().await?,
+            let mapped = match &mut self.upstream {
+                UpstreamSub::Db(s, map) => map(s.recv_event().await?),
+                UpstreamSub::DbPair {
+                    value,
+                    property,
+                    map,
+                } => map(recv_pair(value, property).await?),
+                UpstreamSub::Pv(s, map) => map(s.recv_snapshot().await?),
             };
-            if let Some(v) = (self.map)(ev) {
+            if let Some(v) = mapped {
                 return Some(v);
             }
         }
@@ -2491,14 +2557,16 @@ impl<T> UpstreamMonitor<T> {
             return Ok(v);
         }
         loop {
-            let ev = match &mut self.upstream {
-                UpstreamSub::Db(s) => s.try_recv_event().map_err(from_queue_err)?,
-                UpstreamSub::DbPair { value, property } => {
-                    try_recv_pair(value, property).map_err(from_queue_err)?
-                }
-                UpstreamSub::Pv(s) => s.try_recv_event().map_err(from_queue_err)?,
+            let mapped = match &mut self.upstream {
+                UpstreamSub::Db(s, map) => map(s.try_recv_event().map_err(from_queue_err)?),
+                UpstreamSub::DbPair {
+                    value,
+                    property,
+                    map,
+                } => map(try_recv_pair(value, property).map_err(from_queue_err)?),
+                UpstreamSub::Pv(s, map) => map(s.try_recv_snapshot().map_err(from_queue_err)?),
             };
-            if let Some(v) = (self.map)(ev) {
+            if let Some(v) = mapped {
                 return Ok(v);
             }
         }
@@ -3424,7 +3492,7 @@ mod tests {
 
     fn marked(v: i32, paths: &[&str]) -> MonitorUpdate {
         MonitorUpdate {
-            value: PvField::Scalar(ScalarValue::Int(v)),
+            value: PvField::Scalar(ScalarValue::Int(v)).into(),
             marked: Some(paths.iter().map(|p| p.to_string()).collect()),
             type_changed: false,
             overrun: Vec::new(),

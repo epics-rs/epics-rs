@@ -114,8 +114,8 @@ fn watch(db: &PvDatabase, rec: &str, field: &str, sid: u32) -> EventReader {
 fn drain(rx: &mut EventReader) -> Vec<(f64, u16, u16)> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        let s = &ev.snapshot;
-        out.push((s.value.to_f64().unwrap(), s.alarm.status, s.alarm.severity));
+        let v = ev.value().as_value().and_then(EpicsValue::to_f64).unwrap();
+        out.push((v, ev.stat(), ev.sevr()));
     }
     out
 }

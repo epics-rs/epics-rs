@@ -1009,7 +1009,7 @@ impl GatewayChannelSource {
                         };
                         let overrun = value_overrun_paths(&snap.value);
                         let update = epics_pva_rs::server_native::MonitorUpdate {
-                            value: snap.value,
+                            value: snap.value.into(),
                             marked: None,
                             type_changed: false,
                             overrun,
@@ -1044,7 +1044,7 @@ fn monitor_updates_to_values(
             if update.type_changed {
                 continue;
             }
-            if tx.send(update.value).await.is_err() {
+            if tx.send(update.value.into_owned()).await.is_err() {
                 break;
             }
         }
@@ -3050,7 +3050,7 @@ ASG(DEFAULT) {
         // subscriber never received — and it names the lost leaves in `overrun`.
         // Forwarding the next delta instead would have shipped only that
         // event's own leaves, losing every transition inside the dropped range.
-        let val = |u: &epics_pva_rs::server_native::MonitorUpdate| match &u.value {
+        let val = |u: &epics_pva_rs::server_native::MonitorUpdate| match &*u.value {
             PvField::Structure(s) => match &s.fields[0].1 {
                 PvField::Scalar(ScalarValue::Double(v)) => *v,
                 other => panic!("unexpected value shape: {other:?}"),

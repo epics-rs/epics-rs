@@ -72,7 +72,7 @@ record(lsi, "LI") { field(SIZV, "64") }
             for rx in &mut rxs {
                 let mut got = Vec::new();
                 while let Ok(e) = rx.try_recv() {
-                    got.push(e.snapshot.value.clone());
+                    got.push(e.value().as_value().cloned().unwrap());
                 }
                 assert_eq!(got, [], "{rec} OVAL/OLEN after the {field} put");
             }

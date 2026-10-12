@@ -93,7 +93,7 @@ record(timestamp, "TS:MIN") {
     let first_rval = rval_rx
         .try_recv()
         .expect("first render posts RVAL from inside the guard");
-    let first_secs = ulong_of(&first_rval.snapshot.value);
+    let first_secs = ulong_of(&first_rval.value().as_value().cloned().unwrap());
     let first_val = server.get("TS:MIN.VAL").await.unwrap();
 
     // Cross a second boundary. RVAL (seconds past the EPICS epoch) necessarily
@@ -183,13 +183,14 @@ record(timestamp, "TS:SEC") {
         "the changed string posts VAL alongside RVAL"
     );
     assert!(
-        ulong_of(&second.snapshot.value) > ulong_of(&first.snapshot.value),
+        ulong_of(&second.value().as_value().cloned().unwrap())
+            > ulong_of(&first.value().as_value().cloned().unwrap()),
         "the posted RVAL carries the fresh seconds count"
     );
     // C posts RVAL with VAL's own monitor_mask: DBE_VALUE|DBE_LOG (plus any
     // alarm bits, of which this record raises none).
     assert_eq!(
-        second.mask,
+        second.mask(),
         EventMask::VALUE | EventMask::LOG,
         "RVAL carries VAL's monitor_mask, not a mask of its own"
     );

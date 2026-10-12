@@ -156,7 +156,7 @@ async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
     );
     let mut val_masks = Vec::new();
     while let Ok(e) = val_rx.try_recv() {
-        val_masks.push(e.mask);
+        val_masks.push(e.mask());
     }
     assert!(
         val_masks.iter().any(|m| m.contains(EventMask::ALARM)),
@@ -178,7 +178,7 @@ async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
                      pepid->cval)` gate posts nothing"
                 );
                 assert_eq!(
-                    e.mask,
+                    e.mask(),
                     EventMask::VALUE | EventMask::LOG,
                     "epidRecord.c:376 reassigns monitor_mask to a literal \
                      DBE_LOG|DBE_VALUE, so {field} carries no alarm bit"
@@ -258,17 +258,18 @@ async fn r11_64_a_value_subscriber_still_sees_the_secondary_change() {
     // the `full`-mask subscription above); what THIS subscription's log
     // carries is `caEventMask & pevent->select` (dbEvent.c:896-900), so a
     // DBE_VALUE-only client reads DBE_VALUE.
-    assert_eq!(first.mask, EventMask::VALUE);
+    assert_eq!(first.mask(), EventMask::VALUE);
 
     // Move the readback: ERR changes, so OVAL changes, so C posts again.
     set(&db, "RBV", -4.0).await;
     process(&db, "PID").await;
     let second = oval_rx.try_recv().expect("a changed OVAL posts again");
     assert_ne!(
-        second.snapshot.value, first.snapshot.value,
+        second.value().as_value().cloned().unwrap(),
+        first.value().as_value().cloned().unwrap(),
         "the readback moved, so the PID output moved"
     );
-    assert_eq!(second.mask, EventMask::VALUE);
+    assert_eq!(second.mask(), EventMask::VALUE);
     {
         let g = inst.read();
         assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm, "no alarm was raised");

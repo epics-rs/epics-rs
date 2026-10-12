@@ -34,7 +34,7 @@ const FIELDS: [&str; 5] = ["A", "INAV", "INBV", "OUTV", "OVAL"];
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
     let mut got = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        got.push(ev.snapshot.value.clone());
+        got.push(ev.value().as_value().cloned().unwrap());
     }
     got
 }

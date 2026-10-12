@@ -1770,11 +1770,11 @@ mod tests {
         use crate::server::pv::MonitorEvent;
         use crate::server::recgbl::EventMask;
         use crate::server::snapshot::Snapshot;
-        FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: Arc::new(Snapshot::new(v, 0, 0, std::time::SystemTime::UNIX_EPOCH)),
-            origin: 0,
-            mask: EventMask::VALUE,
-        })
+        FilteredMonitorEvent::new(MonitorEvent::from_snapshot(
+            Arc::new(Snapshot::new(v, 0, 0, std::time::SystemTime::UNIX_EPOCH)),
+            0,
+            EventMask::VALUE,
+        ))
     }
 
     fn conv_doubles(json: &str, input: Vec<f64>) -> Vec<f64> {
@@ -1783,7 +1783,7 @@ mod tests {
         let out = chain
             .apply(conv_ev(EpicsValue::DoubleArray(input.into())))
             .expect("value event must survive an arr filter");
-        match Arc::unwrap_or_clone(out.event.snapshot).value {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::DoubleArray(v) => v.to_vec(),
             other => panic!("expected DoubleArray, got {other:?}"),
         }
@@ -1908,7 +1908,7 @@ mod tests {
                 state.set(set);
                 for (chain, got) in [(&numeric, &mut got_numeric), (&worded, &mut got_worded)] {
                     if let Some(out) = chain.apply(conv_ev(EpicsValue::Double(value))) {
-                        match Arc::unwrap_or_clone(out.event.snapshot).value {
+                        match out.event.value().as_value().cloned().unwrap() {
                             EpicsValue::Double(v) => got.push(v),
                             other => panic!("expected Double, got {other:?}"),
                         }

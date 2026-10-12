@@ -21,6 +21,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::RecordCell;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -41,22 +42,31 @@ async fn build() -> Arc<PvDatabase> {
         .0
 }
 
-fn subscribe(db: &PvDatabase, field: &str, sid: u32) -> EventReader {
-    let inst = db.get_record("AC").unwrap();
-    let mut g = inst.write();
-    g.add_subscriber(
-        field,
-        sid,
-        DbFieldType::Double,
-        (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
-    )
-    .unwrap()
+/// A monitor and the field its client reads a by-reference log from.
+struct Mon {
+    rx: EventReader,
+    rec: Arc<RecordCell>,
+    field: &'static str,
 }
 
-fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
+fn subscribe(db: &PvDatabase, field: &'static str, sid: u32) -> Mon {
+    let rec = db.get_record("AC").unwrap();
+    let rx = rec
+        .write()
+        .add_subscriber(
+            field,
+            sid,
+            DbFieldType::Double,
+            (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
+        )
+        .unwrap();
+    Mon { rx, rec, field }
+}
+
+fn drain(m: &mut Mon) -> Vec<EpicsValue> {
     let mut out = Vec::new();
-    while let Ok(e) = rx.try_recv() {
-        out.push(e.snapshot.value.clone());
+    while let Ok(e) = m.rx.try_recv() {
+        out.push(e.delivered_value(&m.rec.read(), m.field).unwrap());
     }
     out
 }
@@ -162,8 +172,8 @@ async fn aval_posts_past_mdel_against_the_last_posted_copy() {
         .unwrap()
         .0;
     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
-    let inst = db.get_record("AD").unwrap();
-    let mut rx = inst
+    let rec = db.get_record("AD").unwrap();
+    let rx = rec
         .write()
         .add_subscriber(
             "AVAL",
@@ -172,6 +182,11 @@ async fn aval_posts_past_mdel_against_the_last_posted_copy() {
             (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
         )
         .unwrap();
+    let mut rx = Mon {
+        rx,
+        rec,
+        field: "AVAL",
+    };
     drain(&mut rx);
     let a = |v: f64| vec![EpicsValue::DoubleArray(vec![v; 2].into())];
     for (v, want) in [
@@ -217,12 +232,16 @@ record(acalcout, "DL") { field(NELM, "2") field(CALC, "A") field(MDEL, "10") fie
             .await
             .unwrap();
         let inst = db.get_record(rec).unwrap();
-        let mut g = inst.write();
         for (sid, mask) in [(1, EventMask::VALUE), (2, EventMask::LOG)] {
-            rxs.push(
-                g.add_subscriber("AVAL", sid, DbFieldType::Double, mask.bits())
-                    .unwrap(),
-            );
+            let rx = inst
+                .write()
+                .add_subscriber("AVAL", sid, DbFieldType::Double, mask.bits())
+                .unwrap();
+            rxs.push(Mon {
+                rx,
+                rec: inst.clone(),
+                field: "AVAL",
+            });
         }
     }
     epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;

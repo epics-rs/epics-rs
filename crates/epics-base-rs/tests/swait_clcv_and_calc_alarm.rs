@@ -111,7 +111,7 @@ async fn r10_67_a_calc_put_posts_clcv() {
         .unwrap();
 
     let e = ev.try_recv().expect("a CALC put posts CLCV");
-    assert_eq!(e.snapshot.value, EpicsValue::Long(-1));
+    assert_eq!(e.value().as_value().cloned().unwrap(), EpicsValue::Long(-1));
 }
 
 /// The alarm. A broken CALC fails `calcPerform` every cycle, and C raises

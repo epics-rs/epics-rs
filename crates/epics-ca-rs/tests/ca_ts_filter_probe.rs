@@ -36,7 +36,7 @@ use epics_ca_rs::client::{CaChannel, CaClient};
 use epics_ca_rs::server::CaServer;
 
 const DB: &str = r#"
-record(ai, "T") { field(VAL, "1") field(PINI, "YES") }
+record(ai, "T") { field(VAL, "1") field(PINI, "YES") field(PREC, "3") field(EGU, "mm") field(HOPR, "10") }
 "#;
 
 async fn connect(client: &CaClient, name: &str) -> CaChannel {
@@ -123,6 +123,26 @@ async fn a_ts_value_mode_claims_its_probe_type_and_count() {
     assert_eq!((ty, n), (DbFieldType::Double, 1));
     assert_eq!(doubles(name, &read), [nsec]);
     assert_eq!(doubles(name, &event), [nsec]);
+
+    // A value-mode log is a DBF_ULONG: DBR_PRECISION is off, units and
+    // limits stay (`dbAccess.c:387-394`). softIoc R7.0.10, `caget -d
+    // DBR_CTRL_DOUBLE` with PREC 3, EGU mm, HOPR 10: `{"num":"sec"}`
+    // `Units: mm` `Precision: 0` `Hi disp limit: 10`; `{"num":"dbl"}`
+    // `Precision: 3`.
+    for (name, prec) in [
+        (r#"T.VAL{"ts":{"num":"sec"}}"#, 0),
+        (r#"T.VAL{"ts":{"num":"dbl"}}"#, 3),
+    ] {
+        let ch = connect(&client, name).await;
+        let got = ch
+            .get_with_dbr_type(epics_base_rs::types::DBR_CTRL_DOUBLE, 0u32)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(got.precision(), Some(prec), "{name}");
+        let display = got.display.as_ref().expect("display");
+        assert_eq!(display.units, "mm", "{name}");
+        assert_eq!(display.upper_disp_limit, 10.0, "{name}");
+    }
 
     for (name, sep) in [
         (r#"T.VAL{"ts":{"str":"epics"}}"#, ' '),

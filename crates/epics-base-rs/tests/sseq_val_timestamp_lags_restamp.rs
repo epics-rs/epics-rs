@@ -73,7 +73,7 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     // C posts VAL (sseqRecord.c:474) BEFORE recGblGetTimeStamp (:501), so the
     // first VAL carries the pre-update timestamp — the sentinel, untouched.
     assert_eq!(
-        ev1.snapshot.timestamp,
+        ev1.time(),
         WallTime::from(sentinel),
         "the first VAL event must carry the record's pre-update timestamp \
          (asyncFinish posts VAL at :474 before the :501 restamp), not \
@@ -95,13 +95,13 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
         .unwrap();
     let ev2 = val_rx.try_recv().expect("cycle 2 posts a VAL event");
     assert_eq!(
-        ev2.snapshot.timestamp,
+        ev2.time(),
         WallTime::from(t_after_1),
         "the second VAL event must carry the timestamp the FIRST cycle \
          restamped to (asyncFinish's one-completion lag), not a fresh stamp"
     );
     assert_eq!(
-        ev2.snapshot.value,
+        ev2.value().as_value().cloned().unwrap(),
         EpicsValue::Long(2),
         "cycle 2's VAL value is the newly put 2"
     );

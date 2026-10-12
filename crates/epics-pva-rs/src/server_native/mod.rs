@@ -97,6 +97,6 @@ pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER
 pub use shared_pv::{AddPvError, MonitorOutbox, MonitorRing, SharedPV, SharedSource, SquashTail};
 pub use source::{
     ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, MonitorOptions,
-    MonitorStream, MonitorUpdate, OpError, OpErrorKind, RawMonitorEvent, UpstreamMonitor,
-    plain_monitor_updates,
+    MonitorStream, MonitorUpdate, OpError, OpErrorKind, PostValue, RawMonitorEvent,
+    UpstreamMonitor, plain_monitor_updates,
 };

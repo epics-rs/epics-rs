@@ -94,7 +94,9 @@ async fn softioc_pin(case: &str) {
     let mut got = String::new();
     for (pv, mut out, mut rx, enums) in subs {
         while let Ok(ev) = rx.try_recv() {
-            out.push(camonitor_line(pv, &ev.snapshot, &enums));
+            let mut s = Snapshot::new(EpicsValue::Long(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
+            ev.write_log_over(&mut s);
+            out.push(camonitor_line(pv, &s, &enums));
         }
         for line in out {
             got.push_str(&line);

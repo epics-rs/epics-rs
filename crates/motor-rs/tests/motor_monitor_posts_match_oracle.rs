@@ -3,14 +3,14 @@
 //! DHLM 100, DLLM -100), three `camonitor -m v|a|l` clients on `M1 M1.RBV
 //! M1.OFF M1.HLM M1.LLM M1.DHLM M1.DLLM M1.DIR M1.DMOV M1.LVIO` started after
 //! a `caput M1 1` move. The streams below are the oracle's with the timestamps
-//! and the connect values cut, compared per PV: the order across fields within
-//! one cycle is the framework's.
+//! and the connect values cut, compared per PV; the move's cross-field order is
+//! compared on one client's merged stream.
 
 mod common;
 
 use common::{MotorFixture, drain};
 use epics_base_rs::server::database::ProcStack;
-use epics_base_rs::server::event_queue::EventReader;
+use epics_base_rs::server::event_queue::{CircuitEvent, EventReader, EventUser, no_context};
 use epics_base_rs::server::recgbl::{EventMask, alarm_condition_string};
 use epics_base_rs::server::record::MENU_ALARM_SEVR;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -456,4 +456,142 @@ async fn mip_streams(steps: &[&str]) -> Vec<String> {
         }
     }
     got
+}
+
+/// One client's monitor on `field`, on that client's queue `user`, so the
+/// queue's order across fields is the post order.
+fn subscribe_on(
+    fx: &MotorFixture,
+    user: &EventUser,
+    field: &str,
+    sid: u32,
+    field_type: DbFieldType,
+    mask: EventMask,
+) -> EventReader {
+    fx.db
+        .get_record("M1")
+        .unwrap()
+        .write()
+        .add_subscriber_on(user, field, sid, field_type, mask.bits(), no_context())
+        .unwrap()
+}
+
+/// Every event queued on `user`, oldest first, as `(sid, value)`.
+fn drain_user(user: &EventUser) -> Vec<(u32, EpicsValue)> {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(event) = user.poll_next(&mut cx) {
+        if let CircuitEvent::Event { sid, event, .. } = event {
+            out.push((sid, event.value().as_value().cloned().unwrap()));
+        }
+    }
+    out
+}
+
+// A move as one `camonitor` on all twelve fields the move posts sees it,
+// either subscription order: the order across fields is C `monitor()`'s.
+
+const MOVE_FIELDS: [(&str, DbFieldType); 12] = [
+    ("VAL", DbFieldType::Double),
+    ("DVAL", DbFieldType::Double),
+    ("RBV", DbFieldType::Double),
+    ("RRBV", DbFieldType::Long),
+    ("DRBV", DbFieldType::Double),
+    ("DIFF", DbFieldType::Double),
+    ("RDIF", DbFieldType::Long),
+    ("MSTA", DbFieldType::Long),
+    ("TDIR", DbFieldType::Short),
+    ("MIP", DbFieldType::Short),
+    ("MOVN", DbFieldType::Short),
+    ("DMOV", DbFieldType::Short),
+];
+
+/// The put's DMOV post, then the move-start pass.
+const MOVE_START: [&str; 6] = ["DMOV 0", "DIFF 1", "RDIF 1000", "VAL 1", "DVAL 1", "MIP 32"];
+
+const MOVE_DONE: [&str; 10] = [
+    "RBV 1",
+    "RRBV 1000",
+    "DRBV 1",
+    "DIFF 0",
+    "RDIF 0",
+    "MSTA 2",
+    "TDIR 0",
+    "MIP 0",
+    "MOVN 0",
+    "DMOV 1",
+];
+
+fn stream(user: &EventUser, order: &[usize]) -> Vec<String> {
+    drain_user(user)
+        .into_iter()
+        .map(|(sid, value)| {
+            let field = MOVE_FIELDS[order[sid as usize]].0;
+            let value = match value {
+                EpicsValue::Double(v) => v.to_string(),
+                EpicsValue::Long(v) => v.to_string(),
+                EpicsValue::ULong(v) => v.to_string(),
+                EpicsValue::Short(v) => v.to_string(),
+                EpicsValue::UShort(v) => v.to_string(),
+                other => panic!("{field}: unexpected {other:?}"),
+            };
+            format!("{field} {value}")
+        })
+        .collect()
+}
+
+async fn move_streams(reversed: bool) -> (Vec<String>, Vec<String>) {
+    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let user = EventUser::new();
+    let mut order: Vec<usize> = (0..MOVE_FIELDS.len()).collect();
+    if reversed {
+        order.reverse();
+    }
+    let _readers: Vec<_> = order
+        .iter()
+        .enumerate()
+        .map(|(sid, &at)| {
+            let (field, ty) = MOVE_FIELDS[at];
+            subscribe_on(
+                &fx,
+                &user,
+                field,
+                sid as u32,
+                ty,
+                EventMask::VALUE | EventMask::LOG,
+            )
+        })
+        .collect();
+    let _ = drain_user(&user);
+
+    fx.start_move(1.0).await;
+    let start = stream(&user, &order);
+    fx.poll_pass(|m| {
+        m.moving = true;
+        m.direction = true;
+        m.position = 0.5;
+    })
+    .await;
+    let _ = drain_user(&user);
+    fx.poll_pass(|m| {
+        m.moving = false;
+        m.direction = false;
+        m.position = 1.0;
+    })
+    .await;
+    (start, stream(&user, &order))
+}
+
+#[tokio::test]
+async fn monitors_attached_in_declared_order_see_c_post_order() {
+    let (start, done) = move_streams(false).await;
+    assert_eq!(start, MOVE_START);
+    assert_eq!(done, MOVE_DONE);
+}
+
+#[tokio::test]
+async fn monitors_attached_in_reverse_order_see_c_post_order() {
+    let (start, done) = move_streams(true).await;
+    assert_eq!(start, MOVE_START);
+    assert_eq!(done, MOVE_DONE);
 }

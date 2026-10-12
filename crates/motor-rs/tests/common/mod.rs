@@ -30,6 +30,8 @@ pub struct ExactMotor {
     pub comms_error: bool,
     /// Reported as not done, e.g. while a jog runs.
     pub moving: bool,
+    /// MSTA RA_DIRECTION, which TDIR follows.
+    pub direction: bool,
 }
 
 impl AsynMotor for ExactMotor {
@@ -40,6 +42,7 @@ impl AsynMotor for ExactMotor {
             powered: self.powered,
             gain_support: self.gain_support,
             comms_error: self.comms_error,
+            direction: self.direction,
             ..MotorStatus::default()
         })
     }
@@ -104,6 +107,7 @@ impl MotorFixture {
             gain_support: false,
             comms_error: false,
             moving: false,
+            direction: false,
         }));
         let state = motor_rs::device_state::new_shared_state();
 

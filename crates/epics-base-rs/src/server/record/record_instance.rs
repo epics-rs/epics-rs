@@ -4012,6 +4012,8 @@ pub struct FieldSubscriber {
     /// field by its bytes.
     walk: SubWalk,
     posted: bool,
+    /// The field's place in [`MonitorPlan::claimed`], `u16::MAX` outside it.
+    claimed_rank: u16,
     /// The walk's per-field answers for this monitor's field, settled as a
     /// published entry's are.
     roles: Roles,
@@ -11489,11 +11491,27 @@ impl RecordInstance {
             long_string: self.record.field_is_long_string(field),
             walk: SubWalk::Skip,
             posted: false,
+            claimed_rank: self
+                .monitor_plan
+                .claimed
+                .iter()
+                .position(|name| *name == field)
+                .map_or(u16::MAX, |at| at as u16),
             roles: self.posted.roles_of(field, &self.monitor_plan),
             sub: subscriber,
         };
-        // C `ellAdd`: attach order is post order.
-        self.subscribers.push(entry);
+        // C `ellAdd`: attach order is post order — except that a claimed
+        // field goes before the claimed fields the type's `monitor()` posts
+        // after it, since that order, not the list's, is C's post order.
+        let at = match entry.claimed_rank {
+            u16::MAX => self.subscribers.len(),
+            rank => self
+                .subscribers
+                .iter()
+                .position(|sub| sub.claimed_rank != u16::MAX && sub.claimed_rank > rank)
+                .unwrap_or(self.subscribers.len()),
+        };
+        self.subscribers.insert(at, entry);
         // A field with no `last_posted` entry has never been published: seed it
         // with the value the client is handed in the EVENT_ADD response, so the
         // first process cycle does not treat it as changed. An existing entry

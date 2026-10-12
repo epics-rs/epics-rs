@@ -130,6 +130,38 @@ static MONITOR_FIELDS: [&str; 44] = [
     "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM", "CNEN",
 ];
 
+/// Each [`MONITOR_FIELDS`] entry's `monitor_mask` row in [`MONITOR_POSTS`] —
+/// the mark bit it posts from — so a pass posts its marks in C's order.
+static MONITOR_ORDER: [u8; 44] = {
+    const fn same(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut order = [0; 44];
+    let mut i = 0;
+    while i < MONITOR_FIELDS.len() {
+        let mut row = 0;
+        while !(matches!(MONITOR_POSTS[row].1, CyclePostMask::MonitorValueLog)
+            && same(MONITOR_POSTS[row].0, MONITOR_FIELDS[i]))
+        {
+            row += 1;
+        }
+        order[i] = row as u8;
+        i += 1;
+    }
+    order
+};
+
 impl Default for MotorRecord {
     fn default() -> Self {
         Self {
@@ -294,16 +326,29 @@ impl MotorRecord {
 
     /// The move-start pass's posts: what its `monitor()` would post from the
     /// marks, RBV through the deadband when marked.
+    /// `process_motor_info`'s UEIP precedes `monitor()`, whose RBV block
+    /// precedes the rest.
     fn monitor_notify_fields(&mut self) -> Vec<(String, EpicsValue)> {
         let rbv = self.internal.mmap & m::RBV != 0;
         let bits = self.take_monitor_marks() & (m::MONITOR | m::CNEN);
-        let mut fields: Vec<(String, EpicsValue)> =
-            CycleMarks::of(&MONITOR_POSTS, u128::from(bits))
-                .filter_map(|(name, _)| Some((name.to_string(), self.get_field(name)?)))
-                .collect();
+        let mut fields = Vec::new();
+        let mut post = |rec: &Self, row: usize| {
+            let name = MONITOR_POSTS[row].0;
+            if let Some(value) = rec.get_field(name) {
+                fields.push((name.to_string(), value));
+            }
+        };
+        if bits & m::UEIP_POSTED != 0 {
+            post(self, m::UEIP_POSTED.trailing_zeros() as usize);
+        }
         if rbv {
             self.internal.mmap |= m::RBV;
-            fields.push(("RBV".to_string(), EpicsValue::Double(self.pos.rbv)));
+            post(self, m::RBV.trailing_zeros() as usize);
+        }
+        for &row in &MONITOR_ORDER {
+            if bits & 1 << row != 0 {
+                post(self, usize::from(row));
+            }
         }
         fields
     }

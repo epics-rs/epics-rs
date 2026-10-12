@@ -74,18 +74,15 @@ async fn mdns_server_announce_to_client_discover() {
     .expect("client");
 
     let ch = client.create_channel("MDNS:VAL");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect via mDNS-discovered IOC");
 
     let (_, value) = ch
-        .get_with_timeout(budget::FACT_BUDGET)
+        .get_with_timeout(fact_budget::FACT_BUDGET)
         .await
         .expect("read");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 7777);
 
     server_task.abort();
 }
-
-#[path = "common/budget.rs"]
-mod budget;

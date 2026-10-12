@@ -97,7 +97,7 @@ async fn ca_link_resolves_remote_value() {
     // Open the link + wait for the first monitor event to populate
     // the cache.
     let connected = resolver
-        .wait_for_link_connected("CALINK:SRC", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:SRC", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect to the upstream CA server");
 
@@ -155,7 +155,7 @@ async fn link_diagnostics_reads_a_live_channel() {
 
     assert!(
         resolver
-            .wait_for_link_connected("CALINK:DIAG", budget::FACT_BUDGET)
+            .wait_for_link_connected("CALINK:DIAG", fact_budget::FACT_BUDGET)
             .await
     );
 
@@ -215,14 +215,14 @@ async fn ca_link_init_ready_flips_after_metadata_fetch() {
     assert!(!LinkSet::init_ready(&resolver, "CALINK:INITREADY"));
 
     let connected = resolver
-        .wait_for_link_connected("CALINK:INITREADY", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:INITREADY", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect to the upstream CA server");
 
     // The attribute fetch is detached from the monitor path, so poll
     // for the flip; a connected link whose fetch never completes would
     // hold iocInit, and this assert names that failure.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while !LinkSet::init_ready(&resolver, "CALINK:INITREADY") {
         assert!(
             std::time::Instant::now() < deadline,
@@ -253,7 +253,7 @@ async fn ca_link_resolves_with_scheme_prefix() {
     let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
-        .wait_for_link_connected("ca://CALINK:SCHEME", budget::FACT_BUDGET)
+        .wait_for_link_connected("ca://CALINK:SCHEME", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "scheme-prefixed CA link must connect");
 
@@ -293,7 +293,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     // Pre-open the link and wait so the synchronous lset read serves
     // from cache (the C `dbCaAddLink` + iocInit-wait analogue).
     let connected = resolver
-        .wait_for_link_connected("CALINK:INP:SRC", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:INP:SRC", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect before record processing");
 
@@ -395,7 +395,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // (1) The warm's first monitor event must drive the holder to process
     // and read the remote value (5.0) into VAL — with NO explicit
     // process_record call anywhere in this test.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
@@ -418,14 +418,14 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // 42.0 — again with no explicit process_record call.
     let writer = pinned_client(port).await;
     let wch = writer.create_channel("CALINK:CP:SRC");
-    wch.wait_connected(budget::FACT_BUDGET)
+    wch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("writer channel connects");
     wch.put(&EpicsValue::Double(42.0))
         .await
         .expect("remote write to source");
 
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
@@ -471,7 +471,7 @@ async fn ca_link_out_write_updates_remote_pv() {
     // Open the link + wait for the first monitor event so the channel
     // is connected and the OUT write has a live circuit to push on.
     let connected = resolver
-        .wait_for_link_connected("CALINK:OUT:DST", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:OUT:DST", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect before the OUT write");
 
@@ -489,7 +489,7 @@ async fn ca_link_out_write_updates_remote_pv() {
 
     // The resolver's monitor sees the server-side change — poll the
     // monitor-backed cache until the write propagates back.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         if LinkSet::get_value(&resolver, "CALINK:OUT:DST")
             .await
@@ -510,7 +510,7 @@ async fn ca_link_out_write_updates_remote_pv() {
     // server, not merely the resolver's local cache.
     let verify_client = pinned_client(port).await;
     let ch = verify_client.create_channel("CALINK:OUT:DST");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
     let (_dbf, read_back) = ch.get().await.expect("verify GET");
@@ -546,7 +546,7 @@ async fn ca_link_out_write_async_waits_for_completion() {
     let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
-        .wait_for_link_connected("CALINK:OUT:ASYNC", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:OUT:ASYNC", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect before the async OUT write");
 
@@ -567,7 +567,7 @@ async fn ca_link_out_write_async_waits_for_completion() {
     // the WRITE_NOTIFY reached the server and completed.
     let verify_client = pinned_client(port).await;
     let ch = verify_client.create_channel("CALINK:OUT:ASYNC");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
     let (_dbf, read_back) = ch.get().await.expect("verify GET");
@@ -598,7 +598,7 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
     let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
-        .wait_for_link_connected("ca://CALINK:OUT:SCHEME", budget::FACT_BUDGET)
+        .wait_for_link_connected("ca://CALINK:OUT:SCHEME", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "scheme-prefixed CA OUT link must connect");
 
@@ -612,7 +612,7 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
     .await
     .expect("scheme-prefixed CA-link OUT write must succeed");
 
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         if LinkSet::get_value(&resolver, "ca://CALINK:OUT:SCHEME")
             .await
@@ -658,14 +658,14 @@ async fn ca_link_exposes_remote_metadata() {
     let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
-        .wait_for_link_connected("CALINK:META:SRC", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:META:SRC", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect to the upstream CA server");
 
     use epics_base_rs::server::database::{LinkDbfType, LinkSet};
     // The CTRL attribute fetch is detached after the `Connected` event,
     // so poll until the cached metadata lands.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     let md = loop {
         if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC") {
             // Wait for the CTRL get to fill the limits, not just the
@@ -807,7 +807,7 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
             // external-link wait. Poll the holder until the warm's monitor
             // event drives VAL to the source's 5.0 — with NO explicit
             // process call anywhere in this test.
-            let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
             loop {
                 let v = {
                     let rec = config
@@ -832,6 +832,3 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
         .await;
     result.expect("IOC run returns Ok once the CP holder warmed");
 }
-
-#[path = "common/budget.rs"]
-mod budget;

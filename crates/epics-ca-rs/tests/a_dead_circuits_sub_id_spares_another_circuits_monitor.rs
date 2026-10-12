@@ -110,7 +110,7 @@ fn assert_survivor_sees_every_update(addr: SocketAddr, db: &PvDatabase) {
     // B's circuit dies. Wait for its teardown to have run, so the puts below
     // are ordered after it.
     drop(b);
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while monitors_on_val(db) == 2 {
         assert!(Instant::now() < deadline, "B's circuit was never torn down");
         thread::sleep(Duration::from_millis(5));

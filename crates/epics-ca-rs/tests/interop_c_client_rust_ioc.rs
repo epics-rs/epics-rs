@@ -94,7 +94,7 @@ fn spawn_rust_ioc(db_content: &str) -> RustIoc {
         });
 
     let err = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
-    let found = err.wait_for(common::budget::FACT_BUDGET, |t| report_port(t).is_some());
+    let found = err.wait_for(fact_budget::FACT_BUDGET, |t| report_port(t).is_some());
     let port = report_port(&err.text()).unwrap_or_else(|| {
         assert!(!found, "the wait succeeded but the report did not parse");
         panic!("`softioc-rs` never reported its CA port:\n{}", err.text())
@@ -164,7 +164,7 @@ fn c_camonitor_sees_rust_ioc_changes() {
     // connect) rather than assuming a fixed sleep covers search + connect.
     let out_lines = common::LineCollector::spawn(mon.stdout.take().expect("piped stdout"));
     assert!(
-        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("TEST:LOUT")),
+        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("TEST:LOUT")),
         "camonitor never connected; got:\n{}",
         out_lines.text()
     );
@@ -176,7 +176,7 @@ fn c_camonitor_sees_rust_ioc_changes() {
     }
 
     // Wait for the final value to be observed, then stop camonitor.
-    let saw_final = out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("30"));
+    let saw_final = out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("30"));
     let _ = mon.kill();
     let _ = mon.wait();
     assert!(
@@ -253,5 +253,3 @@ fn pyepics_caget_via_libca_against_rust_ioc() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("42"), "pyepics output: {text}");
 }
-
-use common::budget;

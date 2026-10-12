@@ -22,9 +22,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-#[path = "common/budget.rs"]
-mod budget;
-
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::{CaChannel, CaClient};
 use epics_ca_rs::server::CaServer;
@@ -41,7 +38,7 @@ record(lsi, "LE") { field(DTYP, "getenv") field(INP, "@LSPIN") field(SIZV, "100"
 
 async fn connect(client: &CaClient, name: &str) -> CaChannel {
     let ch = client.create_channel(name);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{name} connects: {e:?}"));
     ch
@@ -55,7 +52,7 @@ async fn first_event(client: &CaClient, name: &str) -> Vec<u8> {
         .subscribe()
         .await
         .unwrap_or_else(|e| panic!("{name} subscribes: {e:?}"));
-    let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .unwrap_or_else(|_| panic!("{name}: no event"))
         .expect("monitor open")

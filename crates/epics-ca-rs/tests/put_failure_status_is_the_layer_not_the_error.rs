@@ -86,7 +86,7 @@ async fn a_value_the_field_refuses_is_putfail_not_badtype() {
 
     for (field, value) in [("PHAS", "32768"), ("RVAL", "notanumber")] {
         let chan = client.create_channel(&format!("PUTSTAT:A.{field}"));
-        chan.wait_connected(budget::FACT_BUDGET)
+        chan.wait_connected(fact_budget::FACT_BUDGET)
             .await
             .expect("connect");
 
@@ -127,7 +127,7 @@ async fn a_field_the_channel_cannot_write_is_refused_before_the_put() {
     let (client, server) = serve_one_ai().await;
 
     let chan = client.create_channel("PUTSTAT:A.STAT");
-    chan.wait_connected(budget::FACT_BUDGET)
+    chan.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -154,7 +154,7 @@ async fn a_value_the_field_accepts_still_succeeds() {
     let (client, server) = serve_one_ai().await;
 
     let chan = client.create_channel("PUTSTAT:A.PHAS");
-    chan.wait_connected(budget::FACT_BUDGET)
+    chan.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -166,6 +166,3 @@ async fn a_value_the_field_accepts_still_succeeds() {
 
     server.abort();
 }
-
-#[path = "common/budget.rs"]
-mod budget;

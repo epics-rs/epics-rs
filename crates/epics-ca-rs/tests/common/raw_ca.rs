@@ -40,7 +40,7 @@
 //! any run where the server is slower than the number, so it fails flakily and
 //! never for its own reason. Every absence claim here now names a probe whose
 //! reply the server can only produce *after* the frame being denied, and the
-//! only duration left is `budget::FACT_BUDGET` bounding the wait for that
+//! only duration left is `fact_budget::FACT_BUDGET` bounding the wait for that
 //! reply — a presence wait, which a broken server fails outright.
 //!
 //! The barrier has to be produced by the same writer as the denied frame. This
@@ -74,7 +74,7 @@ use epics_ca_rs::server::blocking::BlockingCaServer;
 pub const DBR_DOUBLE: u16 = 6;
 
 /// How long a read waits before the test is declared hung.
-const READ_TIMEOUT: Duration = budget::FACT_BUDGET;
+const READ_TIMEOUT: Duration = fact_budget::FACT_BUDGET;
 
 /// Frames one expectation will look at before giving up. Bounds a hang in
 /// company with the socket read timeout.
@@ -191,7 +191,7 @@ impl Circuit {
         let mut seen = {
             let sock = &mut self.sock;
             let pending = &mut self.pending;
-            budget::barrier::until(
+            fact_budget::barrier::until(
                 what,
                 |f: &Vec<u8>| denied(f),
                 |f: &Vec<u8>| barrier(f),
@@ -448,6 +448,3 @@ pub fn create_channel(c: &mut Circuit, cid: u32, pv: &str) -> u32 {
     );
     u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]])
 }
-
-#[path = "budget.rs"]
-pub mod budget;

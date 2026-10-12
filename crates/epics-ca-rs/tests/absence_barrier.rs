@@ -1,6 +1,6 @@
 //! The absence primitive's own falsifiability proof.
 //!
-//! `budget::barrier` exists because `sleep(N); assert!(nothing_happened())`
+//! `fact_budget::barrier` exists because `sleep(N); assert!(nothing_happened())`
 //! passes whether the code works or not. A replacement that could itself pass
 //! vacuously would buy nothing, so each case below is the one a windowed
 //! assertion gets wrong: the barrier that never came, and the denied event
@@ -8,14 +8,11 @@
 
 use std::time::Duration;
 
-#[path = "common/budget.rs"]
-mod budget;
-
 /// Baseline: the barrier arrives with nothing denied before it.
 #[test]
 fn a_clean_run_returns_everything_up_to_the_barrier() {
     let mut src = vec!["hello", "world", "PROBE"].into_iter();
-    let seen = budget::barrier::until(
+    let seen = fact_budget::barrier::until(
         "clean",
         |s: &&str| *s == "DENIED",
         |s: &&str| *s == "PROBE",
@@ -30,7 +27,7 @@ fn a_clean_run_returns_everything_up_to_the_barrier() {
 #[should_panic(expected = "\"DENIED\" arrived before the barrier")]
 fn a_denied_event_before_the_barrier_fails() {
     let mut src = vec!["hello", "DENIED", "PROBE"].into_iter();
-    budget::barrier::until(
+    fact_budget::barrier::until(
         "denied-first",
         |s: &&str| *s == "DENIED",
         |s: &&str| *s == "PROBE",
@@ -44,7 +41,7 @@ fn a_denied_event_before_the_barrier_fails() {
 #[test]
 fn a_denied_event_after_the_barrier_is_not_the_claim() {
     let mut src = vec!["PROBE", "DENIED"].into_iter();
-    let seen = budget::barrier::until(
+    let seen = fact_budget::barrier::until(
         "denied-after",
         |s: &&str| *s == "DENIED",
         |s: &&str| *s == "PROBE",
@@ -60,7 +57,7 @@ fn a_denied_event_after_the_barrier_is_not_the_claim() {
 #[should_panic(expected = "the barrier never arrived")]
 fn a_barrier_that_never_arrives_is_vacuous_and_fails() {
     let mut src = vec!["hello"].into_iter();
-    budget::barrier::until(
+    fact_budget::barrier::until(
         "no-barrier",
         |s: &&str| *s == "DENIED",
         |s: &&str| *s == "PROBE",
@@ -74,7 +71,7 @@ fn a_barrier_that_never_arrives_is_vacuous_and_fails() {
 fn the_remaining_budget_shrinks_across_reads() {
     let mut handed: Vec<Duration> = Vec::new();
     let mut n = 0;
-    let seen = budget::barrier::until(
+    let seen = fact_budget::barrier::until(
         "budget",
         |_: &u8| false,
         |v: &u8| *v == 2,
@@ -86,7 +83,7 @@ fn the_remaining_budget_shrinks_across_reads() {
         },
     );
     assert_eq!(seen, vec![1, 2]);
-    assert!(handed[0] <= budget::FACT_BUDGET, "{handed:?}");
+    assert!(handed[0] <= fact_budget::FACT_BUDGET, "{handed:?}");
     assert!(handed[1] < handed[0], "the budget must shrink: {handed:?}");
 }
 
@@ -105,7 +102,7 @@ async fn the_async_twin_fails_on_a_denied_event_too() {
     for f in ["hello", "DENIED", "PROBE"] {
         tx.send(f).unwrap();
     }
-    budget::barrier::until_async(
+    fact_budget::barrier::until_async(
         "async-denied",
         |s: &&str| *s == "DENIED",
         |s: &&str| *s == "PROBE",

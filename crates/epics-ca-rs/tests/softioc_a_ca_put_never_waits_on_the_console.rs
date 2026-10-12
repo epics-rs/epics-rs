@@ -16,8 +16,7 @@ use epics_base_rs::types::EpicsValue;
 /// 400 lines of 40 bytes: a one-page console four times over.
 const PUTS: usize = 400;
 
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 
 /// `PUTS` puts to `LS` on softioc-rs at `port`, its console unread from
 /// `iocRun` on: how many returned and what `LS` then read, or `None` when the

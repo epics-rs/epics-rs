@@ -44,9 +44,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-#[path = "common/budget.rs"]
-mod budget;
-
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::{CaChannel, CaClient, MonitorHandle};
 use epics_ca_rs::server::CaServer;
@@ -58,7 +55,7 @@ record(waveform, "W") { field(FTVL, "DOUBLE") field(NELM, "5") }
 
 async fn connect(client: &CaClient, name: &str) -> CaChannel {
     let ch = client.create_channel(name);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{name} connects: {e:?}"));
     ch
@@ -79,7 +76,7 @@ fn elements(name: &str, value: EpicsValue) -> Vec<f64> {
 async fn read(client: &CaClient, name: &str, count: u32) -> Vec<f64> {
     let (_, value) = connect(client, name)
         .await
-        .get_with_timeout_count(budget::FACT_BUDGET, count)
+        .get_with_timeout_count(fact_budget::FACT_BUDGET, count)
         .await
         .unwrap_or_else(|e| panic!("read {name}: {e:?}"));
     elements(name, value)
@@ -94,7 +91,7 @@ async fn monitor(client: &CaClient, name: &str) -> MonitorHandle {
 }
 
 async fn next(name: &str, mon: &mut MonitorHandle) -> Vec<f64> {
-    let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .unwrap_or_else(|_| panic!("{name}: no event"))
         .expect("monitor open")

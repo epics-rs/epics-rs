@@ -41,8 +41,7 @@ fn once_db() -> String {
     db
 }
 
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 
 /// `(burst lines printed, sum of every lost count, lost-line count)`.
 fn tally(text: &str) -> (usize, usize, usize) {

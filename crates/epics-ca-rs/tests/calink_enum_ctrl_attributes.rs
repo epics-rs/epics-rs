@@ -58,11 +58,11 @@ async fn metadata_when(
 ) -> LinkMetadata {
     assert!(
         resolver
-            .wait_for_link_connected(pv, budget::FACT_BUDGET)
+            .wait_for_link_connected(pv, fact_budget::FACT_BUDGET)
             .await,
         "CA link must connect to the upstream CA server"
     );
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         if let Some(md) = LinkSet::link_metadata(resolver, pv)
             && ready(&md)
@@ -220,6 +220,3 @@ async fn a_string_target_fetches_no_attributes() {
     assert_eq!(md.alarm_limits, None);
     assert_eq!(md.units, None);
 }
-
-#[path = "common/budget.rs"]
-mod budget;

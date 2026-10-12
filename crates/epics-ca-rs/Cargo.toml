@@ -220,6 +220,9 @@ source-guard = { path = "../source-guard" }
 # cannot see each other's `tests/`, and two copies of a retry rule are two
 # chances to retry on the wrong evidence.
 named-port = { path = "../named-port" }
+# Dev-only, path-only: the one budget a test puts on a fact and the barrier an
+# absence claim closes on, for the integration suites and `src/` unit tests.
+fact-budget = { path = "../fact-budget" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
 # entirely): the shared exec-backend test-gating census, called by
 # `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every

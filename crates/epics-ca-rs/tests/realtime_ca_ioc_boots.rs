@@ -56,19 +56,19 @@ fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
 /// helpers cannot drift out of step with the test that uses them.
 #[cfg(exec_backend)]
 mod exec_model {
-    use crate::softioc_verdict::rs_ioc_port_was_taken;
+    use named_port::verdict::rs_ioc_port_was_taken;
     use std::io::Read as _;
     use std::net::TcpListener;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     /// How long the IOC gets to reach the "resolver installed" line.
-    const INIT_BUDGET: Duration = crate::budget::FACT_BUDGET;
+    const INIT_BUDGET: Duration = fact_budget::FACT_BUDGET;
 
     /// How long the IOC then gets to attempt its first name-server dial. That
     /// happens on the first search tick, well under a second; the margin is for a
     /// loaded CI box.
-    const DIAL_BUDGET: Duration = crate::budget::FACT_BUDGET;
+    const DIAL_BUDGET: Duration = fact_budget::FACT_BUDGET;
 
     /// An IOC that came up on the port it was told to use, and the console it
     /// is still writing to.
@@ -363,7 +363,7 @@ mod exec_model {
         // race.
         #[cfg(feature = "bringup-probes")]
         {
-            let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while !console.contains("C6 probe") {
                 assert!(
                     Instant::now() < deadline,
@@ -579,8 +579,7 @@ mod exec_model {
     ) -> (String, String) {
         use std::io::Write as _;
         let mut c = std::net::TcpStream::connect(("127.0.0.1", booted.port)).expect("connect");
-        c.set_read_timeout(Some(crate::budget::FACT_BUDGET))
-            .unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
         let peer = c.local_addr().unwrap().to_string();
         c.write_all(handshake).unwrap();
         let mut answer = vec![0u8; answered];
@@ -591,7 +590,7 @@ mod exec_model {
             .expect("the server closes the circuit");
 
         let disconnect = format!("CAS: forcing disconnect from {peer}\n");
-        let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         let console = loop {
             let console = booted.console();
             if console.contains(&disconnect) {
@@ -643,8 +642,7 @@ mod exec_model {
         let dir = tempfile::tempdir().expect("temp dir");
         let booted = boot_one_record(dir.path());
         let mut c = std::net::TcpStream::connect(("127.0.0.1", booted.port)).expect("connect");
-        c.set_read_timeout(Some(crate::budget::FACT_BUDGET))
-            .unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
         let peer = c.local_addr().unwrap().to_string();
         c.write_all(&ca_hdr(23, 0, 0, 0, 0x1234, 0x55)).unwrap();
         // The greeting VERSION, then the ECA_DEFUNCT frame: its header, the
@@ -654,7 +652,7 @@ mod exec_model {
         drop(c);
 
         let last = format!("CAS: Request from {peer} =>   available=0x55 \tN=0 paddr=(nil)\n");
-        let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         let console = loop {
             let console = booted.console();
             if console.contains(&last) {
@@ -773,7 +771,7 @@ mod exec_model {
                 !rec.field_subscribers().is_empty(),
             )
         };
-        let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         // The first monitor event can process DOWN:CP before its OUT link has
         // connected, which C drops too; each new CP value is another event.
         let mut sent = 42.5;
@@ -809,9 +807,3 @@ mod exec_model {
         accept.join().expect("the accept thread exits on shutdown");
     }
 }
-
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
-
-#[path = "common/budget.rs"]
-mod budget;

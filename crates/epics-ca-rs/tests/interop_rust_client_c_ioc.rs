@@ -65,11 +65,11 @@ async fn rust_client_can_caget_from_softioc() {
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:AI");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
     let (_, value) = ch
-        .get_with_timeout(budget::FACT_BUDGET)
+        .get_with_timeout(fact_budget::FACT_BUDGET)
         .await
         .expect("caget");
     let v = value.to_f64().expect("scalar");
@@ -90,7 +90,7 @@ async fn rust_client_can_caput_to_softioc() {
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:LOUT");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
     eprintln!("test: connected, calling put");
@@ -100,7 +100,7 @@ async fn rust_client_can_caput_to_softioc() {
 
     // Read back via Rust client to verify the IOC accepted the value.
     let (_, value) = ch
-        .get_with_timeout(budget::FACT_BUDGET)
+        .get_with_timeout(fact_budget::FACT_BUDGET)
         .await
         .expect("readback");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 1234);
@@ -120,7 +120,7 @@ async fn rust_client_monitors_softioc_changes() {
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:LOUT");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -140,7 +140,7 @@ async fn rust_client_monitors_softioc_changes() {
     });
 
     let mut last_seen = 0;
-    let deadline = tokio::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), monitor.recv()).await {
             Ok(Some(Ok(snap))) => {
@@ -173,7 +173,7 @@ async fn rust_client_handles_softioc_restart() {
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:AI");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("first connect");
 
@@ -191,7 +191,7 @@ async fn rust_client_handles_softioc_restart() {
     let ioc2 = spawn_softioc_on(TEST_DB, port);
 
     // Reconnection should complete within ~10s (reconnect lane backoff).
-    let result = tokio::time::timeout(budget::FACT_BUDGET, async {
+    let result = tokio::time::timeout(fact_budget::FACT_BUDGET, async {
         loop {
             if let Ok((_, value)) = ch.get_with_timeout(Duration::from_secs(2)).await
                 && (value.to_f64().unwrap_or(0.0) - 42.0).abs() < 0.001
@@ -211,5 +211,3 @@ async fn rust_client_handles_softioc_restart() {
         "did not reconnect after IOC restart; the second IOC said:\n{console}"
     );
 }
-
-use common::budget;

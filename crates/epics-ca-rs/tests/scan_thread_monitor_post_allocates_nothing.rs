@@ -7,9 +7,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-#[path = "common/budget.rs"]
-mod budget;
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,7 +156,7 @@ async fn window(db: &PvDatabase) -> Window {
 
 async fn connect(client: &CaClient, name: &str) -> CaChannel {
     let ch = client.create_channel(name);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{name} connects: {e:?}"));
     ch
@@ -349,7 +346,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
         .put(&EpicsValue::Short(4))
         .await
         .expect("put PREC");
-    let prec = tokio::time::timeout(budget::FACT_BUDGET, async {
+    let prec = tokio::time::timeout(fact_budget::FACT_BUDGET, async {
         loop {
             let (prec, _) = ctrl.recv().await.expect("CTRL open");
             if prec == 4 {

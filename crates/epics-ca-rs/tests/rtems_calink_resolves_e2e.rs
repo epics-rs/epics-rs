@@ -87,7 +87,7 @@ const DOWNSTREAM_DB: &str = concat!(
 
 /// One budget for the whole resolution: search, dial, subscribe, first
 /// monitor, record processing. Generous for a loaded CI box.
-const RESOLVE_BUDGET: Duration = budget::FACT_BUDGET;
+const RESOLVE_BUDGET: Duration = fact_budget::FACT_BUDGET;
 const POLL: Duration = Duration::from_millis(50);
 
 /// Load a database exactly as `realtime-ca-ioc::load_database` does — driven by
@@ -193,6 +193,3 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     server.shutdown();
     accept.join().expect("the accept thread exits on shutdown");
 }
-
-#[path = "common/budget.rs"]
-mod budget;

@@ -95,7 +95,7 @@ fn the_rate_limit_disconnect_is_an_errlog_line() {
     quiet_console();
     let (_server, addr) = serve(&[]);
     let mut c = std::net::TcpStream::connect(addr).expect("connect");
-    c.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
+    c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
     let peer = c.local_addr().unwrap();
     let echo = CaHeader::new(CA_PROTO_ECHO).to_bytes();
     let (errlog, console) = lines_for(peer, || {

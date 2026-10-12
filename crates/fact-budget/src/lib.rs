@@ -1,6 +1,4 @@
-#![allow(dead_code)] // Included by `#[path]` into suites that use only some of it.
-
-//! The one budget a test in this crate may put on a fact it expects to happen.
+//! The one budget an `epics-ca-rs` test may put on a fact it expects to happen.
 //!
 //! # Why one number, and why this number
 //!

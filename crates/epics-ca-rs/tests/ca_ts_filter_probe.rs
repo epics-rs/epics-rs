@@ -27,9 +27,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-#[path = "common/budget.rs"]
-mod budget;
-
 use epics_base_rs::types::DbFieldType;
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::{CaChannel, CaClient};
@@ -41,7 +38,7 @@ record(ai, "T") { field(VAL, "1") field(PINI, "YES") field(PREC, "3") field(EGU,
 
 async fn connect(client: &CaClient, name: &str) -> CaChannel {
     let ch = client.create_channel(name);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{name} connects: {e:?}"));
     ch
@@ -72,7 +69,7 @@ async fn probe(client: &CaClient, name: &str) -> (DbFieldType, u32, EpicsValue, 
         .await
         .unwrap_or_else(|e| panic!("read {name}: {e:?}"));
     let mut mon = ch.subscribe().await.expect("subscribe");
-    let event = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    let event = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .unwrap_or_else(|_| panic!("{name}: no event"))
         .expect("monitor open")

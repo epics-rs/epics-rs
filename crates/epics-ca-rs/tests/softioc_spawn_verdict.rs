@@ -13,10 +13,9 @@
 // Only the verdict, deliberately: `mod common;` would drag `softioc_on`'s
 // `Command::new("softIoc")` into a binary that spawns nothing, and
 // tools/ioc-spawn-gate reads the mod graph, not the call sites.
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 
-use softioc_verdict::{SoftIocVerdict, rs_ioc_port_was_taken, softioc_verdict};
+use softioc_verdict::{SoftIocVerdict, softioc_verdict};
 
 /// C's stderr when the TCP port it was told to use was already held.
 ///
@@ -98,31 +97,4 @@ fn a_broken_ioc_is_not_a_stolen_port() {
             "console must not be read as a stolen port: {console:?}"
         );
     }
-}
-
-/// softioc-rs's console after `iocRun` with port 32961 held, measured: the
-/// UDP arm (search responder held, exit 1) and the TCP arm (listener held, C's
-/// fallback). realtime-ca-ioc's two lines are its `eprintln!`s with the errno
-/// text appended. A different number, or the TCP arm's `local_addr` failure,
-/// is no steal of this port.
-#[test]
-fn an_rs_ioc_reports_its_named_port_taken() {
-    const UDP_HELD: &str = "iocRun: All initialization complete\n\
-        \x1b[31;1mERROR\x1b[0m: I/O error: CA server UDP search responder bind \
-        127.0.0.1:32961: Address already in use (os error 98)\n";
-    const RT_TCP: &str = "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
-        Address already in use (os error 98)\n";
-    const RT_UDP: &str = "realtime-ca-ioc: cannot start the CA UDP search responder on port \
-        32961: Address already in use (os error 98)\n";
-    for console in [UDP_HELD, PORT_HELD, RT_TCP, RT_UDP] {
-        assert!(rs_ioc_port_was_taken(console, 32961), "{console:?}");
-    }
-    assert!(!rs_ioc_port_was_taken(UDP_HELD, 3296));
-    assert!(!rs_ioc_port_was_taken(RT_UDP, 32962));
-    assert!(!rs_ioc_port_was_taken(
-        "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
-         local_addr: Bad file descriptor\n",
-        32961
-    ));
-    assert!(!rs_ioc_port_was_taken(CLEAN_BOOT, 32961));
 }

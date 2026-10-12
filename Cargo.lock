@@ -1080,6 +1080,7 @@ dependencies = [
  "epics-base-rs",
  "epics-macros-rs",
  "epics-rtems-boot",
+ "fact-budget",
  "futures-util",
  "hickory-client",
  "hickory-proto",
@@ -1285,6 +1286,10 @@ name = "error-code"
 version = "3.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
+
+[[package]]
+name = "fact-budget"
+version = "0.31.0"
 
 [[package]]
 name = "fastrand"

@@ -7,9 +7,6 @@
 //! gated on the C tools being available so that CI environments without
 //! a full EPICS install can still run the rest of the suite.
 
-#[path = "budget.rs"]
-pub mod budget;
-
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -157,7 +154,7 @@ impl ManagedIoc {
     }
 }
 
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 pub use softioc_verdict::{SoftIocVerdict, softioc_verdict};
 
 /// Write `db_content` where a child can read it, for the child's lifetime.
@@ -213,13 +210,13 @@ fn softioc_on(db_path: &Path, port: u16) -> Option<ManagedIoc> {
     // Both lines go through errlog, which is stderr; stdout is collected for
     // the panic text, because an IOC that fails some other way may say so
     // there and that belongs in the report.
-    let settled = ioc.err.wait_for(budget::FACT_BUDGET, |t| {
+    let settled = ioc.err.wait_for(fact_budget::FACT_BUDGET, |t| {
         softioc_verdict(t) != SoftIocVerdict::Silent
     });
     assert!(
         settled,
         "`softIoc` neither came up nor reported the port taken within {:?}:\n{}",
-        budget::FACT_BUDGET,
+        fact_budget::FACT_BUDGET,
         ioc.console()
     );
     match softioc_verdict(&ioc.err.text()) {

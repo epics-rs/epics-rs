@@ -65,7 +65,7 @@ fn start_ioc() -> (Reaped, u16) {
     // "CA server: UDP search on port 41234, TCP on port 41235, beacons → …"
     let stderr = ioc.0.stderr.take().expect("piped stderr");
     let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     let mut line = String::new();
     loop {
         assert!(
@@ -119,7 +119,7 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     // Wait for the first monitor event itself, then take the IOC away
     // under it.
     assert!(
-        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("TST:AI")),
+        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("TST:AI")),
         "no first monitor line within 10s; stdout: {:?}",
         out_lines.text()
     );
@@ -130,12 +130,12 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     // The disconnect must surface on both streams; each stream is gated on
     // its own marker so the kill below cannot race either write.
     assert!(
-        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("*** disconnected")),
+        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("*** disconnected")),
         "no `*** disconnected` on stdout within 10s; stdout: {:?}",
         out_lines.text()
     );
     assert!(
-        err_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("Source File:")),
+        err_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("Source File:")),
         "no CA.Client.Exception block on stderr within 10s; stderr: {:?}",
         err_lines.text()
     );
@@ -240,5 +240,3 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
          resolve within the attempt budget; last stderr: {last_stderr:?}"
     );
 }
-
-use common::budget;

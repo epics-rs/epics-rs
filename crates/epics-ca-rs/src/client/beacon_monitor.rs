@@ -1084,7 +1084,7 @@ mod repeater_registration_tests {
         // only from the pacer's second registration on — a whole period of
         // slack, counted in ticks rather than in milliseconds.
         let pacer_ticks = std::cell::Cell::new(0usize);
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "registration must stop on CONFIRM (C `expire` returns noRestart \
              once `registered`)",
             |(src, _): &(SocketAddr, usize)| src.port() == client.port() && pacer_ticks.get() >= 2,

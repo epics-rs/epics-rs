@@ -341,7 +341,9 @@ fn blocking_server_answers_a_raw_udp_search() {
     let udp_thread = thread::spawn(move || srv.serve_udp_search(resp));
 
     let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    client.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
+    client
+        .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+        .unwrap();
 
     // VERSION prelude + SEARCH, the shape a real CA client broadcasts.
     let mut dg = {
@@ -438,7 +440,7 @@ fn blocking_server_answers_a_raw_udp_search() {
     });
     client.send_to(&probe, resp_addr).unwrap();
 
-    budget::barrier::until(
+    fact_budget::barrier::until(
         "an unknown PV must draw no UDP reply",
         // Nothing may precede the barrier datagram, and the batch-up path can
         // coalesce replies, so a datagram carrying cid 0x43 is denied even
@@ -485,7 +487,9 @@ fn a_udp_search_leads_to_a_working_tcp_circuit() {
     let accept = thread::spawn(move || srv_tcp.serve());
 
     let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    client.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
+    client
+        .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+        .unwrap();
     let mut dg = {
         let mut h = CaHeader::new(CA_PROTO_VERSION);
         h.count = CA_MINOR_VERSION;

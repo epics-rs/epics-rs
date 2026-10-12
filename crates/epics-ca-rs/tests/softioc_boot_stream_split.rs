@@ -17,8 +17,7 @@ use std::io::Write;
 use std::net::{TcpListener, UdpSocket};
 use std::process::{Command, Stdio};
 
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 
 /// Replace the describe and the date after its `Git:` / `build date/time:`
 /// label, the two arms `genVersionHeader.pl` has.

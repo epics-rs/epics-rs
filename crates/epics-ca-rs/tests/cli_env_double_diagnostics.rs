@@ -202,7 +202,7 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
     // then take the IOC down and judge everything it wrote.
     let err_lines = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
     assert!(
-        err_lines.wait_for(budget::FACT_BUDGET, |t| {
+        err_lines.wait_for(fact_budget::FACT_BUDGET, |t| {
             t.contains("CA server: UDP search on port")
         }),
         "softioc-rs never printed its startup banner; stderr: {:?}",
@@ -253,6 +253,3 @@ fn conn_tmo_positive_period_is_silent() {
         "10.5 s is a valid period; no diagnostic is due:\n{err}"
     );
 }
-
-#[cfg(tokio_backend)]
-use common::budget;

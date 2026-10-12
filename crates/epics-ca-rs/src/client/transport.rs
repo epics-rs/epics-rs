@@ -3836,7 +3836,7 @@ enum Seen {
 /// past its capacity completes only if the loop is still consuming, which is
 /// strictly after whatever decision could have closed the circuit. `biased`
 /// polls the event first, so an event emitted while draining is reported
-/// rather than lost. The shape `crate::test_budget::barrier` drives.
+/// rather than lost. The shape `fact_budget::barrier` drives.
 #[cfg(test)]
 async fn drain_or_event(
     remaining: std::time::Duration,
@@ -3923,7 +3923,7 @@ mod recv_body_limit_tests {
         // pre-fix client closed on. A window would have proved nothing but
         // that the close was slower than the number.
         let body = vec![0u8; 4096];
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "an oversize payload must never close a CA circuit — C logs and \
              ignores the message, and by default has no size limit at all",
             |s: &Seen| matches!(s, Seen::Event),
@@ -4149,7 +4149,7 @@ mod malformed_header_close_tests {
         // 19 bytes and chosen to read on. A closed loop stops reading, the
         // write stalls, and the close it emitted arrives first.
         let mut client = client_io;
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "partial extended header must NOT close — read_loop waits for the \
              rest of the header",
             |s: &Seen| matches!(s, Seen::Event),
@@ -4277,22 +4277,21 @@ mod error_echo_dispatch_tests {
             Err(e) => panic!("write the barrier VERSION frame: {e:?}"),
         }
 
-        let verdict =
-            match tokio::time::timeout(crate::test_budget::FACT_BUDGET, event_rx.recv()).await {
-                // The barrier: the loop answered a frame that came after, so it
-                // was neither closed nor still chewing on the one under test.
-                Ok(Some(TransportEvent::ServerVersion { .. })) => Verdict::Quiet,
-                Ok(Some(TransportEvent::TcpClosed { .. })) => Verdict::Closed,
-                // The loop dropped its sender without saying anything, which is
-                // the same close seen from the channel's side.
-                Ok(None) => Verdict::Closed,
-                Ok(Some(_)) => Verdict::Other,
-                Err(_) => panic!(
-                    "neither the frame under test nor the VERSION barrier behind \
+        let verdict = match tokio::time::timeout(fact_budget::FACT_BUDGET, event_rx.recv()).await {
+            // The barrier: the loop answered a frame that came after, so it
+            // was neither closed nor still chewing on the one under test.
+            Ok(Some(TransportEvent::ServerVersion { .. })) => Verdict::Quiet,
+            Ok(Some(TransportEvent::TcpClosed { .. })) => Verdict::Closed,
+            // The loop dropped its sender without saying anything, which is
+            // the same close seen from the channel's side.
+            Ok(None) => Verdict::Closed,
+            Ok(Some(_)) => Verdict::Other,
+            Err(_) => panic!(
+                "neither the frame under test nor the VERSION barrier behind \
                  it drew anything within {:?}: the verdict would prove nothing",
-                    crate::test_budget::FACT_BUDGET
-                ),
-            };
+                fact_budget::FACT_BUDGET
+            ),
+        };
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
         verdict
@@ -4518,7 +4517,7 @@ mod error_echo_dispatch_tests {
             ServerVersion,
             Other,
         }
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "a READ_NOTIFY echo must not be routed to a subscription",
             |s: &Seen| matches!(s, Seen::MonitorStatusError),
             |s: &Seen| matches!(s, Seen::ServerVersion),

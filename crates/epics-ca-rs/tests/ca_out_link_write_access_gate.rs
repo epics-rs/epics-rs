@@ -118,7 +118,7 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
     let resolver = CaLinkResolver::with_client(Arc::new(client));
     assert!(
         resolver
-            .wait_for_link_connected(PV, budget::FACT_BUDGET)
+            .wait_for_link_connected(PV, fact_budget::FACT_BUDGET)
             .await,
         "READ is granted to everyone, so the link must connect whatever \
          the write right is"
@@ -129,7 +129,7 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
 /// The rights frame follows the create-channel reply, so poll rather than
 /// racing it. Returns the admission actually observed at the deadline.
 async fn admission_settling_to(resolver: &CaLinkResolver, want: PutAdmission) -> PutAdmission {
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let got = LinkSet::put_admission(resolver, PV);
         if got == want || Instant::now() >= deadline {
@@ -225,6 +225,41 @@ async fn a_connected_but_write_denied_link_is_refused() {
     );
 }
 
+/// The resolver's rights come from the events its watcher receives, so the
+/// receiver must exist before the channel can connect. Reading it only after
+/// the connect is the worst case a preempted `open` can hit, where a receiver
+/// taken then from `connection_events` had missed both events and the write
+/// right stayed at its default `true` — the loaded-run failure above.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn a_receiver_taken_with_the_channel_keeps_a_connect_it_lost_the_race_to() {
+    use epics_ca_rs::client::ConnectionEvent;
+    let port = serve_acf_pv().await;
+    pin_env(port);
+    let client = CaClient::new_with_config(CaClientConfig::default())
+        .await
+        .expect("CA client");
+    client.set_host_name(DENIED_HOST);
+    let (channel, mut with_channel) = client.create_channel_with_events(PV);
+    channel
+        .wait_connected(fact_budget::FACT_BUDGET)
+        .await
+        .expect("READ is granted to everyone");
+
+    assert_eq!(
+        with_channel.recv().await.ok(),
+        Some(ConnectionEvent::Connected)
+    );
+    assert_eq!(
+        with_channel.recv().await.ok(),
+        Some(ConnectionEvent::AccessRightsChanged {
+            read: true,
+            write: false
+        }),
+        "the ACF's WRITE rule names a HAG this client is not in"
+    );
+}
+
 /// Negative control for the same predicate: full rights are admitted, and
 /// the write actually lands. Without this, "refuses" above would pass on a
 /// resolver that refuses everything.
@@ -248,7 +283,7 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
         .await
         .expect("an admitted write must reach the wire");
 
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         if LinkSet::get_value(&resolver, PV)
             .await
@@ -330,6 +365,3 @@ async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
         "and the upstream PV keeps its value"
     );
 }
-
-#[path = "common/budget.rs"]
-mod budget;

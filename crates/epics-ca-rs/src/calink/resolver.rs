@@ -661,16 +661,13 @@ impl CaLinkResolver {
         if let Some(existing) = self.links.read().get(pv_name).cloned() {
             return Ok(existing);
         }
-        let channel = Arc::new(self.client().await?.create_channel(pv_name));
-        // subscribe the connection-event stream BEFORE the
-        // `subscribe()` round-trip that drives the circuit connect, so the
-        // watcher cannot miss the `Connected` event — that event is what
-        // kicks off the one-shot CTRL attribute fetch (mirroring C
-        // `connectionCallback` scheduling `CA_GET_ATTRIBUTES`). Subscribing
-        // after `subscribe()` would race: a connect completing during the
-        // await would emit `Connected` before the watcher existed, leaving
-        // `meta` permanently empty until the next reconnect.
-        let conn_rx = channel.connection_events();
+        // The receiver is taken with the channel, before its search starts:
+        // a `Connected` / `AccessRightsChanged` pair published ahead of the
+        // watcher is lost for good — `meta` stays empty and the write right
+        // stays at its default `true` (C `connectionCallback` scheduling
+        // `CA_GET_ATTRIBUTES` and reading `ca_write_access`).
+        let (channel, conn_rx) = self.client().await?.create_channel_with_events(pv_name);
+        let channel = Arc::new(channel);
         // C `dbCa` opens the record-link monitor with `ca_add_array_event`
         // (`dbCa.c:1225-1229`), whose libca macro expands to
         // `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`

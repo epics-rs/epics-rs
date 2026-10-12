@@ -44,6 +44,10 @@
 //!
 //! Anything else the subject does is a failure and must reach the test as
 //! one.
+//!
+//! [`verdict`] reads the two IOC consoles for that evidence.
+
+pub mod verdict;
 
 use std::net::{TcpListener, UdpSocket};
 

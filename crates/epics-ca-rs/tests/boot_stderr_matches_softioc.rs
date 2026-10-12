@@ -20,8 +20,7 @@ use std::time::{Duration, Instant};
 const SOFTIOC_BOOT_STDERR: &str = "Starting iocInit\niocRun: All initialization complete\n";
 const DB: &str = "record(ai, \"X:AI\") { field(VAL, \"1\") }\n";
 
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 
 /// `bin` with the db and C's environment on `port`, its stderr in a file
 /// under `dir`.
@@ -66,13 +65,64 @@ fn boot_stderr(mut child: Child, dir: &std::path::Path, settle: Duration) -> Str
     read()
 }
 
+/// [`boot_stderr`] of `bin` on `port`, or `None` when the IOC reports that
+/// port taken.
+fn boot_stderr_on(
+    bin: &str,
+    args: &[&std::ffi::OsStr],
+    dir: &std::path::Path,
+    port: u16,
+) -> Option<String> {
+    let stderr = boot_stderr(spawn(bin, args, dir, port), dir, Duration::from_millis(500));
+    (!softioc_verdict::rs_ioc_port_was_taken(&stderr, port)).then_some(stderr)
+}
+
 /// [`boot_stderr`] of `bin` on a port it is named, retried on a fresh one
 /// when the IOC reports that one taken.
 fn named_boot_stderr(bin: &str, args: &[&std::ffi::OsStr], dir: &std::path::Path) -> String {
-    named_port::on_a_named_port(|port| {
-        let stderr = boot_stderr(spawn(bin, args, dir, port), dir, Duration::from_millis(500));
-        (!softioc_verdict::rs_ioc_port_was_taken(&stderr, port)).then_some(stderr)
-    })
+    named_port::on_a_named_port(|port| boot_stderr_on(bin, args, dir, port))
+}
+
+/// [`named_boot_stderr`] with the first candidate held by this test through
+/// `hold`, and the number of attempts it took.
+fn boot_past_a_held_port<H>(
+    bin: &str,
+    args: &[&std::ffi::OsStr],
+    dir: &std::path::Path,
+    hold: impl Fn(u16) -> std::io::Result<H>,
+) -> (usize, String) {
+    let mut attempts = 0;
+    let stderr = named_port::on_a_named_port(|port| {
+        attempts += 1;
+        let _held = (attempts == 1).then(|| hold(port).expect("hold the first candidate"));
+        boot_stderr_on(bin, args, dir, port)
+    });
+    (attempts, stderr)
+}
+
+fn hold_udp(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    std::net::UdpSocket::bind(("127.0.0.1", port))
+}
+
+fn hold_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
+    std::net::TcpListener::bind(("127.0.0.1", port))
+}
+
+/// The retry path end to end on `bin`: whichever socket `hold` takes, the IOC
+/// reports the first candidate taken and a later one boots softIoc's stderr.
+fn retries_past_a_held_port<H>(
+    bin: &str,
+    args: impl Fn(&std::path::Path) -> Vec<std::ffi::OsString>,
+    hold: impl Fn(u16) -> std::io::Result<H>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("x.db");
+    std::fs::write(&db, DB).unwrap();
+    let args = args(&db);
+    let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+    let (attempts, stderr) = boot_past_a_held_port(bin, &args, dir.path(), hold);
+    assert!(attempts >= 2, "the held candidate was not reported taken");
+    assert_eq!(stderr, SOFTIOC_BOOT_STDERR);
 }
 
 #[cfg(tokio_backend)]
@@ -104,5 +154,47 @@ fn realtime_ca_ioc_boot_stderr_is_softiocs() {
             dir.path()
         ),
         SOFTIOC_BOOT_STDERR
+    );
+}
+
+#[cfg(tokio_backend)]
+fn softioc_rs_args(db: &std::path::Path) -> Vec<std::ffi::OsString> {
+    vec!["-d".into(), db.into()]
+}
+
+#[cfg(tokio_backend)]
+#[test]
+fn softioc_rs_retries_a_held_udp_port() {
+    retries_past_a_held_port(env!("CARGO_BIN_EXE_softioc-rs"), softioc_rs_args, hold_udp);
+}
+
+#[cfg(tokio_backend)]
+#[test]
+fn softioc_rs_retries_a_held_tcp_port() {
+    retries_past_a_held_port(env!("CARGO_BIN_EXE_softioc-rs"), softioc_rs_args, hold_tcp);
+}
+
+#[cfg(exec_backend)]
+fn realtime_ca_ioc_args(db: &std::path::Path) -> Vec<std::ffi::OsString> {
+    vec![db.into()]
+}
+
+#[cfg(exec_backend)]
+#[test]
+fn realtime_ca_ioc_retries_a_held_udp_port() {
+    retries_past_a_held_port(
+        env!("CARGO_BIN_EXE_realtime-ca-ioc"),
+        realtime_ca_ioc_args,
+        hold_udp,
+    );
+}
+
+#[cfg(exec_backend)]
+#[test]
+fn realtime_ca_ioc_retries_a_held_tcp_port() {
+    retries_past_a_held_port(
+        env!("CARGO_BIN_EXE_realtime-ca-ioc"),
+        realtime_ca_ioc_args,
+        hold_tcp,
     );
 }

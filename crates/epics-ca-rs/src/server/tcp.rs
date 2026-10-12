@@ -9088,7 +9088,7 @@ mod extended_header_split_tests {
             while matches!(client_rd.read(&mut sink).await, Ok(n) if n > 0) {}
         });
 
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "handle_client returned on a partial extended header — must wait \
              for more bytes (C camessage.c RSRV_OK; break)",
             |s: &Seen| matches!(s, Seen::HandlerReturned),

@@ -3312,7 +3312,7 @@ mod tests {
     }
 
     /// One datagram, or `None` once `remaining` elapses — the reader shape
-    /// `crate::test_budget::barrier` drives.
+    /// `fact_budget::barrier` drives.
     fn recv_datagram(sock: &UdpSocket, remaining: Duration) -> Option<Vec<u8>> {
         sock.set_read_timeout(Some(remaining)).ok()?;
         let mut buf = vec![0u8; 64 * 1024];
@@ -3347,7 +3347,7 @@ mod tests {
         probe.extend_from_slice(&udp_search_frame(10, "BLK:EXISTS"));
         client.send_to(&probe, resp_addr).unwrap();
 
-        crate::test_budget::barrier::until(
+        fact_budget::barrier::until(
             "an unknown PV must draw NO UDP reply",
             |dg: &Vec<u8>| search_reply_cids(dg).contains(&9),
             |dg: &Vec<u8>| search_reply_cids(dg).contains(&10),
@@ -3419,7 +3419,7 @@ mod tests {
         let mut probe = udp_version_prelude(0x3333);
         probe.extend_from_slice(&udp_search_frame(0x03, "BLK:BURST"));
         client.send_to(&probe, resp_addr).unwrap();
-        crate::test_budget::barrier::until(
+        fact_budget::barrier::until(
             "same-source burst must coalesce into ONE reply datagram",
             |dg: &Vec<u8>| {
                 let cids = search_reply_cids(dg);
@@ -3555,7 +3555,7 @@ mod tests {
         let mut probe_a = udp_version_prelude(0xCCCC);
         probe_a.extend_from_slice(&udp_search_frame(0x0C, "BLK:SRC"));
         client_a.send_to(&probe_a, resp_addr).unwrap();
-        crate::test_budget::barrier::until(
+        fact_budget::barrier::until(
             "peer A must receive exactly one reply",
             |dg: &Vec<u8>| {
                 let cids = search_reply_cids(dg);
@@ -3568,7 +3568,7 @@ mod tests {
         let mut probe_b = udp_version_prelude(0xDDDD);
         probe_b.extend_from_slice(&udp_search_frame(0x0D, "BLK:SRC"));
         client_b.send_to(&probe_b, resp_addr).unwrap();
-        crate::test_budget::barrier::until(
+        fact_budget::barrier::until(
             "peer B must receive exactly one reply",
             |dg: &Vec<u8>| {
                 let cids = search_reply_cids(dg);

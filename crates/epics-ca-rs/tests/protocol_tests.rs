@@ -415,7 +415,7 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
     }
 
     let client = epics_ca_rs::client::CaClient::new().await.expect("client");
-    let (_ty, val) = tokio::time::timeout(budget::FACT_BUDGET, client.caget("STATS:BYTES"))
+    let (_ty, val) = tokio::time::timeout(fact_budget::FACT_BUDGET, client.caget("STATS:BYTES"))
         .await
         .expect("caget did not complete within 5s")
         .expect("caget should succeed against local server");
@@ -481,7 +481,7 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     let mut monitor = channel.subscribe().await.expect("subscribe");
     // Wait for the initial monitor frame so we know EVENT_ADD has
     // been accepted server-side.
-    let _initial = tokio::time::timeout(budget::FACT_BUDGET, monitor.recv())
+    let _initial = tokio::time::timeout(fact_budget::FACT_BUDGET, monitor.recv())
         .await
         .expect("initial monitor frame did not arrive")
         .expect("monitor stream yielded no value");
@@ -891,7 +891,7 @@ async fn server_echo_round_trips_request_header_and_payload() {
     let mut buf = [0u8; 64];
     let mut drained = 0;
     while drained < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
             .await
             .expect("server VERSION drain timed out")
             .expect("read VERSION");
@@ -925,7 +925,7 @@ async fn server_echo_round_trips_request_header_and_payload() {
     let mut resp = [0u8; 64];
     let mut total = 0;
     while total < 24 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("ECHO reply timed out")
             .expect("read ECHO reply");
@@ -1014,7 +1014,7 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     let mut buf = [0u8; 64];
     let mut drained = 0usize;
     while drained < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
             .await
             .expect("server VERSION reply timed out")
             .expect("read VERSION");
@@ -1043,7 +1043,7 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     let mut resp = [0u8; 256];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("server error-reply timed out")
             .expect("read error reply");
@@ -1077,7 +1077,7 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
 
     // Server must close the connection: a subsequent read returns EOF.
     let mut tail = [0u8; 16];
-    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut tail))
+    let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut tail))
         .await
         .expect("server did not close after EVENT_CANCEL bad-SID")
         .expect("read after bad-SID cancel");
@@ -1135,7 +1135,7 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
     let mut buf = [0u8; 64];
     let mut got = 0;
     while got < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[got..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut buf[got..]))
             .await
             .expect("server VERSION drain timed out")
             .expect("read VERSION");
@@ -1160,7 +1160,7 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
     let mut resp = [0u8; 256];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("server error-reply timed out")
             .expect("read error reply");
@@ -1190,7 +1190,7 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
     // Server must close the connection: a subsequent read returns 0
     // (EOF) within a reasonable timeout.
     let mut tail = [0u8; 16];
-    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut tail))
+    let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut tail))
         .await
         .expect("server did not close TCP connection after unknown command")
         .expect("read after error");
@@ -1235,7 +1235,7 @@ async fn server_tcp_version_below_minimum_drops_connection() {
     // returns RSRV_ERROR which tears down with no reply).
     let mut buf = [0u8; 64];
     let mut greeting = [0u8; 16];
-    tokio::time::timeout(budget::FACT_BUDGET, async {
+    tokio::time::timeout(fact_budget::FACT_BUDGET, async {
         let mut got = 0;
         while got < 16 {
             let n = sock.read(&mut greeting[got..]).await?;
@@ -1257,7 +1257,7 @@ async fn server_tcp_version_below_minimum_drops_connection() {
 
     // Server must drop the connection — no further VERSION reply,
     // just EOF.
-    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf))
+    let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut buf))
         .await
         .expect("server did not close TCP after unsupported VERSION")
         .expect("read");
@@ -1302,7 +1302,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut hello = [0u8; 64];
-    tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello))
+    tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut hello))
         .await
         .expect("VERSION reply timed out")
         .expect("read VERSION");
@@ -1398,7 +1398,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     let mut resp = [0u8; 64];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("error reply timed out")
             .expect("read error reply");
@@ -1418,7 +1418,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
 
     // Server must disconnect after the error reply.
     let mut tail = [0u8; 16];
-    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut tail))
+    let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut tail))
         .await
         .expect("server did not close after WRITE_NOTIFY bad type")
         .expect("read after error");
@@ -1483,7 +1483,7 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut hello = [0u8; 64];
-    tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello))
+    tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut hello))
         .await
         .expect("VERSION reply timed out")
         .expect("read VERSION");
@@ -1582,7 +1582,7 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
     let mut acc: Vec<u8> = Vec::new();
     let mut replies: Map<u32, CaHeader> = Map::new();
     let mut rbuf = [0u8; 256];
-    let deadline = budget::FACT_BUDGET;
+    let deadline = fact_budget::FACT_BUDGET;
     while replies.len() < 3 {
         let n = tokio::time::timeout(deadline, sock.read(&mut rbuf))
             .await
@@ -1708,7 +1708,7 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut hello = [0u8; 64];
-    tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello))
+    tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut hello))
         .await
         .expect("VERSION reply timed out")
         .expect("read VERSION");
@@ -1800,7 +1800,7 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
     let mut replies: Map<u32, CaHeader> = Map::new();
     let mut rbuf = [0u8; 512];
     while replies.len() < 3 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut rbuf))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut rbuf))
             .await
             .unwrap_or_else(|_| panic!("timed out; got {:?}", replies.keys()))
             .expect("read replies");
@@ -2073,7 +2073,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
     while got_hello < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
             .await
             .expect("VERSION drain timed out")
             .expect("read VERSION");
@@ -2159,7 +2159,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     // silently on INVALID_DB_REQ. Reading should observe EOF
     // (n=0) directly, never any header bytes.
     let mut resp = [0u8; 64];
-    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp))
+    let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut resp))
         .await
         .expect("server did not close after READ_NOTIFY bad type")
         .expect("read after bad type");
@@ -2206,7 +2206,7 @@ async fn server_read_sync_echoes_request_header() {
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
     while got_hello < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
             .await
             .expect("VERSION drain timed out")
             .expect("read VERSION");
@@ -2229,7 +2229,7 @@ async fn server_read_sync_echoes_request_header() {
     let mut resp = [0u8; 32];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(fact_budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("READ_SYNC echo timed out")
             .expect("read echo");
@@ -2306,7 +2306,7 @@ async fn first_connect_does_not_emit_native_type_changed() {
     let mut events = channel.connection_events();
 
     channel
-        .wait_connected(budget::FACT_BUDGET)
+        .wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("channel connects to the in-process server");
 
@@ -2330,7 +2330,7 @@ async fn first_connect_does_not_emit_native_type_changed() {
         Rights { write: bool },
         Other,
     }
-    let seen = budget::barrier::until_async(
+    let seen = fact_budget::barrier::until_async(
         "first connect must not emit NativeTypeChanged: the native type was \
          discovered, not changed",
         |e: &Ev| matches!(e, Ev::NativeTypeChanged),
@@ -2368,6 +2368,3 @@ async fn first_connect_does_not_emit_native_type_changed() {
     );
     drop(dir);
 }
-
-#[path = "common/budget.rs"]
-mod budget;

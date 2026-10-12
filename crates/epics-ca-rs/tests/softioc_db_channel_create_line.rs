@@ -26,8 +26,7 @@ use std::time::{Duration, Instant};
 
 const FILTER_LINE: &str = "dbChannelCreate: Channel filter 'bad' not found";
 
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 
 struct Ioc {
     child: Child,

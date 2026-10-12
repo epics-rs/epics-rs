@@ -6,9 +6,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-#[path = "common/budget.rs"]
-mod budget;
-
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::CaClient;
@@ -38,11 +35,11 @@ async fn a_qtime_tag_record_monitor_update_carries_the_raw_stamp() {
     }
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel("QT");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("QT connects");
     let mut mon = ch.subscribe().await.expect("QT subscribes");
-    tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .expect("initial event")
         .expect("monitor open")
@@ -50,7 +47,7 @@ async fn a_qtime_tag_record_monitor_update_carries_the_raw_stamp() {
 
     ch.put(&EpicsValue::Double(2.0)).await.expect("put QT");
     let update = loop {
-        let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+        let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
             .await
             .expect("an update after the put")
             .expect("monitor open")

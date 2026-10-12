@@ -11,7 +11,6 @@
 #![cfg(feature = "client-core")]
 
 mod common;
-use common::budget;
 
 use epics_base_rs::server::records::int64out::Int64outRecord;
 use epics_base_rs::server::records::longout::LongoutRecord;
@@ -51,8 +50,11 @@ async fn caput_leaves_the_parse_to_the_server() {
         let client = &client;
         async move {
             let ch = client.create_channel(pv);
-            ch.wait_connected(budget::FACT_BUDGET).await.unwrap();
-            ch.get_with_timeout(budget::FACT_BUDGET).await.unwrap().1
+            ch.wait_connected(fact_budget::FACT_BUDGET).await.unwrap();
+            ch.get_with_timeout(fact_budget::FACT_BUDGET)
+                .await
+                .unwrap()
+                .1
         }
     };
 

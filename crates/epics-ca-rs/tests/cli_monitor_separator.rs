@@ -51,7 +51,7 @@ async fn first_line(port: u16, args: &[&str]) -> String {
             .spawn()
             .expect("spawn camonitor-rs");
         let collector = LineCollector::spawn(child.stdout.take().expect("piped stdout"));
-        let got = collector.wait_for(budget::FACT_BUDGET, |text| text.contains('\n'));
+        let got = collector.wait_for(fact_budget::FACT_BUDGET, |text| text.contains('\n'));
         child.kill().expect("kill camonitor-rs");
         let _ = child.wait();
         let text = collector.into_text();
@@ -113,5 +113,3 @@ async fn a_missing_timestamp_does_not_swallow_the_value_separator() {
         "NO_ALARM prints two empties"
     );
 }
-
-use common::budget;

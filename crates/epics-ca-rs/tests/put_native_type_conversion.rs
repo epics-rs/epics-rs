@@ -59,7 +59,7 @@ async fn server_with_bi(pv: &'static str) -> (CaClient, epics_ca_rs::client::CaC
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel(pv);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
     (client, ch)
@@ -91,7 +91,7 @@ async fn matching_enum_put_lands_index() {
 #[serial]
 async fn long_put_on_enum_native_converts() {
     let (_client, ch) = server_with_bi("PNC:BI:LONG").await;
-    ch.put_with_timeout(&EpicsValue::Long(1), budget::FACT_BUDGET)
+    ch.put_with_timeout(&EpicsValue::Long(1), fact_budget::FACT_BUDGET)
         .await
         .expect("put");
     assert_eq!(read_index(&ch).await, 1);
@@ -116,7 +116,7 @@ async fn nowait_long_put_on_enum_native_converts() {
     let (_client, ch) = server_with_bi("PNC:BI:NOWAIT").await;
     ch.put_nowait(&EpicsValue::Long(1)).await.expect("put");
 
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         if read_index(&ch).await == 1 {
             break;
@@ -125,6 +125,3 @@ async fn nowait_long_put_on_enum_native_converts() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
-
-#[path = "common/budget.rs"]
-mod budget;

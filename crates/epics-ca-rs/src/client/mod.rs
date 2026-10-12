@@ -291,7 +291,7 @@ impl OneShotChannelCache {
         }
 
         // Legacy one-shot API has no priority knob — default (0).
-        let channel = client.create_channel_expanded(pv_name.clone(), 0);
+        let channel = client.create_channel_expanded(pv_name.clone(), 0).0;
         self.channels.insert(pv_name.clone(), channel.clone());
         self.order.push_back(pv_name);
 
@@ -1160,6 +1160,18 @@ impl CaClient {
     /// Uses CA `priorityDefault` (0). To request a specific virtual-circuit
     /// priority, use [`Self::create_channel_with_priority`].
     pub fn create_channel(&self, name: &str) -> CaChannel {
+        self.create_channel_expanded(expand_pv_name(name), 0).0
+    }
+
+    /// [`Self::create_channel`] plus a [`CaChannel::connection_events`]
+    /// receiver that exists before the search starts — libca's
+    /// `ca_create_channel` connection callback. A receiver taken after
+    /// `create_channel` returns misses a connect that wins the race,
+    /// together with the access rights it carries.
+    pub fn create_channel_with_events(
+        &self,
+        name: &str,
+    ) -> (CaChannel, broadcast::Receiver<ConnectionEvent>) {
         self.create_channel_expanded(expand_pv_name(name), 0)
     }
 
@@ -1176,13 +1188,18 @@ impl CaClient {
     /// (`cac.cpp:512-520`).
     pub fn create_channel_with_priority(&self, name: &str, priority: u8) -> CaChannel {
         self.create_channel_expanded(expand_pv_name(name), priority.min(99))
+            .0
     }
 
-    fn create_channel_expanded(&self, pv_name: String, priority: u8) -> CaChannel {
+    fn create_channel_expanded(
+        &self,
+        pv_name: String,
+        priority: u8,
+    ) -> (CaChannel, broadcast::Receiver<ConnectionEvent>) {
         // reserve the cid against the live-set. Released by the
         // coordinator at `DropChannel` (the single channel-removal site).
         let cid = self.cid_alloc.allocate();
-        let (conn_tx, _) = broadcast::channel(16);
+        let (conn_tx, conn_rx) = broadcast::channel(16);
 
         // C `cac::createChannel` rejects empty names with
         // ECA_BADSTR, and `tcpiiu::createChannelRequest` rejects
@@ -1233,7 +1250,7 @@ impl CaClient {
             coord_tx: self.coord_tx.clone(),
         });
         let channel_pv_name: Arc<str> = Arc::from(pv_name.as_str());
-        CaChannel {
+        let channel = CaChannel {
             cid,
             pv_name: channel_pv_name,
             priority,
@@ -1248,7 +1265,8 @@ impl CaClient {
             user_data: Arc::new(Mutex::new(None)),
             _lifecycle: lifecycle,
             reactor: self.reactor.clone(),
-        }
+        };
+        (channel, conn_rx)
     }
 
     fn cached_one_shot_channel(&self, name: &str) -> CaChannel {

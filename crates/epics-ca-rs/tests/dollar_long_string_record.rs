@@ -20,9 +20,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-#[path = "common/budget.rs"]
-mod budget;
-
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::lsi::LsiRecord;
 use epics_base_rs::server::records::lso::LsoRecord;
@@ -34,7 +31,7 @@ use epics_ca_rs::server::CaServer;
 
 async fn connect(client: &CaClient, name: &str) -> CaChannel {
     let ch = client.create_channel(name);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{name} connects: {e:?}"));
     ch

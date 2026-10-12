@@ -76,7 +76,7 @@ async fn claimed_host_name_matches_a_host_hag_and_grants_write() {
     client.set_host_name("opi-01.lab");
 
     let ch = client.create_channel("SEC:VAL");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -109,7 +109,7 @@ async fn unlisted_host_name_is_denied_write() {
     client.set_host_name("intruder.example");
 
     let ch = client.create_channel("SEC:VAL");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -119,6 +119,3 @@ async fn unlisted_host_name_is_denied_write() {
         "a host outside HAG(ops) must not get WRITE; got {put:?}"
     );
 }
-
-#[path = "common/budget.rs"]
-mod budget;

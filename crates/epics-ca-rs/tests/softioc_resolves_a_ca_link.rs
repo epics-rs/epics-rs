@@ -9,8 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-#[path = "common/softioc_verdict.rs"]
-mod softioc_verdict;
+use named_port::verdict as softioc_verdict;
 
 /// What one softioc-rs on `db` and `port` printed, and the `dbgf H` line that
 /// showed 3.5 if any did. Ready is `iocRun: All initialization complete`,

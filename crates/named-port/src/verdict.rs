@@ -1,20 +1,12 @@
-#![allow(dead_code)] // Included by `#[path]` into suites that use only some of it.
 //! The verdict a spawned IOC's console carries about the port it was given —
 //! the retry trigger for a test that names that port, and nothing else.
-//!
-//! Its own file rather than a section of `common/mod.rs` so the test that
-//! pins it against C's real console text can include this and NOT the
-//! spawner: `tools/ioc-spawn-gate` derives "this binary spawns an IOC" by
-//! following the `mod` graph from the test root, and a pure string predicate
-//! that arrives carrying `Command::new("softIoc")` would have to be declared
-//! in a `.config/nextest.toml` test-group it has no business being in.
 
 /// C's report that the IOC is up: `iocRun` prints it after `iocBuild` has
 /// bound the server sockets and `rsrv_run` has started their threads
 /// (iocInit.c:272-273 at R7.0.10). Waiting for it replaces an 800 ms sleep,
 /// which was a bet on how much CPU the box would give `softIoc` while the
 /// rest of the suite ran.
-pub(crate) const IOC_IS_UP: &str = "iocRun: All initialization complete";
+pub const IOC_IS_UP: &str = "iocRun: All initialization complete";
 
 /// C's report that the port it was told to use belonged to somebody else.
 ///
@@ -27,13 +19,13 @@ pub(crate) const IOC_IS_UP: &str = "iocRun: All initialization complete";
 /// that C does not exit here — with the UDP port taken as well it reaches
 /// `cantProceed` in `rsrv_init` and *suspends*, so "the child is gone" is not
 /// the discriminator either.
-pub(crate) const PORT_WAS_TAKEN: &str = "cas WARNING: Configured TCP port was unavailable.";
+pub const PORT_WAS_TAKEN: &str = "cas WARNING: Configured TCP port was unavailable.";
 
 /// What a spawned `softIoc`'s stderr says about the port it was given.
 ///
-/// A separate function from [`softioc_on`] so the verdict can be pinned
+/// A separate function from the spawner so the verdict can be pinned
 /// against C's real console text: the alternative is a test that waits
-/// [`budget::FACT_BUDGET`] for a subject built to never speak.
+/// `fact_budget::FACT_BUDGET` for a subject built to never speak.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SoftIocVerdict {
     /// [`IOC_IS_UP`] — serving on the number it was given.
@@ -43,7 +35,7 @@ pub enum SoftIocVerdict {
     PortTaken,
     /// Neither line. **Not** a retry: a different port fixes none of the ways
     /// an IOC can be broken, and retrying here would turn a regression into
-    /// [`named_port::ATTEMPTS`] slow attempts and a misleading panic.
+    /// [`crate::ATTEMPTS`] slow attempts and a misleading panic.
     Silent,
 }
 

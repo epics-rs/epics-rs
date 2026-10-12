@@ -20,19 +20,11 @@
 
 #![cfg(tokio_backend)]
 
-use super::interop_helpers::PvxsOutput;
+use super::interop_helpers::{PvxsOutput, pvxs_command};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-
-fn env_key() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    }
-}
 
 fn locate_tls_binary(name: &str) -> Option<PathBuf> {
     if let Some(root) = super::interop_helpers::pvxs_tls_home() {
@@ -45,15 +37,6 @@ fn locate_tls_binary(name: &str) -> Option<PathBuf> {
         }
     }
     super::interop_helpers::locate_pvxs(name)
-}
-
-fn tls_lib_dir() -> Option<PathBuf> {
-    super::interop_helpers::pvxs_tls_home()
-        .map(|r| r.join("lib").join(super::interop_helpers::pvxs_arch()))
-}
-
-fn effective_lib_dir() -> PathBuf {
-    tls_lib_dir().unwrap_or_else(super::interop_helpers::pvxs_lib_dir)
 }
 
 /// Probe the located pvxs binary for TLS support. `pvxinfo -D` of
@@ -70,11 +53,8 @@ fn pvxs_has_tls() -> bool {
         // Absent prerequisite: no pvxs to probe.
         return false;
     };
-    let mut cmd = std::process::Command::new(&pvxinfo);
-    cmd.arg("-D")
-        .env(env_key(), effective_lib_dir())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = pvxs_command(&pvxinfo);
+    cmd.arg("-D").stdout(Stdio::piped()).stderr(Stdio::piped());
     // Located, so a refusal to run is a broken checkout, not a missing one.
     let out = cmd
         .pvxs_output()
@@ -226,9 +206,8 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
     let server_tcp_port = addr.port();
     let _ = server_str;
     let cert_path = p12_path.clone();
-    let lib = effective_lib_dir().into_os_string();
     let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&pvxget_p)
+        pvxs_command(&pvxget_p)
             .arg("-w")
             .arg("3")
             .arg("TLS:PV")
@@ -239,7 +218,6 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
             .env("EPICS_PVA_NAME_SERVERS", "")
             .env("EPICS_PVA_TLS_KEYCHAIN", cert_path.display().to_string())
             .env("EPICS_PVA_TLS_OPTIONS", "")
-            .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .pvxs_output()

@@ -514,15 +514,10 @@ impl CIoc {
                     let _ = child.wait();
                     return err_retryable(Side::C, format!("PORT_COLLISION on {port}: {line}"));
                 }
-                // `rsrv` lost the CA port on the UDP bind, which base does not
-                // report (`caservertask.c:131-146` returns silently on
-                // EADDRINUSE) and then turns fatal at `cantProceed("CAS: No
-                // TCP server started")`. A different port is exactly the
-                // remedy, so it retries rather than waiting out the timeout.
                 Ok(BootSignal::Died(said)) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return err_retryable(
+                    return err(
                         Side::C,
                         format!(
                             "C softIoc declared itself unable to proceed on port {port}; \
@@ -582,10 +577,20 @@ fn spawn_watcher(
             // Order matters: a collision line must not be mistaken for noise,
             // and it can appear *before* the ready line.
             let sig = if line.contains("can't proceed, suspending") {
-                BootSignal::Died(tail.text())
+                // rsrv lost the CA port on its UDP bind, which it does not
+                // report (`caservertask.c:131-146`), and gave up at :752.
+                if tail.text().contains("CAS: No TCP server started") {
+                    BootSignal::PortCollision(tail.text())
+                } else {
+                    BootSignal::Died(tail.text())
+                }
             } else if line.contains("Configured TCP port was unavailable")
                 || line.contains("two or more servers share the same UDP port")
-                || line.contains("Unable to bind")
+                // pvalink's client context (`client.cpp:581/594`), and the
+                // server's search port (`udp_collector.cpp:151`) as the pvxs
+                // registrar reports it (`iochooks.cpp:508`).
+                || line.contains("Unable to bind random UDP")
+                || line.contains("Error in pvxsBaseRegistrar : Address already in use")
             {
                 BootSignal::PortCollision(line.trim().to_string())
             } else if line.contains("iocRun: All initialization complete")
@@ -1163,11 +1168,12 @@ impl PvxIoc {
             .map_err(|e| BootError::new(Side::C, format!("spawn softIocPVX: {e}")))?;
 
         // Same ready watch as `CIoc`: softIocPVX prints base's `iocRun: All
-        // initialization complete`. Note what this does NOT buy us — a *PVA*
-        // search-port collision prints nothing at all (see `PvaPair::boot`),
-        // and with rsrv unregistered there is no CA side left to warn either.
-        // What it still catches is a death: `cantProceed` suspends the thread
-        // instead of exiting, so nothing else would ever end the wait.
+        // initialization complete`. A search port held by a socket without
+        // `SO_REUSEPORT` prints the registrar's `Address already in use`
+        // before it, and the IOC then runs with no PVA server; one held by
+        // another pvxs server prints nothing at all (see `PvaPair::boot`).
+        // It also catches a death: `cantProceed` suspends the thread instead
+        // of exiting, so nothing else would ever end the wait.
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let (tx, rx) = mpsc::channel::<BootSignal>();
@@ -1199,7 +1205,7 @@ impl PvxIoc {
                 Ok(BootSignal::Died(said)) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return err_retryable(
+                    return err(
                         Side::C,
                         format!(
                             "softIocPVX declared itself unable to proceed on UDP {udp}; \
@@ -1522,23 +1528,59 @@ mod tests {
     /// reported a *reachability* failure for a process that had already said
     /// it was dead.
     #[test]
-    fn a_cant_proceed_banner_is_a_death_not_noise() {
+    fn a_cant_proceed_on_a_lost_ca_port_is_a_collision() {
         let signals = classify(concat!(
             "CAS: No TCP server started\n",
             "CRITICAL ERROR Thread _main_ (0x7f0e4c0010a0) can't proceed, suspending.\n",
         ));
-        let died = signals
+        let lost = signals
             .iter()
             .filter_map(|s| match s {
-                BootSignal::Died(said) => Some(said.clone()),
+                BootSignal::PortCollision(said) => Some(said.clone()),
                 _ => None,
             })
             .next()
-            .expect("the fatal banner must be reported as a death");
+            .expect("the lost CA port must be reported as a collision");
         assert!(
-            died.contains("CAS: No TCP server started"),
-            "the death must quote what led to it, got {died:?}"
+            lost.contains("CAS: No TCP server started"),
+            "the collision must quote what led to it, got {lost:?}"
         );
+    }
+
+    /// Boundary — any other `cantProceed` is a death, which no fresh port
+    /// cures, so a boot loop must not take one.
+    #[test]
+    fn any_other_cant_proceed_is_a_death() {
+        let signals = classify(concat!(
+            "dbLoadRecords: failed\n",
+            "CRITICAL ERROR Thread _main_ (0x7f0e4c0010a0) can't proceed, suspending.\n",
+        ));
+        assert!(
+            signals.iter().any(|s| matches!(s, BootSignal::Died(_))),
+            "{:?}",
+            signals.len()
+        );
+        assert!(
+            !signals
+                .iter()
+                .any(|s| matches!(s, BootSignal::PortCollision(_)))
+        );
+    }
+
+    /// The two lost-port lines softIocPVX prints, verbatim, are collisions.
+    #[test]
+    fn a_softiocpvx_lost_port_is_a_collision() {
+        for line in [
+            "terminate called after throwing an instance of 'std::runtime_error'\n  what():  Unable to bind random UDP6 port\n",
+            "Error in pvxsBaseRegistrar : Address already in use\n",
+        ] {
+            assert!(
+                classify(line)
+                    .iter()
+                    .any(|s| matches!(s, BootSignal::PortCollision(_))),
+                "{line:?}"
+            );
+        }
     }
 
     /// Boundary — base's *recovered* collision. rsrv prints this when it

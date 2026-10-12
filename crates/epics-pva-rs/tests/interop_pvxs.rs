@@ -78,6 +78,9 @@ mod search_prefix;
 #[path = "interop_pvxs_mods/server_ports_env.rs"]
 mod server_ports_env;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/start_pvxs_rule.rs"]
+mod start_pvxs_rule;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
 #[cfg(all(unix, feature = "tls"))]

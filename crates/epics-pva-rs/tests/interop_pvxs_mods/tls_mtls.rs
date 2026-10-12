@@ -10,19 +10,11 @@
 
 #![cfg(tokio_backend)]
 
-use super::interop_helpers::PvxsOutput;
+use super::interop_helpers::{PvxsOutput, pvxs_command};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-
-fn env_key() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    }
-}
 
 fn locate_tls_binary(name: &str) -> Option<PathBuf> {
     super::interop_helpers::pvxs_tls_home().and_then(|r| {
@@ -34,19 +26,10 @@ fn locate_tls_binary(name: &str) -> Option<PathBuf> {
     })
 }
 
-fn tls_lib_dir() -> Option<PathBuf> {
-    super::interop_helpers::pvxs_tls_home()
-        .map(|r| r.join("lib").join(super::interop_helpers::pvxs_arch()))
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
     let Some(pvxget) = locate_tls_binary("pvxget") else {
         eprintln!("SKIP: no TLS-enabled pvxs (set PVXS_TLS_HOME; see batch 12)");
-        return;
-    };
-    let Some(lib) = tls_lib_dir() else {
-        eprintln!("SKIP: pvxs-tls lib dir missing");
         return;
     };
 
@@ -174,9 +157,8 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
 
     let pvxget_p = pvxget.clone();
     let cert_path = p12_path.clone();
-    let lib_os = lib.into_os_string();
     let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&pvxget_p)
+        pvxs_command(&pvxget_p)
             .arg("-w")
             .arg("3")
             .arg("MTLS:PV")
@@ -187,7 +169,6 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
             .env("EPICS_PVA_NAME_SERVERS", "")
             .env("EPICS_PVA_TLS_KEYCHAIN", cert_path.display().to_string())
             .env("EPICS_PVA_TLS_OPTIONS", "")
-            .env(env_key(), lib_os)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .pvxs_output()

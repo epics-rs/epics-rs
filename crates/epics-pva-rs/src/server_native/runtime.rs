@@ -1403,14 +1403,21 @@ mod tcp_fallback_tests {
         use std::net::{Ipv6Addr, SocketAddrV6};
 
         // Take a port from the OS and hand the number back as a *configured*
-        // one, so the test never guesses at a free port.
-        let udp_port = {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .expect("isolated udp port");
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
+        // one, so the test never guesses at a free port. The server binds it
+        // on UDP4 and on UDP6, so it is taken where it is free on both.
+        let udp_port = (0..64)
+            .find_map(|_| {
+                // v6-only, as the responder binds it; a dual-stack socket
+                // would itself hold the UDP4 number.
+                let v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+                v6.set_only_v6(true).ok()?;
+                v6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into())
+                    .ok()?;
+                let p = v6.local_addr().ok()?.as_socket()?.port();
+                std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, p)).ok()?;
+                Some(p)
+            })
+            .expect("a udp port free on both families");
 
         let pv = crate::server_native::SharedPV::new();
         pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();

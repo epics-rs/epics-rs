@@ -7,7 +7,7 @@
 //! binary another test process was about to `exec` and the run died with
 //! `Text file busy`.
 
-// No exec-model census marker: the file's one test is a plain `#[test]`, so there is no reactor-dependent site here for a marker to vouch for.
+// No exec-model census marker: the file's tests are plain `#[test]`s, so there is no reactor-dependent site here for a marker to vouch for.
 
 use super::interop_helpers::{ReadyFile, helper_out_dir, require_cxx};
 
@@ -67,4 +67,31 @@ fn ready_files_are_unique_and_private_to_this_checkout() {
     assert!(a.is_up());
     drop(a);
     assert!(!path.exists(), "Drop did not remove {path:?}");
+}
+
+/// A binary from another pvxs tree (the TLS one) loads that tree's libpvxs,
+/// not [`super::interop_helpers::pvxs_lib_dir`]'s.
+#[test]
+fn a_pvxs_command_loads_the_lib_dir_of_its_own_tree() {
+    let arch = super::interop_helpers::pvxs_arch();
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib").join(arch);
+    std::fs::create_dir_all(&lib).unwrap();
+    let bin = root.path().join("bin").join(arch).join("pvxget");
+    let var = if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
+    let cmd = super::interop_helpers::pvxs_command(&bin);
+    let set = cmd
+        .get_envs()
+        .find(|(k, _)| *k == var)
+        .and_then(|(_, v)| v)
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert!(
+        set.split(':').next() == Some(&*lib.to_string_lossy()),
+        "{var}={set:?}, not led by {lib:?}"
+    );
 }

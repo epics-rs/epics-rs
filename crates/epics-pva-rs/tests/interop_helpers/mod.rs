@@ -201,25 +201,32 @@ pub fn require_pvxs_tls() -> bool {
 /// How many times a pvxs process is started before its failure stands.
 const RANDOM_UDP_ATTEMPTS: usize = 8;
 
-/// Whether a pvxs process's output shows its client context failing to bind
-/// its search socket.
+/// Whether a pvxs process's output shows it lost a port to another socket,
+/// the only failure a fresh attempt is allowed to absorb.
 ///
-/// pvxs binds a random UDP4 port, then the same port on UDP6
-/// (`client.cpp:576-594`), and no variable skips the second bind; on a busy
-/// host the port can be taken on UDP6 alone. The context throws before it
-/// sends anything, so a rerun on a fresh port repeats nothing. Every process
-/// linked to pvxs that builds a client — the tools, softIocPVX's pvalink, a
-/// client helper — is rerun on it through [`rerun_pvxs`] or [`start_pvxs`].
-fn context_bind_failed(text: &str) -> bool {
+/// - `Unable to bind random UDP`: a client context binds a random UDP4 port,
+///   then the same port on UDP6 (`client.cpp:576-594`), and no variable skips
+///   the second bind. It throws before sending anything. Every process that
+///   builds a client prints it: the tools, softIocPVX's pvalink, a client
+///   helper.
+/// - `Error in pvxsBaseRegistrar : Address already in use`: softIocPVX's
+///   server binds the search port a test picked and released
+///   (`server.cpp:422`, `udp_collector.cpp:151`) at registration, and the
+///   registrar prints the throw (`iochooks.cpp:508`) and serves nothing.
+/// - `Server unable to bind port`: a server's picked TCP port was taken, and
+///   it serves on another one (`serverconn.cpp:443-463`).
+pub fn port_collision(text: &str) -> bool {
     text.contains("Unable to bind random UDP")
+        || text.contains("Error in pvxsBaseRegistrar : Address already in use")
+        || text.contains("Server unable to bind port")
 }
 
 /// Run `attempt` until the output `text` reads from its result does not show
-/// [`context_bind_failed`], at most [`RANDOM_UDP_ATTEMPTS`] times.
+/// [`port_collision`], at most [`RANDOM_UDP_ATTEMPTS`] times.
 pub fn rerun_pvxs<T>(mut attempt: impl FnMut() -> T, text: impl Fn(&T) -> String) -> T {
     for _ in 1..RANDOM_UDP_ATTEMPTS {
         let out = attempt();
-        if !context_bind_failed(&text(&out)) {
+        if !port_collision(&text(&out)) {
             return out;
         }
     }
@@ -265,20 +272,45 @@ impl PvxsLogs {
             .map(|f| std::fs::read_to_string(f).unwrap_or_default())
             .join("\n")
     }
+
+    /// Where attempt `n`'s logs are kept once a later attempt replaces it.
+    pub fn kept(&self, n: usize) -> Self {
+        let tag = |p: &Path| PathBuf::from(format!("{}.{n}", p.display()));
+        Self {
+            out: tag(&self.out),
+            err: tag(&self.err),
+        }
+    }
+
+    /// The logs and every attempt's kept copy.
+    pub fn remove_all(&self) {
+        for logs in (1..=RANDOM_UDP_ATTEMPTS).map(|n| self.kept(n)) {
+            let _ = std::fs::remove_file(&logs.out);
+            let _ = std::fs::remove_file(&logs.err);
+        }
+        let _ = std::fs::remove_file(&self.out);
+        let _ = std::fs::remove_file(&self.err);
+    }
 }
 
 /// Start a long-running pvxs process: `build` makes one attempt's command and
 /// the value `ready` is judged against, and the process is returned once
-/// `ready` holds on its logs. An attempt that shows [`context_bind_failed`] or
-/// `Address already in use`, exits, or is not ready within 5 s is killed and
-/// built afresh, at most [`RANDOM_UDP_ATTEMPTS`] times; the last attempt's logs
-/// are the error.
+/// `ready` holds on its logs. Only a [`port_collision`] is built afresh, at
+/// most [`RANDOM_UDP_ATTEMPTS`] times, its logs kept at [`PvxsLogs::kept`]; an
+/// exit or 5 s without `ready` is the error, with its whole output.
 pub fn start_pvxs<T>(
     logs: &PvxsLogs,
     mut build: impl FnMut() -> (Command, T),
     mut ready: impl FnMut(&T, &str) -> bool,
 ) -> Result<(DropChild, T), String> {
-    for _ in 0..RANDOM_UDP_ATTEMPTS {
+    let mut kept = Vec::new();
+    let mut last = String::new();
+    let fail = |why: String, text: String, kept: &[PathBuf]| {
+        Err(format!(
+            "{why}; earlier attempts' logs: {kept:?}\n--- output ---\n{text}"
+        ))
+    };
+    for n in 1..=RANDOM_UDP_ATTEMPTS {
         let (mut cmd, value) = build();
         let child = cmd
             .stdout(std::fs::File::create(&logs.out).expect("create stdout log"))
@@ -286,21 +318,38 @@ pub fn start_pvxs<T>(
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {:?}: {e}", cmd.get_program()));
         let mut proc = DropChild { child };
-        for _ in 0..50 {
+        let mut polls = 0;
+        loop {
+            // Exit first, so the text read after it is the whole output.
+            let exit = proc.child.try_wait().ok().flatten();
             let text = logs.text();
-            if ready(&value, &text) {
+            if port_collision(&text) {
+                last = text;
+                break;
+            }
+            if exit.is_none() && ready(&value, &text) {
                 return Ok((proc, value));
             }
-            if context_bind_failed(&text)
-                || text.contains("Address already in use")
-                || proc.child.try_wait().is_ok_and(|s| s.is_some())
-            {
-                break;
+            if let Some(status) = exit {
+                return fail(format!("attempt {n} exited: {status}"), text, &kept);
+            }
+            polls += 1;
+            if polls == 50 {
+                return fail(format!("attempt {n} not ready within 5 s"), text, &kept);
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        drop(proc);
+        let to = logs.kept(n);
+        std::fs::rename(&logs.out, &to.out).expect("keep stdout log");
+        std::fs::rename(&logs.err, &to.err).expect("keep stderr log");
+        kept.extend([to.out, to.err]);
     }
-    Err(logs.text())
+    fail(
+        format!("all {RANDOM_UDP_ATTEMPTS} attempts lost a port"),
+        last,
+        &kept,
+    )
 }
 
 /// An IOC is ready once iocInit has ended and `addr` accepts. The listen
@@ -312,11 +361,17 @@ pub fn ioc_ready(addr: &std::net::SocketAddr, text: &str) -> bool {
 }
 
 /// Build a `Command` for a pvxs binary, with `DYLD_LIBRARY_PATH`
-/// (macOS) / `LD_LIBRARY_PATH` (linux) extended with the bundled
-/// libpvxs directory so the binary loads cleanly.
+/// (macOS) / `LD_LIBRARY_PATH` (linux) extended with the libpvxs directory
+/// of the tree it came from — `<root>/lib/<arch>` beside `<root>/bin/<arch>`,
+/// so a [`pvxs_tls_home`] binary loads its own — else [`pvxs_lib_dir`].
 pub fn pvxs_command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
-    let lib = pvxs_lib_dir();
+    let lib = bin
+        .ancestors()
+        .nth(3)
+        .map(|root| root.join("lib").join(pvxs_arch()))
+        .filter(|lib| lib.is_dir())
+        .unwrap_or_else(pvxs_lib_dir);
     if lib.is_dir() {
         let var = if cfg!(target_os = "macos") {
             "DYLD_LIBRARY_PATH"
@@ -373,7 +428,7 @@ pub fn spawn_soft_ioc_pvx(ioc_bin: &Path, db: &Path, dir: &Path) -> (DropChild, 
 
 /// [`start_pvxs`] for a `cpp_helpers` server, ready once it writes `ready`,
 /// and the port it serves. Its logs go next to the ready file and are gone
-/// once it is up.
+/// once it is up; a failed start leaves them for the error to name.
 pub fn start_cpp_server(helper: &Path, ready: &ReadyFile, extra: &[&str]) -> (DropChild, u16) {
     let logs = PvxsLogs {
         out: ready.path().with_extension("out"),
@@ -392,8 +447,9 @@ pub fn start_cpp_server(helper: &Path, ready: &ReadyFile, extra: &[&str]) -> (Dr
         (cmd, port)
     };
     let started = start_pvxs(&logs, build, |_, _| ready.is_up());
-    let _ = std::fs::remove_file(&logs.out);
-    let _ = std::fs::remove_file(&logs.err);
+    if started.is_ok() {
+        logs.remove_all();
+    }
     match started {
         Ok(started) => started,
         Err(text) => panic!("{} did not become ready:\n{text}", helper.display()),

@@ -303,6 +303,11 @@ impl Record for TimestampRecord {
     fn clears_udf(&self) -> bool {
         true
     }
+
+    /// C `monitor()` posts VAL and RVAL alone (`timestampRecord.c:158-162`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "RVAL"])
+    }
 }
 
 #[cfg(test)]

@@ -125,6 +125,10 @@ name = "asyn_monitor_posts_its_read_fields"
 required-features = ["epics"]
 
 [[test]]
+name = "asyn_portless_errs_posts_once"
+required-features = ["epics"]
+
+[[test]]
 name = "enum_property_post_mask"
 required-features = ["epics"]
 

@@ -14,10 +14,6 @@ pub(crate) struct RoiPass {
     /// An armed region reached its preset count — C's `*preset_reached`, which
     /// makes `process` stop acquisition (`mcaRecord.c:797-800`).
     pub preset_reached: bool,
-    /// The regions whose `sum` or `net` MOVED this pass. C marks these in `rmap`
-    /// and posts `R{i}`/`R{i}N` for each (`mcaRecord.c:397`, `:1030-1035`); the
-    /// port hands them to the framework's post list.
-    pub changed: Vec<usize>,
 }
 
 impl McaRecord {
@@ -140,7 +136,6 @@ impl McaRecord {
 
         let mut pass = RoiPass {
             preset_reached: false,
-            changed: Vec::new(),
         };
 
         for i in 0..NUM_ROI {
@@ -150,6 +145,8 @@ impl McaRecord {
             let mut net = 0.0;
 
             if lo >= 0 && hi >= lo {
+                // C marks BG for every summed region, background or not (`:395`).
+                self.mmap |= super::cycle::M_BG;
                 let (bg_lo, bg_hi) = if nbg >= 0 {
                     let n = nbg as i32;
                     (
@@ -180,8 +177,9 @@ impl McaRecord {
             }
 
             let roi = &mut self.roi[i];
+            // C `ROI_MARK(M_R0<<i)` (`:397`): `monitor()` posts both sums.
             if sum != roi.sum || net != roi.net {
-                pass.changed.push(i);
+                self.rmap |= 1 << i;
             }
             roi.sum = sum;
             roi.net = net;

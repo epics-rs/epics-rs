@@ -18,7 +18,8 @@ use std::time::SystemTime;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    CommonFields, FieldDesc, FieldMetadataOverride, Ftype, ProcessAction, ProcessOutcome, Record,
+    CommonFields, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, Ftype,
+    ProcessAction, ProcessOutcome, Record, uniform_post_table,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
@@ -184,11 +185,10 @@ pub struct McaRecord {
     pub sims: u16,
 
     /// `MMAP` / `RMAP` — C's per-cycle "post this field" bitmaps
-    /// (`mcaRecord.c:221-306`). They exist in C because a C record must call
-    /// `db_post_events` itself; the port's framework owns posting, so nothing
-    /// writes these. C clears both at the end of every `monitor()`
-    /// (`UNMARK_ALL`), so a client has never been able to observe them as
-    /// anything but zero — see [`Record::get_field`].
+    /// (`mcaRecord.c:221-306`). `MMAP` carries C's own MARK bits, which
+    /// `take_cycle_posted_fields` turns into posts and clears, as C's
+    /// `monitor()` ends with `UNMARK_ALL`, and `RMAP` C's `ROI_MARK` bits,
+    /// cleared as `ROI_UNMARK_ALL` does; so a client still reads both as zero.
     pub mmap: u32,
     pub rmap: u32,
     /// `NEWV` — the setup fields written since the last process, which the next
@@ -283,6 +283,40 @@ impl Default for McaRecord {
         }
     }
 }
+
+/// Everything a cycle may post, in C `monitor()`'s order (`mcaRecord.c:1013-
+/// 1037`): VAL, the MMAP fields, each region's sum and net, ACQG last. RDNG,
+/// which C marks only on a read callback the port has no path for, is absent.
+const PROCESS_POSTED: [&str; 80] = [
+    "VAL", "BG", "NACK", "READ", "ERTM", "ELTM", "ACT", "STRT", "STOP", "STIM", "RTIM", "DWEL",
+    "DTIM", "IDTIM", "NORD", "R0", "R0N", "R1", "R1N", "R2", "R2N", "R3", "R3N", "R4", "R4N", "R5",
+    "R5N", "R6", "R6N", "R7", "R7N", "R8", "R8N", "R9", "R9N", "R10", "R10N", "R11", "R11N", "R12",
+    "R12N", "R13", "R13N", "R14", "R14N", "R15", "R15N", "R16", "R16N", "R17", "R17N", "R18",
+    "R18N", "R19", "R19N", "R20", "R20N", "R21", "R21N", "R22", "R22N", "R23", "R23N", "R24",
+    "R24N", "R25", "R25N", "R26", "R26N", "R27", "R27N", "R28", "R28N", "R29", "R29N", "R30",
+    "R30N", "R31", "R31N", "ACQG",
+];
+/// `PROCESS_POSTED` past VAL, each a mark; VAL goes through
+/// `monitor_value_changed`.
+const MONITOR_POSTS: [(&str, CyclePostMask); 79] =
+    uniform_post_table(PROCESS_POSTED.split_at(1).1, CyclePostMask::MonitorValueLog);
+/// The MMAP bit of each `MONITOR_POSTS` entry ahead of the regions.
+const MONITOR_BITS: [u32; 14] = [
+    cycle::M_BG,
+    cycle::M_NACK,
+    cycle::M_READ,
+    cycle::M_ERTM,
+    cycle::M_ELTM,
+    cycle::M_ACT,
+    cycle::M_STRT,
+    cycle::M_STOP,
+    cycle::M_STIM,
+    cycle::M_RTIM,
+    cycle::M_DWEL,
+    cycle::M_DTIM,
+    cycle::M_IDTIM,
+    cycle::M_NORD,
+];
 
 /// A field name that addresses one member of one region: `R7LO` -> `(7, "LO")`,
 /// `R31` -> `(31, "")`, `R0NM` -> `(0, "NM")`.
@@ -873,6 +907,7 @@ impl Record for McaRecord {
         // one, because both are on the hot path of a scan.
         if bit == cycle::NEWV_NUSE {
             self.read = 1;
+            self.mmap |= cycle::M_READ;
         }
         Ok(())
     }
@@ -901,13 +936,56 @@ impl Record for McaRecord {
         // NOW the record admits acquisition has stopped: the final spectrum is
         // in, its ROI sums are computed, and both will be posted by this same
         // cycle's monitor pass (C `:803-806` and the comment at `:736-738`).
-        self.acqg = u16::from(self.status.acquiring);
+        let acqg = u16::from(self.status.acquiring);
+        if self.acqg != acqg {
+            self.acqg = acqg;
+            self.mmap |= cycle::M_ACQG;
+        }
 
         if self.acqg == 0 {
             self.stim = PvString::from(cycle::format_stim(SystemTime::now()).as_str());
+            self.mmap |= cycle::M_STIM;
         }
 
         Ok(ProcessOutcome::complete_with(actions))
+    }
+
+    /// C posts VAL only when it was marked, alarm transition or not (`:1013`).
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        Some(self.mmap & cycle::M_VAL != 0)
+    }
+
+    fn alarm_alone_posts_value(&self) -> bool {
+        false
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        let mmap = std::mem::take(&mut self.mmap);
+        let rmap = std::mem::take(&mut self.rmap);
+        let mut bits = 0u128;
+        for (i, bit) in MONITOR_BITS.iter().enumerate() {
+            if mmap & bit != 0 {
+                bits |= 1 << i;
+            }
+        }
+        // C posts a marked region's sum and net both (`:1030-1035`).
+        for i in 0..NUM_ROI {
+            if rmap & (1 << i) != 0 {
+                bits |= 0b11 << (MONITOR_BITS.len() + 2 * i);
+            }
+        }
+        if mmap & cycle::M_ACQG != 0 {
+            bits |= 1 << (MONITOR_POSTS.len() - 1);
+        }
+        CycleMarks::of(&MONITOR_POSTS, bits)
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        PROCESS_POSTED.split_at(1).1
+    }
+
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&PROCESS_POSTED)
     }
 
     /// C `mcaAlarm` (`:962-1003`) — the analog ladder runs on `IDTIM`, the

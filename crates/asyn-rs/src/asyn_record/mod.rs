@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(12): checked, not waived — all 12 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(13): checked, not waived — all 13 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1091/1091). asyn-rs became a census subject when its
+// --all-features`, 1124/1124). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -4913,16 +4913,6 @@ impl AsynRecord {
             self.monitor_status();
         }
 
-        // Every fresh (`pact == FALSE`) process clears ERRS before it decides
-        // what to do: C `process()` calls `resetError` at the top of its idle
-        // branch (asynRecord.c:339) and the callback it queues calls it again on
-        // entry (:817) — both *above* the UCMD / ACMD / TMOD dispatch. So a
-        // record that failed a transfer and is then scanned with TMOD=NoIO comes
-        // back with an empty ERRS; the message does not outlive the cycle that
-        // raised it. This port merges C's process and its callback, so one reset
-        // here is both of C's.
-        self.reset_error();
-
         // C dispatches on `state` FIRST, and the nesting is load-bearing:
         // `process()` is an if / else-if chain on `state` (asynRecord.c:331-361)
         // whose `stateIdle` arm holds everything else. `stateNoDevice` — the
@@ -4947,6 +4937,16 @@ impl AsynRecord {
         // `monitor()`. A portless record skips it, so C re-posts such a put.
         let old = &mut self.monitor_old;
         (old.ucmd, old.acmd, old.nowt, old.nrrd) = (self.ucmd, self.acmd, self.nowt, self.nrrd);
+
+        // Every idle process clears ERRS before it decides what to do: C
+        // `process()` calls `resetError` in its `stateIdle` arm (asynRecord.c:339)
+        // and the callback it queues calls it again on entry (:817) — both
+        // *above* the UCMD / ACMD / TMOD dispatch. So a record that failed a
+        // transfer and is then scanned with TMOD=NoIO comes back with an empty
+        // ERRS. This port merges C's process and its callback, so one reset here
+        // is both of C's. The `stateNoDevice` refusal above does not reset: its
+        // unchanged text posts nothing.
+        self.reset_error();
 
         // C `process()`, inside the `stateIdle` arm: "If we got value from
         // interrupt no need to read" (asynRecord.c:340-341) —
@@ -9543,6 +9543,34 @@ mod tests {
         );
         handle.set_can_block(true);
         crate::registry::PortEntry { handle }
+    }
+
+    /// C clears ERRS only in `process()`'s `stateIdle` arm (asynRecord.c:339);
+    /// the `stateNoDevice` arm only reports (:355-357), unchanged text posting
+    /// nothing. A steady portless cycle therefore publishes nothing at all.
+    #[tokio::test]
+    async fn a_steady_portless_cycle_publishes_nothing() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let mut rec = AsynRecord::default();
+        let db = PvDatabase::new();
+        rec.async_ctx = Some(("AS".to_string(), db.async_handle()));
+        rec.process().unwrap();
+        for _ in 0..2000 {
+            if !rec.post_slot.lock().unwrap().armed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(rec.errs, "Not connect to a port");
+
+        rec.process().unwrap();
+        let slot = rec.post_slot.lock().unwrap();
+        assert!(
+            !slot.armed && slot.pending.is_empty(),
+            "a cycle whose ERRS text did not move published {:?}",
+            slot.pending.iter().map(|(f, _)| f).collect::<Vec<_>>()
+        );
     }
 
     /// Boundary: a `can_block` port with a live async context defers `performIO`

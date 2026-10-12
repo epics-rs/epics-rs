@@ -6,8 +6,9 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, CycleHooks, FieldDesc, FieldMetadataOverride, LinkType,
-    ProcessAction, ProcessActions, ProcessContext, ProcessOutcome, Record, link_field_type,
+    AlarmSeverity, CommonFields, CycleCell, CycleHooks, CycleMarks, CyclePostMask, CycleRead,
+    CycleValue, FieldDesc, FieldMetadataOverride, LinkType, ProcessAction, ProcessActions,
+    ProcessContext, ProcessOutcome, Record, link_field_type,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -196,6 +197,9 @@ pub struct EpidRecord {
     /// raised. The framework `check_alarms` hook reads this flag and
     /// applies the severity via `recGblSetSevr`.
     pub inp_constant: bool,
+    /// The `MONITOR_POSTS` entries whose field moved off its own old copy this
+    /// cycle, taken by `take_cycle_posted_fields`.
+    monitor_marks: u128,
     /// The `dbCommon.udf` byte, pushed by the framework via
     /// [`Record::set_process_context`] immediately before `process()`.
     /// C `epidRecord.c:195` skips `do_pid` only while `udf == TRUE`. The
@@ -321,6 +325,7 @@ impl Default for EpidRecord {
             ctp: now,
             device_did_compute: false,
             inp_constant: false,
+            monitor_marks: 0,
             async_callback: false,
             udf: 1,
             udfs: AlarmSeverity::Invalid,
@@ -425,25 +430,33 @@ impl EpidRecord {
         self.outl_write = write;
     }
 
-    /// Update monitor tracking fields. Returns list of fields that changed.
-    /// Ported from epidRecord.c `monitor()`.
+    /// C `monitor()`'s secondaries (`epidRecord.c:376-408`): each posts when it
+    /// differs from its own old copy, never from the value last published, and
+    /// the copy then takes it.
     pub fn update_monitors(&mut self) {
-        // Update previous-value fields for change detection
-        self.ovlp = self.oval;
-        self.pp = self.p;
-        self.ip = self.i;
-        self.dp = self.d;
-        self.dtp = self.dt;
-        self.errp = self.err;
-        self.cvlp = self.cval;
+        let pairs = [
+            (self.oval, &mut self.ovlp),
+            (self.p, &mut self.pp),
+            (self.i, &mut self.ip),
+            (self.d, &mut self.dp),
+            (self.dt, &mut self.dtp),
+            (self.err, &mut self.errp),
+            (self.cval, &mut self.cvlp),
+        ];
+        for (bit, (field, old)) in pairs.into_iter().enumerate() {
+            if *old != field {
+                self.monitor_marks |= 1 << bit;
+                *old = field;
+            }
+        }
 
         // VAL deadband baselines (MLST/ALST) are NOT advanced here. C
         // `epidRecord.c:346-374` `monitor()` computes `delta = mlst - val`,
         // posts VAL when `delta > mdel`, and only THEN sets `mlst = val`
         // — the post and the advance are one owner. In Rust that owner is
         // the framework's `check_deadband_ext`: it reads MLST, fires the
-        // VAL monitor, then advances `mlst`/`alst` via
-        // `store_monitor_last_posted`. Advancing
+        // VAL monitor, then advances `mlst`/`alst` through
+        // `Record::put_cycle_cell`. Advancing
         // them here (before that runs) made the framework see a zero delta
         // and silently suppress every VAL post. `update_monitors` owns only
         // the epid-specific previous-value fields above (`pp`/`ip`/`dp`/
@@ -451,9 +464,48 @@ impl EpidRecord {
     }
 }
 
+/// C `monitor()`'s secondaries in its post order (`epidRecord.c:376-408`), the
+/// bit order of `EpidRecord::update_monitors`. `:376` REASSIGNS `monitor_mask =
+/// DBE_LOG|DBE_VALUE`, so unlike VAL they carry no alarm bits. `CT` is
+/// `DBF_NOACCESS` (`epidRecord.dbd:226`) and has no CA-visible field.
+const MONITOR_POSTS: [(&str, CyclePostMask); 7] = [
+    ("OVAL", CyclePostMask::ValueLog),
+    ("P", CyclePostMask::ValueLog),
+    ("I", CyclePostMask::ValueLog),
+    ("D", CyclePostMask::ValueLog),
+    ("DT", CyclePostMask::ValueLog),
+    ("ERR", CyclePostMask::ValueLog),
+    ("CVAL", CyclePostMask::ValueLog),
+];
+
+const PROCESS_POSTED: [&str; 8] = ["VAL", "OVAL", "P", "I", "D", "DT", "ERR", "CVAL"];
+
 impl Record for EpidRecord {
     fn record_type(&self) -> &'static str {
         "epid"
+    }
+
+    /// MLST and ALST are `SPC_NOMOD` to a client, so `put_field` refuses them;
+    /// the deadband's advance comes through here instead. Without it MLST
+    /// stayed 0 and a held VAL posted on every cycle.
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            _ => CycleRead::ByName,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     /// `epidRecord.c:238-261` and `:263-286` are one switch with TWO windows,
@@ -644,17 +696,19 @@ impl Record for EpidRecord {
         }
     }
 
-    /// C `epidRecord.c:376` REASSIGNS `monitor_mask = DBE_LOG|DBE_VALUE` after
-    /// VAL's own post, so every secondary the rest of `monitor()` posts
-    /// (:377-406) carries a LITERAL `DBE_VALUE | DBE_LOG` — this cycle's alarm
-    /// bits are discarded, unlike VAL's post (:373), which keeps them. A
-    /// `DBE_ALARM`-only subscriber on `.OVAL`/`.P`/`.I`/... is therefore
-    /// notified on no cycle at all.
-    ///
-    /// C's list is OVAL, P, I, D, CT, DT, ERR, CVAL; `CT` is `DBF_NOACCESS`
-    /// (`epidRecord.dbd:226`) and has no CA-visible field, leaving these seven.
-    fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
-        &["OVAL", "P", "I", "D", "DT", "ERR", "CVAL"]
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        CycleMarks::of(&MONITOR_POSTS, std::mem::take(&mut self.monitor_marks))
+    }
+
+    /// `monitor()` posts VAL and its secondaries alone.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&PROCESS_POSTED)
+    }
+
+    /// The secondaries post from their own old copies, so a put that moved one
+    /// must not make the next cycle's walk post it again.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &PROCESS_POSTED[1..]
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

@@ -21,9 +21,8 @@
 //! The port had no way to say that: `value_only_change_fields` strips `DBE_LOG`
 //! and `fields_posted_with_monitor_mask` inherits VAL's deadband mask — both
 //! keep the alarm bits. The generic change loop therefore posted every epid
-//! secondary with `alarm_bits | DBE_VALUE | DBE_LOG`. The fix is a third
-//! declaration, `Record::fields_posted_without_alarm_bits`, resolved by the same
-//! single owner (`AuxPostMask`) as the other two.
+//! secondary with `alarm_bits | DBE_VALUE | DBE_LOG`. epid now marks each
+//! secondary from `monitor()`'s own old copies with `CyclePostMask::ValueLog`.
 
 // RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed
 // on the exec backend (measured on this tree:

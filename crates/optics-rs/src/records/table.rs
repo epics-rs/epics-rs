@@ -2367,6 +2367,13 @@ const TABLE_VALUE_ONLY_FIELDS: &[&str] = &[
     "LVIO", "SYNC", "INIT", "ZERO", "READ", "SET", "AEGU",
 ];
 
+/// What a process cycle posts: `monitor()`'s arrays and LVIO, and the SYNC,
+/// INIT, ZERO or READ `process()` clears (tableRecord.c:449-503, :882-915).
+/// SET and AEGU, last above, post only from `special()`.
+const TABLE_PROCESS_POSTED: &[&str] = TABLE_VALUE_ONLY_FIELDS
+    .split_at(TABLE_VALUE_ONLY_FIELDS.len() - 2)
+    .0;
+
 /// Angle-class fields for which C `tableRecord.c::get_units` reports the
 /// angular engineering units `aegu` (tableRecord.c:758-768); every other
 /// field reports the linear units `legu` (the default branch, :770).
@@ -3232,6 +3239,12 @@ impl Record for TableRecord {
     /// `DBE_VALUE` (no `DBE_LOG`); see `TABLE_VALUE_ONLY_FIELDS`.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
         TABLE_VALUE_ONLY_FIELDS
+    }
+
+    /// C writes VAL, UDF and the motor readbacks, speeds and limits without
+    /// posting them.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(TABLE_PROCESS_POSTED)
     }
 
     /// C `tableRecord.c::special()` posts SET on an `SSET`/`SUSE` write, and

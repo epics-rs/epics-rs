@@ -5,6 +5,8 @@ use epics_macros_rs::EpicsRecord;
 /// 1=Specified, 2=Mask.
 const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 
+const FANOUT_POSTED: [&str; 2] = ["VAL", "SELN"];
+
 /// `fanout` record — forward-link fan-out.
 ///
 /// C parity (`fanoutRecord.c:39` `#define NLINKS 16`,
@@ -21,7 +23,14 @@ const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 // posts VAL only with alarm events (`if (events) db_post_events(&prec->val,
 // events)`, fanoutRecord.c:148-150), never DBE_VALUE/DBE_LOG. So a run of
 // `caput VAL` posts no per-put value monitor (only the connect-time snapshot).
-#[record(type = "fanout", constant_init = "SELL:SELN", no_value_monitor)]
+// `process_posted_fields`: `process()` posts VAL and SELN alone
+// (`fanoutRecord.c:147-152`; fanout has no `monitor()`).
+#[record(
+    type = "fanout",
+    constant_init = "SELL:SELN",
+    no_value_monitor,
+    process_posted_fields = FANOUT_POSTED
+)]
 pub struct FanoutRecord {
     // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (fanoutRecord.dbd:21-25) — the
     // "Used to trigger" field. It carries no output value: C `process`

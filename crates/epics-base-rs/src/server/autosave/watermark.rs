@@ -6,7 +6,6 @@ use tokio::sync::Mutex;
 
 use crate::server::database::PvDatabase;
 
-use super::manager::update_status_pvs;
 use super::save_set::SaveSet;
 
 /// What one poll of a save set decided about its watermark.
@@ -37,14 +36,13 @@ pub(super) enum Tick<W> {
 ///
 /// Losing that retry is permanent and, by default, silent: the value is
 /// never written, `changed` is false from then on, and the next restore
-/// brings back the pre-change value. The `SR_<set>_status` PVs exist only
+/// brings back the pre-change value. The `SR_<i>_Status` PVs exist only
 /// when a `status_prefix` is configured, so nothing else reports the loss.
 pub(super) struct ChangeWatermark<W> {
     state: W,
     set: Arc<SaveSet>,
     lock: Arc<Mutex<()>>,
     db: Arc<PvDatabase>,
-    status_prefix: Option<String>,
 }
 
 impl<W> ChangeWatermark<W> {
@@ -53,14 +51,12 @@ impl<W> ChangeWatermark<W> {
         set: Arc<SaveSet>,
         lock: Arc<Mutex<()>>,
         db: Arc<PvDatabase>,
-        status_prefix: Option<String>,
     ) -> Self {
         Self {
             state,
             set,
             lock,
             db,
-            status_prefix,
         }
     }
 
@@ -89,9 +85,6 @@ impl<W> ChangeWatermark<W> {
 
         let _guard = self.lock.lock().await;
         let result = self.set.save_once(&self.db).await;
-        if let Some(ref prefix) = self.status_prefix {
-            update_status_pvs(&self.db, prefix, &self.set, &result).await;
-        }
         if result.is_ok() {
             self.state = candidate;
         }

@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::Local;
 
-use super::error::AutosaveResult;
+use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
 use super::save_file::{SaveEntry, validate_save_file, write_save_file_with_mode};
 
@@ -239,18 +239,42 @@ pub async fn rotate_backups(
     state: &mut BackupState,
     entries: &[SaveEntry],
     compat: CompatMode,
-) -> AutosaveResult<SavbState> {
-    let savb_state = ensure_savb(sav_path, config, entries, compat).await?;
+) -> Result<SavbState, RotateError> {
+    let at = |step| move |error| RotateError { step, error };
+    let savb_state = ensure_savb(sav_path, config, entries, compat)
+        .await
+        .map_err(at(BackupStep::Savb))?;
 
     // The sequenced and dated copies are made from the generation about
     // to be replaced, so unlike `.savB` they have nothing to copy when
     // that generation is missing or corrupt.
     if sav_path.exists() && validate_save_file(sav_path).await.unwrap_or(false) {
-        state.rotate_seq(sav_path, config).await?;
-        state.write_dated(sav_path, config).await?;
+        state
+            .rotate_seq(sav_path, config)
+            .await
+            .map_err(at(BackupStep::Seq))?;
+        state
+            .write_dated(sav_path, config)
+            .await
+            .map_err(at(BackupStep::Dated))?;
     }
 
     Ok(savb_state)
+}
+
+/// The [`rotate_backups`] step that failed: C gives each its own list
+/// status (save_restore.c:2069, :2197, :2257).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupStep {
+    Savb,
+    Seq,
+    Dated,
+}
+
+#[derive(Debug)]
+pub struct RotateError {
+    pub step: BackupStep,
+    pub error: AutosaveError,
 }
 
 /// Advance `.savB` to the generation just written, which is the other

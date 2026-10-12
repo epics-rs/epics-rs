@@ -6,7 +6,10 @@ use std::time::Duration;
 use crate::server::database::PvDatabase;
 use tokio::sync::RwLock;
 
-use super::backup::{BackupConfig, BackupState, find_best_save_file, publish_savb, rotate_backups};
+use super::backup::{
+    BackupConfig, BackupState, BackupStep, SavbState, find_best_save_file, publish_savb,
+    rotate_backups,
+};
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
 use super::macros::MacroContext;
@@ -109,6 +112,33 @@ pub struct RestoreResult {
     pub malformed_lines: Vec<MalformedLine>,
 }
 
+/// C's list and overall status codes (save_restore.h:38-42), the values the
+/// SR_status and SR_<i>_Status mbbo records index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SrStatus {
+    Init = 0,
+    Fail = 1,
+    Warn = 2,
+    SeqWarn = 3,
+    Ok = 4,
+}
+
+/// A list's status code and the text C writes beside it to SR_<i>_StatusStr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListStatus {
+    pub code: SrStatus,
+    pub text: String,
+}
+
+impl ListStatus {
+    fn new(code: SrStatus, text: &str) -> Self {
+        Self {
+            code,
+            text: text.to_string(),
+        }
+    }
+}
+
 /// A save set: a named group of PVs with save/restore logic.
 pub struct SaveSet {
     config: SaveSetConfig,
@@ -116,6 +146,9 @@ pub struct SaveSet {
     status: RwLock<SaveSetStatus>,
     stats: SaveSetStats,
     backup_state: RwLock<BackupState>,
+    list_status: std::sync::Mutex<ListStatus>,
+    save_time: std::sync::Mutex<chrono::DateTime<chrono::Local>>,
+    recent: std::sync::Mutex<Option<(std::time::Instant, String)>>,
     /// On-disk save-file format used by [`SaveSet::save_once`].
     /// [`CompatMode::Native`] by default; [`CompatMode::CRead`]
     /// writes `.sav` files a C IOC can read.
@@ -141,6 +174,12 @@ impl SaveSet {
             status: RwLock::new(SaveSetStatus::Idle),
             stats: SaveSetStats::default(),
             backup_state: RwLock::new(BackupState::default()),
+            list_status: std::sync::Mutex::new(ListStatus::new(
+                SrStatus::Init,
+                "Initializing list",
+            )),
+            save_time: std::sync::Mutex::new(chrono::Local::now()),
+            recent: std::sync::Mutex::new(None),
             compat,
         })
     }
@@ -258,7 +297,18 @@ impl SaveSet {
         };
         let savb_state = match rotated {
             Ok(state) => state,
-            Err(e) => return Err(self.record_save_failure(e).await),
+            Err(e) => {
+                let status = match e.step {
+                    BackupStep::Savb => ListStatus::new(SrStatus::Fail, "Can't write .savB file"),
+                    BackupStep::Seq => {
+                        ListStatus::new(SrStatus::SeqWarn, "Can't write sequence file")
+                    }
+                    BackupStep::Dated => {
+                        ListStatus::new(SrStatus::Fail, "Can't write dated backup file")
+                    }
+                };
+                return Err(self.record_save_failure(e.error, status).await);
+            }
         };
 
         match write_save_file_with_mode(&self.config.save_path, &save_entries, self.compat).await {
@@ -269,6 +319,7 @@ impl SaveSet {
                     .store(saved_count as u64, Ordering::Relaxed);
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 *self.stats.last_save_time.write().await = Some(now);
+                *self.save_time.lock().unwrap() = chrono::Local::now();
 
                 // The other half of the backup rule: `.savB` follows the
                 // `.sav` that just landed unless the rotation already
@@ -277,21 +328,79 @@ impl SaveSet {
                 // is on disk, so the save stats above stand and the cycle
                 // still fails.
                 if let Err(e) = publish_savb(&self.config.save_path, savb_state).await {
-                    return Err(self.record_save_failure(e).await);
+                    self.note_recent(format!("Can't write '{}B'", self.save_file()));
+                    return Err(self
+                        .record_save_failure(
+                            e,
+                            ListStatus::new(SrStatus::Warn, "Can't copy .sav to .savB file"),
+                        )
+                        .await);
                 }
                 *self.status.write().await = SaveSetStatus::Idle;
+                // C warns for a `.savB` it had to write anew and for values
+                // it could not fetch (save_restore.c:2074, :2129).
+                let not_saved = save_entries.len() - saved_count;
+                *self.list_status.lock().unwrap() = if not_saved > 0 {
+                    let noun = if not_saved == 1 { "value" } else { "values" };
+                    ListStatus::new(SrStatus::Warn, &format!("{not_saved} {noun} not saved"))
+                } else if savb_state == SavbState::Rewritten {
+                    ListStatus::new(SrStatus::Warn, ".savB file was bad")
+                } else {
+                    ListStatus::new(SrStatus::Ok, "Ok")
+                };
+                self.note_recent(format!("Wrote '{}'", self.save_file()));
 
                 Ok(saved_count)
             }
-            Err(e) => Err(self.record_save_failure(e).await),
+            Err(e) => {
+                self.note_recent(format!("Can't write '{}'", self.save_file()));
+                Err(self
+                    .record_save_failure(
+                        e,
+                        ListStatus::new(SrStatus::Fail, "Can't write .sav file"),
+                    )
+                    .await)
+            }
         }
+    }
+
+    /// C's `plist->status` and `statusStr` after this set's last save cycle.
+    pub fn list_status(&self) -> ListStatus {
+        self.list_status.lock().unwrap().clone()
+    }
+
+    /// This set's latest SR_recentlyStr event (save_restore.c:2104, :2121,
+    /// :2134), stamped so the reporter can take the newest of all owners.
+    pub fn recent(&self) -> Option<(std::time::Instant, String)> {
+        self.recent.lock().unwrap().clone()
+    }
+
+    fn note_recent(&self, text: String) {
+        *self.recent.lock().unwrap() = Some((std::time::Instant::now(), text));
+    }
+
+    /// C's `plist->save_file`, the name SR_recentlyStr and SR_<i>_Name use.
+    pub fn save_file(&self) -> String {
+        self.config
+            .save_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// C's `plist->save_time`: the last `.sav` written, or the set's creation
+    /// before any (save_restore.c:2437).
+    pub fn save_time(&self) -> chrono::DateTime<chrono::Local> {
+        *self.save_time.lock().unwrap()
     }
 
     /// The one place a failed save cycle is recorded. Both fallible steps
     /// — the backup rotation and the `.sav` write — go through it, so the
     /// status PVs and the error counters cannot disagree about whether the
     /// cycle failed. Returns the error it recorded so callers can `?` it.
-    async fn record_save_failure(&self, e: AutosaveError) -> AutosaveError {
+    async fn record_save_failure(&self, e: AutosaveError, status: ListStatus) -> AutosaveError {
+        *self.list_status.lock().unwrap() = status;
         self.stats.error_count.fetch_add(1, Ordering::Relaxed);
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         *self.stats.last_error_time.write().await = Some(now);
@@ -301,6 +410,16 @@ impl SaveSet {
 
     /// Perform one restore: find best file -> read -> put_pv_no_process.
     pub async fn restore_once(&self, db: &PvDatabase) -> AutosaveResult<RestoreResult> {
+        self.restore_once_with_mode(db, RestoreMode::NoProcess)
+            .await
+    }
+
+    /// [`Self::restore_once`] with an explicit [`RestoreMode`].
+    pub async fn restore_once_with_mode(
+        &self,
+        db: &PvDatabase,
+        mode: RestoreMode,
+    ) -> AutosaveResult<RestoreResult> {
         let source = find_best_save_file(&self.config.save_path, &self.config.backup)
             .await
             .ok_or_else(|| AutosaveError::CorruptSaveFile {
@@ -308,7 +427,7 @@ impl SaveSet {
                 message: "no valid save file found".to_string(),
             })?;
 
-        restore_from_entries(db, &source).await
+        restore_from_entries_with_mode(db, &source, mode).await
     }
 
     /// Reload request file.
@@ -358,10 +477,9 @@ pub enum RestoreMode {
     /// cases where restore correctness depends on processing.
     #[default]
     NoProcess,
-    /// Write each PV with `put_pv` — the record IS processed after
-    /// the value is set, matching C-autosave's `dbPutField` restore:
-    /// `PP` fields, OUT links and FLNK chains run. Use this when
-    /// restore correctness depends on processing.
+    /// Write each PV with `put_record_field_from_ca_no_notify`, the
+    /// `dbPutField` that C's `do_manual_restore` reaches through `ca_put`
+    /// (save_restore.c:3245): `PP` fields, OUT links and FLNK chains run.
     Process,
 }
 
@@ -434,19 +552,13 @@ pub async fn restore_from_entries_with_mode(
             }
         };
 
-        // A DBF link field takes the no-process write in BOTH modes:
-        // C `reboot_restore` puts via `dbPutField`, and `dbPutField` on a
-        // link field is `dbPutFieldLink` (`dbAccess.c:1261`) — a re-parse
-        // write that never processes. The `dbPut`-analogue `put_pv` would
-        // refuse it (`S_db_badDbrtype`, dbAccess.c:1340).
-        let (base, field) = crate::server::database::parse_pv_name(&entry.pv_name);
-        let is_link_field = db.is_dbf_link_field(base, field);
         let put_result = match mode {
             RestoreMode::NoProcess => db.put_pv_no_process(&entry.pv_name, parsed).await,
-            RestoreMode::Process if is_link_field => {
-                db.put_pv_no_process(&entry.pv_name, parsed).await
+            RestoreMode::Process => {
+                let (base, field) = crate::server::database::parse_pv_name(&entry.pv_name);
+                db.put_record_field_from_ca_no_notify(base, field, parsed)
+                    .await
             }
-            RestoreMode::Process => db.put_pv(&entry.pv_name, parsed).await,
         };
         match put_result {
             Ok(()) => {

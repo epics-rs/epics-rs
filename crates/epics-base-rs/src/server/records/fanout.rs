@@ -150,7 +150,7 @@ mod tests {
         let rec = FanoutRecord::default();
         assert_eq!(rec.shft, -1);
         // SELM=Mask(2), SELN=1, default SHFT=-1 → mask = 1<<1 = 0b10 → LNK1.
-        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft, 16);
-        assert_eq!(sel.indices, vec![1]);
+        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft);
+        assert_eq!(sel.indices().collect::<Vec<_>>(), vec![1]);
     }
 }

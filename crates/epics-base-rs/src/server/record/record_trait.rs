@@ -877,6 +877,11 @@ pub enum ValuePostGate {
     /// guards, so a cycle that changes RVAL without posting it must leave
     /// `oraw` stale for the next cycle to find.
     OnChangeForced,
+    /// No own-value test: C posts the field whenever the widened guard fires,
+    /// with that guard as its mask: ao `OVAL` — `if(prec->omod) monitor_mask
+    /// |= (DBE_VALUE|DBE_LOG); if(monitor_mask) { prec->omod = FALSE;
+    /// db_post_events(&prec->oval, monitor_mask);` (aoRecord.c:535-538).
+    Guarded,
 }
 
 /// The event mask ONE per-cycle mark posts with
@@ -1155,22 +1160,25 @@ pub fn monitor_deadband_classes<R: Record + ?Sized>(
             value: post.post_value,
             archive: post.post_archive,
             hash_changed: post.hash_changed,
-            marked: false,
+            marked: r.cycle_marked_fields(),
         };
     }
     // A value the deadband cannot compare posts unconditionally.
     let Some(cells) = r.monitor_deadband_cells(*last_posted) else {
-        return MonitorValueClasses::ALWAYS;
+        return MonitorValueClasses {
+            marked: r.cycle_marked_fields(),
+            ..MonitorValueClasses::ALWAYS
+        };
     };
     let (value, archive) = cells.crossed();
     if value || archive {
-        commit_last_posted(r, cells.val(), value, archive, last_posted);
+        return commit_last_posted(r, cells.val(), value, archive, last_posted);
     }
     MonitorValueClasses {
         value,
         archive,
         hash_changed: false,
-        marked: false,
+        marked: r.cycle_marked_fields(),
     }
 }
 
@@ -1304,7 +1312,8 @@ pub(crate) fn analog_alarm_ladder<R: Record + ?Sized>(r: &mut R, common: &mut Co
 }
 
 /// C `monitor()`'s `prec->mlst = prec->val` / `prec->alst = prec->val`,
-/// out of line so the no-crossing cycle runs without a frame.
+/// out of line so the no-crossing cycle runs without a frame. It builds the
+/// whole answer, so the caller tail-calls it and holds nothing across it.
 #[inline(never)]
 fn commit_last_posted<R: Record + ?Sized>(
     r: &mut R,
@@ -1312,13 +1321,19 @@ fn commit_last_posted<R: Record + ?Sized>(
     value: bool,
     archive: bool,
     last_posted: &mut [f64; 2],
-) {
+) -> MonitorValueClasses {
     r.store_monitor_last_posted(val, value, archive);
     if archive {
         last_posted[1] = val.as_f64();
     }
     if value {
         last_posted[0] = val.as_f64();
+    }
+    MonitorValueClasses {
+        value,
+        archive,
+        hash_changed: false,
+        marked: r.cycle_marked_fields(),
     }
 }
 
@@ -2468,11 +2483,69 @@ impl PostedValue {
     }
 }
 
-pub type FieldPost = (
-    std::borrow::Cow<'static, str>,
-    PostedValue,
-    crate::server::recgbl::EventMask,
-);
+pub type FieldPost = (PostName, PostedValue, crate::server::recgbl::EventMask);
+
+/// The field a post names. `Declared` is the field's own [`FieldDesc::name`],
+/// so two declared names are one field exactly when they are one pointer —
+/// what lets a post find its subscribers without reading a byte of either name.
+#[derive(Debug, Clone)]
+pub enum PostName {
+    Declared(&'static str),
+    Named(std::borrow::Cow<'static, str>),
+}
+
+impl std::ops::Deref for PostName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Declared(name) => name,
+            Self::Named(name) => name,
+        }
+    }
+}
+
+impl AsRef<str> for PostName {
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl PartialEq for PostName {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<str> for PostName {
+    fn eq(&self, other: &str) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<&str> for PostName {
+    fn eq(&self, other: &&str) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<std::borrow::Cow<'_, str>> for PostName {
+    fn eq(&self, other: &std::borrow::Cow<'_, str>) -> bool {
+        **self == **other
+    }
+}
+
+impl From<&'static str> for PostName {
+    fn from(name: &'static str) -> Self {
+        Self::Named(name.into())
+    }
+}
+
+impl From<String> for PostName {
+    fn from(name: String) -> Self {
+        Self::Named(name.into())
+    }
+}
 
 /// Snapshot of changes from a process cycle, used for notify outside lock.
 ///
@@ -3921,6 +3994,13 @@ pub trait Record: Send + Sync + 'static {
         (false, false)
     }
 
+    /// Whether this cycle marked fields for [`Self::take_cycle_posted_fields`]
+    /// — the `marked` of the default [`Self::monitor_value_classes`], so a
+    /// type that marks keeps that default body instead of wrapping it.
+    fn cycle_marked_fields(&self) -> bool {
+        false
+    }
+
     /// C `monitor()`'s VALUE / LOG decision for the deadband field, asked
     /// once per cycle: [`Self::monitor_value_changed`], else the
     /// [`Self::array_monitor_post`] rule, else the MDEL/ADEL deadband, with
@@ -3942,11 +4022,14 @@ pub trait Record: Send + Sync + 'static {
                 value: changed || val_always,
                 archive: changed || archive_always,
                 hash_changed: false,
-                marked: false,
+                marked: self.cycle_marked_fields(),
             };
         }
         if !gate.uses_deadband {
-            return MonitorValueClasses::ALWAYS;
+            return MonitorValueClasses {
+                marked: self.cycle_marked_fields(),
+                ..MonitorValueClasses::ALWAYS
+            };
         }
         monitor_deadband_classes(self, gate.array_monitor_post, last_posted)
     }
@@ -7511,7 +7594,7 @@ mod tests {
                 .union(CycleHooks::WRITE_POSTED)
                 .union(CycleHooks::PROCESS_POSTED)
                 .union(CycleHooks::PUT_REPORT),
-            "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
+            "mbbiDirect" | "mbboDirect" | "seq" => CycleHooks::CYCLE_POSTED,
             "calcout" => CycleHooks::WRITE_POSTED.union(CycleHooks::PUT_REPORT),
             "swait" => CycleHooks::WRITE_POSTED.union(CycleHooks::PUT_REPORT),
             "mbbi" | "mbbo" | "lso" | "lsi" => CycleHooks::WRITE_POSTED,

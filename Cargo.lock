@@ -1027,6 +1027,7 @@ dependencies = [
  "rustyline",
  "serde_json",
  "serial_test",
+ "smallvec",
  "socket2 0.5.10",
  "source-guard",
  "tempfile",

@@ -190,6 +190,11 @@ impl Record for DfanoutRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    /// `monitor()` posts VAL alone (`dfanoutRecord.c:283-298`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
+    }
+
     /// C `dfanoutRecord.c::init_record` (:96-111) ends without touching
     /// MLST/ALST/LALM, which is the other half of the note on the MLST/ALST
     /// field declarations above: `caget D:DF.MLST` on a C IOC reads 0 even
@@ -356,7 +361,31 @@ impl Record for DfanoutRecord {
         match link_field {
             "DOL" => Some(&self.dol),
             "SELL" => Some(&self.sell),
-            _ => None,
+            // OUTA..OUTP, which the output row reads every cycle.
+            _ => {
+                let [b'O', b'U', b'T', slot] = *link_field.as_bytes() else {
+                    return None;
+                };
+                Some(match slot {
+                    b'A' => &self.outa,
+                    b'B' => &self.outb,
+                    b'C' => &self.outc,
+                    b'D' => &self.outd,
+                    b'E' => &self.oute,
+                    b'F' => &self.outf,
+                    b'G' => &self.outg,
+                    b'H' => &self.outh,
+                    b'I' => &self.outi,
+                    b'J' => &self.outj,
+                    b'K' => &self.outk,
+                    b'L' => &self.outl,
+                    b'M' => &self.outm,
+                    b'N' => &self.outn,
+                    b'O' => &self.outo,
+                    b'P' => &self.outp,
+                    _ => return None,
+                })
+            }
         }
     }
 

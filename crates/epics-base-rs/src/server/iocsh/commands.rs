@@ -4322,10 +4322,10 @@ fn cmd_dbel() -> CommandDef {
             };
 
             let inst = rec.read();
-            let mut subs: Vec<(&String, &crate::server::pv::Subscriber)> = inst
-                .subscribers
+            let mut subs: Vec<(&str, &crate::server::pv::Subscriber)> = inst
+                .field_subscribers()
                 .iter()
-                .flat_map(|(field, bucket)| bucket.iter().map(move |sub| (field, sub)))
+                .map(|entry| (entry.field(), &entry.sub))
                 .collect();
             subs.sort_by_key(|(_, sub)| sub.sid);
 

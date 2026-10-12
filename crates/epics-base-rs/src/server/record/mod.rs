@@ -76,11 +76,11 @@ pub use record_trait::{
     CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
     FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
     InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses,
-    MonitorValueGate, OutTarget, Pact, PostedValue, ProcessAction, ProcessActions, ProcessContext,
-    ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks,
-    SimmCells, Special, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
-    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
-    input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
+    MonitorValueGate, OutTarget, Pact, PostName, PostedValue, ProcessAction, ProcessActions,
+    ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult,
+    ResolvedInputLinks, SimmCells, Special, SubroutineFn, ValuePostGate, ValueView,
+    arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value,
+    dbput_coerce_value, input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
     put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{

@@ -22,7 +22,7 @@ use super::link::{ParsedLink, parse_link_v2};
 use super::menu_choices::MenuBound;
 use super::record_trait::{
     AuxPostMask, CommonFieldPutResult, EnumSlots, FieldDeclaration, FieldDesc, InputLinkRequest,
-    LinkReadAs, PostedValue, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    LinkReadAs, PostName, PostedValue, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -3257,12 +3257,122 @@ pub(crate) trait LinkTargetResolver {
     fn local_target(&self, link: &ParsedLink) -> Option<ResolvedTarget>;
 }
 
+/// A field's index in C's `papFldDes` order — `dbCommon`, then the record's
+/// own table — for a consumer of [`FieldSubscriber`]; never a lookup key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldIx(pub u16);
+
+impl FieldIx {
+    /// A field nothing declares (a virtual field, an undeclared type).
+    pub const UNDECLARED: Self = Self(u16::MAX);
+
+    fn of(record: &dyn Record, desc: Option<&'static FieldDesc>) -> Self {
+        let Some(desc) = desc else {
+            return Self::UNDECLARED;
+        };
+        let common = super::dbd_generated::DB_COMMON_FIELDS;
+        let at = |table: &'static [FieldDesc]| {
+            table
+                .as_ptr_range()
+                .contains(&(desc as *const FieldDesc))
+                .then(|| table.iter().position(|d| std::ptr::eq(d, desc)))
+                .flatten()
+        };
+        at(common)
+            .or_else(|| at(record.field_list()).map(|i| common.len() + i))
+            .and_then(|i| u16::try_from(i).ok())
+            .map_or(Self::UNDECLARED, Self)
+    }
+}
+
+/// The name a subscriber attached under: the field's own [`FieldDesc::name`]
+/// when the spelling is the declared one, the attached spelling otherwise.
+#[derive(Debug)]
+enum SubName {
+    Declared(&'static str),
+    Named(Box<str>),
+}
+
+/// One monitor on one field of the record — C's `evSubscrip` in `mlis`.
+pub struct FieldSubscriber {
+    name: SubName,
+    pub ix: FieldIx,
+    /// [`RecordInstance::declared_field_type`] and
+    /// [`RecordInstance::field_is_long_string`] of the field, both static,
+    /// so a post projects its log without a name lookup.
+    declared: Option<DbFieldType>,
+    long_string: bool,
+    pub sub: Subscriber,
+}
+
+impl FieldSubscriber {
+    /// The field this monitor watches, as attached.
+    pub fn field(&self) -> &str {
+        match &self.name {
+            SubName::Declared(name) => name,
+            SubName::Named(name) => name,
+        }
+    }
+
+    /// The one rule a post finds its monitors by. Two declared names are one
+    /// pointer or two fields; only an undeclared side reads bytes.
+    #[inline(always)]
+    fn watches(&self, post: &PostName) -> bool {
+        match (&self.name, post) {
+            (SubName::Declared(own), PostName::Declared(posted)) => std::ptr::eq(*own, *posted),
+            _ => self.watches_str(post),
+        }
+    }
+
+    /// [`Self::watches`] between two monitors.
+    fn watches_as(&self, other: &FieldSubscriber) -> bool {
+        match (&self.name, &other.name) {
+            (SubName::Declared(own), SubName::Declared(theirs)) => std::ptr::eq(*own, *theirs),
+            _ => self.watches_str(other.field()),
+        }
+    }
+
+    /// [`RecordInstance::project_to_declared_type`] of a borrowed `value` of
+    /// the watched field, copying it only when the projection changes it: a
+    /// post whose log reads a wide field by reference must not copy it to
+    /// find that out.
+    fn declared_view<'v>(&self, value: &'v EpicsValue) -> Cow<'v, EpicsValue> {
+        match declared_projection_of(self.declared, value, || self.long_string) {
+            Some(declared) => Cow::Owned(value.clone().into_type(declared)),
+            None => Cow::Borrowed(value),
+        }
+    }
+
+    /// [`Self::watches`] for a name of unknown provenance: the pointer first,
+    /// then the bytes.
+    #[inline(always)]
+    fn watches_str(&self, field: &str) -> bool {
+        let own = self.field();
+        std::ptr::eq(own, field) || {
+            #[cfg(test)]
+            NAME_BYTE_COMPARES.with(|n| n.set(n.get() + 1));
+            own == field
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many subscriber matches fell back to comparing name bytes.
+    static NAME_BYTE_COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many snapshots reached the delivery loop.
+    static DELIVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A type-erased record instance stored in the database.
 pub struct RecordInstance {
     pub name: String,
     pub record: Box<dyn Record>,
     pub common: CommonFields,
-    pub subscribers: HashMap<String, Vec<Subscriber>>,
+    /// Every monitor on the record in attach order — C's `mlis`, which
+    /// `db_post_events` walks matching the field. Two sit inline; a third
+    /// grows the buffer under the hold at attach, never on a post.
+    pub(crate) subscribers: smallvec::SmallVec<[FieldSubscriber; 2]>,
     /// Terminal destruction marker, the [`crate::server::pv::ProcessVariable`]
     /// flag's counterpart for a record-backed channel. Set once by
     /// [`Self::destroy`], whose only caller is
@@ -3613,6 +3723,8 @@ pub(crate) struct MonitorPlan {
     /// `deadband_field`'s declaration, so the post reads a non-VAL deadband
     /// field without a name scan.
     pub(crate) deadband_desc: Option<&'static FieldDesc>,
+    /// `deadband_field`'s [`PostName`].
+    deadband_declared: Option<&'static str>,
     /// The deadband field's log is a reference ([`posts_by_ref`]): its post
     /// carries no value and never reads the field.
     pub(crate) deadband_ref: bool,
@@ -3624,6 +3736,9 @@ pub(crate) struct MonitorPlan {
     pub(crate) value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
     /// Bit `i`: `value_masked[i]`'s log is a reference ([`posts_by_ref`]).
     pub(crate) value_masked_ref: u64,
+    /// `value_masked[i]`'s [`FieldDesc::name`], for its post's [`PostName`];
+    /// `None` past the fourth or for a field spelled other than declared.
+    value_masked_declared: [Option<&'static str>; 4],
     /// `value_masked` holds a [`ValuePostGate::OnChangeForced`] field — the
     /// only reader of [`Record::take_secondary_value_mask`], so a type without
     /// one is never asked for it.
@@ -3632,6 +3747,10 @@ pub(crate) struct MonitorPlan {
     pub(crate) forced_secondary: bool,
     /// The change-detected aux fields' mask resolver.
     pub(crate) aux_post: AuxPostMask,
+    /// [`Record::fields_posted_only_when_marked`]: the fields whose post
+    /// decisions the type owns, so the framework keeps no published copy of
+    /// them ([`RecordInstance::record_value_post`]).
+    pub(crate) claimed: &'static [&'static str],
     /// [`Record::cycle_hooks`].
     pub(crate) hooks: crate::server::record::CycleHooks,
     /// Whether the type is `sub` or `aSub` — a property of the type, so not
@@ -3653,6 +3772,7 @@ impl MonitorPlan {
             },
             deadband_field,
             deadband_desc,
+            deadband_declared: declared_name(deadband_desc, deadband_field),
             deadband_ref: posts_by_ref(deadband_desc, || {
                 if deadband_field == "VAL" {
                     record.val()
@@ -3672,16 +3792,63 @@ impl MonitorPlan {
                     posts_by_ref(field_desc_of(record, name), || record.get_field(name))
                 })
                 .fold(0, |bits, (i, _)| bits | 1 << i),
+            value_masked_declared: std::array::from_fn(|i| {
+                value_masked
+                    .get(i)
+                    .and_then(|(name, _)| declared_name(field_desc_of(record, name), name))
+            }),
             forced_secondary: record
                 .fields_posted_with_value_mask()
                 .iter()
                 .any(|(_, gate)| {
-                    matches!(gate, crate::server::record::ValuePostGate::OnChangeForced)
+                    matches!(
+                        gate,
+                        crate::server::record::ValuePostGate::OnChangeForced
+                            | crate::server::record::ValuePostGate::Guarded
+                    )
                 }),
             aux_post: AuxPostMask::of(record),
+            claimed: record.fields_posted_only_when_marked(),
             hooks: record.cycle_hooks(),
             subroutine_kind: SubroutineKind::of(record.record_type()),
         }
+    }
+}
+
+/// [`RecordInstance::declared_projection`] from the field's declared type and
+/// long-string flag.
+fn declared_projection_of(
+    declared: Option<DbFieldType>,
+    value: &EpicsValue,
+    long_string: impl FnOnce() -> bool,
+) -> Option<DbFieldType> {
+    match declared? {
+        DbFieldType::String
+            if matches!(value, EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
+                && long_string() =>
+        {
+            None
+        }
+        declared
+            if value.db_field_type() == declared
+                && !matches!(value, EpicsValue::EnumWithChoices { .. }) =>
+        {
+            None
+        }
+        declared => Some(declared),
+    }
+}
+
+/// `desc`'s own name when `field` is its declared spelling.
+fn declared_name(desc: Option<&'static FieldDesc>, field: &str) -> Option<&'static str> {
+    desc.map(|d| d.name).filter(|name| *name == field)
+}
+
+/// The [`PostName`] of `field`, whose declared name is `declared`.
+fn post_name(declared: Option<&'static str>, field: &'static str) -> PostName {
+    match declared {
+        Some(name) => PostName::Declared(name),
+        None => PostName::Named(Cow::Borrowed(field)),
     }
 }
 
@@ -4094,12 +4261,7 @@ impl RecordInstance {
             // so with no subscriber C's `db_post_events` leaves nothing to do —
             // and an entry in `last_posted` would have the walk read the
             // whole array every later cycle.
-            if !self.subscribers.contains_key(field)
-                && self
-                    .record
-                    .fields_posted_only_when_marked()
-                    .contains(&field)
-            {
+            if self.monitor_plan.claimed.contains(&field) && !self.has_subscriber(field) {
                 continue;
             }
             let mask = match mask {
@@ -4739,7 +4901,7 @@ impl RecordInstance {
             name,
             record,
             common,
-            subscribers: HashMap::new(),
+            subscribers: smallvec::SmallVec::new(),
             parsed_inp: LinkCache::none(),
             parsed_out: LinkCache::none(),
             parsed_flnk: LinkCache::none(),
@@ -5149,7 +5311,9 @@ impl RecordInstance {
     /// subscriber, so the value is still owed.
     ///
     /// The deadband field is the exception: its published value is MLST/ALST,
-    /// which [`Self::deadband_post`] owns, so a post of it stores nothing.
+    /// which [`Self::deadband_post`] owns, so a post of it stores nothing. So
+    /// is a field the type claims ([`MonitorPlan::claimed`]): its `monitor()`
+    /// decides from the record's own previous copies, as C's does.
     pub(crate) fn record_value_post(&mut self, field: &str, value: PostedValue) {
         self.record_value_post_as(field, |inst| inst.walk_skips(field), value);
     }
@@ -5185,7 +5349,9 @@ impl RecordInstance {
         walk_skip: impl FnOnce(&Self) -> bool,
         value: PostedValue,
     ) {
-        if field == self.record.monitor_deadband_field() {
+        if field == self.record.monitor_deadband_field()
+            || self.monitor_plan.claimed.contains(&field)
+        {
             return;
         }
         if let Some(slot) = self.last_posted.get_mut(field) {
@@ -5325,8 +5491,8 @@ impl RecordInstance {
             // mirror C dbAccess.c:1395-1396 — the gate `if (propertyUpdate &&
             // !status)` and the `db_post_events(precord, NULL, DBE_PROPERTY)` it
             // guards. The NULL field pointer is what makes it record-wide.
-            // Collect keys first to avoid a re-entrant immutable borrow on subscribers.
-            let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+            // Collect the names first to avoid a re-entrant immutable borrow on subscribers.
+            let fields = self.subscribed_fields();
             let mut own;
             let burst = match burst {
                 Some(burst) => burst,
@@ -6351,7 +6517,7 @@ impl RecordInstance {
     /// field goes on the wire as", run by the CA create-channel path
     /// ([`Self::client_field_value`]), the GET path
     /// ([`Self::snapshot_for_field`]) and the MONITOR path (a post's log,
-    /// [`Self::declared_view`]), so all three announce and serve the same
+    /// [`FieldSubscriber::declared_view`]), so all three announce and serve the same
     /// type.
     ///
     /// The projection is [`EpicsValue::convert_to`], the one value-coercion
@@ -6375,34 +6541,12 @@ impl RecordInstance {
         }
     }
 
-    /// [`Self::project_to_declared_type`] of a borrowed `value`, copying it
-    /// only when the projection changes it: a post whose log reads a wide
-    /// field by reference must not copy it to find that out.
-    fn declared_view<'v>(&self, field: &str, value: &'v EpicsValue) -> Cow<'v, EpicsValue> {
-        match self.declared_projection(field, value) {
-            Some(declared) => Cow::Owned(value.clone().into_type(declared)),
-            None => Cow::Borrowed(value),
-        }
-    }
-
     /// The type [`Self::project_to_declared_type`] converts `value` to, or
     /// `None` when it already serves as it is.
     fn declared_projection(&self, field: &str, value: &EpicsValue) -> Option<DbFieldType> {
-        match self.declared_field_type(field)? {
-            DbFieldType::String
-                if matches!(value, EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
-                    && self.record.field_is_long_string(field) =>
-            {
-                None
-            }
-            declared
-                if value.db_field_type() == declared
-                    && !matches!(value, EpicsValue::EnumWithChoices { .. }) =>
-            {
-                None
-            }
-            declared => Some(declared),
-        }
+        declared_projection_of(self.declared_field_type(field), value, || {
+            self.record.field_is_long_string(field)
+        })
     }
 
     /// The client-facing value of `field`: the resolved value projected onto
@@ -8428,7 +8572,7 @@ impl RecordInstance {
             && !self.monitor_plan.forced_secondary
             && !marked
             && !hooks.has(CycleHooks::CYCLE_POSTED)
-            && self.subscribers.is_empty()
+            && self.unwatched()
             && self.last_posted.is_empty()
         {
             return;
@@ -8465,10 +8609,8 @@ impl RecordInstance {
         // the posts themselves land after the walk, in the order C emits
         // them. Which fields fired is kept as a bit per `value_masked` index
         // rather than a list, so the cycle allocates nothing for it.
-        let forced_mask = (!secondary_guard.is_empty())
-            .then_some(secondary_guard | EventMask::VALUE | EventMask::LOG);
         let mut secondary_fired: u64 = 0;
-        if forced_mask.is_some() {
+        if !secondary_guard.is_empty() {
             debug_assert!(
                 value_masked.len() <= u64::BITS as usize,
                 "fields_posted_with_value_mask is wider than the fired bitmask"
@@ -8478,10 +8620,13 @@ impl RecordInstance {
                 // inside the widened one.
                 let guard_open = match gate {
                     ValuePostGate::OnChange => !deadband_mask.is_empty(),
-                    ValuePostGate::OnChangeForced => true,
+                    ValuePostGate::OnChangeForced | ValuePostGate::Guarded => true,
                     ValuePostGate::WithValue => false,
                 };
-                if guard_open && self.record.take_secondary_value_change(name) {
+                if guard_open
+                    && (matches!(gate, ValuePostGate::Guarded)
+                        || self.record.take_secondary_value_change(name))
+                {
                     secondary_fired |= 1 << index;
                 }
             }
@@ -8496,7 +8641,7 @@ impl RecordInstance {
         // vtable, is asked only here. Everything a cycle owes whether or not
         // anyone is watching — the TAKEs above and the record's own old-copy
         // advance — has already run.
-        if self.subscribers.is_empty() && self.last_posted.is_empty() && secondary_fired == 0 {
+        if self.unwatched() && self.last_posted.is_empty() && secondary_fired == 0 {
             return;
         }
         let MonitorPlan {
@@ -8528,7 +8673,7 @@ impl RecordInstance {
         // C change-detects nothing about these fields; only the record's own
         // per-cycle mark may post them (aCalcout AA..LL — no PAA..PLL previous
         // copy exists to compare against).
-        let marked_only = self.record.fields_posted_only_when_marked();
+        let marked_only = self.monitor_plan.claimed;
         let event_posted = self.record.event_posted_fields();
         let process_posted = self.settle_posted();
         let prev_changed = self.record.prev_compared_inputs().1;
@@ -8545,25 +8690,55 @@ impl RecordInstance {
         // seeds it from the value the subscriber is handed.
         // Published fields first, read from the entry the iterator hands over;
         // only a subscribed field never published costs a probe.
+        // A field two monitors watch is walked once, at its first monitor.
         let tracked = self
             .last_posted
             .iter()
-            .map(|(field, published)| (field, Some(published)))
+            .map(|(field, published)| (field.as_str(), Some(published), published.name))
             .chain(
                 self.subscribers
-                    .keys()
-                    .filter(|field| !self.last_posted.contains_key(*field))
-                    .map(|field| (field, None)),
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, sub)| {
+                        let field = sub.field();
+                        !self.subscribers[..*at]
+                            .iter()
+                            .any(|first| first.watches_as(sub))
+                            && (marked_only.contains(&field)
+                                || !self.last_posted.contains_key(field))
+                    })
+                    .map(|(_, sub)| {
+                        let declared = match sub.name {
+                            SubName::Declared(name) => Some(name),
+                            SubName::Named(_) => None,
+                        };
+                        (sub.field(), None, declared)
+                    }),
             );
-        for (field, published) in tracked {
+        for (field, published, declared) in tracked {
             // `walk_skip_term` can only fire on a field never published:
             // `skipped_posted`, not `last_posted`, holds what it rejects.
             let closed_out = process_posted.is_some_and(|allowed| match published {
                 Some(p) => !p.posted(),
-                None => !allowed.contains(&field.as_str()),
+                None => !allowed.contains(&field),
             });
             if closed_out
                 || published.is_none() && walk_skip_term(field, deadband_field, event_posted)
+            {
+                continue;
+            }
+            // A claimed field is never published, so nothing compares it: only
+            // a post the type or a declared set owes it reads it.
+            let claimed = published.is_none() && marked_only.contains(&field);
+            if claimed
+                && !matches!(
+                    value_gate(value_masked, field),
+                    Some(ValuePostGate::WithValue)
+                )
+                && !force_fields.contains(&field)
+                && !{ cycle_marks }.any(|(name, _)| name == field)
+                && !alarm_fanout.contains(&field)
+                && !log_swept.contains(&field)
             {
                 continue;
             }
@@ -8593,28 +8768,30 @@ impl RecordInstance {
             };
             // Only a field never published, or one keyed off its declared
             // spelling, copies its name into a post.
-            let name = || match published.and_then(|p| p.name) {
-                Some(name) => Cow::Borrowed(name),
-                None => Cow::Owned(field.clone()),
-            };
-            // A subscribed field is published when it is added, so the name
-            // search runs only for one never posted since.
-            let prev_bit = match published {
-                Some(p) => p.prev_bit,
-                None => self.prev_compared_bit(field),
+            let name = || match declared {
+                Some(name) => PostName::Declared(name),
+                None => PostName::Named(Cow::Owned(field.to_owned())),
             };
             // C keeps no published copy of a reference-log field to compare
             // against; only its record's own old copy (`prev_bit`) or a mark
             // posts it.
-            let changed = match (prev_bit, &val) {
-                (Some(bit), _) => prev_changed & (1 << bit) != 0,
-                (None, None) => false,
-                (None, Some(val)) => match prev {
-                    Some(prev) => prev != val,
-                    None => self
-                        .posted_value(field)
-                        .is_none_or(|prev| prev.as_value() != Some(val)),
-                },
+            let changed = !claimed && {
+                // A subscribed field is published when it is added, so the name
+                // search runs only for one never posted since.
+                let prev_bit = match published {
+                    Some(p) => p.prev_bit,
+                    None => self.prev_compared_bit(field),
+                };
+                match (prev_bit, &val) {
+                    (Some(bit), _) => prev_changed & (1 << bit) != 0,
+                    (None, None) => false,
+                    (None, Some(val)) => match prev {
+                        Some(prev) => prev != val,
+                        None => self
+                            .posted_value(field)
+                            .is_none_or(|prev| prev.as_value() != Some(val)),
+                    },
+                }
             };
             if let Some(gate) = value_gate(value_masked, field) {
                 // C posts this secondary value field with VAL's own monitor_mask,
@@ -8629,18 +8806,20 @@ impl RecordInstance {
                     // against the record's own old copy — never here, where
                     // the answer would depend on this loop's `last_posted`
                     // cache and on the field having a subscriber.
-                    ValuePostGate::OnChange | ValuePostGate::OnChangeForced => false,
+                    ValuePostGate::OnChange
+                    | ValuePostGate::OnChangeForced
+                    | ValuePostGate::Guarded => false,
                 };
                 if post {
                     snapshot.push((name(), PostedValue::of_read(&val), deadband_mask));
                 }
-            } else if changed && !marked_only.contains(&field.as_str()) {
+            } else if changed {
                 snapshot.push((
                     name(),
                     PostedValue::of_read(&val),
                     aux_post.mask_for(field, alarm_bits, deadband_mask),
                 ));
-            } else if force_fields.contains(&field.as_str()) {
+            } else if force_fields.contains(&field) {
                 // C `monitor()` posts a statically re-marked field with
                 // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                 snapshot.push((name(), PostedValue::of_read(&val), aux_mask));
@@ -8663,7 +8842,7 @@ impl RecordInstance {
                     };
                     snapshot.push((name(), PostedValue::of_read(&val), mask));
                 }
-            } else if alarm_fanout.contains(&field.as_str()) {
+            } else if alarm_fanout.contains(&field) {
                 // C motor `monitor()` (motorRecord.cc:3456-3646) posts every listed
                 // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber
                 // observes the alarm moment on any of them.
@@ -8697,7 +8876,7 @@ impl RecordInstance {
             // changed or not — that would be a new defect, not a fix. The value
             // path is separately served by the change post (C's `updateCounts()`
             // DBE_VALUE at `:582`).
-            if log_swept.contains(&field.as_str()) {
+            if log_swept.contains(&field) {
                 snapshot.push((
                     name(),
                     PostedValue::of_read(&val),
@@ -8705,12 +8884,12 @@ impl RecordInstance {
                 ));
             }
         }
-        if let Some(forced_mask) = forced_mask.filter(|_| secondary_fired != 0) {
+        if secondary_fired != 0 {
             self.post_forced_secondaries(
                 snapshot,
                 value_masked,
                 secondary_fired,
-                forced_mask,
+                secondary_guard,
                 deadband_mask,
             );
         }
@@ -8727,11 +8906,7 @@ impl RecordInstance {
         snapshot.retain(|(field, _, _)| {
             let walked = index >= first_post;
             index += 1;
-            !walked
-                || self
-                    .subscribers
-                    .get(field.as_ref())
-                    .is_some_and(|subs| !subs.is_empty())
+            !walked || self.subscribers.iter().any(|sub| sub.watches(field))
         });
     }
 
@@ -8747,7 +8922,7 @@ impl RecordInstance {
         snapshot: &mut ProcessSnapshot,
         value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
         fired: u64,
-        forced_mask: EventMask,
+        guard: EventMask,
         deadband_mask: EventMask,
     ) {
         use crate::server::record::ValuePostGate;
@@ -8756,9 +8931,24 @@ impl RecordInstance {
                 continue;
             }
             let mask = match gate {
-                ValuePostGate::OnChangeForced => forced_mask,
+                ValuePostGate::OnChangeForced => guard | EventMask::VALUE | EventMask::LOG,
+                ValuePostGate::Guarded => guard,
                 _ => deadband_mask,
             };
+            let posted = post_name(
+                self.monitor_plan
+                    .value_masked_declared
+                    .get(index)
+                    .copied()
+                    .flatten(),
+                name,
+            );
+            let subscribed = self.subscribers.iter().any(|sub| sub.watches(&posted));
+            // A claimed field keeps no published copy, so an unwatched post
+            // of one is nothing at all.
+            if !subscribed && self.monitor_plan.claimed.contains(name) {
+                continue;
+            }
             let val = if self.monitor_plan.value_masked_ref & (1 << index) != 0 {
                 PostedValue::Ref
             } else {
@@ -8767,12 +8957,8 @@ impl RecordInstance {
                 };
                 PostedValue::Val(val)
             };
-            if self
-                .subscribers
-                .get(*name)
-                .is_some_and(|subs| !subs.is_empty())
-            {
-                snapshot.push((Cow::Borrowed(name), val, mask));
+            if subscribed {
+                snapshot.push((posted, val, mask));
             } else {
                 self.record_value_post(name, val);
             }
@@ -9009,8 +9195,7 @@ impl RecordInstance {
         if self.record.took_metadata_change() {
             self.invalidate_metadata_cache();
             // mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
-            let fields: Vec<String> = self.subscribers.keys().cloned().collect();
-            for f in fields {
+            for f in self.subscribed_fields() {
                 self.notify_field_with_origin(&f, crate::server::recgbl::EventMask::PROPERTY, 0);
             }
         }
@@ -9211,7 +9396,11 @@ impl RecordInstance {
                 .map(PostedValue::Val)
         };
         if let Some(value) = value {
-            snapshot.push((field.into(), value, mask));
+            snapshot.push((
+                post_name(self.monitor_plan.deadband_declared, field),
+                value,
+                mask,
+            ));
         }
         mask
     }
@@ -9944,14 +10133,41 @@ impl RecordInstance {
         // find that out. Same gate as `collect_subscriber_posts`, kept in the
         // inlined half so the unmonitored cycle pays the test and not the
         // delivery loop's frame.
-        if self.subscribers.is_empty() {
+        if self.unwatched() {
             return;
         }
         self.deliver_snapshot(snapshot);
     }
 
+    /// Drops `field`'s monitors whose consumer is gone; how many remain.
+    /// Out of line, so a put's unwatched test keeps its frame.
+    #[inline(never)]
+    fn reap_closed(&mut self, field: &str) -> usize {
+        let mut live = 0;
+        self.subscribers.retain(|sub| {
+            if !sub.watches_str(field) {
+                return true;
+            }
+            let open = !sub.sub.is_closed();
+            live += usize::from(open);
+            open
+        });
+        live
+    }
+
+    /// No monitor is attached, tested on the inline length alone: a spilled
+    /// list emptied by detaches still reads as watched and its post finds no
+    /// one, so the gate is one load where `SmallVec::len` branches on the
+    /// spill.
+    #[inline(always)]
+    fn unwatched(&self) -> bool {
+        !self.subscribers.spilled() && self.subscribers.is_empty()
+    }
+
     #[inline(never)]
     fn deliver_snapshot(&self, snapshot: &ProcessSnapshot) {
+        #[cfg(test)]
+        DELIVERIES.with(|n| n.set(n.get() + 1));
         // Same ambient-origin inheritance as `notify_field_with_origin`:
         // a process cycle driven by an in-process writer's put tags its
         // posts with the writer's origin, so the writer's own filtered
@@ -9964,37 +10180,39 @@ impl RecordInstance {
 
         for (field, value, posting_mask) in snapshot.iter() {
             let posting_mask = *posting_mask;
-            if let Some(subs) = self.subscribers.get(field.as_ref()) {
-                // Each subscriber's log copies the record's alarm, time and
-                // utag and a scalar value; a wider one is read at delivery
-                // (`dbEvent.c:704-730`). No metadata rides on a post: the
-                // consumer reads it when it serves a class that carries it.
-                let value = value.as_value().map(|v| self.declared_view(field, v));
-                for sub in subs {
-                    // Paused subscriber (`db_event_disable`): suppress at
-                    // the source — no delivery, no coalesce.
-                    if !sub.active {
+            // C `db_post_events` walks `mlis` matching the field
+            // (`dbEvent.c:888-890`). Each subscriber's log copies the record's
+            // alarm, time and utag and a scalar value; a wider one is read at
+            // delivery (`dbEvent.c:704-730`). No metadata rides on a post: the
+            // consumer reads it when it serves a class that carries it.
+            let mut logged = None;
+            for entry in self.subscribers.iter().filter(|sub| sub.watches(field)) {
+                let sub = &entry.sub;
+                // Paused subscriber (`db_event_disable`): suppress at
+                // the source — no delivery, no coalesce.
+                if !sub.active {
+                    continue;
+                }
+                // Gate and narrow in one step through
+                // `Subscriber::delivered_mask`, which owns C's
+                // twice-used `caEventMask & pevent->select`. An empty
+                // posting mask means nothing changed and ands to zero,
+                // so it skips there rather than needing a check here.
+                if let Some(mask) = sub.delivered_mask(posting_mask) {
+                    // Server-side filter chain (3.15.7). Empty chain
+                    // is identity, so no behaviour change for the
+                    // common no-filter case. One field's monitors share
+                    // its projected log value.
+                    let value: &Option<Cow<'_, EpicsValue>> = logged
+                        .get_or_insert_with(|| value.as_value().map(|v| entry.declared_view(v)));
+                    let Some(event) = sub.filtered_log(head, value.as_deref(), origin, mask) else {
                         continue;
-                    }
-                    // Gate and narrow in one step through
-                    // `Subscriber::delivered_mask`, which owns C's
-                    // twice-used `caEventMask & pevent->select`. An empty
-                    // posting mask means nothing changed and ands to zero,
-                    // so it skips there rather than needing a check here.
-                    if let Some(mask) = sub.delivered_mask(posting_mask) {
-                        // Server-side filter chain (3.15.7). Empty chain
-                        // is identity, so no behaviour change for the
-                        // common no-filter case.
-                        let Some(event) = sub.filtered_log(head, value.as_deref(), origin, mask)
-                        else {
-                            continue;
-                        };
-                        // C `db_queue_event_log`: append, or replace this
-                        // monitor's last queued entry in place when the queue
-                        // is in flow control or nearly full. The queue owns
-                        // that decision and counts the displaced value.
-                        sub.post(&mut burst, event);
-                    }
+                    };
+                    // C `db_queue_event_log`: append, or replace this
+                    // monitor's last queued entry in place when the queue
+                    // is in flow control or nearly full. The queue owns
+                    // that decision and counts the displaced value.
+                    sub.post(&mut burst, event);
                 }
             }
         }
@@ -10027,8 +10245,7 @@ impl RecordInstance {
 
     /// [`Self::notify_record_alarm`] posting into the caller's `burst`.
     pub fn notify_record_alarm_in(&mut self, burst: &mut PostBurst) {
-        let fields: Vec<String> = self.subscribers.keys().cloned().collect();
-        for field in fields {
+        for field in self.subscribed_fields() {
             self.notify_field_in(burst, &field, crate::server::recgbl::EventMask::ALARM);
         }
     }
@@ -10142,11 +10359,8 @@ impl RecordInstance {
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
         );
         // Rows whose consumer went away without unsubscribing are reaped
-        // from the bucket being posted, not by a sweep of every field per put.
-        let subscribed = self.subscribers.get_mut(field).is_some_and(|subs| {
-            subs.retain(|s| !s.is_closed());
-            !subs.is_empty()
-        });
+        // from the field being posted, not by a sweep of every field per put.
+        let subscribed = !self.unwatched() && self.reap_closed(field) > 0;
         // With no subscriber the post only feeds `record_value_post`, which
         // stores nothing for the deadband field — a `dbPut` target's VAL.
         if !subscribed && (!publishes_value || field == self.record.monitor_deadband_field()) {
@@ -10164,7 +10378,7 @@ impl RecordInstance {
         }
         {
             let head = self.log_head();
-            let logged = value.as_value().map(|v| self.declared_view(field, v));
+            let mut logged = None;
             let mut own;
             let burst = match burst {
                 Some(burst) => burst,
@@ -10173,7 +10387,8 @@ impl RecordInstance {
                     &mut own
                 }
             };
-            for sub in &self.subscribers[field] {
+            for entry in self.subscribers.iter().filter(|sub| sub.watches_str(field)) {
+                let sub = &entry.sub;
                 // Paused subscriber (`db_event_disable`): suppress at
                 // the source — no delivery, no coalesce.
                 if !sub.active {
@@ -10189,6 +10404,8 @@ impl RecordInstance {
                     // existing subscribers see no behaviour
                     // change. A filter returning `None` silences
                     // this event for this subscriber only.
+                    let logged: &Option<Cow<'_, EpicsValue>> = logged
+                        .get_or_insert_with(|| value.as_value().map(|v| entry.declared_view(v)));
                     let Some(event) = sub.filtered_log(head, logged.as_deref(), origin, mask)
                     else {
                         continue;
@@ -10256,28 +10473,18 @@ impl RecordInstance {
         if self.destroyed {
             return Err(SubscribeRefused::NoRecord);
         }
-        // Looked up by `&str`: the key is copied only for a field's first
-        // monitor, since a bucket outlives its last subscriber.
-        let live = match self.subscribers.get_mut(field) {
-            Some(bucket) => {
-                // Reap rows whose consumer is gone before
-                // counting against the cap. A record field whose value
-                // never changes (e.g. a quasi-static catalog field) never
-                // triggers `notify_field_with_origin`'s retain-filter, so
-                // a long-lived subscribe-disconnect storm could pin the
-                // bucket at `cap` worth of dead rows and lock out
-                // genuine new subscribers.
-                bucket.retain(|s| !s.is_closed());
-                bucket.len()
-            }
-            None => 0,
-        };
+        // Reap the field's rows whose consumer is gone before counting
+        // against the cap. A record field whose value never changes (e.g. a
+        // quasi-static catalog field) never triggers `post_field`'s reap, so a
+        // long-lived subscribe-disconnect storm could pin the field at `cap`
+        // worth of dead rows and lock out genuine new subscribers.
+        let live = self.reap_closed(field);
         if live >= cap {
             return Err(SubscribeRefused::CapReached);
         }
-        let kind = crate::server::event_queue::LogKind::of_field(self.field_desc(field), || {
-            self.resolve_field(field)
-        });
+        let desc = self.field_desc(field);
+        let kind =
+            crate::server::event_queue::LogKind::of_field(desc, || self.resolve_field(field));
         let (sink, reader) = crate::server::event_queue::attach_with(user, sid, kind, context);
         let subscriber = Subscriber {
             sid,
@@ -10287,12 +10494,18 @@ impl RecordInstance {
             filters: crate::server::database::filters::FilterChain::new(),
             active: true,
         };
-        match self.subscribers.get_mut(field) {
-            Some(bucket) => bucket.push(subscriber),
-            None => {
-                self.subscribers.insert(field.to_string(), vec![subscriber]);
-            }
-        }
+        let entry = FieldSubscriber {
+            name: match declared_name(desc, field) {
+                Some(name) => SubName::Declared(name),
+                None => SubName::Named(field.into()),
+            },
+            ix: FieldIx::of(self.record.as_ref(), desc),
+            declared: self.declared_field_type(field),
+            long_string: self.record.field_is_long_string(field),
+            sub: subscriber,
+        };
+        // C `ellAdd`: attach order is post order.
+        self.subscribers.push(entry);
         // A field with no `last_posted` entry has never been published: seed it
         // with the value the client is handed in the EVENT_ADD response, so the
         // first process cycle does not treat it as changed. An existing entry
@@ -10322,13 +10535,18 @@ impl RecordInstance {
         field: &str,
         filter: std::sync::Arc<dyn crate::server::database::filters::SubscriptionFilter>,
     ) -> bool {
-        if let Some(bucket) = self.subscribers.get_mut(field) {
-            if let Some(sub) = bucket.last_mut() {
-                sub.filters.push(filter);
-                return true;
+        match self
+            .subscribers
+            .iter_mut()
+            .rev()
+            .find(|sub| sub.watches_str(field))
+        {
+            Some(entry) => {
+                entry.sub.filters.push(filter);
+                true
             }
+            None => false,
         }
-        false
     }
 
     /// C `db_post_single_event` for the `field` subscriber holding slot `id`.
@@ -10338,21 +10556,56 @@ impl RecordInstance {
         id: crate::server::event_queue::AttachId,
         snapshot: Arc<crate::server::snapshot::Snapshot>,
     ) {
-        if let Some(sub) = self
+        if let Some(entry) = self
             .subscribers
-            .get(field)
-            .and_then(|subs| subs.iter().find(|s| s.id() == id))
+            .iter()
+            .find(|sub| sub.sub.id() == id && sub.watches_str(field))
         {
-            sub.post_single(snapshot);
+            entry.sub.post_single(snapshot);
         }
     }
 
     /// Remove the subscriber holding slot `id` (its reader's
     /// [`EventReader::id`](crate::server::event_queue::EventReader::id)).
     pub fn remove_subscriber(&mut self, id: crate::server::event_queue::AttachId) {
-        for subs in self.subscribers.values_mut() {
-            subs.retain(|s| s.id() != id);
+        self.subscribers.retain(|sub| sub.sub.id() != id);
+    }
+
+    /// Whether any monitor watches `field`.
+    pub fn has_subscriber(&self, field: &str) -> bool {
+        self.subscribers.iter().any(|sub| sub.watches_str(field))
+    }
+
+    /// How many monitors watch `field`.
+    pub fn subscriber_count(&self, field: &str) -> usize {
+        self.subscribers
+            .iter()
+            .filter(|sub| sub.watches_str(field))
+            .count()
+    }
+
+    /// `field`'s monitors, in attach order.
+    pub fn subscribers_of<'a>(&'a self, field: &'a str) -> impl Iterator<Item = &'a Subscriber> {
+        self.subscribers
+            .iter()
+            .filter(move |sub| sub.watches_str(field))
+            .map(|sub| &sub.sub)
+    }
+
+    /// Every monitor on the record, in attach order.
+    pub fn field_subscribers(&self) -> &[FieldSubscriber] {
+        &self.subscribers
+    }
+
+    /// Each watched field once, in the order its first monitor attached.
+    fn subscribed_fields(&self) -> Vec<String> {
+        let mut fields: Vec<String> = Vec::new();
+        for sub in &self.subscribers {
+            if !fields.iter().any(|f| sub.watches_str(f)) {
+                fields.push(sub.field().to_owned());
+            }
         }
+        fields
     }
 
     /// Destroy this record: drop every field monitor and refuse every future
@@ -10417,20 +10670,16 @@ impl RecordInstance {
         id: crate::server::event_queue::AttachId,
         active: bool,
     ) {
-        for subs in self.subscribers.values_mut() {
-            for sub in subs.iter_mut() {
-                if sub.id() == id {
-                    sub.active = active;
-                }
+        for entry in self.subscribers.iter_mut() {
+            if entry.sub.id() == id {
+                entry.sub.active = active;
             }
         }
     }
 
     /// Clean up subscriber rows whose consumer is gone.
     pub fn cleanup_subscribers(&mut self) {
-        for subs in self.subscribers.values_mut() {
-            subs.retain(|s| !s.is_closed());
-        }
+        self.subscribers.retain(|sub| !sub.sub.is_closed());
     }
 }
 
@@ -10807,7 +11056,7 @@ mod metadata_cache_tests {
         let _live = add(2);
         drop(gone);
         inst.notify_field_with_origin("VAL", EventMask::VALUE, 0);
-        let sids: Vec<u32> = inst.subscribers["VAL"].iter().map(|s| s.sid).collect();
+        let sids: Vec<u32> = inst.subscribers_of("VAL").map(|s| s.sid).collect();
         assert_eq!(sids, [2]);
     }
 
@@ -11470,9 +11719,9 @@ mod metadata_cache_tests {
         // it.
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
-        assert!(n.contains(&std::borrow::Cow::Borrowed("RBV")), "{n:?}");
+        assert!(n.iter().any(|f| f == "RBV"), "{n:?}");
         assert!(
-            !n.contains(&std::borrow::Cow::Borrowed("VAL")),
+            !n.iter().any(|f| f == "VAL"),
             "VAL unchanged since subscribe must not post: {n:?}"
         );
 
@@ -11480,12 +11729,9 @@ mod metadata_cache_tests {
         // VAL not re-posted.
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
+        assert!(n.iter().any(|f| f == "RBV"), "RBV crossed MDEL: {n:?}");
         assert!(
-            n.contains(&std::borrow::Cow::Borrowed("RBV")),
-            "RBV crossed MDEL: {n:?}"
-        );
-        assert!(
-            !n.contains(&std::borrow::Cow::Borrowed("VAL")),
+            !n.iter().any(|f| f == "VAL"),
             "unchanged VAL must not post: {n:?}"
         );
 
@@ -11494,7 +11740,7 @@ mod metadata_cache_tests {
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
         assert!(
-            !n.contains(&std::borrow::Cow::Borrowed("RBV")),
+            !n.iter().any(|f| f == "RBV"),
             "MDEL must throttle RBV: {n:?}"
         );
 
@@ -11503,12 +11749,9 @@ mod metadata_cache_tests {
         let _ = inst.record.put_field("VAL", EpicsValue::Double(42.0));
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
+        assert!(n.iter().any(|f| f == "VAL"), "changed VAL must post: {n:?}");
         assert!(
-            n.contains(&std::borrow::Cow::Borrowed("VAL")),
-            "changed VAL must post: {n:?}"
-        );
-        assert!(
-            !n.contains(&std::borrow::Cow::Borrowed("RBV")),
+            !n.iter().any(|f| f == "RBV"),
             "MDEL must throttle RBV: {n:?}"
         );
     }
@@ -11660,7 +11903,7 @@ mod metadata_cache_tests {
         // empty so change-detection treats every subscribed field as new.
         let (snap1, _) = inst.process_local().unwrap();
         assert!(
-            names(&snap1).contains(&std::borrow::Cow::Borrowed("DIFF")),
+            names(&snap1).iter().any(|f| f == "DIFF"),
             "DIFF posts on first publish: {:?}",
             names(&snap1)
         );
@@ -11670,12 +11913,12 @@ mod metadata_cache_tests {
         // DBE_VAL_LOG. This is the divergence MOT-1 closes.
         let (snap2, _) = inst.process_local().unwrap();
         assert!(
-            names(&snap2).contains(&std::borrow::Cow::Borrowed("DIFF")),
+            names(&snap2).iter().any(|f| f == "DIFF"),
             "force-posted DIFF must re-post when unchanged: {:?}",
             names(&snap2)
         );
         assert!(
-            !names(&snap2).contains(&std::borrow::Cow::Borrowed("VAL")),
+            !names(&snap2).iter().any(|f| f == "VAL"),
             "an unchanged non-force field must not re-post: {:?}",
             names(&snap2)
         );
@@ -11788,12 +12031,12 @@ mod metadata_cache_tests {
         // with DBE_LOG ONLY; S2 (not swept) must NOT re-post.
         let (snap1, _) = inst.process_local().unwrap();
         assert!(
-            names(&snap1).contains(&std::borrow::Cow::Borrowed("S1")),
+            names(&snap1).iter().any(|f| f == "S1"),
             "log-swept S1 must re-post when unchanged: {:?}",
             names(&snap1)
         );
         assert!(
-            !names(&snap1).contains(&std::borrow::Cow::Borrowed("S2")),
+            !names(&snap1).iter().any(|f| f == "S2"),
             "unchanged non-swept S2 must not re-post: {:?}",
             names(&snap1)
         );
@@ -13199,6 +13442,78 @@ mod unanswerable_notify_tests {
 }
 
 #[cfg(test)]
+mod claimed_field_tests {
+    use super::*;
+    use crate::server::recgbl::EventMask;
+    use crate::server::record::{CycleMarks, CyclePostMask};
+    use crate::types::DbFieldType;
+
+    static FIELDS: &[crate::server::record::FieldDesc] = &[
+        crate::server::record::FieldDesc::new("VAL", DbFieldType::Double, false),
+        crate::server::record::FieldDesc::new("SENT", DbFieldType::Double, false),
+    ];
+    static SENT_POST: [(&str, CyclePostMask); 1] = [("SENT", CyclePostMask::MonitorValueLog)];
+
+    /// Throttle's shape: `process()` marks SENT and leaves VAL unmoved.
+    #[derive(Default)]
+    struct MarksSent {
+        marked: bool,
+    }
+
+    impl Record for MarksSent {
+        fn record_type(&self) -> &'static str {
+            "marks_sent"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            self.marked = true;
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "VAL" | "SENT" => Some(EpicsValue::Double(1.0)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
+            Err(CaError::FieldNotFound(name.to_string()))
+        }
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
+            FIELDS
+        }
+        fn monitor_value_changed(&mut self) -> Option<bool> {
+            Some(false)
+        }
+        fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+            crate::server::record::CycleHooks::ALL
+        }
+        fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+            &["SENT"]
+        }
+        fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+            CycleMarks::of(&SENT_POST, u128::from(std::mem::take(&mut self.marked)))
+        }
+    }
+
+    /// A claimed field keeps no published copy (I2): attach, the marked
+    /// cycles and a direct publish all leave `last_posted` empty, and the
+    /// subscriber still gets one post per mark, as from C's `monitor()`.
+    #[test]
+    fn a_claimed_field_is_never_published() {
+        let mut inst = RecordInstance::new("R".to_string(), MarksSent::default());
+        inst.process_local().unwrap();
+        assert!(inst.last_posted.is_empty(), "an unwatched marked cycle");
+        let all = (EventMask::VALUE | EventMask::LOG).bits();
+        let _sent = inst.add_subscriber("SENT", 2, DbFieldType::Double, all);
+        for _ in 0..2 {
+            let (snap, _) = inst.process_local().unwrap();
+            assert_eq!(snap.iter().filter(|(f, _, _)| f == "SENT").count(), 1);
+        }
+        inst.record_value_post("SENT", PostedValue::Val(EpicsValue::Double(2.0)));
+        assert!(inst.last_posted.is_empty(), "{:?}", inst.last_posted);
+    }
+}
+
+#[cfg(test)]
 mod forced_secondary_post_tests {
     use super::*;
     use crate::server::recgbl::EventMask;
@@ -13259,6 +13574,36 @@ mod forced_secondary_post_tests {
         assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
     }
 
+    /// I2 for ao: watched OVAL, RVAL and RBV post from the record's own
+    /// copies and leave no published copy behind, RBV only on `orbv != rbv`.
+    #[test]
+    fn ao_keeps_no_published_copy_of_its_posts() {
+        let mut rbv_moved = AoRecord::default();
+        rbv_moved.rbv = 3;
+        let instances = [
+            (ao_with_moved_rval(7), ["OVAL", "RVAL"]),
+            (
+                RecordInstance::new("AO:RBV".to_string(), rbv_moved),
+                ["OVAL", "RBV"],
+            ),
+        ];
+        for (mut inst, first) in instances {
+            for (sid, field) in ["OVAL", "RVAL", "RBV"].into_iter().enumerate() {
+                let _rx = inst
+                    .add_subscriber(
+                        field,
+                        sid as u32,
+                        DbFieldType::Double,
+                        EventMask::VALUE.bits(),
+                    )
+                    .expect("subscriber");
+            }
+            assert_eq!(guarded_cycle(&mut inst), first);
+            assert_eq!(guarded_cycle(&mut inst), ["OVAL"]);
+            assert!(inst.last_posted.is_empty(), "{:?}", inst.last_posted);
+        }
+    }
+
     /// ai RVAL rides VAL's own guard (aiRecord.c:459-465): a shut guard
     /// leaves ORAW stale, an open one posts RVAL with VAL's mask and advances
     /// ORAW, subscriber or not.
@@ -13290,6 +13635,169 @@ mod forced_secondary_post_tests {
         let posted = cycle(&mut inst, EventMask::VALUE);
         assert_eq!(posted, [("RVAL".to_string(), EventMask::VALUE)]);
         assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(9)));
+    }
+}
+
+#[cfg(test)]
+mod mlis_tests {
+    //! The record's subscriber list against C's `mlis` walk
+    //! (`dbEvent.c:876-906`), one test per boundary.
+    use super::*;
+    use crate::server::event_queue::{EventReader, TryRecvError};
+    use crate::server::recgbl::EventMask;
+    use crate::server::records::ao::AoRecord;
+    use crate::types::DbFieldType;
+
+    fn ao() -> RecordInstance {
+        RecordInstance::new("AO:MLIS".to_string(), AoRecord::default())
+    }
+
+    fn attach(inst: &mut RecordInstance, field: &str, mask: EventMask) -> EventReader {
+        inst.add_subscriber(field, 0, DbFieldType::Double, mask.bits())
+            .expect("subscriber")
+    }
+
+    /// A cycle's post of `field` under its declared name.
+    fn post(inst: &RecordInstance, field: &str, mask: EventMask) {
+        let name = field_desc_of(inst.record.as_ref(), field).unwrap().name;
+        let mut snapshot = ProcessSnapshot::new();
+        snapshot.push((
+            PostName::Declared(name),
+            PostedValue::Val(EpicsValue::Double(1.0)),
+            mask,
+        ));
+        inst.notify_from_snapshot(&snapshot);
+    }
+
+    fn drained(reader: &mut EventReader) -> Vec<u16> {
+        std::iter::from_fn(|| reader.try_recv().ok())
+            .map(|ev| ev.mask().bits())
+            .collect()
+    }
+
+    /// 0, 1, 2 and 3 monitors on one field: each receives the post once, and
+    /// the third spills the list past its two inline entries.
+    #[test]
+    fn every_monitor_up_to_the_spill_receives_one_post() {
+        for n in 0..=3 {
+            let mut inst = ao();
+            let mut readers: Vec<_> = (0..n)
+                .map(|_| attach(&mut inst, "VAL", EventMask::VALUE))
+                .collect();
+            assert_eq!(inst.subscribers.spilled(), n > 2, "{n} monitors");
+            post(&inst, "VAL", EventMask::VALUE);
+            for reader in &mut readers {
+                assert_eq!(drained(reader), [EventMask::VALUE.bits()], "{n} monitors");
+            }
+        }
+    }
+
+    /// Monitors on two fields of one record each receive only their own.
+    #[test]
+    fn a_post_reaches_only_its_fields_monitors() {
+        let mut inst = ao();
+        let mut val = attach(&mut inst, "VAL", EventMask::VALUE);
+        let mut oval = attach(&mut inst, "OVAL", EventMask::VALUE);
+        post(&inst, "OVAL", EventMask::VALUE);
+        assert!(drained(&mut val).is_empty());
+        assert_eq!(drained(&mut oval), [EventMask::VALUE.bits()]);
+        post(&inst, "VAL", EventMask::VALUE);
+        assert_eq!(drained(&mut val), [EventMask::VALUE.bits()]);
+        assert!(drained(&mut oval).is_empty());
+    }
+
+    /// One field watched for VALUE and for ALARM: `caEventMask & select`
+    /// decides each (`dbEvent.c:896-900`).
+    #[test]
+    fn one_fields_monitors_are_selected_by_mask() {
+        let mut inst = ao();
+        let mut value = attach(&mut inst, "VAL", EventMask::VALUE);
+        let mut alarm = attach(&mut inst, "VAL", EventMask::ALARM);
+        post(&inst, "VAL", EventMask::VALUE);
+        post(&inst, "VAL", EventMask::ALARM);
+        post(&inst, "VAL", EventMask::VALUE | EventMask::ALARM);
+        assert_eq!(
+            drained(&mut value),
+            [EventMask::VALUE.bits(), EventMask::VALUE.bits()]
+        );
+        assert_eq!(
+            drained(&mut alarm),
+            [EventMask::ALARM.bits(), EventMask::ALARM.bits()]
+        );
+    }
+
+    /// Detached between two posts of one burst: the detached monitor keeps
+    /// what was queued and is then closed; the other receives both.
+    #[test]
+    fn a_monitor_detached_mid_burst_closes_alone() {
+        let mut inst = ao();
+        let mut gone = attach(&mut inst, "VAL", EventMask::VALUE);
+        let mut kept = attach(&mut inst, "VAL", EventMask::VALUE);
+        let mut burst = PostBurst::new();
+        inst.notify_field_in(&mut burst, "VAL", EventMask::VALUE);
+        inst.remove_subscriber(gone.id());
+        inst.notify_field_in(&mut burst, "VAL", EventMask::VALUE);
+        drop(burst);
+        assert!(gone.try_recv().is_ok());
+        assert_eq!(gone.try_recv().err(), Some(TryRecvError::Disconnected));
+        assert_eq!(drained(&mut kept).len(), 2);
+    }
+
+    /// A list detached empty after spilling reads as watched: its posts find
+    /// no one, and the next monitor attached receives them.
+    #[test]
+    fn a_list_emptied_after_spilling_posts_to_its_next_monitor() {
+        let mut inst = ao();
+        let gone: Vec<_> = (0..3)
+            .map(|_| attach(&mut inst, "VAL", EventMask::VALUE))
+            .collect();
+        for reader in &gone {
+            inst.remove_subscriber(reader.id());
+        }
+        assert!(inst.subscribers.spilled() && inst.subscribers.is_empty());
+        post(&inst, "VAL", EventMask::VALUE);
+        inst.notify_field("VAL", EventMask::VALUE);
+        let mut next = attach(&mut inst, "VAL", EventMask::VALUE);
+        post(&inst, "VAL", EventMask::VALUE);
+        assert_eq!(drained(&mut next), [EventMask::VALUE.bits()]);
+    }
+
+    /// With no monitor the post stops at the list's length.
+    #[test]
+    fn an_unwatched_record_never_reaches_delivery() {
+        let inst = ao();
+        DELIVERIES.with(|n| n.set(0));
+        post(&inst, "VAL", EventMask::VALUE);
+        assert_eq!(DELIVERIES.with(|n| n.get()), 0);
+    }
+
+    /// A cycle's declared-field posts — the deadband VAL, the forced OVAL and
+    /// RVAL — find their monitors, and pass the others, by pointer alone.
+    #[test]
+    fn a_declared_field_post_compares_no_name_bytes() {
+        let mut rec = AoRecord::default();
+        rec.rval = 7;
+        rec.omod = true;
+        let mut inst = RecordInstance::new("AO:PTR".to_string(), rec);
+        let mut readers: Vec<_> = ["VAL", "OVAL", "RVAL"]
+            .into_iter()
+            .map(|field| attach(&mut inst, field, EventMask::VALUE))
+            .collect();
+        NAME_BYTE_COMPARES.with(|n| n.set(0));
+        let mut snapshot = ProcessSnapshot::new();
+        inst.deadband_post(&mut snapshot, EventMask::NONE, true, false);
+        inst.collect_subscriber_posts(
+            &mut snapshot,
+            EventMask::VALUE,
+            EventMask::NONE,
+            true,
+            false,
+        );
+        inst.notify_from_snapshot(&snapshot);
+        assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0);
+        for reader in &mut readers {
+            assert_eq!(drained(reader).len(), 1);
+        }
     }
 }
 
@@ -13435,7 +13943,7 @@ mod walk_post_name_tests {
 
     /// The walk's posts for one ai cycle with `key` subscribed and HOPR, a
     /// change-detected field, moved since.
-    fn hopr_posts(key: &str) -> Vec<Cow<'static, str>> {
+    fn hopr_posts(key: &str) -> Vec<PostName> {
         let mut inst = RecordInstance::new("AI:NAME".to_string(), AiRecord::default());
         let _rx = inst
             .add_subscriber(key, 1, DbFieldType::Double, EventMask::VALUE.bits())
@@ -13458,7 +13966,10 @@ mod walk_post_name_tests {
     /// the post copies nothing under the record lock.
     #[test]
     fn a_declared_field_posts_its_static_name() {
-        assert!(matches!(hopr_posts("HOPR")[..], [Cow::Borrowed("HOPR")]));
+        assert!(matches!(
+            hopr_posts("HOPR")[..],
+            [PostName::Declared("HOPR")]
+        ));
     }
 
     /// Any other spelling posts as keyed: delivery looks the subscriber up
@@ -13467,7 +13978,7 @@ mod walk_post_name_tests {
     fn another_spelling_posts_as_keyed() {
         let posts = hopr_posts("hopr");
         assert!(
-            matches!(&posts[..], [Cow::Owned(name)] if name == "hopr"),
+            matches!(&posts[..], [PostName::Named(Cow::Owned(name))] if name == "hopr"),
             "{posts:?}"
         );
     }
@@ -13496,21 +14007,48 @@ mod posted_settle_tests {
         inst.last_posted[field].posted()
     }
 
-    /// An EFLG put moves aSub's closed list both ways; each walk after it
-    /// re-settles every entry against the list it now answers, the field it
-    /// closes out (VALA under NEVER, which never posts again) included.
-    #[test]
-    fn an_eflg_put_resettles_every_published_membership() {
-        let mut inst = RecordInstance::new("AS".to_string(), ASubRecord::default());
+    /// A closed list that answers by state, as scaler's channel count or
+    /// aSub's EFLG does, over a field the type does not claim.
+    struct Toggles {
+        closed: bool,
+    }
+
+    impl Record for Toggles {
+        fn record_type(&self) -> &'static str {
+            "toggles"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            matches!(name, "VAL" | "X").then_some(EpicsValue::Double(0.0))
+        }
+        fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
+            Err(CaError::FieldNotFound(name.to_string()))
+        }
+        fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+            Some(if self.closed { &["VAL"] } else { &["VAL", "X"] })
+        }
+    }
+
+    fn toggles(closed: bool) -> RecordInstance {
+        let mut inst = RecordInstance::new("T".to_string(), Toggles { closed });
         let _rx = inst
-            .add_subscriber("VALA", 1, DbFieldType::Double, EventMask::VALUE.bits())
-            .expect("VALA subscriber");
-        for (eflg, member) in [(1, true), (0, false), (2, true)] {
-            inst.record
-                .put_field("EFLG", EpicsValue::Short(eflg))
-                .unwrap();
+            .add_subscriber("X", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("X subscriber");
+        inst
+    }
+
+    /// A state change moves the closed list both ways; each walk after it
+    /// re-settles every entry against the list it now answers, the field it
+    /// closes out included.
+    #[test]
+    fn a_moved_list_resettles_every_published_membership() {
+        let mut inst = toggles(false);
+        for closed in [true, false, true] {
+            inst.record = Box::new(Toggles { closed });
             walk(&mut inst);
-            assert_eq!(posted(&mut inst, "VALA"), member, "EFLG {eflg}");
+            assert_eq!(posted(&mut inst, "X"), !closed, "closed {closed}");
         }
     }
 
@@ -13537,10 +14075,6 @@ mod posted_settle_tests {
     /// reads the current membership: the read settles first.
     #[test]
     fn a_field_published_before_the_first_settle_reads_settled() {
-        let mut inst = RecordInstance::new("AS".to_string(), ASubRecord::default());
-        let _rx = inst
-            .add_subscriber("VALA", 1, DbFieldType::Double, EventMask::VALUE.bits())
-            .expect("VALA subscriber");
-        assert!(posted(&mut inst, "VALA"));
+        assert!(posted(&mut toggles(false), "X"));
     }
 }

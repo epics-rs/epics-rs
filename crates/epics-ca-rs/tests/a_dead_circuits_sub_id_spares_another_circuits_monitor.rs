@@ -86,7 +86,7 @@ fn the_blocking_loop_spares_the_surviving_circuits_monitor() {
 
 fn monitors_on_val(db: &PvDatabase) -> usize {
     let rec = db.get_record(PV).expect("record");
-    rec.read().subscribers.get("VAL").map_or(0, Vec::len)
+    rec.read().subscriber_count("VAL")
 }
 
 fn assert_survivor_sees_every_update(addr: SocketAddr, db: &PvDatabase) {

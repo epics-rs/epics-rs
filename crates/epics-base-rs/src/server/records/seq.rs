@@ -106,6 +106,8 @@ pub(crate) fn set_seq_dly_limit(value: f64) {
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
                      DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",
     init = seq_init_record,
+    take_cycle_posted_fields = seq_monitor_posts,
+    fields_posted_only_when_marked = SEQ_CLAIMED,
     // seq's VAL is a `pp(TRUE)` "trigger" — C `process()` posts VAL only with
     // alarm events (`if (events) db_post_events(&prec->val, events)`,
     // seqRecord.c:227-229), never DBE_VALUE/DBE_LOG. So a run of `caput VAL`
@@ -382,6 +384,24 @@ impl SeqRecord {
     }
 }
 
+/// SELN, posted by `asyncFinish`, and DO0..DOF, posted by `processCallback`
+/// (`seqRecord.c:230-232`, `:266-268`), each against the record's own copy.
+const SEQ_CLAIMED: [&str; 17] = [
+    "SELN", "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "DOB",
+    "DOC", "DOD", "DOE", "DOF",
+];
+
+/// C `asyncFinish`'s SELN post (`seqRecord.c:230-232`): `if (prec->seln !=
+/// prec->oldn)` post it with `events | DBE_VALUE | DBE_LOG`, then `oldn = seln`.
+/// Taken once per cycle at its close, which is where `asyncFinish` runs.
+fn seq_monitor_posts(rec: &mut SeqRecord) -> crate::server::record::CycleMarks {
+    use crate::server::record::{CycleMarks, CyclePostMask};
+    static POSTS: [(&str, CyclePostMask); 1] = [("SELN", CyclePostMask::MonitorValueLog)];
+    let moved = rec.seln != rec.oldn;
+    rec.oldn = rec.seln;
+    CycleMarks::of(&POSTS, u128::from(moved))
+}
+
 /// C `seqRecord.c:init_record` — `Record::init_record` for `seq`, wired through
 /// `#[record(init = seq_init_record)]`.
 ///
@@ -390,11 +410,9 @@ impl SeqRecord {
 /// `prec->oldn = prec->seln` (`seqRecord.c:121,128`) so the first `process`
 /// posts a SELN monitor only on a real change. The SELL constant seed itself
 /// is this framework's constant-link owner's job (`SELL:SELN` in
-/// `constant_init`), which runs after the init passes; OLDN therefore tracks
-/// the default/`.db` SELN here. A non-empty CONSTANT `field(SELL,…)` — the one
-/// case where C seeds SELN inside `init_record` before this copy — is the sole
-/// configuration where OLDN would differ, and is not exercised by the soft
-/// database surface.
+/// `constant_init`), which runs after the init passes and ends by dropping
+/// the init-time marks through [`seq_monitor_posts`], which copies the seeded
+/// SELN into OLDN as C's order does.
 fn seq_init_record(rec: &mut SeqRecord, pass: u8) -> crate::error::CaResult<()> {
     if pass == 1 {
         rec.oldn = rec.seln;
@@ -416,7 +434,7 @@ mod tests {
         let rec = SeqRecord::default();
         assert_eq!(rec.shft, -1);
         // SELM=Mask(2), SELN=1, default SHFT=-1 → mask = 1<<1 = 0b10 → slot 1.
-        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft, 16);
-        assert_eq!(sel.indices, vec![1]);
+        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft);
+        assert_eq!(sel.indices().collect::<Vec<_>>(), vec![1]);
     }
 }

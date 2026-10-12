@@ -474,48 +474,24 @@ impl Record for AoRecord {
         Ok(())
     }
 
-    /// C `aoRecord.c::monitor` (`:531-549`) posts OVAL from INSIDE
-    /// `if (monitor_mask)` with **no test of OVAL's own value**:
-    ///
-    /// ```c
-    /// if(prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG);
-    /// if(monitor_mask) {
-    ///     prec->omod = FALSE;
-    ///     db_post_events(prec,&prec->oval,monitor_mask);
-    /// ```
-    ///
-    /// On a cycle whose only event is an alarm transition, `monitor_mask` is
-    /// the alarm bits alone and `omod` is false (the output did not move), so
-    /// C still sends OVAL to a `DBE_ALARM` subscriber. The port's aux post is
-    /// change-detected, so an unchanged OVAL reached nobody — this hook is the
-    /// unchanged-field arm, and it posts with the alarm bits, which is exactly
-    /// `monitor_mask` on such a cycle.
-    ///
-    /// The CHANGED arm needs nothing: the framework's aux mask is
-    /// `alarm_bits | DBE_VALUE | DBE_LOG`, and C's is
-    /// `monitor_mask | DBE_VALUE | DBE_LOG` where the deadband bits it adds
-    /// (`DBE_VALUE` from MDEL, `DBE_ARCHIVE` from ADEL) are already in that
-    /// pair. RVAL/RBV are NOT named here: C gates each on its own
-    /// `oraw != rval` / `orbv != rbv` test, so an unchanged one posts on no
-    /// cycle at all.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &["OVAL"]
-    }
-
-    /// C `aoRecord.c:539-548` posts RVAL and RBV from INSIDE
-    /// `if (monitor_mask)`, each behind its own `oraw != rval` /
-    /// `orbv != rbv` test, with the forced `monitor_mask|DBE_VALUE|DBE_LOG`.
-    /// The default change-detected path has neither guard, so a cycle whose
-    /// monitor mask is empty — VAL unchanged, no alarm move, `omod` false —
-    /// posted an RVAL that C withholds until the next cycle that does fire.
-    /// Reachable from a client with `caput AO.ASLO` (or AOFF/LINR) followed by
-    /// `caput AO.PROC 1`: measured on softIoc R7.0.10-146, C emits no event
-    /// there and leaves ORAW at its previous value.
+    /// C `aoRecord.c::monitor` (`:535-548`): OVAL whenever the guard
+    /// `omod` widens fires, with that guard as its mask; RVAL and RBV inside
+    /// it, each behind its own `oraw != rval` / `orbv != rbv` test, with
+    /// `monitor_mask|DBE_VALUE|DBE_LOG`. Measured on softIoc R7.0.10: an
+    /// alarm-only cycle posts OVAL with `DBE_ALARM` alone, and a cycle that
+    /// moves nothing posts none of the three.
     fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
         &[
+            ("OVAL", ValuePostGate::Guarded),
             ("RVAL", ValuePostGate::OnChangeForced),
             ("RBV", ValuePostGate::OnChangeForced),
         ]
+    }
+
+    /// `monitor()` decides all three from the record's own `omod`, `oraw`
+    /// and `orbv`, so the framework keeps no published copy of them.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["OVAL", "RVAL", "RBV"]
     }
 
     /// C `aoRecord.c:535` — `omod` opens the block above without opening VAL's

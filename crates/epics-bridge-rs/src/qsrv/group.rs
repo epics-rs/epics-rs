@@ -4967,16 +4967,16 @@ mod tests {
         {
             let plain_inst = plain.read();
             assert!(
-                plain_inst.subscribers.contains_key("RVAL"),
+                plain_inst.has_subscriber("RVAL"),
                 "plain member must subscribe its configured field RVAL"
             );
             assert!(
-                !plain_inst.subscribers.contains_key("VAL"),
+                !plain_inst.has_subscriber("VAL"),
                 "plain member must NOT subscribe the record-default VAL"
             );
             // FR-7: a plain (non-meta) member has exactly one value
             // subscription (no property sub) with VALUE|ALARM|LOG.
-            let rval_subs = &plain_inst.subscribers["RVAL"];
+            let rval_subs: Vec<_> = plain_inst.subscribers_of("RVAL").collect();
             assert_eq!(
                 rval_subs.len(),
                 1,
@@ -4993,8 +4993,7 @@ mod tests {
         // PROPERTY subscription is retained on the same field.
         let meta = db.get_record("R:meta").unwrap();
         let meta_inst = meta.read();
-        let val_subs = &meta_inst.subscribers["VAL"];
-        let masks: Vec<u16> = val_subs.iter().map(|s| s.mask).collect();
+        let masks: Vec<u16> = meta_inst.subscribers_of("VAL").map(|s| s.mask).collect();
         assert!(
             masks.contains(&EventMask::ALARM.bits()),
             "meta value subscription must be ALARM-only, got {masks:?}"
@@ -6320,10 +6319,7 @@ mod tests {
         let rec = db.get_record("SUBF:ai").expect("record exists");
         let filters_installed = {
             let inst = rec.read();
-            inst.subscribers
-                .get("VAL")
-                .map(|subs| subs.iter().any(|s| !s.filters.is_empty()))
-                .unwrap_or(false)
+            inst.subscribers_of("VAL").any(|s| !s.filters.is_empty())
         };
         assert!(
             filters_installed,

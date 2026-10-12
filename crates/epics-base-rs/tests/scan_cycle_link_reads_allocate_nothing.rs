@@ -89,6 +89,23 @@ fn calcs() -> (String, Vec<String>) {
     (db, pvs)
 }
 
+/// `N` dfanouts reading `TICK` through DOL and driving two outputs, as the
+/// bench's dfanout db does: the SELM selection is resolved every cycle.
+fn dfanouts() -> (String, Vec<String>) {
+    let mut db = String::from(TICK);
+    db.push_str("record(calc, \"SINK\") { field(CALC, \"VAL\") }\n");
+    db.push_str("record(calc, \"SINK2\") { field(CALC, \"VAL\") }\n");
+    let mut pvs = Vec::new();
+    for i in 0..N {
+        db.push_str(&format!(
+            "record(dfanout, \"D{i}\") {{ field(SCAN, \".1 second\") field(DOL, \"TICK\") \
+             field(OMSL, \"closed_loop\") field(OUTA, \"SINK\") field(OUTB, \"SINK2\") }}\n"
+        ));
+        pvs.push(format!("D{i}"));
+    }
+    (db, pvs)
+}
+
 fn tick(db: &PvDatabase) -> u64 {
     match db.get_pv("TICK").expect("TICK") {
         EpicsValue::Double(v) => v as u64,
@@ -118,8 +135,12 @@ fn allocs_per_tick(db: &PvDatabase) -> (u64, u64) {
     (a1 - a0, ticks)
 }
 
-/// The cycle allocates nothing unwatched, and a subscriber adds nothing.
-async fn assert_scan_allocates_nothing((db_text, pvs): (String, Vec<String>)) -> Arc<PvDatabase> {
+/// The cycle allocates nothing unwatched, and `monitors` subscribers per
+/// record add nothing.
+async fn assert_scan_allocates_nothing(
+    (db_text, pvs): (String, Vec<String>),
+    monitors: usize,
+) -> Arc<PvDatabase> {
     let db = IocBuilder::new()
         .db_string(&db_text, &HashMap::new())
         .unwrap()
@@ -137,11 +158,13 @@ async fn assert_scan_allocates_nothing((db_text, pvs): (String, Vec<String>)) ->
 
     let mut subs = Vec::new();
     for pv in &pvs {
-        subs.push(
-            DbSubscription::subscribe(&db, pv)
-                .await
-                .unwrap_or_else(|e| panic!("{pv} subscribes: {e:?}")),
-        );
+        for _ in 0..monitors {
+            subs.push(
+                DbSubscription::subscribe(&db, pv)
+                    .await
+                    .unwrap_or_else(|e| panic!("{pv} subscribes: {e:?}")),
+            );
+        }
     }
     let (watched, ticks) = allocs_per_tick(&db);
     assert_eq!(
@@ -160,7 +183,22 @@ async fn assert_scan_allocates_nothing((db_text, pvs): (String, Vec<String>)) ->
 /// A post carries no metadata, so the cycle walks no INPA target for it.
 #[epics_macros_rs::epics_test]
 async fn a_calc_cycle_reading_inpa_allocates_nothing() {
-    let db = assert_scan_allocates_nothing(calcs()).await;
+    let db = assert_scan_allocates_nothing(calcs(), 1).await;
     let c0 = db.get_pv("C0").expect("C0").to_f64().expect("double");
     assert!(c0 > 10.0, "C0 read TICK through INPA: {c0}");
+}
+
+/// The SELM selection is held in place, not collected per cycle.
+#[epics_macros_rs::epics_test]
+async fn a_dfanout_cycle_driving_its_outputs_allocates_nothing() {
+    let db = assert_scan_allocates_nothing(dfanouts(), 1).await;
+    let sink = db.get_pv("SINK").expect("SINK").to_f64().expect("double");
+    assert!(sink > 10.0, "D0 drove TICK into SINK: {sink}");
+}
+
+/// Three monitors per record spill the record's subscriber list, which grew
+/// at attach: a post to them allocates nothing.
+#[epics_macros_rs::epics_test]
+async fn three_monitors_per_record_allocate_nothing() {
+    assert_scan_allocates_nothing(calcs(), 3).await;
 }

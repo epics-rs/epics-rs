@@ -1234,16 +1234,51 @@ pub(crate) enum SelmKind {
     Dfanout,
 }
 
+/// The link slots a fanout, dfanout or seq has: `LNK0..LNKF`, `OUTA..OUTP`.
+pub(crate) const SELM_SLOTS: usize = 16;
+
 /// Result of resolving a SELM/SELN selection.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SelmResult {
-    /// 0-based link indices to drive (into the LNK0../OUTA.. array).
-    pub indices: Vec<usize>,
+    /// Bit `i` drives link slot `i`: a selection is resolved every cycle, so
+    /// it is held in place rather than in a list.
+    pub selected: u16,
     /// `Some` when C would raise an alarm for an out-of-range
     /// `SELN`/`OFFS`/`SHFT`. C uses `recGblSetSevr(prec, SOFT_ALARM,
     /// INVALID_ALARM)` in every such path.
     pub alarm: Option<(u16, crate::server::record::AlarmSeverity)>,
 }
+
+impl SelmResult {
+    /// The selected slots, ascending, as C's loops drive them.
+    pub(crate) fn indices(self) -> SelectedSlots {
+        SelectedSlots(self.selected)
+    }
+}
+
+/// The set bits of a selection, lowest first. Exact-size, so seq's group
+/// list is sized once rather than grown slot by slot.
+pub(crate) struct SelectedSlots(u16);
+
+impl Iterator for SelectedSlots {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let i = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(i)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.0.count_ones() as usize;
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for SelectedSlots {}
 
 /// Convert a link value to `epicsUInt16` with C `dbGetLink(.., DBR_USHORT,
 /// ..)` semantics, for the fanout/dfanout/seq `SELL`→`SELN` read — so a
@@ -1290,8 +1325,7 @@ pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
 /// Select which link indices are active based on SELM/SELN, applying
 /// the record-type-specific `OFFS`/`SHFT` bias.
 ///
-/// SELM: 0 = All, 1 = Specified, 2 = Mask. `count` is the number of
-/// link slots (16 for fanout/dfanout/seq).
+/// SELM: 0 = All, 1 = Specified, 2 = Mask, over [`SELM_SLOTS`] link slots.
 ///
 /// `seln` is the native `DBF_USHORT` value: C declares `SELN` as
 /// `epicsUInt16`, so every comparison below is unsigned, matching C's
@@ -1308,23 +1342,23 @@ pub(crate) fn select_link_indices_ex(
     seln: u16,
     offs: i16,
     shft: i16,
-    count: usize,
 ) -> SelmResult {
     use crate::server::recgbl::alarm_status::SOFT_ALARM;
     use crate::server::record::AlarmSeverity;
 
+    let count = SELM_SLOTS;
     let invalid = || SelmResult {
-        indices: Vec::new(),
+        selected: 0,
         alarm: Some((SOFT_ALARM, AlarmSeverity::Invalid)),
     };
-    let ok = |indices: Vec<usize>| SelmResult {
-        indices,
+    let ok = |selected: u16| SelmResult {
+        selected,
         alarm: None,
     };
 
     match selm {
         // All — every slot.
-        0 => ok((0..count).collect()),
+        0 => ok(u16::MAX),
         // Specified.
         1 => match kind {
             SelmKind::FanoutSeq => {
@@ -1336,7 +1370,7 @@ pub(crate) fn select_link_indices_ex(
                 if i < 0 || i >= count as i32 {
                     invalid()
                 } else {
-                    ok(vec![i as usize])
+                    ok(1 << i)
                 }
             }
             SelmKind::Dfanout => {
@@ -1350,9 +1384,9 @@ pub(crate) fn select_link_indices_ex(
                 if seln_i > count as i32 {
                     invalid()
                 } else if seln_i == 0 {
-                    ok(Vec::new())
+                    ok(0)
                 } else {
-                    ok(vec![(seln_i - 1) as usize])
+                    ok(1 << (seln_i - 1))
                 }
             }
         },
@@ -1374,7 +1408,8 @@ pub(crate) fn select_link_indices_ex(
                 // dfanout Mask has no SHFT.
                 SelmKind::Dfanout => seln as u32,
             };
-            ok((0..count).filter(|i| mask & (1 << i) != 0).collect())
+            // Bits shifted past the last slot drive nothing.
+            ok(mask as u16)
         }
         // Any other SELM value → C `default:` raises INVALID.
         _ => invalid(),
@@ -4308,39 +4343,39 @@ mod tests {
     fn select_link_indices_fanout_all_specified_mask() {
         use crate::server::record::AlarmSeverity;
         // All — every slot.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 0, 0, 0, 0, 16);
-        assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 0, 0, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
         assert!(r.alarm.is_none());
 
         // Specified, 0-based: SELN=0 selects LNK0 (C parity, fanout).
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, 0, 0, 16);
-        assert_eq!(r.indices, vec![0]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0]);
         // Specified with OFFS bias: SELN=2 + OFFS=3 → index 5.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 2, 3, 0, 16);
-        assert_eq!(r.indices, vec![5]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 2, 3, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![5]);
         // Out-of-range Specified → INVALID alarm, no links.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 20, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 20, 0, 0);
+        assert_eq!(r.selected, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
         // Negative resolved index (SELN + negative OFFS) → INVALID.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, -1, 0, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, -1, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
 
         // Mask: SELN=0b101 → bits 0 and 2.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 0, 16);
-        assert_eq!(r.indices, vec![0, 2]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0, 2]);
         // Mask with SHFT: SELN=0b101 >> 1 = 0b10 → bit 1.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 1, 16);
-        assert_eq!(r.indices, vec![1]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 1);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![1]);
         // Mask with negative SHFT: SELN=0b101 << 1 = 0b1010 → bits 1,3.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, -1, 16);
-        assert_eq!(r.indices, vec![1, 3]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, -1);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![1, 3]);
         // SHFT out of [-15,15] → INVALID.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 16, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 16);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
 
         // Unknown SELM → INVALID.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 9, 0, 0, 0, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 9, 0, 0, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
     }
 
@@ -4348,21 +4383,21 @@ mod tests {
     fn select_link_indices_dfanout_specified_is_one_based() {
         use crate::server::record::AlarmSeverity;
         // dfanout Specified is 1-based: SELN=1 → OUTA (index 0).
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 1, 0, 0, 16);
-        assert_eq!(r.indices, vec![0]);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 1, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0]);
         // SELN=2 → OUTB (index 1).
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 2, 0, 0, 16);
-        assert_eq!(r.indices, vec![1]);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 2, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![1]);
         // SELN=0 → drive nothing, NO alarm.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 0, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 0, 0, 0);
+        assert_eq!(r.selected, 0);
         assert!(r.alarm.is_none());
         // SELN > 16 → INVALID.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 17, 0, 0, 16);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 17, 0, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
         // dfanout Mask has no SHFT — SHFT arg ignored.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 2, 5, 0, 7, 16);
-        assert_eq!(r.indices, vec![0, 2]);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 2, 5, 0, 7);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0, 2]);
     }
 
     /// `SELN` is unsigned, and the rule that makes it unsigned depends on the
@@ -4403,17 +4438,17 @@ mod tests {
         // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` = 65535 →
         // out of range → INVALID. A signed read would clamp to 0 and wrongly
         // drive link 0.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_max, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_max, 0, 0);
+        assert_eq!(r.selected, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
         // fanout/seq Mask: 65535 → all 16 low bits set → every link. A signed
         // read would produce an empty mask.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_max, 0, 0, 16);
-        assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_max, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
         // dfanout Specified: 65535 > count → INVALID. A signed read would see
         // -1 ≤ 0 → drive nothing, with no alarm.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_max, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_max, 0, 0);
+        assert_eq!(r.selected, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
     }
 

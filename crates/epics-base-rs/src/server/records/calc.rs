@@ -330,8 +330,22 @@ impl Record for CalcRecord {
         &CALC_INPUT_FIELDS
     }
 
-    fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
-        (&CALC_INPUT_FIELDS, self.input_changes)
+    /// C `monitor()` posts A..U against LA..LU, the record's own copies
+    /// (calcRecord.c:415-423); `advance_prev_inputs` made the comparison.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
+        static POSTS: [(&str, CyclePostMask); crate::calc::CALC_NARGS] =
+            uniform_post_table(&CALC_INPUT_FIELDS, CyclePostMask::MonitorValueLog);
+        CycleMarks::of(&POSTS, u128::from(std::mem::take(&mut self.input_changes)))
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &CALC_INPUT_FIELDS
+    }
+
+    /// The walk takes this cycle's A..U marks only when there are any.
+    fn cycle_marked_fields(&self) -> bool {
+        self.input_changes != 0
     }
 
     fn alarm_cycle_posts_value_log(&self) -> bool {

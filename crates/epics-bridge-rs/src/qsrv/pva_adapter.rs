@@ -2811,7 +2811,7 @@ mod tests {
             .add_subscriber("VAL", 1, epics_base_rs::types::DbFieldType::Double, 1)
             .expect("under the cap");
         assert_eq!(
-            other.read().subscribers["VAL"].len(),
+            other.read().subscriber_count("VAL"),
             1,
             "the failed group keeps no subscription on its other member"
         );

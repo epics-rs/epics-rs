@@ -511,9 +511,9 @@ impl MultiOut {
 
 /// The parse of each output-row link that `indices` selects
 /// ([`RecordInstance::out_row_link`]).
-fn selected_links(instance: &RecordInstance, indices: &[usize]) -> SelectedLinks {
+fn selected_links(instance: &RecordInstance, sel: SelmResult) -> SelectedLinks {
     let mut links: SelectedLinks = Default::default();
-    for &i in indices {
+    for i in sel.indices() {
         links[i] = Some(instance.out_row_link(i).clone());
     }
     links
@@ -3490,18 +3490,11 @@ impl PvDatabase {
                     // C parity (fanoutRecord.c:39): 16 forward links
                     // LNK0..LNKF. LNK0 is the natural first slot.
                     // SELM resolution with OFFS/SHFT bias (fanoutRecord.c).
-                    let sel = select_link_indices_ex(
-                        SelmKind::FanoutSeq,
-                        selm,
-                        seln,
-                        offs,
-                        shft,
-                        LNK_LINK_FIELDS.len(),
-                    );
+                    let sel = select_link_indices_ex(SelmKind::FanoutSeq, selm, seln, offs, shft);
                     // fanout `LNK1`..`LNKF` are `DBF_FWDLINK`
                     // (`fanoutRecord.dbd.pod:144`), so C masks their modifiers
                     // to `pvlOptCA` alone (`dbStaticLib.c:2390`).
-                    let links = selected_links(&instance, &sel.indices);
+                    let links = selected_links(&instance, sel);
                     Some((sel, MultiOut::Fanout(links), None))
                 }
                 "dfanout" => {
@@ -3534,15 +3527,8 @@ impl PvDatabase {
                     };
                     // dfanout Specified is 1-based; Mask has no SHFT
                     // (dfanoutRecord.c:308-339).
-                    let sel = select_link_indices_ex(
-                        SelmKind::Dfanout,
-                        selm,
-                        seln,
-                        0,
-                        0,
-                        DFANOUT_LINK_FIELDS.len(),
-                    );
-                    let links = selected_links(&instance, &sel.indices);
+                    let sel = select_link_indices_ex(SelmKind::Dfanout, selm, seln, 0, 0);
+                    let links = selected_links(&instance, sel);
                     Some((sel, MultiOut::Dfanout(links), val))
                 }
                 "seq" => {
@@ -3556,14 +3542,7 @@ impl PvDatabase {
                         "DLY0", "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8",
                         "DLY9", "DLYA", "DLYB", "DLYC", "DLYD", "DLYE", "DLYF",
                     ];
-                    let sel = select_link_indices_ex(
-                        SelmKind::FanoutSeq,
-                        selm,
-                        seln,
-                        offs,
-                        shft,
-                        LNK_LINK_FIELDS.len(),
-                    );
+                    let sel = select_link_indices_ex(SelmKind::FanoutSeq, selm, seln, offs, shft);
                     let by_name = |field| {
                         instance
                             .record
@@ -3572,9 +3551,8 @@ impl PvDatabase {
                             .unwrap_or(0.0)
                     };
                     let groups: Vec<SeqGroup> = sel
-                        .indices
-                        .iter()
-                        .map(|&i| {
+                        .indices()
+                        .map(|i| {
                             let (dly, dov) =
                                 instance.record.seq_group_cells(i).unwrap_or_else(|| {
                                     (by_name(dly_names[i]), by_name(SEQ_DO_FIELDS[i]))
@@ -3598,7 +3576,7 @@ impl PvDatabase {
             Some(info) => info,
             None => return MultiOutDispatch::default(),
         };
-        debug_assert!(sel.indices.iter().all(|&i| i < payload.len()));
+        debug_assert!(sel.indices().all(|i| i < payload.len()));
         // Single-owner invariant: every record type that produces a
         // `MultiOut` payload here MUST be listed in
         // `multi_output_dispatch_owned` so the generic
@@ -3620,7 +3598,7 @@ impl PvDatabase {
         if !is_value_phase {
             Self::apply_selm_alarm(rec, sel.alarm);
         }
-        let indices = sel.indices;
+        let indices = sel.indices();
         // C `dfanoutRecord.c` push_values raises LINK_ALARM/MAJOR per failed
         // dbPutLink; accumulated across the selected OUT links below.
         let mut link_failed = false;
@@ -3762,7 +3740,7 @@ impl PvDatabase {
                                 let mut visited = crate::server::database::ProcStack::new();
                                 visited.claim(&rec);
                                 db.with_frame(&rec, |frame| {
-                                    db.seq_group_step(frame, &rec_name, grp, &mut visited)
+                                    db.seq_group_step(frame, grp, &mut visited)
                                 });
                             }
                         }
@@ -3831,13 +3809,7 @@ impl PvDatabase {
     /// alarm HERE rather than once per dispatch, because C's `dbPutLink` reads
     /// `psrce->nsta/nsev` at put time (`dbDbLink.c:382-383`) — so a group whose
     /// LNKn put failed propagates that LINK_ALARM into the NEXT group's target.
-    fn seq_group_step(
-        &self,
-        rec: InFrame<'_>,
-        rec_name: &str,
-        grp: &SeqGroup,
-        visited: &mut ProcStack,
-    ) {
+    fn seq_group_step(&self, rec: InFrame<'_>, grp: &SeqGroup, visited: &mut ProcStack) {
         let idx = grp.idx;
         let lnk_real = Self::seq_link_is_real(&grp.lnk);
         let dol_real = Self::seq_link_is_real(&grp.dol);
@@ -3898,14 +3870,21 @@ impl PvDatabase {
             );
         }
         // C `seqRecord.c:266-268`: store DOn and post a DBE_VALUE|DBE_LOG
-        // monitor only when it changed. The field already holds the old value
-        // (snapshot read), so `post_fields` (write + post) is needed only on
-        // change.
+        // monitor only when it changed against `odov`, the value this group
+        // started with. The field already holds that value, so an unchanged
+        // DOn is neither written nor posted.
         if new_dov != grp.dov {
-            let _ = self.post_fields(
-                rec_name,
-                vec![(SEQ_DO_FIELDS[idx].to_string(), EpicsValue::Double(new_dov))],
-            );
+            let field = SEQ_DO_FIELDS[idx];
+            let mut inst = rec.write();
+            if inst
+                .put_internal_field(field, EpicsValue::Double(new_dov))
+                .is_ok()
+            {
+                inst.notify_field(
+                    field,
+                    crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+                );
+            }
         }
     }
 

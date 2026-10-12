@@ -786,7 +786,10 @@ mod exec_model {
         let read = |name: &str| {
             let rec = upstream.get_record(name).expect("upstream record");
             let rec = rec.read();
-            (rec.record.get_field("VAL"), !rec.subscribers.is_empty())
+            (
+                rec.record.get_field("VAL"),
+                !rec.field_subscribers().is_empty(),
+            )
         };
         let deadline = Instant::now() + crate::budget::FACT_BUDGET;
         // The first monitor event can process DOWN:CP before its OUT link has

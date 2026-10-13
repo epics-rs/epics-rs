@@ -320,7 +320,7 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `#[record(type = "longin", process_posted_fields = LONGIN_POSTED)]` —
 ///   the closed set the record's C `process()` + `monitor()` post:
 ///   `Record::process_posted_fields` answers `Some` of the named
-///   `[&'static FieldDesc; N]`, e.g. a `declared_set`
+///   `[FieldIx; N]`, e.g. a `declared_set`
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a

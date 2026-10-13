@@ -11081,8 +11081,8 @@ fn asub_ftype_menu_fields_load_by_label() {
         Some(EpicsValue::Short(0)),
         "FTVB=\"STRING\" must resolve to menuFtype index 0"
     );
-    assert_eq!(rec.get_field("NOA"), Some(EpicsValue::Long(5)));
-    assert_eq!(rec.get_field("NOVB"), Some(EpicsValue::Long(3)));
+    assert_eq!(rec.get_field("NOA"), Some(EpicsValue::ULong(5)));
+    assert_eq!(rec.get_field("NOVB"), Some(EpicsValue::ULong(3)));
 }
 
 /// permissive `OVAL`/`OFLG` are `SPC_NOMOD` trackers that C `monitor()`

@@ -139,7 +139,7 @@ async fn asub_input_channels_never_post_from_a_process_cycle() {
             );
             assert_eq!(
                 g.record.get_field("NEA"),
-                Some(EpicsValue::Long(2)),
+                Some(EpicsValue::ULong(2)),
                 "EFLG={eflg}: and really did move the delivered count"
             );
         }

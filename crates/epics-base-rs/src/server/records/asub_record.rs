@@ -721,10 +721,11 @@ impl Record for ASubRecord {
                 Chan::Out => EpicsValue::String(self.out[idx].clone().into()),
                 Chan::Ft => EpicsValue::Short(self.fta[idx]),
                 Chan::Ftv => EpicsValue::Short(self.ftva[idx]),
-                Chan::No => EpicsValue::Long(self.noa[idx]),
-                Chan::Nov => EpicsValue::Long(self.nova[idx]),
-                Chan::Ne => EpicsValue::Long(self.nea[idx]),
-                Chan::Nev => EpicsValue::Long(self.neva[idx]),
+                // DBF_ULONG: the bits C's epicsUInt32 holds.
+                Chan::No => EpicsValue::ULong(self.noa[idx] as u32),
+                Chan::Nov => EpicsValue::ULong(self.nova[idx] as u32),
+                Chan::Ne => EpicsValue::ULong(self.nea[idx] as u32),
+                Chan::Nev => EpicsValue::ULong(self.neva[idx] as u32),
             });
         }
         match name {
@@ -1213,7 +1214,7 @@ mod tests {
             Some(EpicsValue::LongArray(vec![10, 20, 30].into()))
         );
         // NEC tracks elements used.
-        assert_eq!(rec.get_field("NEC"), Some(EpicsValue::Long(3)));
+        assert_eq!(rec.get_field("NEC"), Some(EpicsValue::ULong(3)));
     }
 
     /// The contract of [`Record::input_links_generation`]: while it stands
@@ -1270,7 +1271,7 @@ mod tests {
         );
         assert_eq!(
             rec.get_field("NEA"),
-            Some(EpicsValue::Long(4)),
+            Some(EpicsValue::ULong(4)),
             "C initFields: NEx starts at NOx"
         );
 
@@ -1308,7 +1309,7 @@ mod tests {
             rec.get_field("A"),
             Some(EpicsValue::LongArray(vec![1, 2, 3].into()))
         );
-        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(3)));
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::ULong(3)));
 
         // A scalar source fills one element of an array cell (nRequest = 1).
         rec.put_field("A", EpicsValue::Double(7.0)).unwrap();
@@ -1316,14 +1317,14 @@ mod tests {
             rec.get_field("A"),
             Some(EpicsValue::LongArray(vec![7].into()))
         );
-        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(1)));
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::ULong(1)));
 
         // An array into a one-element cell keeps element 0 (C's one-element
         // destination, same rule as the store's scalar reduction).
         rec.put_field("B", EpicsValue::DoubleArray(vec![5.5, 6.6].into()))
             .unwrap();
         assert_eq!(rec.get_field("B"), Some(EpicsValue::Double(5.5)));
-        assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(1)));
+        assert_eq!(rec.get_field("NEB"), Some(EpicsValue::ULong(1)));
 
         // An EMPTY array source delivers zero elements — dbGet clamps
         // nRequest to the source count (dbAccess.c:999-1000) and NEx records
@@ -1337,7 +1338,7 @@ mod tests {
             Some(EpicsValue::Double(5.5)),
             "one-element cell retains the previous delivery"
         );
-        assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(0)));
+        assert_eq!(rec.get_field("NEB"), Some(EpicsValue::ULong(0)));
         rec.put_field("A", EpicsValue::DoubleArray(vec![].into()))
             .unwrap();
         assert_eq!(
@@ -1345,7 +1346,7 @@ mod tests {
             Some(EpicsValue::LongArray(vec![7].into())),
             "NOx > 1 cell retains the previous delivery"
         );
-        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(0)));
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::ULong(0)));
 
         // A non-empty delivery after the empty one overwrites normally.
         rec.put_field("A", EpicsValue::DoubleArray(vec![8.0, 9.0].into()))
@@ -1354,7 +1355,7 @@ mod tests {
             rec.get_field("A"),
             Some(EpicsValue::LongArray(vec![8, 9].into()))
         );
-        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(2)));
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::ULong(2)));
     }
 
     /// An output cell follows the same `dbGet` rule: a subroutine that writes
@@ -1366,7 +1367,7 @@ mod tests {
         rec.put_field("NOVA", EpicsValue::Long(3)).unwrap();
         rec.put_field("VALA", EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
             .unwrap();
-        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(2)));
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::ULong(2)));
 
         rec.put_field("VALA", EpicsValue::DoubleArray(vec![].into()))
             .unwrap();
@@ -1374,7 +1375,7 @@ mod tests {
             rec.get_field("VALA"),
             Some(EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
         );
-        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(0)));
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::ULong(0)));
     }
 
     /// FTVx/NOVx declare the output cell the same way (C `initFields` runs
@@ -1391,7 +1392,7 @@ mod tests {
             rec.get_field("VALA"),
             Some(EpicsValue::DoubleArray(vec![0.0; 3].into()))
         );
-        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::ULong(3)));
 
         rec.put_field("VALA", EpicsValue::LongArray(vec![1, 2, 3, 4].into()))
             .unwrap();
@@ -1400,7 +1401,7 @@ mod tests {
             Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())),
             "a subroutine write converts element-wise and clamps to NOVx"
         );
-        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::ULong(3)));
 
         rec.put_field("FTVB", EpicsValue::Short(0)).unwrap(); // STRING
         rec.put_field("VALB", EpicsValue::String("done".into()))

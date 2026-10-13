@@ -79,11 +79,12 @@ pub use record_trait::{
     MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate, OutTarget, OutView, Pact,
     PostName, PostTable, PostedValue, ProcessAction, ProcessActions, ProcessContext,
     ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks,
-    SharedAfterWork, SimmCells, SlotMut, SlotRef, Special, SubroutineFn, ValuePostGate, ValueView,
-    arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value,
-    dbput_coerce_value, declared_field_ix, declared_post_table, declared_set, field_at,
-    input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
-    put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,
+    SecondaryTake, SharedAfterWork, SimmCells, SlotMut, SlotRef, Special, SubroutineFn,
+    ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
+    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value, declared_field_ix,
+    declared_post_table, declared_set, field_at, input_link_slots_of, link_value_in_field_shape,
+    monitor_deadband_classes, put_field_internal_default, put_value_in_field_shape,
+    seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{
     SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, put_string_precision,

@@ -223,6 +223,11 @@ impl Record for StringoutRecord {
         )
     }
 
+    /// VAL, the deadband field, is the only post.
+    fn answers_own_posts(&self) -> bool {
+        true
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
     }

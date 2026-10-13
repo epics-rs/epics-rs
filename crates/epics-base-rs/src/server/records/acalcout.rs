@@ -499,6 +499,9 @@ pub struct AcalcoutRecord {
     /// end and TAKEN by [`Record::take_process_posted_fields`] — AMASK itself
     /// stays readable until the next process.
     amask_posts: u32,
+    /// DLYA moved this pass: C posts it from `process()` with `DBE_VALUE`
+    /// alone (`aCalcoutRecord.c:341`, `:424`), TAKEN with `amask_posts`.
+    dlya_moved: bool,
     /// C `pavl`/`poav` — `monitor()`'s previous AVAL/OAV, `nelm` long, written
     /// only by [`Self::complete_cycle`].
     pavl: Vec<f64>,
@@ -599,6 +602,7 @@ impl Default for AcalcoutRecord {
             cact: 0,
             amask: 0,
             amask_posts: 0,
+            dlya_moved: false,
             pavl: Vec::new(),
             poav: Vec::new(),
             aval_oav_posts: 0,
@@ -1302,6 +1306,7 @@ impl Record for AcalcoutRecord {
         // let the framework write the OUT link + post OEVT. Mirrors `scalcout`.
         if self.pact && self.dlya == 1 {
             self.dlya = 0;
+            self.dlya_moved = true;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             return Ok(self.complete_cycle());
@@ -1484,18 +1489,12 @@ impl Record for AcalcoutRecord {
         // hook, not now. Mirrors `scalcout`/`calcout`.
         if oopt_fires && self.odly > 0.0 {
             self.dlya = 1;
+            self.dlya_moved = true;
             self.pending_output = write_out;
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![
-                    const {
-                        crate::server::record::declared_field_ix(
-                            crate::server::record::dbd_generated::ACALCOUT_FIELDS,
-                            "DLYA",
-                        )
-                    },
-                ]),
+                result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
@@ -1784,7 +1783,7 @@ impl Record for AcalcoutRecord {
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "SIZE" => Some(EpicsValue::Short(self.size)),
             "NEWM" => Some(EpicsValue::ULong(self.newm)),
-            "CACT" => Some(EpicsValue::Char(self.cact)),
+            "CACT" => Some(EpicsValue::UChar(self.cact)),
             "CSTAT" => Some(EpicsValue::Long(self.cstat)),
             "AMASK" => Some(EpicsValue::ULong(self.amask)),
             "AMEM" => Some(EpicsValue::Long(self.mem.amem())),
@@ -2459,7 +2458,7 @@ impl Record for AcalcoutRecord {
     }
 
     /// C's process-cycle `db_post_events` set (`afterCalc`, `monitor()`, the
-    /// NUSE clamp, the DLYA toggle). AMASK, NEWM and CACT are written every
+    /// NUSE clamp); DLYA posts as a process mark. AMASK, NEWM and CACT are written every
     /// cycle and only ever read, so the set is closed rather than blacklisted.
     fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
         Some(
@@ -2467,9 +2466,9 @@ impl Record for AcalcoutRecord {
                 crate::server::record::declared_set(
                     crate::server::record::dbd_generated::ACALCOUT_FIELDS,
                     [
-                        "VAL", "AVAL", "OAV", "OVAL", "AMEM", "NUSE", "DLYA", "A", "B", "C", "D",
-                        "E", "F", "G", "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF",
-                        "GG", "HH", "II", "JJ", "KK", "LL",
+                        "VAL", "AVAL", "OAV", "OVAL", "AMEM", "NUSE", "A", "B", "C", "D", "E", "F",
+                        "G", "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG",
+                        "HH", "II", "JJ", "KK", "LL",
                     ],
                 )
             },
@@ -2638,15 +2637,25 @@ impl Record for AcalcoutRecord {
     /// `monitor()` — so the post carries the previous stamp and the alarm not
     /// yet reset.
     fn take_process_posted_fields(&mut self) -> CycleMarks {
-        static AMASK_POSTS: [(crate::server::record::FieldIx, CyclePostMask); ARR_NAMES.len()] =
-            crate::server::record::uniform_post_table(
+        /// `afterCalc`'s array posts, then DLYA's, in C's order.
+        const POSTS_NAMED: [(&str, CyclePostMask); ARR_NAMES.len() + 1] = {
+            let mut table = [("DLYA", CyclePostMask::Value); ARR_NAMES.len() + 1];
+            let mut i = 0;
+            while i < ARR_NAMES.len() {
+                table[i] = (ARR_NAMES[i], CyclePostMask::ValueLog);
+                i += 1;
+            }
+            table
+        };
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); ARR_NAMES.len() + 1] =
+            crate::server::record::declared_post_table(
                 crate::server::record::dbd_generated::ACALCOUT_FIELDS,
-                &ARR_NAMES,
-                CyclePostMask::ValueLog,
+                POSTS_NAMED,
             );
+        let dlya = u128::from(std::mem::take(&mut self.dlya_moved)) << ARR_NAMES.len();
         CycleMarks::of(
-            &AMASK_POSTS,
-            u128::from(std::mem::take(&mut self.amask_posts)),
+            &POSTS,
+            u128::from(std::mem::take(&mut self.amask_posts)) | dlya,
         )
     }
 

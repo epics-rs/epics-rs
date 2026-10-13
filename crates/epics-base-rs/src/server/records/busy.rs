@@ -120,6 +120,10 @@ impl BusyRecord {
 const BUSY_HIGH_PRECISION: i16 = 2;
 
 impl Record for BusyRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::busy;
+        RVAL => rval;
+        read_only: RBV => rbv);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -158,24 +162,16 @@ impl Record for BusyRecord {
     /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }` and
     /// its RBV twin (`busyRecord.c:371-380`), minus the post. Outside init,
     /// `monitor()` is the only writer of `oraw`/`orbv`.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        match index {
-            0 if self.oraw != self.rval => {
-                self.oraw = self.rval;
-                true
-            }
-            1 if self.orbv != self.rbv => {
-                self.orbv = self.rbv;
-                true
-            }
-            _ => false,
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        if self.oraw == self.rval && self.orbv == self.rbv {
+            return crate::server::record::SecondaryTake::NONE;
         }
-    }
-
-    /// The RVAL/RBV block sits outside `if (monitor_mask)`, so a cycle that
-    /// leaves VAL alone still posts a moved RVAL or RBV.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+        let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
+        let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
+        crate::server::record::SecondaryTake::unguarded(u64::from(rval) | u64::from(rbv) << 1)
     }
 
     /// C `busyRecord.c:277-284` `get_precision`: `HIGH` — busy's only
@@ -458,9 +454,9 @@ impl Record for BusyRecord {
     fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
             CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
-            CycleCell::Oval => CycleRead::Value(CycleValue::Enum(self.oval)),
-            CycleCell::Mlst => CycleRead::Value(CycleValue::Enum(self.mlst)),
-            CycleCell::Lalm => CycleRead::Value(CycleValue::Enum(self.lalm)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::ULong(u32::from(self.oval))),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
             _ => CycleRead::Absent,
         }
     }
@@ -468,19 +464,19 @@ impl Record for BusyRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
-            "OVAL" => Some(EpicsValue::Enum(self.oval)),
+            "OVAL" => Some(EpicsValue::ULong(u32::from(self.oval))),
             "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
             "ONAM" => Some(EpicsValue::String(self.onam.clone())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
-            "LALM" => Some(EpicsValue::Enum(self.lalm)),
+            "LALM" => Some(EpicsValue::UShort(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::UShort(self.ivov)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
-            "MLST" => Some(EpicsValue::Enum(self.mlst)),
+            "MLST" => Some(EpicsValue::UShort(self.mlst)),
             // RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252,256,
             // 261,299,303; busyRecord.dbd:55,59,69,108,112) — serve the native
             // u32 as the unsigned carrier so a high-bit raw/mask value does not

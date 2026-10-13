@@ -481,12 +481,6 @@ impl Record for MbboDirectRecord {
         &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
     }
 
-    /// The RVAL/RBV block sits outside `if (events)`, so a readback that
-    /// moves RBV while VAL holds still posts.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
-    }
-
     /// `monitor()` posts VAL, B0-B1F, RVAL and RBV alone
     /// (`mbboDirectRecord.c:305-340`).
     fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
@@ -504,18 +498,16 @@ impl Record for MbboDirectRecord {
     /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
     /// (`mbboDirectRecord.c:332-339`) and its RBV twin, minus the post.
     /// Outside init, `monitor()` is the only writer of `oraw`/`orbv`.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        match index {
-            0 if self.oraw != self.rval => {
-                self.oraw = self.rval;
-                true
-            }
-            1 if self.orbv != self.rbv => {
-                self.orbv = self.rbv;
-                true
-            }
-            _ => false,
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        if self.oraw == self.rval && self.orbv == self.rbv {
+            return crate::server::record::SecondaryTake::NONE;
         }
+        let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
+        let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
+        crate::server::record::SecondaryTake::unguarded(u64::from(rval) | u64::from(rbv) << 1)
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {

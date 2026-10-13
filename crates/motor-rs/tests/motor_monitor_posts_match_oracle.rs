@@ -595,3 +595,115 @@ async fn monitors_attached_in_reverse_order_see_c_post_order() {
     assert_eq!(start, MOVE_START);
     assert_eq!(done, MOVE_DONE);
 }
+
+/// `caput M1.DHLM -1; M1.HLSV MAJOR; M1.PROC 1; M1.HLSV NO_ALARM; M1.VELO 2;
+/// M1.HLSV MAJOR; M1.VELO 3` on oracleMotorIoc, `camonitor -m a M1.MSTA M1
+/// M1.VELO M1.RHLM M1.RLLM`: a DVAL over DHLM raises HIGH at HLSV. Each alarm
+/// move posts the five fields above C's short circuit and, the put's implicit
+/// GET_INFO having marked STUP below it (motorRecord.cc:2546-2551), the whole
+/// lower group to its last entry RLLM, none of them moved (:3510-3646).
+const SOFT_LIMIT_ALARM: &str = "\
+M1.MSTA 2 HIGH MAJOR
+M1 0 HIGH MAJOR
+M1.VELO 1 HIGH MAJOR
+M1.RHLM -1000 HIGH MAJOR
+M1.RLLM -100000 HIGH MAJOR
+M1.MSTA 2
+M1 0
+M1.VELO 1
+M1.RHLM -1000
+M1.RLLM -100000
+M1.MSTA 2 HIGH MAJOR
+M1 0 HIGH MAJOR
+M1.VELO 2 HIGH MAJOR
+M1.RHLM -1000 HIGH MAJOR
+M1.RLLM -100000 HIGH MAJOR
+";
+
+#[tokio::test]
+async fn a_soft_limit_alarm_posts_the_monitor_list_to_its_tail_as_the_oracle_does() {
+    const ALARM_PVS: [(&str, &str, DbFieldType); 5] = [
+        ("M1.MSTA", "MSTA", DbFieldType::ULong),
+        ("M1", "VAL", DbFieldType::Double),
+        ("M1.VELO", "VELO", DbFieldType::Double),
+        ("M1.RHLM", "RHLM", DbFieldType::Double),
+        ("M1.RLLM", "RLLM", DbFieldType::Double),
+    ];
+    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut readers: Vec<EventReader> = (1u32..)
+        .zip(ALARM_PVS)
+        .map(|(sid, (_, field, ty))| fx.subscribe(field, sid, ty, EventMask::ALARM))
+        .collect();
+    for (field, v) in [
+        ("DHLM", -1.0),
+        ("HLSV", 2.0),
+        ("PROC", 1.0),
+        ("HLSV", 0.0),
+        ("VELO", 2.0),
+        ("HLSV", 2.0),
+        ("VELO", 3.0),
+    ] {
+        put(&fx, field, v).await;
+        // The status the put's implicit GET_INFO asked for (STUP BUSY to
+        // OFF), as motorSim answers it before the next put.
+        fx.poll_pass(|_| {}).await;
+    }
+    let got: Vec<String> = ALARM_PVS
+        .iter()
+        .zip(&mut readers)
+        .flat_map(|(&(pv, _, _), rx)| {
+            let mut lines = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                let v = match e.value().as_value() {
+                    Some(EpicsValue::ULong(v)) => v.to_string(),
+                    Some(EpicsValue::Double(v)) => format!("{v}"),
+                    other => panic!("{pv}: {other:?}"),
+                };
+                let mut line = format!("{pv} {v}");
+                if e.sevr() != 0 {
+                    line += &format!(
+                        " {} {}",
+                        alarm_condition_string(e.stat()),
+                        MENU_ALARM_SEVR[e.sevr() as usize]
+                    );
+                }
+                lines.push(line);
+            }
+            lines
+        })
+        .collect();
+    let want: Vec<String> = ALARM_PVS
+        .iter()
+        .flat_map(|&(pv, _, _)| {
+            SOFT_LIMIT_ALARM
+                .lines()
+                .filter(move |l| l.split(' ').next() == Some(pv))
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// The same alarm on a put that finds STUP still BUSY: C fires no implicit
+/// GET_INFO (motorRecord.cc:2546), nothing below the short circuit is marked,
+/// and the alarm move posts the five fields above it, to their last entry
+/// MSTA, and stops (:3550-3551). motorSim answers GET_INFO before the next put
+/// reaches the IOC, so the fixture's unanswered status stands in for the
+/// window the oracle cannot hold open.
+#[tokio::test]
+async fn an_alarm_move_with_nothing_marked_posts_to_msta_and_stops() {
+    let fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut msta = fx.subscribe("MSTA", 1, DbFieldType::ULong, EventMask::ALARM);
+    let mut velo = fx.subscribe("VELO", 2, DbFieldType::Double, EventMask::ALARM);
+    let mut rllm = fx.subscribe("RLLM", 3, DbFieldType::Double, EventMask::ALARM);
+    put(&fx, "DHLM", -1.0).await;
+    put(&fx, "HLSV", 2.0).await;
+    let sevr = |rx: &mut EventReader| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.sevr())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(sevr(&mut msta), [2], "MSTA");
+    assert_eq!(sevr(&mut velo), Vec::<u16>::new(), "VELO");
+    assert_eq!(sevr(&mut rllm), Vec::<u16>::new(), "RLLM");
+}

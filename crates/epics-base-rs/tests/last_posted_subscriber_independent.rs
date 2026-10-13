@@ -196,9 +196,8 @@ async fn post_with_no_bucket_then_subscribe_sees_move_start() {
     );
 }
 
-/// The same defect on a stock record: aCalcout's ODLY cycle posts DLYA=1
-/// through `AsyncPendingNotify` and its continuation clears DLYA through the
-/// completion walk.
+/// The same defect on a stock record: aCalcout's ODLY cycle and its
+/// continuation post DLYA as process marks.
 #[epics_macros_rs::epics_test]
 async fn acalcout_unwatched_odly_then_subscribe_sees_dlya_rise() {
     let db = PvDatabase::new();

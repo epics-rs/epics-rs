@@ -533,31 +533,29 @@ impl Record for AoRecord {
     /// own post, which is the case OROC creates: VAL sits at the target while
     /// OVAL steps toward it, so VAL crosses no deadband and the output still
     /// has to reach its monitors.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        if std::mem::take(&mut self.omod) {
-            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
-        } else {
-            crate::server::recgbl::EventMask::NONE
-        }
-    }
-
+    ///
     /// C `if(prec->oraw != prec->rval) { db_post_events(...); prec->oraw =
     /// prec->rval; }` (`aoRecord.c:541-543`) and its RBV twin (`:545-548`),
     /// minus the post. `oraw`/`orbv` are written NOWHERE else — `convert()`
     /// used to assign `oraw = rval` eagerly, which made this comparison
     /// unable to ever be true.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        match index {
-            1 if self.oraw != self.rval => {
-                self.oraw = self.rval;
-                true
-            }
-            2 if self.orbv != self.rbv => {
-                self.orbv = self.rbv;
-                true
-            }
-            _ => false,
+    fn take_secondary_value_changes(
+        &mut self,
+        value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        // C clears `omod` only inside `if (monitor_mask)`, so the shut block
+        // leaves it untouched and the idle cycle stores nothing. One OR, so
+        // the idle exit is one branch.
+        if value_mask.bits() | u16::from(self.omod) == 0 {
+            return crate::server::record::SecondaryTake::NONE;
         }
+        let widened = std::mem::take(&mut self.omod);
+        let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
+        let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
+        crate::server::record::SecondaryTake::new(
+            1 | u64::from(rval) << 1 | u64::from(rbv) << 2,
+            widened,
+        )
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

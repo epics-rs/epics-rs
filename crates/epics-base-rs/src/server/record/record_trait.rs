@@ -198,6 +198,25 @@ typed_slots! {
 }
 
 impl SlotRef<'_> {
+    /// The field as [`Record::get_field`] answers it; `dbf` is its declared
+    /// type, which tells a `DBF_ENUM` apart from a `DBF_USHORT`.
+    pub(crate) fn to_value(&self, dbf: DbFieldType) -> EpicsValue {
+        match self {
+            SlotRef::F64(v) => EpicsValue::Double(**v),
+            SlotRef::F32(v) => EpicsValue::Float(**v),
+            SlotRef::I8(v) => EpicsValue::Char(**v as u8),
+            SlotRef::U8(v) => EpicsValue::UChar(**v),
+            SlotRef::I16(v) => EpicsValue::Short(**v),
+            SlotRef::U16(v) if dbf == DbFieldType::Enum => EpicsValue::Enum(**v),
+            SlotRef::U16(v) => EpicsValue::UShort(**v),
+            SlotRef::I32(v) => EpicsValue::Long(**v),
+            SlotRef::U32(v) => EpicsValue::ULong(**v),
+            SlotRef::I64(v) => EpicsValue::Int64(**v),
+            SlotRef::U64(v) => EpicsValue::UInt64(**v),
+            SlotRef::Str(s) => EpicsValue::String((*s).clone()),
+        }
+    }
+
     /// The field as `dbGet(DBR_DOUBLE)` delivers it ([`Record::get_slot_f64`]).
     pub(crate) fn to_f64(&self) -> Option<f64> {
         Some(match self {
@@ -980,7 +999,7 @@ pub enum ValuePostGate {
     /// so a cycle that re-renders the same seconds count still re-posts RVAL.
     WithValue,
     /// [`Self::OnChange`]'s own-value test, but the guard is the record's
-    /// widened one ([`Record::take_secondary_value_mask`]) and the event
+    /// widened one ([`Record::take_secondary_value_changes`]) and the event
     /// carries C's forced `monitor_mask | DBE_VALUE | DBE_LOG`: ao `RVAL` /
     /// `RBV` — `if(prec->oraw != prec->rval) { db_post_events(&prec->rval,
     /// monitor_mask|DBE_VALUE|DBE_LOG); prec->oraw = prec->rval; }`
@@ -992,7 +1011,7 @@ pub enum ValuePostGate {
     /// when VAL's is shut.
     ///
     /// The own-value test AND the advance of the record's "old" copy are one
-    /// step, [`Record::take_secondary_value_change`], never split across the
+    /// step, [`Record::take_secondary_value_changes`], never split across the
     /// code that computed the new value — C assigns `oraw` INSIDE the post it
     /// guards, so a cycle that changes RVAL without posting it must leave
     /// `oraw` stale for the next cycle to find.
@@ -1002,6 +1021,66 @@ pub enum ValuePostGate {
     /// |= (DBE_VALUE|DBE_LOG); if(monitor_mask) { prec->omod = FALSE;
     /// db_post_events(&prec->oval, monitor_mask);` (aoRecord.c:535-538).
     Guarded,
+}
+
+/// What one cycle's secondary block decided
+/// ([`Record::take_secondary_value_changes`]): bit `i` fired
+/// [`Record::fields_posted_with_value_mask`]`[i]`, and the top bit says the
+/// record widened VAL's mask into the block's guard. C's only widening is
+/// `monitor_mask |= (DBE_VALUE|DBE_LOG)` (ao `omod`, aoRecord.c:535), so a
+/// flag carries it, and the whole answer returns in one register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct SecondaryTake(u64);
+
+impl SecondaryTake {
+    const WIDENED: u64 = 1 << 63;
+
+    /// Nothing fired, nothing widened.
+    pub const NONE: Self = Self(0);
+
+    /// `fired` (below the top bit), with the guard widened or not.
+    /// A widened guard always fires something (ao's OVAL is `Guarded`), so
+    /// [`Self::is_none`] tests the whole word.
+    pub const fn new(fired: u64, widened: bool) -> Self {
+        debug_assert!(fired & Self::WIDENED == 0 && (fired != 0 || !widened));
+        Self(fired | if widened { Self::WIDENED } else { 0 })
+    }
+
+    /// Nothing fired.
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// A block outside C's `if (monitor_mask)` (bo `RVAL`/`RBV`): what fired
+    /// opens its own guard, with the `DBE_VALUE | DBE_LOG` it posts with.
+    pub const fn unguarded(fired: u64) -> Self {
+        Self::new(fired, fired != 0)
+    }
+
+    /// The fired bits.
+    pub const fn fired(self) -> u64 {
+        self.0 & !Self::WIDENED
+    }
+
+    /// What the record ORs into VAL's mask to form the block's guard.
+    pub fn widen(self) -> crate::server::recgbl::EventMask {
+        if self.0 & Self::WIDENED != 0 {
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+        } else {
+            crate::server::recgbl::EventMask::NONE
+        }
+    }
+
+    /// C's `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// minus the post: whether `new` moved off `old`, advancing `old`.
+    pub fn advance<T: PartialEq + Copy>(old: &mut T, new: T) -> bool {
+        let moved = *old != new;
+        if moved {
+            *old = new;
+        }
+        moved
+    }
 }
 
 /// The event mask ONE per-cycle mark posts with
@@ -4570,45 +4649,31 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
-    /// Per-cycle widening of the guard [`ValuePostGate::OnChangeForced`]
-    /// fields sit behind — C `if (prec->omod) monitor_mask |=
-    /// (DBE_VALUE|DBE_LOG);` (aoRecord.c:535), which opens the secondary block
-    /// on a cycle where VAL's own monitor mask is empty.
+    /// C `monitor()`'s whole secondary block minus the posts, once per cycle:
+    /// widen VAL's mask `value_mask` into the block's guard (ao `if
+    /// (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG);`, aoRecord.c:535,
+    /// clear-on-read as C's `prec->omod = FALSE`), then TEST each
+    /// [`Self::fields_posted_with_value_mask`] field its [`ValuePostGate`]
+    /// lets in against the record's own "old" copy and, when it moved,
+    /// ADVANCE that copy — C's `if (prec->oraw != prec->rval) {
+    /// db_post_events(...); prec->oraw = prec->rval; }` (aoRecord.c:541-543)
+    /// is one indivisible step.
     ///
-    /// ao needs it because `omod` tracks OVAL, not VAL: OROC can walk the
-    /// output one step per cycle toward a VAL that has not moved since MLST,
-    /// so C posts OVAL/RVAL on cycles that post no VAL at all.
+    /// Called by the framework, independently of whether anyone is
+    /// subscribed, since C's `db_post_events` runs whether or not anyone is
+    /// listening. A record must not advance a copy anywhere else: an eager
+    /// `oraw = rval` in the compute step makes the next cycle see no change
+    /// and withhold an event C sends. Fired bits are positions in
+    /// [`Self::fields_posted_with_value_mask`], so the cycle names no field by
+    /// its bytes.
     ///
-    /// Clear-on-read, because C's is: `omod` can only ever be true on a cycle
-    /// whose guard therefore fires, and the guard's first act is
-    /// `prec->omod = FALSE` (`:537`).
-    ///
-    /// Default: empty — no widening, so the guard is VAL's own mask.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        crate::server::recgbl::EventMask::NONE
-    }
-
-    /// C's whole `if (prec->oraw != prec->rval) { db_post_events(...);
-    /// prec->oraw = prec->rval; }` (aoRecord.c:541-543) minus the post: TEST
-    /// the [`ValuePostGate::OnChangeForced`] field against the record's own
-    /// "old" copy and, when it moved, ADVANCE that copy — one indivisible
-    /// step, because C's two statements are inseparable and splitting them is
-    /// what the port got wrong.
-    ///
-    /// Called once per cycle per declared field, by the framework, only when
-    /// the guard is open — and independently of whether anyone is subscribed,
-    /// since C's `db_post_events` runs whether or not anyone is listening. A
-    /// record must not advance the copy anywhere else: an eager `oraw = rval`
-    /// in the compute step makes the next guarded cycle see no change and
-    /// withhold an event C sends.
-    ///
-    /// `index` is the field's position in [`Self::fields_posted_with_value_mask`],
-    /// so the cycle names no field by its bytes.
-    ///
-    /// Default: `false` — nothing declared, nothing to test.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        let _ = index;
-        false
+    /// Default: [`SecondaryTake::NONE`] — nothing declared, nothing to test.
+    fn take_secondary_value_changes(
+        &mut self,
+        value_mask: crate::server::recgbl::EventMask,
+    ) -> SecondaryTake {
+        let _ = value_mask;
+        SecondaryTake::NONE
     }
 
     /// Change-detected auxiliary fields this record posts with C's
@@ -4742,6 +4807,22 @@ pub trait Record: Send + Sync + 'static {
     /// [`Self::value_only_change_fields`] mask, deadband, `log_swept_fields`).
     fn process_posted_fields(&self) -> Option<DeclaredFields> {
         None
+    }
+
+    /// Whether every post a cycle makes past the deadband field is decided
+    /// from the record's own fields, as C `monitor()` decides it: each
+    /// [`Self::process_posted_fields`] field is the deadband field, a
+    /// `dbCommon` field or a [`Self::fields_posted_only_when_marked`] one, no
+    /// secondary is [`ValuePostGate::WithValue`], and the type names no forced,
+    /// alarm-fan-out or log-swept field. The cycle then walks only on a mark
+    /// or a fired secondary, whoever is subscribed.
+    ///
+    /// The plan's `own_posts_hold` check is necessary, not sufficient: post
+    /// sets that turn over with record state (aSub's `EFLG`) pass it and still
+    /// lose posts, so do not declare this on a new type; a derived post-set
+    /// delta replaces the declaration.
+    fn answers_own_posts(&self) -> bool {
+        false
     }
 
     /// Fields the record posts itself via an event-driven, individually
@@ -7624,7 +7705,7 @@ mod declaration_numbering_tests {
 pub const FORCE_GENERAL: &[(&str, &str)] = &[];
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::server::records::compress::CompressRecord;
 
@@ -7676,7 +7757,7 @@ mod tests {
     }
 
     /// Every module-owned type too: the sweeps below cover `RECORD_TYPES`.
-    fn any_record(record_type: &str) -> Box<dyn Record> {
+    pub(crate) fn any_record(record_type: &str) -> Box<dyn Record> {
         use crate::server::records::{
             acalcout::AcalcoutRecord, asyn_record::AsynRecord, busy::BusyRecord,
             scalcout::ScalcoutRecord, sseq::SseqRecord, swait::SwaitRecord,
@@ -7821,6 +7902,18 @@ mod tests {
                         variant_agrees(r, desc.dbf_type),
                         "{at}: {r:?} for {:?}",
                         desc.dbf_type
+                    );
+                    // A slot read stands in for the whole name read only for a
+                    // readable non-link field.
+                    assert_eq!(
+                        Some(r.to_value(desc.dbf_type)),
+                        probe.get_field(desc.name),
+                        "{at}: slot read disagrees with get_field"
+                    );
+                    assert!(!desc.unreadable(), "{at}: unreadable slot");
+                    assert!(
+                        crate::types::link_class_of(desc).is_none(),
+                        "{at}: link slot"
                     );
                 }
                 let mut shape = any_record(record_type);
@@ -8219,6 +8312,57 @@ mod tests {
                 assert!(r.take_process_posted_fields().is_empty(), "{record_type}");
             }
         }
+    }
+
+    /// A DBF_USHORT/ULONG/UCHAR field reads in its own variant, as C's
+    /// dbAddr carries the declared type (sCalcoutRecord.dbd:420 DLYA,
+    /// busyRecord.dbd:64/117/122, aCalcoutRecord.dbd:813, aSubRecord.dbd:749).
+    #[test]
+    fn an_unsigned_field_reads_in_its_declared_variant() {
+        let mut checked = 0usize;
+        for record_type in super::super::dbd_generated::RECORD_TYPES {
+            let r = any_record(record_type);
+            for d in r.field_list() {
+                if d.runtime_typed
+                    || d.unreadable()
+                    || !matches!(
+                        d.dbf_type,
+                        DbFieldType::UShort | DbFieldType::ULong | DbFieldType::UChar
+                    )
+                {
+                    continue;
+                }
+                let Some(v) = r.get_field(d.name) else {
+                    continue;
+                };
+                assert_eq!(v.db_field_type(), d.dbf_type, "{record_type}.{}", d.name);
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "{checked} unsigned fields");
+    }
+
+    /// A field only the event path posts (waveform HASH from
+    /// `array_monitor_post`) is skipped by the walk, so a declared set that
+    /// names it costs a per-cycle entry and posts nothing.
+    #[test]
+    fn no_declared_set_names_an_event_posted_field() {
+        let mut sets = 0usize;
+        for record_type in super::super::dbd_generated::RECORD_TYPES {
+            let r = any_record(record_type);
+            let Some(set) = r.process_posted_fields() else {
+                continue;
+            };
+            sets += 1;
+            for &ix in set {
+                let name = field_at(r.field_list(), ix).expect("declared").name;
+                assert!(
+                    !r.event_posted_fields().contains(&name),
+                    "{record_type}.{name}"
+                );
+            }
+        }
+        assert!(sets > 4, "{sets} declared sets");
     }
 
     /// Every field the type declares, rendered — `sel` initialises A..L to

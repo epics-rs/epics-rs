@@ -1836,19 +1836,20 @@ impl Record for WaveformRecord {
     /// `pwf->udf = 0` on the next line is the same shape; the walk already
     /// excludes UDF for every record type.
     ///
-    /// Each kind's set indexes its own table; aai/aao declare no BUSY and
-    /// subArray no HASH.
+    /// Each kind's set indexes its own table; aai/aao declare no BUSY.
+    /// subArray's BUSY is declared but posted by nothing: waveform's is the
+    /// asyn TimeSeries device's (devAsynXXXTimeSeries.h:156). HASH posts from
+    /// `array_monitor_post` alone and the walk never reads it
+    /// ([`Record::event_posted_fields`]), so no set names it.
     fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
         use crate::server::record::{dbd_generated as t, declared_set};
         Some(match self.kind {
             ArrayKind::Waveform => {
-                &const { declared_set(t::WAVEFORM_FIELDS, ["VAL", "NORD", "BUSY", "HASH"]) }
+                &const { declared_set(t::WAVEFORM_FIELDS, ["VAL", "NORD", "BUSY"]) }
             }
-            ArrayKind::Aai => &const { declared_set(t::AAI_FIELDS, ["VAL", "NORD", "HASH"]) },
-            ArrayKind::Aao => &const { declared_set(t::AAO_FIELDS, ["VAL", "NORD", "HASH"]) },
-            ArrayKind::SubArray => {
-                &const { declared_set(t::SUB_ARRAY_FIELDS, ["VAL", "NORD", "BUSY"]) }
-            }
+            ArrayKind::Aai => &const { declared_set(t::AAI_FIELDS, ["VAL", "NORD"]) },
+            ArrayKind::Aao => &const { declared_set(t::AAO_FIELDS, ["VAL", "NORD"]) },
+            ArrayKind::SubArray => &const { declared_set(t::SUB_ARRAY_FIELDS, ["VAL", "NORD"]) },
         })
     }
 

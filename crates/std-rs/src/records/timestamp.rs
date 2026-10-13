@@ -188,6 +188,9 @@ fn round_subsec_to_millis(nsec: u32) -> u32 {
 }
 
 impl Record for TimestampRecord {
+    epics_base_rs::slot_map!(crate::records::dbd_generated::slots::timestamp;
+        RVAL => rval);
+
     fn record_type(&self) -> &'static str {
         "timestamp"
     }

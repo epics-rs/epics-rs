@@ -107,7 +107,7 @@ async fn array_source_lands_whole_in_a_declared_array_channel() {
     );
     assert_eq!(
         field(&db, "ASUB", "NEA").await,
-        Some(EpicsValue::Long(5)),
+        Some(EpicsValue::ULong(5)),
         "NEx is the delivered element count (aSubRecord.c:287)"
     );
 }

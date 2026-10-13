@@ -143,6 +143,9 @@ fn raise_bpt_error(common: &mut crate::server::record::CommonFields) {
 }
 
 impl Record for AiRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::ai;
+        RVAL => rval);
+
     fn held_pointer(&self, field: &str) -> Option<usize> {
         match field {
             // C `pbrk`, the table `cvtRawToEngBpt`/`cvtEngToRawBpt` found.
@@ -818,13 +821,20 @@ impl Record for AiRecord {
     /// C `if(prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
     /// inside `if (monitor_mask)` (aiRecord.c:461-464): ORAW advances only
     /// on a cycle that posts VAL.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        if index == 0 && self.oraw != self.rval {
-            self.oraw = self.rval;
-            true
-        } else {
-            false
+    fn take_secondary_value_changes(
+        &mut self,
+        value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        if value_mask.is_empty() {
+            return crate::server::record::SecondaryTake::NONE;
         }
+        crate::server::record::SecondaryTake::new(
+            u64::from(crate::server::record::SecondaryTake::advance(
+                &mut self.oraw,
+                self.rval,
+            )),
+            false,
+        )
     }
 }
 

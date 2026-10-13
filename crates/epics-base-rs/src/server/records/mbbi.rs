@@ -329,6 +329,9 @@ macro_rules! mbb_put_field {
 }
 
 impl Record for MbbiRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::mbbi;
+        RVAL => rval);
+
     /// `mbbiRecord.c:126` loads a constant SIOL as `DBF_USHORT` into the ULONG SVAL.
     fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
         Some(crate::types::DbFieldType::UShort)
@@ -597,17 +600,6 @@ impl Record for MbbiRecord {
         &[("RVAL", crate::server::record::ValuePostGate::OnChangeForced)]
     }
 
-    /// The RVAL block sits outside `if (events)`, so a cycle that leaves VAL
-    /// alone still posts a moved RVAL; shut while RVAL holds, so an idle
-    /// cycle skips the walk.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        if self.oraw != self.rval {
-            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
-        } else {
-            crate::server::recgbl::EventMask::NONE
-        }
-    }
-
     /// `monitor()` decides RVAL from the record's own `oraw`, so the
     /// framework keeps no published copy of it.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
@@ -629,12 +621,13 @@ impl Record for MbbiRecord {
     /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
     /// (`mbbiRecord.c:363-366`), minus the post. Outside init, `monitor()` is
     /// the only writer of `oraw`.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        if index == 0 && self.oraw != self.rval {
-            self.oraw = self.rval;
-            return true;
-        }
-        false
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        crate::server::record::SecondaryTake::unguarded(u64::from(
+            crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval),
+        ))
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {

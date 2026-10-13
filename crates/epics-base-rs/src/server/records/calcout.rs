@@ -173,7 +173,7 @@ pub struct CalcoutRecord {
     // Delay-active flag (DLYA) — C `prec->dlya`. Set to 1 while an ODLY
     // delay is pending, cleared on the delayed re-process. Externally
     // readable (DBF_SHORT) so clients can observe the pending state.
-    pub dlya: i16,
+    pub dlya: u16,
     /// This cycle set or cleared DLYA, which C posts from `process()` with a
     /// literal `DBE_VALUE` (`calcoutRecord.c:279`, `:296`).
     dlya_moved: bool,
@@ -652,7 +652,7 @@ const CALCOUT_PROCESS_POSTED: [&str; 23] = [
 ];
 
 impl Record for CalcoutRecord {
-    // DLYA is DBF_USHORT held as `i16`; the menus are `i16` served as ENUM.
+    // The menus are `i16` served as ENUM, so they map no slot.
     crate::slot_map!(crate::server::record::dbd_generated::slots::calcout;
         VAL => val,
         PVAL => pval,
@@ -712,7 +712,8 @@ impl Record for CalcoutRecord {
         LU => lu,
         LALM => lalm,
         ALST => alst,
-        MLST => mlst);
+        MLST => mlst,
+        DLYA => dlya);
 
     fn alarms_before_stamp(&self) -> bool {
         true
@@ -826,22 +827,17 @@ impl Record for CalcoutRecord {
         &[("OVAL", crate::server::record::ValuePostGate::OnChangeForced)]
     }
 
-    /// The OVAL block sits outside `if (monitor_mask)`, so a cycle that leaves
-    /// VAL alone still posts a moved OVAL.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
-    }
-
     /// C `if (prec->povl != prec->oval) { ...; prec->povl = prec->oval; }`
     /// (`calcoutRecord.c:687-690`), minus the post. Outside init, `monitor()`
     /// is the only writer of `povl`, so an OVAL put posts again from its cycle
     /// unless the cycle sets back the value `povl` holds.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        if index == 0 && self.povl != self.oval {
-            self.povl = self.oval;
-            return true;
-        }
-        false
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        crate::server::record::SecondaryTake::unguarded(u64::from(
+            crate::server::record::SecondaryTake::advance(&mut self.povl, self.oval),
+        ))
     }
 
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
@@ -1169,7 +1165,7 @@ impl Record for CalcoutRecord {
             "PVAL" => Some(EpicsValue::Double(self.pval)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
-            "DLYA" => Some(EpicsValue::Short(self.dlya)),
+            "DLYA" => Some(EpicsValue::UShort(self.dlya)),
             "OEVT" => Some(EpicsValue::String(self.oevt.clone().into())),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),

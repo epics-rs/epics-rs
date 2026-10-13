@@ -81,6 +81,9 @@ pub(crate) const BIT_NAMES: [&str; 32] = [
 ];
 
 impl Record for MbbiDirectRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::mbbiDirect;
+        RVAL => rval);
+
     /// `mbbiDirectRecord.c:109` loads a constant SIOL as `DBF_ULONG` into the LONG SVAL.
     fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
         Some(crate::types::DbFieldType::ULong)
@@ -328,17 +331,6 @@ impl Record for MbbiDirectRecord {
         &[("RVAL", crate::server::record::ValuePostGate::OnChangeForced)]
     }
 
-    /// The RVAL block sits outside `if (events)`, so a cycle that leaves VAL
-    /// alone still posts a moved RVAL; shut while RVAL holds, so an idle
-    /// cycle skips the walk.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        if self.oraw != self.rval {
-            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
-        } else {
-            crate::server::recgbl::EventMask::NONE
-        }
-    }
-
     /// `monitor()` posts VAL, RVAL and B0-B1F alone
     /// (`mbbiDirectRecord.c:208-239`).
     fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
@@ -356,12 +348,13 @@ impl Record for MbbiDirectRecord {
     /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
     /// (`mbbiDirectRecord.c:235-238`), minus the post. Outside init,
     /// `monitor()` is the only writer of `oraw`.
-    fn take_secondary_value_change(&mut self, index: usize) -> bool {
-        if index == 0 && self.oraw != self.rval {
-            self.oraw = self.rval;
-            return true;
-        }
-        false
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        crate::server::record::SecondaryTake::unguarded(u64::from(
+            crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval),
+        ))
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {

@@ -153,7 +153,11 @@ pub struct ScalcoutRecord {
     /// Delay-active flag — C `prec->dlya`. Set to 1 on the delaying cycle
     /// (posted DBE_VALUE) and cleared to 0 on the delayed continuation
     /// (C `process` lines 401/425). Distinguishes the continuation re-entry.
-    dlya: i16,
+    dlya: u16,
+    /// DLYA moved this pass, posted `DBE_VALUE` alone from `process()`
+    /// (`sCalcoutRecord.c:402`, `:426`); TAKEN by
+    /// [`Record::take_process_posted_fields`].
+    dlya_moved: bool,
     /// Snapshot of the delaying cycle's output decision, restored into
     /// `cached_should_output` on the continuation so the deferred OUT write
     /// honours the original cycle's OOPT result. Mirrors calcout.rs.
@@ -255,6 +259,7 @@ impl Default for ScalcoutRecord {
             cached_should_output: false,
             odly: 0.0,
             dlya: 0,
+            dlya_moved: false,
             pending_output: false,
             pact: false,
             oevt: 0,
@@ -808,6 +813,19 @@ impl Record for ScalcoutRecord {
     /// (`db_post_events(pcalc, &pcalc->clcv, DBE_VALUE)`,
     /// sCalcoutRecord.c:470,480); CLCV/OCLV are not `pp(TRUE)`, so nothing
     /// else would post them.
+    fn take_process_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        const DLYA_POST_NAMED: [(&str, CyclePostMask); 1] = [("DLYA", CyclePostMask::Value)];
+        static DLYA_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::SCALCOUT_FIELDS,
+            DLYA_POST_NAMED,
+        );
+        CycleMarks::of(&DLYA_POST, u128::from(std::mem::take(&mut self.dlya_moved)))
+    }
+
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask};
         // `monitor()`'s string posts carry `monitor_mask|DBE_VALUE|DBE_LOG`.
@@ -883,7 +901,7 @@ impl Record for ScalcoutRecord {
     /// Every `db_post_events` C's scalcout makes from a process cycle:
     /// `VAL` (`sCalcoutRecord.c:840`), `SVAL` (`:843`), `OSV` (`:848`),
     /// `A`..`L` (`:856`), `AA`..`LL` (`:862`), `OVAL` (`:867`) — all of
-    /// `monitor()` — and `DLYA` (`:402`, `:426`).
+    /// `monitor()`. DLYA (`:402`, `:426`) posts as a process mark.
     ///
     /// PVAL and PSVL are the reason this list exists: C's `monitor()` posts
     /// NEITHER (they are the cells it compares against), so exposing them as
@@ -896,9 +914,9 @@ impl Record for ScalcoutRecord {
                 crate::server::record::declared_set(
                     crate::server::record::dbd_generated::SCALCOUT_FIELDS,
                     [
-                        "VAL", "SVAL", "OVAL", "OSV", "DLYA", "A", "B", "C", "D", "E", "F", "G",
-                        "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH",
-                        "II", "JJ", "KK", "LL",
+                        "VAL", "SVAL", "OVAL", "OSV", "A", "B", "C", "D", "E", "F", "G", "H", "I",
+                        "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ",
+                        "KK", "LL",
                     ],
                 )
             },
@@ -961,6 +979,7 @@ impl Record for ScalcoutRecord {
 
         if self.pact && self.dlya == 1 {
             self.dlya = 0;
+            self.dlya_moved = true;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             self.exec_output_data();
@@ -1077,18 +1096,12 @@ impl Record for ScalcoutRecord {
         // Mirrors calcout.rs.
         if oopt_fires && self.odly > 0.0 {
             self.dlya = 1;
+            self.dlya_moved = true;
             self.pending_output = write_out;
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![
-                    const {
-                        crate::server::record::declared_field_ix(
-                            crate::server::record::dbd_generated::SCALCOUT_FIELDS,
-                            "DLYA",
-                        )
-                    },
-                ]),
+                result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
@@ -1175,7 +1188,7 @@ impl Record for ScalcoutRecord {
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
-            "DLYA" => Some(EpicsValue::Short(self.dlya)),
+            "DLYA" => Some(EpicsValue::UShort(self.dlya)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             // Fixed code-version constant, C `pcalc->vers = VERSION` in
             // init_record; never the `.dbd` initial.
@@ -2162,7 +2175,7 @@ mod tests {
         // Delaying cycle: DLYA set, ReprocessAfter scheduled, OUT suppressed.
         assert_eq!(
             rec.get_field("DLYA"),
-            Some(EpicsValue::Short(1)),
+            Some(EpicsValue::UShort(1)),
             "Don't_drive must still delay: DLYA set"
         );
         assert!(
@@ -2183,7 +2196,7 @@ mod tests {
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("DLYA"),
-            Some(EpicsValue::Short(0)),
+            Some(EpicsValue::UShort(0)),
             "DLYA cleared on the continuation"
         );
         assert!(

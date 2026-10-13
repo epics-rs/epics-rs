@@ -4139,9 +4139,12 @@ impl FieldSubscriber {
     }
 
     /// [`Self::watches`] for a name of unknown provenance: the pointer first,
-    /// then the bytes.
+    /// then the bytes. Counted on entry: a name that happens to share the
+    /// declared pointer is still a by-name caller.
     #[inline(always)]
     fn watches_str(&self, field: &str) -> bool {
+        #[cfg(test)]
+        NAME_BYTE_COMPARES.with(|n| n.set(n.get() + 1));
         let own = self.field();
         std::ptr::eq(own, field) || name_bytes_eq(own, field)
     }
@@ -4176,6 +4179,199 @@ thread_local! {
     static DELIVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many log heads were built.
     static HEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times the subscriber set was tested ([`RecordInstance::unwatched`]).
+    static SUBSCRIBER_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many cycles entered [`RecordInstance::collect_subscriber_posts`]' walk.
+    static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times the record's secondary block was taken.
+    static SECONDARY_TAKES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many fired secondaries [`RecordInstance::post_forced_secondaries`]
+    /// went on to look up.
+    static FORCED_SECONDARY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many field values were read by name
+    /// ([`RecordInstance::resolve_field_stored_at`]).
+    static NAME_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The fields whose post reached [`RecordInstance::record_value_post_as`]
+    /// only to store nothing.
+    static STORELESS_POSTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The `dbCommon` declarations the acknowledge put path posts, so it reads
+/// no name.
+mod common_desc {
+    use crate::server::record::{
+        FieldDesc, dbd_generated::DB_COMMON_FIELDS as COMMON, declared_field_ix,
+    };
+    // Indexed at run time: a `const` reference would point at a const-eval
+    // copy, which `FieldIx::in_table` cannot place in the table.
+    const ACKT_IX: usize = declared_field_ix(&[], "ACKT").0 as usize;
+    const ACKS_IX: usize = declared_field_ix(&[], "ACKS").0 as usize;
+    pub(super) fn ackt() -> &'static FieldDesc {
+        &COMMON[ACKT_IX]
+    }
+    pub(super) fn acks() -> &'static FieldDesc {
+        &COMMON[ACKS_IX]
+    }
+}
+
+/// A field [`RecordInstance::get_common_field`] answers from
+/// [`CommonFields`], so a read addressed by index reaches the same arm as one
+/// addressed by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommonField {
+    Sevr,
+    Stat,
+    Nsev,
+    Nsta,
+    Amsg,
+    Namsg,
+    Acks,
+    Ackt,
+    Udf,
+    Udfs,
+    Scan,
+    Sscn,
+    Oldsimm,
+    Pini,
+    Tpro,
+    Bkpt,
+    Flnk,
+    Inp,
+    Out,
+    Dtyp,
+    Tse,
+    Tsel,
+    Utag,
+    Asg,
+    Asl,
+    Desc,
+    Phas,
+    Evnt,
+    Prio,
+    Disv,
+    Disa,
+    Sdis,
+    Diss,
+    Hyst,
+    Lcnt,
+    Disp,
+    Putf,
+    Rpro,
+    Pact,
+    Proc,
+    Hihi,
+    High,
+    Low,
+    Lolo,
+    Hhsv,
+    Hsv,
+    Lsv,
+    Llsv,
+    Outn,
+}
+
+impl CommonField {
+    fn by_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "SEVR" => Self::Sevr,
+            "STAT" => Self::Stat,
+            "NSEV" => Self::Nsev,
+            "NSTA" => Self::Nsta,
+            "AMSG" => Self::Amsg,
+            "NAMSG" => Self::Namsg,
+            "ACKS" => Self::Acks,
+            "ACKT" => Self::Ackt,
+            "UDF" => Self::Udf,
+            "UDFS" => Self::Udfs,
+            "SCAN" => Self::Scan,
+            "SSCN" => Self::Sscn,
+            "OLDSIMM" => Self::Oldsimm,
+            "PINI" => Self::Pini,
+            "TPRO" => Self::Tpro,
+            "BKPT" => Self::Bkpt,
+            "FLNK" => Self::Flnk,
+            "INP" => Self::Inp,
+            "OUT" => Self::Out,
+            "DTYP" => Self::Dtyp,
+            "TSE" => Self::Tse,
+            "TSEL" => Self::Tsel,
+            "UTAG" => Self::Utag,
+            "ASG" => Self::Asg,
+            "ASL" => Self::Asl,
+            "DESC" => Self::Desc,
+            "PHAS" => Self::Phas,
+            "EVNT" => Self::Evnt,
+            "PRIO" => Self::Prio,
+            "DISV" => Self::Disv,
+            "DISA" => Self::Disa,
+            "SDIS" => Self::Sdis,
+            "DISS" => Self::Diss,
+            "HYST" => Self::Hyst,
+            "LCNT" => Self::Lcnt,
+            "DISP" => Self::Disp,
+            "PUTF" => Self::Putf,
+            "RPRO" => Self::Rpro,
+            "PACT" => Self::Pact,
+            "PROC" => Self::Proc,
+            "HIHI" => Self::Hihi,
+            "HIGH" => Self::High,
+            "LOW" => Self::Low,
+            "LOLO" => Self::Lolo,
+            "HHSV" => Self::Hhsv,
+            "HSV" => Self::Hsv,
+            "LSV" => Self::Lsv,
+            "LLSV" => Self::Llsv,
+            "OUTN" => Self::Outn,
+            _ => return None,
+        })
+    }
+}
+
+/// How a declared field is read, settled by name once when the plan is built,
+/// so a read that carries the declaration matches no name.
+#[derive(Debug, Clone, Copy)]
+enum FieldRead {
+    /// The type's slot, which reads as its `get_field` does.
+    Slot(u16),
+    /// A [`CommonFields`] arm, for a field the type's `get_field` leaves to
+    /// the instance.
+    Common(CommonField),
+    /// The name chain.
+    Named,
+    /// C `dbGet`'s refused read ([`FieldDesc::unreadable`]).
+    Unreadable,
+}
+
+impl FieldRead {
+    fn table(record: &dyn Record) -> Box<[FieldRead]> {
+        let common = crate::server::record::dbd_generated::DB_COMMON_FIELDS;
+        let own = record.field_list();
+        let slot = |i: usize| {
+            let slot = u16::try_from(i.checked_sub(common.len())?).ok()?;
+            record
+                .slot_ref(crate::server::record::FieldSlot(slot))
+                .map(|_| Self::Slot(slot))
+        };
+        common
+            .iter()
+            .chain(own)
+            .enumerate()
+            .map(|(i, desc)| {
+                if desc.unreadable() {
+                    return Self::Unreadable;
+                }
+                // A runtime-typed field's variant is the record's answer at
+                // each read (mbbo's VAL turns Enum once SDEF is set).
+                if desc.runtime_typed {
+                    return Self::Named;
+                }
+                slot(i).unwrap_or_else(|| match CommonField::by_name(desc.name) {
+                    Some(field) if record.get_field(desc.name).is_none() => Self::Common(field),
+                    _ => Self::Named,
+                })
+            })
+            .collect()
+    }
 }
 
 /// A type-erased record instance stored in the database.
@@ -4592,12 +4788,15 @@ pub(crate) struct MonitorPlan {
     pub(crate) value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
     /// Bit `i`: `value_masked[i]`'s log is a reference ([`posts_by_ref`]).
     pub(crate) value_masked_ref: u64,
+    /// Bit `i`: `value_masked[i]` keeps no published copy
+    /// ([`Self::stores_nothing`]), so its post with no subscriber is nothing.
+    value_masked_silent: u64,
     /// `value_masked[i]`'s [`FieldDesc::name`], for its post's [`PostName`];
     /// `None` past the fourth or for a field spelled other than declared.
     value_masked_declared: [Option<&'static FieldDesc>; 4],
-    /// `value_masked` holds a [`ValuePostGate::OnChangeForced`] field — the
-    /// only reader of [`Record::take_secondary_value_mask`], so a type without
-    /// one is never asked for it.
+    /// `value_masked` holds a field its block posts on a cycle VAL's own mask
+    /// is shut, so [`Record::take_secondary_value_changes`] runs every cycle;
+    /// otherwise only on a cycle VAL posts.
     ///
     /// [`ValuePostGate::OnChangeForced`]: crate::server::record::ValuePostGate::OnChangeForced
     pub(crate) forced_secondary: bool,
@@ -4614,6 +4813,8 @@ pub(crate) struct MonitorPlan {
     pub(crate) claimed: &'static [&'static str],
     /// `claimed`'s declared fields.
     claimed_bits: FieldBits,
+    /// [`Record::answers_own_posts`].
+    answers_own_posts: bool,
     /// The declared fields [`walk_skip_term`] answers for.
     walk_skip_bits: FieldBits,
     /// The `HASH` field's declaration, for the array types' hash post.
@@ -4622,6 +4823,8 @@ pub(crate) struct MonitorPlan {
     val_desc: Option<&'static FieldDesc>,
     /// [`Record::field_list`], which [`FieldIx`] indexes past `dbCommon`.
     fields: &'static [FieldDesc],
+    /// Each declared field's [`FieldRead`], by [`FieldIx`].
+    reads: Box<[FieldRead]>,
     /// [`Record::cycle_hooks`].
     pub(crate) hooks: crate::server::record::CycleHooks,
     /// Whether the type is `sub` or `aSub` — a property of the type, so not
@@ -4636,6 +4839,31 @@ impl MonitorPlan {
             FieldIx::UNDECLARED => PostKey::Named(desc.name),
             ix => PostKey::Ix(ix),
         }
+    }
+
+    /// How the field declared `desc` is read.
+    #[inline]
+    fn read_of(&self, desc: &'static FieldDesc) -> FieldRead {
+        // The type's own table first: a read names an own field far more
+        // often than a `dbCommon` one.
+        let common = crate::server::record::dbd_generated::DB_COMMON_FIELDS;
+        let size = std::mem::size_of::<FieldDesc>();
+        let at = desc as *const FieldDesc as usize;
+        let own = at.wrapping_sub(self.fields.as_ptr() as usize);
+        let ix = if own < std::mem::size_of_val(self.fields) {
+            common.len() + own / size
+        } else {
+            let off = at.wrapping_sub(common.as_ptr() as usize);
+            if off >= std::mem::size_of_val(common) {
+                return if desc.unreadable() {
+                    FieldRead::Unreadable
+                } else {
+                    FieldRead::Named
+                };
+            }
+            off / size
+        };
+        self.reads[ix]
     }
 
     /// The declaration at `ix`.
@@ -4692,7 +4920,7 @@ impl MonitorPlan {
                 fixed.push((ix, roles));
             }
         }
-        Self {
+        let mut plan = Self {
             posts_value_monitor: record.process_posts_value_monitor(),
             alarm_alone_posts_value: record.alarm_alone_posts_value(),
             value_gate: crate::server::record::MonitorValueGate {
@@ -4716,6 +4944,7 @@ impl MonitorPlan {
                     .fields_posted_with_monitor_mask()
                     .contains(&deadband_field),
             value_masked,
+            value_masked_silent: 0,
             value_masked_ref: value_masked
                 .iter()
                 .enumerate()
@@ -4743,15 +4972,68 @@ impl MonitorPlan {
             fixed: fixed.into(),
             claimed,
             claimed_bits: FieldBits::of(record, |desc| claimed.contains(&desc.name)),
+            answers_own_posts: record.answers_own_posts(),
             walk_skip_bits: FieldBits::of(record, |desc| {
                 walk_skip_term(desc.name, deadband_field, event_posted)
             }),
             hash_desc: declared_desc(field_desc_of(record, "HASH"), "HASH"),
             val_desc: declared_desc(field_desc_of(record, "VAL"), "VAL"),
             fields: record.field_list(),
+            reads: FieldRead::table(record),
             hooks: record.cycle_hooks(),
             subroutine_kind: SubroutineKind::of(record.record_type()),
-        }
+        };
+        plan.value_masked_silent = value_masked
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| {
+                plan.stores_nothing(match declared_desc(field_desc_of(record, name), name) {
+                    Some(desc) => plan.key_of(desc),
+                    None => PostKey::Named(name),
+                })
+            })
+            .fold(0, |bits, (i, _)| bits | 1 << i);
+        debug_assert!(
+            !plan.answers_own_posts || plan.own_posts_hold(record),
+            "{} answers its own posts but its post sets say otherwise",
+            record.record_type()
+        );
+        plan
+    }
+
+    /// `take`'s fired bits are ones their [`ValuePostGate`] lets in.
+    ///
+    /// [`ValuePostGate`]: crate::server::record::ValuePostGate
+    fn secondary_fits(
+        &self,
+        take: crate::server::record::SecondaryTake,
+        value_mask: EventMask,
+    ) -> bool {
+        use crate::server::record::ValuePostGate;
+        let guard = value_mask | take.widen();
+        (0..u64::BITS as usize)
+            .filter(|i| take.fired() & (1 << i) != 0)
+            .all(|i| match self.value_masked.get(i) {
+                Some((_, ValuePostGate::OnChange)) => !value_mask.is_empty(),
+                Some((_, ValuePostGate::OnChangeForced | ValuePostGate::Guarded)) => {
+                    !guard.is_empty()
+                }
+                _ => false,
+            })
+    }
+
+    /// [`Record::answers_own_posts`]' claim, held against the record's sets.
+    fn own_posts_hold(&self, record: &dyn Record) -> bool {
+        record.process_posted_fields().is_some_and(|set| {
+            set.iter()
+                .all(|&ix| self.walk_skip_bits.has(ix) || self.claimed_bits.has(ix))
+        }) && self
+            .value_masked
+            .iter()
+            .all(|(_, gate)| !matches!(gate, crate::server::record::ValuePostGate::WithValue))
+            && record.force_posted_fields().is_empty()
+            && record.alarm_cycle_monitored_fields().is_empty()
+            && record.log_swept_fields().is_empty()
     }
 }
 
@@ -5214,18 +5496,6 @@ impl RecordInstance {
             let Some(desc) = self.monitor_plan.desc_at(ix) else {
                 continue;
             };
-            // No change detector reads a marked-only field's published value,
-            // so with no subscriber C's `db_post_events` leaves nothing to do —
-            // and an entry in `last_posted` would have the walk read the
-            // whole array every later cycle.
-            if self.monitor_plan.claimed_bits.has(ix)
-                && !self
-                    .subscribers
-                    .iter()
-                    .any(|sub| sub.watches_key(PostKey::Ix(ix)))
-            {
-                continue;
-            }
             let mask = match mask {
                 // No reset is in scope ahead of the cycle's commit.
                 CyclePostMask::ResetAlarm => continue,
@@ -5298,9 +5568,10 @@ impl RecordInstance {
         // 317-319), independent of the VAL post mask. `array_hash_changed`
         // was set by `check_deadband_ext` this cycle.
         if self.array_hash_changed {
-            if let Some(h) = self.resolve_field("HASH") {
+            let hash = self.monitor_plan.hash_desc;
+            if let Some(h) = hash.and_then(|desc| self.read_declared(desc)) {
                 snapshot.push((
-                    post_name(self.monitor_plan.hash_desc, "HASH"),
+                    post_name(hash, "HASH"),
                     PostedValue::Val(h),
                     EventMask::VALUE,
                 ));
@@ -6314,6 +6585,10 @@ impl RecordInstance {
     #[cold]
     #[inline(never)]
     fn resettle_posted(&mut self, list: Option<DeclaredFields>) {
+        debug_assert!(
+            !self.monitor_plan.answers_own_posts || self.monitor_plan.own_posts_hold(&*self.record),
+            "a turned-over post set broke answers_own_posts"
+        );
         self.posted.resettle(
             list,
             self.monitor_plan.deadband_member(),
@@ -6346,6 +6621,8 @@ impl RecordInstance {
     /// reads no name; only its first publish asks the record about it.
     fn record_value_post_as(&mut self, key: PostKey<'_>, field: &str, value: PostedValue) {
         if self.monitor_plan.stores_nothing(key) {
+            #[cfg(test)]
+            STORELESS_POSTS.with(|p| p.borrow_mut().push(field.to_string()));
             return;
         }
         if let Some(slot) = self.last_posted.get_mut(key) {
@@ -6931,6 +7208,13 @@ impl RecordInstance {
         Some(self.as_a_reader_sees(desc, value))
     }
 
+    /// [`Self::resolve_field_upper_at`] of the field declared `desc`, through
+    /// the type's slot when it maps one — C reads through the `dbAddr` — so
+    /// no name is matched.
+    pub(crate) fn read_declared(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
+        self.resolve_field_upper_at(desc.name, Some(desc))
+    }
+
     /// [`Self::resolve_field`] without the reader's view — what the field
     /// HOLDS, which for a link field is the text C's `dbParseLink` takes
     /// (`dbStaticLib.c:2246`) rather than what `dbGetString` renders
@@ -6969,34 +7253,71 @@ impl RecordInstance {
             // synthesises the declared type's zero for any field with no
             // stored value, so leaving the row to reach it served `REC.TIME`
             // as `UChar(0)` — a value C has no way to produce.
-            Some(desc) if desc.unreadable() => return None,
-            // C `dbFindFieldPart` — the record type's own `.dbd` table, then
-            // `dbCommon`. Every accessor below reads STORAGE, and this port
-            // keeps a good deal of storage on `CommonFields` that C keeps per
-            // record type (`INP`, `OUT`, `SSCN`, the analog-alarm ladder), so
-            // without the declaration in front of them a `calc` answered
-            // `.OUT` with an empty string where C answers `PV 'C:GOOD.OUT'
-            // not found`. The declaration is the namespace, not the storage.
-            //
-            // The record's own answer is returned as it lands rather than
-            // threaded through the fallbacks' `or_else` chain, which moved
-            // the 32-byte value once per link in the chain on the way out.
-            Some(_) => match self.record.get_field(name) {
-                Some(value) => value,
-                None => self
-                    .get_common_field(name)
-                    .or_else(|| self.get_virtual_field(name))
-                    .or_else(|| self.declared_overrides.get(name).cloned())
-                    .or_else(|| self.declared_default(name))?,
+            Some(desc) => match self.monitor_plan.read_of(desc) {
+                FieldRead::Slot(slot) => {
+                    match self.record.slot_ref(crate::server::record::FieldSlot(slot)) {
+                        Some(slot) => slot.to_value(desc.dbf_type),
+                        None => self.read_named(name)?,
+                    }
+                }
+                FieldRead::Common(field) => match self.common_field(field) {
+                    Some(value) => value,
+                    None => self.read_named(name)?,
+                },
+                FieldRead::Named => self.read_named(name)?,
+                FieldRead::Unreadable => return None,
             },
             // C `dbNameToAddr` falls through to `dbGetAttributePart` on
             // `S_dbLib_fieldNotFound` (`dbAccess.c:672-675`), which is how
             // `RTYP` — declared by no record type — reads as the type name.
             // `VERS` and any `dbPutAttribute` name need the database's
             // attribute map and are answered a level up, in `get_pv`.
-            None => self.get_virtual_field(name)?,
+            None => {
+                Self::count_name_read();
+                self.get_virtual_field(name)?
+            }
         };
         Some(value)
+    }
+
+    /// The declared field `name` by the name chain, out of line so the
+    /// settled routes keep a small frame.
+    #[inline(never)]
+    fn read_named(&self, name: &str) -> Option<EpicsValue> {
+        // C `dbFindFieldPart` — the record type's own `.dbd` table, then
+        // `dbCommon`. Every accessor below reads STORAGE, and this port
+        // keeps a good deal of storage on `CommonFields` that C keeps per
+        // record type (`INP`, `OUT`, `SSCN`, the analog-alarm ladder), so
+        // without the declaration in front of them a `calc` answered
+        // `.OUT` with an empty string where C answers `PV 'C:GOOD.OUT'
+        // not found`. The declaration is the namespace, not the storage.
+        //
+        // The record's own answer is returned as it lands rather than
+        // threaded through the fallbacks' `or_else` chain, which moved
+        // the 32-byte value once per link in the chain on the way out.
+        match self.record_get_field_by_name(name) {
+            Some(value) => Some(value),
+            None => self
+                .get_common_field(name)
+                .or_else(|| self.get_virtual_field(name))
+                .or_else(|| self.declared_overrides.get(name).cloned())
+                .or_else(|| self.declared_default(name)),
+        }
+    }
+
+    /// The name chain's entry: the record's own `get_field` by name.
+    fn record_get_field_by_name(&self, name: &str) -> Option<EpicsValue> {
+        Self::count_name_read();
+        self.record.get_field(name)
+    }
+
+    #[inline(always)]
+    fn count_name_read() {
+        #[cfg(test)]
+        {
+            NAME_READS.with(|n| n.set(n.get() + 1));
+            NAME_BYTE_COMPARES.with(|n| n.set(n.get() + 1));
+        }
     }
 
     /// C `dbGet`'s link arm applied to one resolved field: a link field reads
@@ -8083,34 +8404,39 @@ impl RecordInstance {
 
     /// Get a common field value.
     pub fn get_common_field(&self, name: &str) -> Option<EpicsValue> {
-        match name {
-            "SEVR" => Some(EpicsValue::Short(self.common.sevr as i16)),
-            "STAT" => Some(EpicsValue::Short(self.common.stat as i16)),
-            "NSEV" => Some(EpicsValue::Short(self.common.nsev as i16)),
-            "NSTA" => Some(EpicsValue::Short(self.common.nsta as i16)),
+        self.common_field(CommonField::by_name(name)?)
+    }
+
+    /// The value of the field [`Self::get_common_field`] answers as `field`.
+    fn common_field(&self, field: CommonField) -> Option<EpicsValue> {
+        match field {
+            CommonField::Sevr => Some(EpicsValue::Short(self.common.sevr as i16)),
+            CommonField::Stat => Some(EpicsValue::Short(self.common.stat as i16)),
+            CommonField::Nsev => Some(EpicsValue::Short(self.common.nsev as i16)),
+            CommonField::Nsta => Some(EpicsValue::Short(self.common.nsta as i16)),
             // epics-base PR #568 / #566 — alarm message string.
-            "AMSG" => Some(EpicsValue::String(String::from(&self.common.amsg).into())),
-            "NAMSG" => Some(EpicsValue::String(String::from(&self.common.namsg).into())),
-            "ACKS" => Some(EpicsValue::Short(self.common.acks as i16)),
+            CommonField::Amsg => Some(EpicsValue::String(String::from(&self.common.amsg).into())),
+            CommonField::Namsg => Some(EpicsValue::String(String::from(&self.common.namsg).into())),
+            CommonField::Acks => Some(EpicsValue::Short(self.common.acks as i16)),
             // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
             // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu
             // index, which `promote_menu_value` lifts to `DBR_ENUM` with the
             // menu's choice strings. Storing them as `Short` is what makes
             // them eligible for that promotion — see `promote_menu_value`.
-            "ACKT" => Some(EpicsValue::Short(if self.common.ackt { 1 } else { 0 })),
+            CommonField::Ackt => Some(EpicsValue::Short(if self.common.ackt { 1 } else { 0 })),
             // DBF_UCHAR: served as UChar (declared type) so the raw put byte
             // round-trips to the wire — see the DISP/TPRO comment above.
-            "UDF" => Some(EpicsValue::UChar(self.common.udf)),
-            "UDFS" => Some(EpicsValue::Short(self.common.udfs)),
-            "SCAN" => Some(EpicsValue::Enum(self.common.scan.to_u16())),
-            "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
+            CommonField::Udf => Some(EpicsValue::UChar(self.common.udf)),
+            CommonField::Udfs => Some(EpicsValue::Short(self.common.udfs)),
+            CommonField::Scan => Some(EpicsValue::Enum(self.common.scan.to_u16())),
+            CommonField::Sscn => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
             // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
             // and promoted to `DBR_ENUM` with the NO/YES/RAW labels by
             // `promote_menu_value` (shared registry — the saved copy is ALWAYS
             // menuSimm, unlike the live SIMM). Written only by the simulation
             // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
-            "OLDSIMM" => Some(EpicsValue::Short(self.common.oldsimm)),
-            "PINI" => Some(EpicsValue::Short(self.common.pini)),
+            CommonField::Oldsimm => Some(EpicsValue::Short(self.common.oldsimm)),
+            CommonField::Pini => Some(EpicsValue::Short(self.common.pini)),
             // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
             // as `UChar` — their DECLARED type — so `project_to_declared_type`
             // is identity and the raw put byte reaches the wire untouched (C
@@ -8119,9 +8445,9 @@ impl RecordInstance {
             // `Char → UChar` projection (signed −1 clamped to 0), so a
             // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
             // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
-            "TPRO" => Some(EpicsValue::UChar(self.common.tpro)),
-            "BKPT" => Some(EpicsValue::Char(self.common.bkpt.get())),
-            "FLNK" => Some(EpicsValue::String(self.common.flnk.clone().into())),
+            CommonField::Tpro => Some(EpicsValue::UChar(self.common.tpro)),
+            CommonField::Bkpt => Some(EpicsValue::Char(self.common.bkpt.get())),
+            CommonField::Flnk => Some(EpicsValue::String(self.common.flnk.clone().into())),
             // A record type whose C `.dbd` has no INP has no `.INP` channel
             // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
             // a histogram answers "PV 'HI.INP' not found". The port keeps INP on
@@ -8129,84 +8455,84 @@ impl RecordInstance {
             // stands in for the dbd, and it must gate the read side as well as
             // the write side (`put_common_field`) — otherwise the field is
             // unloadable and unwritable yet still resolves as a channel.
-            "INP" if self.record.declares_inp_link() => {
+            CommonField::Inp if self.record.declares_inp_link() => {
                 Some(EpicsValue::String(self.common.inp.clone().into()))
             }
-            "OUT" => Some(EpicsValue::String(self.common.out.clone().into())),
+            CommonField::Out => Some(EpicsValue::String(self.common.out.clone().into())),
             // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
             // type's device menu, NOT the name. The name is what this port
             // stores and dispatches on; the index is what the wire carries.
-            "DTYP" => Some(EpicsValue::Enum(self.dtyp_index())),
-            "TSE" => Some(EpicsValue::Short(self.common.tse)),
-            "TSEL" => Some(EpicsValue::String(self.common.tsel.clone().into())),
+            CommonField::Dtyp => Some(EpicsValue::Enum(self.dtyp_index())),
+            CommonField::Tse => Some(EpicsValue::Short(self.common.tse)),
+            CommonField::Tsel => Some(EpicsValue::String(self.common.tsel.clone().into())),
             // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
             // 64-bit value variant so values above i64::MAX round-trip.
-            "UTAG" => Some(EpicsValue::UInt64(self.common.utag)),
-            "ASG" => Some(EpicsValue::String(self.common.asg.clone().into())),
-            "ASL" => Some(EpicsValue::Char(self.common.asl)),
-            "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
-            "PHAS" => Some(EpicsValue::Short(self.common.phas)),
-            "EVNT" => Some(EpicsValue::String(self.common.evnt.clone().into())),
-            "PRIO" => Some(EpicsValue::Short(self.common.prio)),
-            "DISV" => Some(EpicsValue::Short(self.common.disv)),
-            "DISA" => Some(EpicsValue::Short(self.common.disa)),
-            "SDIS" => Some(EpicsValue::String(self.common.sdis.clone().into())),
-            "DISS" => Some(EpicsValue::Short(self.common.diss)),
-            "HYST" => Some(EpicsValue::Double(self.common.hyst)),
-            "LCNT" => Some(EpicsValue::Short(self.common.lcnt)),
-            "DISP" => Some(EpicsValue::UChar(self.common.disp)),
-            "PUTF" => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
-            "RPRO" => Some(EpicsValue::UChar(self.common.rpro)),
-            "PACT" => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
+            CommonField::Utag => Some(EpicsValue::UInt64(self.common.utag)),
+            CommonField::Asg => Some(EpicsValue::String(self.common.asg.clone().into())),
+            CommonField::Asl => Some(EpicsValue::Char(self.common.asl)),
+            CommonField::Desc => Some(EpicsValue::String(self.common.desc.clone())),
+            CommonField::Phas => Some(EpicsValue::Short(self.common.phas)),
+            CommonField::Evnt => Some(EpicsValue::String(self.common.evnt.clone().into())),
+            CommonField::Prio => Some(EpicsValue::Short(self.common.prio)),
+            CommonField::Disv => Some(EpicsValue::Short(self.common.disv)),
+            CommonField::Disa => Some(EpicsValue::Short(self.common.disa)),
+            CommonField::Sdis => Some(EpicsValue::String(self.common.sdis.clone().into())),
+            CommonField::Diss => Some(EpicsValue::Short(self.common.diss)),
+            CommonField::Hyst => Some(EpicsValue::Double(self.common.hyst)),
+            CommonField::Lcnt => Some(EpicsValue::Short(self.common.lcnt)),
+            CommonField::Disp => Some(EpicsValue::UChar(self.common.disp)),
+            CommonField::Putf => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
+            CommonField::Rpro => Some(EpicsValue::UChar(self.common.rpro)),
+            CommonField::Pact => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
             // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is
             // retained in `prec->proc` and served back SIGNED as `DBR_CHAR`
             // (`caput PROC 255` → `caget` = -1), exactly like DISP/RPRO. The
             // `pp(TRUE)` force-process is orthogonal: writing PROC still
             // reprocesses the record (put-path intercept), but the byte sticks.
-            "PROC" => Some(EpicsValue::UChar(self.common.proc_field)),
+            CommonField::Proc => Some(EpicsValue::UChar(self.common.proc_field)),
             // Analog alarm fields
-            "HIHI" => self
+            CommonField::Hihi => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| a.limit(AlarmLimitField::Hihi).to_epics_value()),
-            "HIGH" => self
+            CommonField::High => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| a.limit(AlarmLimitField::High).to_epics_value()),
-            "LOW" => self
+            CommonField::Low => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| a.limit(AlarmLimitField::Low).to_epics_value()),
-            "LOLO" => self
+            CommonField::Lolo => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| a.limit(AlarmLimitField::Lolo).to_epics_value()),
-            "HHSV" => self
+            CommonField::Hhsv => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| EpicsValue::Short(a.hhsv)),
-            "HSV" => self
+            CommonField::Hsv => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| EpicsValue::Short(a.hsv)),
-            "LSV" => self
+            CommonField::Lsv => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| EpicsValue::Short(a.lsv)),
-            "LLSV" => self
+            CommonField::Llsv => self
                 .common
                 .analog_alarm
                 .as_ref()
                 .map(|a| EpicsValue::Short(a.llsv)),
             // swait OUTN is aliased to common.out
-            "OUTN" => {
+            CommonField::Outn => {
                 if self.record.record_type() == "swait" {
                     Some(EpicsValue::String(self.common.out.clone().into()))
                 } else {
@@ -8386,13 +8712,13 @@ impl RecordInstance {
         use crate::server::recgbl::EventMask;
         let ack_mask = EventMask::VALUE | EventMask::ALARM;
         self.common.ackt = new_ackt;
-        self.notify_field_in(burst, "ACKT", ack_mask);
+        self.notify_declared(Some(burst), common_desc::ackt(), ack_mask);
         // C `:1294-1297`: turning transient acknowledgement off lowers a
         // sticky ACKS down to the current SEVR — an alarm that has already
         // cleared must not keep a higher unacknowledged severity.
         if !new_ackt && self.common.acks > self.common.sevr {
             self.common.acks = self.common.sevr;
-            self.notify_field_in(burst, "ACKS", ack_mask);
+            self.notify_declared(Some(burst), common_desc::acks(), ack_mask);
         }
         self.notify_record_alarm_in(burst);
     }
@@ -8419,7 +8745,11 @@ impl RecordInstance {
         }
         use crate::server::recgbl::EventMask;
         self.common.acks = AlarmSeverity::NoAlarm;
-        self.notify_field_in(burst, "ACKS", EventMask::VALUE | EventMask::ALARM);
+        self.notify_declared(
+            Some(burst),
+            common_desc::acks(),
+            EventMask::VALUE | EventMask::ALARM,
+        );
         self.notify_record_alarm_in(burst);
     }
 
@@ -9553,29 +9883,43 @@ impl RecordInstance {
         include_val: bool,
         marked: bool,
     ) {
-        use crate::server::record::{CycleHooks, CycleMarks, CyclePostMask, ValuePostGate};
+        use crate::server::record::{
+            CycleHooks, CycleMarks, CyclePostMask, SecondaryTake, ValuePostGate,
+        };
 
         let hooks = self.monitor_plan.hooks;
         // C's `if (monitor_mask)` is shut and the type holds no one-shot post
-        // state, so there is nothing to take, no old copy to advance and — with
-        // nothing subscribed or published — no field for the walk to reach.
+        // state, so there is nothing to take, no old copy to advance and no
+        // field for the walk to reach.
         let idle = deadband_mask.is_empty()
             && !marked
             && !hooks.has(CycleHooks::CYCLE_POSTED)
-            && self.unwatched()
-            && self.last_posted.is_empty();
-        // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
-        // `OnChangeForced` fields sit behind, which the record may open on a
-        // cycle where VAL's own mask is shut. TAKEn once per cycle, ahead of
-        // the idle exit, so an idle bo leaves here instead of at the walk.
-        let secondary_mask = if self.monitor_plan.forced_secondary {
-            self.record.take_secondary_value_mask()
+            && self.walk_unreached();
+        // C's secondary block, TAKEn once per cycle and ahead of the idle exit,
+        // so an idle bo leaves here instead of at the walk. It decides each
+        // field from the record's own old copy and advances it (C aoRecord.c:
+        // 535-549), whether or not anyone is subscribed, before the walk reads
+        // the record; the posts land after the walk, in the order C emits
+        // them. Idle, VAL's mask is shut, so only a forced block can open, and
+        // a cycle it leaves shut ends here.
+        let forced_secondary = self.monitor_plan.forced_secondary;
+        let secondary = if idle {
+            if !forced_secondary {
+                return;
+            }
+            let secondary = self.take_secondary(deadband_mask);
+            if secondary.is_none() {
+                return;
+            }
+            secondary
+        } else if forced_secondary
+            || !deadband_mask.is_empty() && !self.monitor_plan.value_masked.is_empty()
+        {
+            self.take_secondary(deadband_mask)
         } else {
-            EventMask::NONE
+            SecondaryTake::NONE
         };
-        if idle && secondary_mask.is_empty() {
-            return;
-        }
+        let secondary_fired = secondary.fired();
 
         // TAKE — this also clears the state it answers from (C's
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
@@ -9586,44 +9930,9 @@ impl RecordInstance {
         };
         let any_marks = !cycle_marks.is_empty();
         let value_masked = self.monitor_plan.value_masked;
-        let secondary_guard = deadband_mask | secondary_mask;
-
-        // C aoRecord.c:536-549: the secondary block runs once per cycle, from
-        // inside `if (monitor_mask)`, and each field's own `oraw != rval` test
-        // is welded to the `oraw = rval` that follows its `db_post_events`.
-        // Decided by the record's own old copy, not this walk's `last_posted`
-        // change detection, and taken whether or not anyone is subscribed —
-        // so the bookkeeping must not depend on who is watching. Decided
-        // HERE, before the walk reads any field, so the record's old copies
-        // are already advanced by the time the walk looks at the record;
-        // the posts themselves land after the walk, in the order C emits
-        // them. Which fields fired is kept as a bit per `value_masked` index
-        // rather than a list, so the cycle allocates nothing for it.
-        let mut secondary_fired: u64 = 0;
-        if !secondary_guard.is_empty() {
-            debug_assert!(
-                value_masked.len() <= u64::BITS as usize,
-                "fields_posted_with_value_mask is wider than the fired bitmask"
-            );
-            for (index, (_, gate)) in value_masked.iter().enumerate() {
-                // `OnChange` sits inside VAL's own guard, `OnChangeForced`
-                // inside the widened one.
-                let guard_open = match gate {
-                    ValuePostGate::OnChange => !deadband_mask.is_empty(),
-                    ValuePostGate::OnChangeForced | ValuePostGate::Guarded => true,
-                    ValuePostGate::WithValue => false,
-                };
-                if guard_open
-                    && (matches!(gate, ValuePostGate::Guarded)
-                        || self.record.take_secondary_value_change(index))
-                {
-                    secondary_fired |= 1 << index;
-                }
-            }
-        }
-        // Nothing is subscribed, no field this walk can act on has ever been
-        // published and no forced post fired, so the walk below has no field
-        // to reach and nothing to advance. The published values of the fields
+        // The walk has no field to reach — nothing subscribed and none it can
+        // act on ever published, or a type answering its own posts with no mark
+        // — and no forced post fired, so there is nothing to advance. The published values of the fields
         // the walk always skips live in `skipped_posted`, so this is exact:
         // while they shared `last_posted` an alarm transition left it
         // permanently non-empty and the walk ran forever for nothing. The record's declared post sets are the walk's
@@ -9631,9 +9940,14 @@ impl RecordInstance {
         // vtable, is asked only here. Everything a cycle owes whether or not
         // anyone is watching — the TAKEs above and the record's own old-copy
         // advance — has already run.
-        if self.unwatched() && self.last_posted.is_empty() && secondary_fired == 0 {
+        if secondary_fired == 0
+            && self.walk_unreached()
+            && !(self.monitor_plan.answers_own_posts && any_marks)
+        {
             return;
         }
+        #[cfg(test)]
+        WALKS.with(|n| n.set(n.get() + 1));
         // Every post this walk adds sits at or past this index, so the
         // published-state advance at the tail covers exactly those.
         let first_post = snapshot.len();
@@ -9887,7 +10201,7 @@ impl RecordInstance {
                 snapshot,
                 value_masked,
                 secondary_fired,
-                secondary_guard,
+                deadband_mask | secondary.widen(),
                 deadband_mask,
             );
         }
@@ -9912,6 +10226,20 @@ impl RecordInstance {
         });
     }
 
+    /// [`Record::take_secondary_value_changes`], once per cycle.
+    #[inline(always)]
+    fn take_secondary(&mut self, deadband_mask: EventMask) -> crate::server::record::SecondaryTake {
+        #[cfg(test)]
+        SECONDARY_TAKES.with(|n| n.set(n.get() + 1));
+        let secondary = self.record.take_secondary_value_changes(deadband_mask);
+        debug_assert!(
+            self.monitor_plan.secondary_fits(secondary, deadband_mask),
+            "{} fired a secondary its gate keeps shut",
+            self.record.record_type()
+        );
+        secondary
+    }
+
     /// The secondary posts `collect_subscriber_posts` decided fired. A guarded
     /// secondary post lands whether or not the field has a subscriber, as C
     /// calls `db_post_events` (aoRecord.c:536-549); one nobody watches only
@@ -9928,10 +10256,18 @@ impl RecordInstance {
         deadband_mask: EventMask,
     ) {
         use crate::server::record::ValuePostGate;
+        let silent = self.monitor_plan.value_masked_silent;
+        let fired = if self.unwatched() {
+            fired & !silent
+        } else {
+            fired
+        };
         for (index, (name, gate)) in value_masked.iter().enumerate() {
             if fired & (1 << index) == 0 {
                 continue;
             }
+            #[cfg(test)]
+            FORCED_SECONDARY_VISITS.with(|n| n.set(n.get() + 1));
             let mask = match gate {
                 ValuePostGate::OnChangeForced => guard | EventMask::VALUE | EventMask::LOG,
                 ValuePostGate::Guarded => guard,
@@ -9945,19 +10281,19 @@ impl RecordInstance {
                 .flatten();
             let posted = post_name(declared, name);
             let subscribed = self.subscribers.iter().any(|sub| sub.watches(&posted));
-            let key = match declared {
-                Some(desc) => self.monitor_plan.key_of(desc),
-                None => self.post_key(name),
-            };
             // A claimed field keeps no published copy, so an unwatched post
             // of one is nothing at all.
-            if !subscribed && self.monitor_plan.stores_nothing(key) {
+            if !subscribed && silent & (1 << index) != 0 {
                 continue;
             }
             let val = if self.monitor_plan.value_masked_ref & (1 << index) != 0 {
                 PostedValue::Ref
             } else {
-                let Some(val) = self.resolve_field(name) else {
+                let val = match declared {
+                    Some(desc) => self.read_declared(desc),
+                    None => self.resolve_field(name),
+                };
+                let Some(val) = val else {
                     continue;
                 };
                 PostedValue::Val(val)
@@ -9965,6 +10301,10 @@ impl RecordInstance {
             if subscribed {
                 snapshot.push((posted, val, mask));
             } else {
+                let key = match declared {
+                    Some(desc) => self.monitor_plan.key_of(desc),
+                    None => self.post_key(name),
+                };
                 self.record_value_post_as(key, name, val);
             }
         }
@@ -11229,12 +11569,23 @@ impl RecordInstance {
         }
     }
 
+    /// Whether the cycle walk has no field to reach unless a mark or a fired
+    /// secondary gives it one. A type that answers its own posts never has,
+    /// so who is subscribed is not asked for it; any other reaches its
+    /// subscribed and published fields.
+    #[inline(always)]
+    fn walk_unreached(&self) -> bool {
+        self.monitor_plan.answers_own_posts || self.unwatched() && self.last_posted.is_empty()
+    }
+
     /// No monitor is attached, tested on the inline length alone: a spilled
     /// list emptied by detaches still reads as watched and its post finds no
     /// one, so the gate is one load where `SmallVec::len` branches on the
     /// spill.
     #[inline(always)]
     fn unwatched(&self) -> bool {
+        #[cfg(test)]
+        SUBSCRIBER_TESTS.with(|n| n.set(n.get() + 1));
         !self.subscribers.spilled() && self.subscribers.is_empty()
     }
 
@@ -12168,8 +12519,9 @@ mod metadata_cache_tests {
         );
 
         let mut burst = PostBurst::new();
-        inst.notify_field_in(&mut burst, "DESC", EventMask::VALUE);
-        inst.notify_field_in(&mut burst, "DESC", EventMask::VALUE);
+        let desc = inst.field_desc("DESC").unwrap();
+        inst.notify_declared(Some(&mut burst), desc, EventMask::VALUE);
+        inst.notify_declared(Some(&mut burst), desc, EventMask::VALUE);
         assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "no wake mid-burst");
         drop(burst);
         assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
@@ -14709,12 +15061,141 @@ mod forced_secondary_post_tests {
         assert!(!posted.iter().any(|f| f == "RVAL"), "{posted:?}");
     }
 
+    /// Every type's forced secondaries are read through their slots: posting
+    /// each one to a subscriber reads no value by name.
+    #[test]
+    fn forced_secondaries_read_no_value_by_name() {
+        use crate::server::records::{
+            ai::AiRecord, bi::BiRecord, bo::BoRecord, busy::BusyRecord, calcout::CalcoutRecord,
+            mbbi::MbbiRecord, mbbi_direct::MbbiDirectRecord, mbbo::MbboRecord,
+            mbbo_direct::MbboDirectRecord,
+        };
+        let records: [Box<dyn Record>; 10] = [
+            Box::new(AiRecord::default()),
+            Box::new(AoRecord::default()),
+            Box::new(BiRecord::default()),
+            Box::new(BoRecord::default()),
+            Box::new(BusyRecord::default()),
+            Box::new(CalcoutRecord::default()),
+            Box::new(MbbiRecord::default()),
+            Box::new(MbbiDirectRecord::default()),
+            Box::new(MbboRecord::default()),
+            Box::new(MbboDirectRecord::default()),
+        ];
+        for rec in records {
+            let rtype = rec.record_type();
+            let mut inst = RecordInstance::new_boxed(format!("{rtype}:SLOT"), rec);
+            let value_masked = inst.record.fields_posted_with_value_mask();
+            let _rx: Vec<_> = value_masked
+                .iter()
+                .map(|(field, _)| {
+                    let ty = inst.field_desc(field).unwrap().dbf_type;
+                    inst.add_subscriber(field, 1, ty, EventMask::VALUE.bits())
+                        .unwrap()
+                })
+                .collect();
+            let mut snapshot = ProcessSnapshot::new();
+            NAME_READS.with(|n| n.set(0));
+            inst.post_forced_secondaries(
+                &mut snapshot,
+                value_masked,
+                (1 << value_masked.len()) - 1,
+                EventMask::VALUE,
+                EventMask::VALUE,
+            );
+            assert_eq!(NAME_READS.with(|n| n.get()), 0, "{rtype}");
+            assert_eq!(snapshot.len(), value_masked.len(), "{rtype}");
+        }
+    }
+
+    /// The secondary block is taken once per cycle, whatever it fires: a type
+    /// whose block can open on a shut VAL mask (bo, ao) every cycle, idle or
+    /// not; one whose block sits inside VAL's guard (ai) only on a cycle VAL
+    /// posts. Each boundary's old copy lands where C's block leaves it.
+    #[test]
+    fn the_secondary_block_is_taken_once_per_cycle() {
+        use crate::server::records::{ai::AiRecord, bo::BoRecord};
+        let cycle = |inst: &mut RecordInstance, mask: EventMask| {
+            SECONDARY_TAKES.with(|n| n.set(0));
+            inst.collect_subscriber_posts(
+                &mut ProcessSnapshot::new(),
+                mask,
+                EventMask::NONE,
+                true,
+                false,
+            );
+            SECONDARY_TAKES.with(|n| n.get())
+        };
+        let mut bo = RecordInstance::new("BO:TAKE".to_string(), BoRecord::default());
+        assert_eq!(cycle(&mut bo, EventMask::NONE), 1, "bo idle");
+        assert_eq!(cycle(&mut bo, EventMask::VALUE), 1, "bo VAL posts");
+        let mut moved = BoRecord::default();
+        moved.rval = 1;
+        moved.rbv = 1;
+        let mut bo = RecordInstance::new("BO:MOVED".to_string(), moved);
+        assert_eq!(cycle(&mut bo, EventMask::NONE), 1, "bo RVAL and RBV moved");
+        assert_eq!(bo.record.get_field("ORAW"), Some(EpicsValue::ULong(1)));
+        assert_eq!(bo.record.get_field("ORBV"), Some(EpicsValue::ULong(1)));
+
+        let mut ai = RecordInstance::new("AI:TAKE".to_string(), AiRecord::default());
+        ai.record.put_field("RVAL", EpicsValue::Long(5)).unwrap();
+        assert_eq!(cycle(&mut ai, EventMask::NONE), 0, "ai VAL shut");
+        assert_eq!(ai.record.get_field("ORAW"), Some(EpicsValue::Long(0)));
+        assert_eq!(cycle(&mut ai, EventMask::VALUE), 1, "ai VAL posts");
+        assert_eq!(ai.record.get_field("ORAW"), Some(EpicsValue::Long(5)));
+
+        let mut ao = RecordInstance::new("AO:TAKE".to_string(), AoRecord::default());
+        assert_eq!(cycle(&mut ao, EventMask::NONE), 1, "ao idle");
+        let mut ao = ao_with_moved_rval(7);
+        assert_eq!(cycle(&mut ao, EventMask::NONE), 1, "ao omod");
+        assert_eq!(ao.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
+    }
+
     /// Boundary no subscriber: the old copy still advances, and nothing is
     /// posted — the bookkeeping must not depend on who is watching.
     #[test]
     fn a_changed_rval_advances_oraw_with_no_subscriber() {
         let mut inst = ao_with_moved_rval(7);
         assert!(guarded_cycle(&mut inst).is_empty());
+        assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
+    }
+
+    /// Boundary unwatched vs watched: with no subscriber the fired OVAL and
+    /// RVAL, which keep no published copy, are not looked up while ORAW still
+    /// advances; one subscriber brings the lookups and its post back.
+    #[test]
+    fn an_unwatched_ao_skips_the_forced_secondary_lookups() {
+        let passes = |inst: &mut RecordInstance| {
+            FORCED_SECONDARY_VISITS.with(|n| n.set(0));
+            let posted = guarded_cycle(inst);
+            (FORCED_SECONDARY_VISITS.with(|n| n.get()), posted)
+        };
+        let mut inst = ao_with_moved_rval(7);
+        assert_eq!(passes(&mut inst), (0, Vec::<String>::new()));
+        assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
+
+        let mut inst = ao_with_moved_rval(7);
+        let _rx = inst
+            .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+            .expect("subscriber");
+        let (visits, posted) = passes(&mut inst);
+        assert!(visits > 0);
+        assert_eq!(posted, vec![String::from("RVAL")]);
+    }
+
+    /// Boundary watched record, unwatched silent field: with RVAL alone
+    /// watched, the fired OVAL, which keeps no published copy, is neither
+    /// read nor handed to the published log.
+    #[test]
+    fn a_watched_ao_skips_its_unwatched_silent_secondary() {
+        let mut inst = ao_with_moved_rval(7);
+        let _rx = inst
+            .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+            .expect("subscriber");
+        STORELESS_POSTS.with(|p| p.borrow_mut().clear());
+        assert_eq!(guarded_cycle(&mut inst), ["RVAL"]);
+        let storeless = STORELESS_POSTS.with(|p| p.take());
+        assert!(!storeless.iter().any(|f| f == "OVAL"), "{storeless:?}");
         assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
     }
 
@@ -14836,6 +15317,28 @@ mod mlis_tests {
         }
     }
 
+    /// An ACKT put that lowers ACKS and an ACKS put post ACKT, ACKS and the
+    /// record-wide alarm by declaration: no name byte is read.
+    #[test]
+    fn an_acknowledge_put_reads_no_name() {
+        let mut inst = ao();
+        let mut readers: Vec<_> = ["ACKT", "ACKS", "VAL"]
+            .into_iter()
+            .map(|field| attach(&mut inst, field, EventMask::VALUE | EventMask::ALARM))
+            .collect();
+        inst.common.acks = AlarmSeverity::Major;
+        inst.common.ackt = true;
+        NAME_BYTE_COMPARES.with(|n| n.set(0));
+        inst.put_ackt(0);
+        inst.common.acks = AlarmSeverity::Minor;
+        inst.put_acks(AlarmSeverity::Minor as u16);
+        assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0);
+        let got: Vec<_> = readers.iter_mut().map(|r| drained(r).len()).collect();
+        // C putAckt (dbAccess.c:1295-1301) posts ACKT, ACKS and the
+        // record-wide alarm; putAcks (:1313-1314) ACKS and the alarm again.
+        assert_eq!(got, [3, 4, 2]);
+    }
+
     /// Monitors on two fields of one record each receive only their own.
     #[test]
     fn a_post_reaches_only_its_fields_monitors() {
@@ -14878,9 +15381,10 @@ mod mlis_tests {
         let mut gone = attach(&mut inst, "VAL", EventMask::VALUE);
         let mut kept = attach(&mut inst, "VAL", EventMask::VALUE);
         let mut burst = PostBurst::new();
-        inst.notify_field_in(&mut burst, "VAL", EventMask::VALUE);
+        let val = inst.field_desc("VAL").unwrap();
+        inst.notify_declared(Some(&mut burst), val, EventMask::VALUE);
         inst.remove_subscriber(gone.id());
-        inst.notify_field_in(&mut burst, "VAL", EventMask::VALUE);
+        inst.notify_declared(Some(&mut burst), val, EventMask::VALUE);
         drop(burst);
         assert!(gone.try_recv().is_ok());
         assert_eq!(gone.try_recv().err(), Some(TryRecvError::Disconnected));
@@ -15097,6 +15601,176 @@ mod mlis_tests {
         }
     }
 
+    /// A cycle that posts nothing does the same work whoever is subscribed: an
+    /// idle bo or stringout never tests its subscriber set or enters the walk,
+    /// with no monitor, one on the deadband VAL, one on a claimed field (RVAL)
+    /// or one on a field the cycle never posts (DESC). A cycle that moves RVAL,
+    /// a posted field, walks and delivers.
+    #[epics_macros_rs::epics_test]
+    async fn an_idle_cycle_does_the_same_work_whoever_is_subscribed() {
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(bo, "BO:IDLE") {}
+                record(stringout, "SO:IDLE") {}"#,
+                &Default::default(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let cycles = || {
+            let db = db.clone();
+            async move {
+                for _ in 0..8 {
+                    for name in ["BO:IDLE", "SO:IDLE"] {
+                        let mut visited = crate::server::database::ProcStack::new();
+                        db.process_record_with_links(name, &mut visited)
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        };
+        let counted = || {
+            (
+                SUBSCRIBER_TESTS.with(|n| n.replace(0)),
+                WALKS.with(|n| n.replace(0)),
+                DELIVERIES.with(|n| n.replace(0)),
+            )
+        };
+        // The first cycle clears UDF's alarm and posts.
+        cycles().await;
+        counted();
+        cycles().await;
+        assert_eq!(counted(), (0, 0, 0), "unwatched");
+        let mut readers = Vec::new();
+        for (name, field) in [
+            ("BO:IDLE", "VAL"),
+            ("BO:IDLE", "RVAL"),
+            ("BO:IDLE", "DESC"),
+            ("SO:IDLE", "VAL"),
+            ("SO:IDLE", "DESC"),
+        ] {
+            let rec = db.get_record(name).unwrap();
+            readers.push(
+                rec.write()
+                    .add_subscriber(field, 1, DbFieldType::Double, EventMask::VALUE.bits())
+                    .unwrap(),
+            );
+        }
+        counted();
+        cycles().await;
+        assert_eq!(counted(), (0, 0, 0), "watched");
+        db.put_record_field_from_ca_no_notify("BO:IDLE", "VAL", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let (_, walks, deliveries) = counted();
+        assert!(
+            walks > 0 && deliveries > 0,
+            "RVAL moved: {walks} walks, {deliveries} deliveries"
+        );
+        assert!(!drained(&mut readers[1]).is_empty());
+    }
+
+    /// Every declared field of every type reads through the plan's route as
+    /// the name chain answers it, and an unreadable one is refused.
+    #[test]
+    fn every_declared_read_answers_as_the_name_chain() {
+        use crate::server::record::dbd_generated::{DB_COMMON_FIELDS, RECORD_TYPES};
+        let mut checked = 0usize;
+        for record_type in RECORD_TYPES {
+            let inst = RecordInstance::new_boxed(
+                format!("T:{record_type}"),
+                crate::server::record::record_trait::tests::any_record(record_type),
+            );
+            for desc in DB_COMMON_FIELDS.iter().chain(inst.record.field_list()) {
+                let read = inst.resolve_field_stored_at(desc.name, Some(desc));
+                if desc.unreadable() {
+                    assert!(read.is_none(), "{record_type}.{}", desc.name);
+                    continue;
+                }
+                let Some(chain) = inst
+                    .record
+                    .get_field(desc.name)
+                    .or_else(|| inst.get_common_field(desc.name))
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    format!("{read:?}"),
+                    format!("{:?}", Some(chain)),
+                    "{record_type}.{}",
+                    desc.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "{checked} reads");
+    }
+
+    /// `FieldRead::table` settles a common-named own field once, from the
+    /// construction-time `get_field` answer; that holds only while no type
+    /// answers such a name in one state and leaves it to the instance in
+    /// another. Every declared field is put to flip what state it can.
+    #[test]
+    fn a_common_named_own_field_is_owned_in_every_state() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        let owned = |record: &dyn Record| -> Vec<&'static str> {
+            record
+                .field_list()
+                .iter()
+                .filter(|d| CommonField::by_name(d.name).is_some())
+                .filter(|d| record.get_field(d.name).is_some())
+                .map(|d| d.name)
+                .collect()
+        };
+        let mut owning = 0usize;
+        for record_type in RECORD_TYPES {
+            let mut record = crate::server::record::record_trait::tests::any_record(record_type);
+            let fresh = owned(&*record);
+            owning += fresh.len();
+            for desc in record.field_list() {
+                for value in [
+                    EpicsValue::Double(1.0),
+                    EpicsValue::Short(1),
+                    EpicsValue::String("X.VAL".into()),
+                ] {
+                    let _ = record.put_field(desc.name, value);
+                }
+            }
+            assert_eq!(owned(&*record), fresh, "{record_type}");
+        }
+        assert!(owning >= 28, "{owning} owned common names");
+    }
+
+    /// A record whose one monitor watches the field its cycle posts: a
+    /// by-name match there answers from `ptr::eq` before any byte, so only a
+    /// count taken on entry to `watches_str` sees it.
+    #[epics_macros_rs::epics_test]
+    async fn a_lone_monitor_post_takes_no_name() {
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(calcout, "CL:PTR") { field(CALC, "A") field(ODLY, "0.1") }"#,
+                &Default::default(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let rec = db.get_record("CL:PTR").unwrap();
+        let mut rx = rec
+            .write()
+            .add_subscriber("DLYA", 1, DbFieldType::UShort, EventMask::VALUE.bits())
+            .unwrap();
+        NAME_BYTE_COMPARES.with(|n| n.set(0));
+        db.put_record_field_from_ca_no_notify("CL:PTR", "PROC", EpicsValue::Short(1))
+            .await
+            .unwrap();
+        crate::runtime::task::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0);
+        assert_eq!(drained(&mut rx).len(), 2, "DLYA set and cleared");
+    }
+
     /// Monitored bo, ao, stringout and calcout cycles and put-time posts walk,
     /// match, publish and reap by index and pointer from the first publish:
     /// the deadband VAL, a `dbCommon` field the walk always skips, the
@@ -15283,6 +15957,51 @@ mod skipped_posted_tests {
                 inst.last_posted
             );
             assert!(inst.posted_value(field).is_some(), "{rec}.{field}");
+        }
+    }
+
+    /// A marked claimed array (acalcout's AA, stored by its CALC every
+    /// cycle) with no monitor stops at `post_put_field`'s `reap_closed` and
+    /// leaves no `last_posted` entry, so no later walk reads it; with one
+    /// monitor each cycle posts it once.
+    #[epics_macros_rs::epics_test]
+    async fn a_marked_claimed_array_is_read_only_for_its_monitor() {
+        use crate::server::database::ProcStack;
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        let (db, _) = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "AC") { field(NELM, "4") field(CALC, "AA:=IX;0") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .expect("db")
+            .build()
+            .await
+            .expect("ioc");
+        db.ioc_init().await;
+        let cell = db.get_record("AC").unwrap();
+        for _ in 0..2 {
+            db.process_record_with_links("AC", &mut ProcStack::new())
+                .await
+                .unwrap();
+            let inst = cell.read();
+            assert!(
+                !inst.last_posted.contains(inst.post_key("AA")),
+                "AA reached the walk with no monitor: {:?}",
+                inst.last_posted
+            );
+        }
+        let mut rx = cell
+            .write()
+            .add_subscriber("AA", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("subscriber");
+        for _ in 0..2 {
+            db.process_record_with_links("AC", &mut ProcStack::new())
+                .await
+                .unwrap();
+            assert!(rx.try_recv().is_ok(), "the marked AA posted to its monitor");
+            assert!(rx.try_recv().is_err(), "AA posted more than once a cycle");
         }
     }
 

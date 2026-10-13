@@ -213,3 +213,37 @@ fn array(v: &EpicsValue) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// subArray's BUSY is a device's flag C posts nowhere: neither
+/// `subArrayRecord.c` (its one read, `:140`, gates an async completion) nor
+/// `devSASoft.c` calls `db_post_events` on it, so a cycle that finds it moved
+/// stays silent on every class.
+#[epics_macros_rs::epics_test]
+async fn a_moved_busy_posts_nothing_on_the_cycle() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    let (db, _) = IocBuilder::new()
+        .db_string(DB, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    let cell = db.get_record("S").unwrap();
+    let all = EventMask::VALUE | EventMask::ALARM | EventMask::LOG;
+    let mut busy = cell
+        .write()
+        .add_subscriber("BUSY", 1, DbFieldType::Short, all.bits())
+        .unwrap();
+    for set in [true, false] {
+        let mut inst = cell.write();
+        let wf = inst.record.as_any_mut();
+        wf.and_then(|a| a.downcast_mut::<WaveformRecord>())
+            .unwrap()
+            .busy = set;
+        drop(inst);
+        db.put_record_field_from_ca("S", "PROC", EpicsValue::String("1".into()))
+            .await
+            .unwrap();
+    }
+    assert!(busy.try_recv().is_err(), "subArray BUSY posted on a cycle");
+}

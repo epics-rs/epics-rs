@@ -2593,10 +2593,7 @@ fn dbtgf_option_lines(
         // `get_graphic_double` fills HOPR/LOPR only for `VAL`.
         out.push("units = \"\"".to_string());
         out.push("precision not returned".to_string());
-        out.push(format!(
-            "time = {}",
-            dbtgf_time_text(crate::types::WallTime::from(inst.common.time))
-        ));
+        out.push(format!("time = {}", dbtgf_time_text(inst.common.time)));
         out.push("enum strings not returned".to_string());
         for name in ["gr", "ctrl"] {
             out.push(format!("{name}Long: 0 .. 0"));

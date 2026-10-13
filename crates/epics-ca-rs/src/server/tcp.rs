@@ -13200,7 +13200,7 @@ mod snapshot_scan_lock_tests {
     use epics_base_rs::server::records::ai::AiRecord;
     use epics_base_rs::types::EpicsValue;
     use std::sync::{Arc, Barrier};
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     /// A put commits VAL under one record write-lock and stamps TIME under a
     /// SECOND — `put_record_field_from_ca_body` drops the put guard between them
@@ -13226,9 +13226,9 @@ mod snapshot_scan_lock_tests {
         // Capture how the snapshot renders each of the two stamps, so the
         // assertion names the exact `WallTime` a torn read could not produce —
         // independent of whatever `set_val` does to `common.time`.
-        let t0 = SystemTime::UNIX_EPOCH + Duration::new(1_000, 0);
-        let t1 = SystemTime::UNIX_EPOCH + Duration::new(2_000, 0);
-        let stamp = |t: SystemTime| {
+        let t0 = epics_base_rs::types::WallTime::from_unix(1_000, 0);
+        let t1 = epics_base_rs::types::WallTime::from_unix(2_000, 0);
+        let stamp = |t: epics_base_rs::types::WallTime| {
             rec.write().common.time = t;
             record_field_snapshot_scan_locked(&db, &rec, "VAL", false)
                 .expect("snapshot")

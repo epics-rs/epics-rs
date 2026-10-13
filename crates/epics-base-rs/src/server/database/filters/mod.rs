@@ -256,7 +256,7 @@ impl FilterChain {
             return Some(value);
         }
         let snap =
-            crate::server::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::now());
+            crate::server::snapshot::Snapshot::new(value, 0, 0, crate::types::WallTime::now());
         self.apply_single(snap, read_context, mask)
             .map(|snap| snap.value)
     }

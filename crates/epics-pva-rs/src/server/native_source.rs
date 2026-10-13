@@ -5297,7 +5297,7 @@ ASG(DEFAULT) {
                 .expect("an update must post within 2s")
                 .expect("stream open");
 
-        let raw = WallTime::from(rec.read().common.time);
+        let raw = rec.read().common.time;
         let mask = (1u32 << 20) - 1;
         let PvField::Structure(top) = &*update.value else {
             panic!("an NTScalar is a structure");
@@ -5900,10 +5900,7 @@ ASG(PLAIN) {
     fn has_processed(db: &PvDatabase, record: &str) -> bool {
         let rec = db.get_record(record).expect("record");
         let t = rec.read().common.time;
-        t.duration_since(std::time::UNIX_EPOCH)
-            .expect("post-1970")
-            .as_secs()
-            > 700_000_000
+        t.unix_secs() > 700_000_000
     }
 
     async fn ai_db(name: &str) -> Arc<PvDatabase> {

@@ -3,8 +3,9 @@
 //! not carried past the SIML put. softIoc `R7.0.10-146-g8f5015b66`, ao,
 //! `TSE=-2`, SIML "SM" processed once with SM=0.
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -39,8 +40,8 @@ async fn a_siml_put_forgets_the_simm_read_before_it() {
     db.put_record_field_from_ca("AO", "SIMM", EpicsValue::Short(1))
         .await
         .unwrap();
-    cell.write().common.time = SystemTime::UNIX_EPOCH + STALE;
-    let before = SystemTime::now();
+    cell.write().common.time = WallTime::UNIX_EPOCH + STALE;
+    let before = WallTime::now();
     process().await;
     let t = cell.read().common.time;
     assert!(t >= before, "TIME not stamped: {t:?}");

@@ -17,8 +17,9 @@
 
 #![cfg(tokio_backend)]
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_ca_rs::protocol::{
@@ -86,7 +87,7 @@ fn stamp(body: &[u8]) -> (u32, u32) {
 
 fn record_stamp(db: &PvDatabase) -> (u32, u32) {
     let t = db.get_record("TAG").unwrap().read().common.time;
-    let d = t.duration_since(UNIX_EPOCH).unwrap();
+    let d = t.since_unix_epoch();
     ((d.as_secs() - EPICS_EPOCH) as u32, d.subsec_nanos())
 }
 
@@ -103,7 +104,7 @@ async fn three_reads() -> [((u32, u32), (u32, u32)); 3] {
     let db = server.database().clone();
     tokio::spawn(async move { server.run().await });
     db.get_record("TAG").unwrap().write().common.time =
-        SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, STAMP_NSEC);
+        WallTime::UNIX_EPOCH + Duration::new(1_700_000_000, STAMP_NSEC);
 
     let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     sock.write_all(&frame(

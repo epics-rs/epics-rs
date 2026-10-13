@@ -6727,7 +6727,7 @@ async fn test_sdis_cp_link_registration() {
 ///
 /// Regression: the pre-fix Rust port read TSE=-1 as
 /// "device-provided with BestTime fallback" and gated the call on
-/// UNIX_EPOCH. A stale device write of any non-epoch SystemTime
+/// UNIX_EPOCH. A stale device write of any non-epoch epics_base_rs::types::WallTime
 /// suppressed every subsequent BestTime refresh.
 #[epics_macros_rs::epics_test]
 async fn test_tse_minus1_always_overwrites_via_best_time() {
@@ -6737,7 +6737,8 @@ async fn test_tse_minus1_always_overwrites_via_best_time() {
         .unwrap();
     // Stale but non-epoch timestamp — exactly the case the pre-fix
     // path mis-classified as "device-provided, keep".
-    let stale = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
+    let stale =
+        epics_base_rs::types::WallTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
     if let Some(rec) = db.get_record("REC") {
         let mut inst = rec.write();
         inst.common.tse = -1;
@@ -6762,7 +6763,8 @@ async fn test_tse_minus2_keeps_time_unchanged() {
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    let fixed_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(999);
+    let fixed_time =
+        epics_base_rs::types::WallTime::UNIX_EPOCH + std::time::Duration::from_secs(999);
     if let Some(rec) = db.get_record("REC") {
         let mut inst = rec.write();
         inst.common.tse = -2;
@@ -6871,7 +6873,7 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
     // Source carries a known timestamp and a bit-31 userTag; the bit-31
     // value pins that the u64 utag is copied verbatim (no narrowing or
     // reset on the way through processing).
-    let src_time = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123);
+    let src_time = epics_base_rs::types::WallTime::from_unix(1_700_000_000, 123);
     let src_utag: u64 = 0x9000_0000;
     {
         let rec = db.get_record("TSE_SRC").unwrap();
@@ -6972,7 +6974,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
 
     let rec = db.get_record("TS_CADST").unwrap();
     let inst = rec.read();
-    let expected = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 456);
+    let expected = epics_base_rs::types::WallTime::from_unix(1_700_000_000, 456);
     assert_eq!(
         inst.common.time, expected,
         "CA TSEL .TIME link must adopt the CA link's cached timestamp"
@@ -7050,7 +7052,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
 
     let rec = db.get_record("TS_NLDST").unwrap();
     let inst = rec.read();
-    let expected = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_123, 789);
+    let expected = epics_base_rs::types::WallTime::from_unix(1_700_000_123, 789);
     assert_eq!(
         inst.common.time, expected,
         "non-local Db TSEL .TIME link must adopt the remote .TIME via the CA path"
@@ -7559,8 +7561,6 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
 /// — the timestamp invariant is the load-bearing assertion here.
 #[epics_macros_rs::epics_test]
 async fn test_output_link_cascade_uses_post_process_source_timestamp() {
-    use std::time::SystemTime;
-
     let db = PvDatabase::new();
     db.add_record("TS_SRC", Box::new(AoRecord::new(0.0)))
         .await
@@ -7578,7 +7578,7 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
             .unwrap();
     }
 
-    let baseline = SystemTime::now();
+    let baseline = epics_base_rs::types::WallTime::now();
 
     // Drive the source. SRC processes → apply_timestamp → OUT stage
     // captures (TS_DST, val) → snapshot/notify → write_db_link_value
@@ -7713,7 +7713,6 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
 #[epics_macros_rs::epics_test]
 async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
     use epics_base_rs::server::records::longout::LongoutRecord;
-    use std::time::SystemTime;
 
     let db = PvDatabase::new();
     db.add_record("LO_SRC", Box::new(LongoutRecord::new(0)))
@@ -7732,7 +7731,7 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
         inst.record.put_field("OOPT", EpicsValue::Short(1)).unwrap();
     }
 
-    let baseline = SystemTime::now();
+    let baseline = epics_base_rs::types::WallTime::now();
 
     // First cycle: val == pval == 0 satisfies "no change", but the
     // first-output-done guard forces the OUT cascade to fire.

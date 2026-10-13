@@ -30,7 +30,7 @@ async fn the_async_output_stamps_like_the_sync_one() {
         .await
         .unwrap()
         .0;
-    let stale = std::time::SystemTime::UNIX_EPOCH + STALE;
+    let stale = epics_base_rs::types::WallTime::UNIX_EPOCH + STALE;
     let cell = db.get_record("A_AO").unwrap();
     cell.write().common.time = stale;
     let mut prev = stale;

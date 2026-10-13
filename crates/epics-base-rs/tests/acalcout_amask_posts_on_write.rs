@@ -280,7 +280,7 @@ async fn the_aftercalc_post_carries_the_previous_stamp_and_alarm() {
             (*f, rx)
         })
         .collect();
-    let born: WallTime = inst.read().common.time.into();
+    let born: WallTime = inst.read().common.time;
     let mut prev_stamp = born;
     for cycle in 0..3 {
         process(&db, "AC").await;
@@ -325,13 +325,13 @@ fn the_aftercalc_post_through_process_local_carries_the_previous_stamp() {
         .unwrap();
     while aa.try_recv().is_ok() {}
     for cycle in 0..2 {
-        let stamp: WallTime = inst.common.time.into();
+        let stamp: WallTime = inst.common.time;
         let alarm = (inst.common.stat, inst.common.sevr as u16);
         inst.process_local().unwrap();
         let e = aa.try_recv().expect("afterCalc posts AA");
         assert_eq!(e.time(), stamp, "cycle {cycle}: AA stamp");
         assert_eq!((e.stat(), e.sevr()), alarm, "cycle {cycle}: AA alarm");
-        let after: WallTime = inst.common.time.into();
+        let after: WallTime = inst.common.time;
         assert_ne!(after, stamp, "cycle {cycle}: the cycle stamped the record");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }

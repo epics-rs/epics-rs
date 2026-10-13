@@ -13,8 +13,9 @@
 //!   aao        U         U      N      N     S
 //! ```
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -43,7 +44,7 @@ async fn the_stamp_sees_this_or_the_previous_cycles_simm_per_record_type() {
         .await
         .unwrap()
         .0;
-    let stale = SystemTime::UNIX_EPOCH + STALE;
+    let stale = WallTime::UNIX_EPOCH + STALE;
     for (rec, want) in [
         ("O_LSO", [Step::U, Step::N, Step::N, Step::S, Step::S]),
         ("O_AAO", [Step::U, Step::U, Step::N, Step::N, Step::S]),

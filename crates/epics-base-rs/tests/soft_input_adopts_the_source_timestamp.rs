@@ -35,9 +35,10 @@
 //! is deliberately NOT adopted — only TSEL `.TIME` (`recGbl.c:317`) takes that.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// A stamp no clock in this process will ever produce, so an assertion that
 /// finds it can only have got it from SRC.
@@ -61,7 +62,7 @@ async fn build(db_text: &str) -> Db {
 fn stamp_src(db: &Db) {
     let src = db.get_record("SRC").unwrap();
     let mut inst = src.write();
-    inst.common.time = SystemTime::UNIX_EPOCH + SENTINEL;
+    inst.common.time = WallTime::UNIX_EPOCH + SENTINEL;
     inst.common.utag = SENTINEL_UTAG;
 }
 
@@ -72,7 +73,7 @@ async fn proc(db: &Db, rec: &str) {
         .unwrap();
 }
 
-fn time_of(db: &Db, rec: &str) -> SystemTime {
+fn time_of(db: &Db, rec: &str) -> WallTime {
     db.get_record(rec).unwrap().read().common.time
 }
 
@@ -102,7 +103,7 @@ record(waveform, "D_WF") { field(INP, "SRC") field(TSE, "-2") field(FTVL, "DOUBL
         proc(&db, dst).await;
         assert_eq!(
             time_of(&db, dst),
-            SystemTime::UNIX_EPOCH + SENTINEL,
+            WallTime::UNIX_EPOCH + SENTINEL,
             "{dst} must carry SRC's stamp"
         );
     }
@@ -122,7 +123,7 @@ record(ai, "DST") { field(INP, "SRC") field(TSE, "-2") }
     stamp_src(&db);
     proc(&db, "DST").await;
 
-    assert_eq!(time_of(&db, "DST"), SystemTime::UNIX_EPOCH + SENTINEL);
+    assert_eq!(time_of(&db, "DST"), WallTime::UNIX_EPOCH + SENTINEL);
     assert_eq!(utag_of(&db, "DST"), 0, "ptag is NULL on this path");
 }
 
@@ -142,7 +143,7 @@ record(ai, "DST") { field(INP, "SRC") }
 
     assert_ne!(
         time_of(&db, "DST"),
-        SystemTime::UNIX_EPOCH + SENTINEL,
+        WallTime::UNIX_EPOCH + SENTINEL,
         "TSE=0 stamps from the clock, not from INP"
     );
 }
@@ -170,7 +171,7 @@ record(ai, "DST")   { field(INP, "SRC") field(TSEL, "TSESRC") }
     );
     assert_ne!(
         time_of(&db, "DST"),
-        SystemTime::UNIX_EPOCH + SENTINEL,
+        WallTime::UNIX_EPOCH + SENTINEL,
         "dbLinkIsConstant(&prec->tsel) is false, so ptime is NULL"
     );
 }
@@ -215,12 +216,12 @@ record(ai, "DST") { field(INP, "SRC") field(TSE, "-2") }
     let first = time_of(&db, "DST");
 
     let src = db.get_record("SRC").unwrap();
-    src.write().common.time = SystemTime::UNIX_EPOCH + SENTINEL + Duration::from_secs(1);
+    src.write().common.time = WallTime::UNIX_EPOCH + SENTINEL + Duration::from_secs(1);
     proc(&db, "DST").await;
     let second = time_of(&db, "DST");
 
     assert_eq!(
-        second.duration_since(first).unwrap(),
+        second.since_unix_epoch() - first.since_unix_epoch(),
         Duration::from_secs(1),
         "DST's stamp must move exactly as SRC's did"
     );

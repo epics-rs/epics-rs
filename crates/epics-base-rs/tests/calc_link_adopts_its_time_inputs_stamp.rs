@@ -35,9 +35,10 @@
 use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// Stamps no clock in this process will produce, so an assertion that finds
 /// one can only have got it from the record it was planted on.
@@ -64,7 +65,7 @@ fn stamp_sources(db: &Db) {
     for (name, t, tag) in [("SRC_A", A_STAMP, A_UTAG), ("SRC_B", B_STAMP, B_UTAG)] {
         if let Some(rec) = db.get_record(name) {
             let mut inst = rec.write();
-            inst.common.time = SystemTime::UNIX_EPOCH + t;
+            inst.common.time = WallTime::UNIX_EPOCH + t;
             inst.common.utag = tag;
         }
     }
@@ -77,7 +78,7 @@ async fn proc(db: &Db, rec: &str) {
         .unwrap();
 }
 
-fn stamp_of(db: &Db, rec: &str) -> (SystemTime, u64) {
+fn stamp_of(db: &Db, rec: &str) -> (WallTime, u64) {
     let r = db.get_record(rec).unwrap();
     let inst = r.read();
     (inst.common.time, inst.common.utag)
@@ -109,7 +110,7 @@ record(ai, "DST") {
     );
     assert_eq!(
         stamp_of(&db, "DST"),
-        (SystemTime::UNIX_EPOCH + A_STAMP, A_UTAG),
+        (WallTime::UNIX_EPOCH + A_STAMP, A_UTAG),
         "C `lnkCalc.c:580-581` copies clink->time AND clink->utag into the record"
     );
 }
@@ -139,7 +140,7 @@ record(ai, "DST") {
     );
     assert_eq!(
         stamp_of(&db, "DST"),
-        (SystemTime::UNIX_EPOCH + B_STAMP, B_UTAG),
+        (WallTime::UNIX_EPOCH + B_STAMP, B_UTAG),
         "`time:\"B\"` is args[1], C `clink->tinp = tinp - 'A'` (lnkCalc.c:184)"
     );
 }
@@ -166,7 +167,7 @@ record(ai, "DST") {
 
     assert_eq!(
         stamp_of(&db, "DST"),
-        (SystemTime::UNIX_EPOCH + A_STAMP, A_UTAG),
+        (WallTime::UNIX_EPOCH + A_STAMP, A_UTAG),
         "C toupper()s the `time` letter before testing its range"
     );
 }
@@ -194,7 +195,7 @@ record(ai, "DST") {
     let (time, utag) = stamp_of(&db, "DST");
     assert_ne!(
         time,
-        SystemTime::UNIX_EPOCH + A_STAMP,
+        WallTime::UNIX_EPOCH + A_STAMP,
         "no `time` key → C's tinp = -1 → the record keeps its own stamp"
     );
     assert_eq!(utag, 0, "and no userTag arrives either");
@@ -222,7 +223,7 @@ record(ai, "DST") {
     let (time, utag) = stamp_of(&db, "DST");
     assert_ne!(
         time,
-        SystemTime::UNIX_EPOCH + A_STAMP,
+        WallTime::UNIX_EPOCH + A_STAMP,
         "TSE=0 → `dbLinkIsConstant(&tsel) && tse == -2` is false → no adoption"
     );
     assert_eq!(utag, 0);
@@ -274,7 +275,7 @@ record(ai, "DST") {
     assert_eq!(
         stamp_of(&db, "DST"),
         (
-            SystemTime::UNIX_EPOCH + Duration::new(1_700_000_456, 321),
+            WallTime::UNIX_EPOCH + Duration::new(1_700_000_456, 321),
             A_UTAG
         ),
         "a non-local time input is a CA link; its stamp is the lset's"

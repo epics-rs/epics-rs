@@ -797,7 +797,7 @@ pub trait DeviceSupport: Send + Sync + 'static {
 
     /// Return the last timestamp from the driver.
     /// None means the driver does not override timestamps.
-    fn last_timestamp(&self) -> Option<std::time::SystemTime> {
+    fn last_timestamp(&self) -> Option<crate::types::WallTime> {
         None
     }
 

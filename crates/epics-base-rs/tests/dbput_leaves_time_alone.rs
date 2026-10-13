@@ -6,9 +6,10 @@
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 const DB: &str = r#"
 record(ai,        "AI") { field(VAL, "1") }
@@ -28,12 +29,12 @@ async fn build() -> Arc<PvDatabase> {
         .unwrap()
         .0;
     for rec in ["AI", "AO", "SO", "LS"] {
-        db.get_record(rec).unwrap().write().common.time = SystemTime::UNIX_EPOCH + STAMP;
+        db.get_record(rec).unwrap().write().common.time = WallTime::UNIX_EPOCH + STAMP;
     }
     db
 }
 
-fn time(db: &PvDatabase, rec: &str) -> SystemTime {
+fn time(db: &PvDatabase, rec: &str) -> WallTime {
     db.get_record(rec).unwrap().read().common.time
 }
 
@@ -69,7 +70,7 @@ async fn no_put_body_restamps_time() {
             }
             assert_eq!(
                 time(&db, rec),
-                SystemTime::UNIX_EPOCH + STAMP,
+                WallTime::UNIX_EPOCH + STAMP,
                 "{body} {name} restamped TIME"
             );
         }

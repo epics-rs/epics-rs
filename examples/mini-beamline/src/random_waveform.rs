@@ -283,7 +283,7 @@ pub mod ioc_support {
             None
         }
 
-        fn last_timestamp(&self) -> Option<std::time::SystemTime> {
+        fn last_timestamp(&self) -> Option<epics_base_rs::types::WallTime> {
             None
         }
 

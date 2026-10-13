@@ -1363,7 +1363,7 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
                 nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
                 phas: 0,
                 tse: 0,
-                time: std::time::SystemTime::UNIX_EPOCH,
+                time: epics_base_rs::types::WallTime::UNIX_EPOCH,
                 soft: inst.common.dtyp.soft(),
                 callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
             });

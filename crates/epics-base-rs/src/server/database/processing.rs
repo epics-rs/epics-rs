@@ -396,7 +396,7 @@ pub(crate) struct NotifiedRead {
     raw: Option<EpicsValue>,
     alarm: Option<super::links::SourceAlarm>,
     render: Option<crate::server::record::record_instance::SourceRender>,
-    time: Option<std::time::SystemTime>,
+    time: Option<crate::types::WallTime>,
 }
 
 impl std::fmt::Debug for NotifiedRead {
@@ -860,17 +860,14 @@ fn ca_tsel_time_record(pv: &str) -> Option<&str> {
 }
 
 /// Convert an lset `(seconds_past_epoch, nanos, userTag)` timestamp
-/// triple into the record-side `(SystemTime, userTag)` pair, clamping
+/// triple into the record-side `(WallTime, userTag)` pair, clamping
 /// seconds/nanos to the valid `Duration` range. Shared by the TSEL
 /// `.TIME` Ca arm and the non-local Db arm — both read a `ca://` `.TIME`
 /// source through `external_link_time` and adopt the result identically.
-fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u64) {
+fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (crate::types::WallTime, u64) {
     let secs = secs.max(0) as u64;
     let ns = (ns.max(0) as u32).min(999_999_999);
-    (
-        std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns),
-        utag,
-    )
+    (crate::types::WallTime::from_unix(secs, ns), utag)
 }
 
 /// The alarm-field events `recGblResetAlarms` posts (recGbl.c:202-222), each
@@ -2252,7 +2249,7 @@ impl SoftDbValue for EpicsValue {
 /// read at least one link.
 struct LinkInputs {
     inp_value: Option<EpicsValue>,
-    inp_source_time: Option<std::time::SystemTime>,
+    inp_source_time: Option<crate::types::WallTime>,
     inp_source_utag: Option<u64>,
     inp_link_remote_time: Option<(i64, i32, u64)>,
     resolved_link_fields: Vec<&'static str>,
@@ -3840,7 +3837,7 @@ impl PvDatabase {
     fn db_get_time_stamp_tag(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> Option<(std::time::SystemTime, u64)> {
+    ) -> Option<(crate::types::WallTime, u64)> {
         match link {
             crate::server::record::ParsedLink::Db(l) => {
                 self.record_time_stamp_tag(&l.target().record)
@@ -3942,7 +3939,7 @@ impl PvDatabase {
     /// makes a DB-style link naming a record this IOC does not hold a CA
     /// link, so its timestamp comes from the CA lset's cached monitor and
     /// carries no userTag.
-    fn record_time_stamp_tag(&self, record: &str) -> Option<(std::time::SystemTime, u64)> {
+    fn record_time_stamp_tag(&self, record: &str) -> Option<(crate::types::WallTime, u64)> {
         match self.link_target(record) {
             super::links::LinkTarget::Local(src) => {
                 let g = src.read();
@@ -4566,7 +4563,7 @@ impl PvDatabase {
         // ->tsel) && prec->tse == epicsTimeEventDeviceTime` gate that
         // `wants_source_time` already carries. So the pair the owner returns
         // is adopted whole for a calc link and time-only otherwise.
-        let (inp_source_time, inp_source_utag): (Option<std::time::SystemTime>, Option<u64>) =
+        let (inp_source_time, inp_source_utag): (Option<crate::types::WallTime>, Option<u64>) =
             if let Some(inp_parsed) = inp.as_ref()
                 && is_soft
                 && wants_source_time
@@ -6338,7 +6335,7 @@ impl PvDatabase {
                     let secs = secs.max(0) as u64;
                     let ns = ns.max(0) as u32;
                     instance.common.time =
-                        std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns.min(999_999_999));
+                        crate::types::WallTime::from_unix(secs, ns.min(999_999_999));
                     // adopt the upstream `timeStamp.userTag` alongside the
                     // time, mirroring pvxs PR-added `precord->utag = snap_tag`
                     // next to `precord->time = snap_time` in the `time=true`
@@ -10117,7 +10114,7 @@ enum SiolStamp {
     /// A constant SIOL: `epicsTimeGetCurrent`.
     Now,
     /// `dbGetTimeStampTag(siol, &time, &utag)`.
-    From(std::time::SystemTime, u64),
+    From(crate::types::WallTime, u64),
     /// The read failed: C errlogs and leaves `time` alone.
     Keep,
 }
@@ -10125,7 +10122,7 @@ enum SiolStamp {
 impl SiolStamp {
     fn apply(self, common: &mut crate::server::record::CommonFields) {
         match self {
-            SiolStamp::Now => common.time = std::time::SystemTime::now(),
+            SiolStamp::Now => common.time = crate::types::WallTime::now(),
             SiolStamp::From(time, utag) => {
                 common.time = time;
                 common.utag = utag;

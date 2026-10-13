@@ -328,7 +328,7 @@ pub struct AsynDeviceSupport {
     int32_mask: Option<Int32Mask>,
     last_alarm_status: u16,
     last_alarm_severity: u16,
-    last_ts: Option<SystemTime>,
+    last_ts: Option<epics_base_rs::types::WallTime>,
     /// C `pPvt->lastStatus`: the status of the last record process, so the
     /// `ASYN_TRACE_ERROR` line for a failing read/write prints once per
     /// change of status, not once per scan (devAsynInt32.c:494-500, :519-525).
@@ -2582,7 +2582,7 @@ impl DeviceSupport for AsynDeviceSupport {
                 );
                 self.last_alarm_status = status;
                 self.last_alarm_severity = severity;
-                self.last_ts = Some(ci.timestamp);
+                self.last_ts = Some(ci.timestamp.into());
                 // C gates the value store on the transport status:
                 // `if (result.status == asynSuccess) { pr->rval = … } else
                 // return -1` (processAi devAsynInt32.c:844-855; processBo
@@ -2665,7 +2665,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
-                    self.last_ts = result.timestamp;
+                    self.last_ts = result.timestamp.map(Into::into);
                 }
                 Err(e) => {
                     // A failed octet read that still transferred bytes hands
@@ -2736,7 +2736,7 @@ impl DeviceSupport for AsynDeviceSupport {
         }
     }
 
-    fn last_timestamp(&self) -> Option<SystemTime> {
+    fn last_timestamp(&self) -> Option<epics_base_rs::types::WallTime> {
         self.last_ts
     }
 

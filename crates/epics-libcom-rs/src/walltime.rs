@@ -31,13 +31,32 @@ impl WallTime {
     /// EPICS hits), so "now" loses no precision relative to C; only an
     /// externally supplied sub-100 ns `nsec` would, and that arrives through
     /// [`WallTime::from_unix`].
+    #[cfg(unix)]
+    #[inline]
+    pub fn now() -> Self {
+        // `SystemTime::now().into()` reads the same clock, then pays
+        // `duration_since`'s signed `sub_timespec` on every record stamp.
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid out-pointer; CLOCK_REALTIME always exists.
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+        match u64::try_from(ts.tv_sec) {
+            Ok(secs) => Self::from_unix(secs, ts.tv_nsec as u32),
+            Err(_) => Self::UNIX_EPOCH,
+        }
+    }
+
+    /// Current wall-clock time from the OS clock.
+    #[cfg(not(unix))]
     pub fn now() -> Self {
         SystemTime::now().into()
     }
 
     /// Build from an integer `(unix_seconds, nanoseconds)` pair. `nanos` at or
     /// above 1e9 carries into seconds, matching [`Duration::new`].
-    pub fn from_unix(secs: u64, nanos: u32) -> Self {
+    pub const fn from_unix(secs: u64, nanos: u32) -> Self {
         Self {
             since_epoch: Duration::new(secs, nanos),
         }
@@ -63,6 +82,17 @@ impl WallTime {
     pub fn saturating_sub(self, d: Duration) -> Self {
         Self {
             since_epoch: self.since_epoch.saturating_sub(d),
+        }
+    }
+}
+
+impl std::ops::Add<Duration> for WallTime {
+    type Output = Self;
+
+    /// As `SystemTime + Duration`: panics on overflow.
+    fn add(self, d: Duration) -> Self {
+        Self {
+            since_epoch: self.since_epoch + d,
         }
     }
 }

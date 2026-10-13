@@ -7,7 +7,7 @@ use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::database::filters::parse_filter_chain;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::ao::AoRecord;
-use epics_base_rs::types::{EpicsValue, WallTime};
+use epics_base_rs::types::EpicsValue;
 
 #[epics_macros_rs::epics_test]
 async fn ts_then_utag_leaves_the_other_subscribers_time_and_utag() {
@@ -36,7 +36,7 @@ async fn ts_then_utag_leaves_the_other_subscribers_time_and_utag() {
     let rec = db.get_record("AO").unwrap();
     let (time, utag) = {
         let r = rec.read();
-        (WallTime::from(r.common.time), r.common.utag as i32)
+        (r.common.time, r.common.utag as i32)
     };
     let stamped = filtered.try_recv_event().expect("the put posts VAL");
     let posted = plain.try_recv_event().expect("the put posts VAL");

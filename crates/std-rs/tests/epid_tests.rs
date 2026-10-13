@@ -1477,7 +1477,7 @@ fn ctx_with_udf(udf: u8) -> ProcessContext {
         nsev: AlarmSeverity::NoAlarm,
         phas: 0,
         tse: 0,
-        time: std::time::SystemTime::UNIX_EPOCH,
+        time: epics_base_rs::types::WallTime::UNIX_EPOCH,
         soft: None,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
@@ -1490,7 +1490,7 @@ fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
         nsev: AlarmSeverity::NoAlarm,
         phas: 0,
         tse: 0,
-        time: std::time::SystemTime::UNIX_EPOCH,
+        time: epics_base_rs::types::WallTime::UNIX_EPOCH,
         soft: epics_base_rs::server::device_support::classify_soft(dtyp),
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }

@@ -8,9 +8,10 @@
 //! mbboDirect stay `<undefined>` under `SIMM=1` too, because they `goto
 //! CONTINUE` past the stamp while `UDF` is set (`mbboRecord.c:210`).
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
@@ -31,9 +32,9 @@ record(mbboDirect, "ST_MBD") { field(SIMM, "1") field(TSE, "-2") }
 record(ao, "ST_NOSIM")     { field(SIMM, "0") field(TSE, "-2") }
 "#;
 
-async fn process_from_stale(db: &Db, rec: &str) -> SystemTime {
+async fn process_from_stale(db: &Db, rec: &str) -> WallTime {
     let cell = db.get_record(rec).expect("record exists");
-    cell.write().common.time = SystemTime::UNIX_EPOCH + STALE;
+    cell.write().common.time = WallTime::UNIX_EPOCH + STALE;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
@@ -50,13 +51,13 @@ async fn a_simulated_output_with_device_time_stamps_the_clock() {
         .await
         .unwrap()
         .0;
-    let before = SystemTime::now();
+    let before = WallTime::now();
     let mut bad = Vec::new();
     for rec in [
         "ST_AO", "ST_BO", "ST_LO", "ST_SO", "ST_LSO", "ST_AAO", "ST_I64",
     ] {
         let t = process_from_stale(&db, rec).await;
-        if t < before || t > SystemTime::now() {
+        if t < before || t > WallTime::now() {
             bad.push(format!("{rec}: {t:?}"));
         }
     }
@@ -72,7 +73,7 @@ async fn device_time_is_left_alone_without_simulation_or_with_udf_set() {
         .await
         .unwrap()
         .0;
-    let stale = SystemTime::UNIX_EPOCH + STALE;
+    let stale = WallTime::UNIX_EPOCH + STALE;
     let mut bad = Vec::new();
     for rec in ["ST_NOSIM", "ST_MBBO", "ST_MBD"] {
         let t = process_from_stale(&db, rec).await;

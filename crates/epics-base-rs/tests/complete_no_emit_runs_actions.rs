@@ -179,7 +179,7 @@ async fn a_complete_cycle_runs_the_epilogue_the_no_emit_cycle_skips() {
 
 /// STAT, SEVR and TIME: what `recGblGetTimeStamp` and `monitor()`'s
 /// `recGblResetAlarms` would move.
-fn stamp_and_alarm(db: &PvDatabase) -> (u16, u16, std::time::SystemTime) {
+fn stamp_and_alarm(db: &PvDatabase) -> (u16, u16, epics_base_rs::types::WallTime) {
     let rec = db.get_record("N").unwrap();
     let g = rec.read();
     (g.common.stat, g.common.sevr as u16, g.common.time)

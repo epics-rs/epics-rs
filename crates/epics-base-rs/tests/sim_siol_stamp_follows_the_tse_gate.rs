@@ -14,9 +14,10 @@
 //! A SIOL that names nothing logs
 //! `recGblGetTimeStampSimm: dbGetTimeStamp (sim mode) failed, <rec>.SIOL = <pv>`.
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -49,12 +50,12 @@ async fn ioc() -> Arc<PvDatabase> {
         .0
 }
 
-async fn stamp_after_processing(db: &PvDatabase, rec: &str) -> SystemTime {
+async fn stamp_after_processing(db: &PvDatabase, rec: &str) -> WallTime {
     for (name, d) in [("SS_SRC", SRC), ("SS_OTHER", OTHER)] {
-        db.get_record(name).unwrap().write().common.time = SystemTime::UNIX_EPOCH + d;
+        db.get_record(name).unwrap().write().common.time = WallTime::UNIX_EPOCH + d;
     }
     let cell = db.get_record(rec).unwrap();
-    cell.write().common.time = SystemTime::UNIX_EPOCH;
+    cell.write().common.time = WallTime::UNIX_EPOCH;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
@@ -65,8 +66,8 @@ async fn stamp_after_processing(db: &PvDatabase, rec: &str) -> SystemTime {
 #[epics_macros_rs::epics_test]
 async fn the_siol_stamp_is_taken_only_at_device_time_and_not_under_a_time_tsel() {
     let db = ioc().await;
-    let before = SystemTime::now();
-    let at = |d: Duration| SystemTime::UNIX_EPOCH + d;
+    let before = WallTime::now();
+    let at = |d: Duration| WallTime::UNIX_EPOCH + d;
     let mut bad = Vec::new();
     for (rec, want) in [
         ("SS_TIME", Some(at(SRC))),
@@ -79,7 +80,7 @@ async fn the_siol_stamp_is_taken_only_at_device_time_and_not_under_a_time_tsel()
         let got = stamp_after_processing(&db, rec).await;
         let ok = match want {
             Some(w) => got == w,
-            None => got >= before && got <= SystemTime::now(),
+            None => got >= before && got <= WallTime::now(),
         };
         if !ok {
             bad.push(format!("{rec}: got {got:?}, want {want:?} (None = clock)"));

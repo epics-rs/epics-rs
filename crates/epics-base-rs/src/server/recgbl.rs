@@ -463,8 +463,8 @@ pub fn rec_gbl_check_udf(
 /// drift.
 pub fn get_time_stamp(
     tse: i16,
-    device_time: std::time::SystemTime,
-) -> Option<std::time::SystemTime> {
+    device_time: crate::types::WallTime,
+) -> Option<crate::types::WallTime> {
     if tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
         // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support has
         // already written the time; C recGbl.c:324-342 makes this the only
@@ -481,7 +481,7 @@ pub fn get_time_stamp(
 /// is C's non-zero status: `prec->time` keeps its old value and
 /// `recGblGetTimeStampSimm` errlogs (recGbl.c:325-327).
 #[inline]
-pub(crate) fn event_time(tse: i16) -> Option<std::time::SystemTime> {
+pub(crate) fn event_time(tse: i16) -> Option<crate::types::WallTime> {
     crate::runtime::general_time::get_event(tse as i32)
 }
 

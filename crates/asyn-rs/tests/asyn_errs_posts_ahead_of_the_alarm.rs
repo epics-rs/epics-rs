@@ -49,7 +49,7 @@ A.ERRS
 struct Line {
     pv: &'static str,
     stream: Arc<Mutex<String>>,
-    stamps: Arc<Mutex<Vec<(&'static str, std::time::SystemTime)>>>,
+    stamps: Arc<Mutex<Vec<(&'static str, epics_base_rs::types::WallTime)>>>,
 }
 
 impl SubscriptionFilter for Line {
@@ -76,7 +76,7 @@ impl SubscriptionFilter for Line {
         let mut stream = self.stream.lock().unwrap();
         stream.push_str(&line);
         stream.push('\n');
-        self.stamps.lock().unwrap().push((self.pv, e.time().into()));
+        self.stamps.lock().unwrap().push((self.pv, e.time()));
         Some(event)
     }
 }

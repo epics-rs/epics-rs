@@ -17,9 +17,10 @@
 //!
 //! The put arm's posts carry the alarm the record held before the cycle.
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::PvDatabase;
@@ -463,18 +464,18 @@ async fn a_pending_link_alarm_rides_sents_tail_and_clears_on_val() {
     assert_eq!(inst.read().common.stat, NO_ALARM);
 }
 
-fn drain_stamps(rx: &mut EventReader) -> Vec<(f64, SystemTime)> {
+fn drain_stamps(rx: &mut EventReader) -> Vec<(f64, WallTime)> {
     let mut out = Vec::new();
     while let Ok(e) = rx.try_recv() {
         out.push((
             e.value().as_value().and_then(EpicsValue::to_f64).unwrap(),
-            e.time().into(),
+            e.time(),
         ));
     }
     out
 }
 
-fn time_of(db: &PvDatabase, rec: &str) -> SystemTime {
+fn time_of(db: &PvDatabase, rec: &str) -> WallTime {
     db.get_record(rec).unwrap().read().common.time
 }
 

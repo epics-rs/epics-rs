@@ -716,7 +716,7 @@ fn describe(db: &PvDatabase, name: &str) -> String {
         inst.common.sscn,
         inst.common.scan,
         inst.common.tse,
-        inst.common.time != std::time::SystemTime::UNIX_EPOCH,
+        inst.common.time != crate::types::WallTime::UNIX_EPOCH,
     )
 }
 
@@ -752,7 +752,7 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
             }
         }
     }
-    let mut last_time = std::time::SystemTime::UNIX_EPOCH;
+    let mut last_time = crate::types::WallTime::UNIX_EPOCH;
     let mut out = Vec::new();
     let mut arms = String::new();
     for (i, step) in sc.steps.iter().enumerate() {

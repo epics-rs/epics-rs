@@ -55,7 +55,7 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     // comparable bit-for-bit and cannot be confused with wall-clock "now": a
     // fixed instant well in the past (1970-01-12), which the deferred restamp
     // must move forward.
-    let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let sentinel = WallTime::from_unix(1_000_000, 0);
     inst.write().common.time = sentinel;
 
     let mut val_rx = inst
@@ -74,7 +74,7 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     // first VAL carries the pre-update timestamp — the sentinel, untouched.
     assert_eq!(
         ev1.time(),
-        WallTime::from(sentinel),
+        sentinel,
         "the first VAL event must carry the record's pre-update timestamp \
          (asyncFinish posts VAL at :474 before the :501 restamp), not \
          wall-clock now"
@@ -82,7 +82,7 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     // The deferred restamp (C recGblGetTimeStamp :501) then advanced TIME off
     // the sentinel, for the BUSY post and the next cycle.
     assert!(
-        WallTime::from(t_after_1) > WallTime::from(sentinel),
+        t_after_1 > sentinel,
         "the completion must restamp TIME forward off the sentinel after the \
          VAL post (asyncFinish :501)"
     );
@@ -96,7 +96,7 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     let ev2 = val_rx.try_recv().expect("cycle 2 posts a VAL event");
     assert_eq!(
         ev2.time(),
-        WallTime::from(t_after_1),
+        t_after_1,
         "the second VAL event must carry the timestamp the FIRST cycle \
          restamped to (asyncFinish's one-completion lag), not a fresh stamp"
     );

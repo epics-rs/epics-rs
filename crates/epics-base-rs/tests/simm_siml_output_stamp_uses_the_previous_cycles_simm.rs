@@ -6,9 +6,10 @@
 //! the clock, the cycle where SIML turns it off still stamps, and the one
 //! after keeps that stamp.
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -26,7 +27,7 @@ record(stringout, "O_SO") { field(SIML, "SW") field(TSE, "-2") }
 record(ao, "O_AO")        { field(SIML, "SW") field(TSE, "-2") }
 "#;
 
-async fn cycle(db: &Db, rec: &str) -> SystemTime {
+async fn cycle(db: &Db, rec: &str) -> WallTime {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
@@ -34,7 +35,7 @@ async fn cycle(db: &Db, rec: &str) -> SystemTime {
     db.get_record(rec).unwrap().read().common.time
 }
 
-async fn all(db: &Db) -> Vec<SystemTime> {
+async fn all(db: &Db) -> Vec<WallTime> {
     let mut v = Vec::new();
     for r in OUTS {
         v.push(cycle(db, r).await);
@@ -51,7 +52,7 @@ async fn the_stamp_follows_the_simm_of_the_previous_cycle() {
         .await
         .unwrap()
         .0;
-    let stale = SystemTime::UNIX_EPOCH + STALE;
+    let stale = WallTime::UNIX_EPOCH + STALE;
     for r in OUTS {
         db.get_record(r).unwrap().write().common.time = stale;
     }
@@ -63,7 +64,7 @@ async fn the_stamp_follows_the_simm_of_the_previous_cycle() {
                 .unwrap();
         }
     };
-    let start = SystemTime::now();
+    let start = WallTime::now();
 
     assert_eq!(all(&db).await, vec![stale; 4], "first, SW=0");
     set_sw(1).await;

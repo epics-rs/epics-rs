@@ -10793,7 +10793,7 @@ impl RecordInstance {
             stat: self.common.stat,
             sevr: self.common.sevr as u16,
             amsg: crate::server::pv::log_amsg(self.common.amsg.parts()),
-            time: self.common.time.into(),
+            time: self.common.time,
             utag: self.common.utag as i32,
         }
     }
@@ -12704,13 +12704,8 @@ mod metadata_cache_tests {
     /// (`iocsource.cpp:239-248`), made by each PVA reader.
     #[test]
     fn qtime_tag_get_door_serves_the_raw_stamp() {
-        use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
-        // 123_456_700, not …789: Windows `SystemTime` is a FILETIME with 100 ns
-        // resolution, so a sub-100 ns literal is truncated on readback and the
-        // assertion below would see …700. Any value < 2^31 exercises the
-        // nsec:lsb:31 mask identically, so pin one that survives the round trip.
-        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
+        inst.common.time = crate::types::WallTime::from_unix(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
@@ -12725,11 +12720,8 @@ mod metadata_cache_tests {
     /// the split is the PVA consumer's, from the mask its subscription read.
     #[test]
     fn qtime_nsec_mask_leaves_the_monitor_post_raw() {
-        use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
-        // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
-        // see qtime_tag_get_door_serves_the_raw_stamp for the FILETIME reason.
-        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
+        inst.common.time = crate::types::WallTime::from_unix(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
@@ -12745,11 +12737,8 @@ mod metadata_cache_tests {
     /// unmasked.
     #[test]
     fn qtime_uppercase_tag_leaves_timestamp_untouched() {
-        use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
-        // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
-        // see qtime_tag_get_door_serves_the_raw_stamp for the FILETIME reason.
-        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
+        inst.common.time = crate::types::WallTime::from_unix(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "NSEC:LSB:4");
 
@@ -14077,10 +14066,10 @@ mod aftc_filter_tests {
     //! Codeathon (epics-base `824d37811`), C `aiRecord.c:355-401`.
 
     use crate::server::records::alarm_filter::aftc_filter;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
-    fn at(secs: f64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs)
+    fn at(secs: f64) -> crate::types::WallTime {
+        crate::types::WallTime::UNIX_EPOCH + Duration::from_secs_f64(secs)
     }
 
     #[test]

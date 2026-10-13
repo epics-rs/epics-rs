@@ -6,7 +6,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-use epics_base_rs::types::WallTime;
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
@@ -58,6 +57,6 @@ async fn a_qtime_tag_record_monitor_update_carries_the_raw_stamp() {
     };
 
     let rec = db.get_record("QT").expect("QT loaded");
-    let raw = WallTime::from(rec.read().common.time);
+    let raw = rec.read().common.time;
     assert_eq!(update.timestamp, raw);
 }

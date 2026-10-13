@@ -280,7 +280,7 @@ fn ctx_with_tse(tse: i16) -> ProcessContext {
         nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
         phas: 0,
         tse,
-        time: std::time::SystemTime::UNIX_EPOCH,
+        time: epics_base_rs::types::WallTime::UNIX_EPOCH,
         soft: None,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }

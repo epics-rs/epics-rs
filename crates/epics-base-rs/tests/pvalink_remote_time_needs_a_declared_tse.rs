@@ -18,8 +18,9 @@
 //! touches `time` and not `utag`, so the tag survives in BOTH rows while the
 //! timestamp survives only in the declared one.
 
+use epics_base_rs::types::WallTime;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::database::{LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
@@ -50,8 +51,8 @@ impl LinkSet for TimedLset {
     }
 }
 
-fn remote_stamp() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::new(REMOTE_SECS as u64, REMOTE_NSEC as u32)
+fn remote_stamp() -> WallTime {
+    WallTime::UNIX_EPOCH + Duration::new(REMOTE_SECS as u64, REMOTE_NSEC as u32)
 }
 
 #[epics_macros_rs::epics_test]

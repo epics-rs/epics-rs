@@ -5,8 +5,9 @@
 //! stamps X with T's time; `X.FLNK "Y CP"` reads back `Y`; `X.SDIS
 //! '{"zz":1}'` and `X.TSEL '#C1 S2'` are refused and keep the old link.
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -53,7 +54,7 @@ async fn flnk_tsel_and_sdis_put_at_runtime_act_on_the_next_process() {
     assert!(put(&db, "FLNK", text("Y CP")).await);
     assert_eq!(read(&db, "X.FLNK"), "Y", "a forward link drops CP");
 
-    let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let stamp = WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     db.get_record("T").unwrap().write().common.time = stamp;
     assert!(put(&db, "TSE", EpicsValue::Short(-2)).await);
     assert!(put(&db, "TSEL", text("T.TIME")).await);

@@ -2714,7 +2714,7 @@ pub struct ProcessContext {
     /// [`crate::server::recgbl::get_time_stamp`]`(tse, time)`. The `time`
     /// member is the device-provided value that helper returns verbatim on
     /// the `TSE == epicsTimeEventDeviceTime (-2)` branch.
-    pub time: std::time::SystemTime,
+    pub time: crate::types::WallTime,
     /// The soft-channel dset the record was bound to at iocInit
     /// ([`crate::server::device_support::Dtyp::soft`]), not the current DTYP
     /// name: C keeps `prec->dset` from `initDevSup`, so a runtime DTYP put

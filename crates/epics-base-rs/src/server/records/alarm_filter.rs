@@ -12,7 +12,7 @@
 //! longin, mbbi type records"; later extended to `int64in`, and to `bi`
 //! by PR #817 `c9817fa59`).
 
-use std::time::SystemTime;
+use crate::types::WallTime;
 
 /// Apply the `AFTC` alarm-range low-pass filter.
 ///
@@ -52,8 +52,8 @@ pub fn aftc_filter(
     raw_alarm: u16,
     aftc: f64,
     afvl_in: f64,
-    time_last: SystemTime,
-    time_new: SystemTime,
+    time_last: WallTime,
+    time_new: WallTime,
 ) -> (u16, f64) {
     // C `aiRecord.c:47` — `#define THRESHOLD 0.6321` (≈ 1 - 1/e).
     const THRESHOLD: f64 = 0.6321;
@@ -74,8 +74,8 @@ pub fn aftc_filter(
     // range with a signed contribution and a fold-back on the fractional
     // part.
     let dt = time_new
-        .duration_since(time_last)
-        .unwrap_or_default()
+        .since_unix_epoch()
+        .saturating_sub(time_last.since_unix_epoch())
         .as_secs_f64();
     let alpha = aftc / (dt + aftc);
     // `afvl = alpha*afvl + ((afvl>0) ? (1-alpha) : (alpha-1)) * alarmRange`
@@ -97,10 +97,12 @@ pub fn aftc_filter(
 #[cfg(test)]
 mod tests {
     use super::aftc_filter;
-    use std::time::{Duration, SystemTime};
+    use crate::types::WallTime;
+    use std::time::Duration;
 
-    fn at(secs: f64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs)
+    fn at(secs: f64) -> WallTime {
+        let d = Duration::from_secs_f64(secs);
+        WallTime::from_unix(d.as_secs(), d.subsec_nanos())
     }
 
     /// softIocPVX: bi OSV=MAJOR AFTC=2 seeded at state 1, then state 0 after

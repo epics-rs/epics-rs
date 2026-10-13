@@ -3,11 +3,12 @@
 //! without SIMM TIME is left alone. softIoc `camonitor -ts`:
 //! `AI` shares `TSRC`'s timestamp, `AIC` is current, `AIN` is `<undefined>`.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use epics_base_rs::types::WallTime;
+use std::time::Duration;
 
 /// The EPICS epoch, `<undefined>` to a client.
-fn unstamped() -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(631_152_000)
+fn unstamped() -> WallTime {
+    WallTime::UNIX_EPOCH + Duration::from_secs(631_152_000)
 }
 
 use epics_base_rs::server::database::PvDatabase;
@@ -27,7 +28,7 @@ async fn process(db: &PvDatabase, rec: &str) {
         .unwrap();
 }
 
-fn time_of(db: &PvDatabase, rec: &str) -> std::time::SystemTime {
+fn time_of(db: &PvDatabase, rec: &str) -> WallTime {
     db.get_record(rec).unwrap().read().common.time
 }
 

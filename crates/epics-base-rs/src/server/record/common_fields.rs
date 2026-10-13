@@ -1,6 +1,6 @@
+use crate::types::WallTime;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::scan::{ScanType, SimModeScan};
@@ -46,10 +46,10 @@ impl Clone for BkptFlag {
 /// See [`CommonFields::time_last`]. Outside the crate it can only be read or
 /// reset to the default, so `begin_stamp` stays its one writer.
 #[derive(Clone, Copy, Debug)]
-pub struct TimeLast(SystemTime);
+pub struct TimeLast(WallTime);
 
 impl TimeLast {
-    pub fn get(self) -> SystemTime {
+    pub fn get(self) -> WallTime {
         self.0
     }
 }
@@ -137,7 +137,7 @@ pub struct CommonFields {
     /// [`Dtyp`](crate::server::device_support::Dtyp).
     pub dtyp: crate::server::device_support::Dtyp,
     // Timestamp
-    pub time: SystemTime,
+    pub time: WallTime,
     /// C `process()`'s local `timeLast`: [`Self::time`] as it stood when this
     /// cycle's stamp began, before any device-supplied time. The AFTC filter
     /// measures its gap from here.

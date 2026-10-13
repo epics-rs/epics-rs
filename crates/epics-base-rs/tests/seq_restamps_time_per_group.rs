@@ -21,7 +21,8 @@
 //! restamp must go through the TSE owner (TSE=-2 leaves TIME alone) and must
 //! re-resolve TSEL per group (a `.TIME` TSEL re-copies its source).
 
-use std::time::{Duration, SystemTime};
+use epics_base_rs::types::WallTime;
+use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -81,7 +82,7 @@ async fn run_chain(db: &PvDatabase, rec: &str) {
     panic!("{rec} never finished its DLYn chain");
 }
 
-fn time_of(db: &PvDatabase, rec: &str) -> SystemTime {
+fn time_of(db: &PvDatabase, rec: &str) -> WallTime {
     db.get_record(rec).unwrap().read().common.time
 }
 
@@ -140,7 +141,7 @@ async fn the_restamp_re_resolves_a_time_tsel_per_group() {
          post-group-0 time"
     );
     assert!(
-        src > SystemTime::UNIX_EPOCH,
+        src > WallTime::UNIX_EPOCH,
         "SEQ:SRC must actually have been processed by group 0"
     );
 }

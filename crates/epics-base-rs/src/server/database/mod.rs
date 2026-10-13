@@ -136,8 +136,6 @@ pub(crate) use tsel_stamp::TselStamp;
 /// `fetch_values` first), and let the device-time override at the stamp point
 /// win over a TSEL C gives priority to.
 mod tsel_stamp {
-    use std::time::SystemTime;
-
     use crate::server::record::CommonFields;
 
     /// The TSEL half of C `recGblGetTimeStampSimm`, read but not yet stored.
@@ -153,7 +151,7 @@ mod tsel_stamp {
         /// and that `TSE` itself is not touched. There is no assignment to
         /// `prec->tse` anywhere in epics-base; the flag that suppresses the
         /// lookup lives in `plink->flags`, not in a field clients can read.
-        Time(SystemTime, u64),
+        Time(crate::types::WallTime, u64),
         /// Every other `TSEL` (`recGbl.c:322`): `dbGetLink(&prec->tsel,
         /// DBR_SHORT, &prec->tse, 0, 0)`.
         Tse(i16),
@@ -251,7 +249,7 @@ mod tsel_stamp {
     #[inline(never)]
     fn device_time(common: &mut CommonFields, simm_set: impl FnOnce() -> bool) {
         if simm_set() {
-            common.time = SystemTime::now();
+            common.time = crate::types::WallTime::now();
         }
     }
 
@@ -4325,15 +4323,15 @@ mod tests {
     /// unconditionally; only TSE=-2 (epicsTimeEventDeviceTime) leaves
     /// `precord->time` untouched.
     ///
-    /// Regression: a stale device write (any non-epoch SystemTime)
+    /// Regression: a stale device write (any non-epoch crate::types::WallTime)
     /// suppressed every BestTime refresh thereafter.
     #[test]
     fn apply_timestamp_tse_minus_one_always_overwrites_with_best_time() {
         use crate::server::record::CommonFields;
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
 
         // Pre-populate `time` with a stale but non-epoch sentinel.
-        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stale = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut common = CommonFields::default();
         common.tse = -1;
         common.time = stale;
@@ -4356,9 +4354,9 @@ mod tests {
     #[test]
     fn apply_timestamp_tse_minus_two_preserves_device_provided_time() {
         use crate::server::record::CommonFields;
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
 
-        let device_time = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let device_time = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
         let mut common = CommonFields::default();
         common.tse = -2;
         common.time = device_time;
@@ -4382,7 +4380,7 @@ mod tests {
         use crate::server::record::CommonFields;
         use std::io::Write;
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
         use tracing_subscriber::fmt::MakeWriter;
 
         #[derive(Clone, Default)]
@@ -4412,7 +4410,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stale = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut common = CommonFields::default();
         common.tse = -3;
         common.time = stale;

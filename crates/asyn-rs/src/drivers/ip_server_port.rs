@@ -61,7 +61,7 @@ use parking_lot::Mutex;
 use crate::asyn_trace;
 use crate::drivers::ip_port::{
     BoundNextRead, DrvAsynIPPort, OWNED_NONBLOCKING, is_nonfatal_read_timeout, maxchars_zero_error,
-    sock_err_text, socket_poll_timeout, write_with_retry,
+    nonblock_failure_text, sock_err_text, socket_poll_timeout, write_with_retry,
 };
 use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -106,6 +106,39 @@ pub enum IpServerProtocol {
     /// NULL)` — **source address discarded** — into a single shared
     /// buffer. `read_octet` drains; `write_octet` is a no-op error.
     Udp,
+}
+
+/// C `createServerSocket`'s text for each setup call that fails
+/// (drvAsynIPServerPort.c:412-478); `server_info` is C's `tty->serverInfo`.
+fn server_setup_failure_text(server_info: &str, e: &socket::SetupError) -> String {
+    let err = sock_err_text(&e.error);
+    match e.step {
+        socket::SetupStep::Create => format!("Can't create socket: {err}"),
+        // C's own SO_REUSEADDR call (:448-454); the fanout helper's earlier
+        // one fails silently in C and then fails here the same way.
+        socket::SetupStep::ReuseAddress => {
+            format!("Error calling setsockopt {server_info}: {err}")
+        }
+        socket::SetupStep::Bind => format!("Error in binding {server_info}: {err}"),
+        // Two spaces, as C has them (:467-469).
+        socket::SetupStep::Listen => format!("Error calling listen() on {server_info}:  {err}"),
+        // The UDP server's fanout (:444-447): C's helper logs this and goes on
+        // (osdSockAddrReuse.cpp:51-57); rs fails the setup instead.
+        // Where SO_REUSEPORT is undefined C's helper sets, and names,
+        // SO_REUSEADDR, as libcom degrades the request.
+        socket::SetupStep::ReusePort => format!(
+            "epicsSocketEnablePortUseForDatagramFanout: unable to set {}?",
+            if cfg!(unix) {
+                "SO_REUSEPORT"
+            } else {
+                "SO_REUSEADDR"
+            }
+        ),
+        // Neither is requested on a server socket.
+        socket::SetupStep::Broadcast | socket::SetupStep::NonBlocking => {
+            format!("Error calling setsockopt {server_info}: {err}")
+        }
+    }
 }
 
 /// Configuration parsed from a `drvAsynIPServerPortConfigure`-style spec.
@@ -363,13 +396,14 @@ impl ClientSlot {
     /// listener is non-blocking because the poll loop needs it to be.
     ///
     /// A failure drops the stream on the way out, which is C's
-    /// `epicsSocketDestroy(fd)` on the same failure (drvAsynIPPort.c:516-523).
-    fn assign(&self, stream: TcpStream, peer: SocketAddr) -> AsynResult<()> {
+    /// `epicsSocketDestroy(fd)` on the same failure (drvAsynIPPort.c:516-523),
+    /// reported in the child's words; `device` is its `IPDeviceName`.
+    fn assign(&self, stream: TcpStream, peer: SocketAddr, device: &str) -> AsynResult<()> {
         stream
             .set_nonblocking(OWNED_NONBLOCKING)
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("set_nonblocking on accepted client failed: {e}"),
+                message: nonblock_failure_text(device, &e),
             })?;
         *self.stream.lock() = Some(stream);
         *self.peer.lock() = Some(peer);
@@ -639,6 +673,8 @@ struct Acceptor {
     read_timeout: Option<Duration>,
     max_clients: usize,
     port_name: String,
+    /// The children's `IPDeviceName` — see [`DrvAsynIPServerPort::server_info`].
+    server_info: String,
     announcer: ExceptionAnnouncer,
     /// The parent port's interrupt source, shared with the driver's own
     /// `base.interrupts`. C fires the octet callbacks that carry the new child
@@ -696,7 +732,7 @@ impl Acceptor {
         // loop (:357-365).
         for (i, slot) in self.slots.iter().enumerate() {
             if !slot.is_occupied() {
-                slot.assign(stream, peer)?;
+                slot.assign(stream, peer, &self.server_info)?;
                 self.announcer.announce(AsynException::Connect, i as i32);
                 let child = format!("{}:{}", self.port_name, i);
                 // C :384-386 — "Set the new port to initially have the same
@@ -783,6 +819,10 @@ impl Acceptor {
 pub struct DrvAsynIPServerPort {
     base: PortDriverBase,
     config: IpServerConfig,
+    /// C `tty->serverInfo`, which every child port gets as its hostInfo and so
+    /// as the `IPDeviceName` its error texts name (drvAsynIPServerPort.c:711-715)
+    /// — not the child's `parent:N` port name.
+    server_info: String,
     listener: Mutex<Option<TcpListener>>,
     /// Fixed-size client slot table. Pre-allocated to `max_clients`
     /// slots; `slots[addr].is_occupied()` says whether a connection
@@ -858,7 +898,10 @@ impl DrvAsynIPServerPort {
     /// drive it).
     pub fn new(port_name: &str, spec: &str) -> AsynResult<Self> {
         let config = IpServerConfig::parse(spec)?;
-        Self::with_config(port_name, config)
+        let mut port = Self::with_config(port_name, config)?;
+        // Verbatim, as C keeps the configure argument.
+        port.server_info = spec.to_string();
+        Ok(port)
     }
 
     /// Create from an explicit config (skips the spec parser, useful
@@ -907,9 +950,15 @@ impl DrvAsynIPServerPort {
         for _ in 0..max {
             slots.push(Arc::new(ClientSlot::new_empty()));
         }
+        // An explicit config has no spec text; this is its spelling of one.
+        let server_info = match config.protocol {
+            IpServerProtocol::Tcp => format!("{}:{}", config.bind_host, config.bind_port),
+            IpServerProtocol::Udp => format!("{}:{} udp", config.bind_host, config.bind_port),
+        };
         Ok(Self {
             base,
             config,
+            server_info,
             listener: Mutex::new(None),
             slots,
             udp_socket: Mutex::new(None),
@@ -974,6 +1023,7 @@ impl DrvAsynIPServerPort {
             read_timeout: self.config.read_timeout,
             max_clients: self.config.max_clients,
             port_name: self.base.port_name.to_string(),
+            server_info: self.server_info.clone(),
             announcer: self.base.exception_announcer(),
             interrupts: InterruptManager::from_shared_state(self.base.interrupts.shared_state()),
             trace: self.base.trace.clone(),
@@ -1014,12 +1064,8 @@ impl DrvAsynIPServerPort {
         // SO_REUSEADDR (:448); the fanout helper is SOCK_DGRAM-only. That
         // pairing is `SocketOptions::FANOUT`, and the seam is what keeps the
         // options ahead of the bind on both hosted and embedded targets.
-        let socket = socket::udp_socket(addr, socket::SocketOptions::FANOUT).map_err(|e| {
-            AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("UDP bind '{addr}' failed: {e}"),
-            }
-        })?;
+        let socket = socket::udp_socket(addr, socket::SocketOptions::FANOUT)
+            .map_err(|e| self.setup_failure(&e))?;
         // Read timeout caps shutdown latency — recv wakes every
         // 200ms so the worker can observe `udp_shutdown` flag.
         socket
@@ -1086,19 +1132,20 @@ impl DrvAsynIPServerPort {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }
-        // Otherwise resolve the name (C hostToIPAddr, :431).
+        // Otherwise resolve the name (C hostToIPAddr, :431). C's text
+        // (:432-434) appends `sockerrmsg`, but hostToIPAddr never sets errno, so
+        // that suffix is whatever an earlier call left; the words are kept and
+        // the stale errno is not.
         use std::net::ToSocketAddrs;
+        let lookup_failed = || AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("using ANY interface, cannot lookup '{host}'"),
+        };
         (host, port)
             .to_socket_addrs()
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("cannot resolve bind host '{host}': {e}"),
-            })?
+            .map_err(|_| lookup_failed())?
             .next()
-            .ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("cannot resolve bind host '{host}': no addresses"),
-            })
+            .ok_or_else(lookup_failed)
     }
 
     fn bind_with_options(&self, addr: SocketAddr) -> AsynResult<TcpListener> {
@@ -1115,12 +1162,15 @@ impl DrvAsynIPServerPort {
         // hanging up. `max_clients` is rejected at zero (`with_config`), so the
         // backlog is always at least one (DRV-21).
         let backlog = i32::try_from(self.config.max_clients).unwrap_or(i32::MAX);
-        socket::tcp_listener(addr, socket::SocketOptions::REUSE_ADDRESS, backlog).map_err(|e| {
-            AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("bind '{addr}' failed: {e}"),
-            }
-        })
+        socket::tcp_listener(addr, socket::SocketOptions::REUSE_ADDRESS, backlog)
+            .map_err(|e| self.setup_failure(&e))
+    }
+
+    fn setup_failure(&self, e: &socket::SetupError) -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: server_setup_failure_text(&self.server_info, e),
+        }
     }
 
     /// Return the actual bound port (useful when `bind_port = 0`).
@@ -1215,6 +1265,7 @@ impl DrvAsynIPServerPort {
         let name = self.child_port_name(idx);
         Ok(DrvAsynIPSubport::new(
             name,
+            self.server_info.clone(),
             Arc::clone(&self.slots[idx]),
             self.config.no_process_eos,
         ))
@@ -1342,7 +1393,7 @@ impl PortDriver for DrvAsynIPServerPort {
                 if !slot.is_occupied() {
                     continue;
                 }
-                if let Err(f) = self.write_to_slot(slot, i as i32, data, poll, cap) {
+                if let Err(f) = slot.write_or_close(data, poll, cap, &self.server_info) {
                     tracing::debug!(
                         target: "asyn_rs::ip_server_port",
                         addr = i,
@@ -1364,12 +1415,11 @@ impl PortDriver for DrvAsynIPServerPort {
         let arc = self.slot_arc(user.addr)?;
         // An addressed write is one client's transfer and C bounds only its
         // individual `poll(POLLOUT)`, so there is no outer budget here.
-        match self.write_to_slot(
-            &arc,
-            user.addr,
+        match arc.write_or_close(
             data,
             socket_poll_timeout(user.timeout),
             None,
+            &self.server_info,
         ) {
             Ok(n) => Ok(n),
             Err(f) => Err(self.finish_slot_failure(user.addr, f)),
@@ -1409,8 +1459,7 @@ impl PortDriver for DrvAsynIPServerPort {
 impl DrvAsynIPServerPort {
     fn base_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let arc = self.slot_arc(user.addr)?;
-        let device = self.slot_device_name(user.addr);
-        match arc.read_or_close(buf, user.timeout, &device) {
+        match arc.read_or_close(buf, user.timeout, &self.server_info) {
             Ok(n) => Ok(OctetReadResult {
                 nbytes_transferred: n,
                 // C parity: CNT only when the requested count was
@@ -1436,24 +1485,6 @@ impl DrvAsynIPServerPort {
             self.base.announce_exception(AsynException::Connect, addr);
         }
         failure.error
-    }
-
-    /// C `tty->IPDeviceName` for a client slot — the name that goes into
-    /// `"%s read error: %s"` (drvAsynIPPort.c:855-857). C's child ports are named
-    /// `parent:N` (drvAsynIPServerPort.c:707).
-    fn slot_device_name(&self, addr: i32) -> String {
-        format!("{}:{}", self.base.port_name, addr)
-    }
-
-    fn write_to_slot(
-        &self,
-        slot: &ClientSlot,
-        addr: i32,
-        data: &[u8],
-        poll: Option<Duration>,
-        cap: Option<Instant>,
-    ) -> Result<usize, SlotFailure> {
-        slot.write_or_close(data, poll, cap, &self.slot_device_name(addr))
     }
 
     /// C `readIt` (drvAsynIPServerPort.c:166-250), the UDP server's read:
@@ -1634,10 +1665,18 @@ fn udp_recv_loop(
 pub struct DrvAsynIPSubport {
     base: PortDriverBase,
     slot: Arc<ClientSlot>,
+    /// The child's `IPDeviceName`: C configures it with the server's own
+    /// hostInfo (drvAsynIPServerPort.c:711-715).
+    host_info: String,
 }
 
 impl DrvAsynIPSubport {
-    fn new(port_name: String, slot: Arc<ClientSlot>, no_process_eos: bool) -> Self {
+    fn new(
+        port_name: String,
+        host_info: String,
+        slot: Arc<ClientSlot>,
+        no_process_eos: bool,
+    ) -> Self {
         let mut base = PortDriverBase::new(
             &port_name,
             1,
@@ -1668,7 +1707,11 @@ impl DrvAsynIPSubport {
             /* noAutoConnect */ true,
             no_process_eos,
         );
-        Self { base, slot }
+        Self {
+            base,
+            slot,
+            host_info,
+        }
     }
 
     /// Peer address currently bound to this subport's slot, if any.
@@ -1771,19 +1814,19 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let device = self.base.port_name.clone();
-        match self.slot.read_or_close(buf, user.timeout, &device) {
+        match self.slot.read_or_close(buf, user.timeout, &self.host_info) {
             Ok(n) => Ok(n),
             Err(f) => Err(self.finish_slot_failure(f)),
         }
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let device = self.base.port_name.clone();
-        match self
-            .slot
-            .write_or_close(data, socket_poll_timeout(user.timeout), None, &device)
-        {
+        match self.slot.write_or_close(
+            data,
+            socket_poll_timeout(user.timeout),
+            None,
+            &self.host_info,
+        ) {
             Ok(n) => Ok(n),
             Err(f) => Err(self.finish_slot_failure(f)),
         }
@@ -1996,6 +2039,79 @@ mod tests {
             read_timeout: None,
         };
         assert!(DrvAsynIPServerPort::with_config("one_client", ok).is_ok());
+    }
+
+    /// A port another listener holds fails the bind in C's words, naming the
+    /// configured serverInfo (drvAsynIPServerPort.c:455-461).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_port_in_use_fails_the_bind_in_c_s_words() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let spec = format!("127.0.0.1:{}", holder.local_addr().unwrap().port());
+        let mut srv = DrvAsynIPServerPort::new("srv_inuse", &spec).unwrap();
+        let err = srv.connect(&AsynUser::default()).unwrap_err();
+        assert_eq!(
+            err.message(),
+            format!("Error in binding {spec}: Address already in use")
+        );
+    }
+
+    fn server_setup_failure(step: socket::SetupStep) -> String {
+        server_setup_failure_text(
+            "127.0.0.1:5025",
+            &socket::SetupError {
+                step,
+                error: std::io::Error::other("cause"),
+            },
+        )
+    }
+
+    /// osdSockAddrReuse.cpp:51-57, reached from drvAsynIPServerPort.c:444-447.
+    #[test]
+    fn a_fanout_option_that_fails_is_reported_in_c_s_words() {
+        assert_eq!(
+            server_setup_failure(socket::SetupStep::ReusePort),
+            "epicsSocketEnablePortUseForDatagramFanout: unable to set SO_REUSEPORT?"
+        );
+    }
+
+    /// drvAsynIPServerPort.c:413-417.
+    #[test]
+    fn a_server_socket_that_cannot_be_created_is_reported_in_c_s_words() {
+        assert_eq!(
+            server_setup_failure(socket::SetupStep::Create),
+            "Can't create socket: cause"
+        );
+    }
+
+    /// drvAsynIPServerPort.c:448-454.
+    #[test]
+    fn a_reuse_address_option_that_fails_is_reported_in_c_s_words() {
+        assert_eq!(
+            server_setup_failure(socket::SetupStep::ReuseAddress),
+            "Error calling setsockopt 127.0.0.1:5025: cause"
+        );
+    }
+
+    /// drvAsynIPServerPort.c:465-473.
+    #[test]
+    fn a_listen_that_fails_is_reported_in_c_s_words() {
+        assert_eq!(
+            server_setup_failure(socket::SetupStep::Listen),
+            "Error calling listen() on 127.0.0.1:5025:  cause"
+        );
+    }
+
+    /// A bind host that does not resolve is C's lookup text without its stale
+    /// errno suffix (drvAsynIPServerPort.c:431-434). `.invalid` never resolves
+    /// (RFC 6761).
+    #[test]
+    fn an_unresolvable_bind_host_is_reported_in_c_s_words() {
+        let srv = DrvAsynIPServerPort::new("rb_invalid", "no-such-nic.invalid:0").unwrap();
+        assert_eq!(
+            srv.resolve_bind_addr().unwrap_err().message(),
+            "using ANY interface, cannot lookup 'no-such-nic.invalid'"
+        );
     }
 
     /// DRV-19: bind-host resolution. C `createServerSocket`
@@ -2230,6 +2346,25 @@ mod tests {
         wait_for_slot(&srv, 0);
 
         srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// A child port's error texts name C's `IPDeviceName`, which is the
+    /// server's hostInfo verbatim (drvAsynIPServerPort.c:711-715), not the
+    /// child's `parent:N` port name.
+    #[test]
+    fn a_child_port_error_names_the_server_s_host_info() {
+        let mut srv = DrvAsynIPServerPort::new("srv_name", "127.0.0.1:0").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        let user = AsynUser::default().with_timeout(Duration::from_millis(50));
+        let err = child.read_octet(&user, &mut [0u8; 8]).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "127.0.0.1:0 timeout: Resource temporarily unavailable"
+        );
     }
 
     /// W10-D5: the child port honours `disconnectOnReadTimeout`.
@@ -3440,7 +3575,7 @@ mod tests {
         let payload = vec![0x5au8; PAYLOAD];
 
         let slot = Arc::new(ClientSlot::new_empty());
-        slot.assign(server_side, peer).unwrap();
+        slot.assign(server_side, peer, "test").unwrap();
 
         // The wait runs on its own thread and reports through a channel, so an
         // unbounded write fails this test in seconds instead of hanging it.
@@ -3550,7 +3685,7 @@ mod tests {
             let (server_side, peer) = listener.accept().unwrap();
             pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
             fill_until_refused(&server_side);
-            slot.assign(server_side, peer).unwrap();
+            slot.assign(server_side, peer, "test").unwrap();
             clients.push(client);
         }
 

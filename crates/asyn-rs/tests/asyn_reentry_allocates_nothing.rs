@@ -21,6 +21,8 @@ use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
+use epics_libcom_rs::runtime::background::CallbackPriority;
+use epics_libcom_rs::runtime::task::{sleep_background, spawn_background};
 
 const PORT: &str = "REENTRY";
 
@@ -147,6 +149,15 @@ async fn a_blocking_port_reentry_allocates_nothing() {
         .unwrap();
     db.ioc_init().await;
 
+    // std allocates on a new thread before running it, and a `cb*` thread
+    // spawned with the executor can get there after the warm-up cycles. One
+    // round trip per band (one thread each by default), each through cbTimer
+    // by the sleep, puts every counted thread past its start before arming.
+    for p in CallbackPriority::ALL {
+        spawn_background(p, sleep_background(Duration::from_millis(1)))
+            .await
+            .unwrap();
+    }
     // The first cycles resolve what each thread builds once.
     for n in 1..=3 {
         cycle(&db, n).await;

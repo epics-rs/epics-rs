@@ -1406,7 +1406,7 @@ impl Default for CancelToken {
 #[cfg(test)]
 mod tests {
     /// bab72deef: the entry the actor still holds for a request the timer took
-    /// (C unlinks it, asynManager.c:666-676) must not claim the cell's next
+    /// (C unlinks it, asynManager.c:664-674) must not claim the cell's next
     /// request — `begin_running` from `Done` would run that one twice.
     #[test]
     fn a_timed_out_entry_does_not_claim_the_next_request() {

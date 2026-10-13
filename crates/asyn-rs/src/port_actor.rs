@@ -255,7 +255,7 @@ impl ActorMessage {
     }
 
     /// It left the queue on another clock and was reported there — C's timer
-    /// unlinked it (asynManager.c:666-676), so the port thread never sees it.
+    /// unlinked it (asynManager.c:664-674), so the port thread never sees it.
     fn is_gone(&self) -> bool {
         match &self.op {
             RequestOp::Cell(cell) => cell.is_gone(self.seq),
@@ -864,7 +864,7 @@ impl PortActor {
     /// queue timer's (`RequestCell::expire`) or a waiter's own — which C's
     /// `queueTimeoutCallback` unlinks from wherever they sit: behind other
     /// requests, parked behind a disabled device, or held by a block
-    /// (asynManager.c:666-676). Its signal (:702) is what wakes this pass.
+    /// (asynManager.c:664-674). Its signal (:702) is what wakes this pass.
     fn drop_left(&mut self) {
         if !self.cells.take_left() {
             return;

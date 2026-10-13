@@ -109,10 +109,10 @@ fn plain_udp_still_refuses_a_second_bind_of_one_local_port() {
         let mut first = DrvAsynIPPort::new("R1862C", &spec).unwrap();
         match first.connect(&AsynUser::default()) {
             Ok(()) => {}
-            // The driver wraps the bind EADDRINUSE as "UDP bind '...' failed"
-            // (ip_port.rs::connect_udp). On the first bind that can only be a
+            // A bind EADDRINUSE is C's "unable to bind to local port"
+            // (drvAsynIPPort.c:500-505). On the first bind that can only be a
             // steal of the just-probed number — try a fresh one.
-            Err(e) if e.message().contains("UDP bind") => continue,
+            Err(e) if e.message().starts_with("unable to bind to local port: ") => continue,
             Err(e) => panic!(
                 "first udp bind failed for a non-steal reason: {:?}",
                 e.message()
@@ -124,7 +124,7 @@ fn plain_udp_still_refuses_a_second_bind_of_one_local_port() {
             .connect(&AsynUser::default())
             .expect_err("without the & suffix the local port is exclusive");
         assert!(
-            err.message().contains("UDP bind"),
+            err.message().starts_with("unable to bind to local port: "),
             "the refusal must come from the bind, got {:?}",
             err.message()
         );

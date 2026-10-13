@@ -670,14 +670,17 @@ impl IpIoInner {
     /// connect is that non-blocking socket polled for `POLLOUT` (:541-566);
     /// [`socket::tcp_connect`] makes the bounded connect itself, so the mode is
     /// owned once it returns. Both own it before `tty->fd = fd` (`:593`).
-    fn own_blocking_mode(&self) -> AsynResult<()> {
+    fn own_blocking_mode(&self, device: &str) -> AsynResult<()> {
         match self {
             IpIoInner::Tcp(stream) => stream.set_nonblocking(OWNED_NONBLOCKING),
             IpIoInner::Udp(socket, _peer) => socket.set_nonblocking(OWNED_NONBLOCKING),
             #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => stream.set_nonblocking(OWNED_NONBLOCKING),
         }
-        .map_err(AsynError::Io)
+        .map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: nonblock_failure_text(device, &e),
+        })
     }
 }
 
@@ -1203,19 +1206,54 @@ pub(crate) fn sock_err_text(e: &std::io::Error) -> String {
     }
 }
 
-/// The `sockerrmsg` in C's `"Can't connect to %s: %s"` (drvAsynIPPort.c:568-571).
-/// C saves it from `connect()` itself (:534-539), before `poll` can clobber
-/// `errno`, so a connect that expired in `poll` reports the in-progress errno.
-fn connect_failure_cause(e: &std::io::Error) -> String {
-    if e.kind() != std::io::ErrorKind::TimedOut {
-        return sock_err_text(e);
+/// C's `"Can't connect to %s: %s"` (drvAsynIPPort.c:568-571), or the setup
+/// call's own text when the socket never reached `connect()`. C saves the
+/// `sockerrmsg` from `connect()` itself (:534-539), before `poll` can clobber
+/// `errno`, so a connect the poll then failed — timed out or refused — reports
+/// the in-progress errno.
+fn connect_failure_text(device: &str, e: &socket::TcpConnectError) -> String {
+    match e {
+        socket::TcpConnectError::Setup(setup) => setup_failure_text(device, setup),
+        _ => format!("Can't connect to {device}: {}", sock_err_text(e.sockerr())),
     }
-    #[cfg(unix)]
-    let in_progress = libc::EINPROGRESS;
-    // `SOCK_EWOULDBLOCK` (:541) is what a Windows `connect()` leaves behind.
-    #[cfg(windows)]
-    let in_progress = 10035; // WSAEWOULDBLOCK
-    sock_err_text(&std::io::Error::from_raw_os_error(in_progress))
+}
+
+/// C `connectIt`'s text for each setup call that fails before `connect()`
+/// (drvAsynIPPort.c:443-524); `device` is C's `IPDeviceName`, the hostInfo.
+fn setup_failure_text(device: &str, e: &socket::SetupError) -> String {
+    let err = sock_err_text(&e.error);
+    match e.step {
+        socket::SetupStep::Create => format!("Can't create socket: {err}"),
+        socket::SetupStep::Bind => format!("unable to bind to local port: {err}"),
+        socket::SetupStep::Broadcast => {
+            format!("Can't set {device} socket BROADCAST option: {err}")
+        }
+        socket::SetupStep::ReusePort => {
+            format!("Can't set {device} socket SO_REUSEPORT option: {err}")
+        }
+        // Not C's: SO_REUSEADDR rides only on the local bind rs keeps usable
+        // across TIME_WAIT; worded as C words its options.
+        socket::SetupStep::ReuseAddress => {
+            format!("Can't set {device} socket SO_REUSEADDR option: {err}")
+        }
+        socket::SetupStep::NonBlocking => nonblock_failure_text(device, &e.error),
+        // Only `tcp_listener` reports it, and no client port listens.
+        socket::SetupStep::Listen => format!("Can't listen on {device}: {err}"),
+    }
+}
+
+/// C's `TCP_NODELAY` failure after the connect (drvAsynIPPort.c:580-589).
+fn nodelay_failure_text(device: &str, e: &std::io::Error) -> String {
+    format!(
+        "Can't set {device} socket NODELAY option: {}",
+        sock_err_text(e)
+    )
+}
+
+/// C's `setNonBlock` failure (drvAsynIPPort.c:516-523), for libcom's switch
+/// around the bounded connect and for [`IpIoInner::own_blocking_mode`] alike.
+pub(crate) fn nonblock_failure_text(device: &str, e: &std::io::Error) -> String {
+    format!("Can't set {device} O_NONBLOCK option: {}", sock_err_text(e))
 }
 
 /// The `sockerrmsg` a failed read carries up to [`classify_read_failure`]:
@@ -1571,19 +1609,33 @@ impl DrvAsynIPPort {
         }
     }
 
-    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
+    /// Resolve the remote at connect time, as C does in case the device has
+    /// just appeared in DNS; a failed or empty lookup is C's one message for
+    /// `hostToIPAddr` failing (drvAsynIPPort.c:484-494).
+    fn resolve_remote(&self) -> AsynResult<Vec<std::net::SocketAddr>> {
         use std::net::ToSocketAddrs;
-        let addr_str = format!("{}:{}", self.config.host, self.config.port);
-        // Resolve the remote first: C delays the lookup to connect time too, in
-        // case the device has just appeared in DNS (drvAsynIPPort.c:484-493).
-        let addrs: Vec<std::net::SocketAddr> = addr_str
+        let addrs: Vec<_> = (self.config.host.as_str(), self.config.port)
             .to_socket_addrs()
-            .map_err(|e| AsynError::Status {
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        if addrs.is_empty() {
+            return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("failed to resolve '{addr_str}': {e}"),
-            })?
-            .collect();
+                message: format!("Unknown host \"{}\"", self.config.host),
+            });
+        }
+        Ok(addrs)
+    }
 
+    fn enable_nodelay(&self, stream: &TcpStream) -> AsynResult<()> {
+        stream.set_nodelay(true).map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: nodelay_failure_text(&self.host_info, &e),
+        })
+    }
+
+    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
+        let addrs = self.resolve_remote()?;
         let mut last_err: Option<AsynError> = None;
         for remote_addr in &addrs {
             // C binds the local address only when one was configured — "a very
@@ -1609,39 +1661,20 @@ impl DrvAsynIPPort {
                 Err(e) => {
                     last_err = Some(AsynError::Status {
                         status: AsynStatus::Error,
-                        message: format!(
-                            "Can't connect to {}: {}",
-                            self.host_info,
-                            connect_failure_cause(&e)
-                        ),
+                        message: connect_failure_text(&self.host_info, &e),
                     })
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("no addresses found for '{addr_str}'"),
-        }))
+        Err(last_err.expect("resolve_remote returns at least one address"))
     }
 
     fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
-        use std::net::ToSocketAddrs;
         // C drvAsynIPPort.c::connectIt (484-493) resolves the remote name to
         // tty->farAddr but (513) does NOT connect() a SOCK_DGRAM socket.
         // Resolve the peer once, then leave the socket unconnected and bind
         // a local endpoint of the peer's address family.
-        let remote = format!("{}:{}", self.config.host, self.config.port);
-        let peer = remote
-            .to_socket_addrs()
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("UDP resolve '{remote}': {e}"),
-            })?
-            .next()
-            .ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("UDP resolve '{remote}': no addresses"),
-            })?;
+        let peer = self.resolve_remote()?[0];
         let local_port = self.config.local_port.unwrap_or(0);
         let local_addr: std::net::SocketAddr = if peer.is_ipv6() {
             (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
@@ -1655,7 +1688,7 @@ impl DrvAsynIPPort {
         let socket = socket::udp_socket(local_addr, self.socket_options()).map_err(|e| {
             AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("UDP bind '{local_addr}' failed: {e}"),
+                message: setup_failure_text(&self.host_info, &e),
             }
         })?;
         Ok((socket, peer))
@@ -1663,10 +1696,12 @@ impl DrvAsynIPPort {
 
     #[cfg(asyn_af_unix)]
     fn connect_unix(&mut self) -> AsynResult<std::os::unix::net::UnixStream> {
+        // C's one connect text for every family (drvAsynIPPort.c:568-571); an
+        // AF_UNIX connect fails at once, so its own errno is the one C saves.
         let stream = std::os::unix::net::UnixStream::connect(&self.config.host).map_err(|e| {
             AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("unix connect to '{}': {e}", self.config.host),
+                message: format!("Can't connect to {}: {}", self.host_info, sock_err_text(&e)),
             }
         })?;
         Ok(stream)
@@ -1694,7 +1729,7 @@ impl DrvAsynIPPort {
         // The last fallible step, taken while the transport is still a local
         // that a failure simply drops — closing the socket the way C's
         // `epicsSocketDestroy` does.
-        inner.own_blocking_mode()?;
+        inner.own_blocking_mode(&self.host_info)?;
         self.io.inner = Some(inner);
         self.base.set_connected(true);
         Ok(())
@@ -1738,7 +1773,7 @@ impl PortDriver for DrvAsynIPPort {
             IpProtocol::Tcp | IpProtocol::TcpReusePort | IpProtocol::Com => {
                 let stream = self.connect_tcp()?;
                 if self.config.no_delay {
-                    stream.set_nodelay(true)?;
+                    self.enable_nodelay(&stream)?;
                 }
                 // `tcp&` = TCP + SO_REUSEPORT (C :360-363, :467-481). The option
                 // is set by `new_socket` on the unconnected socket, which is the
@@ -1779,7 +1814,7 @@ impl PortDriver for DrvAsynIPPort {
                 // socket is reused by the first write, HTTP/1.0 servers wait
                 // for the request).
                 let stream = self.connect_tcp()?;
-                stream.set_nodelay(true)?;
+                self.enable_nodelay(&stream)?;
                 IpIoInner::Tcp(stream)
             }
         };
@@ -3553,6 +3588,141 @@ mod tests {
         );
     }
 
+    /// A refusal the poll finds still reports `connect()`'s own errno, as C's
+    /// saved `sockerrmsg` does (drvAsynIPPort.c:534-539, :568-571). Linux only:
+    /// its loopback connect defers the refusal to `SO_ERROR`, other stacks may
+    /// refuse in `connect()` itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_tcp_connect_reports_connect_s_errno_in_c_s_words() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let err = drv.connect(&AsynUser::default()).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error);
+        assert_eq!(
+            err.message(),
+            format!("Can't connect to 127.0.0.1:{port}: Operation now in progress")
+        );
+    }
+
+    /// A name that does not resolve is C's `Unknown host "<host>"`, for TCP and
+    /// UDP alike (drvAsynIPPort.c:488-494). `.invalid` never resolves (RFC 6761).
+    #[test]
+    fn an_unknown_host_is_reported_in_c_s_words() {
+        for info in [
+            "no-such-device.invalid:5025",
+            "no-such-device.invalid:5025 udp",
+        ] {
+            let mut drv = DrvAsynIPPort::new("iptest", info).unwrap();
+            let err = drv.connect(&AsynUser::default()).unwrap_err();
+            assert_eq!(err.status(), AsynStatus::Error, "{info}");
+            assert_eq!(
+                err.message(),
+                "Unknown host \"no-such-device.invalid\"",
+                "{info}"
+            );
+        }
+    }
+
+    fn setup_failure(step: socket::SetupStep) -> String {
+        let e = socket::SetupError {
+            step,
+            error: std::io::Error::other("cause"),
+        };
+        setup_failure_text("10.0.0.1:5025 udp", &e)
+    }
+
+    /// drvAsynIPPort.c:454-459.
+    #[test]
+    fn a_broadcast_option_that_fails_is_reported_in_c_s_words() {
+        assert_eq!(
+            setup_failure(socket::SetupStep::Broadcast),
+            "Can't set 10.0.0.1:5025 udp socket BROADCAST option: cause"
+        );
+    }
+
+    /// drvAsynIPPort.c:470-478 — C keeps this text when `USE_SO_REUSEADDR`
+    /// swaps the option underneath it.
+    #[test]
+    fn a_reuse_port_option_that_fails_is_reported_in_c_s_words() {
+        assert_eq!(
+            setup_failure(socket::SetupStep::ReusePort),
+            "Can't set 10.0.0.1:5025 udp socket SO_REUSEPORT option: cause"
+        );
+        assert_eq!(
+            setup_failure(socket::SetupStep::ReuseAddress),
+            "Can't set 10.0.0.1:5025 udp socket SO_REUSEADDR option: cause"
+        );
+    }
+
+    /// drvAsynIPPort.c:516-523.
+    #[test]
+    fn a_blocking_mode_that_cannot_be_set_is_reported_in_c_s_words() {
+        assert_eq!(
+            setup_failure(socket::SetupStep::NonBlocking),
+            "Can't set 10.0.0.1:5025 udp O_NONBLOCK option: cause"
+        );
+    }
+
+    /// drvAsynIPPort.c:580-589.
+    #[test]
+    fn a_nodelay_option_that_fails_is_reported_in_c_s_words() {
+        assert_eq!(
+            nodelay_failure_text("10.0.0.1:5025", &std::io::Error::other("cause")),
+            "Can't set 10.0.0.1:5025 socket NODELAY option: cause"
+        );
+    }
+
+    /// drvAsynIPPort.c:443-446: no device name, the errno text only.
+    #[test]
+    fn a_socket_that_cannot_be_created_is_reported_in_c_s_words() {
+        assert_eq!(
+            setup_failure(socket::SetupStep::Create),
+            "Can't create socket: cause"
+        );
+    }
+
+    /// drvAsynIPPort.c:500-505: no device name, the errno text only.
+    #[test]
+    fn a_local_bind_that_fails_is_reported_in_c_s_words() {
+        assert_eq!(
+            setup_failure(socket::SetupStep::Bind),
+            "unable to bind to local port: cause"
+        );
+    }
+
+    /// The bind C provokes with a local port another socket listens on: the
+    /// setup text, not "Can't connect to" (drvAsynIPPort.c:500-505).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_local_port_in_use_fails_the_bind_in_c_s_words() {
+        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let local = held.local_addr().unwrap().port();
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:9:{local}")).unwrap();
+        let err = drv.connect(&AsynUser::default()).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "unable to bind to local port: Address already in use"
+        );
+    }
+
+    /// An AF_UNIX connect failure reads as C's, naming the whole hostInfo
+    /// (drvAsynIPPort.c:568-571).
+    #[cfg(asyn_af_unix)]
+    #[test]
+    fn a_unix_connect_failure_is_reported_in_c_s_words() {
+        let mut drv = DrvAsynIPPort::new("iptest", "unix:///nonexistent/asyn.sock").unwrap();
+        let err = drv.connect(&AsynUser::default()).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "Can't connect to unix:///nonexistent/asyn.sock: No such file or directory"
+        );
+    }
+
     /// hostInfo runtime reparse must update the protocol field too,
     /// matching C parseHostInfo (drvAsynIPPort.c:356-391). Previously
     /// only host/port/local_port were copied, so switching from TCP
@@ -4185,9 +4355,10 @@ mod tests {
         let err = drv
             .publish_transport(IpIoInner::Tcp(unusable))
             .expect_err("set_nonblocking on an O_PATH descriptor must fail");
-        assert!(
-            matches!(err, AsynError::Io(_)),
-            "expected the EBADF from set_nonblocking, got {err:?}"
+        // C's setNonBlock text (drvAsynIPPort.c:516-523) around the EBADF.
+        assert_eq!(
+            err.message(),
+            "Can't set 127.0.0.1:1 O_NONBLOCK option: Bad file descriptor"
         );
         assert!(
             drv.io.inner.is_none(),

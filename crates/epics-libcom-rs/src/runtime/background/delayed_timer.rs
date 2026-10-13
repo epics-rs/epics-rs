@@ -294,7 +294,7 @@ impl DelayedTimer {
             // but just below High (71), matching C: a due deadline preempts
             // ordinary callback work, and a High callback still preempts the
             // timer. Best effort, and only when the RT switch is on
-            // (`runtime::task::RT_PRIORITY_ENV`).
+            // (`runtime::task::C_RT_PRIORITY_ENV`).
             ThreadPriority::ScanHigh,
             // C allocates the timer queue's thread with
             // `epicsThreadGetStackSize(epicsThreadStackMedium)`

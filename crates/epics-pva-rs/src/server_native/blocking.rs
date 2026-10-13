@@ -202,9 +202,9 @@ use crate::error::{PvaError, PvaResult};
 /// (`udp_collector.cpp:93`), where CA's name-search responder also sits, so a
 /// SEARCH flood cannot starve established connections.
 ///
-/// Applying it is best effort and gated on `EPICS_RS_ALLOW_RT_PRIORITY`,
-/// which defaults **on** for RTEMS and off for hosted targets
-/// (`runtime::task::DEFAULT_POLICY`). On RTEMS the platform arm really does
+/// Applying it is best effort and gated on
+/// `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`, which defaults on as C's
+/// does (`runtime::task::DEFAULT_POLICY`). On RTEMS the platform arm really does
 /// call `pthread_setschedparam`, and the number is load-bearing there: RTEMS
 /// pthreads inherit `POSIX_Init`'s priority, so a thread that does not take a
 /// band runs one level above idle rather than "at the default".

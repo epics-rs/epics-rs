@@ -124,6 +124,10 @@ default-filter = """
 # skips *building* the crate, which the filter does not — but the guarantee is
 # here, so a new workspace-wide row cannot lose it.
 #
+# The three FIFO pins are in it by name: each needs a process that may have
+# SCHED_FIFO (root or RLIMIT_RTPRIO > 0) and fails without one, which a hosted
+# runner never is. Their RT-off halves deny or skip SCHED_FIFO and run here.
+#
 # Keep the two lists in step: an addition to profile.default's list belongs
 # here too, or CI silently runs a suite the default loop does not. (The
 # test-group overrides used to be duplicated here for the same reason and no
@@ -154,7 +158,10 @@ default-filter = """
     binary(wire_golden_ext) |
     binary(interop_pvxs) |
     binary(reference_trees) |
-    package(epics-oracle-rs)
+    package(epics-oracle-rs) |
+    (binary(rt_priority_default) & test(=the_default_gets_fifo_where_the_process_may_have_it)) |
+    (package(epics-libcom-rs) & test(=runtime::task::tests::an_above_99_priority_is_refused_by_the_fifo_scheduler)) |
+    (package(asyn-rs) & test(=runtime::port::tests::a_refused_port_thread_fails_registration))
   )
 """
 

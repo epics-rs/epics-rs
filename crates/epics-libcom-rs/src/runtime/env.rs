@@ -50,7 +50,10 @@ impl EnvParam {
     /// absence check: `caservertask.c:492-509` uses it to pick *which* of two
     /// parameters to resolve, so `FOO=` must read as "not configured".
     pub fn get(&self) -> Option<String> {
-        let v = std::env::var(self.name).unwrap_or_else(|_| self.default.to_string());
+        let v = match get(self.name) {
+            Some(v) => v,
+            None => self.default.to_string(),
+        };
         if v.is_empty() { None } else { Some(v) }
     }
 
@@ -213,7 +216,9 @@ pub enum EnvDoubleError {
 /// `getenv` too and its caller owns the fallback. Every EPICS Base `ENV_PARAM`
 /// must go through [`super::env_table`].
 pub fn get(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+    // C's `getenv` returns bytes: a value that is not UTF-8 is still set. The
+    // lossy copy keeps every ASCII byte the C parsers look at.
+    std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
 }
 
 /// Lowest port number a configurable EPICS port may take.
@@ -400,13 +405,13 @@ mod tests {
     /// never doubted. Walking `ENV_PARAM_LIST` deletes the second list:
     /// whatever a test asserts on, the table has already covered.
     #[must_use]
-    struct SilentEnv(Vec<(&'static str, String)>);
+    struct SilentEnv(Vec<(&'static str, std::ffi::OsString)>);
 
     impl SilentEnv {
         fn take() -> Self {
             let saved = ENV_PARAM_LIST
                 .iter()
-                .filter_map(|p| std::env::var(p.name()).ok().map(|v| (p.name(), v)))
+                .filter_map(|p| std::env::var_os(p.name()).map(|v| (p.name(), v)))
                 .collect();
             for p in ENV_PARAM_LIST {
                 clear(*p);
@@ -576,6 +581,16 @@ mod tests {
         assert_eq!(SCRATCH.bool(), None);
         clear(SCRATCH);
         assert_eq!(SCRATCH.bool(), None);
+        // Not UTF-8 is set and not `yes`; it never falls back to the default.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let yes = EnvParam::new(SCRATCH.name(), "YES");
+            // SAFETY: see `clear`.
+            unsafe { std::env::set_var(yes.name(), std::ffi::OsStr::from_bytes(b"y\xffes")) };
+            assert_eq!(yes.bool(), Some(false));
+            clear(SCRATCH);
+        }
     }
 
     /// `long_or_default` is C's `long i = <default>; envGetLongConfigParam(...)`

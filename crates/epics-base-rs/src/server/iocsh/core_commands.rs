@@ -1339,7 +1339,30 @@ mod tests {
     #[test]
     fn epics_thread_show_all_prints_the_header_the_rows_and_a_stderr_trailer() {
         let ctx = make_ctx();
-        let (finish, join) = parked_ioc_thread("cbShowAllRow");
+        // The OSSPRI column is the kernel's live `sched_priority`, as C reads
+        // it (`osdThreadExtra.c:39`): 0 off SCHED_FIFO, the mapped band on it.
+        let (sched_tx, sched_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish, finish_rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::Builder::new()
+            .name("cbShowAllRow".to_string())
+            .spawn(move || {
+                let _ = crate::runtime::task::enter_ioc_thread(
+                    crate::runtime::task::ThreadPriority::ScanLow,
+                );
+                let mut policy = 0;
+                let mut param = libc::sched_param { sched_priority: 0 };
+                // SAFETY: the calling thread, with stack-local out-params.
+                unsafe {
+                    libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)
+                };
+                sched_tx.send(param.sched_priority).unwrap();
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .unwrap();
+        started_rx.recv().unwrap();
+        let ossprio = sched_rx.recv().unwrap();
 
         let (out, err, failed) = run_split(&ctx, "epicsThreadShowAll", &[]);
         assert!(!failed);
@@ -1356,7 +1379,7 @@ mod tests {
             row.ends_with(&format!(
                 "{:3}{:8} {:>8.8}",
                 crate::runtime::task::ThreadPriority::ScanLow.value(),
-                0,
+                ossprio,
                 "OK"
             )),
             "{row}"

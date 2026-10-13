@@ -104,7 +104,7 @@ enum Cmd {
         hogs: usize,
     },
     /// Observe whether an IOC thread actually gets SCHED_FIFO under the
-    /// current `EPICS_RS_ALLOW_RT_PRIORITY` setting — the switch both
+    /// current `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` setting — the switch both
     /// directions. Reports `enter_ioc_thread`'s verdict and the kernel's
     /// own `sched_getscheduler`/priority for the thread.
     RtPolicy,
@@ -573,7 +573,7 @@ fn extract_pva_double(f: &epics_pva_rs::PvField) -> Option<f64> {
 
 /// Spawn one IOC thread through the real `enter_ioc_thread` path and report
 /// both the runtime's own verdict and the kernel's ground truth. Run twice by
-/// the caller — once with `EPICS_RS_ALLOW_RT_PRIORITY=YES`, once `=NO` — to see
+/// the caller — once with `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=YES`, once `=NO` — to see
 /// the switch bite in both directions. Must run as root (or with CAP_SYS_NICE)
 /// for the YES arm to actually obtain SCHED_FIFO.
 fn rt_policy() {

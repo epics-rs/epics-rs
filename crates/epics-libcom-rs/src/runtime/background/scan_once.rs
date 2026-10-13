@@ -526,10 +526,19 @@ mod tests {
     /// (`epicsRingBytes.c:242-251`). A drained ring is the special case where
     /// the two readings agree, so it cannot tell the behaviours apart.
     ///
-    /// Queued without starting the drain thread, so the ring holds still.
+    /// The first `scanOnce` starts the worker, so it is held inside a callback
+    /// to keep the ring still; a SCHED_FIFO worker otherwise drains it first.
     #[test]
     fn a_high_water_reset_comes_back_to_the_entries_still_queued() {
         let q = ScanOnceQueue::with_capacity(8);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        q.scan_once(Box::new(move || {
+            started_tx.send(()).unwrap();
+            gate_rx.recv().unwrap();
+        }))
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
         for _ in 0..5 {
             q.scan_once(Box::new(|| {})).unwrap();
         }
@@ -545,5 +554,6 @@ mod tests {
             st.max_used, 5,
             "the reset put the mark below the entries already queued"
         );
+        gate_tx.send(()).unwrap();
     }
 }

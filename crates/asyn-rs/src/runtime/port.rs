@@ -515,10 +515,28 @@ mod tests {
 
     /// registerPort's priority is C's `unsigned int`, kept as given
     /// (asynManager.c:2077); 0 is Medium. A synchronous port has no C thread,
-    /// so its priority is never read.
+    /// so its priority is never read. Run with RT off: under RT a can-block
+    /// port at 200 gets no thread (`a_refused_port_thread_fails_registration`).
     #[test]
     fn a_port_thread_runs_at_its_configured_priority() {
-        use epics_libcom_rs::runtime::task::thread_report;
+        use epics_libcom_rs::runtime::task::{C_RT_PRIORITY_ENV, thread_report};
+        const CHILD: &str = "ASYN_RS_PRIO_KEPT_CHILD";
+        const TEST: &str = "runtime::port::tests::a_port_thread_runs_at_its_configured_priority";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(C_RT_PRIORITY_ENV, "NO")
+                .output()
+                .expect("re-exec the test binary");
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         for (name, can_block, priority, osipri) in [
             ("prio_0", true, 0, 50),
             ("prio_1", true, 1, 1),
@@ -579,6 +597,8 @@ mod tests {
             .args(["--exact", TEST, "--nocapture"])
             .env(CHILD, "1")
             .env(epics_libcom_rs::runtime::task::RT_PRIORITY_ENV, "YES")
+            // The alias counts only while C's switch is unset.
+            .env_remove(epics_libcom_rs::runtime::task::C_RT_PRIORITY_ENV)
             .output()
             .expect("re-exec the test binary");
         let stdout = String::from_utf8_lossy(&out.stdout);

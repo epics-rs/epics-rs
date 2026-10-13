@@ -4335,9 +4335,29 @@ mod tests {
     /// A configured `priority` is the band of the data thread and of every
     /// callback thread, including the ones a NumThreads write respawns, and
     /// `priority <= 0` is Medium (asynNDArrayDriver.cpp:878,
-    /// NDPluginDriver.cpp:1016).
+    /// NDPluginDriver.cpp:1016). Run with RT off: under RT, 200 maps past the
+    /// FIFO range and the data thread is refused.
     #[test]
     fn a_configured_priority_is_the_band_of_every_plugin_thread() {
+        use epics_libcom_rs::runtime::task::C_RT_PRIORITY_ENV;
+        const CHILD: &str = "AD_CORE_PRIO_PIN_CHILD";
+        const TEST: &str =
+            "plugin::runtime::tests::a_configured_priority_is_the_band_of_every_plugin_thread";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(C_RT_PRIORITY_ENV, "NO")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         // A thread registers in its own prologue, after the spawn returns.
         let osipri = |name: &str| -> Vec<u32> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

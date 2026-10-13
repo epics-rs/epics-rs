@@ -240,9 +240,11 @@ is enabled at run/feature level, not by cross-compiling:
 # build with priority-inheritance mutexes (PTHREAD_PRIO_INHERIT)
 cargo build --release --features epics-base-rs/linux-rt
 
-# opt the IOC into SCHED_FIFO thread banding (default is off on hosted targets),
-# granting the privilege via an RTPRIO rlimit, CAP_SYS_NICE, or chrt
-EPICS_RS_ALLOW_RT_PRIORITY=YES ./your-ioc
+# SCHED_FIFO thread banding is on by default, as in C; grant the privilege via
+# an RTPRIO rlimit, CAP_SYS_NICE, or chrt (without it threads stay SCHED_OTHER)
+./your-ioc
+# turn it off
+EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=NO ./your-ioc
 ```
 
 Both levers are documented in

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### SCHED_FIFO thread banding is on by default, under C's switch
+
+IOC threads now ask for SCHED_FIFO by default on every target, as C's do.
+`EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` is the switch: unset means
+`YES` (`configure/CONFIG_ENV`), and only a case-insensitive `yes` turns it on,
+so `NO` or an empty value turns it off. `EPICS_RS_ALLOW_RT_PRIORITY`, the
+earlier opt-in, is still read, but only when C's variable is unset. Where the
+process may not use SCHED_FIFO (no `RLIMIT_RTPRIO`, no `CAP_SYS_NICE`), threads
+fall back to the default policy silently, as C's do; the once-per-process
+warning is gone.
+
 ## v0.31.0 — 2026-10-06
 
 Minor release. **The pinned toolchain moves 1.94.0 -> 1.99.0**, which

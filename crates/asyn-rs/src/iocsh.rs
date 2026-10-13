@@ -22,7 +22,8 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use epics_base_rs::server::ioc_app::IocApplication;
@@ -1456,7 +1457,7 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
                 };
 
             if publish_configured_port(
-                "drvAsynIPPortConfigure",
+                Refusal::Line("drvAsynIPPortConfigure: Can't register myself."),
                 &port,
                 driver,
                 arg_int(args, 2).unwrap_or(0) as u32,
@@ -1574,7 +1575,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
             // C hands the server's priority to every child (:711-713).
             let priority = arg_int(args, 3).unwrap_or(0) as u32;
             let Some(handle) = publish_configured_port(
-                "drvAsynIPServerPortConfigure",
+                Refusal::Line("drvAsynIPServerPortConfigure: Can't register myself."),
                 &port,
                 driver,
                 priority,
@@ -1606,15 +1607,27 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 // C traces and keeps going: a child that cannot be created costs
                 // that slot, not the server (:715-718). The helper has already
                 // printed and cleaned up whichever way it failed.
-                publish_configured_port(
-                    &format!("drvAsynIPServerPortConfigure: {name}"),
+                // The child is a `drvAsynIPPortConfigure` call (:709), whose
+                // own refusal line comes first, then the server's trace line.
+                if publish_configured_port(
+                    Refusal::Line("drvAsynIPPortConfigure: Can't register myself."),
                     &name,
                     child,
                     priority,
                     0,
                     &services,
                     ctx,
-                );
+                )
+                .is_none()
+                {
+                    services.trace().print(
+                        Some(&port),
+                        None,
+                        0,
+                        crate::trace::TraceMask::ERROR,
+                        format_args!("drvAsynIPServerPort: unable to create port {name}"),
+                    );
+                }
             }
 
             ctx.println(&format!(
@@ -1686,7 +1699,7 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                 };
 
             if publish_configured_port(
-                "drvAsynSerialPortConfigure",
+                Refusal::Line("drvAsynSerialPortConfigure: Can't register myself."),
                 &port,
                 driver,
                 arg_int(args, 2).unwrap_or(0) as u32,
@@ -1761,7 +1774,7 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
             };
 
             if publish_configured_port(
-                "prologixGPIBConfigure",
+                Refusal::Gpib,
                 &port,
                 driver,
                 arg_int(args, 2).unwrap_or(0) as u32,
@@ -1781,6 +1794,20 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
     )
 }
 
+/// How a `*Configure` command's driver reaches `registerPort`: directly
+/// through the manager with its own refusal line, or through `asynGpib`.
+enum Refusal<'a> {
+    Line(&'a str),
+    Gpib,
+}
+
+/// The prologix and vxi11 drivers' line when `pasynGpib->registerPort`
+/// returns NULL (drvPrologixGPIB.c:600, drvVxi11.c:1764).
+const GPIB_REFUSAL: &str = "registerPort failed";
+
+/// C `gpibPvtList`: the port names `asynGpib` has accepted.
+static GPIB_PORTS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
 /// The single path a `*Configure` shell command uses to turn a freshly built
 /// driver into a live, named, traceable port — C's `registerPort`, which is the
 /// sole entry into the port list (asynManager.c:2047, adding the port at
@@ -1788,6 +1815,11 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
 /// port to its trace configuration and exception list happens inside
 /// [`create_port_runtime`], driven by the services passed here, so a port an
 /// st.cmd builds is traceable from the moment it exists.
+///
+/// `refusal` is the driver's own C line, printed on stdout when
+/// `registerPort` refuses; C prints no cause beyond the manager's own line.
+/// A GPIB driver goes through `asynGpib`'s `registerPort` first, which refuses
+/// a name already on its own list before the manager is reached.
 ///
 /// `None` means **no port was published**, for either reason C has: the runtime
 /// thread could not be created (asynManager.c:2083-2093), or the name is
@@ -1801,7 +1833,7 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
 /// drop it: the registry above holds a live `PortHandle`, and that is what
 /// keeps the actor alive.
 fn publish_configured_port<D: PortDriver>(
-    command: &str,
+    refusal: Refusal<'_>,
     port: &str,
     driver: D,
     priority: u32,
@@ -1809,6 +1841,21 @@ fn publish_configured_port<D: PortDriver>(
     services: &PortServices,
     ctx: &CommandContext,
 ) -> Option<PortRuntimeHandle> {
+    let refusal = match refusal {
+        Refusal::Line(line) => line,
+        Refusal::Gpib => {
+            // asynGpib.c:571-576, then the driver's own refusal line; the
+            // name joins the list before the manager is asked (:597).
+            if !GPIB_PORTS.lock().unwrap().insert(port.to_string()) {
+                ctx.println(&format!(
+                    "asynGpib:registerDriver {port} already registered"
+                ));
+                ctx.println(GPIB_REFUSAL);
+                return None;
+            }
+            GPIB_REFUSAL
+        }
+    };
     let config = RuntimeConfig {
         services: services.clone(),
         priority,
@@ -1817,17 +1864,19 @@ fn publish_configured_port<D: PortDriver>(
     };
     let (handle, _jh) = match create_port_runtime(driver, config) {
         Ok(v) => v,
-        Err(e) => {
-            ctx.println(&format!("{command}: {e}"));
+        Err(_) => {
+            ctx.println(refusal);
             return None;
         }
     };
-    if let Err(e) = crate::asyn_record::register_port(
+    if crate::asyn_record::register_port(
         port,
         handle.port_handle().clone(),
         ctx.db().scan_control().interrupt_gate(),
-    ) {
-        ctx.println(&format!("{command}: {e}"));
+    )
+    .is_err()
+    {
+        ctx.println(refusal);
         handle.shutdown();
         return None;
     }
@@ -1890,7 +1939,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                 }
             };
             if publish_configured_port(
-                "drvAsynFTDIPortConfigure",
+                Refusal::Line("drvAsynFTDIPortConfigure: Can't register myself."),
                 &port,
                 driver,
                 arg_int(args, 5).unwrap_or(0) as u32,
@@ -1973,7 +2022,7 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
                 }
             };
             if publish_configured_port(
-                "vxi11Configure",
+                Refusal::Gpib,
                 &port,
                 driver,
                 arg_int(args, 5).unwrap_or(0) as u32,
@@ -2047,7 +2096,7 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
                 }
             };
             if publish_configured_port(
-                "usbtmcConfigure",
+                Refusal::Line("registerPort failed"),
                 &port,
                 driver,
                 arg_int(args, 4).unwrap_or(0) as u32,
@@ -3675,6 +3724,119 @@ mod tests {
         );
     }
 
+    /// Re-run this test binary on `test` with `CHILD` set and return its
+    /// stdout and stderr: a Configure command prints on the process stdout,
+    /// which a test cannot redirect in-process.
+    fn run_child(test: &str, child_env: &str) -> (String, String) {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", test, "--nocapture"])
+            .env(child_env, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{stdout}{stderr}");
+        (stdout, stderr)
+    }
+
+    fn call_configure(cmd: &CommandDef, args: &[ArgValue]) {
+        cmd.handler.call(args, &make_ctx()).expect("the command");
+    }
+
+    /// A Configure whose `registerPort` is refused prints the driver's own
+    /// C line, not `{command}: {error}` (drvAsynIPPort.c:1087,
+    /// drvAsynIPServerPort.c:651), and publishes nothing.
+    #[test]
+    fn ip_and_ip_server_configure_print_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_IP_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::ip_and_ip_server_configure_print_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let ip = drv_asyn_ip_port_configure_command(PortServices::new());
+            let srv = drv_asyn_ip_server_port_configure_command(PortServices::new());
+            let ip_args = |name: &str| {
+                [
+                    ArgValue::String(name.into()),
+                    ArgValue::String("127.0.0.1:9001".into()),
+                ]
+            };
+            call_configure(&ip, &ip_args("refuse_ip"));
+            println!("---second ip");
+            call_configure(&ip, &ip_args("refuse_ip"));
+            // The server's child "refuse_srv:0" is already taken.
+            call_configure(&ip, &ip_args("refuse_srv:0"));
+            let srv_args = |name: &str| {
+                [
+                    ArgValue::String(name.into()),
+                    ArgValue::String("127.0.0.1:0".into()),
+                    ArgValue::Int(1),
+                ]
+            };
+            println!("---first server");
+            call_configure(&srv, &srv_args("refuse_srv"));
+            println!("---second server");
+            call_configure(&srv, &srv_args("refuse_srv"));
+            return;
+        }
+        let (stdout, stderr) = run_child(TEST, CHILD);
+        let sec = |from: &str, to: Option<&str>| -> String {
+            let a = stdout.find(from).expect(from) + from.len();
+            let b = to.map_or(stdout.len(), |t| a + stdout[a..].find(t).expect(t));
+            stdout[a..b].to_string()
+        };
+        assert!(
+            sec("---second ip\n", Some("---first server"))
+                .lines()
+                .any(|l| l == "drvAsynIPPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+        let first = sec("---first server\n", Some("---second server"));
+        assert!(
+            first
+                .lines()
+                .any(|l| l == "drvAsynIPPortConfigure: Can't register myself."),
+            "the child's own line, from the first server: {stdout}"
+        );
+        assert!(
+            format!("{stdout}{stderr}")
+                .lines()
+                .any(|l| l.ends_with("drvAsynIPServerPort: unable to create port refuse_srv:0")),
+            "{stdout}{stderr}"
+        );
+        assert!(
+            sec("---second server\n", None)
+                .lines()
+                .any(|l| l == "drvAsynIPServerPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+    }
+
+    /// drvAsynSerialPort.c:1106.
+    #[cfg(asyn_serial_backend)]
+    #[test]
+    fn serial_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_SERIAL_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::serial_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_serial_port_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_serial".into()),
+                ArgValue::String("/dev/ttyS0".into()),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let second = &stdout[stdout.find("---second").expect("marker")..];
+        assert!(
+            second
+                .lines()
+                .any(|l| l == "drvAsynSerialPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+    }
+
     /// A missing required argument is rejected without creating a port.
     #[test]
     fn drv_asyn_ip_port_configure_rejects_missing_host() {
@@ -3887,6 +4049,134 @@ mod tests {
         assert!(
             crate::asyn_record::get_port("iocsh_usbtmc_cfg_test").is_some(),
             "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// drvAsynFTDIPort.cpp:591.
+    #[test]
+    fn ftdi_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_FTDI_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::ftdi_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_ftdi_port_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_ftdi".into()),
+                ArgValue::Int(0x0403),
+                ArgValue::Int(0x6001),
+                ArgValue::Int(9600),
+                ArgValue::Int(1),
+                ArgValue::Int(0),
+                ArgValue::Int(1),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let second = &stdout[stdout.find("---second").expect("marker")..];
+        assert!(
+            second
+                .lines()
+                .any(|l| l == "drvAsynFTDIPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+        assert!(
+            !stdout[..stdout.find("---second").unwrap()]
+                .contains("drvAsynFTDIPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+    }
+
+    /// drvPrologixGPIB.c:600.
+    #[test]
+    fn prologix_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_PROLOGIX_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::prologix_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_prologix_port_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_prologix".into()),
+                ArgValue::String("127.0.0.1:1234".into()),
+                ArgValue::Int(0),
+                ArgValue::Int(1),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let at = stdout.find("---second").expect("marker");
+        assert!(!stdout[..at].contains("registerPort failed"), "{stdout}");
+        let lines: Vec<&str> = stdout[at..].lines().collect();
+        let gpib = lines
+            .iter()
+            .position(|l| *l == "asynGpib:registerDriver refuse_prologix already registered")
+            .unwrap_or_else(|| panic!("no asynGpib line:\n{stdout}"));
+        assert_eq!(lines.get(gpib + 1).copied(), Some("registerPort failed"));
+        assert!(!stdout.contains("asynCommon:registerDriver"), "{stdout}");
+    }
+
+    /// drvVxi11.c:1764.
+    #[test]
+    fn vxi11_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_VXI11_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::vxi11_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = vxi11_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_vxi11".into()),
+                ArgValue::String("127.0.0.1".into()),
+                ArgValue::Int(0),
+                ArgValue::String("1.0".into()),
+                ArgValue::String("inst0".into()),
+                ArgValue::Int(0),
+                ArgValue::Int(1),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let at = stdout.find("---second").expect("marker");
+        assert!(!stdout[..at].contains("registerPort failed"), "{stdout}");
+        let lines: Vec<&str> = stdout[at..].lines().collect();
+        let gpib = lines
+            .iter()
+            .position(|l| *l == "asynGpib:registerDriver refuse_vxi11 already registered")
+            .unwrap_or_else(|| panic!("no asynGpib line:\n{stdout}"));
+        assert_eq!(lines.get(gpib + 1).copied(), Some("registerPort failed"));
+        assert!(!stdout.contains("asynCommon:registerDriver"), "{stdout}");
+    }
+
+    /// drvAsynUSBTMC.c:1278.
+    #[test]
+    fn usbtmc_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_USBTMC_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::usbtmc_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = usbtmc_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_usbtmc".into()),
+                ArgValue::Int(0x0699),
+                ArgValue::Int(0x0368),
+                ArgValue::String(String::new()),
+                ArgValue::Int(0),
+                ArgValue::Int(0),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let at = stdout.find("---second").expect("marker");
+        assert!(!stdout[..at].contains("registerPort failed"), "{stdout}");
+        assert!(
+            stdout[at..].lines().any(|l| l == "registerPort failed"),
+            "{stdout}"
         );
     }
 }

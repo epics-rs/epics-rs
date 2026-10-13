@@ -1316,8 +1316,8 @@ pub fn attach_with(
 /// Entries are sorted by field and in attach order within a field, so a post
 /// walks only its field's run. Readers get a [`RetireGuard`]: the map they
 /// see is freed by a later writer, never by their guard's drop.
-pub struct SubscriberList<S> {
-    map: RetiringSwap<SubscriberMap<S>>,
+pub struct SubscriberList<T> {
+    map: RetiringSwap<SubscriberMap<T>>,
     /// Never below the published map's length — [`Self::publish`] raises it
     /// before the store and lowers it after — so a reader that sees 0 sees an
     /// empty map. A nonzero count does not say the map holds anyone.
@@ -1328,9 +1328,9 @@ pub struct SubscriberList<S> {
 
 /// One version of a [`SubscriberList`]'s map.
 ///
-/// A reader sees what each entry points at, never the entry: an
-/// `Arc<Subscriber>` yields `&Subscriber`, so no cycle thread can clone a
-/// handle out of a guard and become the subscriber's last holder.
+/// The map owns each monitor through an `Arc` a reader never sees: it gets
+/// `&T`, so no cycle thread can clone the owning handle out of a guard and
+/// keep the monitor alive past its removal.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -1355,13 +1355,13 @@ pub struct SubscriberList<S> {
 /// list.add(0, Arc::new(1u32), || ());
 /// let _owned: Arc<u32> = list.load().iter().next().unwrap().1.clone();
 /// ```
-pub struct SubscriberMap<S> {
-    entries: Vec<(u16, S)>,
+pub struct SubscriberMap<T> {
+    entries: Vec<(u16, Arc<T>)>,
 }
 
-impl<S: std::ops::Deref> SubscriberMap<S> {
+impl<T> SubscriberMap<T> {
     /// The run of `field`'s monitors, in attach order.
-    pub fn of(&self, field: u16) -> impl Iterator<Item = &S::Target> {
+    pub fn of(&self, field: u16) -> impl Iterator<Item = &T> {
         let start = self.entries.partition_point(|(f, _)| *f < field);
         self.entries[start..]
             .iter()
@@ -1370,12 +1370,10 @@ impl<S: std::ops::Deref> SubscriberMap<S> {
     }
 
     /// Every monitor with its field index, by field then attach order.
-    pub fn iter(&self) -> impl Iterator<Item = (u16, &S::Target)> {
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &T)> {
         self.entries.iter().map(|(f, s)| (*f, &**s))
     }
-}
 
-impl<S> SubscriberMap<S> {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -1385,7 +1383,7 @@ impl<S> SubscriberMap<S> {
     }
 }
 
-impl<S> Default for SubscriberList<S> {
+impl<T> Default for SubscriberList<T> {
     fn default() -> Self {
         Self {
             map: RetiringSwap::new(Arc::new(SubscriberMap {
@@ -1397,14 +1395,14 @@ impl<S> Default for SubscriberList<S> {
     }
 }
 
-impl<S: Clone> SubscriberList<S> {
+impl<T> SubscriberList<T> {
     /// The current map, for one phase on this thread.
     ///
     /// A post loads it inside the record hold that wrote the value; loaded
     /// after the release, a late post can queue an older value behind a newer
     /// one. Every cycle thread runs [`crate::sync::prime_current_thread`]
     /// first, or its first load allocates.
-    pub fn load(&self) -> RetireGuard<'_, SubscriberMap<S>> {
+    pub fn load(&self) -> RetireGuard<'_, SubscriberMap<T>> {
         self.map.load()
     }
 
@@ -1414,16 +1412,35 @@ impl<S: Clone> SubscriberList<S> {
         self.count.load(Ordering::Acquire) == 0
     }
 
-    /// C `db_add_event`'s `ellAdd` onto `mlis`, behind `field`'s earlier
-    /// monitors, then `seed` — EVENT_ADD's first value, read and queued inside
-    /// one scan-lock hold (C `db_post_single_event`'s `dbScanLock`).
+    /// C `db_event_enable`'s `ellAdd` onto `mlis` (`dbEvent.c:515`), behind
+    /// `field`'s earlier monitors, then `seed` — EVENT_ADD's first value, read
+    /// and queued inside one scan-lock hold (C `db_post_single_event`'s
+    /// `dbScanLock`).
     ///
     /// The seed runs once `sub` is published and the writer mutex released, so
     /// a racing change is delivered at most twice and never lost. C seeds
     /// before the enable (`camessage.c:1907`, `:1913`) and can lose it.
-    pub fn add<R>(&self, field: u16, sub: S, seed: impl FnOnce() -> R) -> R {
+    pub fn add<R>(&self, field: u16, sub: Arc<T>, seed: impl FnOnce() -> R) -> R {
+        match self.try_add(field, sub, |_| Ok::<(), std::convert::Infallible>(()), seed) {
+            Ok(r) => r,
+        }
+    }
+
+    /// [`Self::add`] behind `check`, which runs under the writer mutex on the
+    /// current map: the owner's refusals (a destroyed PV, the monitor cap)
+    /// are decided against the same writer section that would publish, so a
+    /// racing [`Self::clear_with`] cannot slip between them. A refusal
+    /// publishes nothing and runs no seed.
+    pub fn try_add<R, E>(
+        &self,
+        field: u16,
+        sub: Arc<T>,
+        check: impl FnOnce(&SubscriberMap<T>) -> Result<(), E>,
+        seed: impl FnOnce() -> R,
+    ) -> Result<R, E> {
         let _w = self.writer.lock();
         let cur = self.map.load();
+        check(&cur)?;
         let at = cur.entries.partition_point(|(f, _)| *f <= field);
         let mut entries = Vec::with_capacity(cur.entries.len() + 1);
         entries.extend_from_slice(&cur.entries[..at]);
@@ -1433,13 +1450,29 @@ impl<S: Clone> SubscriberList<S> {
         let freed = self.publish(entries, 1, 0);
         drop(_w);
         drop(freed);
-        seed()
+        Ok(seed())
+    }
+
+    /// Run `mark` and remove every monitor in one writer section — the
+    /// owner's destroy: with `mark` setting the flag a [`Self::try_add`]
+    /// check refuses on, no monitor is added after the clear. The removed
+    /// monitors are returned, to drop once every lock is released.
+    pub fn clear_with<R>(&self, mark: impl FnOnce() -> R) -> (R, Vec<Arc<T>>) {
+        let w = self.writer.lock();
+        let marked = mark();
+        let cur = self.map.load();
+        let gone: Vec<Arc<T>> = cur.entries.iter().map(|(_, s)| s.clone()).collect();
+        drop(cur);
+        let freed = (!gone.is_empty()).then(|| self.publish(Vec::new(), 0, gone.len()));
+        drop(w);
+        drop(freed);
+        (marked, gone)
     }
 
     /// Remove every monitor `keep` refuses, returning them so their drops run
     /// after the writer mutex is released, as do the drops of the maps the
     /// store frees. No store when nothing goes.
-    pub fn retain(&self, mut keep: impl FnMut(u16, &S) -> bool) -> Vec<S> {
+    pub fn retain(&self, mut keep: impl FnMut(u16, &T) -> bool) -> Vec<Arc<T>> {
         let mut gone = Vec::new();
         let _freed = {
             let _w = self.writer.lock();
@@ -1466,10 +1499,10 @@ impl<S: Clone> SubscriberList<S> {
     /// `removed` after, which keeps it at or above the map's length.
     fn publish(
         &self,
-        entries: Vec<(u16, S)>,
+        entries: Vec<(u16, Arc<T>)>,
         added: usize,
         removed: usize,
-    ) -> crate::sync::Freed<SubscriberMap<S>> {
+    ) -> crate::sync::Freed<SubscriberMap<T>> {
         self.count.fetch_add(added, Ordering::Release);
         #[cfg(test)]
         self.midpoint(true);
@@ -1512,7 +1545,7 @@ mod subscriber_list_tests {
     #[derive(Default)]
     struct Rec {
         hold: StdMutex<i32>,
-        list: SubscriberList<Arc<StdMutex<Vec<i32>>>>,
+        list: SubscriberList<StdMutex<Vec<i32>>>,
     }
 
     impl Rec {
@@ -1593,27 +1626,11 @@ mod subscriber_list_tests {
         assert!(list.is_empty() && list.load().is_empty());
     }
 
-    /// Each clone is its own value, so freeing a map version shows up as
-    /// drops of that version's copies, on the thread that freed it.
+    /// Records its drop and the thread it ran on: the last holder of a
+    /// removed monitor's `Arc`.
     struct Probe {
         id: u32,
         drops: Drops,
-    }
-
-    impl Clone for Probe {
-        fn clone(&self) -> Self {
-            Self {
-                id: self.id,
-                drops: self.drops.clone(),
-            }
-        }
-    }
-
-    impl std::ops::Deref for Probe {
-        type Target = u32;
-        fn deref(&self) -> &u32 {
-            &self.id
-        }
     }
 
     impl Drop for Probe {
@@ -1625,15 +1642,15 @@ mod subscriber_list_tests {
         }
     }
 
-    fn probe(id: u32, drops: &Drops) -> Probe {
-        Probe {
+    fn probe(id: u32, drops: &Drops) -> Arc<Probe> {
+        Arc::new(Probe {
             id,
             drops: drops.clone(),
-        }
+        })
     }
 
     fn ids(map: &SubscriberMap<Probe>, field: u16) -> Vec<u32> {
-        map.of(field).copied().collect()
+        map.of(field).map(|p| p.id).collect()
     }
 
     #[test]
@@ -1650,7 +1667,7 @@ mod subscriber_list_tests {
         list.add(5, probe(4, &drops), || ());
         let map = list.load();
         assert_eq!(ids(&map, 3), [1, 2]);
-        let order: Vec<_> = map.iter().map(|(f, id)| (f, *id)).collect();
+        let order: Vec<_> = map.iter().map(|(f, p)| (f, p.id)).collect();
         assert_eq!(order, [(1, 3), (3, 1), (3, 2), (5, 4)]);
     }
 
@@ -1659,11 +1676,13 @@ mod subscriber_list_tests {
         let drops = Drops::default();
         let list = SubscriberList::default();
         list.add(0, probe(1, &drops), || ());
+        MIDPOINTS.with(|m| m.take());
         assert!(list.retain(|_, _| true).is_empty());
-        // Had the retain stored, this add would free the map the first add
-        // made, dropping its copy of 1.
+        assert!(
+            MIDPOINTS.with(|m| m.take()).is_empty(),
+            "the no-op retain stored"
+        );
         list.add(0, probe(2, &drops), || ());
-        assert!(drops.lock().unwrap().is_empty(), "the no-op retain stored");
         let gone = list.retain(|_, _| false);
         assert_eq!(gone.iter().map(|p| p.id).collect::<Vec<_>>(), [1, 2]);
         assert!(list.is_empty() && list.load().is_empty());
@@ -1738,8 +1757,7 @@ mod subscriber_list_tests {
     #[test]
     fn a_freed_map_drops_after_the_writer_mutex_is_released() {
         struct Chk;
-        static LIST: std::sync::OnceLock<&'static SubscriberList<Arc<Chk>>> =
-            std::sync::OnceLock::new();
+        static LIST: std::sync::OnceLock<&'static SubscriberList<Chk>> = std::sync::OnceLock::new();
         static LOCKED_AT_DROP: StdMutex<Vec<bool>> = StdMutex::new(Vec::new());
         impl Drop for Chk {
             fn drop(&mut self) {
@@ -1761,6 +1779,163 @@ mod subscriber_list_tests {
         drop(guard);
         drop(list.retain(|_, _| false));
         assert_eq!(*LOCKED_AT_DROP.lock().unwrap(), [false, false]);
+    }
+
+    /// An owner's PV: `destroyed` is set only by `clear_with`, and an add is
+    /// refused once it is.
+    #[derive(Default)]
+    struct Owner {
+        destroyed: AtomicBool,
+        list: SubscriberList<u32>,
+    }
+
+    impl Owner {
+        fn add(&self, id: u32) -> Result<(), &'static str> {
+            self.list.try_add(
+                0,
+                Arc::new(id),
+                |_| match self.destroyed.load(Ordering::Acquire) {
+                    true => Err("destroyed"),
+                    false => Ok(()),
+                },
+                || (),
+            )
+        }
+
+        fn destroy(&self) -> Vec<Arc<u32>> {
+            self.list
+                .clear_with(|| self.destroyed.store(true, Ordering::Release))
+                .1
+        }
+    }
+
+    #[test]
+    fn try_add_after_the_destroy_is_refused_and_publishes_nothing() {
+        let pv = Owner::default();
+        assert!(pv.destroy().is_empty());
+        MIDPOINTS.with(|m| m.take());
+        let mut seeded = false;
+        let got = pv.list.try_add(
+            0,
+            Arc::new(1),
+            |_| Err::<(), _>(pv.destroyed.load(Ordering::Acquire)),
+            || seeded = true,
+        );
+        assert_eq!(got, Err(true));
+        assert!(!seeded, "a refused add ran its seed");
+        assert!(
+            MIDPOINTS.with(|m| m.take()).is_empty(),
+            "a refused add stored"
+        );
+        assert!(pv.list.is_empty() && pv.list.load().is_empty());
+    }
+
+    #[test]
+    fn try_add_before_the_destroy_is_removed_by_it() {
+        let pv = Owner::default();
+        assert_eq!(pv.add(1), Ok(()));
+        let gone = pv.destroy();
+        assert_eq!(gone.iter().map(|g| **g).collect::<Vec<_>>(), [1]);
+        assert!(pv.list.is_empty() && pv.list.load().is_empty());
+        assert_eq!(pv.add(2), Err("destroyed"));
+    }
+
+    /// A destroy started while an add's check runs waits for the add's
+    /// publish and removes it: destroyed never has a subscriber. A check
+    /// outside the writer section lets the destroy finish inside the window
+    /// and the add publish after it.
+    #[test]
+    fn a_destroy_inside_try_adds_check_removes_the_add() {
+        let pv = Owner::default();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let gone = thread::scope(|s| {
+            let mut destroyer = None;
+            let added = pv.list.try_add(
+                0,
+                Arc::new(7),
+                |_| {
+                    let pv = &pv;
+                    let done_tx = done_tx.clone();
+                    destroyer = Some(s.spawn(move || {
+                        let gone = pv.destroy();
+                        done_tx.send(()).unwrap();
+                        gone
+                    }));
+                    let raced = done_rx
+                        .recv_timeout(std::time::Duration::from_millis(200))
+                        .is_ok();
+                    assert!(!raced, "the destroy finished inside the add's check");
+                    match pv.destroyed.load(Ordering::Acquire) {
+                        true => Err(()),
+                        false => Ok(()),
+                    }
+                },
+                || (),
+            );
+            assert_eq!(added, Ok(()));
+            destroyer.unwrap().join().unwrap()
+        });
+        assert_eq!(gone.iter().map(|g| **g).collect::<Vec<_>>(), [7]);
+        assert!(pv.list.load().is_empty(), "destroyed with a subscriber");
+    }
+
+    /// The destroy's removed monitors reach the caller; neither their drop
+    /// nor the freed map's runs under the writer mutex.
+    #[test]
+    fn clear_with_drops_after_the_writer_mutex_is_released() {
+        struct Chk;
+        static LIST: std::sync::OnceLock<&'static SubscriberList<Chk>> = std::sync::OnceLock::new();
+        static LOCKED_AT_DROP: StdMutex<Vec<bool>> = StdMutex::new(Vec::new());
+        impl Drop for Chk {
+            fn drop(&mut self) {
+                if let Some(list) = LIST.get() {
+                    LOCKED_AT_DROP.lock().unwrap().push(list.writer.is_locked());
+                }
+            }
+        }
+        let list = *LIST.get_or_init(|| Box::leak(Box::default()));
+        list.add(0, Arc::new(Chk), || ());
+        list.add(1, Arc::new(Chk), || ());
+        let ((), gone) = list.clear_with(|| assert!(list.writer.is_locked()));
+        assert_eq!(gone.len(), 2);
+        drop(gone);
+        // The cleared map still holds both; the next store frees it.
+        list.add(0, Arc::new(Chk), || ());
+        drop(list.clear_with(|| ()));
+        list.add(0, Arc::new(Chk), || ());
+        assert_eq!(*LOCKED_AT_DROP.lock().unwrap(), [false, false, false]);
+    }
+
+    /// CANCEL / circuit close: the removed monitor's drop is its end of
+    /// stream, so it reaches the caller alive and neither it nor the freed
+    /// map drops under the writer mutex.
+    #[test]
+    fn retain_drops_after_the_writer_mutex_is_released() {
+        struct Chk(u16);
+        static LIST: std::sync::OnceLock<&'static SubscriberList<Chk>> = std::sync::OnceLock::new();
+        static DROPS: StdMutex<Vec<(u16, bool)>> = StdMutex::new(Vec::new());
+        impl Drop for Chk {
+            fn drop(&mut self) {
+                if let Some(list) = LIST.get() {
+                    DROPS
+                        .lock()
+                        .unwrap()
+                        .push((self.0, list.writer.is_locked()));
+                }
+            }
+        }
+        let list = *LIST.get_or_init(|| Box::leak(Box::default()));
+        list.add(0, Arc::new(Chk(1)), || ());
+        list.add(0, Arc::new(Chk(2)), || ());
+        let gone = list.retain(|_, c| c.0 != 1);
+        assert_eq!(gone.iter().map(|g| g.0).collect::<Vec<_>>(), [1]);
+        assert!(DROPS.lock().unwrap().is_empty(), "dropped before return");
+        drop(gone);
+        // A removed monitor's last owner can be a map version the next
+        // store frees.
+        drop(list.retain(|_, _| false));
+        list.add(0, Arc::new(Chk(3)), || ());
+        assert_eq!(*DROPS.lock().unwrap(), [(1, false), (2, false)]);
     }
 
     /// A reader loading and walking the map while a writer adds and removes

@@ -588,7 +588,7 @@ fn spawn_watcher(
                 || line.contains("two or more servers share the same UDP port")
                 // pvalink's client context (`client.cpp:581/594`), and the
                 // server's search port (`udp_collector.cpp:151`) as the pvxs
-                // registrar reports it (`iochooks.cpp:508`).
+                // registrar reports it (`iochooks.cpp:509`).
                 || line.contains("Unable to bind random UDP")
                 || line.contains("Error in pvxsBaseRegistrar : Address already in use")
             {

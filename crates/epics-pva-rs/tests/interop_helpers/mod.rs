@@ -202,7 +202,9 @@ pub fn require_pvxs_tls() -> bool {
 const RANDOM_UDP_ATTEMPTS: usize = 8;
 
 /// Whether a pvxs process's output shows it lost a port to another socket,
-/// the only failure a fresh attempt is allowed to absorb.
+/// the only failure a fresh attempt is allowed to absorb. The rerun is
+/// justified only because the test needs the port it picked: the number was
+/// free when picked and released, and pvxs itself refuses a taken one.
 ///
 /// - `Unable to bind random UDP`: a client context binds a random UDP4 port,
 ///   then the same port on UDP6 (`client.cpp:576-594`), and no variable skips
@@ -211,8 +213,8 @@ const RANDOM_UDP_ATTEMPTS: usize = 8;
 ///   helper.
 /// - `Error in pvxsBaseRegistrar : Address already in use`: softIocPVX's
 ///   server binds the search port a test picked and released
-///   (`server.cpp:422`, `udp_collector.cpp:151`) at registration, and the
-///   registrar prints the throw (`iochooks.cpp:508`) and serves nothing.
+///   (`server.cpp:423`, `udp_collector.cpp:151`) at registration, and the
+///   registrar prints the throw (`iochooks.cpp:509`) and serves nothing.
 /// - `Server unable to bind port`: a server's picked TCP port was taken, and
 ///   it serves on another one (`serverconn.cpp:443-463`).
 /// - RSRV's report that softIocPVX's CA server lost its probed

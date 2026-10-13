@@ -57,6 +57,9 @@ struct StallRig {
     ioc: std::process::Child,
     port: u16,
     frozen: tokio::sync::watch::Sender<bool>,
+    /// Connections the proxy has accepted: a disconnect is redialled, an
+    /// unresponsive circuit is not.
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
     proxy: tokio::task::JoinHandle<()>,
     dir: tempfile::TempDir,
 }
@@ -76,7 +79,21 @@ impl Drop for StallRig {
 impl StallRig {
     const IOC: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 2);
 
+    /// The proxy's number is picked on 127.0.0.1, where nothing says it is
+    /// free on 127.0.0.2; a softIoc that loses it there serves nothing, and
+    /// only then is a fresh number taken.
     async fn start(db: &str, acf: &str) -> Self {
+        let mut lost = String::new();
+        for _ in 0..4 {
+            match Self::try_start(db, acf).await {
+                Ok(rig) => return rig,
+                Err(console) => lost = console,
+            }
+        }
+        panic!("softIoc lost its port four times:\n{lost}");
+    }
+
+    async fn try_start(db: &str, acf: &str) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("proxy listener");
@@ -99,8 +116,11 @@ impl StallRig {
             .expect("spawn softIoc");
         let (frozen, frozen_rx) = tokio::sync::watch::channel(false);
         let upstream = SocketAddr::from((Self::IOC, port));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
         let proxy = tokio::spawn(async move {
             while let Ok((down, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let Ok(up) = tokio::net::TcpStream::connect(upstream).await else {
                     continue;
                 };
@@ -114,11 +134,16 @@ impl StallRig {
             ioc,
             port,
             frozen,
+            accepted,
             proxy,
             dir,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while tokio::net::TcpStream::connect(upstream).await.is_err() {
+            // rsrv's line when its TCP bind fails (`caservertask.c:752`).
+            if rig.console().contains("CAS: No TCP server started") {
+                return Err(rig.console());
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "softIoc did not listen on {upstream}:\n{}",
@@ -135,7 +160,7 @@ impl StallRig {
             // The echo watchdog arms after this much silence.
             std::env::set_var("EPICS_CA_CONN_TMO", "1");
         }
-        rig
+        Ok(rig)
     }
 
     fn ioc_env(port: u16) -> Vec<(&'static str, String)> {
@@ -167,6 +192,10 @@ impl StallRig {
                 return;
             }
         }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn freeze(&self, on: bool) {
@@ -246,6 +275,7 @@ async fn rights_after_an_unresponsive_window(
     })
     .await;
 
+    let dialled = rig.accepted();
     rig.freeze(true);
     until(
         bound,
@@ -269,6 +299,12 @@ async fn rights_after_an_unresponsive_window(
     };
     let hook = back.access_hook().expect("access hook");
     let first = rights(&hook);
+    // A disconnect would have cleared the rights and passed for that reason.
+    assert_eq!(
+        rig.accepted(),
+        dialled,
+        "the window was a disconnect: the gateway redialled"
+    );
     mgr.shutdown().await;
     (first, rig.console())
 }

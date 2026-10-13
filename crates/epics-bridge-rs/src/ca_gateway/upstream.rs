@@ -227,10 +227,12 @@ async fn current_rights(channel: &CaChannel) -> Option<AccessRights> {
     channel.info().await.ok().map(|i| i.access_rights)
 }
 
-/// The rights the coordinator broadcasts with `Connected`, before it (C order,
-/// `camessage.c:1180/1201`) or after it, from a receiver taken with the
-/// channel, or from `resync` ([`current_rights`]) once the receiver has
-/// lagged. `None` once the client is gone.
+/// The rights the client sends just before `Connected` (C order,
+/// `camessage.c:1180/1201`; `nciu.cpp:170-177` clears them at a
+/// disconnect), from a receiver taken with the channel. A `Connected` with
+/// none since the last `Disconnected`, which only a lag leaves, asks
+/// `resync` ([`current_rights`]), as a lag does. `None` once the client is
+/// gone.
 async fn connect_rights<F>(
     rx: &mut broadcast::Receiver<ConnectionEvent>,
     resync: impl Fn() -> F,
@@ -238,30 +240,32 @@ async fn connect_rights<F>(
 where
     F: std::future::Future<Output = Option<AccessRights>>,
 {
-    let mut connected = false;
     // Rights since the last `Disconnected`, which a following `Connected` owns.
     let mut held = None;
     loop {
-        match rx.recv().await {
+        let lost = match rx.recv().await {
             Ok(ConnectionEvent::Connected) => match held {
                 Some(rights) => return Some(rights),
-                None => connected = true,
+                None => true,
             },
             Ok(ConnectionEvent::AccessRightsChanged { read, write }) => {
-                let rights = AccessRights { read, write };
-                if connected {
-                    return Some(rights);
-                }
-                held = Some(rights);
+                held = Some(AccessRights { read, write });
+                false
             }
-            Ok(ConnectionEvent::Disconnected) => (connected, held) = (false, None),
-            Ok(_) => {}
+            Ok(ConnectionEvent::Disconnected) => {
+                held = None;
+                false
+            }
+            Ok(_) => false,
             // What is left in the receiver may be a past connect's pair.
-            Err(broadcast::error::RecvError::Lagged(_)) => match resync().await {
-                Some(rights) => return Some(rights),
-                None => (connected, held) = (false, None),
-            },
+            Err(broadcast::error::RecvError::Lagged(_)) => true,
             Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        if lost {
+            match resync().await {
+                Some(rights) => return Some(rights),
+                None => held = None,
+            }
         }
     }
 }
@@ -2075,8 +2079,8 @@ mod tests {
     #[cfg(tokio_backend)]
     use serial_test::serial;
 
-    /// `connect_rights` takes the rights on either side of `Connected`, and
-    /// across its lag boundary. Eighteen events into the
+    /// `connect_rights` takes the last rights before `Connected`, and across
+    /// its lag boundary. Eighteen events into the
     /// 16-slot receiver drop the first pair, and the oldest kept pair is a
     /// past connect's — so a lagged read must take the resync, not that.
     #[tokio::test]
@@ -2094,15 +2098,19 @@ mod tests {
             write: true,
         };
 
-        // No lag, no resync: the rights on either side of `Connected`, never
-        // a pair from before a `Disconnected`.
+        // No lag, no resync: the last rights before `Connected`, never a pair
+        // from before a `Disconnected` nor one after `Connected`.
         let read_only = AccessRightsChanged {
             read: true,
             write: false,
         };
-        for events in [
-            [granted, Disconnected, Connected, read_only],
-            [granted, Disconnected, read_only, Connected],
+        let none = AccessRightsChanged {
+            read: false,
+            write: false,
+        };
+        for (events, want) in [
+            ([granted, Disconnected, read_only, Connected], (true, false)),
+            ([Disconnected, none, Connected, read_only], (false, false)),
         ] {
             let (tx, mut rx) = broadcast::channel(16);
             send_all(&tx, &events);
@@ -2112,12 +2120,20 @@ mod tests {
             )
             .await
             .expect("bounded");
-            assert_eq!(
-                got.map(|r| (r.read, r.write)),
-                Some((true, false)),
-                "{events:?}"
-            );
+            assert_eq!(got.map(|r| (r.read, r.write)), Some(want), "{events:?}");
         }
+
+        // `Connected` with no rights since `Disconnected`: the resync's, not
+        // the grant from before the outage.
+        let (tx, mut rx) = broadcast::channel(16);
+        send_all(&tx, &[granted, Disconnected, Connected]);
+        let got = tokio::time::timeout(
+            bound,
+            connect_rights(&mut rx, || async { Some(rights(true, false)) }),
+        )
+        .await
+        .expect("bounded");
+        assert_eq!(got.map(|r| (r.read, r.write)), Some((true, false)));
 
         // Lagged while connected: the resync's rights.
         let (tx, mut rx) = broadcast::channel(16);
@@ -2156,11 +2172,11 @@ mod tests {
                 send_all(
                     &tx,
                     &[
-                        Connected,
                         AccessRightsChanged {
                             read: false,
                             write: false,
                         },
+                        Connected,
                     ],
                 );
             }

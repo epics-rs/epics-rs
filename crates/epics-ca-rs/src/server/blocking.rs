@@ -67,10 +67,10 @@
 //! # The send lock
 //!
 //! C serializes every write to one client's socket with `client->lock`
-//! (`SEND_LOCK`, `server.h:212`), because two threads write it — the
+//! (`SEND_LOCK`, `server.h:221`), because two threads write it — the
 //! `camsgtask` command thread and the `CAS-event` monitor thread
-//! (`dbEvent.c:1016`). We model that with an `Arc<Mutex<Arc<TcpStream>>>` write
-//! handle. Both writers now exist (S1c): the client thread draining command
+//! (`dbEvent.c:1016`). We model that with an `Arc<Mutex<SendBuf>>`: the
+//! socket and C's per-client send buffer (`client->send`) under one lock. Both writers now exist (S1c): the client thread draining command
 //! replies AND the per-client event thread (`run_event_task`) writing
 //! monitor updates lock this same mutex, so the two never interleave a frame.
 //!
@@ -1085,33 +1085,90 @@ fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
     )
 }
 
-/// Write one complete frame to the socket under the send lock, then flush.
-///
-/// Wrapped in [`crate::server::send::RetryTransient`] so an `EINTR` or an
-/// `ENOBUFS` retries the unsent remainder instead of ending the client, which
-/// is what C's `cas_send_bs_msg` loop does under the same `SEND_LOCK`.
-fn write_frame_locked(send_lock: &Mutex<Arc<TcpStream>>, frame: &[u8]) -> std::io::Result<()> {
-    let sock = send_lock.lock().expect("CA send-lock poisoned");
-    // `impl Write for &TcpStream` — the shared handle needs no `&mut`.
-    let mut sock = crate::server::send::RetryTransient(&**sock);
-    sock.write_all(frame)?;
-    sock.flush()
+/// C `client->send` (`server.h:80`): the client's one send buffer, which
+/// both writers append complete frames to under the send lock, so the wire
+/// order of their frames is the order they were staged in. Allocated once,
+/// at `MAX_TCP`, like C's `casExpandSendBuffer`-less default.
+pub(crate) struct SendBuf<W = TcpStream> {
+    sock: Arc<W>,
+    buf: Vec<u8>,
 }
 
-/// Drain every queued frame into the socket in arrival order, then flush
-/// once. Single owner of "server bytes reach the socket" for the command
-/// path — the blocking analogue of `drain_and_flush` (`tcp.rs:1627`), held
-/// under the `client->lock` send-lock (`server.h:74`).
-fn drain_outbox_locked(
-    send_lock: &Mutex<Arc<TcpStream>>,
-    drain: &mut OutboxDrain,
-) -> std::io::Result<()> {
-    let sock = send_lock.lock().expect("CA send-lock poisoned");
-    let mut sock = crate::server::send::RetryTransient(&**sock);
-    while let Some(frame) = drain.try_next() {
-        sock.write_all(&frame)?;
+impl<W> SendBuf<W>
+where
+    for<'a> &'a W: Write,
+{
+    fn new(sock: Arc<W>) -> Self {
+        Self {
+            sock,
+            buf: Vec::with_capacity(crate::protocol::MAX_TCP),
+        }
     }
-    sock.flush()
+
+    /// C `cas_copy_in_header` (its flush, `caserverio.c:280-286`) +
+    /// `cas_commit_msg` (`:350`): a frame that does not fit sends what is
+    /// buffered first. A frame larger than the whole buffer goes out on its
+    /// own rather than growing it.
+    fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        if self.buf.len() + frame.len() > self.buf.capacity() {
+            self.send()?;
+        }
+        if frame.len() > self.buf.capacity() {
+            return crate::server::send::RetryTransient(&*self.sock).write_all(frame);
+        }
+        self.buf.extend_from_slice(frame);
+        Ok(())
+    }
+
+    /// C `cas_send_bs_msg`: everything staged, in one write. Wrapped in
+    /// [`crate::server::send::RetryTransient`] so an `EINTR` or an `ENOBUFS`
+    /// retries the unsent remainder instead of ending the client, which is
+    /// what C's send loop does under the same `SEND_LOCK`. The buffer is
+    /// emptied on failure too: C resets `send.stk` once the circuit is gone.
+    fn send(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let sent = crate::server::send::RetryTransient(&*self.sock).write_all(&self.buf);
+        self.buf.clear();
+        sent
+    }
+}
+
+/// The CAS-event thread's handle on the client's [`SendBuf`].
+struct EventSendBuf<W = TcpStream>(Arc<Mutex<SendBuf<W>>>);
+
+impl<W> super::tcp::EventSink for EventSendBuf<W>
+where
+    for<'a> &'a W: Write,
+{
+    fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        self.0.lock().expect("CA send-lock poisoned").stage(frame)
+    }
+
+    fn send(&mut self) -> std::io::Result<()> {
+        self.0.lock().expect("CA send-lock poisoned").send()
+    }
+}
+
+/// Stage one complete frame and send everything staged.
+fn write_frame_locked(send_lock: &Mutex<SendBuf>, frame: &[u8]) -> std::io::Result<()> {
+    let mut sb = send_lock.lock().expect("CA send-lock poisoned");
+    sb.stage(frame)?;
+    sb.send()
+}
+
+/// Stage every queued frame in arrival order, then send once. Single owner of
+/// "server bytes reach the socket" for the command path — the blocking
+/// analogue of `drain_and_flush` (`tcp.rs:1627`), held under the
+/// `client->lock` send-lock (`server.h:83`). The send also carries whatever
+/// the event thread staged before it.
+fn drain_outbox_locked(send_lock: &Mutex<SendBuf>, drain: &mut OutboxDrain) -> std::io::Result<()> {
+    let mut sb = send_lock.lock().expect("CA send-lock poisoned");
+    while let Some(frame) = drain.try_next() {
+        sb.stage(&frame)?;
+    }
+    sb.send()
 }
 
 /// The blocking driver's per-subscription cancel handle. This is a SEPARATE
@@ -1286,7 +1343,7 @@ fn handle_client_blocking(
 
     let stream = Arc::new(stream);
     let mut reader: &TcpStream = &stream;
-    let send_lock = Arc::new(Mutex::new(stream.clone()));
+    let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone())));
 
     let (outbox, mut drain) = outbox::channel();
     let mut state = ClientState::new(acf, tcp_port, db.clone());
@@ -1306,7 +1363,7 @@ fn handle_client_blocking(
     // client's monitor queues and, when `db_post_events` posts an update, writes
     // it to the socket under the SAME `send_lock` this read/dispatch thread
     // drains its command replies under (C `client->lock` serializes `camsgtask`
-    // + `event_task`, `server.h:74`). It has no async runtime either:
+    // + `event_task`, `server.h:83`). It has no async runtime either:
     // `run_event_task` is an async fn driven by `park_on`; its readers suspend
     // on the runtime-agnostic `EvQue` wake (a `Notify`) and are woken
     // cross-thread by `db_post_events`.
@@ -1331,8 +1388,8 @@ fn handle_client_blocking(
             epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
             None,
         );
-        let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
-        if block_on_sync(run_event_task(event_user, ev_rx, &mut write)).is_err() {
+        let sink = EventSendBuf(event_send_lock);
+        if block_on_sync(run_event_task(event_user, ev_rx, sink)).is_err() {
             tracing::error!(
                 target: "epics_ca_rs::server::blocking",
                 %peer,
@@ -1668,6 +1725,10 @@ fn handle_client_blocking(
     let _ = event_job.join();
     result
 }
+
+#[cfg(test)]
+#[path = "send_buf_tests.rs"]
+mod send_buf_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3296,7 +3296,7 @@ pub(crate) async fn dispatch_message(
                 // CREATE_CHAN); push in order. FIFO drain preserves the
                 // access-rights-before-create ordering C emits.
                 writer.push(ar.to_bytes().to_vec());
-                writer.push(resp.to_bytes_extended());
+                writer.push(resp.to_bytes_extended().to_vec());
 
                 let result = match access_level {
                     AccessLevel::NoAccess => "denied",
@@ -5797,7 +5797,7 @@ pub(crate) fn cancel_subscription_reply(
         .expect("the client framed this very EVENT_ADD count");
     resp.cid = info.channel_sid;
     resp.available = sub_id;
-    writer.push(resp.to_bytes_extended());
+    writer.push(resp.to_bytes_extended().to_vec());
     Ok(info.id)
 }
 
@@ -5832,12 +5832,12 @@ pub(crate) enum EventTaskControl {
 
 /// What one `select` cycle of [`run_event_task`] resolved to.
 enum EventStep {
-    /// The circuit's oldest entry and the monitor it is for. Boxed: a
-    /// `MonitorEvent` dwarfs the `Control` variant, so the box keeps
-    /// `EventStep` small.
+    /// The circuit's oldest entry and the monitor it is for. Not boxed: a
+    /// step lives on this task's stack for one turn, and a box is one
+    /// allocation per delivered event.
     Delivered(
         epics_base_rs::server::event_queue::DeliveryContext,
-        Box<epics_base_rs::server::pv::MonitorEvent>,
+        epics_base_rs::server::pv::MonitorEvent,
     ),
     /// Subscription `idx`'s producer is gone and its entries are delivered.
     Ended(usize),
@@ -5901,7 +5901,7 @@ async fn next_event_step(
         loop {
             match std::task::ready!(events.poll_next(cx)) {
                 CircuitEvent::Event { context, event, .. } => {
-                    return std::task::Poll::Ready(EventStep::Delivered(context, Box::new(event)));
+                    return std::task::Poll::Ready(EventStep::Delivered(context, event));
                 }
                 CircuitEvent::Ended(id) => {
                     if let Some(idx) = subs.iter().position(|s| s.reader.id() == id) {
@@ -5924,11 +5924,34 @@ async fn next_event_step(
     }
 }
 
+/// [`run_event_task`]'s side of the client's send buffer — C `client->send`
+/// under `SEND_LOCK`, which the dispatch thread appends its replies to as
+/// well, so the order of the two writers' frames is the order they were
+/// staged in.
+pub(crate) trait EventSink {
+    /// C `cas_copy_in_header` + `cas_commit_msg`: append one complete frame,
+    /// first sending what is buffered when the frame does not fit.
+    fn stage(&mut self, frame: &[u8]) -> std::io::Result<()>;
+    /// C `cas_send_bs_msg`: put everything staged on the wire.
+    fn send(&mut self) -> std::io::Result<()>;
+}
+
+/// [`run_event_task`]'s one exit path for staged frames: whatever ends the
+/// task — clean disconnect, a failed stage, the future dropped — what is
+/// staged still goes out, as it did when every frame was written at once.
+struct FlushOnExit<S: EventSink>(S);
+
+impl<S: EventSink> Drop for FlushOnExit<S> {
+    fn drop(&mut self) {
+        let _ = self.0.send();
+    }
+}
+
 /// The blocking (RTEMS) driver's monitor event thread — the analogue of C
 /// `event_task` (`dbEvent.c:1016`): ONE second thread per client that blocks
 /// on the client's monitor event queue and, when `db_post_events` posts an
 /// update, frames it and writes it to the client's TCP socket under the same
-/// send lock the dispatch thread holds (C `client->lock`, `server.h:74`).
+/// send lock the dispatch thread holds (C `client->lock`, `server.h:83`).
 /// `db_post_events` stays enqueue-only; this thread is the sole consumer.
 ///
 /// It takes the circuit's queued entries in post order
@@ -5948,16 +5971,15 @@ async fn next_event_step(
 /// send lock. So there is no third socket writer — monitors and write
 /// completions share this one owner.
 ///
-/// `write_frame` writes one complete frame under the send lock; on its first
-/// error (peer gone) the thread exits. It returns when the control sender is
-/// dropped (clean disconnect) so the dispatch thread can join it.
-pub(crate) async fn run_event_task<W>(
+/// Frames are staged into the client's send buffer and sent once nothing more
+/// is ready (see [`EventSink`]); on the first error (peer gone) the thread
+/// exits. It returns when the control sender is dropped (clean disconnect) so
+/// the dispatch thread can join it.
+pub(crate) async fn run_event_task(
     events: Arc<epics_base_rs::server::event_queue::EventUser>,
     mut control: tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
-    mut write_frame: W,
-) where
-    W: FnMut(&[u8]) -> std::io::Result<()>,
-{
+    sink: impl EventSink,
+) {
     let mut subs: Vec<MonitorDelivery> = Vec::new();
     // The cids this circuit has already retired. The async driver needs no
     // equivalent because it retires out of `ClientState::channels`, the channel
@@ -5977,8 +5999,25 @@ pub(crate) async fn run_event_task<W>(
     // `send_put_notify_response` builders) then drained to the socket under the
     // send lock.
     let (ev_outbox, mut ev_drain) = crate::server::outbox::channel();
+    let mut sink = FlushOnExit(sink);
     loop {
-        match next_event_step(&events, &mut subs, &mut pending_writes, &mut control).await {
+        // C `read_reply` sends only `if (!eventsRemaining)`
+        // (`camessage.c:593-594`): what this turn staged goes out when the
+        // task is about to wait, never per frame and never on a timer.
+        let step = {
+            let next = next_event_step(&events, &mut subs, &mut pending_writes, &mut control);
+            let mut next = std::pin::pin!(next);
+            std::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+                std::task::Poll::Pending => match sink.0.send() {
+                    Ok(()) => std::task::Poll::Pending,
+                    Err(_) => std::task::Poll::Ready(None),
+                },
+                ready => ready.map(Some),
+            })
+            .await
+        };
+        let Some(step) = step else { break };
+        match step {
             // Dispatch thread dropped the control sender: clean disconnect.
             EventStep::Control(None) => break,
             EventStep::Control(Some(EventTaskControl::Add(d))) => {
@@ -5989,7 +6028,8 @@ pub(crate) async fn run_event_task<W>(
                 // the channel still owes the client one frame if nothing else
                 // has sent it.
                 if d.target.is_destroyed() {
-                    if retired.insert(d.cid) && write_frame(&server_disconn_frame(d.cid)).is_err() {
+                    if retired.insert(d.cid) && sink.0.stage(&server_disconn_frame(d.cid)).is_err()
+                    {
                         break;
                     }
                 } else {
@@ -6041,7 +6081,7 @@ pub(crate) async fn run_event_task<W>(
                 if !retired.insert(d.cid) {
                     continue;
                 }
-                if write_frame(&server_disconn_frame(d.cid)).is_err() {
+                if sink.0.stage(&server_disconn_frame(d.cid)).is_err() {
                     break;
                 }
             }
@@ -6052,18 +6092,16 @@ pub(crate) async fn run_event_task<W>(
                 // Read before the gate, which a cancel can hold this thread
                 // in; `None` is a failed get, framed inside it.
                 let source =
-                    super::monitor::with_live_options(m.data_type, (*event).clone(), || {
-                        m.live_options()
-                    });
-                // The gate spans BUILD AND SOCKET WRITE here, not just the
-                // enqueue as on the async path: this driver's frames reach the
-                // socket through `write_frame` under the send lock, so that —
-                // not the private `ev_outbox` — is where the cancel
-                // confirmation could overtake them. Holding it across the
-                // write can park the dispatch thread inside `revoke`, which is
-                // what C does too: `db_cancel_event` blocks in `db_sync_event`
-                // while the event task is inside a callback that is itself
-                // writing under SEND_LOCK.
+                    super::monitor::with_live_options(m.data_type, event, || m.live_options());
+                // The gate spans BUILD AND STAGING here, not just the enqueue
+                // as on the async path: this driver's frames reach the wire
+                // through the client's send buffer, shared with the dispatch
+                // thread, so that — not the private `ev_outbox` — is where the
+                // cancel confirmation could overtake them. Holding it across
+                // the stage can park the dispatch thread inside `revoke`, which
+                // is what C does too: `db_cancel_event` blocks in
+                // `db_sync_event` while the event task is inside a callback
+                // that is itself writing under SEND_LOCK.
                 //
                 // `None` from `deliver` means EVENT_CANCEL confirmed this
                 // subscription while the update was in flight; C discards
@@ -6107,7 +6145,7 @@ pub(crate) async fn run_event_task<W>(
                         );
                     }
                     while let Some(frame) = ev_drain.try_next() {
-                        if write_frame(&frame).is_err() {
+                        if sink.0.stage(&frame).is_err() {
                             return DeliverStep::PeerGone;
                         }
                     }
@@ -6136,15 +6174,15 @@ pub(crate) async fn run_event_task<W>(
                 // the decision about whether a reply is still owed are one copy,
                 // not two.
                 let mut p = pending_writes.remove(idx);
-                // Draining INSIDE `settle` is what keeps this driver's two
-                // socket writers in order. Each stages into its own outbox and
-                // they race for the send lock, so a push is not a commit here:
-                // the dispatch thread, released by this reply, would otherwise
-                // be free to take the lock and put its own put-callback's reply
-                // on the wire first.
+                // Staging INSIDE `settle` is what keeps this driver's two
+                // writers in order. Each builds into its own outbox and they
+                // meet only in the shared send buffer, so a push is not a
+                // commit here: the dispatch thread, released by this reply,
+                // would otherwise be free to stage its own put-callback's
+                // reply ahead of it.
                 let committed = p.settle(res, &ev_outbox, || {
                     while let Some(frame) = ev_drain.try_next() {
-                        if write_frame(&frame).is_err() {
+                        if sink.0.stage(&frame).is_err() {
                             return false;
                         }
                     }
@@ -6401,7 +6439,7 @@ fn send_put_notify_response(
     }
     resp.cid = eca_status;
     resp.available = ioid;
-    writer.push(resp.to_bytes_extended());
+    writer.push(resp.to_bytes_extended().to_vec());
     Ok(())
 }
 
@@ -7788,7 +7826,7 @@ pub(crate) fn build_ca_error_frame(
         original_hdr.actual_count(),
         client_minor,
     ) {
-        Ok(()) => echo.to_bytes_extended(),
+        Ok(()) => echo.to_bytes_extended().to_vec(),
         // A pre-V49 peer has no code to parse the 8-byte annex, so C does not
         // withhold the reply: it keeps the 16-byte form and truncates the two
         // fields to `u16` (`htons((ca_uint16_t) curp->m_postsize)`,
@@ -12632,14 +12670,17 @@ mod destroyed_channel_teardown_tests {
 
         let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let task = tokio::spawn(run_event_task(
-            user.clone(),
-            ctl_rx,
-            move |bytes: &[u8]| {
-                let _ = frame_tx.send(bytes.to_vec());
+        struct Frames(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+        impl EventSink for Frames {
+            fn stage(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                let _ = self.0.send(bytes.to_vec());
                 Ok(())
-            },
-        ));
+            }
+            fn send(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let task = tokio::spawn(run_event_task(user.clone(), ctl_rx, Frames(frame_tx)));
 
         let mut readers = readers.into_iter();
         ctl_tx
@@ -12671,6 +12712,145 @@ mod destroyed_channel_teardown_tests {
             extra.is_empty(),
             "a channel is retired once, whenever its subscriptions turn up: {extra:?}"
         );
+    }
+
+    /// What an [`EventSink`] was asked to do, by frame command.
+    #[derive(Debug, PartialEq)]
+    enum Op {
+        Stage(u16),
+        Send,
+    }
+
+    struct Record(tokio::sync::mpsc::UnboundedSender<Op>);
+
+    impl EventSink for Record {
+        fn stage(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            let _ = self
+                .0
+                .send(Op::Stage(u16::from_be_bytes([bytes[0], bytes[1]])));
+            Ok(())
+        }
+        fn send(&mut self) -> std::io::Result<()> {
+            let _ = self.0.send(Op::Send);
+            Ok(())
+        }
+    }
+
+    /// C `read_reply` sends only once `eventsRemaining` is 0
+    /// (`camessage.c:593-594`): frames that are ready together are staged
+    /// together and go out in ONE send, made when the event thread is about
+    /// to wait. `k` channels retired by `k` queued `Add`s are `k` ready
+    /// frames; the boundary is one frame against several.
+    // RTEMS-EXEC-MODEL-ALLOW(1): drives `run_event_task` on the test runtime
+    // with a recording sink, no socket.
+    #[tokio::test]
+    async fn ready_frames_are_staged_and_sent_once_before_the_event_thread_waits() {
+        use epics_base_rs::server::event_queue::EventUser;
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::types::DbFieldType;
+
+        for k in [1u32, 3] {
+            let db = Arc::new(PvDatabase::new());
+            let user = Arc::new(EventUser::new());
+            let mask = (EventMask::VALUE | EventMask::LOG).bits();
+            let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+            for cid in 0..k {
+                let name = format!("BATCH:{k}:{cid}");
+                db.add_pv(&name, EpicsValue::Double(1.0))
+                    .await
+                    .expect("add_pv");
+                let pv = db.find_pv(&name).await.expect("just added");
+                let reader = pv
+                    .add_subscriber_on(
+                        &user,
+                        cid + 1,
+                        DbFieldType::Double,
+                        mask,
+                        epics_base_rs::server::event_queue::no_context(),
+                    )
+                    .expect("under the per-PV cap");
+                db.remove_simple_pv(&name).await.expect("was registered");
+                ctl_tx
+                    .send(EventTaskControl::Add(Box::new(MonitorDelivery {
+                        reader,
+                        target: ChannelTarget::SimplePv(pv),
+                        cid,
+                    })))
+                    .expect("receiver is held");
+            }
+
+            let (op_tx, mut op_rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(run_event_task(user.clone(), ctl_rx, Record(op_tx)));
+            let mut ops = Vec::new();
+            loop {
+                let op = tokio::time::timeout(Duration::from_secs(5), op_rx.recv())
+                    .await
+                    .expect("the event thread sends before it waits")
+                    .expect("the event thread holds the sink");
+                let sent = op == Op::Send;
+                ops.push(op);
+                if sent {
+                    break;
+                }
+            }
+            let mut want: Vec<Op> = (0..k).map(|_| Op::Stage(CA_PROTO_SERVER_DISCONN)).collect();
+            want.push(Op::Send);
+            assert_eq!(ops, want, "{k} ready frames: staged, then one send");
+
+            drop(ctl_tx);
+            task.await.expect("event task ends when the sender drops");
+        }
+    }
+
+    /// A frame staged just before the control sender drops still reaches
+    /// the wire: the task ends without ever waiting, so only its exit path
+    /// can send it.
+    // RTEMS-EXEC-MODEL-ALLOW(1): drives `run_event_task` on the test runtime
+    // with a recording sink, no socket.
+    #[tokio::test]
+    async fn r3_probe_staged_frames_reach_the_wire_when_the_control_sender_drops() {
+        use epics_base_rs::server::event_queue::EventUser;
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("BATCH:EXIT", EpicsValue::Double(1.0))
+            .await
+            .expect("add_pv");
+        let pv = db.find_pv("BATCH:EXIT").await.expect("just added");
+        let user = Arc::new(EventUser::new());
+        let reader = pv
+            .add_subscriber_on(
+                &user,
+                1,
+                DbFieldType::Double,
+                (EventMask::VALUE | EventMask::LOG).bits(),
+                epics_base_rs::server::event_queue::no_context(),
+            )
+            .expect("under the per-PV cap");
+        db.remove_simple_pv("BATCH:EXIT")
+            .await
+            .expect("was registered");
+
+        // The `Add` and the sender's drop are both queued before the task
+        // first runs, so it stages the retirement and then sees `None`.
+        let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        ctl_tx
+            .send(EventTaskControl::Add(Box::new(MonitorDelivery {
+                reader,
+                target: ChannelTarget::SimplePv(pv),
+                cid: 7,
+            })))
+            .expect("receiver is held");
+        drop(ctl_tx);
+
+        let (op_tx, mut op_rx) = tokio::sync::mpsc::unbounded_channel();
+        run_event_task(user, ctl_rx, Record(op_tx)).await;
+        let mut ops = Vec::new();
+        while let Ok(op) = op_rx.try_recv() {
+            ops.push(op);
+        }
+        assert_eq!(ops, [Op::Stage(CA_PROTO_SERVER_DISCONN), Op::Send]);
     }
 }
 

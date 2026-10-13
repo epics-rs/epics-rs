@@ -448,6 +448,25 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
     );
 }
 
+/// `counter` once it reads at least `want`, or what it reads when
+/// [`fact_budget::FACT_BUDGET`] runs out.
+#[cfg(tokio_backend)]
+async fn counter_reaches(counter: &std::sync::atomic::AtomicU64, want: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reached = async {
+        loop {
+            let n = counter.load(Relaxed);
+            if n >= want {
+                return n;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(fact_budget::FACT_BUDGET, reached)
+        .await
+        .unwrap_or_else(|_| counter.load(Relaxed))
+}
+
 /// PR #592 follow-up: subscription counters track EVENT_ADD opens
 /// and EVENT_CANCEL/teardown closes. Pre-wiring the counters were
 /// declared and printed by `casr` but never incremented. Asserts
@@ -458,8 +477,6 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
-    use std::time::Duration;
-
     let server = CaServer::builder()
         .port(0)
         .pv("STATS:SUB:PV", EpicsValue::Double(1.0))
@@ -486,8 +503,9 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
         .expect("initial monitor frame did not arrive")
         .expect("monitor stream yielded no value");
 
-    use std::sync::atomic::Ordering::Relaxed;
-    let opened = stats.subscriptions_opened_total.load(Relaxed);
+    // The stats are bumped by a separate task draining the server's
+    // connection events, which nothing orders before the monitor frame.
+    let opened = counter_reaches(&stats.subscriptions_opened_total, 1).await;
     assert!(
         opened >= 1,
         "subscriptions_opened_total must increment after EVENT_ADD; got {opened}"
@@ -501,9 +519,7 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     drop(channel);
     drop(client);
 
-    // Give the server a moment to process the disconnect / clear.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let closed = stats.subscriptions_closed_total.load(Relaxed);
+    let closed = counter_reaches(&stats.subscriptions_closed_total, opened).await;
     assert!(
         closed >= 1,
         "subscriptions_closed_total must increment after teardown; got {closed}"

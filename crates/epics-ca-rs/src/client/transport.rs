@@ -1832,7 +1832,7 @@ fn process_command(
                 connections,
                 server_writers,
                 (server_addr, priority),
-                hdr.to_bytes_extended(),
+                hdr.to_bytes_extended().to_vec(),
                 event_tx,
             );
         }
@@ -1946,8 +1946,7 @@ fn process_command(
             let mut mask_payload = [0u8; 16];
             mask_payload[12..14].copy_from_slice(&mask.to_be_bytes());
 
-            let mut frame = hdr.to_bytes_extended();
-            frame.extend_from_slice(&mask_payload);
+            let frame = [&hdr.to_bytes_extended()[..], &mask_payload[..]].concat();
             send_frame(
                 connections,
                 server_writers,
@@ -1992,7 +1991,7 @@ fn process_command(
                 connections,
                 server_writers,
                 (server_addr, priority),
-                hdr.to_bytes_extended(),
+                hdr.to_bytes_extended().to_vec(),
                 event_tx,
             );
         }

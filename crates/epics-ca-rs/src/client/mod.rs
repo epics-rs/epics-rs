@@ -1988,7 +1988,7 @@ impl CaChannel {
         } else {
             hdr.count = count as u16;
         }
-        Ok(hdr.to_bytes_extended())
+        Ok(hdr.to_bytes_extended().to_vec())
     }
 
     fn decode_plain_read_reply(reply: ReadReply) -> CaResult<(DbFieldType, EpicsValue)> {

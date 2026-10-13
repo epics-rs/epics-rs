@@ -38,6 +38,11 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// Allocation calls this thread has made so far.
+pub(super) fn allocs() -> u64 {
+    ALLOCS.with(Cell::get)
+}
+
 #[test]
 fn a_gr_update_allocates_nothing_beyond_the_read() {
     epics_base_rs::runtime::task::test_ioc_thread(

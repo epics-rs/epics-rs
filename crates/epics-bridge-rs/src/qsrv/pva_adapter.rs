@@ -1415,7 +1415,7 @@ pub async fn install_pvalink(
 ///
 /// Installs the `"pva"` link set (pvalink) on `db` and returns the
 /// `pvxr` / `dbpvxr` / `pvalink_enable` / `pvalink_disable` iocsh
-/// commands. [`run_qsrv_ioc_app`] registers it for every QSRV route; only a
+/// commands. `run_qsrv_ioc_app` registers it for every QSRV route; only a
 /// custom runner registers it itself. It is fired by
 /// `IocApplication::run` at the `AfterCaLinkInit` hook — BEFORE
 /// `setup_cp_links` and before record processing (PINI), so a `pva://`

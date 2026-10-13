@@ -1613,7 +1613,7 @@ pub struct ScanOwner {
 impl ScanOwner {
     /// Start the scan owner thread for a `db` with no IOC lifecycle: C's
     /// `scanRun` and nothing of `iocRun`'s, so `iocState` is left alone. An
-    /// IOC reaches its owner through [`Self::start_running`] instead, after
+    /// IOC reaches its owner through `Self::start_running` instead, after
     /// the lifecycle owner's `iocRun`. See the type docs for why redundant
     /// calls are harmless.
     pub fn start(db: Arc<PvDatabase>) -> Self {

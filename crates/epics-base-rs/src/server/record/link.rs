@@ -1877,7 +1877,7 @@ impl ParsedLink {
     ///
     /// Parsing a link and being able to service it are two different facts,
     /// and this is the second one. The first is `{pva:…}` loading at all,
-    /// which needs the database to declare the type ([`LinkList`]) as C needs
+    /// which needs the database to declare the type (`LinkList`) as C needs
     /// `pvxs7x.dbd`'s `link()` line. A declared type can still reach iocInit
     /// with no link set installed, and so can `pva://`, which C has no
     /// `link()` gate for; `PvDatabase::db_init_link_locality` asks this and

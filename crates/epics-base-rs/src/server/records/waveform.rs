@@ -903,7 +903,7 @@ impl Record for WaveformRecord {
         })
     }
 
-    /// [`Self::put_val`]'s scalar row without building the one-element array:
+    /// `Self::put_val`'s scalar row without building the one-element array:
     /// the same parse or `to_<ty>` cast, into `bptr[0]` of the unshared buffer.
     fn put_primary_element0(&mut self, src: crate::server::record::OutView<'_>) -> bool {
         use crate::server::record::OutView;

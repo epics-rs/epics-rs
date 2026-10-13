@@ -1098,7 +1098,7 @@ impl BridgeProvider {
     /// `createGroups` catches the `Field`/`Channel` ctor throw and prints
     /// `"%s: Error Group not created: %s\n"` (groupconfigprocessor.cpp:429-444,
     /// ioc/field.cpp:23-25, ioc/channel.cpp:37); it is not counted, and
-    /// its name still answers (see [`Self::group_serve`]). Trigger references to unknown fields stay a warning
+    /// its name still answers (see `Self::group_serve`). Trigger references to unknown fields stay a warning
     /// (pvxs `defineGroupTriggers` prints and continues, :393-398).
     pub async fn process_groups(&self) -> usize {
         let mut defs: Vec<GroupPvDef> = self.groups.read().values().cloned().collect();

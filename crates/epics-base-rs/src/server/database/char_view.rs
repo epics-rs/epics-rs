@@ -630,7 +630,7 @@ impl DollarView {
     }
 
     /// `dbGet`'s chars from the `log` a filter chain made of `image`. A
-    /// field's are the log, cut ([`Self::cut`]). A link's or an attribute's
+    /// field's are the log, cut (`Self::cut`). A link's or an attribute's
     /// are its text afresh: `getLinkValue`/`getAttrValue` ignore the log and
     /// keep only its count, `nRequest` (`dbAccess.c:817-895,945-952`).
     pub fn read(self, image: EpicsValue, log: EpicsValue) -> EpicsValue {

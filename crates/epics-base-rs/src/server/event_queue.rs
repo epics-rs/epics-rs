@@ -209,7 +209,7 @@ impl FlowCtrl {
 /// always followed by its wake.
 ///
 /// The queues it made non-empty — C's `firstEventFlag` — are chained through themselves
-/// ([`QueInner::burst_next`]), so a burst allocates nothing. A queue already
+/// (`QueInner::burst_next`), so a burst allocates nothing. A queue already
 /// in another producer's burst stays there: that burst's drop wakes it, after
 /// this post.
 #[derive(Default)]

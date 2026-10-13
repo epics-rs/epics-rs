@@ -377,7 +377,7 @@ pub enum NtType {
     /// string) by making the channel's intent explicit.
     LongString,
     /// A `$` channel, served as its text or its `DBR_CHAR` image. The
-    /// snapshot carries the value [`View::read`] already made of it.
+    /// snapshot carries the value `View::read` already made of it.
     Dollar(PvaDollar),
 }
 

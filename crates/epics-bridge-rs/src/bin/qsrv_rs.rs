@@ -2,7 +2,7 @@
 //!
 //! Loads EPICS records from a `.db` file and optional group PV definitions
 //! from a JSON config, then exposes them over pvAccess using the native
-//! PVA server via [`QsrvPvStore`].
+//! PVA server via [`QsrvPvStore`](epics_bridge_rs::qsrv::pva_adapter::QsrvPvStore).
 //!
 //! Usage:
 //!

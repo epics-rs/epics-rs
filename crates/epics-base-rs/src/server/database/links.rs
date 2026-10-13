@@ -4429,7 +4429,7 @@ impl PvDatabase {
     /// is C's ordering: `initPVLinks` walks the loaded database once, every
     /// `DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK` of every record
     /// (`dbLink.c:92-143`). The fields come from the dbd table
-    /// ([`Self::link_field_texts`]), so a fanout `LNKn` or an `INPA` is
+    /// (`Self::link_field_texts`), so a fanout `LNKn` or an `INPA` is
     /// decided like `FLNK`.
     ///
     /// The decision is taken from the field's RAW text, not from the stored

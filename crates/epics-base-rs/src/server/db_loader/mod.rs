@@ -1529,7 +1529,7 @@ impl DbFaults {
     /// one, in C's own order — see [`DbDiagnostic`].
     ///
     /// One positioned past what the load has read is held until it gets
-    /// there (see [`Self::unread`]); any other prints now.
+    /// there (see `Self::unread`); any other prints now.
     pub fn report(&mut self, diagnostic: DbDiagnostic) {
         self.messages.push(diagnostic.message.clone());
         match self.park.clone() {

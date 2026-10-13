@@ -2713,7 +2713,7 @@ impl Record for TableRecord {
         InputLinkRequest::As(LinkReadAs::Double)
     }
 
-    /// Resumes the cycle after the read [`Resume`] holds; never asks which
+    /// Resumes the cycle after the read `Resume` holds; never asks which
     /// link reported, so the cycle path compares no names.
     fn link_read_result(&mut self, _link_field: &'static str, read: LinkRead) -> ProcessActions {
         let Resume { stage, at } = self.resume;

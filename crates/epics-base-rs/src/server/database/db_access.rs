@@ -485,7 +485,7 @@ impl DbSubscription {
     /// Serve this subscription as a `$` channel: each event is read as
     /// [`DollarView::render`](crate::server::database::char_view::DollarView::render)'s
     /// image, through the post chain, then
-    /// [`DollarView::cut`](crate::server::database::char_view::DollarView::cut).
+    /// `DollarView::cut`.
     pub fn with_dollar_view(
         mut self,
         view: crate::server::database::char_view::DollarView,

@@ -113,7 +113,7 @@ pub struct RestoreResult {
 }
 
 /// C's list and overall status codes (save_restore.h:38-42), the values the
-/// SR_status and SR_<i>_Status mbbo records index.
+/// SR_status and `SR_<i>_Status` mbbo records index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SrStatus {
     Init = 0,
@@ -123,7 +123,7 @@ pub enum SrStatus {
     Ok = 4,
 }
 
-/// A list's status code and the text C writes beside it to SR_<i>_StatusStr.
+/// A list's status code and the text C writes beside it to `SR_<i>_StatusStr`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListStatus {
     pub code: SrStatus,
@@ -379,7 +379,7 @@ impl SaveSet {
         *self.recent.lock().unwrap() = Some((std::time::Instant::now(), text));
     }
 
-    /// C's `plist->save_file`, the name SR_recentlyStr and SR_<i>_Name use.
+    /// C's `plist->save_file`, the name SR_recentlyStr and `SR_<i>_Name` use.
     pub fn save_file(&self) -> String {
         self.config
             .save_path

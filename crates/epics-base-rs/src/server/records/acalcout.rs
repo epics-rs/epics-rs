@@ -2662,7 +2662,7 @@ impl Record for AcalcoutRecord {
     /// value.)
     ///
     /// AVAL and OAV post from `monitor()`'s own PAVL/POAV test, marked by
-    /// [`AcalcoutRecord::complete_cycle`].
+    /// `AcalcoutRecord::complete_cycle`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
         &[
             "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL", "AVAL", "OAV",

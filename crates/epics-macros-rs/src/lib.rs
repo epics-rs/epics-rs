@@ -350,7 +350,7 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// A numeric or `PvStr` member is the record's [`Record::slot_mut`] at
+/// A numeric or `PvStr` member is the record's `Record::slot_mut` at
 /// `slots::<type>::<FIELD>`, so a member the type's `.dbd` does not declare
 /// does not compile:
 ///

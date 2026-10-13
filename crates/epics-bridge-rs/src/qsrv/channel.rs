@@ -258,7 +258,7 @@ impl MemberChannel {
     }
 
     /// The value this member's channel serves, read through the `$` view it
-    /// was bound with — [`served_value`] with this member's `string_view`.
+    /// was bound with — `served_value` with this member's `string_view`.
     ///
     /// Every group path that needs a member's value goes through here rather
     /// than resolving [`Self::names`]'s field itself: the bare name has lost

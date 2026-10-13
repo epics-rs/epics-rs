@@ -143,7 +143,7 @@ pub enum Base {
 }
 
 /// A field's index in its record type's generated field table
-/// ([`Record::field_list`]) — C's `dbFldDes::offset` as a handle rather than
+/// ([`FieldDeclaration::field_list`]) — C's `dbFldDes::offset` as a handle rather than
 /// a byte count. `dbd_generated::slots::<rtype>::<FIELD>` names each one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FieldSlot(pub u16);
@@ -5932,7 +5932,7 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// C `dbFldDes::offset` for `field` (upper-case): its index in
-    /// [`Self::field_list`], settled once per link target as `dbDbInitLink`
+    /// [`FieldDeclaration::field_list`], settled once per link target as `dbDbInitLink`
     /// settles a `dbAddr`. A type hands out a slot ONLY for a field
     /// [`Self::slot_ref`] answers; `None` sends every read of the field
     /// through [`Self::get_field`] by name.

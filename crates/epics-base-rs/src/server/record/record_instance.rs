@@ -5056,7 +5056,7 @@ impl RecordInstance {
     }
 
     /// Install `link` as the stored link of `field` — its slot, else its
-    /// `dbCommon` link cache, the order [`Self::stored_link`] reads —
+    /// `dbCommon` link cache, the order `Self::stored_link` reads —
     /// and return the parse it replaced, or hand `link` back for a field that
     /// is not one of the record's links. Either way nothing is allocated or
     /// freed here: the caller builds the `Arc` before the record's hold and
@@ -7508,7 +7508,7 @@ impl RecordInstance {
     /// field goes on the wire as", run by the CA create-channel path
     /// ([`Self::client_field_value`]), the GET path
     /// ([`Self::snapshot_for_field`]) and the MONITOR path (a post's log,
-    /// [`FieldSubscriber::declared_view`]), so all three announce and serve the same
+    /// `FieldSubscriber::declared_view`), so all three announce and serve the same
     /// type.
     ///
     /// The projection is [`EpicsValue::convert_to`], the one value-coercion

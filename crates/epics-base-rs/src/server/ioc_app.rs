@@ -282,7 +282,7 @@ fn adopt_scan_owner(owner: crate::server::scan::ScanOwner) {
 /// `dbCaRun` has no analogue here: the link sets ([`crate::server::database::LinkSet`])
 /// carry no lifecycle methods, so external links keep running across a
 /// pause — see [`ioc_pause`]. The first run's connect-time CP pass sits
-/// between the two halves, in [`run_built`].
+/// between the two halves, in `run_built`.
 pub fn ioc_run() -> i32 {
     match ioc_run_begin() {
         Some(running) => {

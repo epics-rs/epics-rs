@@ -326,7 +326,7 @@ impl Dtyp {
         self.set_class(DsetClass::Detached);
     }
 
-    /// C `prec->dset == NULL` after [`Self::detach`].
+    /// C `prec->dset == NULL` after `Self::detach`.
     pub fn is_detached(&self) -> bool {
         matches!(self.class, DsetClass::Detached)
     }

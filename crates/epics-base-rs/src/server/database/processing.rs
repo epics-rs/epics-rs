@@ -382,7 +382,7 @@ impl AsyncDbHandle {
     }
 
     /// Out-of-band field post under the caller's own event mask — see
-    /// [`PvDatabase::post_fields_with_mask`]. Returns an empty `Vec` (no-op)
+    /// `PvDatabase::post_fields_with_mask`. Returns an empty `Vec` (no-op)
     /// if the database has been dropped.
     pub fn post_fields_with_mask(
         &self,

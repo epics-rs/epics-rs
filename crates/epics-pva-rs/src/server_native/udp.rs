@@ -915,7 +915,7 @@ async fn dispatch_search_outputs(
     }
 }
 
-/// IPv6 UDP responder on `socket`, the `[::]` search socket [`bind_udp`]
+/// IPv6 UDP responder on `socket`, the `[::]` search socket `bind_udp`
 /// bound on the server's UDP number. Answers `Search` queries against
 /// `source` with a `SearchResponse` containing this server's TCP port and
 /// GUID.

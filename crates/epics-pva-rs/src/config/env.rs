@@ -1041,7 +1041,7 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 /// Routes each whitespace-separated token (pvxs `split_addr_into` splits on
 /// whitespace; the comma is endpoint syntax, never a list separator)
 /// through [`Endpoint::parse`], so a `,ttl` / `@iface` token survives, and
-/// its address through the shared [`resolve_token_addr`] resolver — literal
+/// its address through the shared `resolve_token_addr` resolver — literal
 /// IP / `ip:port` / hostname / `host:port`, IPv4-preferred DNS. Unresolvable tokens are dropped with a `warn` so an
 /// operator sees a mistyped interface. One owner for both the client and
 /// server interface lists so the family cannot drift back to dropping
@@ -1049,7 +1049,7 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 ///
 /// The list comes back in pvxs's order: `split_addr_into` prints each
 /// endpoint with `default_port` filled in and sorts and dedups those strings
-/// (`config.cpp:166-182`), keyed by [`sock_endpoint_text`]. That order is
+/// (`config.cpp:166-182`), keyed by `sock_endpoint_text`. That order is
 /// load-bearing on the server, whose first interface is the one that may fall
 /// back (`server.cpp:476-486`). The port stays 0 in the entry itself, so the
 /// bind fills it from the port the server ends up with, an explicit one

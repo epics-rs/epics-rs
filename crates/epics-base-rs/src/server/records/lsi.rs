@@ -491,7 +491,7 @@ impl Record for LsiRecord {
 
     /// `devLsiSoft.c::readLocked` is `dbGetLinkLS(pinp, prec->val, prec->sizv,
     /// &prec->len)`: the read (DBR_STRING, or a char source's bytes up to
-    /// SIZV) lands in VAL through [`link_ls_read`], and LEN is `strlen + 1`. The read is
+    /// SIZV) lands in VAL through `link_ls_read`, and LEN is `strlen + 1`. The read is
     /// already VAL's text, so it skips the generic put's shape lookups and
     /// its 40-byte DBR_STRING put cap, which C's char-source read does not have.
     fn soft_input_read(

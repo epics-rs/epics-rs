@@ -2314,7 +2314,7 @@ pub(crate) enum MemberEventKind {
 /// the only consumer of member events: it resolves the marked leaves,
 /// assembles the atomic snapshot and posts the assembled update into this
 /// monitor's bounded update ring, which `PvaMonitor::poll` (or the PVA
-/// server, after [`Self::take_updates`]) reads. No per-member task exists
+/// server, after `Self::take_updates`) reads. No per-member task exists
 /// anywhere — the task cost of a group tick is O(1), not O(members).
 pub struct GroupMonitor {
     db: Arc<PvDatabase>,

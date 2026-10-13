@@ -1460,6 +1460,7 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
                 &port,
                 driver,
                 arg_int(args, 2).unwrap_or(0) as u32,
+                0,
                 &services,
                 ctx,
             )
@@ -1577,6 +1578,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 &port,
                 driver,
                 priority,
+                0,
                 &services,
                 ctx,
             ) else {
@@ -1609,6 +1611,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                     &name,
                     child,
                     priority,
+                    0,
                     &services,
                     ctx,
                 );
@@ -1687,6 +1690,7 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                 &port,
                 driver,
                 arg_int(args, 2).unwrap_or(0) as u32,
+                0,
                 &services,
                 ctx,
             )
@@ -1761,6 +1765,7 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
                 &port,
                 driver,
                 arg_int(args, 2).unwrap_or(0) as u32,
+                0,
                 &services,
                 ctx,
             )
@@ -1800,12 +1805,14 @@ fn publish_configured_port<D: PortDriver>(
     port: &str,
     driver: D,
     priority: u32,
+    stack_size: usize,
     services: &PortServices,
     ctx: &CommandContext,
 ) -> Option<PortRuntimeHandle> {
     let config = RuntimeConfig {
         services: services.clone(),
         priority,
+        stack_size,
         ..RuntimeConfig::default()
     };
     let (handle, _jh) = match create_port_runtime(driver, config) {
@@ -1823,13 +1830,16 @@ fn publish_configured_port<D: PortDriver>(
     Some(handle)
 }
 
+/// C `drvAsynFTDIPort` registers its port thread with a 500000-byte stack
+/// (drvAsynFTDIPort.cpp:586-590).
+const FTDI_STACK_SIZE: usize = 500_000;
+
 /// Build the `drvAsynFTDIPortConfigure` iocsh command.
 ///
 /// C parity: `drvAsynFTDIPort.cpp:641-660` — nine positional args
 /// (`portName`, `vendorID`, `productID`, `baudrate`, `latency`, `priority`,
 /// `noAutoConnect`, `noProcessEos`, `mode`), all but the name integers.
-/// `priority` is the port thread's band. C's 500000-byte `stackSize`
-/// (drvAsynFTDIPort.cpp:590) is not carried: the thread takes Medium.
+/// `priority` is the port thread's band.
 pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDef {
     let int_args = [
         "vendorID",
@@ -1880,6 +1890,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                 &port,
                 driver,
                 arg_int(args, 5).unwrap_or(0) as u32,
+                FTDI_STACK_SIZE,
                 &services,
                 ctx,
             )
@@ -1962,6 +1973,7 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
                 &port,
                 driver,
                 arg_int(args, 5).unwrap_or(0) as u32,
+                0,
                 &services,
                 ctx,
             )
@@ -2035,6 +2047,7 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
                 &port,
                 driver,
                 arg_int(args, 4).unwrap_or(0) as u32,
+                0,
                 &services,
                 ctx,
             )
@@ -3692,6 +3705,69 @@ mod tests {
             crate::asyn_record::get_port("iocsh_ftdi_cfg_test").is_some(),
             "port must be resolvable via the asyn_record registry"
         );
+    }
+
+    /// The FTDI port thread runs on C's 500000-byte stack
+    /// (drvAsynFTDIPort.cpp:590), not the Medium class every other driver's 0
+    /// gives. Measured from outside: the stack mapping that holds the parked
+    /// thread's stack pointer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn iocsh_ftdi_port_thread_runs_on_c_s_500000_byte_stack() {
+        let cmd = drv_asyn_ftdi_port_configure_command(PortServices::new());
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("ftdi_stack".into()),
+                ArgValue::Int(0x0403),
+                ArgValue::Int(0x6001),
+                ArgValue::Int(9600),
+                ArgValue::Int(1),
+                ArgValue::Int(0),
+                ArgValue::Int(1), // noAutoConnect
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        let got = parked_thread_stack_bytes("ftdi_stack");
+        assert!(
+            (500_000..500_000 + 64 * 1024).contains(&got),
+            "the FTDI port thread has a {got}-byte stack, C asks for 500000"
+        );
+    }
+
+    /// Size of the mapping holding the stack pointer of the thread named
+    /// `name`, read while it is parked in a syscall.
+    #[cfg(target_os = "linux")]
+    fn parked_thread_stack_bytes(name: &str) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let tid = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|t| std::fs::read_to_string(t.join("comm")).unwrap().trim_end() == name)
+            .expect("the port thread carries the port's name");
+        // `syscall` reads "running" until the thread parks, then ends "sp pc".
+        let sp = loop {
+            let line = std::fs::read_to_string(tid.join("syscall")).unwrap();
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() > 2 {
+                break usize::from_str_radix(&fields[fields.len() - 2][2..], 16).unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "{name} never parked");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .find_map(|l| {
+                let (lo, hi) = l.split_whitespace().next()?.split_once('-')?;
+                let (lo, hi) = (
+                    usize::from_str_radix(lo, 16).ok()?,
+                    usize::from_str_radix(hi, 16).ok()?,
+                );
+                (lo..hi).contains(&sp).then_some(hi - lo)
+            })
+            .expect("the stack pointer lies in a mapping")
     }
 
     /// R19-111: `vxi11Configure` exists with C's seven args

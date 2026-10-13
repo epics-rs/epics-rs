@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
 
 use tokio::sync::{broadcast, mpsc};
 
@@ -330,9 +330,13 @@ pub fn create_port_runtime_boxed(
         0 => ThreadPriority::Medium,
         p => ThreadPriority::Custom(p.min(99) as u8),
     };
+    let stack = match config.stack_size {
+        0 => StackSpec::Class(StackSizeClass::Medium),
+        raw => StackSpec::from_c(raw),
+    };
     let join_handle =
-        match MandatoryThread::new(port_name.clone(), priority, StackSizeClass::Medium).try_spawn(
-            move || {
+        match MandatoryThread::new(port_name.clone(), priority, StackSizeClass::Medium)
+            .try_spawn_sized(stack, move || {
                 let _ = event_tx_clone.send(RuntimeEvent::Started {
                     port_name: name_clone.clone(),
                 });
@@ -341,8 +345,7 @@ pub fn create_port_runtime_boxed(
                     port_name: name_clone,
                 });
                 let _ = completion_tx.send(());
-            },
-        ) {
+            }) {
             Ok(jh) => jh,
             Err(e) => {
                 // Loud at the point of failure, as C is: `printf(

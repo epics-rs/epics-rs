@@ -72,6 +72,10 @@ pub struct RuntimeConfig {
     /// C `registerPort`'s `priority`, the band of the port's thread; 0 is
     /// `epicsThreadPriorityMedium` (asynManager.c:2077).
     pub priority: u32,
+    /// C `registerPort`'s `stackSize` for the port's thread, as C reads it: 0
+    /// is `epicsThreadStackMedium` (asynManager.c:2078-2080), then 1/2 are the
+    /// Medium/Big classes and the rest bytes (`StackSpec::from_c`).
+    pub stack_size: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -82,6 +86,7 @@ impl Default for RuntimeConfig {
             supervision: SupervisionPolicy::default(),
             auto_connect_timeout: auto_connect_timeout(),
             priority: 0,
+            stack_size: 0,
             services: PortServices::global(),
         }
     }

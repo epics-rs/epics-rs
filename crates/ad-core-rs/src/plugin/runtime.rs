@@ -13,10 +13,10 @@
 //! value is written back, so the PV is honest about the accepted value rather
 //! than silently inert.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked, not waived — all 7 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(8): checked, not waived — all 8 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
-// --all-features`, 345/345). ad-core-rs became a census subject when its
+// --all-features`, 376/376). ad-core-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -31,7 +31,7 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::user::AsynUser;
-use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
 
 use asyn_rs::port_handle::PortHandle;
 
@@ -561,6 +561,8 @@ struct SharedProcessorInner {
     max_threads: i32,
     /// NumThreads — validated/clamped to [1, MaxThreads] on write (G4).
     num_threads: i32,
+    /// The band and stack every callback thread gets.
+    threads: PluginThreads,
 }
 
 impl SharedProcessorInner {
@@ -1758,9 +1760,15 @@ pub struct PluginRuntimeHandle {
     param_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
     pub ndarray_params: NDArrayDriverParams,
     pub plugin_params: PluginBaseParams,
+    threads: PluginThreads,
 }
 
 impl PluginRuntimeHandle {
+    /// The band and stack its threads were built with.
+    pub fn threads(&self) -> PluginThreads {
+        self.threads
+    }
+
     pub fn port_runtime(&self) -> &PortRuntimeHandle {
         &self.port_runtime
     }
@@ -1836,6 +1844,58 @@ impl PluginRuntimeHandle {
     }
 }
 
+/// The stack a plugin's threads get when its `*Configure` gave none.
+pub const DEFAULT_PLUGIN_STACK: StackSpec = StackSpec::Class(StackSizeClass::Medium);
+
+/// A `*Configure` command's `stackSize` as the stack its threads get.
+///
+/// `asynNDArrayDriver.cpp:876-877` turns `stackSize <= 0` into
+/// `epicsThreadGetStackSize(epicsThreadStackMedium)` before any thread sees
+/// it, so 0 is Medium here, not the Small a bare `epicsThreadCreate` 0 gives;
+/// anything else is read as `epicsThreadCreateOpt` reads it.
+pub fn plugin_stack(stack_size: i64) -> StackSpec {
+    match usize::try_from(stack_size) {
+        Ok(n) if n > 0 => StackSpec::from_c(n),
+        _ => DEFAULT_PLUGIN_STACK,
+    }
+}
+
+/// A `*Configure` command's `priority` as the band its threads get.
+///
+/// `asynNDArrayDriver.cpp:878`: `if (priority <= 0) priority =
+/// epicsThreadPriorityMedium`; anything else is the EPICS priority as given.
+pub fn plugin_priority(priority: i64) -> ThreadPriority {
+    if priority <= 0 {
+        ThreadPriority::Medium
+    } else {
+        ThreadPriority::Custom(u32::try_from(priority).unwrap_or(u32::MAX))
+    }
+}
+
+/// The band and stack of every thread one plugin creates: C++
+/// `threadPriority_` and `threadStackSize_` (`asynNDArrayDriver.cpp:876-879`),
+/// which `NDPluginDriver` hands together to each thread
+/// (`NDPluginDriver.cpp:1016`, `:1105-1107`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginThreads {
+    pub priority: ThreadPriority,
+    pub stack: StackSpec,
+}
+
+/// The threads of a plugin whose `*Configure` gave neither.
+pub const DEFAULT_PLUGIN_THREADS: PluginThreads = PluginThreads {
+    priority: ThreadPriority::Medium,
+    stack: DEFAULT_PLUGIN_STACK,
+};
+
+/// A `*Configure` command's `priority` and `stackSize`, each read as C reads it.
+pub fn plugin_threads(priority: i64, stack_size: i64) -> PluginThreads {
+    PluginThreads {
+        priority: plugin_priority(priority),
+        stack: plugin_stack(stack_size),
+    }
+}
+
 /// Create a plugin runtime with control plane (PortActor) and data plane (processing thread).
 ///
 /// Returns:
@@ -1849,6 +1909,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     queue_size: usize,
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
+    threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     create_plugin_runtime_multi_addr(
         port_name,
@@ -1858,6 +1919,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
         ndarray_port,
         wiring,
         1,
+        threads,
     )
 }
 
@@ -1872,6 +1934,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
     max_addr: usize,
+    threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     // Param change channel (control plane -> data plane)
     // B14: unbounded so control-plane param changes (e.g. autosave restoring
@@ -1972,6 +2035,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         nd_array_addr: PLUGIN_NDARRAY_ADDR,
         max_threads: PLUGIN_MAX_THREADS,
         num_threads: PLUGIN_NUM_THREADS,
+        threads,
     }));
 
     let data_enabled = enabled.clone();
@@ -1991,15 +2055,10 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // Spawn data processing thread
     let data_jh = MandatoryThread::new(
         format!("plugin-data-{port_name}"),
-        // `asynNDArrayDriver.cpp:878` — `if (priority <= 0) priority =
-        // epicsThreadPriorityMedium`, and that is what `NDPluginDriver` hands
-        // its callback threads (`NDPluginDriver.cpp:1000`).
-        ThreadPriority::Medium,
-        // `asynNDArrayDriver.cpp:876` — `if (stackSize <= 0) stackSize =
-        // epicsThreadGetStackSize(epicsThreadStackMedium)`.
+        threads.priority,
         StackSizeClass::Medium,
     )
-    .spawn(move || {
+    .spawn_sized(threads.stack, move || {
         plugin_data_loop(
             shared,
             processor,
@@ -2024,6 +2083,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         param_tx: handle_param_tx,
         ndarray_params,
         plugin_params,
+        threads,
     };
 
     (handle, data_jh)
@@ -2200,6 +2260,7 @@ fn spawn_worker_pool<P: NDPluginProcess>(
     let queue = Arc::new(WorkQueue::new());
     let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
     let size = num_threads.max(1);
+    let plugin_threads = shared.lock().threads;
     let mut threads = Vec::with_capacity(size);
     for i in 0..size {
         let queue = Arc::clone(&queue);
@@ -2211,10 +2272,10 @@ fn spawn_worker_pool<P: NDPluginProcess>(
         // gives them the driver's stack size and priority (`:1000`).
         let jh = MandatoryThread::new(
             format!("{port_name}_Plugin_{}", i + 1),
-            ThreadPriority::Medium,
+            plugin_threads.priority,
             StackSizeClass::Medium,
         )
-        .spawn(move || {
+        .spawn_sized(plugin_threads.stack, move || {
             while let Some(item) = queue.pop() {
                 // C's `beginProcessCallbacks` runs here, on the callback
                 // thread at the top of `processCallbacks` — so the cached
@@ -2926,6 +2987,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     output: NDArrayOutput,
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
+    threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     // B14: unbounded so control-plane param changes (e.g. autosave restoring
     // hundreds of PVs at IOC init) are never silently dropped before the
@@ -3008,6 +3070,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         nd_array_addr: PLUGIN_NDARRAY_ADDR,
         max_threads: PLUGIN_MAX_THREADS,
         num_threads: PLUGIN_NUM_THREADS,
+        threads,
     }));
 
     let data_enabled = enabled.clone();
@@ -3026,15 +3089,10 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 
     let data_jh = MandatoryThread::new(
         format!("plugin-data-{port_name}"),
-        // `asynNDArrayDriver.cpp:878` — `if (priority <= 0) priority =
-        // epicsThreadPriorityMedium`, and that is what `NDPluginDriver` hands
-        // its callback threads (`NDPluginDriver.cpp:1000`).
-        ThreadPriority::Medium,
-        // `asynNDArrayDriver.cpp:876` — `if (stackSize <= 0) stackSize =
-        // epicsThreadGetStackSize(epicsThreadStackMedium)`.
+        threads.priority,
         StackSizeClass::Medium,
     )
-    .spawn(move || {
+    .spawn_sized(threads.stack, move || {
         plugin_data_loop(
             shared,
             processor,
@@ -3059,6 +3117,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         param_tx: handle_param_tx,
         ndarray_params,
         plugin_params,
+        threads,
     };
 
     (handle, data_jh)
@@ -3294,6 +3353,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -3318,6 +3378,7 @@ mod tests {
             10,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -3345,6 +3406,7 @@ mod tests {
             10,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
 
         // Verify port name
@@ -3372,6 +3434,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
         let port = handle.port_runtime().port_handle().clone();
@@ -3414,6 +3477,7 @@ mod tests {
             10,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
 
         // Drop the handle (closes sender channel, which should cause data thread to exit)
@@ -3446,6 +3510,7 @@ mod tests {
             "",
             wiring.clone(),
             2,
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&up_handle);
 
@@ -3503,6 +3568,7 @@ mod tests {
                 "",
                 wiring.clone(),
                 1,
+                DEFAULT_PLUGIN_THREADS,
             );
             enable_callbacks(&up);
             ups.push((up, jh));
@@ -3515,6 +3581,7 @@ mod tests {
             "UP_A",
             wiring.clone(),
             2,
+            DEFAULT_PLUGIN_THREADS,
         );
         wiring.rewire(handle.array_sender(), "", "UP_A").unwrap();
         let (down, mut down_rx) = ndarray_channel("DOWN", 10);
@@ -3570,6 +3637,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -3594,6 +3662,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -3638,6 +3707,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
 
         // Disable callbacks
@@ -3681,8 +3751,15 @@ mod tests {
         const LAST: i32 = 5;
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
-        let (handle, _jh) =
-            create_plugin_runtime("DISABLE_MID", processor, pool, 8, "", test_wiring());
+        let (handle, _jh) = create_plugin_runtime(
+            "DISABLE_MID",
+            processor,
+            pool,
+            8,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         enable_callbacks(&handle);
 
@@ -3748,6 +3825,7 @@ mod tests {
             4,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
         let p = handle.ndarray_params;
@@ -3814,6 +3892,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -3852,6 +3931,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -3965,6 +4045,7 @@ mod tests {
             NDArrayOutput::new(),
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
         let read = |reason: usize| port.read_int32_blocking(reason, 0);
@@ -4063,6 +4144,7 @@ mod tests {
             NDArrayOutput::new(),
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
         // NumThreads is clamped to [1, MaxThreads] (C `createCallbackThreads`
@@ -4094,6 +4176,189 @@ mod tests {
         );
     }
 
+    /// Records the stack of the thread each hook runs on: `on_param_change`
+    /// on the data thread, `process_array` on a callback thread.
+    #[derive(Clone, Default)]
+    struct StackProbe {
+        data: Arc<parking_lot::Mutex<Vec<usize>>>,
+        callback: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl NDPluginProcess for StackProbe {
+        fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            let bytes = epics_libcom_rs::runtime::task::current_thread_stack_bytes();
+            self.callback.lock().push(bytes.expect("stack readback"));
+            ProcessResult::empty()
+        }
+        fn on_param_change(
+            &self,
+            _reason: usize,
+            _params: &PluginParamSnapshot,
+        ) -> ParamChangeResult {
+            let bytes = epics_libcom_rs::runtime::task::current_thread_stack_bytes();
+            self.data.lock().push(bytes.expect("stack readback"));
+            ParamChangeResult::empty()
+        }
+        fn plugin_type(&self) -> &str {
+            "StackProbe"
+        }
+    }
+
+    /// A configured `stackSize` is the stack of the data thread and of every
+    /// callback thread, including the ones a NumThreads write respawns: C
+    /// hands `threadStackSize_` to all of them (asynNDArrayDriver.cpp:876-877,
+    /// NDPluginDriver.cpp:1000).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_configured_stack_size_is_the_stack_of_every_plugin_thread() {
+        // glibc hands a new thread the cached stack of an exited one when it
+        // is up to 4x the request, and the readback reports that block, so
+        // each value runs in a child of its own, where every exited thread is
+        // one of the plugin's.
+        const CHILD: &str = "AD_CORE_STACK_PIN_RAW";
+        let Some(raw) = std::env::var_os(CHILD) else {
+            let name = "plugin::runtime::tests::a_configured_stack_size_is_the_stack_of_every_plugin_thread";
+            for raw in ["0", "-1", "1", "2", "500000"] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--nocapture"])
+                    .env(CHILD, raw)
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    out.status.success() && stdout.contains("1 passed"),
+                    "stackSize {raw}: {stdout}{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        };
+        let raw: i64 = raw.to_str().unwrap().parse().unwrap();
+        let spec = match raw {
+            500_000 => StackSpec::Bytes(500_000),
+            2 => StackSpec::Class(StackSizeClass::Big),
+            _ => StackSpec::Class(StackSizeClass::Medium),
+        };
+        assert_eq!(plugin_stack(raw), spec, "stackSize {raw}");
+        // glibc reports 499968 for a 500000 request.
+        let within = |got: usize, want: usize| got <= want && want - got <= 64;
+        // Frames go out from this thread: `send_array`'s helper thread would
+        // leave a 2 MiB stack in the cache.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let publish = |handle: &PluginRuntimeHandle, id| {
+            rt.block_on(handle.array_sender().publish(make_test_array(id)))
+        };
+        let probe = StackProbe::default();
+        let (handle, _data_jh) = create_plugin_runtime(
+            &format!("STACK_{raw}"),
+            probe.clone(),
+            NDArrayPool::new(1_000_000),
+            10,
+            "",
+            test_wiring(),
+            plugin_threads(0, raw),
+        );
+        assert_eq!(handle.threads().stack, spec);
+        enable_callbacks(&handle);
+        publish(&handle, 1);
+        params_applied(&handle);
+
+        let port = handle.port_runtime().port_handle();
+        port.write_int32_blocking(handle.plugin_params.max_threads, 0, 2)
+            .unwrap();
+        port.write_int32_blocking(handle.plugin_params.num_threads, 0, 2)
+            .unwrap();
+        params_applied(&handle);
+        publish(&handle, 2);
+        params_applied(&handle);
+
+        let want = spec.bytes();
+        let data = probe.data.lock().clone();
+        let callback = probe.callback.lock().clone();
+        assert!(!data.is_empty(), "stackSize {raw}: no data-thread hook ran");
+        assert_eq!(callback.len(), 2, "stackSize {raw}: one frame per pool");
+        for got in data.iter().chain(&callback) {
+            assert!(
+                within(*got, want),
+                "stackSize {raw}: a plugin thread has {got} bytes of stack, want {want} \
+                     (data {data:?}, callback {callback:?})"
+            );
+        }
+    }
+
+    /// A configured `priority` is the band of the data thread and of every
+    /// callback thread, including the ones a NumThreads write respawns, and
+    /// `priority <= 0` is Medium (asynNDArrayDriver.cpp:878,
+    /// NDPluginDriver.cpp:1016).
+    #[test]
+    fn a_configured_priority_is_the_band_of_every_plugin_thread() {
+        // A thread registers in its own prologue, after the spawn returns.
+        let osipri = |name: &str| -> Vec<u32> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let rows: Vec<u32> = epics_libcom_rs::runtime::task::thread_report()
+                    .iter()
+                    .filter(|t| t.name() == name)
+                    .map(|t| t.epics_priority())
+                    .collect();
+                if !rows.is_empty() || std::time::Instant::now() > deadline {
+                    return rows;
+                }
+                std::thread::yield_now();
+            }
+        };
+        let cases = [(0, 50), (-1, 50), (1, 1), (30, 30), (200, 200)];
+        for (with_output, (raw, want)) in [false, true]
+            .into_iter()
+            .flat_map(|o| cases.map(|c| (o, c)))
+        {
+            let port = format!("PRIO_{with_output}_{raw}");
+            let (handle, _data_jh) = if with_output {
+                create_plugin_runtime_with_output(
+                    &port,
+                    StackProbe::default(),
+                    NDArrayPool::new(1_000_000),
+                    10,
+                    NDArrayOutput::new(),
+                    "",
+                    test_wiring(),
+                    plugin_threads(raw, 0),
+                )
+            } else {
+                create_plugin_runtime(
+                    &port,
+                    StackProbe::default(),
+                    NDArrayPool::new(1_000_000),
+                    10,
+                    "",
+                    test_wiring(),
+                    plugin_threads(raw, 0),
+                )
+            };
+            enable_callbacks(&handle);
+            let p = handle.port_runtime().port_handle();
+            p.write_int32_blocking(handle.plugin_params.max_threads, 0, 2)
+                .unwrap();
+            p.write_int32_blocking(handle.plugin_params.num_threads, 0, 2)
+                .unwrap();
+            params_applied(&handle);
+            for name in [
+                format!("plugin-data-{port}"),
+                format!("{port}_Plugin_1"),
+                format!("{port}_Plugin_2"),
+            ] {
+                // A respawned pool's old thread may not have deregistered yet.
+                let rows = osipri(&name);
+                assert!(
+                    !rows.is_empty() && rows.iter().all(|p| *p == want),
+                    "priority {raw}: {name} has {rows:?}, want {want}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_default_num_threads_processes_one_frame_at_a_time() {
         // C's constructor starts NumThreads at 1 (NDPluginDriver.cpp:159), so
@@ -4112,6 +4377,7 @@ mod tests {
             NDArrayOutput::new(),
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
         for id in 1..=2 {
@@ -4141,6 +4407,7 @@ mod tests {
             NDArrayOutput::new(),
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
         let p = &handle.ndarray_params;
@@ -4219,6 +4486,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
         enable_callbacks(&handle);
@@ -4274,6 +4542,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -4349,6 +4618,7 @@ mod tests {
             10,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -4408,6 +4678,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -4472,6 +4743,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -4513,6 +4785,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
         let dropped = handle.array_sender().dropped_arrays_counter().clone();
@@ -4571,6 +4844,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
         let port = handle.port_runtime().port_handle().clone();
@@ -4656,6 +4930,7 @@ mod tests {
                 output,
                 "",
                 test_wiring(),
+                DEFAULT_PLUGIN_THREADS,
             );
             enable_callbacks(&handle);
             let port = handle.port_runtime().port_handle().clone();
@@ -4685,6 +4960,7 @@ mod tests {
                 output,
                 "",
                 test_wiring(),
+                DEFAULT_PLUGIN_THREADS,
             );
             enable_callbacks(&handle);
             let port = handle.port_runtime().port_handle().clone();
@@ -4718,6 +4994,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -4779,6 +5056,7 @@ mod tests {
             output,
             "",
             test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&handle);
 
@@ -4823,8 +5101,15 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         // Downstream plugin with queue size 1 and a slow processor.
-        let (downstream_handle, _ds_jh) =
-            create_plugin_runtime("B1_DOWNSTREAM", SlowProcessor, pool, 1, "", test_wiring());
+        let (downstream_handle, _ds_jh) = create_plugin_runtime(
+            "B1_DOWNSTREAM",
+            SlowProcessor,
+            pool,
+            1,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
         enable_callbacks(&downstream_handle);
         let ds_sender = downstream_handle.array_sender().clone();
         let dropped = ds_sender.dropped_arrays_counter().clone();
@@ -5089,8 +5374,15 @@ mod tests {
         const OFFERED: usize = 20;
         let pool = NDArrayPool::new(1_000_000);
         let (processor, _entered, gated) = GatedProcessor::new();
-        let (handle, _jh) =
-            create_plugin_runtime("QSIZE_TEST", processor, pool, 2, "", test_wiring());
+        let (handle, _jh) = create_plugin_runtime(
+            "QSIZE_TEST",
+            processor,
+            pool,
+            2,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         enable_callbacks(&handle);
 
@@ -5150,8 +5442,15 @@ mod tests {
         const DEPTH: usize = 2;
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
-        let (handle, _jh) =
-            create_plugin_runtime("MINCB_PRESSURE", processor, pool, DEPTH, "", test_wiring());
+        let (handle, _jh) = create_plugin_runtime(
+            "MINCB_PRESSURE",
+            processor,
+            pool,
+            DEPTH,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         enable_callbacks(&handle);
         // Long enough that nothing after the first frame can pass the gate,
@@ -5219,8 +5518,15 @@ mod tests {
         }
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
-        let (handle, _jh) =
-            create_plugin_runtime("COMPR_PRESSURE", processor, pool, 2, "", test_wiring());
+        let (handle, _jh) = create_plugin_runtime(
+            "COMPR_PRESSURE",
+            processor,
+            pool,
+            2,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         enable_callbacks(&handle);
 
@@ -5259,8 +5565,15 @@ mod tests {
     fn test_process_plugin_queues_behind_the_backlog() {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
-        let (handle, _jh) =
-            create_plugin_runtime("PPORDER_TEST", processor, pool, 8, "", test_wiring());
+        let (handle, _jh) = create_plugin_runtime(
+            "PPORDER_TEST",
+            processor,
+            pool,
+            8,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         enable_callbacks(&handle);
 
@@ -5304,8 +5617,15 @@ mod tests {
     fn test_process_plugin_is_refused_when_the_queue_is_full() {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
-        let (handle, _jh) =
-            create_plugin_runtime("PPFULL_TEST", processor, pool, 1, "", test_wiring());
+        let (handle, _jh) = create_plugin_runtime(
+            "PPFULL_TEST",
+            processor,
+            pool,
+            1,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         enable_callbacks(&handle);
 

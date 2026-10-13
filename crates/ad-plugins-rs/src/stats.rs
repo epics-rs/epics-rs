@@ -2136,6 +2136,7 @@ pub fn create_stats_runtime(
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
     ts_registry: &crate::time_series::TsReceiverRegistry,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     Arc<Mutex<StatsResult>>,
@@ -2156,6 +2157,7 @@ pub fn create_stats_runtime(
         queue_size,
         ndarray_port,
         wiring,
+        threads,
     );
 
     let stats_params = *params_handle.lock();
@@ -3206,8 +3208,15 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let ts_registry = crate::time_series::TsReceiverRegistry::new();
-        let (handle, stats, _params, _jh) =
-            create_stats_runtime("STATS_RT", pool, 10, "", wiring, &ts_registry);
+        let (handle, stats, _params, _jh) = create_stats_runtime(
+            "STATS_RT",
+            pool,
+            10,
+            "",
+            wiring,
+            &ts_registry,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         // Plugins default to disabled — enable for test, and fence until the
         // data thread has applied the flip (the write only queues it).

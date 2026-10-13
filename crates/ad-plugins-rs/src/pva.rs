@@ -736,6 +736,7 @@ mod tests {
             10,
             "",
             Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
         );
         let dropped = handle.array_sender().dropped_arrays_counter().clone();
         handle

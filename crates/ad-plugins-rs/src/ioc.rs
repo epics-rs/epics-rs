@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use ad_core_rs::ioc::{
     PluginManager, attr_arg_defs, count_arg, dtyp_from_port, extract_plugin_args, gather_arg_defs,
     max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
+    threads_arg,
 };
 use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
@@ -48,6 +49,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     pool,
                     &ndarray_port,
                     m.wiring().clone(),
+                    threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) =
@@ -85,6 +87,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &ndarray_port,
                     m.wiring().clone(),
                     &tsr,
+                    threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
 
@@ -122,6 +125,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     queue_size,
                     &ndarray_port,
                     m.wiring().clone(),
+                    threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) =
@@ -144,7 +148,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDProcessConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::process::{ProcessConfig, ProcessProcessor};
             create_plugin_runtime(
                 port_name,
@@ -153,6 +158,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -162,7 +168,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDTransformConfigure",
         plugin_arg_defs(),
         Some(9),
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::transform::{TransformProcessor, TransformType};
             create_plugin_runtime(
                 port_name,
@@ -171,6 +178,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -180,7 +188,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDColorConvertConfigure",
         plugin_arg_defs(),
         Some(9),
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::color_convert::{ColorConvertConfig, ColorConvertProcessor};
             use ad_core_rs::color::{NDBayerPattern, NDColorMode};
             let config = ColorConvertConfig {
@@ -195,6 +204,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -226,6 +236,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &ndarray_port,
                     m.wiring().clone(),
                     max_overlays,
+                    threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
                 if let Err(e) =
@@ -248,7 +259,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFFTConfigure",
         plugin_arg_defs(),
         Some(9),
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::fft::FFTProcessor;
             create_plugin_runtime(
                 port_name,
@@ -257,6 +269,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -266,7 +279,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDCircularBuffConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Fixed(2_000_000),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::circular_buff::{CircularBuffProcessor, TriggerCondition};
             create_plugin_runtime(
                 port_name,
@@ -277,6 +291,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -286,7 +301,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDCodecConfigure",
         plugin_arg_defs(),
         Some(9),
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::codec::{CodecMode, CodecProcessor};
             use ad_core_rs::codec::CodecName;
             create_plugin_runtime(
@@ -299,6 +315,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -308,7 +325,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDScatterConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::scatter::ScatterProcessor;
             create_plugin_runtime(
                 port_name,
@@ -317,6 +335,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -351,6 +370,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     "",
                     m.wiring().clone(),
                     max_ports,
+                    threads_arg(args, 7),
                 );
                 if let Err(e) =
                     m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
@@ -435,6 +455,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &in_port,
                     m.wiring().clone(),
                     max_addr,
+                    threads_arg(args, 9),
                 );
                 if let Err(e) =
                     m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
@@ -456,7 +477,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileTIFFConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(6),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::file_tiff::TiffFileProcessor;
             create_plugin_runtime(
                 port_name,
@@ -465,6 +487,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -474,7 +497,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileJPEGConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(6),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::file_jpeg::JpegFileProcessor;
             create_plugin_runtime(
                 port_name,
@@ -483,6 +507,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -492,7 +517,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileHDF5Configure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(6),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::file_hdf5::Hdf5FileProcessor;
             create_plugin_runtime(
                 port_name,
@@ -501,6 +527,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -510,7 +537,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileNetCDFConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(6),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::file_netcdf::NetcdfFileProcessor;
             create_plugin_runtime(
                 port_name,
@@ -519,6 +547,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -528,7 +557,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileMagickConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(6),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::file_magick::MagickFileProcessor;
             create_plugin_runtime(
                 port_name,
@@ -537,6 +567,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -569,6 +600,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                     &tsr,
                     max_attributes,
+                    threads_arg(args, 9),
                 );
                 if let Err(e) =
                     m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
@@ -607,6 +639,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                     count_arg(args, 5),
                     &tsr,
+                    threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
                 if let Err(e) =
@@ -631,7 +664,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDBadPixelConfigure",
         plugin_arg_defs(),
         Some(9),
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::bad_pixel::BadPixelProcessor;
             create_plugin_runtime(
                 port_name,
@@ -640,6 +674,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -650,7 +685,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileNexusConfigure",
         plugin_arg_defs(),
         None,
-        |port_name, queue_size, ndarray_port, pool, wiring| {
+        PluginThreadArgs::Arg(6),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
             use crate::file_nexus::NexusFileProcessor;
             create_plugin_runtime(
                 port_name,
@@ -659,6 +695,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 queue_size,
                 ndarray_port,
                 wiring,
+                threads,
             )
         },
     );
@@ -682,6 +719,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     );
                     return Ok(CommandOutcome::Continue);
                 }
+                // One read for both ports below: C builds the same plugin either way.
+                let threads = threads_arg(args, 9);
 
                 // Look up the pending receiver from the upstream plugin
                 let (ts_rx, channel_names) = match tsr.take(&ndarray_port) {
@@ -708,6 +747,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                             // C maxAddr = maxSignals + 1 (the 2-D array callback
                             // address is reserved at addr == maxSignals).
                             max_signals + 1,
+                            threads,
                         );
                         if let Err(e) =
                             m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
@@ -738,6 +778,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                         2048,
                         ts_rx,
                         drv.pool(),
+                        threads,
                     );
                 if let Err(e) =
                     m.add_port(&dtyp, ts_runtime, ctx.db().scan_control().interrupt_gate())
@@ -816,6 +857,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     queue_size,
                     &ndarray_port,
                     m.wiring().clone(),
+                    threads_arg(args, 9),
                 );
                 if let Err(e) =
                     m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
@@ -853,6 +895,16 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
     app
 }
 
+/// Where a generic plugin's thread priority and stack come from.
+#[derive(Clone, Copy)]
+enum PluginThreadArgs {
+    /// The command's `stackSize` argument at this index, `priority` before it.
+    Arg(usize),
+    /// A command with neither argument, whose C passes priority 0 and this
+    /// stack (`NDCircularBuffConfigure`: 2000000, NDPluginCircularBuff.cpp:465).
+    Fixed(i64),
+}
+
 /// Register one plugin `*Configure` command whose only arguments this crate
 /// reads are `portName`, `queueSize` and `NDArrayPort`.
 ///
@@ -868,6 +920,7 @@ fn register_generic_plugin<F>(
     cmd_name: &'static str,
     arg_defs: Vec<ArgDesc>,
     max_threads_idx: Option<usize>,
+    thread_args: PluginThreadArgs,
     factory: F,
 ) -> IocApplication
 where
@@ -877,6 +930,7 @@ where
             &str,
             Arc<ad_core_rs::ndarray_pool::NDArrayPool>,
             Arc<WiringRegistry>,
+            ad_core_rs::plugin::runtime::PluginThreads,
         ) -> (
             ad_core_rs::plugin::runtime::PluginRuntimeHandle,
             std::thread::JoinHandle<()>,
@@ -902,12 +956,19 @@ where
             }
             let drv = m.driver()?;
             let pool = drv.pool();
+            let threads = match thread_args {
+                PluginThreadArgs::Arg(idx) => threads_arg(args, idx),
+                PluginThreadArgs::Fixed(bytes) => {
+                    ad_core_rs::plugin::runtime::plugin_threads(0, bytes)
+                }
+            };
             let (handle, _jh) = factory(
                 &port_name,
                 queue_size,
                 &ndarray_port,
                 pool,
                 m.wiring().clone(),
+                threads,
             );
             if let Some(idx) = max_threads_idx {
                 handle.set_max_threads(max_threads_arg(args, idx));

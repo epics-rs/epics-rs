@@ -11,7 +11,7 @@ use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
 // Same types as `epics_libcom_rs::runtime::task` — `epics-base-rs` re-exports
 // the runtime layer, and this crate already depends on it unconditionally.
-use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass};
 use parking_lot::Mutex;
 
 // ===== Stats-specific channel definitions =====
@@ -690,6 +690,7 @@ pub fn create_ts_port_runtime(
     num_points: usize,
     data_rx: TimeSeriesReceiver,
     pool: Arc<NDArrayPool>,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PortRuntimeHandle,
     TSParams,
@@ -736,10 +737,10 @@ pub fn create_ts_port_runtime(
     // than returning a status the plugin carries on from.
     let data_jh = MandatoryThread::new(
         format!("ts-data-{port_name}"),
-        ThreadPriority::Medium,
+        threads.priority,
         StackSizeClass::Medium,
     )
-    .spawn(move || {
+    .spawn_sized(threads.stack, move || {
         ts_data_thread(shared, data_rx);
     });
 
@@ -1333,8 +1334,14 @@ mod tests {
     #[test]
     fn test_create_ts_port_runtime() {
         let (_tx, rx) = tokio::sync::mpsc::channel(16);
-        let (handle, params, _actor_jh, _data_jh) =
-            create_ts_port_runtime("TEST_TS_RT", &TEST_CHANNELS, 100, rx, test_pool());
+        let (handle, params, _actor_jh, _data_jh) = create_ts_port_runtime(
+            "TEST_TS_RT",
+            &TEST_CHANNELS,
+            100,
+            rx,
+            test_pool(),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
         assert_eq!(handle.port_name(), "TEST_TS_RT");
         assert_eq!(params.channel_names.len(), 3);
         handle.shutdown();

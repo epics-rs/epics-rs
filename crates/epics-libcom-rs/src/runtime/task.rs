@@ -1193,9 +1193,9 @@ pub fn runtime_handle() -> tokio::runtime::Handle {
 // ---------------------------------------------------------------------------
 
 /// Minimum EPICS thread priority (`epicsThreadPriorityMin`).
-pub const PRIORITY_MIN: u8 = 0;
+pub const PRIORITY_MIN: u32 = 0;
 /// Maximum EPICS thread priority (`epicsThreadPriorityMax`).
-pub const PRIORITY_MAX: u8 = 99;
+pub const PRIORITY_MAX: u32 = 99;
 
 /// EPICS thread priority — an integer `0..=99` with the named levels
 /// from `epicsThreadPriority*` (`epicsThread.h:73-83`). Lower values
@@ -1219,21 +1219,22 @@ pub enum ThreadPriority {
     High,
     /// `epicsThreadPriorityIocsh` = 91.
     Iocsh,
-    /// An explicit priority value, clamped to `0..=99` on use.
-    Custom(u8),
+    /// An explicit priority value, kept as given: C stores any `unsigned
+    /// int` as `osiPriority` (`osdThread.c:219`) and scales it unclamped.
+    Custom(u32),
 }
 
 impl ThreadPriority {
-    /// The raw EPICS priority value `0..=99`, matching the
-    /// `epicsThreadPriority*` constants in `epicsThread.h`.
+    /// The raw EPICS priority value, matching the `epicsThreadPriority*`
+    /// constants in `epicsThread.h`; a [`Custom`](Self::Custom) one as given.
     ///
     /// `const` so a server can *derive* its band from the named one C derives
     /// it from — `CaServerLow - 2` rather than a bare `18` with a comment
     /// asserting the two are the same number. C builds exactly that ladder at
     /// `caservertask.c:563-575`; restating its output as a literal is how the
     /// ladder and its constants come to disagree.
-    pub const fn value(self) -> u8 {
-        let v = match self {
+    pub const fn value(self) -> u32 {
+        match self {
             ThreadPriority::Low => 10,
             ThreadPriority::CaServerLow => 20,
             ThreadPriority::CaServerHigh => 40,
@@ -1243,9 +1244,7 @@ impl ThreadPriority {
             ThreadPriority::High => 90,
             ThreadPriority::Iocsh => 91,
             ThreadPriority::Custom(v) => v,
-        };
-        // `Ord::min` is not `const`; the clamp is the same one.
-        if v > PRIORITY_MAX { PRIORITY_MAX } else { v }
+        }
     }
 }
 
@@ -1331,20 +1330,83 @@ impl StackSpec {
     }
 
     /// The bytes the builder gets: a class as [`StackSizeClass::bytes`], a
-    /// byte count raised to `PTHREAD_STACK_MIN` if smaller. C instead only
-    /// logs the `EINVAL` and keeps the attr's default (`osdThread.c:213-214`).
+    /// byte count as given. A count `pthread_attr_setstacksize` refuses
+    /// (below `PTHREAD_STACK_MIN`) gets the attr's default, as C's thread does
+    /// when it prints the `EINVAL` and goes on (`osdThread.c:213-214`).
     pub fn bytes(self) -> usize {
         match self {
             Self::Class(class) => class.bytes(),
-            Self::Bytes(n) => n.max(PTHREAD_STACK_MIN),
+            Self::Bytes(_) if self.refused() => pthread_default_stack_bytes(),
+            Self::Bytes(n) => n,
         }
     }
+
+    fn refused(self) -> bool {
+        matches!(self, Self::Bytes(n) if n < PTHREAD_STACK_MIN)
+    }
+}
+
+/// C's `checkStatusOnce(status, message)` line (`osdThread.c:116-118`), which
+/// C writes to stderr: `"%s error %s\n"` with `strerror(status)`.
+fn check_status_once_line(message: &str, status: i32) -> String {
+    #[cfg(unix)]
+    // SAFETY: `strerror` returns a NUL-terminated string that stays valid
+    // until the next `strerror` call; it is copied out at once.
+    let text = unsafe { std::ffi::CStr::from_ptr(libc::strerror(status)) }
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(unix))]
+    let text = std::io::Error::from_raw_os_error(status).to_string();
+    format!("{message} error {text}")
+}
+
+/// The stack a fresh `pthread_attr_t` carries, which is what a C thread keeps
+/// when its `stackSize` is refused.
+#[cfg(unix)]
+fn pthread_default_stack_bytes() -> usize {
+    // SAFETY: `attr` is initialised by `pthread_attr_init` before it is read
+    // and destroyed once; `bytes` is a valid out-pointer.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        libc::pthread_attr_init(&mut attr);
+        let mut bytes = 0;
+        libc::pthread_attr_getstacksize(&attr, &mut bytes);
+        libc::pthread_attr_destroy(&mut attr);
+        bytes
+    }
+}
+
+#[cfg(not(unix))]
+fn pthread_default_stack_bytes() -> usize {
+    PTHREAD_STACK_MIN
 }
 
 impl From<StackSizeClass> for StackSpec {
     fn from(class: StackSizeClass) -> Self {
         Self::Class(class)
     }
+}
+
+/// The calling thread's stack size as `pthread_getattr_np` reports it — the
+/// readback a test needs to see what [`StackSpec`] a thread was given.
+/// `None` where glibc's call is unavailable.
+pub fn current_thread_stack_bytes() -> Option<usize> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `attr` is initialised by `pthread_getattr_np` before it is read
+    // and destroyed once; both out-pointers are valid locals.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return None;
+        }
+        let mut addr: *mut libc::c_void = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
+        libc::pthread_attr_destroy(&mut attr);
+        (rc == 0).then_some(size)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    None
 }
 
 #[cfg(unix)]
@@ -2102,8 +2164,8 @@ impl ThreadInfo {
         self.os_id
     }
 
-    /// The `OSIPRI` column: the EPICS priority, 0..=99.
-    pub fn epics_priority(&self) -> u8 {
+    /// The `OSIPRI` column: the EPICS priority as given (C `osiPriority`).
+    pub fn epics_priority(&self) -> u32 {
         self.priority.value()
     }
 
@@ -2408,7 +2470,8 @@ fn probe_fifo_range() -> RtRange {
     }
 }
 
-/// Map an EPICS priority `0..=99` onto the permitted SCHED_FIFO range.
+/// Map an EPICS priority onto the permitted SCHED_FIFO range. Above 99 it lands
+/// past `max`, unclamped as C's is, and the scheduler refuses it.
 ///
 /// C parity: `epicsThreadGetPosixPriority` (`osdThread.c:129-144`) — the
 /// POSIX counterpart of the `epicsThreadGetOssPriorityValue` used on
@@ -2419,17 +2482,14 @@ fn probe_fifo_range() -> RtRange {
 /// arm of the cfg exists so the two maps can be compared in one process
 /// on the host; without it the divergence test would silently vanish.
 #[cfg(any(target_os = "linux", test))]
-fn map_epics_priority(epics_priority: u8, min: i32, max: i32) -> i32 {
+fn map_epics_priority(epics_priority: u32, min: i32, max: i32) -> i32 {
     // `osdThread.c:133-134`: a degenerate range collapses to one level.
     if max == min {
         return max;
     }
     let slope = (max - min) as f64 / 100.0;
     let oss = epics_priority as f64 * slope + min as f64;
-    // `ThreadPriority::value` caps at 99 and the slope is over 100, so this
-    // cannot exceed `max`; the clamp guards the probed bounds, which are
-    // runtime values rather than compile-time constants.
-    (oss as i32).clamp(min, max)
+    oss as i32
 }
 
 /// The highest RTEMS *core* priority number, i.e. the least urgent level.
@@ -2459,7 +2519,7 @@ const RTEMS_MAXIMUM_PRIORITY: i32 = 255;
 /// occupies core `100..=199` and nothing else can be reached — which is the
 /// property [`map_epics_priority_rtems`] is chosen for.
 #[cfg(any(target_os = "rtems", test))]
-const fn rtems_core_priority(epics_priority: u8) -> i32 {
+const fn rtems_core_priority(epics_priority: u32) -> i32 {
     if epics_priority > 99 {
         100
     } else {
@@ -2506,7 +2566,7 @@ const fn rtems_core_priority(epics_priority: u8) -> i32 {
 /// see `rtems_priority_map_stays_below_the_libbsd_network_band`, which
 /// asserts the non-strict `core >= 100` this tie actually produces.
 #[cfg(any(target_os = "rtems", test))]
-pub(crate) fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_rtems(epics_priority: u32) -> i32 {
     RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
 }
 
@@ -2532,8 +2592,49 @@ pub(crate) fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 /// change to the RTEMS core-priority mechanism cannot silently move the
 /// VxWorks value with it.
 #[cfg(any(target_os = "vxworks", test))]
-pub(crate) fn map_epics_priority_vxworks(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_vxworks(epics_priority: u32) -> i32 {
+    // C's own vxWorks `getOssPriorityValue` takes anything above 99 as 99
+    // (`vxWorks/osdThread.c:99-105`).
     56 + epics_priority.min(99) as i32
+}
+
+/// C's refusal to create a thread whose priority maps past the SCHED_FIFO
+/// range: `setSchedulingPolicy`'s `pthread_attr_setschedparam` fails EINVAL,
+/// the attr keeps FIFO with `sched_priority` 0, and `pthread_create` refuses
+/// it too, so `epicsThreadCreate` returns NULL after printing both statuses
+/// (`osdThread.c:160-162`, `:672-680`). Every thread constructor that can
+/// report failure asks here before it creates anything.
+#[cfg(target_os = "linux")]
+fn fifo_attr_refusal(priority: ThreadPriority) -> Option<std::io::Error> {
+    if RtPolicy::current() != RtPolicy::AllowRealtime {
+        return None;
+    }
+    let RtRange::Available { min, max } = permitted_fifo_range() else {
+        return None;
+    };
+    let oss = map_epics_priority(priority.value(), min, max);
+    // glibc's `pthread_attr_setschedparam` checks the policy's nominal range,
+    // not the RLIMIT_RTPRIO ceiling the probe found.
+    // SAFETY: both take only an int policy and have no preconditions.
+    let nominal = unsafe {
+        libc::sched_get_priority_min(libc::SCHED_FIFO)
+            ..=libc::sched_get_priority_max(libc::SCHED_FIFO)
+    };
+    if nominal.contains(&oss) {
+        return None;
+    }
+    eprintln!(
+        "{}",
+        check_status_once_line("pthread_attr_setschedparam", libc::EINVAL)
+    );
+    eprintln!("{}", check_status_once_line("pthread_create", libc::EINVAL));
+    Some(std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// No target but Linux maps a priority outside its settable range.
+#[cfg(not(target_os = "linux"))]
+fn fifo_attr_refusal(_priority: ThreadPriority) -> Option<std::io::Error> {
+    None
 }
 
 /// Ask the OS for SCHED_FIFO at `oss` on the **calling** thread. The single
@@ -2711,7 +2812,7 @@ fn warn_rt_denied_once() {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     let (min, max) = match permitted_fifo_range() {
         RtRange::Unsupported => return PriorityApplied::Unsupported,
         RtRange::Denied => {
@@ -2739,7 +2840,7 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 }
 
 #[cfg(target_os = "rtems")]
-fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     // Without this, every IOC thread runs at one level just above idle:
     // `cpukit/posix/src/pthreadattrdefault.c:49-58` (both `rtems` pins) sets
     // `inheritsched = PTHREAD_INHERIT_SCHED` in the default attribute set and
@@ -2781,7 +2882,7 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 /// [`map_epics_priority_vxworks`]'s fixed image is inside the settable range
 /// by construction. There is nothing to discover on this target either.
 #[cfg(target_os = "vxworks")]
-fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     let oss = map_epics_priority_vxworks(epics_priority);
     let rc = set_fifo_priority(oss);
     if rc == 0 {
@@ -2799,7 +2900,7 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 }
 
 #[cfg(not(any(target_os = "linux", epics_embedded_target)))]
-fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(_epics_priority: u32) -> PriorityApplied {
     // No OS-scheduler priority API is wired on other targets. The three that
     // are wired each needed a *measured* target band before they could be:
     // Linux probes for its settable ceiling at runtime, RTEMS's map is
@@ -2966,6 +3067,9 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    if let Some(refused) = fifo_attr_refusal(priority) {
+        return Err(refused);
+    }
     let ambient = InheritedRuntime::capture();
     let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
@@ -3051,6 +3155,9 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    if let Some(refused) = fifo_attr_refusal(priority) {
+        return Err(refused);
+    }
     let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
@@ -3122,8 +3229,17 @@ impl MandatoryThread {
     where
         F: FnOnce() + Send + 'static,
     {
+        let stack = StackSpec::Class(self.stack);
+        self.spawn_sized(stack, f)
+    }
+
+    /// [`spawn`](Self::spawn) on `stack` in place of the declared class.
+    pub fn spawn_sized<F>(self, stack: StackSpec, f: F) -> std::thread::JoinHandle<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let name = self.name.clone();
-        match self.try_spawn(f) {
+        match self.try_spawn_sized(stack, f) {
             Ok(handle) => handle,
             Err(e) => mandatory_thread_unavailable(&name, &e),
         }
@@ -3156,6 +3272,15 @@ impl MandatoryThread {
         F: FnOnce() + Send + 'static,
     {
         let priority = self.priority;
+        if stack.refused() {
+            eprintln!(
+                "{}",
+                check_status_once_line("pthread_attr_setstacksize", libc::EINVAL)
+            );
+        }
+        if let Some(refused) = fifo_attr_refusal(priority) {
+            return Err(refused);
+        }
         let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
         // Returns once the thread is through its prologue, so what std and
         // `enter_ioc_thread` allocate there happens before the spawner goes
@@ -3829,11 +3954,126 @@ mod tests {
         assert!(ThreadPriority::CaServerLow.value() < ThreadPriority::ScanLow.value());
     }
 
+    /// C keeps any `unsigned int` priority as given (`osdThread.c:219`).
     #[test]
-    fn priority_custom_clamps_to_max() {
-        assert_eq!(ThreadPriority::Custom(200).value(), PRIORITY_MAX);
-        assert_eq!(ThreadPriority::Custom(99).value(), 99);
+    fn a_custom_priority_is_kept_as_given() {
+        assert_eq!(ThreadPriority::Custom(200).value(), 200);
+        assert_eq!(ThreadPriority::Custom(u32::MAX).value(), u32::MAX);
         assert_eq!(ThreadPriority::Custom(0).value(), PRIORITY_MIN);
+        // Scaled unclamped (`osdThread.c:139`): past the FIFO maximum.
+        assert_eq!(map_epics_priority(200, 1, 99), (200.0 * 0.98 + 1.0) as i32);
+    }
+
+    /// A priority above 99 is kept as given without RT. With RT allowed, one
+    /// that maps past the FIFO range creates no thread and prints C's two
+    /// lines on every attempt (`osdThread.c:160-162`, `:672-680`); 101 maps
+    /// to 99 and runs FIFO there.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn an_above_99_priority_is_kept_and_refused_by_the_fifo_scheduler() {
+        const CHILD: &str = "EPICS_RS_PRIORITY_200_CHILD";
+        const TEST: &str =
+            "runtime::task::tests::an_above_99_priority_is_kept_and_refused_by_the_fifo_scheduler";
+        let lines = [
+            "pthread_attr_setschedparam error Invalid argument",
+            "pthread_create error Invalid argument",
+        ];
+        assert_eq!(
+            check_status_once_line("pthread_attr_setschedparam", libc::EINVAL),
+            lines[0]
+        );
+        assert_eq!(
+            check_status_once_line("pthread_create", libc::EINVAL),
+            lines[1]
+        );
+
+        if std::env::var_os(CHILD).is_some() {
+            let fifo = matches!(permitted_fifo_range(), RtRange::Available { .. });
+            println!("FIFO={fifo}");
+            for priority in [200, 200, 101] {
+                let name = format!("prio-{priority}");
+                let (tx, rx) = std::sync::mpsc::channel();
+                let spawned = MandatoryThread::new(
+                    name.clone(),
+                    ThreadPriority::Custom(priority),
+                    StackSizeClass::Small,
+                )
+                .try_spawn(move || {
+                    let mut policy = 0;
+                    let mut param = libc::sched_param { sched_priority: 0 };
+                    // SAFETY: the calling thread, with stack-local out-params.
+                    unsafe {
+                        libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)
+                    };
+                    let osipri = thread_report()
+                        .into_iter()
+                        .find(|t| t.name() == name)
+                        .map(|t| t.epics_priority());
+                    tx.send((policy, param.sched_priority, osipri)).unwrap();
+                });
+                match spawned {
+                    Ok(thread) => {
+                        let (policy, sched, osipri) = rx.recv().unwrap();
+                        thread.join().unwrap();
+                        let fifo = policy == libc::SCHED_FIFO;
+                        println!("{priority}: THREAD fifo={fifo} sched={sched} osipri={osipri:?}");
+                    }
+                    Err(e) => println!("{priority}: NONE {:?}", e.raw_os_error()),
+                }
+            }
+            return;
+        }
+
+        for rt in ["NO", "YES"] {
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("the test binary path"))
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, "1")
+                    .env(RT_PRIORITY_ENV, rt)
+                    .output()
+                    .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "{RT_PRIORITY_ENV}={rt}: {stdout}{stderr}"
+            );
+            let said = |l: &str| stdout.lines().filter(|o| *o == l).count();
+            let printed: Vec<&str> = stderr.lines().filter(|l| lines.contains(l)).collect();
+            if rt == "NO" {
+                assert_eq!(
+                    said("200: THREAD fifo=false sched=0 osipri=Some(200)"),
+                    2,
+                    "{stdout}"
+                );
+                assert_eq!(
+                    said("101: THREAD fifo=false sched=0 osipri=Some(101)"),
+                    1,
+                    "{stdout}"
+                );
+                assert!(printed.is_empty(), "{stderr}");
+            } else {
+                assert!(
+                    stdout.contains("FIFO=true"),
+                    "this box cannot obtain SCHED_FIFO, so the RT branch is unverified: {stdout}"
+                );
+                assert_eq!(
+                    said(&format!("200: NONE Some({})", libc::EINVAL)),
+                    2,
+                    "{stdout}"
+                );
+                assert_eq!(
+                    said("101: THREAD fifo=true sched=99 osipri=Some(101)"),
+                    1,
+                    "{stdout}"
+                );
+                assert_eq!(
+                    printed,
+                    [lines[0], lines[1], lines[0], lines[1]],
+                    "{stderr}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3874,28 +4114,6 @@ mod tests {
         );
     }
 
-    /// The running thread's stack size, as `pthread_getattr_np` reports it.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    fn reported_stack_bytes() -> usize {
-        unsafe {
-            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-            assert_eq!(
-                libc::pthread_getattr_np(libc::pthread_self(), &mut attr),
-                0,
-                "pthread_getattr_np"
-            );
-            let mut addr: *mut libc::c_void = std::ptr::null_mut();
-            let mut size: libc::size_t = 0;
-            assert_eq!(
-                libc::pthread_attr_getstack(&attr, &mut addr, &mut size),
-                0,
-                "pthread_attr_getstack"
-            );
-            libc::pthread_attr_destroy(&mut attr);
-            size
-        }
-    }
-
     #[test]
     fn from_c_reads_0_1_2_as_classes_and_the_rest_as_bytes() {
         assert_eq!(
@@ -3911,13 +4129,17 @@ mod tests {
         assert_eq!(StackSpec::from_c(500_000), StackSpec::Bytes(500_000));
     }
 
-    /// A sized thread gets its bytes, raised to `PTHREAD_STACK_MIN` below it,
-    /// and a class gets exactly what `try_spawn` gives it.
+    /// A sized thread gets its bytes, the attr's default below
+    /// `PTHREAD_STACK_MIN`, and a class gets exactly what `try_spawn` gives it.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn a_sized_thread_reports_the_stack_its_spec_asks_for() {
         for (stack, asked) in [
-            (StackSpec::Bytes(1), libc::PTHREAD_STACK_MIN),
+            (StackSpec::Bytes(1), pthread_default_stack_bytes()),
+            (
+                StackSpec::Bytes(libc::PTHREAD_STACK_MIN),
+                libc::PTHREAD_STACK_MIN,
+            ),
             (StackSpec::Bytes(500_000), 500_000),
             (
                 StackSpec::Class(StackSizeClass::Medium),
@@ -3928,7 +4150,7 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             MandatoryThread::new("stack-sized", ThreadPriority::Low, StackSizeClass::Small)
                 .try_spawn_sized(stack, move || {
-                    let _ = tx.send(reported_stack_bytes());
+                    let _ = tx.send(current_thread_stack_bytes().unwrap());
                 })
                 .expect("sized thread spawned")
                 .join()
@@ -3939,6 +4161,52 @@ mod tests {
             assert!(
                 got + 64 > asked && got < asked + 64 * 1024,
                 "{stack:?}: asked for {asked} bytes, thread reports {got}"
+            );
+        }
+    }
+
+    /// A refused byte count prints C's line once per thread, an accepted one
+    /// prints nothing (`osdThread.c:213-214`).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_refused_stack_size_prints_c_s_line() {
+        const CHILD: &str = "EPICS_RS_STACK_REFUSED_CHILD";
+        const TEST: &str = "runtime::task::tests::a_refused_stack_size_prints_c_s_line";
+
+        // glibc's `strerror(EINVAL)`.
+        let line = "pthread_attr_setstacksize error Invalid argument";
+        assert_eq!(
+            check_status_once_line("pthread_attr_setstacksize", libc::EINVAL),
+            line
+        );
+
+        if let Some(bytes) = std::env::var_os(CHILD) {
+            let bytes: usize = bytes.to_str().unwrap().parse().unwrap();
+            MandatoryThread::new("stack-refused", ThreadPriority::Low, StackSizeClass::Small)
+                .try_spawn_sized(StackSpec::Bytes(bytes), || {})
+                .expect("sized thread spawned")
+                .join()
+                .expect("thread joined");
+            return;
+        }
+
+        for (bytes, printed) in [
+            (1, 1),
+            (libc::PTHREAD_STACK_MIN - 1, 1),
+            (libc::PTHREAD_STACK_MIN, 0),
+        ] {
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("the test binary path"))
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, bytes.to_string())
+                    .output()
+                    .expect("re-exec the test binary");
+            assert!(out.status.success(), "child for {bytes} failed");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.lines().filter(|l| *l == line).count(),
+                printed,
+                "{bytes} bytes; stderr: {stderr}"
             );
         }
     }
@@ -3972,7 +4240,7 @@ mod tests {
                 ThreadPriority::CaServerLow,
                 class,
                 move || {
-                    let _ = tx.send(reported_stack_bytes());
+                    let _ = tx.send(current_thread_stack_bytes().unwrap());
                 },
             )
             .expect("dedicated thread spawned");
@@ -4256,8 +4524,7 @@ mod tests {
     /// thread, and strictly less urgent than `IRQS`/`TIME`. That is a
     /// property of the map's construction (fixed offsets over a 100-wide
     /// EPICS space), not of the endpoints, which is why no input — including
-    /// the out-of-range ones `ThreadPriority::value` cannot currently produce
-    /// — can escape it.
+    /// the above-99 ones a `ThreadPriority::Custom` carries — can escape it.
     #[test]
     fn rtems_priority_map_stays_below_the_libbsd_network_band() {
         /// libbsd's most urgent network thread on the measured guest.
@@ -4268,7 +4535,7 @@ mod tests {
         const POSIX_MIN: i32 = 1;
         const POSIX_MAX: i32 = 254;
 
-        for epics in 0..=u8::MAX {
+        for epics in 0..=255u32 {
             let posix = map_epics_priority_rtems(epics);
             let core = RTEMS_MAXIMUM_PRIORITY - posix;
             assert!(
@@ -4293,7 +4560,7 @@ mod tests {
         assert_eq!(map_epics_priority_rtems(0), 56);
         assert_eq!(map_epics_priority_rtems(99), 155);
         assert_eq!(map_epics_priority_rtems(100), 155);
-        assert_eq!(map_epics_priority_rtems(u8::MAX), 155);
+        assert_eq!(map_epics_priority_rtems(255), 155);
         // Ordering still holds: a higher EPICS priority is a more urgent core.
         assert!(
             RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(ThreadPriority::ScanLow.value())
@@ -4309,7 +4576,7 @@ mod tests {
     /// nothing else pins the two together if one of them drifts.
     #[test]
     fn vxworks_priority_map_matches_the_rtems_posix_values() {
-        for epics in 0..=u8::MAX {
+        for epics in 0..=255u32 {
             assert_eq!(
                 map_epics_priority_vxworks(epics),
                 map_epics_priority_rtems(epics),
@@ -4322,7 +4589,7 @@ mod tests {
         assert_eq!(map_epics_priority_vxworks(0), 56);
         assert_eq!(map_epics_priority_vxworks(99), 155);
         assert_eq!(map_epics_priority_vxworks(100), 155);
-        assert_eq!(map_epics_priority_vxworks(u8::MAX), 155);
+        assert_eq!(map_epics_priority_vxworks(255), 155);
     }
 
     /// The RTEMS map is not the hosted map with retuned endpoints, and the
@@ -4341,19 +4608,19 @@ mod tests {
         // What `find_pri_range` yields on the guest (osdThread.c:295-311).
         let (min, max) = (1, 254);
 
-        let hosted_core = |epics: u8| RTEMS_MAXIMUM_PRIORITY - map_epics_priority(epics, min, max);
-        let rtems_core = |epics: u8| RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(epics);
+        let hosted_core = |epics: u32| RTEMS_MAXIMUM_PRIORITY - map_epics_priority(epics, min, max);
+        let rtems_core = |epics: u32| RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(epics);
 
-        let hosted_above_irqs: Vec<u8> = (0..=99)
+        let hosted_above_irqs: Vec<u32> = (0..=99)
             .filter(|&e| hosted_core(e) < LIBBSD_IRQS_CORE)
             .collect();
-        let rtems_above_irqs: Vec<u8> = (0..=99)
+        let rtems_above_irqs: Vec<u32> = (0..=99)
             .filter(|&e| rtems_core(e) < LIBBSD_IRQS_CORE)
             .collect();
 
         assert_eq!(
             rtems_above_irqs,
-            Vec::<u8>::new(),
+            Vec::<u32>::new(),
             "the RTEMS map must place no EPICS priority above libbsd's IRQS"
         );
         assert_eq!(

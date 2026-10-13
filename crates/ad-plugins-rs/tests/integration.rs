@@ -45,8 +45,15 @@ fn test_driver_to_stats_pipeline() {
     let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let ts_registry = ad_plugins_rs::time_series::TsReceiverRegistry::new();
-    let (stats_handle, stats_data, _params, _jh) =
-        create_stats_runtime("STATS1", pool.clone(), 10, "SIM1", wiring, &ts_registry);
+    let (stats_handle, stats_data, _params, _jh) = create_stats_runtime(
+        "STATS1",
+        pool.clone(),
+        10,
+        "SIM1",
+        wiring,
+        &ts_registry,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Plugins default to disabled — enable for test
     stats_handle
@@ -93,8 +100,13 @@ fn test_driver_to_stats_pipeline() {
 fn test_driver_to_std_arrays_pipeline() {
     let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
-    let (image_handle, image_data, _jh) =
-        create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1", wiring);
+    let (image_handle, image_data, _jh) = create_std_arrays_runtime(
+        "IMAGE1",
+        pool.clone(),
+        "SIM1",
+        wiring,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Plugins default to disabled — enable for test
     image_handle
@@ -205,7 +217,15 @@ fn test_rewire_ndarray_port_at_runtime() {
         last_id: last_id.clone(),
     };
 
-    let (handle, _jh) = create_plugin_runtime("STATS1", proc, pool, 10, "SIM1", wiring.clone());
+    let (handle, _jh) = create_plugin_runtime(
+        "STATS1",
+        proc,
+        pool,
+        10,
+        "SIM1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Wire STATS1 → SIM1
     wiring.rewire(handle.array_sender(), "", "SIM1").unwrap();
@@ -306,6 +326,7 @@ fn test_rewire_through_real_roi_plugin() {
         10,
         "SIM1",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     wiring.register_output("ROI1", roi_handle.array_output().clone());
     wiring
@@ -343,8 +364,15 @@ fn test_rewire_through_real_roi_plugin() {
         last_id: last_id.clone(),
     };
 
-    let (stats_handle, _stats_jh) =
-        create_plugin_runtime("STATS1", proc, pool.clone(), 10, "SIM1", wiring.clone());
+    let (stats_handle, _stats_jh) = create_plugin_runtime(
+        "STATS1",
+        proc,
+        pool.clone(),
+        10,
+        "SIM1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     wiring.register_output("STATS1", stats_handle.array_output().clone());
     wiring
         .rewire(stats_handle.array_sender(), "", "SIM1")
@@ -415,8 +443,14 @@ fn test_roi_param_change_enables_output() {
     let sim_publisher = ArrayPublisher::new(sim_output.clone());
 
     // Create ROI1 with DEFAULT config (size=0) — like the real IOC
-    let (roi_handle, roi_params, _roi_jh) =
-        ad_plugins_rs::roi::create_roi_runtime("ROI1", pool.clone(), 10, "SIM1", wiring.clone());
+    let (roi_handle, roi_params, _roi_jh) = ad_plugins_rs::roi::create_roi_runtime(
+        "ROI1",
+        pool.clone(),
+        10,
+        "SIM1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     wiring.register_output("ROI1", roi_handle.array_output().clone());
     wiring
         .rewire(roi_handle.array_sender(), "", "SIM1")
@@ -452,8 +486,15 @@ fn test_roi_param_change_enables_output() {
     let proc = TrackingProcessor {
         last_id: last_id.clone(),
     };
-    let (stats_handle, _jh) =
-        create_plugin_runtime("STATS1", proc, pool.clone(), 10, "ROI1", wiring.clone());
+    let (stats_handle, _jh) = create_plugin_runtime(
+        "STATS1",
+        proc,
+        pool.clone(),
+        10,
+        "ROI1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     wiring.register_output("STATS1", stats_handle.array_output().clone());
     wiring
         .rewire(stats_handle.array_sender(), "", "ROI1")
@@ -739,8 +780,13 @@ fn test_process_and_publish_writes_array_size_params() {
     // Verify that process_and_publish writes ArraySizeX/Y/Z params correctly.
     let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
-    let (image_handle, image_data, _jh) =
-        create_std_arrays_runtime("IMG_SZ", pool.clone(), "DRV1", wiring);
+    let (image_handle, image_data, _jh) = create_std_arrays_runtime(
+        "IMG_SZ",
+        pool.clone(),
+        "DRV1",
+        wiring,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Enable callbacks
     let ph = image_handle.port_runtime().port_handle();

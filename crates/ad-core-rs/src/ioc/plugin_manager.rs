@@ -77,6 +77,15 @@ impl PluginManager {
         Ok(())
     }
 
+    /// The registered plugin whose port is `port_name`.
+    pub fn plugin(&self, port_name: &str) -> Option<PluginRuntimeHandle> {
+        self.plugin_handles
+            .lock()
+            .iter()
+            .find(|h| h.port_runtime().port_handle().port_name() == port_name)
+            .cloned()
+    }
+
     /// Register a raw port (not a plugin runtime) for auxiliary ports like TimeSeries.
     ///
     /// The `PortRuntimeHandle` is stored to keep the actor thread alive.

@@ -749,6 +749,7 @@ pub fn create_roi_stat_runtime(
     wiring: Arc<WiringRegistry>,
     num_rois: usize,
     ts_registry: &crate::time_series::TsReceiverRegistry,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     ROIStatParams,
@@ -769,6 +770,7 @@ pub fn create_roi_stat_runtime(
         ndarray_port,
         wiring,
         num_rois,
+        threads,
     );
 
     let roi_stat_params = *params_handle.lock();

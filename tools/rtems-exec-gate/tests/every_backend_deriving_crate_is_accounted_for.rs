@@ -109,6 +109,7 @@ use std::path::{Path, PathBuf};
 const SCOPE_GATED: &[(&str, &str)] = &[
     ("ad-plugins-rs", "tests/ioc_asyn_commands.rs"),
     ("ad-plugins-rs", "tests/plugin_configure_max_threads.rs"),
+    ("ad-plugins-rs", "tests/plugin_configure_stack_size.rs"),
     ("asyn-rs", "tests/process_gate_tests.rs"),
     ("epics-base-rs", "tests/client_server.rs"),
     (

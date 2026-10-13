@@ -326,9 +326,12 @@ pub fn create_port_runtime_boxed(
     // (asynManager.c:2077-2082), stackSize 0 → `epicsThreadStackMedium`. As an
     // IOC thread its park state is built at entry, not in its first contended
     // lock mid-cycle.
+    // C creates the thread, and so reads the priority, for an ASYN_CANBLOCK
+    // port only (asynManager.c:2074); a synchronous port's priority can never
+    // fail its registration.
     let priority = match config.priority {
-        0 => ThreadPriority::Medium,
-        p => ThreadPriority::Custom(p.min(99) as u8),
+        p if can_block && p != 0 => ThreadPriority::Custom(p),
+        _ => ThreadPriority::Medium,
     };
     let stack = match config.stack_size {
         0 => StackSpec::Class(StackSizeClass::Medium),
@@ -348,13 +351,8 @@ pub fn create_port_runtime_boxed(
             }) {
             Ok(jh) => jh,
             Err(e) => {
-                // Loud at the point of failure, as C is: `printf(
-                // "asynCommon:registerDriver %s epicsThreadCreate failed \n",
-                // portName)` (asynManager.c:2083-2084). `eprintln!` rather than
-                // `tracing`, because the targets where thread creation actually
-                // fails (RTEMS/VxWorks IOCs) install no subscriber and the console
-                // is all there is.
-                eprintln!("asyn: port '{port_name}' runtime thread could not be created: {e}");
+                // C's line, byte for byte and on stdout (asynManager.c:2083-2084).
+                println!("asynCommon:registerDriver {port_name} epicsThreadCreate failed ");
                 // Everything this function built for the port is dropped on the way
                 // out — C's :2085-2091 unwind — and the port is never published.
                 return Err(port_thread_unavailable(&port_name, &e));
@@ -493,7 +491,11 @@ mod tests {
 
     impl TestPort {
         fn new(name: &str) -> Self {
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            Self::with_flags(name, PortFlags::default())
+        }
+
+        fn with_flags(name: &str, flags: PortFlags) -> Self {
+            let mut base = PortDriverBase::new(name, 1, flags);
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             Self { base }
@@ -507,6 +509,87 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
+    }
+
+    /// registerPort's priority is C's `unsigned int`, kept as given
+    /// (asynManager.c:2077); 0 is Medium. A synchronous port has no C thread,
+    /// so its priority is never read.
+    #[test]
+    fn a_port_thread_runs_at_its_configured_priority() {
+        use epics_libcom_rs::runtime::task::thread_report;
+        for (name, can_block, priority, osipri) in [
+            ("prio_0", true, 0, 50),
+            ("prio_1", true, 1, 1),
+            ("prio_200", true, 200, 200),
+            ("sync_200", false, 200, 50),
+        ] {
+            let config = RuntimeConfig {
+                priority,
+                ..RuntimeConfig::default()
+            };
+            let flags = PortFlags {
+                can_block,
+                ..PortFlags::default()
+            };
+            let (_handle, _jh) = create_port_runtime(TestPort::with_flags(name, flags), config)
+                .expect("the port runtime thread must start");
+            let row = (0..10_000)
+                .find_map(|_| {
+                    let row = thread_report().into_iter().find(|t| t.name() == name);
+                    if row.is_none() {
+                        std::thread::yield_now();
+                    }
+                    row
+                })
+                .expect("the port thread is in the thread report");
+            assert_eq!(row.epics_priority(), osipri, "port {name}");
+        }
+    }
+
+    /// Under RT, a can-block port whose priority maps past the FIFO range gets
+    /// no thread, so registerPort fails with C's line and registers nothing
+    /// (asynManager.c:2081-2092).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_refused_port_thread_fails_registration() {
+        const CHILD: &str = "ASYN_RS_PRIO_200_CHILD";
+        const TEST: &str = "runtime::port::tests::a_refused_port_thread_fails_registration";
+        if std::env::var_os(CHILD).is_some() {
+            let config = RuntimeConfig {
+                priority: 200,
+                ..RuntimeConfig::default()
+            };
+            let flags = PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            };
+            match create_port_runtime(TestPort::with_flags("refused_200", flags), config) {
+                Ok(_) => println!("REGISTERED"),
+                Err(_) => println!("FAILED"),
+            }
+            let listed = epics_libcom_rs::runtime::task::thread_report()
+                .into_iter()
+                .any(|t| t.name() == "refused_200");
+            println!("THREAD={listed}");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(epics_libcom_rs::runtime::task::RT_PRIORITY_ENV, "YES")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "asynCommon:registerDriver refused_200 epicsThreadCreate failed "),
+            "{stdout}"
+        );
+        assert!(stdout.lines().any(|l| l == "FAILED"), "{stdout}");
+        assert!(stdout.lines().any(|l| l == "THREAD=false"), "{stdout}");
     }
 
     #[test]
@@ -782,10 +865,12 @@ mod tests {
              status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             out.status
         );
-        // The failure is loud where C's is (asynManager.c:2083).
+        // C's `printf` line, on stdout (asynManager.c:2083-2084).
         assert!(
-            stderr.contains(PORT),
-            "the diagnostic on stderr must name the port, got:\n{stderr}"
+            stdout
+                .lines()
+                .any(|l| l == format!("asynCommon:registerDriver {PORT} epicsThreadCreate failed ")),
+            "C's registerDriver line on stdout, got:\n{stdout}"
         );
     }
 }

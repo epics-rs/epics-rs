@@ -15,5 +15,6 @@ pub use driver_context::{DriverContext, GenericDriverContext};
 pub use helpers::{
     attr_arg_defs, count_arg, dtyp_from_port, extract_plugin_args, gather_arg_defs,
     max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
+    threads_arg,
 };
 pub use plugin_manager::PluginManager;

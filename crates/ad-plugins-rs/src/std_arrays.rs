@@ -73,6 +73,7 @@ pub fn create_std_arrays_runtime(
     pool: Arc<NDArrayPool>,
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     Arc<Mutex<Option<Arc<NDArray>>>>,
@@ -88,6 +89,7 @@ pub fn create_std_arrays_runtime(
         1, // LatestOnly semantics
         ndarray_port,
         wiring,
+        threads,
     );
 
     (handle, data_handle, data_jh)
@@ -140,7 +142,13 @@ mod tests {
     fn test_std_arrays_runtime() {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, data, _jh) = create_std_arrays_runtime(
+            "IMAGE1",
+            pool,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         // Plugins default to disabled — enable for test
         handle
@@ -166,7 +174,13 @@ mod tests {
         // constructor; the initial param a client reads must be 0, not 1.
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, _data, _jh) = create_std_arrays_runtime(
+            "IMAGE1",
+            pool,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         let val = handle
             .port_runtime()
@@ -222,7 +236,13 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, data, _jh) = create_std_arrays_runtime(
+            "IMAGE1",
+            pool,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
         let dropped = handle.array_sender().dropped_arrays_counter().clone();
         handle
             .port_runtime()
@@ -283,7 +303,13 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, _data, _jh) = create_std_arrays_runtime(
+            "IMAGE1",
+            pool,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         let port = handle.port_runtime().port_handle();
         port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
@@ -339,7 +365,13 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, _data, _jh) = create_std_arrays_runtime(
+            "IMAGE1",
+            pool,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
             .unwrap();

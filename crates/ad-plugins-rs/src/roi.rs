@@ -608,6 +608,7 @@ pub fn create_roi_runtime(
     queue_size: usize,
     ndarray_port: &str,
     wiring: Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     ad_core_rs::plugin::runtime::PluginRuntimeHandle,
     ROIParams,
@@ -621,6 +622,7 @@ pub fn create_roi_runtime(
         queue_size,
         ndarray_port,
         wiring,
+        threads,
     );
     // Recreate param layout on a scratch PortDriverBase to get matching reasons.
     let params = {

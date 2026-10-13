@@ -233,7 +233,11 @@ pub fn set_periodic_scan_band_count(n: usize) {
 /// scanOnce preempts every periodic scan thread, as in C.
 fn scan_once_priority() -> ThreadPriority {
     let n = PERIODIC_SCAN_BAND_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-    ThreadPriority::Custom(ThreadPriority::ScanLow.value() + n.min(u8::MAX as usize) as u8)
+    ThreadPriority::Custom(
+        ThreadPriority::ScanLow
+            .value()
+            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX)),
+    )
 }
 
 /// Port of `onceTask` (`dbScan.c:696-726`): wait on the wake event, drain the
@@ -425,7 +429,7 @@ mod tests {
     fn scan_once_band_is_scanlow_plus_n_periodic() {
         assert_eq!(
             scan_once_priority().value(),
-            ThreadPriority::ScanLow.value() + DEFAULT_PERIODIC_SCAN_BAND_COUNT as u8
+            ThreadPriority::ScanLow.value() + DEFAULT_PERIODIC_SCAN_BAND_COUNT as u32
         );
         assert_eq!(scan_once_priority().value(), 67);
     }

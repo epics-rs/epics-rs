@@ -77,7 +77,7 @@ const FACILITY: &str = "periodic scan";
 /// [`periodic_scans`] slowest-first this is scan-10 → 60 up to
 /// scan-0.1 → 66, the ladder the C IOC measures on RTEMS 6.
 fn periodic_priority(ind: usize) -> ThreadPriority {
-    ThreadPriority::Custom(ThreadPriority::ScanLow.value() + ind as u8)
+    ThreadPriority::Custom(ThreadPriority::ScanLow.value() + ind as u32)
 }
 
 /// C names the thread `scan-%g` of the period in seconds
@@ -2840,7 +2840,7 @@ mod tests {
     /// the C IOC measures on RTEMS 6 (`scan-10` 60 … `scan-0.1` 66).
     #[test]
     fn periodic_ladder_matches_dbscan() {
-        let expected: &[(ScanType, u8, &str)] = &[
+        let expected: &[(ScanType, u32, &str)] = &[
             (ScanType::SEC10, 60, "scan-10"),
             (ScanType::SEC5, 61, "scan-5"),
             (ScanType::SEC2, 62, "scan-2"),

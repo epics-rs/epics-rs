@@ -118,7 +118,7 @@ fn roi_stat_max_threads_is_argument_ten() {
     let (_ioc, shell) = ad_ioc_with_driver("MTUP2");
     run(
         &shell,
-        r#"NDROIStatConfigure("MTRS1", 20, 0, "MTUP2", 0, 8, 0, 0, 0, 40000, 3)"#,
+        r#"NDROIStatConfigure("MTRS1", 20, 0, "MTUP2", 0, 8, 0, 0, 0, 4000000, 3)"#,
     );
 
     let port = plugin_port("MTRS1");
@@ -161,7 +161,7 @@ fn a_command_without_the_argument_does_not_invent_one() {
     let (_ioc, shell) = ad_ioc_with_driver("MTUP4");
     run(
         &shell,
-        r#"NDProcessConfigure("MTPR1", 20, 0, "MTUP4", 0, 0, 0, 0, 40000)"#,
+        r#"NDProcessConfigure("MTPR1", 20, 0, "MTUP4", 0, 0, 0, 0, 4000000)"#,
     );
 
     let port = plugin_port("MTPR1");
@@ -169,6 +169,6 @@ fn a_command_without_the_argument_does_not_invent_one() {
         port.read_int32_blocking(reason(&port, "MAX_THREADS"), 0)
             .unwrap(),
         1,
-        "a stackSize of 40000 was read as a thread ceiling"
+        "a stackSize of 4000000 was read as a thread ceiling"
     );
 }

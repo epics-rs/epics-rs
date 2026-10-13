@@ -835,7 +835,7 @@ fn read_until(fd: &impl SerialFd, buf: &mut [u8], deadline: Option<Instant>) -> 
 
 /// C `writeIt`'s poll/write loop on the same deadline.
 ///
-/// `transferred` is C's `*nbytesTransfered` (drvAsynSerialPort.c:843): it is
+/// `transferred` is C's `*nbytesTransferred` (drvAsynSerialPort.c:843): it is
 /// advanced in place so the count the port took survives every exit — timeout
 /// and fatal errno alike — instead of being dropped by the error.
 fn write_until(
@@ -2256,14 +2256,14 @@ mod tests {
 
         assert_eq!(err("baud", "fast"), "Bad number", "C :264");
         assert_eq!(err("bits", "9"), "Invalid number of bits.", "C :374");
-        assert_eq!(err("parity", "mark"), "Invalid parity.", "C :395");
+        assert_eq!(err("parity", "mark"), "Invalid parity.", "C :393");
         assert_eq!(err("stop", "3"), "Invalid number of stop bits.", "C :406");
         assert_eq!(err("clocal", "maybe"), "Invalid clocal value.", "C :419");
         assert_eq!(err("crtscts", "maybe"), "Invalid crtscts value.", "C :440");
         assert_eq!(err("ixon", "maybe"), "Invalid ixon value.", "C :464");
         assert_eq!(err("ixany", "maybe"), "Invalid ixany value.", "C :481");
-        assert_eq!(err("ixoff", "maybe"), "Invalid ixoff value.", "C :502");
-        assert_eq!(err("break", "soon"), "Bad number", "C :513");
+        assert_eq!(err("ixoff", "maybe"), "Invalid ixoff value.", "C :501");
+        assert_eq!(err("break", "soon"), "Bad number", "C :515");
         assert_eq!(err("nosuch", "x"), "Unsupported key \"nosuch\"", "C :595");
     }
 
@@ -2741,7 +2741,7 @@ mod tests {
         let mut buf = [0u8; 32];
         // The EOS layer is the port's, not the driver's: a caller enters the
         // chain at the top and the driver is its base (C findInterface,
-        // asynManager.c:1493-1501). `PortActor` does exactly this.
+        // asynManager.c:1494-1503). `PortActor` does exactly this.
         let (n, _eom) = crate::port::octet_read_chain(&mut drv, &user, &mut buf).unwrap();
         // EOS should strip the terminator
         assert_eq!(&buf[..n], b"OK");
@@ -3449,7 +3449,7 @@ mod tests {
             other => panic!("expected total-deadline Timeout, got {other:?}"),
         };
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
-        // R8-48: C `writeIt` publishes `*nbytesTransfered = numchars - nleft`
+        // R8-48: C `writeIt` publishes `*nbytesTransferred = numchars - nleft`
         // on the timeout break (drvAsynSerialPort.c:843) — the bytes the port
         // already took ride out *with* the timeout instead of being dropped.
         // This write drained part of the payload into the pty before the

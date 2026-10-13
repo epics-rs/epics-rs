@@ -734,7 +734,7 @@ impl PortHandle {
     }
 
     /// Returns the number of bytes transferred (C `asynOctet::write`'s
-    /// `*nbytesTransfered`).
+    /// `*nbytesTransferred`).
     pub async fn write_octet(&self, reason: usize, addr: i32, data: Vec<u8>) -> AsynResult<usize> {
         let user = AsynUser::new(reason).with_addr(addr);
         let result = self
@@ -1207,7 +1207,7 @@ impl PortHandle {
     // --- Multi-device convenience methods ---
 
     /// The port-side half of C `pasynManager->connectDevice(pasynUser, port,
-    /// addr)` (asynManager.c:1324-1355): create the device's dpCommon on a
+    /// addr)` (asynManager.c:1324-1357): create the device's dpCommon on a
     /// multi-device port (`locateDevice(..., TRUE)`) so it is counted and
     /// reported from the moment a user binds to it. Every user bind — a
     /// record's device support at init, `asynRecord`'s PORT/ADDR connect —
@@ -1306,7 +1306,7 @@ impl PortHandle {
     ///
     /// The address is not decoration. `findDpCommon` hands back the DEVICE's
     /// slot on an `ASYN_MULTIDEVICE` port whenever the user names one
-    /// (:538-544), so a per-device `asynEnable P 1 0` is invisible at addr 0
+    /// (:538-546), so a per-device `asynEnable P 1 0` is invisible at addr 0
     /// and at the port. `-1` asks the port's own slot — the answer for every
     /// single-device port, whatever addr is passed.
     pub fn is_enabled_blocking(&self, addr: i32) -> AsynResult<bool> {
@@ -2265,7 +2265,7 @@ mod tests {
     }
 
     /// R10-49. C `queueRequest(pasynUser, priority, timeout)` arms a timer
-    /// (asynManager.c:1617-1623) whose callback unlinks a still-queued request
+    /// (asynManager.c:1619-1625) whose callback unlinks a still-queued request
     /// (:649-703) and runs the caller's `timeoutUser` **instead of** its
     /// `processUser`. The port had no queue-wait deadline at all: a request
     /// behind a slow one waited as long as it took, whatever `queueRequest` was

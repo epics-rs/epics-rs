@@ -1,7 +1,7 @@
 //! R18-58: an IP server port accepts connections.
 //!
 //! C `drvAsynIPServerPortConfigure` binds the socket, pre-creates one child port
-//! per client slot (`<parent>:<N>`, drvAsynIPServerPort.c:682-708) and starts
+//! per client slot (`<parent>:<N>`, drvAsynIPServerPort.c:703-729) and starts
 //! `connectionListener` (:732-735), which loops on `epicsSocketAccept` (:340).
 //! Before the fix, nothing in the port ever accepted — `accept_one` had no
 //! caller outside `mod tests` — and `drvAsynIPServerPortConfigure` was not an
@@ -126,7 +126,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
         assert!(
             Instant::now() < deadline,
             "no bytes reached the child port — the server never accepted the client \
-             (C: connectionListener, drvAsynIPServerPort.c:326)"
+             (C: connectionListener, drvAsynIPServerPort.c:340)"
         );
         // C parity: a child port is built by `drvAsynIPPortConfigure`
         // (drvAsynIPServerPort.c:709-715), so it carries the EOS interpose
@@ -189,7 +189,7 @@ fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
     // (iocsh.rs; a bind failure unregisters it, iocsh.rs:1573-1580). So a
     // successful bind ⟺ the port stays registered: `get_port` SOME is exactly
     // "a listener was bound". maxClients=0 is rejected at `with_config`, before
-    // registration and before any bind (C drvAsynIPServerPort.c:545-548), so the
+    // registration and before any bind (C drvAsynIPServerPort.c:566-569), so the
     // race-free registry check below is the whole proof — no listener, no child.
     //
     // The old test also re-bound the number to prove the socket was free. That

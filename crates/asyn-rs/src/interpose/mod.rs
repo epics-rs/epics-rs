@@ -45,7 +45,7 @@ pub struct OctetReadResult {
 }
 
 /// The transfer an octet read completed *before* it failed — C's
-/// `*nbytesTransfered` / `*eomReason`, which `asynOctet::read` writes out
+/// `*nbytesTransferred` / `*eomReason`, which `asynOctet::read` writes out
 /// even when it returns a failing `asynStatus`
 /// (`asynInterposeEos.c:242-253`).
 ///
@@ -64,7 +64,7 @@ pub struct PartialOctetRead {
 }
 
 impl PartialOctetRead {
-    /// C's `*nbytesTransfered` for this failed read.
+    /// C's `*nbytesTransferred` for this failed read.
     pub fn nbytes_transferred(&self) -> usize {
         self.data.len()
     }
@@ -178,8 +178,8 @@ pub trait OctetInterpose: Send + Sync {
     /// C parity: `asynInterposeEos.c:110` registers `eosInExceptionHandler`
     /// via `exceptionCallbackAdd`, and `:142-151` clears `inBufHead`,
     /// `inBufTail` and `eosInMatch` on `asynExceptionConnect` — which
-    /// `exceptionConnect` (asynManager.c:2158) *and* `exceptionDisconnect`
-    /// (asynManager.c:2185) both fire, so the reset happens on either edge.
+    /// `exceptionConnect` (asynManager.c:2161) *and* `exceptionDisconnect`
+    /// (asynManager.c:2187) both fire, so the reset happens on either edge.
     /// [`crate::port::PortDriverBase::set_connected`] is the Rust owner of
     /// that transition and drives this hook for the whole stack.
     fn connection_changed(&mut self) {}
@@ -194,14 +194,14 @@ pub const PORT_CHAIN: i32 = -1;
 /// which exists once per *device* as well as once per port.
 ///
 /// `interposeInterface` takes an `addr` (asynManager.c:2192-2222): `addr >= 0` on
-/// a multi-device port puts the layer on that DEVICE's list (:2202-2206), and
+/// a multi-device port puts the layer on that DEVICE's list (:2204-2208), and
 /// `findInterface` resolves a request device-first, port-second (:1495-1503). So
 /// `asynInterposeDelay("gpib", 4, 0.01)` slows device 4 and nothing else — a
 /// single port-wide chain slowed every device on the bus (R15-48).
 ///
 /// A device's chain **shadows** the port's rather than extending it, because
 /// that is what C builds: a layer installed on a device whose list was empty
-/// takes its `pPrev` from the *driver's* `interfaceList` (:2211-2215), not from
+/// takes its `pPrev` from the *driver's* `interfaceList` (:2213-2217), not from
 /// the port's interposes, so it delegates straight down to the driver.
 pub struct OctetInterposeStack {
     /// [`PORT_CHAIN`] plus one entry per device that has an interpose of its own.
@@ -230,7 +230,7 @@ impl OctetInterposeStack {
     /// interpose node's `pasynInterface` with it, :2219) and the interface it
     /// displaced — the previously installed interpose at the same level, or the
     /// driver's own interface when there was none — becomes the one it delegates
-    /// down to (C hands it back as `pPrev`, :2209-2215).
+    /// down to (C hands it back as `pPrev`, :2211-2218).
     ///
     /// So the **last layer installed is the outermost**: a caller enters it first,
     /// and it calls down through the earlier layers to the driver. An
@@ -246,7 +246,7 @@ impl OctetInterposeStack {
     }
 
     /// The chain a request on `addr` runs through — C `findInterface`
-    /// (asynManager.c:1493-1501): the device's own interposes if it has any,
+    /// (asynManager.c:1494-1503): the device's own interposes if it has any,
     /// otherwise the port's.
     fn chain_key(&self, addr: i32) -> i32 {
         let key = crate::port::eos_device_key(self.multi_device, addr);
@@ -594,7 +594,7 @@ mod tests {
         assert!(base.flushed);
     }
 
-    /// R9-56. C `interposeInterface` (asynManager.c:2209-2217) makes each newly
+    /// R9-56. C `interposeInterface` (asynManager.c:2209-2219) makes each newly
     /// installed layer the port's octet interface and hands it the one it
     /// displaced to call down into, so the *last* install is the *outermost*.
     /// This stack appended and dispatched from index 0, so a later install landed
@@ -650,7 +650,7 @@ mod tests {
     /// whole port.
     ///
     /// C `interposeInterface(portName, addr, ...)` puts the layer on the device's
-    /// `dpCommon.interposeInterfaceList` when `addr >= 0` (asynManager.c:2202-2206),
+    /// `dpCommon.interposeInterfaceList` when `addr >= 0` (asynManager.c:2204-2208),
     /// and `findInterface` resolves a request device-first, port-second
     /// (:1495-1503). Both iocsh interposes pass their addr
     /// (asynInterposeEcho.c:176, asynInterposeDelay.c:187) — so
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(stack.len_for(7), 0);
 
         // The port's own chain (addr < 0) is what every unaddressed device falls
-        // back to — C `findInterface`'s second lookup (:1501-1503).
+        // back to — C `findInterface`'s second lookup (:1500-1502).
         stack.install(PORT_CHAIN, Box::new(Tag(b'P')));
         assert_eq!(
             write_from(&mut stack, 7),

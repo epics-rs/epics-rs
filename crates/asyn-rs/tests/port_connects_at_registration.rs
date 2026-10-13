@@ -2,7 +2,7 @@
 //! first request happens to arrive.
 //!
 //! C `registerPort` → `registerInterface(asynCommonType)` → `initPortConnect` +
-//! `portConnectTimerCallback` + `waitConnect` (asynManager.c:2131-2136). The
+//! `portConnectTimerCallback` + `waitConnect` (asynManager.c:2133-2138). The
 //! timer callback queues a connect at `asynQueuePriorityConnect` the moment the
 //! port exists (:3283-3297) and `waitConnect` blocks registration on the connect
 //! exception for up to `DEFAULT_AUTOCONNECT_TIMEOUT` (0.5 s, :49/:509).

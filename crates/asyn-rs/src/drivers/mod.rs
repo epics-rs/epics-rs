@@ -86,7 +86,7 @@ mod tests {
     /// nothing positive rounds down into the expired one.
     /// No production C asyn driver passes `ASYN_DESTRUCTIBLE` to `registerPort`
     /// at pin `e2a281e2`. The flag occurs in exactly six places there — its
-    /// definition (asynDriver.h:97), its two consumers (asynManager.c:2096 in
+    /// definition (asynDriver.h:97), its two consumers (asynManager.c:2098 in
     /// `registerPort`, :2273 in `shutdownPort`), the `asynPortDriver` base that
     /// forwards a caller's `asynFlags` (asynPortDriver.cpp:3996), and two *test*
     /// drivers (testAsynPortDriver.cpp:54, asynPortDriverTest.cpp:58) — plus

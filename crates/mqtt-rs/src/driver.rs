@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(req.topic, "test/str_topic");
         assert_eq!(req.payload, b"hi");
     }
-    /// `*nbytesTransfered` for an embedded-NUL octet write.
+    /// `*nbytesTransferred` for an embedded-NUL octet write.
     ///
     /// C, at the declared autoparam pin (`v2.1.0`, `2159559`,
     /// `/home/stevek/work/epics-modules/autoparamDriver`):
@@ -776,7 +776,7 @@ mod tests {
     /// Both halves are asserted here because they move independently: the count
     /// is the caller's buffer, the payload stops at the NUL.
     #[test]
-    fn write_octet_reports_c_s_full_nbytes_transfered() {
+    fn write_octet_reports_c_s_full_nbytes_transferred() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
         let reason = driver
             .drv_user_create(&DrvUserRequest::new("FLAT:STRING test/str_topic", 0))

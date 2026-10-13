@@ -268,7 +268,7 @@ impl OctetInterpose for EosInterpose {
             // C parity (`asynInterposeEos.c::readIt:242-253`): a failing
             // lower-layer read `break`s the loop and falls through to the
             // SAME tail as a successful one — null-terminate, `*eomReason =
-            // eom`, `*nbytesTransfered = nRead` — and only then `return
+            // eom`, `*nbytesTransferred = nRead` — and only then `return
             // status`. So the caller gets the error AND everything already
             // transferred: the classic partial-line timeout reaches
             // asynRecord as `asynTimeout` with `AINP="abc"`, `NORD=3`
@@ -277,7 +277,7 @@ impl OctetInterpose for EosInterpose {
             //
             // `?` here would return the bare error and drop both the count
             // and the eom reason. The bytes are not recoverable afterwards —
-            // `in_buf_tail` has already advanced past them at :114-118 — so
+            // `in_buf_tail` has already advanced past them at asynInterposeEos.c:197 — so
             // dropping the count loses the data outright. Run C's tail, then
             // hand the error back with the partial attached.
             //
@@ -351,7 +351,7 @@ impl OctetInterpose for EosInterpose {
         buf.extend_from_slice(data);
         buf.extend_from_slice(&out_eos);
         // C `asynInterposeEos.c::writeIt` (:179-180) runs one common tail
-        // regardless of status: `*nbytesTransfered = min(nbytesActual,
+        // regardless of status: `*nbytesTransferred = min(nbytesActual,
         // numchars); return status`. So the clamp — never report the appended
         // terminator bytes as caller payload — applies to the failure path too,
         // and a lower layer that stalled part-way through the *user* bytes has
@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(
             partial.nbytes_transferred(),
             3,
-            "C publishes *nbytesTransfered = nRead on the error path"
+            "C publishes *nbytesTransferred = nRead on the error path"
         );
         assert_eq!(
             partial.data, b"abc",
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     /// R8-48: C `asynInterposeEos.c::writeIt` (:179-180) runs one tail on every
-    /// path — `*nbytesTransfered = min(nbytesActual, numchars); return status` —
+    /// path — `*nbytesTransferred = min(nbytesActual, numchars); return status` —
     /// so a lower layer that stalled part-way reports its count *through* the
     /// interpose, clamped to the caller's payload. The appended terminator must
     /// never be counted as user bytes, on the error path either.

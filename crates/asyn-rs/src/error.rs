@@ -20,12 +20,12 @@ pub enum AsynError {
     /// An octet read that failed *after* transferring bytes into the
     /// caller's buffer.
     ///
-    /// C parity: `asynOctet::read` reports `*nbytesTransfered` and
+    /// C parity: `asynOctet::read` reports `*nbytesTransferred` and
     /// `*eomReason` **together with** a failing `asynStatus` — the EOS
     /// interpose breaks out of its accumulation loop on a lower-layer error
     /// and still runs the common tail
     /// (`asynInterposeEos.c:242-253`: null-terminate, `*eomReason = eom`,
-    /// `*nbytesTransfered = nRead`, `return status`). A device that emits a
+    /// `*nbytesTransferred = nRead`, `return status`). A device that emits a
     /// partial line and then goes quiet therefore reaches the record as
     /// `asynTimeout` *plus* the bytes it did send; `asynRecord` commits both
     /// (`asynRecord.c:1591,1627`: `eomr` and `nord` are assigned regardless
@@ -58,23 +58,23 @@ pub enum AsynError {
         /// The failure that ended the transfer, intact.
         source: Box<AsynError>,
         /// The bytes transferred before the failure and the end-of-message
-        /// reason accumulated up to that point — the `*nbytesTransfered` /
+        /// reason accumulated up to that point — the `*nbytesTransferred` /
         /// `*eomReason` pair C writes out alongside the error.
         partial: crate::interpose::PartialOctetRead,
     },
 
     /// An octet write that failed *after* the device accepted bytes.
     ///
-    /// C parity: `asynOctet::write` reports `*nbytesTransfered` **together
+    /// C parity: `asynOctet::write` reports `*nbytesTransferred` **together
     /// with** a failing `asynStatus`, at every layer of the write chain —
     /// `drvAsynSerialPort.c::writeIt` (`:843`) assigns
-    /// `*nbytesTransfered = numchars - nleft` on the way out of the loop no
+    /// `*nbytesTransferred = numchars - nleft` on the way out of the loop no
     /// matter whether it broke on `asynTimeout` or on a fatal `write()` errno;
     /// `asynInterposeEcho.c::writeIt` (`:83`) and `asynInterposeDelay.c` (`:51`)
-    /// assign `*nbytesTransfered = transfered` on every break; and
+    /// assign `*nbytesTransferred = transferred` on every break; and
     /// `asynInterposeEos.c::writeIt` (`:179`) clamps the lower layer's count to
     /// the caller's `numchars` and returns it beside the status. `asynRecord`
-    /// commits the result unconditionally — `nawt = nbytesTransfered`
+    /// commits the result unconditionally — `nawt = nbytesTransferred`
     /// (asynRecord.c:1547) runs *before* the status check at `:1551` — so a
     /// half-written command lands `NAWT=3` next to its `Write error, nout=3`
     /// diagnostic.
@@ -95,7 +95,7 @@ pub enum AsynError {
         /// The failure that ended the write, intact.
         source: Box<AsynError>,
         /// The bytes the device accepted before the failure — C's
-        /// `*nbytesTransfered` on the error path.
+        /// `*nbytesTransferred` on the error path.
         nbytes: usize,
     },
 
@@ -104,7 +104,7 @@ pub enum AsynError {
     ///
     /// C `queueTimeoutCallback` (asynManager.c:649-703): the timer
     /// `queueRequest(pasynUser, priority, timeout)` armed at enqueue
-    /// (asynManager.c:1617-1623) fires while `isQueued` is still true, the
+    /// (asynManager.c:1619-1625) fires while `isQueued` is still true, the
     /// request is unlinked from the port's queue list, and the caller's
     /// `timeoutUser` runs **instead of** its `processUser`. Only a caller that
     /// asked for a queue deadline can see this — device support passes
@@ -347,7 +347,7 @@ impl AsynError {
     }
 
     /// The partial octet transfer delivered before this error, if any —
-    /// C's `*nbytesTransfered` / `*eomReason` / caller-buffer contents on the
+    /// C's `*nbytesTransferred` / `*eomReason` / caller-buffer contents on the
     /// failure path.
     ///
     /// Every consumer of an octet read MUST consult this on the error path:
@@ -368,7 +368,7 @@ impl AsynError {
     ///
     /// Re-attaching overwrites the count: in a stacked interpose chain the
     /// outermost layer is the one that filled the caller's buffer, so its count
-    /// is the authoritative `*nbytesTransfered`. The original source is kept —
+    /// is the authoritative `*nbytesTransferred`. The original source is kept —
     /// re-wrapping must not bury it one layer deeper each hop.
     pub fn with_partial_read(self, partial: crate::interpose::PartialOctetRead) -> Self {
         let source = match self {
@@ -379,12 +379,12 @@ impl AsynError {
     }
 
     /// The bytes the device accepted before this write failed — C's
-    /// `*nbytesTransfered` on a failing `asynOctet::write`. `None` means the
+    /// `*nbytesTransferred` on a failing `asynOctet::write`. `None` means the
     /// layer reported no transfer, which is C's pre-call
-    /// `nbytesTransfered = 0` (asynRecord.c:1527) left untouched: zero bytes.
+    /// `nbytesTransferred = 0` (asynRecord.c:1527) left untouched: zero bytes.
     ///
     /// Every consumer of an octet write MUST consult this on the error path:
-    /// C `asynRecord::performOctetIO` publishes `nawt = nbytesTransfered`
+    /// C `asynRecord::performOctetIO` publishes `nawt = nbytesTransferred`
     /// before it looks at the status (asynRecord.c:1547-1551), so an error
     /// branch that reports only "0 written" contradicts what the device
     /// actually received.
@@ -402,7 +402,7 @@ impl AsynError {
     /// Re-attaching overwrites the count: in a stacked interpose chain the
     /// outermost layer is the one that owns the caller's `numchars` (the EOS
     /// interpose must not report its appended terminator bytes), so its count
-    /// is the authoritative `*nbytesTransfered`. The original source is kept.
+    /// is the authoritative `*nbytesTransferred`. The original source is kept.
     pub fn with_partial_write(self, nbytes: usize) -> Self {
         let source = match self {
             AsynError::PartialWrite { source, .. } => source,

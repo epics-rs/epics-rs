@@ -113,7 +113,7 @@ impl SyncIOHandle {
     }
 
     /// Returns the number of bytes transferred (C `asynOctet::write`'s
-    /// `*nbytesTransfered`).
+    /// `*nbytesTransferred`).
     pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<usize> {
         let user = self.user(reason);
         let result = self.handle.submit_blocking(
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(sio.timeout(), before, "10× r/w must preserve timeout");
     }
 
-    /// R7-46: C `asynOctetSyncIO::read` hands the caller `*nbytesTransfered`
+    /// R7-46: C `asynOctetSyncIO::read` hands the caller `*nbytesTransferred`
     /// alongside the failing status — `pasynOctet->read` fills the caller's
     /// buffer before returning `asynTimeout`, so a partial line is not lost to
     /// a SyncIO caller. `read_octet`'s `Err` must therefore carry the transfer:

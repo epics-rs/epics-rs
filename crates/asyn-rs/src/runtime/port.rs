@@ -246,7 +246,7 @@ pub fn create_port_runtime<D: PortDriver>(
 /// by [`ConnectWaiter`]'s `Drop`.
 ///
 /// A caller that can report the failure returns it, as
-/// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1033-1035`: print,
+/// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1087-1089`: print,
 /// `ttyCleanup`, `return -1`) — the iocsh command fails and the IOC boots on
 /// without that port. A caller with no error channel — one shaped like a C++
 /// constructor, returning the built port by value — uses
@@ -267,7 +267,7 @@ pub fn create_port_runtime_boxed(
 
     // C `registerInterface(asynCommonType)` — reached from `registerPort` for
     // every port — calls `initPortConnect` and then `portConnectTimerCallback`
-    // (asynManager.c:2131-2136), which queues a connect at
+    // (asynManager.c:2133-2138), which queues a connect at
     // `asynQueuePriorityConnect` the moment the port exists (:3283-3297). An
     // auto-connect port is therefore brought up BY REGISTRATION, not by whichever
     // record first happens to do I/O: `CNCT` reads 1 straight after
@@ -289,7 +289,7 @@ pub fn create_port_runtime_boxed(
     let max_addr = driver.base().max_addr as i32;
     // The driver's interface declaration, taken once here — C's port
     // registration is where `registerInterface` is called too, and the set never
-    // changes afterwards (asynManager.c:2105-2138).
+    // changes afterwards (asynManager.c:2104-2140).
     let interfaces = driver.capabilities();
 
     // Event broadcast
@@ -387,7 +387,7 @@ pub fn create_port_runtime_boxed(
 
     // C `registerPort` ends by arming the port's own process-exit callback —
     // `epicsAtExit(destroyPortDriver, (void *)pport->portName)` — but only for
-    // an `ASYN_DESTRUCTIBLE` port (asynManager.c:2096-2098); every other port
+    // an `ASYN_DESTRUCTIBLE` port (asynManager.c:2098-2100); every other port
     // in C simply survives to process exit with no teardown at all. This line
     // arms it for EVERY port, a deliberate widening: the actor owns the driver,
     // so the teardown a driver owes its device rides its `Drop` (below), and a
@@ -400,7 +400,7 @@ pub fn create_port_runtime_boxed(
     // serial `disconnect`. Drivers therefore need to know nothing about
     // shutdown, which is C's arrangement too: `shutdownPort` fires
     // `asynExceptionShutdown` and leaves the destruction to the driver
-    // (asynManager.c:2301-2305).
+    // (asynManager.c:2303-2307).
     //
     // The callback holds the two channel ends, not the runtime handle: holding
     // a `PortHandle` would keep the port reachable, and so alive, for the life
@@ -427,7 +427,7 @@ pub fn create_port_runtime_boxed(
 /// it and moving on to the next.
 ///
 /// C does not wait at all — `shutdownPort` disables the port, fires the
-/// shutdown exception and returns (asynManager.c:2296-2306) — but C's teardown
+/// shutdown exception and returns (asynManager.c:2285-2309) — but C's teardown
 /// is the exception handler, which has already run by then. Ours is the
 /// driver's `Drop`, which runs on the actor thread, so leaving without waiting
 /// would be leaving before the teardown this whole path exists to reach. The
@@ -661,7 +661,7 @@ mod tests {
     /// `create_port_runtime`, not one the registering caller picked: a mask
     /// set by port name through the registry (`asynSetTraceMask`, asynRecord
     /// `TMSK`) must be the mask the driver's `trace_print` reads. C reaches
-    /// the one `tracePvt` through the port (asynManager.c:449-459).
+    /// the one `tracePvt` through the port (asynManager.c:451-461).
     #[test]
     fn the_registry_publishes_the_trace_the_driver_was_bound_to() {
         const PORT: &str = "trace_from_handle";

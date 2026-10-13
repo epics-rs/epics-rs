@@ -1,7 +1,7 @@
 //! The process-wide asyn port registry: the single claim on a port name.
 //!
 //! This is the list C `asynManager` keeps as `pasynBase->asynPortList`
-//! (`asynManager.c:2082-2095`), and it answers the same question for the same
+//! (`asynManager.c:2084-2097`), and it answers the same question for the same
 //! callers: `drvAsyn*PortConfigure`, areaDetector plugin ports, hand-registered
 //! driver ports and every port published through a
 //! [`crate::manager::PortManager`]. `asynReport` with no port argument
@@ -69,7 +69,7 @@ impl PortRegistry {
     /// bound to at `create_port_runtime` — so a mask set through the registry
     /// (`asynSetTraceMask`, asynRecord `TMSK`) is the mask the driver's
     /// `trace_print` reads. C has one `tracePvt` per port, reached through
-    /// the port (asynManager.c:449-459); a registration that named a second
+    /// the port (asynManager.c:451-461); a registration that named a second
     /// manager published masks nothing printed against.
     pub fn register(&self, name: &str, handle: PortHandle) -> AsynResult<()> {
         let mut reg = self.inner.lock().unwrap();

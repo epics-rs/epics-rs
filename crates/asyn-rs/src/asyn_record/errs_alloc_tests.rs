@@ -230,7 +230,7 @@ fn blocking_cycle(rec: &mut AsynRecord) -> u64 {
 
 /// C `process()` queues the record's one `asynUser`, made at init
 /// (asynRecord.c:306-308, :342), and `queueRequest` links it without
-/// allocating (asynManager.c:1606-1626). A cycle on a blocking port — the
+/// allocating (asynManager.c:1605-1628). A cycle on a blocking port — the
 /// queue under the hold and the completion re-entry that applies the result —
 /// allocates nothing once the record has run one.
 #[test]

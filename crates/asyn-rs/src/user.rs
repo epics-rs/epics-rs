@@ -86,7 +86,7 @@ pub struct AsynUser {
     /// The device this user is connected to, or `-1` when it is connected to
     /// the port itself. `-1` is the default: C decides port-vs-device from
     /// whether `connectDevice` allocated a device at all (`puserPvt->pdevice`,
-    /// set only for `addr >= 0`, asynManager.c:1348-1351), and renders the
+    /// set only for `addr >= 0`, asynManager.c:1351-1354), and renders the
     /// no-device case as -1 at the driver boundary (`getAddr`, :2006-2010;
     /// `connectAttempt`, :754). A non-negative value therefore means a device
     /// was deliberately chosen — `0` is device 0, never "unset".
@@ -289,7 +289,7 @@ impl AsynUser {
     /// (asynRecord.c:561-563, asynShellCommands.c). Priority being given, only
     /// the second half of C's `checkPortConnect` waiver remains (:1538-1540):
     /// a user with no device or the explicit sentinel. C's `addr` there is the
-    /// device's (`pdevice ? pdevice->addr : -1`, :1529), and `connectDevice`
+    /// device's (`pdevice ? pdevice->addr : -1`, :1522), and `connectDevice`
     /// finds no device on a port without `ASYN_MULTIDEVICE` (:576, :1352), so
     /// only a multi-device port refuses a device-addressed CNCT put on a
     /// disconnected port.
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(u.reason, 0);
         // A user that has not been connected to a device is port-level. C
         // renders that as -1: `connectDevice` sets `puserPvt->pdevice` only
-        // when `addr >= 0` (asynManager.c:1348-1351), and `getAddr` returns -1
+        // when `addr >= 0` (asynManager.c:1351-1354), and `getAddr` returns -1
         // whenever `pdevice` is NULL (:2006-2010).
         assert_eq!(u.addr, -1);
         assert_eq!(u.timeout, Some(Duration::from_secs(1)));

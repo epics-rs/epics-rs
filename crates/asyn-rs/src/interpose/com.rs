@@ -373,7 +373,7 @@ impl OctetInterpose for ComInterpose {
     /// *caller* handed us, not the stuffed count.
     ///
     /// C only subtracts the stuffing back out when the lower layer took the
-    /// whole stuffed buffer (`if (*nbytesTransfered == numchars)`, :192-193): a
+    /// whole stuffed buffer (`if (*nbytesTransferred == numchars)`, :192-193): a
     /// short write reports a count in stuffed-byte units, which the caller reads
     /// as un-stuffed bytes. That subtraction is unreachable on the failure path
     /// (a lower write that transferred every byte returns `asynSuccess`), so a
@@ -908,9 +908,9 @@ impl ComPortOptions {
     /// pushed to the server — which is how the line comes up configured after a
     /// terminal server reboots. `break` is deliberately not in C's key list: a
     /// break is a momentary line condition, not a setting to restore.
-    /// Runs on the interpose's own `asynUser` (C creates it at :847-850 and hands
-    /// it to `restoreSettings` from both the configure path (:865) and the
-    /// reconnect `exceptionHandler` (:784)), so this is the one negotiation with a
+    /// Runs on the interpose's own `asynUser` (C creates it at :843-850 and hands
+    /// it to `restoreSettings` from both the configure path (:863) and the
+    /// reconnect `exceptionHandler` (:783)), so this is the one negotiation with a
     /// timeout of its own — 2 s — and no caller to inherit one from.
     pub fn restore_settings(&mut self, next: &mut dyn OctetNext) -> AsynResult<()> {
         let mut user = interpose_user();
@@ -1426,9 +1426,9 @@ mod tests {
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_DATASIZE, 8, IAC, SE,
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_PARITY, CPO_PARITY_NONE, IAC, SE,
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_STOPSIZE, 1, IAC, SE,
-            // crtscts "N" re-sends the *current* flow mode (:588), not NOFLOW by
-            // name — they coincide at the default, and the ixon "N" that follows
-            // sends the same byte for the same reason.
+            // crtscts "N" sends `flow_mode_off`'s byte, not C's NOFLOW by name
+            // (:588, CBUG-B6) — they coincide at the default, and the ixon "N"
+            // that follows sends the same byte for the same reason.
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_CONTROL, CPO_CONTROL_NOFLOW, IAC, SE,
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_CONTROL, CPO_CONTROL_NOFLOW, IAC, SE,
         ];
@@ -1469,7 +1469,7 @@ mod tests {
     /// IACs, so `baud=255` (0x000000FF) put a raw IAC into the payload and a
     /// compliant RFC-2217 server mis-framed the rest of the negotiation. asyn
     /// #236 merged the write half (`9a4c3185:435-442`); the read half is still
-    /// raw there (:471, :477-481), so the un-escape this asserts on the way in
+    /// raw there (:458, :464-468), so the un-escape this asserts on the way in
     /// remains a deviation while the escape on the way out no longer is.
     #[test]
     fn b8_a_payload_byte_of_0xff_is_escaped_both_ways() {

@@ -1,7 +1,7 @@
 //! R18-59: an octet read on a stream port fans out to the octet interrupt users.
 //!
 //! C `asynOctetBase::readIt` (asynOctetBase.c:224-238) calls
-//! `callInterruptUsers(pasynUser, pasynPvt, data, nbytesTransfered, eomReason)`
+//! `callInterruptUsers(pasynUser, pasynPvt, data, nbytesTransferred, eomReason)`
 //! after every successful read, when the port enabled `interruptProcess` — which
 //! both stream drivers do (`pasynOctetBase->initialize(..., 1)`,
 //! drvAsynIPPort.c:1109 and drvAsynSerialPort.c:1125-1126). It is what makes a

@@ -303,8 +303,8 @@ enum IpIoInner {
 /// `newlib/rtems` glob collision that once made a bare `libc::POLLOUT`
 /// ambiguous on `armv7-rtems-eabihf` was removed by the pinned `libc` fork in
 /// `6f64e70d`, so the bare names compile and are correct there today.
-/// VxWorks 7 defines both at these same values (`libc`
-/// `src/vxworks/mod.rs:1198` and `:1029`).
+/// VxWorks 7 defines all three at these same values (`libc`
+/// `src/vxworks/mod.rs:1200`, `:1198` and `:1031`).
 #[cfg(target_os = "rtems")]
 const POLLOUT_EVENT: libc::c_short = 0x0004;
 #[cfg(target_os = "rtems")]
@@ -341,7 +341,7 @@ const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 /// before a byte was sent.
 pub(super) trait WaitWritable {
     /// `None` is a wait with no deadline — C's negative `pasynUser->timeout`,
-    /// which reaches `poll` as its own `-1` (drvAsynIPPort.c:615-617).
+    /// which reaches `poll` as its own `-1` (drvAsynIPPort.c:662-664).
     fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool>;
 }
 
@@ -388,6 +388,8 @@ pub(super) trait SendWithoutParking {
 /// `SO_SNDTIMEO` or `SO_RCVTIMEO`, and the bound is the poll in
 /// [`WaitWritable`] / [`BoundNextRead`] on every unix alike. Blocking
 /// elsewhere: Windows implements both options and both bounds ride on them.
+/// RTEMS differs from C: `__rtems__` selects `USE_SOCKTIMEOUT` (:71-72), so C
+/// never calls `setNonBlock` there and bounds each transfer by `SO_*TIMEO`.
 pub(super) const OWNED_NONBLOCKING: bool = cfg!(unix);
 
 /// Make the `read`/`recv_from` that follows return within `timeout`.
@@ -545,13 +547,13 @@ impl SendWithoutParking for TcpStream {
 ///
 /// Returns the bytes the peer accepted. C parity
 /// (`drvAsynIPPort.c::writeIt`, like `drvAsynSerialPort.c:843`): a write that
-/// stalls part-way reports `*nbytesTransfered` **together with** its
+/// stalls part-way reports `*nbytesTransferred` **together with** its
 /// `asynTimeout`/`asynError` status, so a failure here carries the accepted
 /// count in [`AsynError::with_partial_write`] rather than dropping it — that
 /// count is what `asynRecord` publishes as NAWT (asynRecord.c:1547).
 ///
 /// The loop is C's shape: wait for `POLLOUT`, send, advance, repeat until the
-/// buffer is gone (`drvAsynIPPort.c:632-700`). Waiting first is what bounds the
+/// buffer is gone (`drvAsynIPPort.c:680-750`). Waiting first is what bounds the
 /// call — see [`WaitWritable`] for why that bound is not `SO_SNDTIMEO`.
 ///
 /// `poll` is C's `writePollmsec` (`:662-663`) and it bounds **one** wait for
@@ -619,7 +621,7 @@ pub(super) fn write_with_retry(
             }
             Ok(n) => offset += n,
             // C retries both of these against `pasynUser->timeout`
-            // (`drvAsynIPPort.c:694-710`) and sleeps `SEND_RETRY_DELAY`
+            // (`drvAsynIPPort.c:710-724`) and sleeps `SEND_RETRY_DELAY`
             // between attempts; the wait at the top of this loop is that
             // sleep, so the retry needs none of its own — but it is not the
             // bound, because it re-arms.
@@ -663,9 +665,11 @@ impl IpIoInner {
     /// reach the read and write paths without it. It takes the transport by
     /// value-borrow rather than reading it back out of [`IpIoState`] because
     /// it must run *before* the socket is installed — see
-    /// [`DrvAsynIPPort::publish_transport`]. C is the same shape and the same
-    /// order: `setNonBlock(fd, 1)` right after the connect succeeds
-    /// (`drvAsynIPPort.c:516`), `tty->fd = fd` only at `:593`.
+    /// [`DrvAsynIPPort::publish_transport`]. C sets the mode earlier, before
+    /// `connect()` (`drvAsynIPPort.c:516` vs `:534`), because its bounded
+    /// connect is that non-blocking socket polled for `POLLOUT` (:541-566);
+    /// [`socket::tcp_connect`] makes the bounded connect itself, so the mode is
+    /// owned once it returns. Both own it before `tty->fd = fd` (`:593`).
     fn own_blocking_mode(&self) -> AsynResult<()> {
         match self {
             IpIoInner::Tcp(stream) => stream.set_nonblocking(OWNED_NONBLOCKING),
@@ -811,7 +815,7 @@ impl OctetNext for IpIoState {
         // `write_with_retry`, which is what stops a writable-but-EWOULDBLOCK
         // cycle from running forever.
         let poll = socket_poll_timeout(user.timeout);
-        // C writeIt reports what the socket took (`*nbytesTransfered`) on
+        // C writeIt reports what the socket took (`*nbytesTransferred`) on
         // success and on failure alike; return the real count rather than
         // assuming the whole buffer went out.
         // No arm arms `SO_SNDTIMEO`: the deadline is enforced by the wait in
@@ -823,7 +827,7 @@ impl OctetNext for IpIoState {
             IpIoInner::Udp(socket, peer) => {
                 // C polls `POLLOUT` before the datagram too — `writeIt` shares
                 // one loop across `SOCK_DGRAM` and `SOCK_STREAM`
-                // (`drvAsynIPPort.c:666-691`).
+                // (`drvAsynIPPort.c:680-702`).
                 if !socket.wait_writable(poll.map(|p| std::time::Instant::now() + p))? {
                     return Err(AsynError::Status {
                         status: AsynStatus::Timeout,
@@ -1017,7 +1021,7 @@ pub(crate) fn maxchars_zero_error() -> AsynError {
     }
 }
 
-/// What C `readIt` does with a failed read (drvAsynIPPort.c:798-813) — the
+/// What C `readIt` does with a failed read (drvAsynIPPort.c:851-867) — the
 /// teardown and the status it reports, as one value.
 ///
 /// ```c
@@ -1156,7 +1160,7 @@ impl OctetNext for NegotiationLink<'_> {
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let r = self.io.write(user, data);
         if let Err(ref e) = r {
-            // C `writeIt` (drvAsynIPPort.c:692-698) closes the connection on any
+            // C `writeIt` (drvAsynIPPort.c:741-748) closes the connection on any
             // failing send, which `is_fatal_transport` is the single owner of.
             if e.is_fatal_transport() {
                 self.teardown = true;
@@ -1228,7 +1232,7 @@ fn sock_err_cause(e: &AsynError) -> String {
 /// applying the C `drvAsynIPPort` poll-interval floor.
 ///
 /// C `readIt`/`writeIt` compute `pollmsec = (int)(timeout * 1000.0)` and
-/// then `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:741-743 and
+/// then `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:792-794 and
 /// :662-664): a zero timeout (a poll / non-blocking request) becomes a 1 ms
 /// poll, never an immediate-return zero interval. `std::net`'s
 /// `set_read_timeout`/`set_write_timeout` likewise reject a zero `Duration`
@@ -1340,7 +1344,7 @@ impl DrvAsynIPPort {
                 // A variant match therefore never saw a timeout on a default
                 // IP port and `disconnectOnReadTimeout` could not fire; C runs
                 // its test inside readIt, below the interpose, where the raw
-                // recv timeout is visible (drvAsynIPPort.c:798-806).
+                // recv timeout is visible (drvAsynIPPort.c:851-860).
                 let failure = classify_read_failure(
                     e,
                     self.disconnect_on_read_timeout,
@@ -1429,7 +1433,7 @@ impl DrvAsynIPPort {
 
     /// Run one transfer against the port's raw octet link — the **bottom** of
     /// the port's interpose chain, which the port itself runs on top of this
-    /// driver ([`crate::port::octet_read_chain`], C asynManager.c:2190-2220).
+    /// driver ([`crate::port::octet_read_chain`], C asynManager.c:2192-2222).
     ///
     /// Single owner of what that chain terminates at: the raw socket, or — for a
     /// COM port — the socket wrapped in the IAC layer, which is what puts COM
@@ -1508,7 +1512,7 @@ impl DrvAsynIPPort {
     }
 
     /// Everything `drvAsynIPPortConfigure` gives a port beyond constructing the
-    /// driver (drvAsynIPPort.c:1028-1066):
+    /// driver (drvAsynIPPort.c:1082-1120):
     ///
     /// ```c
     /// pasynManager->registerPort(tty->portName, ASYN_CANBLOCK, !noAutoConnect, ...);
@@ -1520,7 +1524,7 @@ impl DrvAsynIPPort {
     /// IP-server child ports are created by this very call** —
     /// `drvAsynIPServerPortConfigure` runs `drvAsynIPPortConfigure(pl->portName,
     /// tty->serverInfo, priority, 1 /*noAutoConnect*/, tty->noProcessEos)` for
-    /// each slot (drvAsynIPServerPort.c:688-694). A child is not "a port plus
+    /// each slot (drvAsynIPServerPort.c:709-715). A child is not "a port plus
     /// some of what a port gets": it gets all of it. Sharing one owner is what
     /// makes that true here too — the child inherited none of it while each
     /// property lived inside `DrvAsynIPPort::new` (R19-107, R19-108).
@@ -1544,7 +1548,7 @@ impl DrvAsynIPPort {
     }
 
     /// Create the socket C's `connectIt` creates: fresh fd, then every option
-    /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:451-459)
+    /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:453-462)
     /// and `SO_REUSEPORT` (:467-481) — applied **before** the socket is bound or
     /// connected, because that is the only time the kernel honours them. Binding
     /// first and setting `SO_REUSEPORT` afterwards, as this driver used to, left
@@ -2022,7 +2026,7 @@ mod tests {
 
     /// Enter the port's octet interface the way a caller does — through the
     /// interpose chain, with the driver at the bottom of it. C `findInterface`
-    /// hands the caller the *topmost* interpose (asynManager.c:1493-1501,
+    /// hands the caller the *topmost* interpose (asynManager.c:1494-1503,
     /// 2190-2220); the driver's own `read`/`write`/`flush` are the base the chain
     /// ends at, so a test that wants the EOS layer must enter above it, exactly
     /// as `PortActor` does.
@@ -2569,7 +2573,7 @@ mod tests {
     }
 
     /// R8-57 boundary: C runs the negotiation's reads through
-    /// `readIt`, so `readIt`'s teardown gate (drvAsynIPPort.c:798-806)
+    /// `readIt`, so `readIt`'s teardown gate (drvAsynIPPort.c:851-860)
     /// governs them too — a negotiation read that times out with
     /// `disconnectOnReadTimeout=Y` closes the socket. Driving the raw link would
     /// have silently skipped that.
@@ -2667,7 +2671,7 @@ mod tests {
     /// `drvAsynIPPortConfigure` does by default (iocsh.rs), so this is the
     /// *normal* configuration, not a corner case. C runs its disconnect test
     /// inside readIt, below the interpose, on the raw recv timeout
-    /// (drvAsynIPPort.c:798-806); asyn-rs runs it above the interpose, where
+    /// (drvAsynIPPort.c:851-860); asyn-rs runs it above the interpose, where
     /// the same timeout arrives wrapped as `PartialRead` — so the test must
     /// key off `e.status()`, not the error variant. Matching by variant made
     /// the option inert on every default IP port.
@@ -2764,7 +2768,7 @@ mod tests {
     }
 
     /// R11-47: the restamp keeps the bytes the device did send. C assigns
-    /// `*nbytesTransfered = thisRead` (drvAsynIPPort.c:878) *below* both branches,
+    /// `*nbytesTransferred = thisRead` (drvAsynIPPort.c:878) *below* both branches,
     /// so a device that emits half a line and goes quiet reaches the record as
     /// asynError **plus** its partial line — asynRecord commits NORD/EOMR
     /// regardless of status (asynRecord.c:1591,1627).
@@ -2785,16 +2789,16 @@ mod tests {
 
         let f = classify_read_failure(timed_out, true, Some(timeout), "127.0.0.1:5001");
         assert!(f.disconnect, "disconnectOnReadTimeout + timeout > 0");
-        assert_eq!(f.error.status(), AsynStatus::Error, "C :805");
+        assert_eq!(f.error.status(), AsynStatus::Error, "C :860");
         assert_eq!(
             f.error.message(),
             "127.0.0.1:5001 read error: read timeout",
-            "C :801-803"
+            "C :856-858"
         );
         assert_eq!(
             f.error.partial_read().map(|p| p.nbytes_transferred()),
             Some(3),
-            "the transfer C writes out at :824 survives the restamp"
+            "the transfer C writes out at :878 survives the restamp"
         );
     }
 
@@ -3193,7 +3197,7 @@ mod tests {
     }
 
     /// The other half of the same bound: when one wait really does outlast it,
-    /// C reports `asynTimeout` with `*nbytesTransfered` (`:697-701`, `:727`).
+    /// C reports `asynTimeout` with `*nbytesTransferred` (`:697-701`, `:727`).
     #[test]
     fn a_peer_that_stalls_longer_than_one_poll_times_out_with_its_count() {
         let peer = DribblePeer {
@@ -3821,7 +3825,7 @@ mod tests {
         assert_eq!(cfg.port, 5000);
     }
 
-    /// R8-57: `isCom` is what gates the install (C drvAsynIPPort.c:1061), so a
+    /// R8-57: `isCom` is what gates the install (C drvAsynIPPort.c:1115), so a
     /// COM port comes up with the IAC layer already in place — before the first
     /// transfer, not lazily at connect — and a TCP port never gets one.
     ///

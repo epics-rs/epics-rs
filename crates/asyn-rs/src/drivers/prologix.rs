@@ -62,7 +62,8 @@ pub const EOT_MARKER: u8 = 0xEF;
 
 /// Default TCP port for the Prologix bridge — set in the bridge
 /// firmware (Prologix doesn't allow it to be changed). C asyn
-/// hard-codes `:1234 TCP` when the host string has no `:`.
+/// hard-codes `:1234 TCP` when the host string has no `:`
+/// (drvPrologixGPIB.c:571).
 pub const DEFAULT_TCP_PORT: u16 = 1234;
 
 /// Initial output staging buffer capacity. Matches C asyn
@@ -152,7 +153,7 @@ impl DrvAsynPrologixPort {
     /// the framework triggers it — same flag semantics as C asyn.
     pub fn new(port_name: &str, host: &str, no_auto_connect: bool) -> AsynResult<Self> {
         // Inner TCP spec — `"host:port TCP"`. C asyn always appends
-        // `:1234 TCP` when no colon present; we do the same. When a
+        // `:1234 TCP` when no colon present (drvPrologixGPIB.c:571); we do the same. When a
         // colon is already present we trust the caller's port and
         // still append the `TCP` token so the inner ip_port parser
         // selects the right protocol.
@@ -339,7 +340,7 @@ impl DrvAsynPrologixPort {
 /// This is a deliberate deviation from C: `prologixConnect` returns at
 /// `drvPrologixGPIB.c:189`, `:196` and `:202` without disconnecting
 /// `pasynUserTCPcommon`, which leaves the TCP port holding a socket while the
-/// GPIB port stays down, and every retry then answers `drvAsynIPPort.c:424-427`
+/// GPIB port stays down, and every retry then answers `drvAsynIPPort.c:425-428`
 /// `"Link already open!"`.
 struct HandshakeLink<'a> {
     port: &'a mut super::ip_port::DrvAsynIPPort,
@@ -480,7 +481,7 @@ impl PortDriver for DrvAsynPrologixPort {
             // announces through `exceptionConnect(pasynUser)` (:213), which
             // resolves `findDpCommon` off the *caller's* user — so only that
             // device's `dpCommon` is marked and only its callbacks fire
-            // (asynManager.c:2151-2159). Publishing the port edge here instead
+            // (asynManager.c:2153-2161). Publishing the port edge here instead
             // would tell every other device on the bridge that the shared TCP
             // link had just come up.
             self.base.set_addr_connected(user.addr, true);
@@ -891,7 +892,7 @@ mod tests {
     /// `exceptionConnect(pasynUser)` (:213); `prologixDisconnect` likewise drops
     /// the shared TCP link only for `address < 0` (:226-230) and announces on
     /// the caller's user (:231). Both resolve `findDpCommon` off that user, so
-    /// they mark and fan out on exactly one device (asynManager.c:2151-2159,
+    /// they mark and fan out on exactly one device (asynManager.c:2153-2161,
     /// :2176-2187). The bridge's TCP link is shared by every GPIB address, so
     /// publishing the port edge from a device transition would misreport the
     /// whole bus.

@@ -75,7 +75,7 @@ pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) ->
 
 /// The trace a trace-setting command acts on. C connects an `asynUser` to
 /// the named port first (asynShellCommands.c:645-651) and `setTrace*` then
-/// writes that port's own `dpCommon` (asynManager.c:2774-2802), whichever
+/// writes that port's own `dpCommon` (asynManager.c:2788-2816), whichever
 /// manager the command was registered with; a port that does not exist is
 /// the `connectDevice` failure C prints and returns on. With no port named
 /// the setter writes the global config (C `pasynUser == NULL`), which lives
@@ -228,7 +228,7 @@ fn shell_eos_user(addr: i32) -> AsynUser {
 ///
 /// C parity: `asynShellCommands.c::asynSetEos` (:219-253) escape-decodes the
 /// `eos` argument, `connectDevice`s its `asynUser` to `(portName, addr)` through
-/// `findInterface` (:79-80, :233-234) and routes the bytes to
+/// `findInterface` (:79-80, :235-236) and routes the bytes to
 /// `pasynOctet->setInputEos`/`setOutputEos` — which read the addr off that user
 /// to pick the device's terminator. The addr is threaded here for the same
 /// reason: EOS is per device (see [`crate::port::eos_device_key`]).
@@ -471,7 +471,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // setOption callback; `addr` rides on the same user, as C's
                 // `findInterface(portName, addr, ...)` connects it to the device.
                 // It queues at `asynQueuePriorityConnect` carrying
-                // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:121,:126) — that is
+                // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:121,:127) — that is
                 // what lets an `st.cmd` configure a serial line whose device is
                 // not powered on yet.
                 let user = AsynUser::default()
@@ -597,7 +597,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     //
     // The `addr` names the DEVICE the layer lands on: C hands it to
     // `interposeInterface` (:176), which puts the layer on that device's
-    // `dpCommon.interposeInterfaceList` (asynManager.c:2202-2206), and
+    // `dpCommon.interposeInterfaceList` (asynManager.c:2204-2208), and
     // `findInterface` resolves a request device-first (:1495-1503). On a port that
     // is not multi-device every addr resolves to the port itself.
     {
@@ -775,7 +775,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // Same addr routing as the trace-mask setters: C connects the
                 // asynUser to (port, addr) first, so `addr >= 0` writes the
                 // device's dpCommon and `addr < 0` the port's
-                // (asynManager.c:2945-2959 via findTracePvt).
+                // (asynManager.c:2957-2984 via findTracePvt).
                 match port.as_deref() {
                     Some(p) if addr >= 0 => trace.set_device_io_truncate_size(p, addr, size),
                     Some(p) => trace.set_io_truncate_size(Some(p), size),
@@ -1168,7 +1168,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                         // `connectDevice(pasynUser, portName, addr)`
                         // before `setTraceIOMask`. When `addr >= 0` the
                         // pasynUser carries a `pdevice`, so
-                        // `setTraceIOMask` (asynManager.c:2830-2833)
+                        // `setTraceIOMask` (asynManager.c:2844-2847)
                         // writes the device-specific dpCommon; only
                         // when `addr < 0` does it fall to the
                         // every-device + port fallback.
@@ -1227,7 +1227,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                         };
                         // C parity: asynShellCommands.c:799-820 routes
                         // through `connectDevice(pasynUser, portName, addr)`.
-                        // `setTraceInfoMask` (asynManager.c:2872-2875)
+                        // `setTraceInfoMask` (asynManager.c:2886-2889)
                         // writes the device-specific dpCommon when
                         // `pdevice != NULL` (addr >= 0); falls to
                         // every-device + port otherwise.
@@ -1536,7 +1536,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             };
             // C takes maxClients from the shell argument and rejects 0
-            // ("No clients.", drvAsynIPServerPort.c:545-548).
+            // ("No clients.", drvAsynIPServerPort.c:566-569).
             config.max_clients = max_clients.max(0) as usize;
             // C stores noProcessEos on the server and hands it to every child's
             // `drvAsynIPPortConfigure` (:709-715) — that is its only use. The
@@ -1705,8 +1705,8 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
 /// Build the `prologixGPIBConfigure` iocsh command.
 ///
 /// C parity: `drvPrologixGPIB.c::prologixGPIBConfigure(portName, host,
-/// priority, noAutoConnect)` (lines 547-628). `host` may be `"hostname"`
-/// (the bridge's fixed `:1234 TCP` is appended) or `"hostname:port"`; see
+/// priority, noAutoConnect)` (lines 547-603). `host` may be `"hostname"`
+/// (the bridge's fixed `:1234 TCP` is appended, :571) or `"hostname:port"`; see
 /// [`DrvAsynPrologixPort::new`]. The created GPIB port is registered in the
 /// [`crate::asyn_record`] port registry so `asynRecord` device support
 /// resolves it by name.
@@ -1789,7 +1789,7 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
 /// already taken. Both have already printed the diagnostic and torn down
 /// whatever was half-built, so the caller has nothing to clean up and only has
 /// to stop — C's `drvAsynIPPortConfigure: Can't register myself.` / `ttyCleanup`
-/// / `return -1` (drvAsynIPPort.c:1033-1035).
+/// / `return -1` (drvAsynIPPort.c:1087-1089).
 ///
 /// `Some` hands back the runtime handle for the callers that need it (the
 /// server port binds its listening socket through it). Callers that do not may
@@ -2148,7 +2148,7 @@ mod tests {
 
     /// The same, for a port that carries `ASYN_MULTIDEVICE`. An `addr`
     /// names a device only on such a port — `locateDevice` returns NULL
-    /// otherwise (asynManager.c:574) — so every per-device trace routing
+    /// otherwise (asynManager.c:576) — so every per-device trace routing
     /// test has to build its port this way.
     fn fresh_mgr_with_multi_device_port(name: &str, max_addr: usize) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
@@ -2261,7 +2261,7 @@ mod tests {
 
     /// R19-120: `asynSetTraceIOTruncateSize` routes `addr` the way every other
     /// trace setter does — device dpCommon when `addr >= 0`, port when `addr <
-    /// 0` (C asynManager.c:2945-2959 via `findTracePvt`).
+    /// 0` (C asynManager.c:2957-2984 via `findTracePvt`).
     #[test]
     fn iocsh_set_trace_io_truncate_size_routes_addr_to_the_device() {
         let mgr = fresh_mgr_with_multi_device_port("trunc_port", 8);
@@ -2511,7 +2511,7 @@ mod tests {
 
     /// R19-117: `asynSetAutoConnectTimeout` rewrites the value a newly
     /// registered port waits for its first connect — C's process-global
-    /// `pasynBase->autoConnectTimeout` (asynManager.c:2370-2377), read at every
+    /// `pasynBase->autoConnectTimeout` (asynManager.c:2375-2382), read at every
     /// port registration (:2137). It was hard-coded at 0.5 s, which is too
     /// short for a slow device and was the reason C exposes the knob.
     #[test]
@@ -2827,7 +2827,7 @@ mod tests {
             user.reason,
             crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED,
             "C asynSetEos stamps ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED \
-             (asynShellCommands.c:241)"
+             (asynShellCommands.c:240)"
         );
         assert_eq!(
             user.timeout,
@@ -2928,7 +2928,7 @@ mod tests {
     /// R14-48: the `addr` argument names the device whose terminator is being
     /// set. C threads it into `findInterface(portName, addr, ...)`, which
     /// `connectDevice`s the queued `asynUser` to that device
-    /// (asynShellCommands.c:79-80, :233-234) — so `setInputEos` lands on that
+    /// (asynShellCommands.c:79-80, :235-236) — so `setInputEos` lands on that
     /// device's EOS. iocsh parsed the addr and dropped it, so every
     /// `asynOctetSetInputEos port <addr> ...` wrote device 0's.
     ///

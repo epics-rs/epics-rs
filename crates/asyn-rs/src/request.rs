@@ -74,10 +74,10 @@ pub trait CellBody: Send + Sync + 'static {
 
 /// One preallocated request — C's `asynUser` and its `userPvt`, which
 /// `queueRequest` links onto a port queue without allocating
-/// (asynManager.c:1606-1626).
+/// (asynManager.c:1605-1628).
 ///
 /// One request per cell is outstanding, as C's `isQueued` allows one per
-/// `asynUser` (asynManager.c:1574-1579); here the cell stays outstanding until
+/// `asynUser` (asynManager.c:1586-1591); here the cell stays outstanding until
 /// its body has run, which for one user queued from one record is the same.
 pub struct RequestCell {
     queue: Arc<CellQueue>,
@@ -914,7 +914,7 @@ pub enum RequestOp {
     /// `pasynManager->isConnected` — the state the driver publishes through
     /// `exceptionConnect`/`exceptionDisconnect`, not "is a record bound to
     /// this port". `asynRecord` reads it in `monitorStatus` (asynRecord.c:
-    /// 1089-1093) to refresh CNCT, and gates its `callbackConnect` on it
+    /// 1090-1094) to refresh CNCT, and gates its `callbackConnect` on it
     /// (:858-888) so a CNCT put never re-connects an already-connected port.
     GetConnected,
     /// Install the echo interpose on top of the port's octet stack. C parity:
@@ -1086,7 +1086,7 @@ impl RequestResult {
     }
 
     /// Octet write result carrying the number of bytes transferred
-    /// (C `asynOctet::write`'s `*nbytesTransfered`). Used by
+    /// (C `asynOctet::write`'s `*nbytesTransferred`). Used by
     /// `PortHandle::write_octet` / `SyncIO::write_octet` to report how
     /// many bytes the driver actually wrote on success.
     pub fn write_n(nbytes: usize) -> Self {
@@ -1251,7 +1251,7 @@ impl RequestResult {
 /// is still on the queue (asynManager.c:1663-1668); once the port thread has
 /// dequeued it and is running the callback (`callbackActive`) or it has already
 /// finished, `wasQueued==0` and the I/O runs to completion and is reported
-/// normally (asynManager.c:1645-1659). `Queued` is the only state a cancel can
+/// normally (asynManager.c:1647-1661). `Queued` is the only state a cancel can
 /// win from; the executor's `Queued -> Running` transition closes that window.
 ///
 /// The queue-wait timeout (C `queueTimeoutCallback`, asynManager.c:649-703) is
@@ -1290,7 +1290,7 @@ impl CancelToken {
     /// from the queue (the caller must report "I/O request canceled",
     /// asynRecord.c:397-404); `false` when it had already been dequeued and was
     /// running or had completed, in which case the I/O runs to completion and
-    /// reports normally (asynManager.c:1645-1659).
+    /// reports normally (asynManager.c:1647-1661).
     pub fn cancel(&self) -> bool {
         self.0
             .compare_exchange(

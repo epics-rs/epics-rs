@@ -10,7 +10,7 @@
 //! The owner is `epics_libcom_rs::runtime::exit` (C `epicsExit.c`), which
 //! `IocApplication::run` calls on every way out. Ports enrol themselves in it at
 //! creation, where C's `registerPort` enrols an `ASYN_DESTRUCTIBLE` one
-//! (`epicsAtExit(destroyPortDriver, …)`, asynManager.c:2096-2098) — here every
+//! (`epicsAtExit(destroyPortDriver, …)`, asynManager.c:2098-2100) — here every
 //! port enrols, whatever it declared, so a driver still knows nothing about
 //! shutdown.
 //!

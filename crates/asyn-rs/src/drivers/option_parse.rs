@@ -117,7 +117,7 @@ pub fn sscanf_uint(value: &str) -> Option<u32> {
 }
 
 /// C's diagnostic for a value that carries no number at all —
-/// `"Bad number"` (drvAsynSerialPort.c:264, :512, :576, :585;
+/// `"Bad number"` (drvAsynSerialPort.c:264, :515, :576, :586;
 /// drvAsynSerialPortWin32.c:196, :205, :314).
 pub fn bad_number() -> AsynError {
     AsynError::Status {
@@ -128,7 +128,7 @@ pub fn bad_number() -> AsynError {
 
 /// C's diagnostic for a boolean/enumerated key whose value it does not
 /// recognise — `"Invalid <key> value."` (drvAsynSerialPort.c:419, :440, :464,
-/// :481, :502, :539, :558; drvAsynIPPort.c:987).
+/// :481, :501, :539, :553; drvAsynIPPort.c:987).
 ///
 /// The three keys whose C text is *not* of this shape have their own literal at
 /// the call site: `"Invalid parity."`, `"Invalid number of bits."`,

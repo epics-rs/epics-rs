@@ -775,7 +775,7 @@ impl AsynDeviceSupport {
 
     /// C `queueRequest` of the output request (devAsynFloat64.c:661): its gate,
     /// then the link. A write still queued from an earlier put is refused, as
-    /// C refuses an `asynUser` that `isQueued` (asynManager.c:1574-1579).
+    /// C refuses an `asynUser` that `isQueued` (asynManager.c:1586-1591).
     fn queue_write(&mut self, op: RequestOp, user: AsynUser) -> AsynResult<()> {
         let cell = self.write_cell();
         self.handle.queue_gate(&user)?;
@@ -2480,7 +2480,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     }
                     // Transport success: store the mean and define the
                     // record — C `processAiAverage` ends `pr->rval = rval;
-                    // pr->udf = 0; return 0` (devAsynInt32.c:1082-1085).
+                    // pr->udf = 0; return 0` (devAsynInt32.c:920-922).
                     let wrote_val = self.store_read_value(record, val);
                     return Ok(stored(wrote_val));
                 }
@@ -2488,7 +2488,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     // No samples since the last process. C `processAiAverage`
                     // sets UDF_ALARM/INVALID, sets the record's `udf = 1` and
                     // returns -2 with VAL untouched — devAsynInt32.c:900-904,
-                    // devAsynFloat64.c:721-725, devAsynInt64.c:827-831.
+                    // devAsynFloat64.c:721-725, devAsynInt64.c:829-833.
                     // `undefined()` is that -2: it skips the RVAL→VAL convert
                     // so VAL keeps its previous value, suppresses the framework's
                     // per-cycle UDF re-derive (which `aiRecord.c:161` gates on
@@ -6564,7 +6564,7 @@ mod tests {
 
     /// C devAsyn queues its output on the record's own `asynUser`, which
     /// `queueRequest` links onto the port queue without allocating
-    /// (asynManager.c:1606-1626). A put on a blocking port queues the same way:
+    /// (asynManager.c:1605-1628). A put on a blocking port queues the same way:
     /// the one allocation left is the `Box` that `WriteStart::Pending` carries.
     #[test]
     fn a_put_on_a_blocking_port_queues_its_write_without_allocating() {

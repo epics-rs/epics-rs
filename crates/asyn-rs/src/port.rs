@@ -22,7 +22,7 @@ use std::any::Any;
 
 use parking_lot::Mutex;
 
-/// C `autoConnectDevice` reconnect throttle window (asynManager.c:713).
+/// C `autoConnectDevice` reconnect throttle window (asynManager.c:715).
 /// A disconnected `auto_connect` device is refused a fresh connect attempt
 /// until this much time has elapsed since its last connect/disconnect
 /// transition or attempt, bounding reconnect storms to one attempt per
@@ -31,7 +31,7 @@ const AUTO_CONNECT_THROTTLE: Duration = Duration::from_secs(2);
 
 /// First autonomous connect-retry delay after a port drops. C
 /// `exceptionDisconnect` arms the port's connect timer at `.01` seconds
-/// (asynManager.c:2181-2182), so the reconnect is attempted essentially
+/// (asynManager.c:2183-2184), so the reconnect is attempted essentially
 /// immediately and then backs off to [`DEFAULT_SECONDS_BETWEEN_PORT_CONNECT`].
 const CONNECT_RETRY_INITIAL: Duration = Duration::from_millis(10);
 
@@ -309,7 +309,7 @@ impl Default for LockPortTimeout {
 }
 
 /// The announces C `enable` and `autoConnectAsyn` raise inline on one
-/// dpCommon (asynManager.c:2249, :2321-2323), owed to the port's actor: the
+/// dpCommon (asynManager.c:2249, :2323-2326), owed to the port's actor: the
 /// port stamp of the latest call of each kind, 0 for none. Owed in place, so a
 /// call under a record's hold allocates nothing and is never refused; repeated
 /// calls of one kind on one dpCommon coalesce into one announce at the latest
@@ -366,7 +366,7 @@ pub fn eos_device_key(multi_device: bool, addr: i32) -> i32 {
     dp_common_key(multi_device, addr).unwrap_or(-1)
 }
 
-/// C `findDpCommon` (asynManager.c:538-545) as a key: which `dpCommon` a
+/// C `findDpCommon` (asynManager.c:538-546) as a key: which `dpCommon` a
 /// `(port, addr)` pair names. `Some(a)` is that device's own slot; `None` is
 /// the port's — C's `!(pport->attributes&ASYN_MULTIDEVICE) || !pdevice` arm,
 /// which a single-device port and a port-level user both take (`connectDevice`
@@ -612,7 +612,7 @@ pub struct PortDriverBase {
     eos: HashMap<i32, DeviceEos>,
     pub interpose_octet: OctetInterposeStack,
     /// Trace configuration — C `dpCommon.trace`, inited by `dpCommonInit`
-    /// (asynManager.c:528). Same
+    /// (asynManager.c:530). Same
     /// owner as [`Self::announcer`]: bound by
     /// [`crate::services::PortServices::bind`] at port creation.
     pub(crate) trace: Option<Arc<TraceManager>>,
@@ -640,7 +640,7 @@ pub struct PortDriverBase {
     /// asynManager.c:223). `None` = disarmed.
     ///
     /// Armed by [`Self::set_connected`] on a disconnect (C
-    /// `exceptionDisconnect`, asynManager.c:2181-2182) and re-armed by the
+    /// `exceptionDisconnect`, asynManager.c:2183-2184) and re-armed by the
     /// actor after a failed attempt; cleared on connect. The actor is what
     /// services it — see `PortActor::service_connect_timer` — so this field
     /// is the whole handoff between the transition owner and the timer.
@@ -814,7 +814,7 @@ impl PortDriverBase {
     }
 
     /// How many callbacks are registered on this port's exception list — the
-    /// `exceptionUsers` count `reportPrintPort` prints (asynManager.c:1068-1072).
+    /// `exceptionUsers` count `reportPrintPort` prints (asynManager.c:1070-1074).
     /// `asynReport` itself is the iocsh command (asynShellCommands.c:587); it
     /// reaches this through `asynManager`'s own `report` (:1138).
     pub fn exception_callback_count(&self) -> usize {
@@ -895,7 +895,7 @@ impl PortDriverBase {
 
     /// Single owner-API for the port-level `connected` transition.
     ///
-    /// C parity: `exceptionConnect` (asynManager.c:2151-2160) and
+    /// C parity: `exceptionConnect` (asynManager.c:2153-2162) and
     /// `exceptionDisconnect` (:2176-2187) fire
     /// `asynExceptionConnect` only when the state actually changes.
     /// All driver code that toggles connection state MUST go through
@@ -918,8 +918,8 @@ impl PortDriverBase {
     }
 
     /// Publish the port's connection edge if the truth has moved since the last
-    /// fan-out: the single owner of `exceptionConnect` (asynManager.c:2142-2161)
-    /// and `exceptionDisconnect` (:2165-2188), of the interpose stack's connection
+    /// fan-out: the single owner of `exceptionConnect` (asynManager.c:2142-2163)
+    /// and `exceptionDisconnect` (:2165-2190), of the interpose stack's connection
     /// reset and of the retry timer.
     ///
     /// [`Self::set_connected`] is one caller. The other is the actor, on a port
@@ -966,7 +966,7 @@ impl PortDriverBase {
         // (asynInterposeEos.c:110) and drops its read-ahead buffer +
         // partial-EOS match on `asynExceptionConnect`
         // (asynInterposeEos.c:142-151). Both C edges — `exceptionConnect`
-        // (asynManager.c:2158) and `exceptionDisconnect` (asynManager.c:2185)
+        // (asynManager.c:2161) and `exceptionDisconnect` (asynManager.c:2187)
         // — raise that same exception, so both edges reset here. Driving the
         // hook from this owner (rather than from an out-of-band subscriber)
         // keeps it impossible to change `connected` without the stack
@@ -984,7 +984,7 @@ impl PortDriverBase {
     /// interpose is installed on one (port, addr) pair and registers its
     /// exception callback on that address's `dpCommon`, so a device-level
     /// connect exception only resets *that* device's interpose
-    /// (asynManager.c:611-625 fans out per-`dpCommon`). `interpose_octet`
+    /// (asynManager.c:613-627 fans out per-`dpCommon`). `interpose_octet`
     /// here is port-scoped, so clearing it from a per-device transition
     /// would discard read-ahead belonging to the port's other addresses.
     /// The port-level transition owner [`Self::set_connected`] carries the
@@ -1071,7 +1071,7 @@ impl PortDriverBase {
         dp_common_key(self.flags.multi_device, addr)
     }
 
-    /// C `findDpCommon(puserPvt)->enabled` (asynManager.c:2352) — what
+    /// C `findDpCommon(puserPvt)->enabled` (asynManager.c:2356) — what
     /// `pasynManager->isEnabled` answers for this address.
     pub fn dp_enabled(&self, addr: i32) -> bool {
         self.device(addr, DeviceState::enabled)
@@ -1172,7 +1172,7 @@ impl PortDriverBase {
     }
 
     /// What C `enable` and `autoConnectAsyn` do after their store
-    /// (asynManager.c:2249, :2321-2323) — start the port's connect timer and
+    /// (asynManager.c:2249, :2323-2326) — start the port's connect timer and
     /// raise the exception on the dpCommon it was made on — for every store
     /// [`DeviceTable`] recorded, on this thread or a handle's, oldest first.
     pub(crate) fn drain_announces(&mut self) {
@@ -1191,7 +1191,7 @@ impl PortDriverBase {
     /// Per-address variant — for multi-device ports. C parity:
     /// `autoConnectAsyn` walks dpCommon via findDpCommon so a per-
     /// device pasynUser hits the device's dpc, otherwise the port's
-    /// dpc (asynManager.c:2314 + findDpCommon).
+    /// dpc (asynManager.c:2316 + findDpCommon).
     pub fn set_auto_connect_addr(&mut self, addr: i32, yes: bool) {
         // Same `findDpCommon` split as [`Self::set_addr_enabled`]
         // (asynManager.c:2316).
@@ -1207,7 +1207,7 @@ impl PortDriverBase {
     }
 
     /// The one place a shut-down port is named in an error message, and the
-    /// only one C has: `enable` on a defunct device (asynManager.c:2236-2241).
+    /// only one C has: `enable` on a defunct device (asynManager.c:2238-2243).
     /// Every other gate refuses a defunct port as a disabled one.
     fn shut_down_error() -> AsynError {
         AsynError::Status {
@@ -1236,7 +1236,7 @@ impl PortDriverBase {
     /// from a driver error raised *inside* a callback that did run — the record
     /// writes the refusal to ERRS and stops, where a driver error still gets the
     /// callback's readback and `monitorStatus` tail (asynRecord.c:571-578 vs
-    /// :788-900). This is the only place that stamps it.
+    /// :808-901). This is the only place that stamps it.
     pub fn check_queue(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
         self.check_queue_inner(addr, connect)
             .map_err(AsynError::into_queue_refusal)
@@ -1264,9 +1264,9 @@ impl PortDriverBase {
     fn check_queue_inner(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
         self.queue_gate().check(connect)?;
         if !self.flags.can_block {
-            // C :1561-1567 — the device-enabled refusal in the synchronous block
+            // C :1563-1569 — the device-enabled refusal in the synchronous block
             // is *not* conditioned on `checkPortConnect`; only the connected one
-            // below is (:1568).
+            // below is (:1570).
             self.check_device_enabled(addr)?;
             if connect == ConnectCheck::Required {
                 self.check_device_connected(addr)?;
@@ -1276,7 +1276,7 @@ impl PortDriverBase {
     }
 
     /// The device-level enabled refusal, C's text verbatim
-    /// (asynManager.c:1561-1567). Its *use* differs by port class, which is why
+    /// (asynManager.c:1563-1569). Its *use* differs by port class, which is why
     /// it is a check and not a gate: `queueRequest` returns it on a synchronous
     /// port, while on a CANBLOCK port the same condition makes `portThread` park
     /// the request instead (:877). Both callers ask this one function.
@@ -1334,7 +1334,7 @@ impl PortDriverBase {
     /// (defunct => permanently disabled) otherwise.
     ///
     /// There is no defunct branch: `shutdownPort` clears `enabled` alongside
-    /// setting `defunct` (asynManager.c:2283-2284), and the invariant
+    /// setting `defunct` (asynManager.c:2285-2286), and the invariant
     /// `defunct ⟹ !enabled` (see the field doc) lets the one check answer for
     /// both.
     pub fn check_ready(&self) -> AsynResult<()> {
@@ -1493,7 +1493,7 @@ impl PortDriverBase {
     /// Set a specific device address as connected.
     ///
     /// C parity: announce only on actual transition
-    /// (asynManager.c:2151-2160 — `exceptionConnect` rejects
+    /// (asynManager.c:2153-2162 — `exceptionConnect` rejects
     /// already-connected; we keep an Ok return for idempotency but
     /// suppress the duplicate fan-out so subscribers don't see
     /// spurious connect events). Thin wrapper over
@@ -1506,7 +1506,7 @@ impl PortDriverBase {
     /// Set a specific device address as disconnected.
     ///
     /// C parity: announce only on actual transition
-    /// (asynManager.c:2174-2185). Thin wrapper over
+    /// (asynManager.c:2176-2187). Thin wrapper over
     /// [`Self::set_addr_connected`].
     pub fn disconnect_addr(&mut self, addr: i32) {
         self.set_addr_connected(addr, false);
@@ -2111,7 +2111,7 @@ pub trait PortDriver: Any + Send + Sync {
     /// The trivial driver's `pasynCommon->connect`: C's own does its transport
     /// work and then calls `pasynManager->exceptionConnect(pasynUser)`, which
     /// resolves the slot it marks connected through `findDpCommon` on that same
-    /// user (asynManager.c:2142-2162). So the addr the request carries selects
+    /// user (asynManager.c:2142-2163). So the addr the request carries selects
     /// the slot here too — [`PortDriverBase::set_addr_connected`] is the one
     /// owner of that resolution, and a user addressing no device marks the
     /// port's own. A driver that overrides this owns its transport's shape.
@@ -2159,7 +2159,7 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     /// The driver's own report — C `asynCommon::report`, which the manager calls
-    /// last (`reportPrintPort`, asynManager.c:1113-1122) after printing the port's
+    /// last (`reportPrintPort`, asynManager.c:1115-1124) after printing the port's
     /// manager-level state itself.
     ///
     /// So this prints only what the *driver* owns. The port's enable / connect /
@@ -2620,7 +2620,7 @@ pub trait PortDriver: Any + Send + Sync {
     // C asyn `asynOctetSyncIO::setInputEos` / `setOutputEos`
     // (`asynOctetSyncIO.c:300-321`, `:346-367`) bracket the driver call in
     // `lockPort`/`unlockPort`. `lockPort` is a plain mutex take —
-    // `defunct` check, then `synchronousLock` (asynManager.c:1789-1798) —
+    // `defunct` check, then `synchronousLock` (asynManager.c:1791-1800) —
     // and waits for no connection, so an EOS set blocks only behind
     // whoever else holds the port. The connect wait lives elsewhere:
     // `registerPort` calls `waitConnect(pport->pconnectUser,
@@ -2652,7 +2652,7 @@ pub trait PortDriver: Any + Send + Sync {
     /// drvAsynIPServerPort.c:118-123, drvAsynFTDIPort.cpp:610-612). What
     /// makes IEOS work on those ports is `asynInterposeEos`, installed above
     /// the driver by `asynOctetBase::initialize` when `processEosIn` is set
-    /// (:169-171) — so the terminator is accepted exactly when a layer takes
+    /// (:170-171) — so the terminator is accepted exactly when a layer takes
     /// it, and refused otherwise. A `noProcessEos` port reporting success and
     /// then never terminating is the failure this refusal exists to make loud.
     ///
@@ -4284,7 +4284,7 @@ mod tests {
         assert_eq!(last_addr.load(Ordering::Relaxed), 2);
     }
 
-    /// C parity (asynManager.c:2151-2160 exceptionConnect,
+    /// C parity (asynManager.c:2153-2162 exceptionConnect,
     /// :2176-2187 exceptionDisconnect): redundant connect/disconnect
     /// on a port already in that state must NOT fan out a duplicate
     /// `asynExceptionConnect`. Subscribers depend on the event
@@ -4367,7 +4367,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::Relaxed), 3);
     }
 
-    /// `autoConnectAsyn` (asynManager.c:2321-2323): enabling auto-connect on a
+    /// `autoConnectAsyn` (asynManager.c:2323-2325): enabling auto-connect on a
     /// down port/device arms the connect timer; a connected port, or a
     /// flip to OFF, arms nothing. Pre-fix no flip armed the timer, so a
     /// never-connected port enabled late made one exception-wake attempt
@@ -4425,7 +4425,7 @@ mod tests {
 
     #[test]
     fn auto_connect_throttle_gate_boundaries() {
-        // C autoConnectDevice 2.0s gate (asynManager.c:712-713). Boundary
+        // C autoConnectDevice 2.0s gate (asynManager.c:714-715). Boundary
         // cases, not narrative: never-stamped, exactly-2s, just-under-2s.
         let mut base = PortDriverBase::new("thr", 1, PortFlags::default());
 
@@ -4492,7 +4492,7 @@ mod tests {
     fn set_enabled_refuses_defunct_port() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // C `enable` on a defunct port: asynDisabled, no `enabled` toggle,
-        // no asynExceptionEnable fan-out (asynManager.c:2236-2241).
+        // no asynExceptionEnable fan-out (asynManager.c:2238-2243).
         let flags = PortFlags {
             destructible: true,
             ..PortFlags::default()

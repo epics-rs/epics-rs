@@ -650,7 +650,7 @@ impl OldStr {
 /// The first [`HELD_POSTS`] entries are the posts `process()` and `special()`
 /// make themselves, drained as each returns, all `DBE_VALUE | DBE_LOG`:
 /// `reportError`'s ERRS (:2047), `monitorStatus` (:1102-1139), `getOptions`
-/// (:1928-1945), `getEos` (:2016-2024), ERRS again, `monitorStatus` again. Two
+/// (:1928-1943), `getEos` (:2016-2024), ERRS again, `monitorStatus` again. Two
 /// copies of a post cover both of C's orders: `connectDevice` runs
 /// `monitorStatus` before its readbacks and again after (:1271, :1319), while
 /// `asynCallbackSpecial` reads back and then runs it (:845-897).
@@ -968,7 +968,7 @@ enum GpibCycle {
     /// One `universalCmd(cmd)` — C `gpibUniversalCmd` (asynRecord.c:1638-1677).
     Universal(u8),
     /// One `addressedCmd(frame)` — C `gpibAddressedCmd`'s `acmd[]`
-    /// (asynRecord.c:1698-1750).
+    /// (asynRecord.c:1698-1749).
     Addressed(Vec<u8>),
     /// C's three-operation Serial Poll (asynRecord.c:1717-1746).
     SerialPoll,
@@ -1277,7 +1277,7 @@ enum IoPhase {
     /// C `gpibUniversalCmd`'s single `universalCmd(cmd_char)`
     /// (asynRecord.c:1672).
     GpibUniversal(u8),
-    /// C `gpibAddressedCmd`'s `addressedCmd(acmd, lenCmd)` (asynRecord.c:1750);
+    /// C `gpibAddressedCmd`'s `addressedCmd(acmd, lenCmd)` (asynRecord.c:1748-1749);
     /// the frame is [`GpibCycle::Addressed`]'s.
     GpibAddressed,
     /// Serial Poll step 1 — `universalCmd(IBSPE)` (asynRecord.c:1720-1726).
@@ -1472,8 +1472,9 @@ fn io_phase_user(plan: &IoPlan, phase: IoPhase) -> AsynUser {
 }
 
 /// Record a write-phase result into the outcome — the C `performIO` write
-/// branch (asynRecord.c:1524-1556 octet, :1442-1453 register). A write
-/// failure reports `ERRS` but, like C, does not skip the read phase.
+/// branch (asynRecord.c:1524-1556 octet, :1370-1382, :1405-1418, :1442-1454
+/// register). A write failure reports `ERRS` but, like C, does not skip
+/// the read phase.
 fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<RequestResult>) {
     if plan.iface != InterfaceType::Octet {
         // C performInt32IO/performUInt32DigitalIO/performFloat64IO write error
@@ -1500,10 +1501,10 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
         return;
     }
 
-    // C performOctetIO write branch (asynRecord.c:1524-1556). `nbytesTransfered`
+    // C performOctetIO write branch (asynRecord.c:1524-1556). `nbytesTransferred`
     // is what the *device* took: C seeds it to 0 (:1527), the octet chain writes
     // it out on success and on failure alike, and the record commits it —
-    // `nawt = nbytesTransfered` (:1547) runs *before* the status test at :1551.
+    // `nawt = nbytesTransferred` (:1547) runs *before* the status test at :1551.
     // So both arms report a real count: the reply's `nbytes` on success, and the
     // failure's `PartialWrite` carrier on error (absent => the layer moved
     // nothing, which is exactly C's untouched seed of 0).
@@ -1544,13 +1545,14 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
 }
 
 /// Record a read-phase result into the outcome — the C `performIO` read
-/// branch (asynRecord.c:1557-1631 octet, :1478-1527 register).
+/// branch (asynRecord.c:1557-1635 octet, :1383-1395, :1419-1433,
+/// :1455-1467 register).
 fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<RequestResult>) {
     match plan.iface {
         InterfaceType::Octet => {
             // C performOctetIO reads into a buffer it memset to zero
             // (asynRecord.c:1560) and then assigns EOMR / the IFMT-selected
-            // input field / NORD / TINP from `nbytesTransfered` **regardless
+            // input field / NORD / TINP from `nbytesTransferred` **regardless
             // of the returned status** (:1591-1629) — the error branch at
             // :1583 reports the error and raises the alarm but does not skip
             // the assignments. So a device that emits a partial line and then
@@ -1578,13 +1580,13 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 }
             };
 
-            // C `nbytesTransfered` — the count every read-side diagnostic and
+            // C `nbytesTransferred` — the count every read-side diagnostic and
             // field assignment below is built from. Taken before `data` is
             // moved into the IFMT-selected input field.
             let nread = data.len();
 
             out.eomr = Some(eom as i32);
-            // NORD is the raw transfer count (C `nord = nbytesTransfered`,
+            // NORD is the raw transfer count (C `nord = nbytesTransferred`,
             // asynRecord.c:1627) — independent of the overflow
             // NUL-truncation below and of UTF-8-lossy expansion.
             out.nord = Some(nread as i32);
@@ -1646,7 +1648,7 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                     format_args!("Error {}", e.message_display()),
                 );
                 // C: reportError(status, "%s  nread %d %s", <status word>,
-                // nbytesTransfered, pasynUser->errorMessage) — two spaces after
+                // nbytesTransferred, pasynUser->errorMessage) — two spaces after
                 // the status word, verbatim from the C format string.
                 out.report_error(
                     &plan.trace,
@@ -1664,7 +1666,7 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             }
             if overflow {
                 // C: reportError(status, "Overflow nread %d %s",
-                // nbytesTransfered, pasynUser->errorMessage) in all three
+                // nbytesTransferred, pasynUser->errorMessage) in all three
                 // overflow branches (asynRecord.c:1602-1621), alongside the
                 // MINOR alarm. The `%s` tail is the driver's message; an
                 // overflow that did not *fail* has none, and C then splices
@@ -1841,7 +1843,7 @@ fn record_phase_result(
             }
         }
         IoPhase::GpibAddressed => {
-            // C gpibAddressedCmd (asynRecord.c:1750-1756).
+            // C gpibAddressedCmd (asynRecord.c:1748-1755).
             if let Err(e) = res {
                 out.report_error(
                     &plan.trace,
@@ -2661,7 +2663,7 @@ impl AsynRecord {
         TraceInfoMask::from_bits_truncate(mask)
     }
 
-    /// C `findTracePvt` (asynManager.c:539-551) for the record's user: the
+    /// C `findTracePvt` (asynManager.c:538-553) for the record's user: the
     /// device rung on a multi-device port, else the port's, else — a user
     /// connected to no port — the global one. Every trace read and write the
     /// record makes resolves here, so a record whose connect failed still
@@ -2860,7 +2862,7 @@ impl AsynRecord {
     /// blocking worker, not on the thread that raised the exception: that is
     /// the port actor whenever the driver raised it, and `monitor_status`'s
     /// port queries are round trips to that actor. C also takes the lock
-    /// before `interruptAccept` (:906, :911); the record is not processed
+    /// before `interruptAccept` (:907, :911); the record is not processed
     /// then, so taking it costs nothing.
     ///
     /// With no database handle or no runtime the callback raises
@@ -3033,7 +3035,7 @@ impl AsynRecord {
 
     /// C `getOptions`'s bracket around the driver readback: `REMEMBER_STATE`
     /// on the eleven menus (asynRecord.c:1851-1861), then `POST_IF_NEW` on
-    /// them and HOSTINFO against its last post (:1928-1945).
+    /// them and HOSTINFO against its last post (:1928-1943).
     fn get_options(&mut self, opts: &HashMap<String, String>) {
         self.old.options = self.option_values();
         self.apply_option_readback(opts);
@@ -3242,7 +3244,7 @@ impl AsynRecord {
     /// every second with text the client already has.
     ///
     /// C prints the text on the record's trace rung first, at ASYN_TRACE_ERROR,
-    /// unless `status` is success or timeout (:2037-2040) — under the hold, as
+    /// unless `status` is success or timeout (:2039-2042) — under the hold, as
     /// C does under `dbScanLock`, and without allocating.
     fn report_error(&mut self, status: AsynStatus, msg: std::fmt::Arguments<'_>) {
         self.report_errs(status, Errs::format(msg));
@@ -3336,8 +3338,8 @@ impl AsynRecord {
     ///   is why the text comes in from the caller as [`QueuedBy`].
     /// - It waited out `QUEUE_TIMEOUT`: `queueTimeoutCallbackSpecial` runs
     ///   instead of the callback (:929-938), reporting its own text. Both queueing
-    ///   sites hand that callback to `duplicateAsynUser` (:1273-1274, :1290-1291,
-    ///   :543-544), so the timeout text does *not* vary with the caller.
+    ///   sites hand that callback to `duplicateAsynUser` (:1274-1275, :1291-1292,
+    ///   :531-533), so the timeout text does *not* vary with the caller.
     ///
     /// Every [`SpecialDone::NeverRan`] lands here through
     /// [`Self::complete_special`], which then runs no tail: an arm that reported
@@ -3521,7 +3523,7 @@ impl AsynRecord {
     /// that field's value.
     ///
     /// C parity: CNCT is a readback, not a latch. `monitorStatus`
-    /// (asynRecord.c:1089-1093) assigns it from `pasynManager->isConnected` on
+    /// (asynRecord.c:1090-1094) assigns it from `pasynManager->isConnected` on
     /// every cycle, and `isConnected` fails (→ CNCT=0) when the record is bound
     /// to no port. It says nothing about whether *this record* found its port —
     /// that is PCNCT (asynRecord.c:519-527, `connectDevice` /
@@ -3544,7 +3546,7 @@ impl AsynRecord {
     /// port, the last through [`Self::register_exception_callback`].
     ///
     /// A failing query lands as 0, exactly as C's `else` branches do
-    /// (:1087,:1092,:1097).
+    /// (:1089,:1094,:1099).
     fn monitor_status(&mut self) {
         // C `REMEMBER_STATE` on the fields another thread can move
         // (:1045-1064): they post only if this refresh moves them.
@@ -3823,11 +3825,11 @@ impl AsynRecord {
         Err(e)
     }
 
-    /// C `connectDevice`'s own failure diagnostic (asynRecord.c:1157-1159):
+    /// C `connectDevice`'s own failure diagnostic (asynRecord.c:1159-1162):
     /// `reportError(status, "Connect error, status=%d, %s", status,
     /// pasynUser->errorMessage)`, where `status` is the numeric `asynStatus`
     /// the manager returned (`asynError` = 3 for every `connectDevice` failure,
-    /// asynManager.c:1331-1345).
+    /// asynManager.c:1331-1348).
     ///
     /// Reads the buffer the manager just wrote, so it must run before the
     /// `bad:` → `done:` tail re-writes it.
@@ -4232,7 +4234,8 @@ impl AsynRecord {
     /// write the plan into the record's request, queue it, return with
     /// `pact = TRUE`. Nothing here allocates or spawns — the request was made
     /// when the port was connected ([`Self::process_cell_on`]) — and a refusal
-    /// is C's `reportError(..., "queueRequest failed")` (:355,:360).
+    /// is C's `reportError(..., "queueRequest failed")` (:355, alarmed
+    /// STATE/MINOR at :361).
     fn queue_process(&mut self, handle: &PortHandle, gpib: Option<GpibCycle>) -> ProcessOutcome {
         let job = Arc::clone(&self.process_job);
         let user = {
@@ -4961,7 +4964,7 @@ impl Record for AsynRecord {
             // could not bring a dropped link back up.
             // CNCT — the `callbackConnect` arm (asynRecord.c:857-889). Its tail is
             // C's own: `monitorStatus` re-reads CNCT from `isConnected`
-            // (:1089-1093), so a refused or failed request snaps the field back to
+            // (:1090-1094), so a refused or failed request snaps the field back to
             // the wire's real state — *and posts it*, which is the half that was
             // missing (W10-D2). Without the post the snap-back was invisible: the
             // operator's screen kept showing the value they typed at a port that
@@ -4994,7 +4997,7 @@ impl Record for AsynRecord {
                     self.device_user.disconnect();
                     self.clear_exception_callback();
                     // Detached: `isConnected` has no device to report on, which
-                    // is C's CNCT=0 (monitorStatus, :1091-1093). The refresh goes
+                    // is C's CNCT=0 (monitorStatus, :1093-1094). The refresh goes
                     // in the post bracket like every other one — a field that
                     // moves without its monitor is a field the operator's screen
                     // never learns about (R14-47).
@@ -6014,7 +6017,7 @@ mod tests {
 
     /// R9-51: every ERRS text the record writes is one of C's, not an
     /// invented one. C's connect diagnostics are `connectDevice`'s own
-    /// "Connect error, status=%d, %s" (asynRecord.c:1158) — where `%s` is the
+    /// "Connect error, status=%d, %s" (asynRecord.c:1160-1161) — where `%s` is the
     /// manager's `pasynUser->errorMessage` (asynManager.c:1331,1339) — and,
     /// on the `special()` PORT/ADDR/DRVINFO path only, the wrapper
     /// "connectDevice failed: %s" (asynRecord.c:515).
@@ -6852,7 +6855,7 @@ mod tests {
 
     /// R10-55. A pending ACMD reaches `pasynGpib->addressedCmd` with the frame C
     /// builds in `acmd[]` — `[UNT, UNL, addr + LADBASE, cmd, UNT, UNL]`
-    /// (asynRecord.c:1698-1716, :1750).
+    /// (asynRecord.c:1698-1716, :1748-1749).
     #[test]
     fn process_acmd_sends_the_addressed_frame_to_the_port() {
         use crate::interfaces::gpib::{IBGET, IBUNL, IBUNT, LADBASE};
@@ -6927,7 +6930,7 @@ mod tests {
     /// "No asynGpib interface" + COMM_ALARM/MAJOR and sends nothing, C's
     /// `if (!pasynRec->gpibiv)` branch (asynRecord.c:1647-1651, :1693-1697). The
     /// menu field is still consumed: C resets it in the caller either way
-    /// (:822, :826).
+    /// (:821, :825).
     #[test]
     fn a_port_without_asyngpib_refuses_ucmd_and_acmd() {
         use crate::interfaces::octet_transport_capabilities;
@@ -7457,7 +7460,7 @@ mod tests {
     }
 
     /// A record whose connect failed has a user on no port, and C's
-    /// `findTracePvt` gives that user the global rung (asynManager.c:548-551):
+    /// `findTracePvt` gives that user the global rung (asynManager.c:548-553):
     /// `setTraceFile` / `setTraceIOTruncateSize` write it and `monitorStatus`
     /// reads it, while the mask setters refuse the user. The oracles: as5,
     /// `caput A.PORT NOSUCH` posts TMSK 1 and TFIL "Unknown" off
@@ -7946,7 +7949,7 @@ mod tests {
         assert_eq!(binary.tinp, "", "failed read must clear TINP");
         assert_eq!(binary.ainp, "KEEP", "Binary path must not touch AINP");
 
-        // Write failure: NAWT reset to 0 (C assigns nbytesTransfered=0).
+        // Write failure: NAWT reset to 0 (C assigns nbytesTransferred=0).
         let mut writer = AsynRecord::default();
         writer.port = port_name.to_string();
         let _ = writer.connect_device();
@@ -8359,7 +8362,7 @@ mod tests {
     /// R8-56: the octet read-error ERRS is C's `"%s  nread %d %s"` with the
     /// status word ∈ {timeout, overflow, error}, the transferred count, and the
     /// driver's `pasynUser->errorMessage` (asynRecord.c:1593-1598 — it
-    /// overwrites the earlier `"Error %s"` at :1583, which never reaches the
+    /// overwrites the earlier `"Error %s"` at :1584-1585, which never reaches the
     /// operator). The port emitted `"read: {e}"`, which carries neither the
     /// status word nor the count and prefixes the Rust status debug onto the
     /// driver text.
@@ -8457,7 +8460,7 @@ mod tests {
     /// R7-46: a device that emits a partial line and then goes quiet reaches
     /// the record as `asynTimeout` **plus** the bytes it did send. C
     /// `performOctetIO` assigns `eomr`/`nord`/`inptr`/`tinp` from
-    /// `nbytesTransfered` regardless of the read status (asynRecord.c:1591-1629
+    /// `nbytesTransferred` regardless of the read status (asynRecord.c:1591-1629
     /// — the error branch at :1583 only reports + alarms), and the EOS
     /// interpose publishes that count with the failing status
     /// (asynInterposeEos.c:242-253). So AINP="abc", NORD=3, EOMR=0 land
@@ -8538,8 +8541,11 @@ mod tests {
         rec.ifmt = ASYN_FMT_ASCII;
         rec.process().unwrap();
 
-        assert_eq!(rec.ainp, "abc", "the partial line reaches AINP (C :1503)");
-        assert_eq!(rec.nord, 3, "NORD = nbytesTransfered (C :1627)");
+        assert_eq!(
+            rec.ainp, "abc",
+            "the partial line reaches AINP (C :1503-1505)"
+        );
+        assert_eq!(rec.nord, 3, "NORD = nbytesTransferred (C :1627)");
         assert_eq!(rec.eomr, 0, "no EOS matched, buffer never filled (C :1591)");
         assert_eq!(rec.tinp, "abc", "TINP is posted for the failed read too");
         assert_eq!(
@@ -8571,7 +8577,7 @@ mod tests {
     /// `pasynManager->isConnected` and then calls `pasynCommon->connect` or
     /// `->disconnect` — while PCNCT (:519-527) only runs `connectDevice` /
     /// `pasynManager->disconnect`, never touching the wire. And CNCT is a
-    /// *readback*: `monitorStatus` (:1089-1093) assigns it from `isConnected`.
+    /// *readback*: `monitorStatus` (:1090-1094) assigns it from `isConnected`.
     ///
     /// Before the fix CNCT was a duplicate of PCNCT: a CNCT=0 put detached the
     /// record and left the socket open, CNCT=1 could not raise a dropped link,
@@ -8700,7 +8706,7 @@ mod tests {
         );
         assert_eq!(
             rec.cnct, 0,
-            "detached: isConnected has no device to report on (C :1091)"
+            "detached: isConnected has no device to report on (C :1094)"
         );
     }
 
@@ -9294,10 +9300,10 @@ mod tests {
     }
 
     /// R8-48: NAWT is what the *device* took, on both arms. C `performOctetIO`
-    /// (asynRecord.c:1524-1556) seeds `nbytesTransfered = 0`, hands it to the
+    /// (asynRecord.c:1524-1556) seeds `nbytesTransferred = 0`, hands it to the
     /// octet chain — which fills it in on success and on failure alike
     /// (`drvAsynSerialPort.c:843` writes `numchars - nleft` on the timeout
-    /// break) — and commits it with `nawt = nbytesTransfered` (:1547) *before*
+    /// break) — and commits it with `nawt = nbytesTransferred` (:1547) *before*
     /// testing the status (:1551). The short-write diagnostic then fires
     /// whenever the status failed **or** fewer bytes went out than were asked
     /// for, landing "Write error, nout=%d, %s" in ERRS via reportError.
@@ -9383,10 +9389,10 @@ mod tests {
         // took, not 0, and ERRS carries C's nout diagnostic.
         let mut partial = writer("test_short_write_err", 3, true);
         partial.process().unwrap();
-        assert_eq!(partial.nawt, 3, "NAWT = nbytesTransfered (C :1547)");
+        assert_eq!(partial.nawt, 3, "NAWT = nbytesTransferred (C :1547)");
         assert!(
             partial.errs.starts_with("Write error, nout=3,"),
-            "C :1552 reportError text, got {:?}",
+            "C :1553 reportError text, got {:?}",
             partial.errs
         );
         // C's octet write branch reports but raises NO severity (:1551-1555) —
@@ -9400,7 +9406,7 @@ mod tests {
         );
 
         // Short write that reported *success*: C still fires the diagnostic
-        // (`nbytesTransfered != nwrite`), and NAWT is the driver's real count,
+        // (`nbytesTransferred != nwrite`), and NAWT is the driver's real count,
         // not the planned length.
         let mut short_ok = writer("test_short_write_ok", 2, false);
         short_ok.process().unwrap();
@@ -10000,7 +10006,7 @@ mod tests {
     /// IMAX — and the text overwrites the read-status text when the read both
     /// failed and overflowed (`reportError` `strncpy`s over ERRS, and the
     /// overflow check runs last). The port raised the MINOR alarm and left ERRS
-    /// blank, so `process()`'s ERRS clear (:3043 equivalent) was all the
+    /// blank, so `process()`'s ERRS clear (:339) was all the
     /// operator saw.
     #[test]
     fn overflow_read_reports_errs_in_every_ifmt() {
@@ -10054,7 +10060,7 @@ mod tests {
         assert_eq!(read_alarm(&mut rec).1, AlarmSeverity::NoAlarm);
     }
 
-    /// C's overflow test is a plain length compare (`nbytesTransfered >=
+    /// C's overflow test is a plain length compare (`nbytesTransferred >=
     /// sizeof(ainp)`, asynRecord.c:1602) — a full buffer overflows even when the
     /// driver reported an EOS/END end-of-message, so no eomReason may gate it.
     #[test]
@@ -10703,7 +10709,7 @@ mod tests {
     /// thread is the C `wasQueued==0` / `callbackActive` case. C `special()`
     /// for `AQR` (asynRecord.c:393-408) calls `cancelRequest`; once the request
     /// has been dequeued and its callback is running, `cancelRequest` reports
-    /// `wasQueued==0` and waits for the callback (asynManager.c:1645-1659), so
+    /// `wasQueued==0` and waits for the callback (asynManager.c:1647-1661), so
     /// the I/O runs to completion and is reported normally — `AQR` does NOT
     /// raise "I/O request canceled". Here the read is already parked in the
     /// driver (the executor has claimed the token, `Running`) when `AQR` fires,
@@ -12645,7 +12651,7 @@ A.OEOS
         let mut rec = AsynRecord::default();
         rec.port = vxi_name.to_string();
         rec.connect_device().unwrap();
-        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1228-1234)");
+        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1232-1236)");
         assert_eq!(rec.i32iv, 1, "asynInt32, registered by asynGpib (C :140)");
         assert_eq!(rec.octetiv, 1, "asynOctet");
         assert_eq!(rec.optioniv, 1, "vxi11 registers asynOption (:1777)");
@@ -12661,7 +12667,7 @@ A.OEOS
         let mut rec = AsynRecord::default();
         rec.port = prologix_name.to_string();
         rec.connect_device().unwrap();
-        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1228-1234)");
+        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1232-1236)");
         assert_eq!(rec.i32iv, 1, "asynInt32, registered by asynGpib (C :140)");
         assert_eq!(rec.octetiv, 1, "asynOctet");
         assert_eq!(
@@ -12745,7 +12751,7 @@ A.OEOS
     /// R9-55. C queues the option callback on a `duplicateAsynUser` of the
     /// record's own `pasynUser` (asynRecord.c:531-533), and `duplicateAsynUser`
     /// copies `timeout` (asynManager.c:1227), which the record set to TMOT
-    /// (asynRecord.c:818). `setOption` then gets that user (:1787-1826) and an RFC
+    /// (asynRecord.c:818). `setOption` then gets that user (:1758-1832) and an RFC
     /// 2217 negotiation runs under it (asynInterposeCom.c:488,508). The port's
     /// option path carried no asynUser at all, so the record's TMOT never reached
     /// the driver and the negotiation used a private 2 s.
@@ -13271,7 +13277,7 @@ A.OEOS
     ///
     /// `monitorStatus` re-imports the status readbacks from the port and
     /// POST_IF_NEWs them: ENBL from `isEnabled` (:1094-1097), AUCT from
-    /// `isAutoConnect` (:1084-1088), CNCT from `isConnected` (:1089-1093). The
+    /// `isAutoConnect` (:1085-1089), CNCT from `isConnected` (:1090-1094). The
     /// arms ran only their own narrow readback (option fields, EOS fields, CNCT
     /// alone), so a port whose state moved underneath the record kept showing the
     /// stale value — and after a *failed* CNCT put the snap-back fired no monitor,

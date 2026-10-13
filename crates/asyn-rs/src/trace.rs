@@ -307,7 +307,7 @@ pub struct TraceSnapshot {
 }
 
 /// C `DEFAULT_TRACE_BUFFER_SIZE` (asynManager.c:47) — the size `tracePvtInit`
-/// (:451) allocates `tracePvt.traceBuffer` with. That buffer is the destination
+/// (:453) allocates `tracePvt.traceBuffer` with. That buffer is the destination
 /// `epicsStrSnPrintEscaped` writes the ESCAPE form into on the errlog branch
 /// (:3184), so it is the bound that truncates an errlog trace line.
 const DEFAULT_TRACE_BUFFER_SIZE: usize = 80;
@@ -342,7 +342,7 @@ impl Default for TraceConfig {
             // turns a form on (:3215-3221). ASCII is a value an operator asks
             // for, not one a port is born with.
             trace_io_mask: TraceIoMask::NODATA,
-            // C `tracePvtInit` (asynManager.c:455) sets
+            // C `tracePvtInit` (asynManager.c:457) sets
             // `traceInfoMask = ASYN_TRACEINFO_TIME` and nothing else, so a port
             // is born with only the TIME bit: `monitorStatus` reads back
             // `TINM=1`, `TINB0(time)=On`, `TINB1(port)=Off`. PORT is a bit an
@@ -356,7 +356,7 @@ impl Default for TraceConfig {
 }
 
 /// One port's `dpCommon` trace state — C's `port` struct as the trace
-/// facility sees it (asynManager.c:510-529).
+/// facility sees it (asynManager.c:512-531).
 ///
 /// `pport->dpc.trace` and one `pdevice->dpc.trace` per address, plus the
 /// `ASYN_MULTIDEVICE` attribute, because that attribute is what decides
@@ -413,7 +413,7 @@ fn device_slot(multi_device: bool, addr: Option<i32>) -> Option<i32> {
 /// `TraceManager::write_scoped` the only mutator; the setters below are
 /// thin wrappers that name which field to write.
 pub struct TraceManager {
-    /// C `pasynBase->trace` (asynManager.c:503), written by the
+    /// C `pasynBase->trace` (asynManager.c:505), written by the
     /// `pasynUser == NULL` arm of every `setTrace*`. `findTracePvt` reaches
     /// it only when `findDpCommon` returns NULL — that is, for a user with no
     /// port (:548-553) — so **no port-attached user reads it** and no output
@@ -554,10 +554,10 @@ impl TraceManager {
     /// three siblings share this shape exactly:
     ///
     /// - a **device-scoped** write touches that device's slot alone and
-    ///   announces once for it (:2789-2791);
+    ///   announces once for it (:2802-2805);
     /// - a **port-scoped** write **pushes down** — every device slot first,
     ///   announcing per device, then the port's own with a port announce
-    ///   (:2793-2801).
+    ///   (:2806-2815).
     ///
     /// The push-down is what makes `asynSetTraceMask P -1 0x1` after
     /// `asynSetTraceMask P 1 0x3f` quiet device 1. Announces fire after the
@@ -975,7 +975,7 @@ impl TraceManager {
 
     /// Per-device variant of [`Self::set_io_truncate_size`].
     ///
-    /// C parity: `setTraceIOTruncateSize` (asynManager.c:2945-2959) writes
+    /// C parity: `setTraceIOTruncateSize` (asynManager.c:2957-2984) writes
     /// the truncate size into the device `dpCommon` resolved by
     /// `findTracePvt` when the asynUser carries a device, and announces
     /// `asynExceptionTraceIOTruncateSize` per device.
@@ -996,7 +996,7 @@ impl TraceManager {
             Some(name) => self
                 .with_dp_common(name, None, |cfg| cfg.trace_mask)
                 // C parity: default port mask is ERROR-only
-                // (asynManager.c:454); keep the poisoned-lock fallback in
+                // (asynManager.c:456); keep the poisoned-lock fallback in
                 // sync with TraceConfig::default.
                 .unwrap_or(TraceMask::ERROR),
             None => self
@@ -1056,7 +1056,7 @@ impl TraceManager {
             Some(name) => self
                 .with_dp_common(name, None, |cfg| cfg.trace_info_mask)
                 // Matches `TraceConfig::default` — a port born with only the
-                // TIME bit (C `tracePvtInit`, asynManager.c:455).
+                // TIME bit (C `tracePvtInit`, asynManager.c:457).
                 .unwrap_or(TraceInfoMask::TIME),
             None => self
                 .global_config
@@ -1207,7 +1207,7 @@ fn thread_epics_priority() -> u32 {
 }
 
 /// The data section of one `asynPrintIO` line — C `traceVprintIOSource`
-/// (asynManager.c:3145-3196), appended to the message line.
+/// (asynManager.c:3145-3225), appended to the message line.
 ///
 /// The I/O mask is a **bitfield** and C tests each bit in its own `if`, so the
 /// blocks are independent and appear in C's order — ASCII (:3171), ESCAPE
@@ -1276,7 +1276,7 @@ fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
 
 /// `ASYN_TRACEIO_ESCAPE`. Which of libCom's *two* escape entry points runs is a
 /// property of the trace **destination**, not of the mask
-/// (`traceVprintIOSource`, asynManager.c:3153-3165):
+/// (`traceVprintIOSource`, asynManager.c:3178-3190):
 ///
 /// ```text
 /// fp != NULL   epicsStrPrintEscaped(fp, buffer, nBytes)   stdout/stderr/file
@@ -1539,7 +1539,7 @@ mod tests {
     }
 
     /// A port is born with only the TIME trace-info bit (C `tracePvtInit`,
-    /// asynManager.c:455 `traceInfoMask = ASYN_TRACEINFO_TIME`), so an asyn
+    /// asynManager.c:457 `traceInfoMask = ASYN_TRACEINFO_TIME`), so an asyn
     /// record over a fresh port reads back `TINM=1` / `TINB1(port)=Off` — not
     /// `TIME | PORT` (=3, which lit `TINB1=On`).
     #[test]
@@ -1562,7 +1562,7 @@ mod tests {
 
     /// `asynSetTraceMask` with no port name passes `pasynUser = NULL`
     /// (asynShellCommands.c:646-660), so `setTraceMask` writes
-    /// `pasynBase->trace` and nothing else (asynManager.c:2779-2783). The
+    /// `pasynBase->trace` and nothing else (asynManager.c:2789-2791). The
     /// global slot is read back by `getTraceMask(NULL)` and by no port.
     #[test]
     fn test_set_global_mask() {
@@ -1746,7 +1746,7 @@ mod tests {
     }
 
     /// R17-46. C picks the escape entry point by *destination*
-    /// (asynManager.c:3153-3165): `fp != NULL` → `epicsStrPrintEscaped`,
+    /// (asynManager.c:3178-3190): `fp != NULL` → `epicsStrPrintEscaped`,
     /// errlog → `epicsStrSnPrintEscaped`. `getTraceFile` (:2942-2955) hands back
     /// `NULL` for errlog alone, and a port's default sink is stderr
     /// (`tracePvtInit`, :460) — so the *default* trace line takes the stream
@@ -1796,7 +1796,7 @@ mod tests {
     fn test_output_to_buffer() {
         let mgr = TraceManager::new();
         // `asynSetTraceMask testport -1 ...` — the port's own dpCommon, which
-        // is the only slot the emit path reads (asynManager.c:536-551).
+        // is the only slot the emit path reads (asynManager.c:538-553).
         mgr.set_trace_mask(Some("testport"), TraceMask::ERROR | TraceMask::IO_DRIVER);
         mgr.set_trace_info_mask(Some("testport"), TraceInfoMask::PORT); // only port name for predictability
 
@@ -1851,7 +1851,7 @@ mod tests {
     #[test]
     fn test_get_masks() {
         let mgr = TraceManager::new();
-        // Default global mask is ERROR-only (asynManager.c:454), and the I/O
+        // Default global mask is ERROR-only (asynManager.c:456), and the I/O
         // mask is the calloc zero `tracePvtInit` leaves behind (:451-461).
         assert_eq!(mgr.get_trace_mask(None), TraceMask::ERROR);
         assert_eq!(mgr.get_trace_io_mask(None), TraceIoMask::NODATA);
@@ -2335,7 +2335,7 @@ mod tests {
 
     /// C parity: `setTraceIOMask` with `addr >= 0` writes
     /// `pdevice->dpc.trace.traceIOMask`
-    /// (asynManager.c:2830-2833). The Rust per-device setter must
+    /// (asynManager.c:2844-2847). The Rust per-device setter must
     /// place the mask in the `(port, addr)` device slot so the
     /// effective-config resolver returns the device mask when the
     /// emit path supplies the matching `addr`.
@@ -2371,7 +2371,7 @@ mod tests {
 
     /// C parity: `setTraceInfoMask` with `pdevice != NULL` writes
     /// `pdevice->dpc.trace.traceInfoMask` and announces per-device
-    /// (asynManager.c:2872-2875).
+    /// (asynManager.c:2886-2889).
     #[test]
     fn set_device_trace_info_mask_writes_device_slot_and_announces() {
         let mgr = TraceManager::new();
@@ -2452,7 +2452,7 @@ mod tests {
 
     /// R18-63, symptom 1. C `setTraceMask` with `pdevice == NULL` walks
     /// `pport->deviceList` and writes every device's `dpc.trace.traceMask`
-    /// before the port's own (asynManager.c:2793-2801). So
+    /// before the port's own (asynManager.c:2807-2815). So
     /// `asynSetTraceMask P -1 0x1` after `asynSetTraceMask P 1 0x3f`
     /// **quiets** device 1 — the port-level set is a push-down, not a
     /// lower-priority default the device keeps overriding.

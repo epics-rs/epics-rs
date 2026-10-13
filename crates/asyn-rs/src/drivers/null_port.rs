@@ -84,7 +84,7 @@ impl PortDriver for NullOctetPort {
     // Observed on the C fat softIoc with a registered-disconnected octet port
     // (`drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`, noAutoConnect):
     // drvAsynIPPort advertises exactly asynCommon + asynOption + asynOctet
-    // (drvAsynIPPort.c:1037-1053), so C reads OCTETIV=1, OPTIONIV=1, and
+    // (drvAsynIPPort.c:1091-1109), so C reads OCTETIV=1, OPTIONIV=1, and
     // GPIBIV=I32IV=UI32IV=F64IV=0. `octet_transport_capabilities()`
     // ({OctetRead, OctetWrite, Option, Flush, Connect}) yields byte-exact those
     // readbacks — CNCT/AUCT/ENBL/PCNCT/REASON also matched. This is the pinned,

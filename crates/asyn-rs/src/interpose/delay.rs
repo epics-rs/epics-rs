@@ -62,7 +62,7 @@ impl OctetInterpose for DelayInterpose {
         // epicsThreadSleep(delay) — AFTER every char, including the last
         // and including a single-char write. On a write error it breaks
         // before sleeping and publishes what it managed to send
-        // (`*nbytesTransfered = transfered`, :52), so the count rides out on
+        // (`*nbytesTransferred = transferred`, :51), so the count rides out on
         // the error instead of being dropped by `?`.
         //
         // The chunking is unconditional in C: `writeIt` has no zero-delay

@@ -34,7 +34,7 @@ impl PortManager {
 
     /// The process's one port table — C's `pasynBase->asynPortList`, which
     /// every `registerPort` adds to and every shell command reads
-    /// (asynManager.c:2018-2070). It is bound to [`PortServices::global`],
+    /// (asynManager.c:2096). It is bound to [`PortServices::global`],
     /// the services a port built with `RuntimeConfig::default()` gets, so a
     /// port created from a driver's own configure command and one created by
     /// `drvAsynIPPortConfigure` share the trace file, the masks and the
@@ -116,7 +116,7 @@ impl PortManager {
         // `?` is the whole registration contract on this path: a port whose
         // actor thread the OS refused is not a port, so the name below is never
         // claimed for it (C `registerDriver` returns `asynError` ahead of
-        // `ellAdd(&pasynBase->asynPortList,...)`, asynManager.c:2082-2095).
+        // `ellAdd(&pasynBase->asynPortList,...)`, asynManager.c:2084-2097).
         let (handle, _jh) = create_port_runtime(driver, config)?;
 
         // The process-registry insert is the atomic claim on the name —
@@ -253,7 +253,7 @@ impl Default for PortManager {
 ///
 /// Deliberately carries no message. C's manager writes its diagnostic into
 /// `pasynUser->errorMessage` and returns only the status
-/// (asynManager.c:1331-1346, :2331-2373), so the last call to touch a user owns
+/// (asynManager.c:1331-1348, :2331-2373), so the last call to touch a user owns
 /// what the caller reads: `asynRecord`'s `special()` splices the buffer *after*
 /// `connectDevice`'s tail has run `monitorStatus` over it, and therefore
 /// reports the `isEnabled` text for a failed connect (asynRecord.c:515). A
@@ -330,7 +330,7 @@ impl DeviceUser {
         self.error_message.as_str()
     }
 
-    /// C `connectDevice` (asynManager.c:1324-1355), in C's order: no port name,
+    /// C `connectDevice` (asynManager.c:1324-1357), in C's order: no port name,
     /// then the registry lookup (`locatePort`), then a user that is already
     /// connected to a device.
     pub fn connect_device(&mut self, port_name: &str, addr: i32) -> Result<PortEntry, DeviceError> {
@@ -366,7 +366,7 @@ impl DeviceUser {
     /// takes is the only one modelled.
     pub fn disconnect(&mut self) {
         // C clears both halves of the binding: `puserPvt->pport = 0;
-        // puserPvt->pdevice = 0` (asynManager.c:1386-1387).
+        // puserPvt->pdevice = 0` (asynManager.c:1387-1388).
         self.device = None;
         self.addr = -1;
     }
@@ -494,7 +494,7 @@ mod tests {
 
     /// `connectDevice`'s three rejections in C's order — no port name, an
     /// unknown name, a user already connected — and the binding each leaves
-    /// behind (asynManager.c:1324-1355).
+    /// behind (asynManager.c:1324-1357).
     #[test]
     fn connect_device_binds_once_and_refuses_the_second_attempt() {
         let mgr = PortManager::new();

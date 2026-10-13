@@ -106,6 +106,11 @@ fn be_the_broker() {
     println!("MQ4: packet types after CONNACK: {session:?}; child exited {status}");
 
     assert!(
+        status.contains("exit status: 0"),
+        "the IOC child must run to a clean exit, not die in its protocol runner; \
+         child exited {status}, packets after CONNACK: {session:?}"
+    );
+    assert!(
         session.contains(&DISCONNECT),
         "an IOC exit must put a DISCONNECT on the wire — C's `~MqttClient` \
          disconnects and waits for the packet (mqttClient.cpp:37-41,51-55). \
@@ -259,19 +264,29 @@ fn be_the_ioc() -> ! {
 
     let outcome = runtime.block_on(async move {
         let handle = epics_base_rs::runtime::task::runtime_handle();
+        let reactor = handle.clone();
         let app = epics_ca_rs::server::ioc_app::IocApplication::new();
         let app = mqtt_rs::ioc::register_mqtt_commands(app, handle);
         app.startup_script(&script)
             .run(move |_config| async move {
                 // The broker has CONNACKed by the time this byte arrives.
-                use tokio::io::AsyncReadExt;
-                let mut go = tokio::net::TcpStream::connect(("127.0.0.1", ready_port))
+                //
+                // The runner is polled on a callback thread under the thread
+                // backend, which has no tokio reactor: a `tokio::net` socket
+                // built here panics there. The socket lives on the runtime.
+                reactor
+                    .spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut go = tokio::net::TcpStream::connect(("127.0.0.1", ready_port))
+                            .await
+                            .expect("connect to the release socket");
+                        let mut b = [0u8; 1];
+                        go.read_exact(&mut b)
+                            .await
+                            .expect("wait for the broker's release byte");
+                    })
                     .await
-                    .expect("connect to the release socket");
-                let mut b = [0u8; 1];
-                go.read_exact(&mut b)
-                    .await
-                    .expect("wait for the broker's release byte");
+                    .expect("the release wait ran to completion");
                 Ok(())
             })
             .await

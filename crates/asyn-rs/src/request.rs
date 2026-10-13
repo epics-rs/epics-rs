@@ -68,7 +68,8 @@ pub trait CellBody: Send + Sync + 'static {
     fn process(&self, port: &mut dyn PortCalls);
     /// C `timeoutUser`, or the other ways the request never ran.
     fn unrun(&self, why: Unrun);
-    /// Runs once the cell may be queued again, after `process` or `unrun`.
+    /// Runs after each `process` or `unrun` returns. The cell may already be
+    /// queued again by then, from inside the callback, as C allows.
     fn done(self: Arc<Self>);
 }
 
@@ -76,15 +77,64 @@ pub trait CellBody: Send + Sync + 'static {
 /// `queueRequest` links onto a port queue without allocating
 /// (asynManager.c:1605-1628).
 ///
-/// One request per cell is outstanding, as C's `isQueued` allows one per
-/// `asynUser` (asynManager.c:1586-1591); here the cell stays outstanding until
-/// its body has run, which for one user queued from one record is the same.
+/// One request per cell is queued, as C's `isQueued` allows one per `asynUser`
+/// (asynManager.c:1586-1590). A request leaves the queue before its callback
+/// runs, so the callback may queue the cell again (:684 before :689, :895
+/// before :905).
 pub struct RequestCell {
     queue: Arc<CellQueue>,
     token: CancelToken,
-    outstanding: std::sync::atomic::AtomicBool,
-    request: Mutex<CellRequest>,
+    slot: Mutex<Slot>,
     body: Arc<dyn CellBody>,
+}
+
+/// The cell's request and its state, which change together.
+struct Slot {
+    request: CellRequest,
+    state: CellState,
+}
+
+/// C's `isQueued` and `state == callbackActive`, as one state. `callbacks`
+/// counts the `process`/`unrun` calls running: one that queued the cell again
+/// can still be running when that request leaves the queue too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellState {
+    Idle,
+    Queued,
+    Active { callbacks: u32 },
+    ActiveQueued { callbacks: u32 },
+}
+
+impl CellState {
+    fn is_queued(self) -> bool {
+        matches!(self, Self::Queued | Self::ActiveQueued { .. })
+    }
+
+    /// The request leaves the queue and its callback is about to run.
+    fn dequeue(&mut self) {
+        *self = match *self {
+            Self::Queued => Self::Active { callbacks: 1 },
+            Self::ActiveQueued { callbacks } => Self::Active {
+                callbacks: callbacks + 1,
+            },
+            idle => unreachable!("{idle:?} has no request to dequeue"),
+        };
+    }
+
+    /// A callback [`Self::dequeue`] started has returned.
+    fn end_callback(&mut self) {
+        *self = match *self {
+            Self::Active { callbacks: 1 } => Self::Idle,
+            Self::Active { callbacks } => Self::Active {
+                callbacks: callbacks - 1,
+            },
+            Self::ActiveQueued { callbacks: 1 } => Self::Queued,
+            Self::ActiveQueued { callbacks } => Self::ActiveQueued {
+                callbacks: callbacks - 1,
+            },
+            idle => unreachable!("{idle:?} has no callback running"),
+        };
+    }
 }
 
 /// What the actor needs of a queued cell: the gate's user and its queue band
@@ -110,30 +160,31 @@ pub(crate) enum Claim {
 
 impl RequestCell {
     /// C `queueRequest` past its port gate: link the cell and signal the port
-    /// thread. Refused, with C's text, while the cell is still outstanding.
+    /// thread. Refused, with C's text, only while the cell is queued
+    /// (asynManager.c:1586-1590); a callback still running does not refuse it.
     pub fn queue(
         self: &Arc<Self>,
         user: &crate::user::AsynUser,
     ) -> Result<(), QueueRefusal<'static>> {
-        if self
-            .outstanding
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return Err(QueueRefusal::AlreadyQueued);
-        }
+        // All of it under the lock, as C does under `asynManagerLock`: an exit
+        // that finds the cell queued finds its timer and its entry too.
+        let mut slot = self.lock();
+        let was = slot.state;
+        slot.state = match was {
+            CellState::Idle => CellState::Queued,
+            CellState::Active { callbacks } => CellState::ActiveQueued { callbacks },
+            CellState::Queued | CellState::ActiveQueued { .. } => {
+                return Err(QueueRefusal::AlreadyQueued);
+            }
+        };
         let seq = crate::port_actor::next_seq();
-        {
-            // The generation and the token change together, so an exit that
-            // checks one under this lock sees the other.
-            let mut request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-            *request = CellRequest {
-                reason: user.reason,
-                addr: user.addr,
-                priority: user.priority,
-                seq,
-            };
-            self.token.requeue();
-        }
+        slot.request = CellRequest {
+            reason: user.reason,
+            addr: user.addr,
+            priority: user.priority,
+            seq,
+        };
+        self.token.requeue();
         // C starts the timer before it signals the port thread
         // (asynManager.c:1619-1628).
         if let Some(timeout) = user.queue_timeout {
@@ -143,8 +194,8 @@ impl RequestCell {
             Ok(())
         } else {
             queue_timer().disarm(self);
-            self.outstanding
-                .store(false, std::sync::atomic::Ordering::Release);
+            slot.state = was;
+            self.token.leave_if_queued();
             Err(QueueRefusal::ShutDown)
         }
     }
@@ -156,14 +207,16 @@ impl RequestCell {
     /// thread, whose entry for it is now gone (`is_gone`).
     pub fn cancel(&self) -> bool {
         {
-            let _request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-            if !self.token.cancel() {
+            let mut slot = self.lock();
+            if !slot.state.is_queued() || !self.token.cancel() {
                 return false;
             }
+            queue_timer().disarm(self);
+            self.queue.unlink(self);
+            slot.state.dequeue();
         }
-        self.queue.unlink(self);
         self.body.unrun(Unrun::Canceled);
-        self.release();
+        self.end_callback();
         self.queue.poke();
         true
     }
@@ -177,10 +230,10 @@ impl RequestCell {
         self.request().priority == crate::port::QueuePriority::Connect
     }
 
-    /// C `isQueued`, or its callback still running.
+    /// C `isQueued`, or a callback still running.
     #[cfg(feature = "epics")]
     pub(crate) fn is_outstanding(&self) -> bool {
-        self.outstanding.load(std::sync::atomic::Ordering::Acquire)
+        self.lock().state != CellState::Idle
     }
 
     pub(crate) fn token(&self) -> &CancelToken {
@@ -188,54 +241,56 @@ impl RequestCell {
     }
 
     pub(crate) fn request(&self) -> CellRequest {
-        *self.request.lock().unwrap_or_else(|e| e.into_inner())
+        self.lock().request
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The port thread's dequeue of the entry queued as `seq` (C
     /// asynManager.c:894-895, and the timer cancel at :908).
     pub(crate) fn claim(&self, seq: u64) -> Claim {
-        let claim = {
-            let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-            if self.left(&request, seq) {
-                Claim::Gone
-            } else if self.token.begin_running() {
-                Claim::Run
-            } else {
-                Claim::Left
-            }
-        };
-        if matches!(claim, Claim::Run) {
+        let mut slot = self.lock();
+        if self.left(&slot, seq) {
+            Claim::Gone
+        } else if self.token.begin_running() {
             queue_timer().disarm(self);
+            slot.state.dequeue();
+            Claim::Run
+        } else {
+            Claim::Left
         }
-        claim
     }
 
     /// On the port's thread, once [`Self::claim`] said [`Claim::Run`].
     pub(crate) fn run(&self, port: &mut dyn PortCalls) {
         self.body.process(port);
         self.token.finish();
-        self.release();
+        self.end_callback();
     }
 
     /// The actor takes the entry queued as `seq` off its queue without running
     /// it, for `e`: reported once, by whichever exit wins the token, and not at
     /// all for an entry a later request has replaced.
     pub(crate) fn leave(&self, seq: u64, e: AsynError) {
-        let why = {
-            let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut slot = self.lock();
             // A later request owns the cell, or the canceller or the timer
             // reported this one.
-            if request.seq != seq || !self.token.leave_if_queued() {
+            if self.left(&slot, seq) || !self.token.leave_if_queued() {
                 return;
             }
-            if matches!(e, AsynError::QueueTimeout { .. }) {
+            queue_timer().disarm(self);
+            slot.state.dequeue();
+        }
+        self.body
+            .unrun(if matches!(e, AsynError::QueueTimeout { .. }) {
                 Unrun::TimedOut
             } else {
                 Unrun::Refused(e)
-            }
-        };
-        self.body.unrun(why);
-        self.release();
+            });
+        self.end_callback();
     }
 
     /// C `queueTimeoutCallback` (asynManager.c:649-703), on the timer thread:
@@ -244,36 +299,34 @@ impl RequestCell {
     /// told (:702).
     fn expire(&self, seq: u64) {
         {
-            let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+            let mut slot = self.lock();
             // :657-663 `if(!puserPvt->isQueued) return;`
-            if request.seq != seq || !self.token.time_out_if_queued() {
+            if self.left(&slot, seq) || !self.token.time_out_if_queued() {
                 return;
             }
+            // :664-674 unlinks it and :684 clears `isQueued` before :689 calls
+            // `timeoutUser`; one entry the actor already took is its to drop.
+            self.queue.unlink(self);
+            slot.state.dequeue();
         }
-        // :664-674 unlinks it, so the entry is gone before the cell can be
-        // queued again; one the actor already took is its to drop.
-        self.queue.unlink(self);
         self.body.unrun(Unrun::TimedOut);
-        self.release();
+        self.end_callback();
         self.queue.poke();
     }
 
     /// Whether the actor's entry queued as `seq` is one it can drop unseen: a
     /// later request owns the cell, or a cancel or the timer took this one.
     pub(crate) fn is_gone(&self, seq: u64) -> bool {
-        let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-        self.left(&request, seq)
+        self.left(&self.lock(), seq)
     }
 
-    /// [`Self::is_gone`] under the request lock.
-    fn left(&self, request: &CellRequest, seq: u64) -> bool {
-        request.seq != seq || self.token.is_timed_out() || self.token.is_cancelled()
+    /// [`Self::is_gone`] under the lock.
+    fn left(&self, slot: &Slot, seq: u64) -> bool {
+        slot.request.seq != seq || !slot.state.is_queued()
     }
 
-    fn release(&self) {
-        queue_timer().disarm(self);
-        self.outstanding
-            .store(false, std::sync::atomic::Ordering::Release);
+    fn end_callback(&self) {
+        self.lock().state.end_callback();
         Arc::clone(&self.body).done();
     }
 }
@@ -325,12 +378,14 @@ impl CellQueue {
         Arc::new(RequestCell {
             queue: Arc::clone(self),
             token: CancelToken::new(),
-            outstanding: std::sync::atomic::AtomicBool::new(false),
-            request: Mutex::new(CellRequest {
-                reason: 0,
-                addr: -1,
-                priority: crate::port::QueuePriority::default(),
-                seq: 0,
+            slot: Mutex::new(Slot {
+                request: CellRequest {
+                    reason: 0,
+                    addr: -1,
+                    priority: crate::port::QueuePriority::default(),
+                    seq: 0,
+                },
+                state: CellState::Idle,
             }),
             body,
         })
@@ -1427,6 +1482,234 @@ mod tests {
         let (_, next) = queue.pop().unwrap();
         assert!(matches!(cell.claim(stale), Claim::Gone));
         assert!(matches!(cell.claim(next), Claim::Run));
+    }
+
+    /// What a [`Probe`] saw: the callback, the cell's state inside it, and the
+    /// refusal of the requeue it made there, if it made one.
+    type Seen = (
+        &'static str,
+        CellState,
+        Option<Result<(), QueueRefusal<'static>>>,
+    );
+
+    /// A body that queues its own cell again from inside its callback, and
+    /// optionally claims that request there too, as the port thread could.
+    #[derive(Default)]
+    struct Probe {
+        cell: std::sync::OnceLock<std::sync::Weak<RequestCell>>,
+        requeue: bool,
+        claim: std::sync::atomic::AtomicBool,
+        seen: Mutex<Vec<Seen>>,
+    }
+
+    impl Probe {
+        fn cell(&self) -> Arc<RequestCell> {
+            self.cell.get().unwrap().upgrade().unwrap()
+        }
+
+        fn callback(&self, what: &'static str) {
+            let cell = self.cell();
+            let requeued = self
+                .requeue
+                .then(|| cell.queue(&crate::user::AsynUser::new(0)));
+            if self.claim.swap(false, AtomicOrdering::Relaxed) {
+                let (_, seq) = cell.queue.pop().unwrap();
+                assert!(matches!(cell.claim(seq), Claim::Run));
+            }
+            let state = cell.lock().state;
+            self.seen.lock().unwrap().push((what, state, requeued));
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            std::mem::take(&mut *self.seen.lock().unwrap())
+        }
+    }
+
+    impl CellBody for Probe {
+        fn process(&self, _: &mut dyn PortCalls) {
+            self.callback("process");
+        }
+        fn unrun(&self, why: Unrun) {
+            self.callback(match why {
+                Unrun::Canceled => "canceled",
+                Unrun::TimedOut => "timed out",
+                Unrun::Refused(_) => "refused",
+            });
+        }
+        fn done(self: Arc<Self>) {
+            let state = self.cell().lock().state;
+            self.seen.lock().unwrap().push(("done", state, None));
+        }
+    }
+
+    struct NoPort;
+    impl PortCalls for NoPort {
+        fn call(&mut self, _: RequestOp, _: crate::user::AsynUser) -> AsynResult<RequestResult> {
+            unreachable!("a probe calls no port")
+        }
+    }
+
+    fn probe(requeue: bool) -> (Arc<CellQueue>, Arc<Probe>, Arc<RequestCell>) {
+        let queue = Arc::new(CellQueue::default());
+        let body = Arc::new(Probe {
+            requeue,
+            ..Probe::default()
+        });
+        let cell = queue.new_cell(body.clone());
+        body.cell.set(Arc::downgrade(&cell)).unwrap();
+        (queue, body, cell)
+    }
+
+    const ACTIVE_QUEUED: CellState = CellState::ActiveQueued { callbacks: 1 };
+
+    /// C clears `isQueued` before `timeoutUser` (asynManager.c:684, :689), so
+    /// `queueRequest` from inside it is accepted (:1586-1590) — for each of
+    /// the three ways a queued request leaves without running.
+    #[test]
+    fn a_requeue_from_inside_unrun_is_accepted() {
+        fn cancel(cell: &RequestCell, _: u64) {
+            assert!(cell.cancel());
+        }
+        fn leave(cell: &RequestCell, seq: u64) {
+            // The actor took the entry and refuses it.
+            assert_eq!(cell.queue.pop().unwrap().1, seq);
+            let port = String::new();
+            cell.leave(seq, AsynError::QueueTimeout { port });
+        }
+        type Exit = fn(&RequestCell, u64);
+        let exits: [(&str, Exit); 3] = [
+            ("canceled", cancel),
+            ("timed out", RequestCell::expire),
+            ("timed out", leave),
+        ];
+        for (what, exit) in exits {
+            let (queue, body, cell) = probe(true);
+            cell.queue(&crate::user::AsynUser::new(0)).unwrap();
+            let seq = cell.request().seq;
+            exit(&cell, seq);
+            assert_eq!(
+                body.seen(),
+                [
+                    (what, ACTIVE_QUEUED, Some(Ok(()))),
+                    ("done", CellState::Queued, None)
+                ],
+            );
+            // The left entry is unlinked, or was the actor's (`leave`); only
+            // the requeued one is on the queue, and it is the one that runs.
+            let (_, next) = queue.pop().unwrap();
+            assert!(queue.pop().is_none());
+            assert_ne!(next, seq);
+            assert!(cell.is_gone(seq));
+            assert!(matches!(cell.claim(next), Claim::Run));
+        }
+    }
+
+    /// The refusal is `isQueued` only: queued, or queued again while a
+    /// callback runs.
+    #[test]
+    fn a_queued_cell_refuses_a_second_request() {
+        let user = crate::user::AsynUser::new(0);
+        let (queue, _body, cell) = probe(false);
+        cell.queue(&user).unwrap();
+        assert_eq!(cell.queue(&user), Err(QueueRefusal::AlreadyQueued));
+        let (_, seq) = queue.pop().unwrap();
+        assert!(matches!(cell.claim(seq), Claim::Run));
+        cell.queue(&user).unwrap();
+        assert_eq!(cell.lock().state, ACTIVE_QUEUED);
+        assert_eq!(cell.queue(&user), Err(QueueRefusal::AlreadyQueued));
+    }
+
+    /// C `state == callbackActive` with `isQueued` clear: a cancel finds
+    /// nothing queued (asynManager.c:1647-1661), the callback may queue the
+    /// cell again, and `done` follows the callback's end.
+    #[test]
+    fn done_follows_a_callback_that_was_active() {
+        let (queue, body, cell) = probe(true);
+        cell.queue(&crate::user::AsynUser::new(0)).unwrap();
+        let (_, seq) = queue.pop().unwrap();
+        assert!(matches!(cell.claim(seq), Claim::Run));
+        assert_eq!(cell.lock().state, CellState::Active { callbacks: 1 });
+        assert!(
+            !cell.cancel(),
+            "nothing queued while the callback is active"
+        );
+        cell.run(&mut NoPort);
+        assert_eq!(
+            body.seen(),
+            [
+                ("process", ACTIVE_QUEUED, Some(Ok(()))),
+                ("done", CellState::Queued, None)
+            ],
+        );
+        // Without a requeue the callback's end leaves the cell idle.
+        let (queue, body, cell) = probe(false);
+        cell.queue(&crate::user::AsynUser::new(0)).unwrap();
+        let (_, seq) = queue.pop().unwrap();
+        assert!(matches!(cell.claim(seq), Claim::Run));
+        cell.run(&mut NoPort);
+        assert_eq!(
+            body.seen(),
+            [
+                ("process", CellState::Active { callbacks: 1 }, None),
+                ("done", CellState::Idle, None)
+            ],
+        );
+    }
+
+    /// The request an `unrun` queued is claimed by the port thread before
+    /// that `unrun` returns: callback-active ends with the second callback.
+    #[test]
+    fn overlapping_callbacks_end_one_at_a_time() {
+        let (_queue, body, cell) = probe(true);
+        body.claim.store(true, AtomicOrdering::Relaxed);
+        cell.queue(&crate::user::AsynUser::new(0)).unwrap();
+        cell.expire(cell.request().seq);
+        assert_eq!(
+            body.seen(),
+            [
+                (
+                    "timed out",
+                    CellState::Active { callbacks: 2 },
+                    Some(Ok(()))
+                ),
+                ("done", CellState::Active { callbacks: 1 }, None)
+            ],
+        );
+        // The claimed request's `process` queues once more as it ends.
+        cell.run(&mut NoPort);
+        assert_eq!(
+            body.seen(),
+            [
+                ("process", ACTIVE_QUEUED, Some(Ok(()))),
+                ("done", CellState::Queued, None)
+            ],
+        );
+    }
+
+    /// A request the closed queue refused was never queued: nothing can
+    /// cancel it, and a requeue from the shutdown's `unrun` is refused for the
+    /// shutdown, not as already queued.
+    #[test]
+    fn a_shut_down_refusal_leaves_nothing_queued() {
+        let user = crate::user::AsynUser::new(0);
+        let (queue, body, cell) = probe(true);
+        cell.queue(&user).unwrap();
+        queue.close();
+        assert_eq!(
+            body.seen(),
+            [
+                (
+                    "refused",
+                    CellState::Active { callbacks: 1 },
+                    Some(Err(QueueRefusal::ShutDown))
+                ),
+                ("done", CellState::Idle, None)
+            ],
+        );
+        assert_eq!(cell.queue(&user), Err(QueueRefusal::ShutDown));
+        assert_eq!(cell.lock().state, CellState::Idle);
+        assert!(!cell.cancel());
+        assert!(body.seen().is_empty());
     }
 
     use super::*;

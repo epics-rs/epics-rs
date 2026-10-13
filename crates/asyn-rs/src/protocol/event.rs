@@ -71,6 +71,16 @@ pub struct EventFilter {
     pub addr: Option<i32>,
 }
 
+/// The ring a subscription is delivered through: C's `ringSize` and the byte
+/// size of each element (`valSize` / `NELM` times the element size). There is
+/// no default; an octet or array longer than `payload_bytes` reaches the
+/// subscriber clamped, as it reaches a record sized the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventRing {
+    pub ring_len: usize,
+    pub payload_bytes: usize,
+}
+
 /// Full protocol event envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PortEvent {

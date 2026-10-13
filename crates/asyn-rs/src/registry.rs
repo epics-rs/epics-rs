@@ -232,7 +232,7 @@ mod tests {
         PortHandle::new(
             tx,
             name.to_string(),
-            Arc::new(InterruptManager::new(4)),
+            Arc::new(InterruptManager::new()),
             crate::port_actor::ActorLink::unowned(),
             Arc::new(TraceManager::new()),
         )

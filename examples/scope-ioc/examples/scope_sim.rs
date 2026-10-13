@@ -29,7 +29,7 @@ async fn main() {
     let port_handle = runtime_handle.port_handle().clone();
 
     // 3. Subscribe for interrupt notifications
-    let mut rx = port_handle.interrupts().subscribe_async();
+    let mut rx = port_handle.interrupts().subscribe_async(256, 4096);
 
     // 4. Open `interruptAccept`. `call_param_callbacks` returns without
     // notifying while the gate is closed, and the gate's single owner is the

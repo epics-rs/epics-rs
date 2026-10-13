@@ -787,7 +787,7 @@ mod tests {
         let ext = crate::port_handle::PortHandle::new(
             tx,
             "extowned".to_string(),
-            Arc::new(crate::interrupt::InterruptManager::new(4)),
+            Arc::new(crate::interrupt::InterruptManager::new()),
             crate::port_actor::ActorLink::unowned(),
             Arc::new(crate::trace::TraceManager::new()),
         );

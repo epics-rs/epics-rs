@@ -194,8 +194,7 @@ impl PortDriver for EchoDriver {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.base
-            .set_string_param(user.reason, user.addr, data.to_vec())?;
+        self.base.set_string_param(user.reason, user.addr, data)?;
         self.base.call_param_callbacks(user.addr)?;
         Ok(data.len())
     }
@@ -682,7 +681,7 @@ async fn test_port_connected_by_default() {
 #[tokio::test]
 async fn test_callback_flushes_multiple_changes() {
     let (_mgr, h) = setup_scope();
-    let mut broadcast_rx = h.interrupts().subscribe_async();
+    let mut broadcast_rx = h.interrupts().subscribe_async(256, 4096);
     let run = h
         .drv_user_create(&DrvUserRequest::new("Run", 0))
         .await

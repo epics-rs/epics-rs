@@ -5812,7 +5812,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -6347,7 +6347,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -6469,7 +6469,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -6647,7 +6647,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -6731,7 +6731,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -7156,7 +7156,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -7217,7 +7217,7 @@ mod tests {
             }
         }
 
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(TestDriver::new()), rx);
         let actor_link = actor.link();
@@ -7266,7 +7266,7 @@ mod tests {
             multi_device: true,
             ..PortFlags::default()
         };
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(MdDriver(PortDriverBase::new(port_name, 4, flags))),
@@ -7340,7 +7340,7 @@ mod tests {
                 multi_device,
                 ..PortFlags::default()
             };
-            let interrupts = Arc::new(InterruptManager::new(256));
+            let interrupts = Arc::new(InterruptManager::new());
             let (tx, rx) = mpsc::unbounded_channel();
             let actor = PortActor::new(
                 Box::new(DpDriver(PortDriverBase::new(port_name, max_addr, flags))),
@@ -7551,7 +7551,7 @@ mod tests {
         }
 
         let port_name = "test_trace_info_sync";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
@@ -7607,7 +7607,7 @@ mod tests {
         }
 
         let port_name = "test_trace_info_live";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
@@ -7690,7 +7690,7 @@ mod tests {
         }
 
         let port_name = "test_ifmt_octet_read";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(OctetDriver(PortDriverBase::new(
@@ -7797,7 +7797,7 @@ mod tests {
         }
 
         let port_name = "r17_48_escape_bounds";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(LongDriver(PortDriverBase::new(
@@ -7896,7 +7896,7 @@ mod tests {
         }
 
         let port_name = "test_octet_error_reset";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FailingOctetDriver(PortDriverBase::new(
@@ -8078,7 +8078,7 @@ mod tests {
         }
 
         let port_name = "test_register_errs_text";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(AllFailDriver(PortDriverBase::new(
@@ -8234,7 +8234,7 @@ mod tests {
         }
 
         let port_name = "test_option_eos_reread";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(StubbornDriver(PortDriverBase::new(
@@ -8335,7 +8335,7 @@ mod tests {
         }
 
         let port_name = "test_flush_failure_discarded";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FlushFailsDriver(PortDriverBase::new(
@@ -8437,7 +8437,7 @@ mod tests {
         }
 
         let port_name = "test_octet_read_errs_text";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(StatusDriver {
@@ -8531,7 +8531,7 @@ mod tests {
         }
 
         let port_name = "test_octet_partial_read";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PartialThenTimeout(PortDriverBase::new(
@@ -8654,7 +8654,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -8846,7 +8846,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -8997,7 +8997,7 @@ mod tests {
         let mut handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -9152,7 +9152,7 @@ mod tests {
             let handle = PortHandle::new(
                 tx,
                 name.into(),
-                Arc::new(InterruptManager::new(16)),
+                Arc::new(InterruptManager::new()),
                 link,
                 Arc::new(TraceManager::new()),
             );
@@ -9373,7 +9373,7 @@ mod tests {
         }
 
         fn writer(port_name: &'static str, accept: usize, fail: bool) -> AsynRecord {
-            let interrupts = Arc::new(InterruptManager::new(256));
+            let interrupts = Arc::new(InterruptManager::new());
             let (tx, rx) = mpsc::unbounded_channel();
             let actor = PortActor::new(
                 Box::new(ShortWriteDriver {
@@ -9503,7 +9503,7 @@ mod tests {
         }
 
         let port_name = "test_io_alarm_fail";
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FailDriver(PortDriverBase::new(
@@ -9622,7 +9622,7 @@ mod tests {
         }
 
         let requested = Arc::new(Mutex::new(None));
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FillDriver {
@@ -9747,7 +9747,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -9813,7 +9813,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -9902,7 +9902,7 @@ mod tests {
         }
 
         let log = Arc::new(Mutex::new(Vec::new()));
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PhaseLogDriver {
@@ -10535,7 +10535,7 @@ mod tests {
         let mut handle = PortHandle::new(
             tx,
             "ASYNIO".into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
@@ -10679,7 +10679,7 @@ mod tests {
         let mut handle = PortHandle::new(
             tx,
             "ASYNSPQ".into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             link,
             Arc::new(crate::trace::TraceManager::new()),
         );
@@ -10790,7 +10790,7 @@ mod tests {
         let mut handle = PortHandle::new(
             tx,
             "ASYNAQR".into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
@@ -10898,7 +10898,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -11066,7 +11066,7 @@ A.TMSK 1
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -11624,7 +11624,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -11777,7 +11777,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -11893,7 +11893,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -12058,7 +12058,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(64)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -12168,7 +12168,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(64)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             Arc::new(TraceManager::new()),
         );
@@ -12270,7 +12270,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -12364,7 +12364,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -12488,7 +12488,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -12550,7 +12550,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
@@ -12622,7 +12622,7 @@ A.OEOS
         let handle = PortHandle::new(
             tx,
             port_name.into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );

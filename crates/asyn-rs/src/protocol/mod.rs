@@ -16,7 +16,7 @@ pub mod value;
 
 pub use command::PortCommand;
 pub use error::ProtocolError;
-pub use event::{EventFilter, EventPayload, PortEvent};
+pub use event::{EventFilter, EventPayload, EventRing, PortEvent};
 pub use reply::{PortReply, ReplyPayload};
 pub use request::{PortRequest, ProtocolPriority, RequestMeta};
 pub use status::ReplyStatus;

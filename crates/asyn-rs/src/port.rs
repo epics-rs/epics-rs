@@ -714,7 +714,7 @@ impl PortDriverBase {
             max_addr: max_addr.max(1),
             flags,
             params: ParamList::new(max_addr),
-            interrupts: InterruptManager::new(256),
+            interrupts: InterruptManager::new(),
             connected: Connection::Own(Arc::new(AtomicBool::new(true))),
             last_announced: true,
             enabled: Arc::new(AtomicBool::new(true)),
@@ -1600,7 +1600,7 @@ impl PortDriverBase {
         &mut self,
         index: usize,
         addr: i32,
-        value: impl Into<Vec<u8>>,
+        value: impl AsRef<[u8]>,
     ) -> AsynResult<()> {
         self.params.set_string(index, addr, value)
     }
@@ -2347,7 +2347,7 @@ pub trait PortDriver: Any + Send + Sync {
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.base_mut()
             .params
-            .set_string(user.reason, user.addr, data.to_vec())?;
+            .set_string(user.reason, user.addr, data)?;
         self.base_mut().call_param_callbacks(user.addr)?;
         self.base().trace_write(
             user,
@@ -3108,7 +3108,7 @@ mod tests {
         // The record's database: its gate is closed until `scan_run`.
         let gate = InterruptGate::new();
         let mut base = PortDriverBase::new("gate", 1, PortFlags::default());
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(256, gate.clone());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(gate.clone());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
 
         let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3167,8 +3167,7 @@ mod tests {
             // preservation regression test builds its own `PortDriverBase` and
             // drives the gate itself, so it is unaffected.
             let mut base = PortDriverBase::new("test", 1, PortFlags::default());
-            base.interrupts =
-                crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
+            base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("TEMP", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -3259,7 +3258,7 @@ mod tests {
     #[test]
     fn test_call_param_callbacks() {
         let mut drv = TestDriver::new();
-        let mut rx = drv.base_mut().interrupts.subscribe_async();
+        let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         drv.base_mut().set_int32_param(0, 0, 100).unwrap();
         drv.base_mut().set_float64_param(1, 0, 2.0).unwrap();
@@ -3284,7 +3283,7 @@ mod tests {
             .base_mut()
             .create_param("ARR", ParamType::Int32Array)
             .unwrap();
-        let mut rx = drv.base_mut().interrupts.subscribe_async();
+        let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         // Status change on the never-set scalar VAL (index 0): marks it
         // changed but it stays undefined.
@@ -3321,7 +3320,7 @@ mod tests {
         // (asynPortDriver.cpp:855): a second flush must deliver only the
         // bits changed since the first, never the accumulated history.
         let mut drv = TestDriver::new();
-        let mut rx = drv.base_mut().interrupts.subscribe_async();
+        let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         // flush 1: change bit 0 on BITS (param index 3).
         drv.base_mut()
@@ -3358,7 +3357,7 @@ mod tests {
         // pasynUser before invoking the callback. The Rust port carries
         // those fields on InterruptValue.
         let mut drv = TestDriver::new();
-        let mut rx = drv.base_mut().interrupts.subscribe_async();
+        let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         drv.base_mut().set_int32_param(0, 0, 99).unwrap();
         drv.base_mut()
@@ -3378,7 +3377,7 @@ mod tests {
     fn test_call_param_callback_single_propagates_aux_status() {
         // Mirror for the single-flush path (call_param_callback).
         let mut drv = TestDriver::new();
-        let mut rx = drv.base_mut().interrupts.subscribe_async();
+        let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         drv.base_mut().set_int32_param(0, 0, 1).unwrap();
         drv.base_mut()
@@ -3399,7 +3398,7 @@ mod tests {
     #[test]
     fn test_no_callback_for_unchanged() {
         let mut drv = TestDriver::new();
-        let mut rx = drv.base_mut().interrupts.subscribe_async();
+        let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         drv.base_mut().set_int32_param(0, 0, 5).unwrap();
         drv.base_mut().call_param_callbacks(0).unwrap();
@@ -3453,7 +3452,7 @@ mod tests {
     #[test]
     fn test_callback_uses_param_timestamp() {
         let mut drv = TestDriver::new();
-        let mut rx = drv.base_mut().interrupts.subscribe_async();
+        let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         let custom_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
         drv.base_mut().set_int32_param(0, 0, 77).unwrap();
@@ -3511,10 +3510,9 @@ mod tests {
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
         let mut base = PortDriverBase::new("test_enum_cb", 1, PortFlags::default());
-        base.interrupts =
-            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
         base.create_param("MODE", ParamType::Enum).unwrap();
-        let mut rx = base.interrupts.subscribe_async();
+        let mut rx = base.interrupts.subscribe_async(256, 4096);
 
         struct EnumDriver {
             base: PortDriverBase,
@@ -3560,13 +3558,12 @@ mod tests {
         use crate::param::{EnumEntry, ParamValue};
 
         let mut base = PortDriverBase::new("test_cb_enum", 1, PortFlags::default());
-        base.interrupts =
-            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
         let owner = base.create_param("MODE", ParamType::Enum).unwrap();
         let plain = base.create_param("GAIN", ParamType::Int32).unwrap();
         base.set_int32_param(plain, 0, 7).unwrap();
         base.call_param_callbacks(0).unwrap();
-        let mut rx = base.interrupts.subscribe_async();
+        let mut rx = base.interrupts.subscribe_async(256, 4096);
         let choices: Arc<[EnumEntry]> = Arc::from(vec![EnumEntry {
             string: "A".into(),
             value: 3,
@@ -3617,10 +3614,16 @@ mod tests {
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
         let mut base = PortDriverBase::new("test_gp_cb", 1, PortFlags::default());
-        base.interrupts =
-            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
-        let mut rx = base.interrupts.subscribe_async();
+        let mut rx = base.interrupts.subscribe_async(256, 4096);
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sync = base
+            .interrupts
+            .register_sync_callback(crate::interrupt::InterruptFilter::default(), move |iv| {
+                log.lock().push((iv.reason, iv.value.clone()))
+            });
 
         struct GpDriver {
             base: PortDriverBase,
@@ -3641,9 +3644,13 @@ mod tests {
             .unwrap();
         drv.base_mut().call_param_callbacks(0).unwrap();
 
-        let v = rx.try_recv().unwrap();
-        assert_eq!(v.reason, 0);
-        assert!(matches!(v.value, ParamValue::GenericPointer(_)));
+        // C: doCallbacksGenericPointer reaches the registered callbacks
+        // inline and nothing queues it (asynPortDriver.cpp:3340-3375).
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, 0);
+        assert!(matches!(seen[0].1, ParamValue::GenericPointer(_)));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -4078,10 +4085,9 @@ mod tests {
     fn test_timestamp_source_in_callbacks() {
         // Post-`iocInit` precondition — see `TestDriver::new`.
         let mut base = PortDriverBase::new("ts_cb", 1, PortFlags::default());
-        base.interrupts =
-            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
         base.create_param("V", ParamType::Int32).unwrap();
-        let mut rx = base.interrupts.subscribe_async();
+        let mut rx = base.interrupts.subscribe_async(256, 4096);
 
         let fixed_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123456);
         base.register_timestamp_source(move || fixed_ts);
@@ -4718,10 +4724,7 @@ mod tests {
         drv.base_mut().params.set_int32(i32_idx, 0, 7).unwrap();
         drv.base_mut().params.set_int64(i64_idx, 0, 9).unwrap();
         drv.base_mut().params.set_float64(f64_idx, 0, 1.5).unwrap();
-        drv.base_mut()
-            .params
-            .set_string(oct_idx, 0, b"hi".to_vec())
-            .unwrap();
+        drv.base_mut().params.set_string(oct_idx, 0, b"hi").unwrap();
         drv.base_mut()
             .params
             .set_uint32(u32_idx, 0, 0x05, 0xFFFF_FFFF, 0)
@@ -4795,7 +4798,7 @@ mod tests {
             .unwrap();
         base.params.set_int32(n, 0, 7).unwrap();
         base.params.set_float64(x, 0, 0.1 + 0.2).unwrap();
-        base.params.set_string(s_idx, 0, b"hello".to_vec()).unwrap();
+        base.params.set_string(s_idx, 0, b"hello").unwrap();
         base.params.set_uint32(bits, 0, 0xa5, 0xff, 0).unwrap();
         base.params
             .set_uint32_interrupt(bits, 0, 0x0f, InterruptReason::ZeroToOne)

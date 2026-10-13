@@ -4397,7 +4397,6 @@ mod tests {
             },
         );
         base.interrupts = crate::interrupt::InterruptManager::owned_by(
-            256,
             epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
         );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -4454,7 +4453,6 @@ mod tests {
         // interruptAccept gate. See `TestDriver::new` in `port.rs`.
         let mut base = PortDriverBase::new("status_pub", 1, PortFlags::default());
         base.interrupts = crate::interrupt::InterruptManager::owned_by(
-            256,
             epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
         );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();

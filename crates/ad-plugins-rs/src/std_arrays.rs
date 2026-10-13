@@ -321,7 +321,7 @@ mod tests {
             .unwrap();
         params_applied(&handle);
 
-        let mut rx = port.interrupts().subscribe_async();
+        let mut rx = port.interrupts().subscribe_async(256, 4096);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -347,7 +347,7 @@ mod tests {
                         served = true;
                     }
                 }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(asyn_rs::interrupt::AsyncTryRecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
         }

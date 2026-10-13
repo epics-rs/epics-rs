@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(53): checked, not waived — all 53 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(54): checked, not waived — all 54 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
 // --all-features`, 1158/1158). asyn-rs became a census subject when its
@@ -19,7 +19,9 @@ use epics_base_rs::types::EpicsValue;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::InterfaceType;
-use crate::interrupt::{InterruptFilter, InterruptSubscription};
+use crate::interrupt::{
+    ENUM_ENTRY_BYTES, InterruptFilter, InterruptSubscription, MAX_ENUM_STATES, clamp_enum_table,
+};
 use crate::port::{DrvUserRequest, QueuePriority};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
 use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
@@ -2229,6 +2231,9 @@ impl DeviceSupport for AsynDeviceSupport {
             let user = self.init_user();
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
+                    // The table setEnums leaves in the record, which is also
+                    // what a ring slot carries back.
+                    let entries = clamp_enum_table(&entries);
                     self.apply_enum_table(record, &entries);
                     // Capture the shape + table so the runtime callback
                     // (property_post_receiver) can re-propagate on change.
@@ -3255,10 +3260,11 @@ impl DeviceSupport for AsynDeviceSupport {
         // gate is read when the callback fires, in the mailbox write, not
         // when the task below drains it.
         let gate = self.gate.clone();
-        let (sub, mut intr_rx) =
-            self.handle
-                .interrupts()
-                .register_interrupt_user_when(filter, 0, move || gate.open());
+        let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user_when(
+            filter,
+            MAX_ENUM_STATES * ENUM_ENTRY_BYTES,
+            move || gate.open(),
+        );
         self.enum_interrupt_sub = Some(sub);
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -4083,7 +4089,7 @@ mod tests {
         // interface; a UInt32Digital adapter keeps the raw mask, no nbits.
         // No submit happens here, so the channels need no actor.
         let mk_handle = |name: &str| {
-            let interrupts = Arc::new(InterruptManager::new(256));
+            let interrupts = Arc::new(InterruptManager::new());
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             (
                 PortHandle::new(
@@ -4119,7 +4125,7 @@ mod tests {
     fn result_to_value_masks_and_sign_extends_int32() {
         // The polled read path (result_to_value) must apply the nbits mask +
         // sign-extend (C processCallbackInput, devAsynInt32.c:485-488).
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
@@ -4155,7 +4161,7 @@ mod tests {
         use epics_base_rs::server::records::int64in::Int64inRecord;
         use epics_base_rs::server::records::longin::LonginRecord;
 
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
@@ -4209,7 +4215,7 @@ mod tests {
     fn io_intr_masks_and_sign_extends_int32_like_the_polled_read() {
         use crate::param::ParamValue;
 
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
@@ -4358,7 +4364,7 @@ mod tests {
 
     fn make_bounded_adapter(low: i32, high: i32, iface: &str) -> AsynDeviceSupport {
         let driver = BoundedPort::new(low, high);
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -4410,7 +4416,7 @@ mod tests {
 
     fn make_adapter(scan: ScanType) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -4452,7 +4458,7 @@ mod tests {
             .params
             .set_param_status(0, 0, status, 0, 0)
             .unwrap();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -4486,7 +4492,7 @@ mod tests {
     /// gate in production); the port is never read by the average path.
     fn make_average_adapter(iface: &str) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -4530,7 +4536,7 @@ mod tests {
     /// shape the factory produces for `asynXxxTimeSeries`.
     fn make_timeseries_adapter(iface: &str) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -4947,7 +4953,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -5002,7 +5008,7 @@ mod tests {
     /// interface with the given record `@asynMask`.
     fn make_uint32_io_intr_adapter(mask: u32) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -6214,7 +6220,7 @@ mod tests {
         base.set_enum_choices_param(0, 0, choices).unwrap();
         let driver = EnumPort { base };
 
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -6389,6 +6395,68 @@ mod tests {
         assert_eq!(get("ONAM"), Some(EpicsValue::String("OPEN".into())));
         assert_eq!(get("ZSV"), Some(EpicsValue::Short(0)));
         assert_eq!(get("OSV"), Some(EpicsValue::Short(1)));
+    }
+
+    /// C `setEnums` keeps 16 states of 25-byte strings (devAsynInt32.c:65-66),
+    /// so a driver table past either limit equals what the ring carries back:
+    /// a value-only interrupt posts nothing, and a real change still does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_driver_table_past_the_setenums_limits_posts_nothing_on_a_value_change() {
+        use crate::interrupt::InterruptValue;
+        use crate::param::{EnumEntry, ParamValue};
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+        let long = "A_VERY_LONG_STATE_NAME_OF_THIRTY";
+        let mut table = vec![enum_entry(long, 0, 0), enum_entry("ON", 1, 0)];
+        for i in 2..30 {
+            table.push(enum_entry(&format!("S{i}"), i, 0));
+        }
+        let table: Arc<[EnumEntry]> = Arc::from(table);
+        let mut ads = make_enum_adapter(table.clone());
+        let gate = open_gate();
+        ads.bind_interrupt_gate(&gate);
+        let mut rec = MbbiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let mut rx = ads.property_post_receiver().expect("armed");
+
+        let notify = |ads: &AsynDeviceSupport, index, choices: Arc<[EnumEntry]>| {
+            ads.handle.interrupts().notify(InterruptValue {
+                reason: ads.reason,
+                addr: ads.addr,
+                value: ParamValue::Enum { index, choices },
+                ..Default::default()
+            });
+        };
+        notify(&ads, 1, table.clone());
+        // The mailbox keeps the latest value, so let the receiver drain this
+        // one before the change replaces it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a value-only interrupt posts no DBE_PROPERTY"
+        );
+        let changed: Arc<[EnumEntry]> = Arc::from(vec![enum_entry("LOW", 0, 0)]);
+        notify(&ads, 0, changed);
+        // The value-only interrupt was consumed before the change arrived; a
+        // coalesce would mean the change replaced it unread and the silence
+        // above proved nothing.
+        assert_eq!(
+            ads.handle.interrupts().coalesce_count(),
+            0,
+            "the value-only interrupt must be drained before the change"
+        );
+        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the table change posts")
+            .expect("channel open");
+        assert!(
+            post.writes
+                .iter()
+                .any(|(f, v)| f == "ZRST" && *v == EpicsValue::String("LOW".into())),
+            "the first post is the real change, not the value-only interrupt: {:?}",
+            post.writes
+        );
     }
 
     /// Runtime asynEnum re-propagation: after init captures the table, a
@@ -6714,7 +6782,7 @@ mod tests {
             let mut base = PortDriverBase::new("capport", 1, PortFlags::default());
             base.create_param("VAL", ParamType::Int32).unwrap();
             let driver = CapPort { base, cap };
-            let interrupts = Arc::new(InterruptManager::new(256));
+            let interrupts = Arc::new(InterruptManager::new());
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = PortActor::new(Box::new(driver), rx);
             let actor_link = actor.link();
@@ -6994,7 +7062,7 @@ mod tests {
                 base: PortDriverBase::new("ondemand", 1, PortFlags::default()),
                 binds: Arc::clone(&binds),
             };
-            let interrupts = Arc::new(InterruptManager::new(256));
+            let interrupts = Arc::new(InterruptManager::new());
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = PortActor::new(Box::new(driver), rx);
             let actor_link = actor.link();
@@ -7379,7 +7447,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
         // Build an asynInt32Array adapter on the readback (output) path.
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -7983,7 +8051,7 @@ mod tests {
         }
 
         let driver = F64Port::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -8433,7 +8501,7 @@ mod tests {
             writes: writes.clone(),
             fail,
         };
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
         let actor_link = actor.link();
@@ -8690,7 +8758,7 @@ mod tests {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             writes: writes.clone(),
         };
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
         let actor_link = actor.link();
@@ -8903,7 +8971,7 @@ mod tests {
             sequence: sequence.clone(),
             reply: reply.to_vec(),
         };
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
         let actor_link = actor.link();
@@ -9084,7 +9152,7 @@ mod tests {
             }
         }
 
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PartialThenTimeout(PortDriverBase::new(

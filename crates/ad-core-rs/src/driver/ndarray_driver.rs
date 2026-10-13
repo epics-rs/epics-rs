@@ -1152,7 +1152,7 @@ impl NDArrayDriverBase {
         let full = sprintf_template(&template, &path, &name, number);
 
         self.port_base
-            .set_string_param(self.params.full_file_name, 0, full.clone())?;
+            .set_string_param(self.params.full_file_name, 0, &full)?;
 
         // C++: auto-increment file number after creating filename
         if auto_increment != 0 {

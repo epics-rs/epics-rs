@@ -75,7 +75,7 @@ fn enum_fire(reason: usize, choices: &Arc<[EnumEntry]>, index: usize) -> Interru
 #[test]
 fn notify_with_a_ring_and_an_enum_client_allocates_and_frees_nothing() {
     const N: usize = 256;
-    let im = InterruptManager::new(4);
+    let im = InterruptManager::new();
     let filter = |iface| InterruptFilter {
         reason: Some(0),
         addr: Some(0),
@@ -88,8 +88,11 @@ fn notify_with_a_ring_and_an_enum_client_allocates_and_frees_nothing() {
     let _sync = im.register_sync_callback(filter(None), move |_| {
         hits.fetch_add(1, Ordering::Relaxed);
     });
-    let (_sub, _parked) =
-        im.register_interrupt_user_when(filter(Some(InterfaceType::Enum)), 0, || true);
+    let (_sub, _parked) = im.register_interrupt_user_when(
+        filter(Some(InterfaceType::Enum)),
+        asyn_rs::interrupt::MAX_ENUM_STATES * asyn_rs::interrupt::ENUM_ENTRY_BYTES,
+        || true,
+    );
 
     let table: Arc<[EnumEntry]> = Arc::from(vec![entry("OFF", 0), entry("ON", 1)]);
     let fires: Vec<InterruptValue> = (0..N).map(|i| enum_fire(0, &table, i % 2)).collect();
@@ -120,7 +123,7 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
     let mut base = PortDriverBase::new("flushAlloc", 1, PortFlags::default());
-    base.interrupts = InterruptManager::owned_by(4, InterruptGate::opened());
+    base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
     let num = base.create_param("NUM", ParamType::Int32).unwrap();
@@ -171,6 +174,35 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
     );
 }
 
+/// C `paramVal::setString` (paramVal.cpp:271-281) compares, then assigns
+/// into the string it owns. An octet set of a new value is one allocation —
+/// the shared buffer — and an unchanged value allocates nothing, whatever
+/// type the caller hands in.
+#[test]
+fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() {
+    use asyn_rs::param::{ParamList, ParamType};
+
+    let mut pl = ParamList::new(1);
+    let msg = pl.create_param("MSG", ParamType::Octet).unwrap();
+    pl.set_string(msg, 0, "first value").unwrap();
+
+    let owned = String::from("second value");
+    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, &owned));
+    r.unwrap();
+    assert_eq!(allocs, 1, "a new value: the shared buffer, and no Vec");
+
+    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, "second value"));
+    r.unwrap();
+    assert_eq!(allocs, 0, "an unchanged &str");
+    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, &owned));
+    r.unwrap();
+    assert_eq!(allocs, 0, "an unchanged String");
+    let bytes: &[u8] = b"second value";
+    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, bytes));
+    r.unwrap();
+    assert_eq!(allocs, 0, "an unchanged byte slice");
+}
+
 /// The changed-flag list is reserved to the parameter count at creation
 /// (`createParam`, asynPortDriver.cpp:135): setting and flushing 256 params
 /// in an order other than index order allocates nothing.
@@ -210,7 +242,7 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
     let mut base = PortDriverBase::new("mbxFlush", 1, PortFlags::default());
-    base.interrupts = InterruptManager::owned_by(4, InterruptGate::opened());
+    base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
     let num = base.create_param("NUM", ParamType::Int32).unwrap();
@@ -267,7 +299,7 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
 async fn a_mailbox_clamps_a_payload_to_its_registered_size() {
     use asyn_rs::param::ParamValue;
 
-    let im = InterruptManager::new(4);
+    let im = InterruptManager::new();
     let (_sub, mut rx) = im.register_interrupt_user(
         InterruptFilter {
             reason: Some(0),
@@ -313,7 +345,7 @@ async fn a_mailbox_clamps_a_payload_to_its_registered_size() {
 async fn a_mailbox_registered_for_a_large_array_delivers_it_whole() {
     use asyn_rs::param::ParamValue;
 
-    let im = InterruptManager::new(4);
+    let im = InterruptManager::new();
     let (_sub, mut rx) = im.register_interrupt_user(
         InterruptFilter {
             reason: Some(0),
@@ -334,4 +366,81 @@ async fn a_mailbox_registered_for_a_large_array_delivers_it_whole() {
         ParamValue::Float64Array(a) => assert_eq!(&a[..], &src[..]),
         other => panic!("expected the array, got {other:?}"),
     }
+}
+
+/// An unfiltered async subscriber owns a ring of copied elements, so the flush
+/// retains nothing: with one present, 256 flushes of octet + `Int32Array(64)` +
+/// `Int32` neither allocate nor free on the flush thread. The tokio broadcast
+/// this replaces held an `Arc` clone per element and dropped the overwritten
+/// one under the hold.
+#[test]
+fn a_flush_with_an_async_subscriber_neither_allocates_nor_frees() {
+    use asyn_rs::param::ParamType;
+    use asyn_rs::port::{PortDriverBase, PortFlags};
+    use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
+    let mut base = PortDriverBase::new("asyncFlush", 1, PortFlags::default());
+    base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+    let msg = base.create_param("MSG", ParamType::Octet).unwrap();
+    let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
+    let num = base.create_param("NUM", ParamType::Int32).unwrap();
+    // Ring shorter than the 256 x 3 elements the loop fires, so it overflows
+    // and overwrites on every flush after the first few.
+    let _rx = base.interrupts.subscribe_async(8, 256);
+
+    let mut flush = |i: i32| {
+        base.params
+            .set_string(msg, 0, format!("message number {i}"))
+            .unwrap();
+        base.params
+            .set_int32_array(wave, 0, (0..64).map(|k| k + i).collect::<Vec<i32>>())
+            .unwrap();
+        base.params.set_int32(num, 0, i).unwrap();
+        counted(|| base.call_param_callbacks(0))
+    };
+    for i in 0..4 {
+        flush(i).0.unwrap();
+    }
+    let (mut allocs, mut frees) = (0, 0);
+    for i in 4..260 {
+        let (r, a, f) = flush(i);
+        r.unwrap();
+        allocs += a;
+        frees += f;
+    }
+    assert_eq!(
+        (allocs, frees),
+        (0, 0),
+        "256 flushes with an async subscriber attached"
+    );
+}
+
+/// C's ring drops its oldest element when full and keeps the rest in arrival
+/// order (devAsynOctet.c:528-560); the consumer is told once how many went.
+#[epics_base_rs::epics_test]
+async fn a_full_async_ring_drops_the_oldest_and_keeps_arrival_order() {
+    use asyn_rs::interrupt::{AsyncRecvError, AsyncTryRecvError};
+    use asyn_rs::param::ParamValue;
+
+    let im = InterruptManager::new();
+    let mut rx = im.subscribe_async(3, 0);
+    for v in 0..5 {
+        im.notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::Int32(v),
+            ..Default::default()
+        });
+    }
+    // Five arrived into a ring of three: 0 and 1 were dropped.
+    assert_eq!(rx.recv().await.unwrap_err(), AsyncRecvError::Lagged(2));
+    for want in [2, 3, 4] {
+        match rx.recv().await.unwrap().value {
+            ParamValue::Int32(got) => assert_eq!(got, want),
+            other => panic!("expected Int32({want}), got {other:?}"),
+        }
+    }
+    assert_eq!(rx.try_recv().unwrap_err(), AsyncTryRecvError::Empty);
+    drop(im);
+    assert_eq!(rx.recv().await.unwrap_err(), AsyncRecvError::Closed);
 }

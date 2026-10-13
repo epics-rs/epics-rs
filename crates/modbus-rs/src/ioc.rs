@@ -4851,7 +4851,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver
             .poll_cycle()
@@ -4913,7 +4913,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         let path = std::env::temp_dir().join(format!(
             "modbus_MB_TRACE_CLEAN_{}.trace",
@@ -4998,7 +4998,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver
             .poll_cycle()
@@ -5178,10 +5178,9 @@ mod tests {
         // it must establish that post-`iocInit` precondition itself: an owned
         // manager, in place before anything subscribes.
         driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            256,
             epics_base_rs::runtime::interrupt_accept::InterruptGate::opened(),
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         // The statistics params live at addr 0; their monitors must have
@@ -5241,7 +5240,7 @@ mod tests {
             4096,
         );
 
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         let mut int32 = None;
@@ -5346,7 +5345,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         let mut int32_arr = None;
@@ -5380,7 +5379,7 @@ mod tests {
         drop(_sub_f);
         drop(_rx_i);
         drop(_rx_f);
-        let mut rx2 = driver.base.interrupts.subscribe_async();
+        let mut rx2 = driver.base.interrupts.subscribe_async(256, 4096);
         driver.poll_cycle().expect("second poll_cycle must succeed");
         while let Ok(iv) = rx2.try_recv() {
             assert!(
@@ -5397,7 +5396,7 @@ mod tests {
     /// Drain every buffered interrupt fire for `(reason, addr 0)`, in order.
     /// The R57 on-change tests inspect which interfaces fired each poll.
     fn drain_addr0_fires(
-        rx: &mut tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        rx: &mut asyn_rs::interrupt::AsyncInterruptReceiver,
         reason: usize,
     ) -> Vec<asyn_rs::interrupt::InterruptValue> {
         let mut out = Vec::new();
@@ -5459,7 +5458,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
             fires
@@ -5539,7 +5538,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         // Poll 1 (force): int32Array + float64Array + scalars all fire.
         driver.poll_cycle().expect("poll 1 must succeed");
@@ -5637,7 +5636,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver.poll_cycle().expect("poll 1 must succeed");
         assert_eq!(
@@ -5694,7 +5693,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver.poll_cycle().expect("poll 1 must succeed");
         let _ = drain_addr0_fires(&mut rx, reason); // discard the forced first fire
@@ -5782,7 +5781,7 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
             fires
@@ -6133,23 +6132,22 @@ mod tests {
             },
             4096,
         );
-        let mut rx = driver.base.interrupts.subscribe_async();
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         // The Int32 fires this cycle produced, as (value, aux_status).
-        let int32_fires =
-            |rx: &mut tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>| {
-                let mut out = Vec::new();
-                while let Ok(iv) = rx.try_recv() {
-                    if iv.reason == reason
-                        && iv.addr == 0
-                        && iv.iface == Some(InterfaceType::Int32)
-                        && let ParamValue::Int32(v) = iv.value
-                    {
-                        out.push((v, iv.aux_status));
-                    }
+        let int32_fires = |rx: &mut asyn_rs::interrupt::AsyncInterruptReceiver| {
+            let mut out = Vec::new();
+            while let Ok(iv) = rx.try_recv() {
+                if iv.reason == reason
+                    && iv.addr == 0
+                    && iv.iface == Some(InterfaceType::Int32)
+                    && let ParamValue::Int32(v) = iv.value
+                {
+                    out.push((v, iv.aux_status));
                 }
-                out
-            };
+            }
+            out
+        };
 
         // 1. Clean poll.
         driver.poll_cycle().expect("clean poll must succeed");

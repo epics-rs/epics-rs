@@ -100,8 +100,8 @@ fn bench_concurrent_32_producers(c: &mut Criterion) {
 }
 
 fn bench_interrupt_event_throughput(c: &mut Criterion) {
-    let im = InterruptManager::new(4096);
-    let _rx = im.subscribe_async();
+    let im = InterruptManager::new();
+    let _rx = im.subscribe_async(256, 4096);
 
     c.bench_function("interrupt_event_throughput", |b| {
         b.iter(|| {

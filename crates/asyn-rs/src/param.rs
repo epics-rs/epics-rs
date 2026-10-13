@@ -637,29 +637,36 @@ impl ParamList {
     /// `value` is taken as bytes — C's `setStringParam(int, const char *)`
     /// copies whatever the driver points at, and a device answer is not
     /// required to be UTF-8. `String`/`&str` callers are unaffected.
+    ///
+    /// The bytes are compared in place and copied once, into the shared
+    /// buffer, only when they differ — C's `sval != value` then
+    /// `sval = value` (paramVal.cpp:271-281). An unchanged value allocates
+    /// nothing.
     pub fn set_string(
         &mut self,
         index: usize,
         addr: i32,
-        value: impl Into<Vec<u8>>,
+        value: impl AsRef<[u8]>,
     ) -> AsynResult<()> {
-        let value: Vec<u8> = value.into();
-        self.store_octet(index, addr, &value, || Arc::from(value.as_slice()))
+        self.store_octet(index, addr, value.as_ref(), None)
     }
 
+    /// The one owner of an octet store. `shared` is the value's buffer when
+    /// the caller already holds one; otherwise `bytes` is copied into a new
+    /// one, and only when the stored value differs.
     fn store_octet(
         &mut self,
         index: usize,
         addr: i32,
         bytes: &[u8],
-        shared: impl FnOnce() -> Arc<[u8]>,
+        shared: Option<Arc<[u8]>>,
     ) -> AsynResult<()> {
         let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Octet(ref old) = entry.value {
             // C parity: paramVal::setString (paramVal.cpp:271-281) —
             // `!isDefined() || sval != value`.
             if !entry.defined || **old != *bytes {
-                entry.value = ParamValue::Octet(shared());
+                entry.value = ParamValue::Octet(shared.unwrap_or_else(|| Arc::from(bytes)));
                 flags.set(index);
                 entry.defined = true;
             }
@@ -1142,7 +1149,7 @@ impl ParamList {
             ParamValue::Int32(v) => self.set_int32(index, addr, v),
             ParamValue::Int64(v) => self.set_int64(index, addr, v),
             ParamValue::Float64(v) => self.set_float64(index, addr, v),
-            ParamValue::Octet(s) => self.store_octet(index, addr, &s, || s.clone()),
+            ParamValue::Octet(s) => self.store_octet(index, addr, &s, Some(s.clone())),
             ParamValue::UInt32Digital(v) => self.set_uint32(index, addr, v, u32::MAX, 0),
             ParamValue::Int8Array(a) => self.set_int8_array(index, addr, a.to_vec()),
             ParamValue::Int16Array(a) => self.set_int16_array(index, addr, a.to_vec()),

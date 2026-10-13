@@ -1704,7 +1704,7 @@ impl PortDriver for PluginPortDriver {
         let reason = user.reason;
         let addr = user.addr;
         let s = String::from_utf8_lossy(data).into_owned();
-        self.base.set_string_param(reason, addr, s.clone())?;
+        self.base.set_string_param(reason, addr, &s)?;
         self.base.call_param_callbacks(addr)?;
         let _ = self.param_change_tx.send(PluginParamMsg::Change(
             reason,

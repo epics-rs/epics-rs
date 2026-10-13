@@ -1516,7 +1516,7 @@ mod tests {
     }
 
     fn make_handle(driver: impl PortDriver) -> PortHandle {
-        let interrupts = Arc::new(InterruptManager::new(256));
+        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -1547,7 +1547,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             "cd_noactor".into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor.link(),
             Arc::new(TraceManager::new()),
         );
@@ -1605,7 +1605,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             "enbl_noactor".into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor.link(),
             Arc::new(TraceManager::new()),
         );
@@ -1772,7 +1772,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             "park_waiter".into(),
-            Arc::new(InterruptManager::new(16)),
+            Arc::new(InterruptManager::new()),
             link,
             Arc::new(TraceManager::new()),
         );
@@ -2028,7 +2028,7 @@ mod tests {
         let handle = PortHandle::new(
             tx,
             "announce_order".into(),
-            Arc::new(InterruptManager::new(256)),
+            Arc::new(InterruptManager::new()),
             actor.link(),
             Arc::new(TraceManager::new()),
         );

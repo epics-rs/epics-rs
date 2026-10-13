@@ -92,3 +92,6 @@ mod tls_mtls;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/type_cache.rs"]
 mod type_cache;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/udp_v6_port_held.rs"]
+mod udp_v6_port_held;

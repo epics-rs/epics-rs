@@ -109,36 +109,50 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
 ///   the same port silently and the two answer searches at random. There is
 ///   no error to detect after the fact, which is exactly why the number must
 ///   never be guessed.)
+///
+/// With `v6`, the v6 SEARCH socket is bound here too, on the same number, so
+/// a start either holds both families or fails — pvxs binds its `[::]`
+/// listener on the number the v4 one read back and throws out of the
+/// `Server` constructor when it cannot (`server.cpp:421-426`,
+/// `udp_collector.cpp:151`). v4 goes first: its ephemeral pick must come from
+/// the kernel, since a guessed number under the bundle's reuse flags would
+/// co-bind silently, while the v6 socket of an ephemeral number carries no
+/// reuse flag and so reports a holder as `EADDRINUSE`. On that error the
+/// pair is dropped and the kernel asked again, which pvxs does not do.
 pub(crate) fn bind_udp(
     port: u16,
     interfaces: &[Ipv4Addr],
     beacon_dests: &[Endpoint],
-) -> PvaResult<(AsyncUdpV4, u16)> {
-    // `EPICS_PVAS_INTF_ADDR_LIST` constrains the responder to the listed
-    // interfaces (pvxs `src/server.cpp:407-439` binds UDP search listeners
-    // only on the effective interface set). Empty list = the historical
-    // all-NIC default. A constrained bind also gets each listed NIC's
-    // broadcast-RX socket from `bind_on_interfaces`, so subnet-directed
-    // SEARCH to a listed interface still reaches us.
-    let mut sock = if port == 0 {
-        // Ephemeral: every NIC socket must land on the SAME kernel-assigned
-        // port (see the doc comment) — `bind(0, ..)` per NIC would not.
-        if interfaces.is_empty() {
-            AsyncUdpV4::bind_ephemeral_same_port(true)
-        } else {
-            AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, true)
+    v6: bool,
+) -> PvaResult<UdpBind> {
+    const EPHEMERAL_TRIES: usize = 32;
+    let port_use = PortUse::from_caller(port);
+    let mut tries = 1;
+    let (mut sock, port, v6) = loop {
+        let (sock, bound) = bind_udp_v4(port, interfaces)?;
+        if !v6 {
+            break (sock, bound, None);
         }
-    } else if interfaces.is_empty() {
-        AsyncUdpV4::bind(port, true)
-    } else {
-        AsyncUdpV4::bind_on_interfaces(interfaces, port, true)
-    }
-    .map_err(PvaError::Io)?;
-
-    // The bound port, read off the socket. pvxs does the same read-back
-    // (`src/server.cpp:426`: `effective.udp_port = addr.addr.port()`), which is
-    // what makes `EPICS_PVAS_BROADCAST_PORT=0` usable at all.
-    let port = resolve_bound_udp_port(&sock, port)?;
+        #[cfg(test)]
+        tests::BEFORE_V6_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bound)));
+        match bind_search_v6(bound, port_use) {
+            Ok(v6) => break (sock, bound, Some(v6)),
+            Err(e)
+                if port == 0
+                    && e.kind() == std::io::ErrorKind::AddrInUse
+                    && tries < EPHEMERAL_TRIES =>
+            {
+                debug!("UDP6 port {bound} is held; choosing another search port");
+                tries += 1;
+            }
+            Err(e) => return Err(PvaError::Io(e)),
+        }
+    };
+    let external_nics: Vec<Ipv4Addr> = IfaceMap::new()?
+        .up_non_loopback()
+        .into_iter()
+        .map(|i| i.ip)
+        .collect();
     // pvxs `config.cpp:512-519` calls `addGroups(ifaces, beaconDestinations,
     // ifmap)` after resolving the server's beacon destinations, so every
     // multicast address the server beacons to also becomes a search-listener
@@ -157,12 +171,65 @@ pub(crate) fn bind_udp(
     // multicast destination is joined on every external NIC — even NICs
     // outside the configured interface list — and `&mut sock` lets
     // `ensure_iface_socket` add those listener sockets to the bundle.
-    let external_nics: Vec<Ipv4Addr> = IfaceMap::new()?
-        .up_non_loopback()
-        .into_iter()
-        .map(|i| i.ip)
-        .collect();
     join_beacon_multicast_groups(&mut sock, beacon_dests, port, &external_nics);
+    Ok(UdpBind { v4: sock, v6, port })
+}
+
+/// A server start's search sockets, all on [`Self::port`].
+pub(crate) struct UdpBind {
+    pub v4: AsyncUdpV4,
+    /// The v6 SEARCH socket, when the v6 responder is on.
+    pub v6: Option<std::net::UdpSocket>,
+    pub port: u16,
+}
+
+/// `[::]:port` with `IPV6_V6ONLY`, so it and the v4 bundle stay disjoint
+/// lanes whatever the platform default, under `port_use`'s reuse set: a
+/// restart picks a configured number up without TIME_WAIT and a second PVA
+/// process co-binds it, while a kernel-chosen number is owned outright.
+fn bind_search_v6(port: u16, port_use: PortUse) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    if let Err(e) = sock.set_only_v6(true) {
+        debug!("v6 responder: set_only_v6 failed: {e}");
+    }
+    if let Err(e) = port_use.apply_reuse(&sock) {
+        debug!("v6 responder: reuse options failed: {e}");
+    }
+    sock.set_nonblocking(true)?;
+    let bind_addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
+    sock.bind(&bind_addr.into())?;
+    Ok(sock.into())
+}
+
+/// The v4 bundle on `port` (0: one kernel-chosen number across it) and the
+/// number it holds.
+fn bind_udp_v4(port: u16, interfaces: &[Ipv4Addr]) -> PvaResult<(AsyncUdpV4, u16)> {
+    // `EPICS_PVAS_INTF_ADDR_LIST` constrains the responder to the listed
+    // interfaces (pvxs `src/server.cpp:407-439` binds UDP search listeners
+    // only on the effective interface set). Empty list = the historical
+    // all-NIC default. A constrained bind also gets each listed NIC's
+    // broadcast-RX socket from `bind_on_interfaces`, so subnet-directed
+    // SEARCH to a listed interface still reaches us.
+    let sock = if port == 0 {
+        // Ephemeral: every NIC socket must land on the SAME kernel-assigned
+        // port (see the doc comment) — `bind(0, ..)` per NIC would not.
+        if interfaces.is_empty() {
+            AsyncUdpV4::bind_ephemeral_same_port(true)
+        } else {
+            AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, true)
+        }
+    } else if interfaces.is_empty() {
+        AsyncUdpV4::bind(port, true)
+    } else {
+        AsyncUdpV4::bind_on_interfaces(interfaces, port, true)
+    }
+    .map_err(PvaError::Io)?;
+
+    // The bound port, read off the socket. pvxs does the same read-back
+    // (`src/server.cpp:426`: `effective.udp_port = addr.addr.port()`), which is
+    // what makes `EPICS_PVAS_BROADCAST_PORT=0` usable at all.
+    let port = resolve_bound_udp_port(&sock, port)?;
     Ok((sock, port))
 }
 
@@ -353,10 +420,10 @@ pub async fn run_udp_responder_with_config(
     // discovered NIC. Empty = all-NIC default.
     interfaces: Vec<Ipv4Addr>,
 ) -> PvaResult<()> {
-    let (socket, udp_port) = bind_udp(udp_port, &interfaces, &destinations)?;
+    let bound = bind_udp(udp_port, &interfaces, &destinations, false)?;
     run_udp_responder_on_socket(
-        socket,
-        udp_port,
+        bound.v4,
+        bound.port,
         source,
         tcp_port,
         guid,
@@ -848,11 +915,10 @@ async fn dispatch_search_outputs(
     }
 }
 
-/// IPv6 UDP responder. Binds `[::]:udp_port` (kernel default
-/// `IPV6_V6ONLY` controls whether IPv4-mapped traffic also lands
-/// here — Linux is dual-stack by default, BSD/macOS are v6-only)
-/// and answers `Search` queries against `source` with a
-/// `SearchResponse` containing this server's TCP port and GUID.
+/// IPv6 UDP responder on `socket`, the `[::]` search socket [`bind_udp`]
+/// bound on the server's UDP number. Answers `Search` queries against
+/// `source` with a `SearchResponse` containing this server's TCP port and
+/// GUID.
 ///
 /// Companion to the existing IPv4 responder driven by
 /// [`run_udp_responder_with_config`]. Both can run in parallel
@@ -872,43 +938,14 @@ async fn dispatch_search_outputs(
 /// management that arrives in a follow-up commit.
 pub async fn run_udp_responder_v6(
     source: DynSource,
-    udp_port: u16,
-    udp_port_use: PortUse,
+    socket: std::net::UdpSocket,
     tcp_port: u16,
     guid: [u8; 12],
     protocol: &'static str,
     ignore_addrs: Vec<(IpAddr, u16)>,
 ) -> PvaResult<()> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    // Build the v6 socket explicitly via socket2 so we can force
-    // `IPV6_V6ONLY=1`. On Linux the kernel default is `0` (dual-stack):
-    // a `[::]:port` socket would also claim v4 traffic and overlap
-    // with the parallel v4 responder bundle, causing surprising
-    // duplicate handling or EADDRINUSE on the per-NIC binds. Mirroring
-    // `bind_beacon_send_v6` keeps the v4 and v6 responder lanes
-    // strictly disjoint regardless of platform default.
-    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
-        .map_err(crate::error::PvaError::Io)?;
-    if let Err(e) = sock.set_only_v6(true) {
-        debug!("v6 responder: set_only_v6 failed: {e}");
-    }
-    // The reuse set `PortUse::Shared` names, applied by the enum that names it
-    // rather than spelled out again here: a restart picks the same port up
-    // without TIME_WAIT, and a second PVA process co-binds the well-known one.
-    // Only for a number the operator chose — `udp_port` has already been
-    // through `bind_udp`'s read-back, so on an `EPICS_PVAS_BROADCAST_PORT=0`
-    // server it is the *kernel's* answer, and `PortUse` is what still
-    // remembers which it was.
-    if let Err(e) = udp_port_use.apply_reuse(&sock) {
-        debug!("v6 responder: reuse options failed: {e}");
-    }
-    sock.set_nonblocking(true)
-        .map_err(crate::error::PvaError::Io)?;
-    let bind_addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), udp_port);
-    sock.bind(&bind_addr.into())
-        .map_err(crate::error::PvaError::Io)?;
-    let std_sock: std::net::UdpSocket = sock.into();
-    let socket = tokio::net::UdpSocket::from_std(std_sock).map_err(crate::error::PvaError::Io)?;
+    let udp_port = socket.local_addr().map(|a| a.port()).ok();
+    let socket = tokio::net::UdpSocket::from_std(socket).map_err(crate::error::PvaError::Io)?;
     if let Err(e) = enable_so_rxq_ovfl_for_socket(&socket) {
         debug!("v6 SO_RXQ_OVFL enable failed (non-fatal): {e}");
     }
@@ -1423,6 +1460,82 @@ fn rebuild_beacon_forward(b: &BeaconForward, source: SocketAddr) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// Called with each number `bind_udp` is about to bind on v6.
+        pub(super) static BEFORE_V6_BIND: std::cell::RefCell<Option<Box<dyn FnMut(u16)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Holds each number `bind_udp` tries on v6, as a stranger with no reuse
+    /// flag would, for the first `n` tries; returns the tries seen. A number
+    /// some other process already holds there counts as held.
+    fn hold_v6_for(n: usize) -> std::rc::Rc<std::cell::RefCell<Vec<u16>>> {
+        let tried = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut held = Vec::new();
+        let seen = tried.clone();
+        BEFORE_V6_BIND.set(Some(Box::new(move |port| {
+            seen.borrow_mut().push(port);
+            if seen.borrow().len() <= n {
+                held.extend(try_v6_holder(port));
+            }
+        })));
+        tried
+    }
+
+    fn try_v6_holder(port: u16) -> Option<socket2::Socket> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        s.set_only_v6(true).unwrap();
+        let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
+        match s.bind(&addr.into()) {
+            Ok(()) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+            Err(e) => panic!("hold {port} on v6: {e}"),
+        }
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn an_ephemeral_number_held_on_v6_is_chosen_again() {
+        let tried = hold_v6_for(3);
+        let bound = super::bind_udp(0, &[Ipv4Addr::LOCALHOST], &[], true).expect("bind");
+        BEFORE_V6_BIND.take();
+        let tried = tried.borrow();
+        // More than four when a stranger already held a later pick.
+        assert!(tried.len() >= 4, "{tried:?}");
+        assert_eq!(*tried.last().unwrap(), bound.port);
+        assert!(!tried[..tried.len() - 1].contains(&bound.port), "{tried:?}");
+        let v6 = bound.v6.expect("the v6 socket");
+        assert_eq!(v6.local_addr().unwrap().port(), bound.port);
+    }
+
+    /// The re-choice is bounded: a number held on every try fails the start.
+    #[epics_macros_rs::epics_test]
+    async fn an_ephemeral_number_held_on_every_try_fails_the_bind() {
+        let tried = hold_v6_for(usize::MAX);
+        let err = super::bind_udp(0, &[Ipv4Addr::LOCALHOST], &[], true).err();
+        BEFORE_V6_BIND.take();
+        assert!(
+            matches!(&err, Some(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse),
+            "{err:?}"
+        );
+        assert_eq!(tried.borrow().len(), 32);
+    }
+
+    /// A configured number is never swapped for another: held on v6, the
+    /// start fails, as softIocPVX's does.
+    #[epics_macros_rs::epics_test]
+    async fn a_configured_number_held_on_v6_fails_the_bind() {
+        let holder = try_v6_holder(0).unwrap();
+        let port = holder.local_addr().unwrap().as_socket().unwrap().port();
+        let tried = hold_v6_for(0);
+        let err = super::bind_udp(port, &[Ipv4Addr::LOCALHOST], &[], true).err();
+        BEFORE_V6_BIND.take();
+        assert!(
+            matches!(&err, Some(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse),
+            "{err:?}"
+        );
+        assert_eq!(*tried.borrow(), [port]);
+    }
     use super::*;
     use crate::server_native::MonitorStream;
     // Named from its new home rather than re-exported through the module

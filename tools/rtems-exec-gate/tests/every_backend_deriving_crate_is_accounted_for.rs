@@ -223,6 +223,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_interop.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_mtls.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/type_cache.rs"),
+    (
+        "epics-pva-rs",
+        "tests/interop_pvxs_mods/udp_v6_port_held.rs",
+    ),
     ("epics-pva-rs", "tests/monitor_conn_events.rs"),
     (
         "epics-pva-rs",

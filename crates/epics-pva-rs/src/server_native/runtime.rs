@@ -5,8 +5,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use epics_base_rs::net::PortUse;
-
 use crate::error::{PvaError, PvaResult};
 
 use super::source::{ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource};
@@ -418,20 +416,18 @@ impl PvaServer {
         // and stamping the result back onto `config` keeps a single
         // bound-port source of truth (pvxs does the same read-back at
         // `src/server.cpp:426`).
-        // Read *before* the stamp below: once `config.udp_port` carries the
-        // bound number, nothing downstream can tell an operator-configured
-        // port from the one the kernel chose, and the v6 companion would put
-        // the co-bind flag on a port nobody asked to share.
-        let udp_port_use = PortUse::from_caller(config.udp_port);
-        let (udp_socket, bound_udp_port) = crate::server_native::udp::bind_udp(
+        // The v6 companion's socket is bound here as well, on the same
+        // number, so a start that cannot hold both families fails here.
+        let bound = crate::server_native::udp::bind_udp(
             config.udp_port,
             &udp_interfaces,
             &config.beacon_destinations,
+            config.enable_ipv6_udp,
         )?;
-        config.udp_port = bound_udp_port;
+        config.udp_port = bound.port;
         let udp_handle = tokio::spawn(run_udp_responder_on_socket(
-            udp_socket,
-            bound_udp_port,
+            bound.v4,
+            bound.port,
             dyn_source.clone(),
             advertised_tcp_port,
             guid,
@@ -449,19 +445,16 @@ impl PvaServer {
         // the GUID + TCP port + protocol of the v4 path so a peer
         // sees one consistent PVA identity across both families.
         // Default-off via `enable_ipv6_udp = false`.
-        let udp_v6_handle = if config.enable_ipv6_udp {
-            Some(tokio::spawn(run_udp_responder_v6(
+        let udp_v6_handle = bound.v6.map(|socket| {
+            tokio::spawn(run_udp_responder_v6(
                 dyn_source.clone(),
-                config.udp_port,
-                udp_port_use,
+                socket,
                 advertised_tcp_port,
                 guid,
                 protocol,
                 config.ignore_addrs.clone(),
-            )))
-        } else {
-            None
-        };
+            ))
+        });
         // One accept loop per bound interface, supervised by a single
         // task so the `PvaServer` keeps its single-handle shape (Drop /
         // run / wait / report / stop are unchanged). The supervisor owns

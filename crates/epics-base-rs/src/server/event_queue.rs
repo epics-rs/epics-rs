@@ -583,6 +583,9 @@ impl QueInner {
                 sid: sub.sid,
                 context: sub.context.clone(),
                 event: MonitorEvent::of_log(log),
+                // C `eventsRemaining`: the next ring slot, a cancelled
+                // monitor's entry included (`dbEvent.c:965`).
+                remaining: self.used > 0,
             });
         }
         None
@@ -714,7 +717,10 @@ impl EvQue {
     /// release) comes through here. It frees nothing and allocates nothing,
     /// because a [`PostBurst`] drops under the record hold.
     fn wake_readers(&self) {
-        if let Some(waker) = self.flow.ppendsem().take() {
+        // Woken after the guard drops: a parker contending for `ppendsem`
+        // would otherwise be woken into the still-held lock.
+        let waker = self.flow.ppendsem().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -1001,6 +1007,10 @@ pub enum CircuitEvent {
         sid: u32,
         context: DeliveryContext,
         event: MonitorEvent,
+        /// C `eventsRemaining`: this queue holds another entry. A consumer
+        /// flushes its send buffer on `false`, as `read_reply` does
+        /// (`camessage.c:525`, `:536`, `:593`).
+        remaining: bool,
     },
     /// Monitor `id`'s producer is gone and its entries are delivered.
     Ended(AttachId),
@@ -2403,6 +2413,81 @@ mod tests {
         let counter = Arc::new(CountWaker(std::sync::atomic::AtomicUsize::new(0)));
         let waker = std::task::Waker::from(counter.clone());
         (counter, waker)
+    }
+
+    /// C `eventsRemaining`: an entry is told whether its queue holds another,
+    /// so the last of a drained queue reads `false`.
+    #[test]
+    fn the_last_entry_of_a_drained_queue_reports_none_remaining() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1, LogKind::Val);
+        let (b, _rb) = attach(&user, 2, LogKind::Val);
+        a.post(ev(1));
+        b.post(ev(2));
+        let mut got = Vec::new();
+        while let std::task::Poll::Ready(CircuitEvent::Event {
+            event, remaining, ..
+        }) = circuit_now(&user)
+        {
+            got.push((val(&event), remaining));
+        }
+        assert_eq!(got, [(1, true), (2, false)]);
+        b.post(ev(3));
+        assert!(matches!(
+            circuit_now(&user),
+            std::task::Poll::Ready(CircuitEvent::Event {
+                remaining: false,
+                ..
+            })
+        ));
+    }
+
+    /// C reads `evque[getix]` before the dead-entry skip (`dbEvent.c:965`), so
+    /// a cancelled monitor's entry next in the ring still counts as remaining.
+    #[test]
+    fn a_cancelled_monitors_next_entry_counts_as_remaining() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1, LogKind::Val);
+        let (b, rb) = attach(&user, 2, LogKind::Val);
+        a.post(ev(1));
+        b.post(ev(2));
+        drop(rb);
+        assert!(matches!(
+            circuit_now(&user),
+            std::task::Poll::Ready(CircuitEvent::Event {
+                sid: 1,
+                remaining: true,
+                ..
+            })
+        ));
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// Records whether `ppendsem` was held when it was woken.
+    struct HeldAtWake(Arc<FlowCtrl>, std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for HeldAtWake {
+        fn wake(self: Arc<Self>) {
+            let held = self.0.ppendsem.try_lock().is_err();
+            self.1.store(held, Ordering::SeqCst);
+        }
+    }
+
+    /// The wake runs with `ppendsem` released, so the woken consumer's park
+    /// does not contend with the waker's release.
+    #[test]
+    fn wake_readers_wakes_after_releasing_ppendsem() {
+        let user = EventUser::new();
+        let (sink, mut reader) = attach(&user, 7, LogKind::Val);
+        let probe = Arc::new(HeldAtWake(
+            user.flow.clone(),
+            std::sync::atomic::AtomicBool::new(true),
+        ));
+        let waker = std::task::Waker::from(probe.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(reader.poll_recv(&mut cx).is_pending());
+        sink.post(ev(1));
+        assert!(!probe.1.load(Ordering::SeqCst), "woken under ppendsem");
     }
 
     /// Boundary empty→posted: a parked `poll_recv` registers its waker, a

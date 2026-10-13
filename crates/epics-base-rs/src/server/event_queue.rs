@@ -357,14 +357,9 @@ struct SubQ {
     nreplace: u64,
     /// Posts absorbed by C's early-drop, which keeps no counter of its own.
     ncollapse: u64,
-    /// The producer row (`EventSink`) is gone: no further posts can arrive. The
-    /// reader still drains what is queued and then sees end-of-stream, exactly
-    /// as an `mpsc::Receiver` does when the last `Sender` drops.
-    producer_gone: bool,
-    /// The reader (`EventReader`) is gone (C `user_sub == NULL`): posts are
-    /// refused, its entries are dropped as the ring drains, and the slot is
-    /// freed after the last.
-    reader_gone: bool,
+    /// [`SubQ::PRODUCER_GONE`] and [`SubQ::READER_GONE`]; a post is accepted
+    /// only while it is 0, one test on the cycle path.
+    gone: u8,
     /// [`EventUser::poll_next`] has reported this monitor's end of stream.
     end_reported: bool,
     /// C `user_sub`/`user_arg`, fixed at attach as `db_add_event` fixes them:
@@ -373,6 +368,23 @@ struct SubQ {
 }
 
 impl SubQ {
+    /// The producer row (`EventSink`) is closed: no further posts land. The
+    /// reader still drains what is queued and then sees end-of-stream, exactly
+    /// as an `mpsc::Receiver` does when the last `Sender` drops.
+    const PRODUCER_GONE: u8 = 1;
+    /// The reader (`EventReader`) is gone (C `user_sub == NULL`): posts are
+    /// refused, its entries are dropped as the ring drains, and the slot is
+    /// freed after the last.
+    const READER_GONE: u8 = 2;
+
+    fn producer_gone(&self) -> bool {
+        self.gone & Self::PRODUCER_GONE != 0
+    }
+
+    fn reader_gone(&self) -> bool {
+        self.gone & Self::READER_GONE != 0
+    }
+
     fn new(id: AttachId, sid: u32, kind: LogKind, context: DeliveryContext) -> Self {
         Self {
             id,
@@ -382,8 +394,7 @@ impl SubQ {
             last: 0,
             nreplace: 0,
             ncollapse: 0,
-            producer_gone: false,
-            reader_gone: false,
+            gone: 0,
             end_reported: false,
             context,
         }
@@ -522,7 +533,7 @@ impl QueInner {
             return false;
         };
         sub.npend -= 1;
-        let (duplicate, gone, drained) = (sub.npend > 0, sub.reader_gone, sub.npend == 0);
+        let (duplicate, gone, drained) = (sub.npend > 0, sub.reader_gone(), sub.npend == 0);
         if duplicate {
             debug_assert!(self.n_duplicates >= 1, "nDuplicates underflow");
             self.n_duplicates -= 1;
@@ -584,7 +595,7 @@ impl QueInner {
     fn take_for(&mut self, id: AttachId) -> Option<PostLog> {
         while self.used > 0 {
             let head = self.ring[self.getix].as_ref().expect("occupied").id;
-            if self.sub(head).is_some_and(|s| !s.reader_gone) {
+            if self.sub(head).is_some_and(|s| !s.reader_gone()) {
                 break;
             }
             self.pop();
@@ -616,7 +627,7 @@ impl QueInner {
             .subs
             .iter_mut()
             .flatten()
-            .find(|s| s.producer_gone && !s.end_reported && s.npend == 0)?;
+            .find(|s| s.producer_gone() && !s.end_reported && s.npend == 0)?;
         sub.end_reported = true;
         Some(CircuitEvent::Ended(sub.id))
     }
@@ -725,7 +736,7 @@ impl EvQue {
         let ring_space = q.ring_space();
         let Some(sub) = q.subs[usize::from(id.slot())]
             .as_mut()
-            .filter(|s| s.id == id && !s.reader_gone)
+            .filter(|s| s.id == id && s.gone == 0)
         else {
             return PostOutcome::Closed;
         };
@@ -813,7 +824,7 @@ impl EvQue {
             return Poll::Ready(None);
         };
         let has_entry = sub.npend > 0;
-        let producer_gone = sub.producer_gone;
+        let producer_gone = sub.producer_gone();
         if has_entry {
             if q.may_drain(flow_on) {
                 q.draining = true;
@@ -850,7 +861,7 @@ impl EvQue {
             return Err(TryRecvError::Disconnected);
         };
         if sub.npend == 0 {
-            return Err(if sub.producer_gone {
+            return Err(if sub.producer_gone() {
                 TryRecvError::Disconnected
             } else {
                 TryRecvError::Empty
@@ -866,10 +877,11 @@ impl EvQue {
             .ok_or(TryRecvError::Empty)
     }
 
-    /// Is this subscription's reader gone (C: the monitor was cancelled)?
-    /// Producer rows are reaped on this, replacing `mpsc::Sender::is_closed`.
-    fn reader_gone(&self, id: AttachId) -> bool {
-        self.lock().sub(id).is_none_or(|s| s.reader_gone)
+    /// Does this subscription refuse posts — its reader gone (C: the monitor
+    /// was cancelled) or its producer closed? Producer rows are reaped on
+    /// this, replacing `mpsc::Sender::is_closed`.
+    fn refuses_posts(&self, id: AttachId) -> bool {
+        self.lock().sub(id).is_none_or(|s| s.gone != 0)
     }
 
     /// The producer row for `id` is gone: no more posts, but what is already
@@ -880,7 +892,7 @@ impl EvQue {
             let Some(sub) = q.sub_mut(id) else {
                 return;
             };
-            sub.producer_gone = true;
+            sub.gone |= SubQ::PRODUCER_GONE;
         }
         self.wake_readers();
     }
@@ -894,7 +906,7 @@ impl EvQue {
             let Some(sub) = q.sub_mut(id) else {
                 return;
             };
-            sub.reader_gone = true;
+            sub.gone |= SubQ::READER_GONE;
             if sub.npend == 0 {
                 q.free_slot(id);
             }
@@ -1170,9 +1182,24 @@ impl std::error::Error for TryRecvError {}
 pub struct EventReader {
     que: Arc<EvQue>,
     id: AttachId,
+    /// The monitor list holding this subscription's row, which the drop
+    /// unlinks it from (C `db_cancel_event`'s `ellDelete`), so the list a
+    /// post walks never holds a row whose reader is gone.
+    owner: Option<std::sync::Weak<dyn RowOwner>>,
+}
+
+/// A monitor list an [`EventReader`]'s drop unlinks its row from.
+pub(crate) trait RowOwner: Send + Sync {
+    fn remove_row(&self, id: AttachId);
 }
 
 impl EventReader {
+    /// Unlink this subscription's row from `owner` when the reader drops.
+    pub(crate) fn owned_by(mut self, owner: std::sync::Weak<dyn RowOwner>) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
     /// Await this subscription's next event, suspending exactly where C's
     /// `event_read` does (`flowCtrlMode && nDuplicates == 0`, no drain pass in
     /// flight). `None` = producer gone and queue drained.
@@ -1218,6 +1245,9 @@ impl EventReader {
 
 impl Drop for EventReader {
     fn drop(&mut self) {
+        if let Some(owner) = self.owner.take().and_then(|o| o.upgrade()) {
+            owner.remove_row(self.id);
+        }
         self.que.close_reader(self.id);
     }
 }
@@ -1259,10 +1289,18 @@ impl EventSink {
         self.kind
     }
 
-    /// The reader is gone — the producer row can be reaped. Replaces
-    /// `mpsc::Sender::is_closed`.
+    /// The queue refuses this sink's posts — the producer row can be reaped.
+    /// Replaces `mpsc::Sender::is_closed`.
     pub fn is_closed(&self) -> bool {
-        self.que.reader_gone(self.id)
+        self.que.refuses_posts(self.id)
+    }
+
+    /// End this monitor's stream now: later posts are refused and the reader
+    /// gets end-of-stream once what is queued is delivered. The owner that
+    /// removed the monitor calls it — a [`SubscriberList`] map retired by
+    /// that removal can still hold this sink until a later store.
+    pub(crate) fn close(&self) {
+        self.que.close_producer(self.id);
     }
 
     /// This monitor's queue state, for `dbel`.
@@ -1273,7 +1311,7 @@ impl EventSink {
 
 impl Drop for EventSink {
     fn drop(&mut self) {
-        self.que.close_producer(self.id);
+        self.close();
     }
 }
 
@@ -1306,7 +1344,11 @@ pub fn attach_with(
             id,
             kind,
         },
-        EventReader { que, id },
+        EventReader {
+            que,
+            id,
+            owner: None,
+        },
     )
 }
 
@@ -1322,9 +1364,16 @@ pub struct SubscriberList<T> {
     /// before the store and lowers it after — so a reader that sees 0 sees an
     /// empty map. A nonzero count does not say the map holds anyone.
     count: AtomicUsize,
-    /// Serialises the copy-modify-store; a cycle thread never takes it.
-    writer: parking_lot::Mutex<()>,
+    /// Serialises the copy-modify-store and holds the closed state, so only
+    /// [`Self::close`], inside this section, can close the list and every
+    /// add reads it in the section it publishes in. A cycle thread never
+    /// takes it.
+    writer: parking_lot::Mutex<bool>,
 }
+
+/// A [`SubscriberList`] add refused because [`SubscriberList::close`] ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Closed;
 
 /// One version of a [`SubscriberList`]'s map.
 ///
@@ -1390,7 +1439,7 @@ impl<T> Default for SubscriberList<T> {
                 entries: Vec::new(),
             })),
             count: AtomicUsize::new(0),
-            writer: parking_lot::Mutex::new(()),
+            writer: parking_lot::Mutex::new(false),
         }
     }
 }
@@ -1417,28 +1466,35 @@ impl<T> SubscriberList<T> {
     /// and queued inside one scan-lock hold (C `db_post_single_event`'s
     /// `dbScanLock`).
     ///
-    /// The seed runs once `sub` is published and the writer mutex released, so
-    /// a racing change is delivered at most twice and never lost. C seeds
-    /// before the enable (`camessage.c:1907`, `:1913`) and can lose it.
+    /// The seed runs once `sub` is published and the writer mutex released.
+    /// The publish alone orders nothing: the seed must read and queue under
+    /// the hold a change takes, or a change between its read and its queue
+    /// lands first and the seed's older value arrives last. C seeds before the
+    /// enable (`camessage.c:1907`, `:1913`) and can lose a change.
+    ///
+    /// For an owner whose list is live for every add; one that can close it
+    /// adds with [`Self::try_add`], which refuses as [`Closed`].
     pub fn add<R>(&self, field: u16, sub: Arc<T>, seed: impl FnOnce() -> R) -> R {
-        match self.try_add(field, sub, |_| Ok::<(), std::convert::Infallible>(()), seed) {
-            Ok(r) => r,
-        }
+        self.try_add(field, sub, |_| Ok::<(), Closed>(()), seed)
+            .expect("SubscriberList::add on a closed list")
     }
 
     /// [`Self::add`] behind `check`, which runs under the writer mutex on the
-    /// current map: the owner's refusals (a destroyed PV, the monitor cap)
-    /// are decided against the same writer section that would publish, so a
-    /// racing [`Self::clear_with`] cannot slip between them. A refusal
-    /// publishes nothing and runs no seed.
-    pub fn try_add<R, E>(
+    /// current map after the closed test: the owner's own refusal (the
+    /// monitor cap) is decided in the same writer section that would
+    /// publish. A refusal publishes nothing, runs no seed, and drops `sub`
+    /// after the release.
+    pub fn try_add<R, E: From<Closed>>(
         &self,
         field: u16,
         sub: Arc<T>,
         check: impl FnOnce(&SubscriberMap<T>) -> Result<(), E>,
         seed: impl FnOnce() -> R,
     ) -> Result<R, E> {
-        let _w = self.writer.lock();
+        let w = self.writer.lock();
+        if *w {
+            return Err(Closed.into());
+        }
         let cur = self.map.load();
         check(&cur)?;
         let at = cur.entries.partition_point(|(f, _)| *f <= field);
@@ -1448,25 +1504,32 @@ impl<T> SubscriberList<T> {
         entries.extend_from_slice(&cur.entries[at..]);
         drop(cur);
         let freed = self.publish(entries, 1, 0);
-        drop(_w);
+        drop(w);
         drop(freed);
         Ok(seed())
     }
 
-    /// Run `mark` and remove every monitor in one writer section — the
-    /// owner's destroy: with `mark` setting the flag a [`Self::try_add`]
-    /// check refuses on, no monitor is added after the clear. The removed
-    /// monitors are returned, to drop once every lock is released.
-    pub fn clear_with<R>(&self, mark: impl FnOnce() -> R) -> (R, Vec<Arc<T>>) {
-        let w = self.writer.lock();
-        let marked = mark();
+    /// Close the list: remove every monitor and refuse every later add, in
+    /// one writer section. The closing call gets the removed monitors, to
+    /// drop once every lock is released; a later call gets `None`.
+    pub fn close(&self) -> Option<Vec<Arc<T>>> {
+        let mut w = self.writer.lock();
+        if *w {
+            return None;
+        }
+        *w = true;
         let cur = self.map.load();
         let gone: Vec<Arc<T>> = cur.entries.iter().map(|(_, s)| s.clone()).collect();
         drop(cur);
         let freed = (!gone.is_empty()).then(|| self.publish(Vec::new(), 0, gone.len()));
         drop(w);
         drop(freed);
-        (marked, gone)
+        Some(gone)
+    }
+
+    /// Whether [`Self::close`] has run.
+    pub fn is_closed(&self) -> bool {
+        *self.writer.lock()
     }
 
     /// Remove every monitor `keep` refuses, returning them so their drops run
@@ -1781,129 +1844,124 @@ mod subscriber_list_tests {
         assert_eq!(*LOCKED_AT_DROP.lock().unwrap(), [false, false]);
     }
 
-    /// An owner's PV: `destroyed` is set only by `clear_with`, and an add is
-    /// refused once it is.
-    #[derive(Default)]
-    struct Owner {
-        destroyed: AtomicBool,
-        list: SubscriberList<u32>,
-    }
-
-    impl Owner {
-        fn add(&self, id: u32) -> Result<(), &'static str> {
-            self.list.try_add(
-                0,
-                Arc::new(id),
-                |_| match self.destroyed.load(Ordering::Acquire) {
-                    true => Err("destroyed"),
-                    false => Ok(()),
-                },
-                || (),
-            )
-        }
-
-        fn destroy(&self) -> Vec<Arc<u32>> {
-            self.list
-                .clear_with(|| self.destroyed.store(true, Ordering::Release))
-                .1
-        }
-    }
-
     #[test]
-    fn try_add_after_the_destroy_is_refused_and_publishes_nothing() {
-        let pv = Owner::default();
-        assert!(pv.destroy().is_empty());
+    fn an_add_after_close_is_refused_and_publishes_nothing() {
+        let list = SubscriberList::<u32>::default();
+        assert_eq!(list.close().map(|g| g.len()), Some(0));
+        assert!(list.is_closed());
+        assert!(list.close().is_none(), "only the first close closes");
         MIDPOINTS.with(|m| m.take());
         let mut seeded = false;
-        let got = pv.list.try_add(
+        let added = list.try_add(0, Arc::new(1), |_| Ok::<(), Closed>(()), || seeded = true);
+        assert_eq!(added, Err(Closed));
+        // The owner's check is not consulted: the list refuses first.
+        let checked = list.try_add(
             0,
-            Arc::new(1),
-            |_| Err::<(), _>(pv.destroyed.load(Ordering::Acquire)),
-            || seeded = true,
+            Arc::new(2),
+            |_| -> Result<(), Closed> { panic!() },
+            || (),
         );
-        assert_eq!(got, Err(true));
+        assert_eq!(checked, Err(Closed));
         assert!(!seeded, "a refused add ran its seed");
         assert!(
             MIDPOINTS.with(|m| m.take()).is_empty(),
             "a refused add stored"
         );
-        assert!(pv.list.is_empty() && pv.list.load().is_empty());
+        assert!(list.is_empty() && list.load().is_empty());
     }
 
     #[test]
-    fn try_add_before_the_destroy_is_removed_by_it() {
-        let pv = Owner::default();
-        assert_eq!(pv.add(1), Ok(()));
-        let gone = pv.destroy();
+    fn an_add_before_close_is_in_what_close_returns() {
+        let list = SubscriberList::<u32>::default();
+        list.add(0, Arc::new(1), || ());
+        let gone = list.close().expect("the first close");
         assert_eq!(gone.iter().map(|g| **g).collect::<Vec<_>>(), [1]);
-        assert!(pv.list.is_empty() && pv.list.load().is_empty());
-        assert_eq!(pv.add(2), Err("destroyed"));
+        assert!(list.is_empty() && list.load().is_empty());
     }
 
-    /// A destroy started while an add's check runs waits for the add's
-    /// publish and removes it: destroyed never has a subscriber. A check
-    /// outside the writer section lets the destroy finish inside the window
-    /// and the add publish after it.
+    /// A close started while an add is in its writer section waits for the
+    /// publish and returns the add: no live entry survives a close.
     #[test]
-    fn a_destroy_inside_try_adds_check_removes_the_add() {
-        let pv = Owner::default();
+    fn a_close_racing_an_add_in_flight_returns_the_add() {
+        let list = SubscriberList::<u32>::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let gone = thread::scope(|s| {
-            let mut destroyer = None;
-            let added = pv.list.try_add(
+            let mut closer = None;
+            let added = list.try_add(
                 0,
                 Arc::new(7),
-                |_| {
-                    let pv = &pv;
+                |_| -> Result<(), Closed> {
+                    let list = &list;
                     let done_tx = done_tx.clone();
-                    destroyer = Some(s.spawn(move || {
-                        let gone = pv.destroy();
+                    closer = Some(s.spawn(move || {
+                        let gone = list.close();
                         done_tx.send(()).unwrap();
                         gone
                     }));
                     let raced = done_rx
                         .recv_timeout(std::time::Duration::from_millis(200))
                         .is_ok();
-                    assert!(!raced, "the destroy finished inside the add's check");
-                    match pv.destroyed.load(Ordering::Acquire) {
-                        true => Err(()),
-                        false => Ok(()),
-                    }
+                    assert!(!raced, "the close finished inside the add's section");
+                    Ok(())
                 },
                 || (),
             );
             assert_eq!(added, Ok(()));
-            destroyer.unwrap().join().unwrap()
+            closer.unwrap().join().unwrap().expect("the first close")
         });
         assert_eq!(gone.iter().map(|g| **g).collect::<Vec<_>>(), [7]);
-        assert!(pv.list.load().is_empty(), "destroyed with a subscriber");
+        assert!(list.load().is_empty(), "a live entry after close");
     }
 
-    /// The destroy's removed monitors reach the caller; neither their drop
-    /// nor the freed map's runs under the writer mutex.
+    /// Unordered: every add is either refused or in close's set.
     #[test]
-    fn clear_with_drops_after_the_writer_mutex_is_released() {
-        struct Chk;
+    fn a_close_racing_adds_leaves_none_live() {
+        for _ in 0..300 {
+            let list = SubscriberList::<u32>::default();
+            let (added, gone) = thread::scope(|s| {
+                let adder =
+                    s.spawn(|| list.try_add(0, Arc::new(9), |_| Ok::<(), Closed>(()), || ()));
+                let gone = list.close().expect("the first close");
+                (adder.join().unwrap(), gone)
+            });
+            assert!(list.load().is_empty(), "a live entry after close");
+            assert_eq!(added.is_ok(), gone.len() == 1, "{added:?} {gone:?}");
+        }
+    }
+
+    /// The close's removed monitors reach the caller alive, and the map the
+    /// close frees — the last owner of a monitor an earlier retain removed —
+    /// drops after the writer mutex is released.
+    #[test]
+    fn close_drops_after_the_writer_mutex_is_released() {
+        struct Chk(u16);
         static LIST: std::sync::OnceLock<&'static SubscriberList<Chk>> = std::sync::OnceLock::new();
-        static LOCKED_AT_DROP: StdMutex<Vec<bool>> = StdMutex::new(Vec::new());
+        static DROPS: StdMutex<Vec<(u16, bool)>> = StdMutex::new(Vec::new());
         impl Drop for Chk {
             fn drop(&mut self) {
                 if let Some(list) = LIST.get() {
-                    LOCKED_AT_DROP.lock().unwrap().push(list.writer.is_locked());
+                    DROPS
+                        .lock()
+                        .unwrap()
+                        .push((self.0, list.writer.is_locked()));
                 }
             }
         }
         let list = *LIST.get_or_init(|| Box::leak(Box::default()));
-        list.add(0, Arc::new(Chk), || ());
-        list.add(1, Arc::new(Chk), || ());
-        let ((), gone) = list.clear_with(|| assert!(list.writer.is_locked()));
-        assert_eq!(gone.len(), 2);
+        list.add(0, Arc::new(Chk(1)), || ());
+        list.add(0, Arc::new(Chk(2)), || ());
+        // 1's last owner is now the map this retain displaced.
+        drop(list.retain(|_, c| c.0 != 1));
+        assert!(DROPS.lock().unwrap().is_empty());
+        let gone = list.close().expect("the first close");
+        assert_eq!(*DROPS.lock().unwrap(), [(1, false)], "close freed the map");
+        assert_eq!(gone.iter().map(|g| g.0).collect::<Vec<_>>(), [2]);
         drop(gone);
-        // The cleared map still holds both; the next store frees it.
-        list.add(0, Arc::new(Chk), || ());
-        drop(list.clear_with(|| ()));
-        list.add(0, Arc::new(Chk), || ());
-        assert_eq!(*LOCKED_AT_DROP.lock().unwrap(), [false, false, false]);
+        assert_eq!(
+            *DROPS.lock().unwrap(),
+            [(1, false)],
+            "2 is still in a retired map"
+        );
     }
 
     /// CANCEL / circuit close: the removed monitor's drop is its end of
@@ -2098,6 +2156,38 @@ mod tests {
     /// entries stay until the drain drops them through the accounting every
     /// removal uses (`event_remove`, `dbEvent.c:542-558`), and the slot and
     /// its quota come back only then (`dbEvent.c:623`, `:999-1002`).
+    /// A sink closed while something still holds it — a retired
+    /// `SubscriberList` map — refuses every later post, and its reader ends
+    /// after what was queued before the close.
+    #[test]
+    fn a_closed_sink_refuses_posts_and_ends_after_its_queue() {
+        let user = EventUser::new();
+        let (sink, mut reader) = attach(&user, 1, LogKind::Val);
+        assert!(matches!(sink.post(ev(1)), PostOutcome::Appended { .. }));
+        sink.close();
+        assert_eq!(sink.post(ev(2)), PostOutcome::Closed);
+        assert!(
+            reader.try_recv().is_ok(),
+            "the entry queued before the close"
+        );
+        assert!(matches!(reader.try_recv(), Err(TryRecvError::Disconnected)));
+        drop(sink);
+        assert!(matches!(reader.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    /// A closed producer with its reader still attached reads closed, so the
+    /// post walk's `reap_closed` drops the row rather than keep posting into
+    /// a refused slot.
+    #[epics_macros_rs::epics_test]
+    async fn a_producer_closed_sink_reads_closed_while_its_reader_lives() {
+        let user = EventUser::new();
+        let (sink, _reader) = attach(&user, 1, LogKind::Val);
+        assert!(!sink.is_closed());
+        sink.close();
+        assert!(sink.is_closed());
+        assert_eq!(sink.post(ev(1)), PostOutcome::Closed);
+    }
+
     #[epics_macros_rs::epics_test]
     async fn detach_with_queued_entries_keeps_the_duplicate_count_symmetric() {
         let user = EventUser::new();

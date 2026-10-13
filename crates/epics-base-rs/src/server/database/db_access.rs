@@ -461,8 +461,8 @@ impl DbSubscription {
         let reader = {
             let mut instance = rec.write();
             let reader = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
-            for filter in pre.iter() {
-                instance.attach_filter_to_last_subscriber(&field, filter.clone());
+            for filter in pre {
+                instance.attach_filter_to_last_subscriber(&field, filter);
             }
             reader
         };
@@ -933,8 +933,8 @@ impl<D: EventDelivery> DbEventSource<D> {
                 mask,
                 &context,
             )?;
-            for filter in pre.iter() {
-                instance.attach_filter_to_last_subscriber(&field, filter.clone());
+            for filter in pre {
+                instance.attach_filter_to_last_subscriber(&field, filter);
             }
             instance.set_subscriber_active(reader.id(), false);
             reader

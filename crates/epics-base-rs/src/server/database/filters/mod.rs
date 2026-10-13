@@ -133,9 +133,33 @@ pub trait SubscriptionFilter: Send + Sync + 'static {
 
 /// Ordered chain of filters owned by one subscriber. The default is
 /// an empty chain — every event passes unchanged.
+///
+/// Only an owned chain hands out its `Arc`s ([`Clone`], [`Self::split`],
+/// `into_iter`), for the server thread building a monitor; a borrow yields
+/// `&dyn SubscriptionFilter`, so a cycle thread reading a published monitor
+/// never holds a filter it could drop last.
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use epics_base_rs::server::database::filters::{FilterChain, SubscriptionFilter};
+/// fn owned(chain: &FilterChain) -> Arc<dyn SubscriptionFilter> {
+///     chain.iter().next().unwrap().clone()
+/// }
+/// ```
 #[derive(Default, Clone)]
 pub struct FilterChain {
     filters: Vec<Arc<dyn SubscriptionFilter>>,
+}
+
+/// The filters in registration order, owned: how a monitor being built takes
+/// its chain.
+impl IntoIterator for FilterChain {
+    type Item = Arc<dyn SubscriptionFilter>;
+    type IntoIter = std::vec::IntoIter<Arc<dyn SubscriptionFilter>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.filters.into_iter()
+    }
 }
 
 impl FilterChain {
@@ -201,8 +225,8 @@ impl FilterChain {
     }
 
     /// Iterate over the filters in registration order.
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn SubscriptionFilter>> {
-        self.filters.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &dyn SubscriptionFilter> {
+        self.filters.iter().map(|f| &**f)
     }
 
     /// Apply the chain to a single value wrapped in a synthetic

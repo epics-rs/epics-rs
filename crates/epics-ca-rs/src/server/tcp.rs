@@ -5644,9 +5644,16 @@ pub(crate) async fn register_subscription(
     // read access is denied.
     let rx = match &target {
         ChannelTarget::SimplePv(pv) => {
-            let Ok(rx) =
-                pv.add_subscriber_on(&state.event_user, sub_id, native_type, mask, &context)
-            else {
+            // The same chain a record-field monitor runs, sourced from the
+            // single `ChannelEntry::filter_chain` owner.
+            let Ok(rx) = pv.add_monitor_on(
+                &state.event_user,
+                sub_id,
+                native_type,
+                mask,
+                &context,
+                pre_chain,
+            ) else {
                 return Err(refuse_install(
                     writer,
                     hdr,
@@ -5655,10 +5662,6 @@ pub(crate) async fn register_subscription(
                     InstallFailure::DbAddEvent,
                 ));
             };
-            // The same chain a record-field monitor runs, sourced from the
-            // single `ChannelEntry::filter_chain` owner.
-            pv.attach_filters_to_subscriber(rx.id(), pre_chain);
-            pv.post_single_event(rx.id(), Arc::new(pv.snapshot()));
             rx
         }
         ChannelTarget::RecordField { record, field } => {
@@ -5681,8 +5684,8 @@ pub(crate) async fn register_subscription(
                         &context,
                     )
                     .inspect(|rx| {
-                        for filt in pre_chain.iter() {
-                            instance.attach_filter_to_last_subscriber(field, filt.clone());
+                        for filt in pre_chain {
+                            instance.attach_filter_to_last_subscriber(field, filt);
                         }
                         if let Some(snap) = snap {
                             instance.post_single_event(field, rx.id(), snap);

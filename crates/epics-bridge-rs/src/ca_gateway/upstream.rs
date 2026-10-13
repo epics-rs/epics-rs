@@ -3107,7 +3107,7 @@ ASG(NewGroup) {
              which is what retires them with CA_PROTO_SERVER_DISCONN"
         );
         assert!(
-            shadow.subscribers.lock().is_empty(),
+            shadow.subscriber_count() == 0,
             "the monitor stops rather than receiving one more frame"
         );
 

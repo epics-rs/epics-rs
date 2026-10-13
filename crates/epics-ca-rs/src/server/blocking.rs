@@ -4590,7 +4590,7 @@ mod tests {
         let pv = simple_pv(&db, "BLK:LEAK");
         let mut cleared = false;
         for _ in 0..200 {
-            if pv.subscribers.lock().is_empty() {
+            if pv.subscriber_count() == 0 {
                 cleared = true;
                 break;
             }
@@ -5371,7 +5371,7 @@ mod tests {
         // the channel, so nothing is left to post to.
         let pv = simple_pv(&db, "BLK:CLR");
         assert_eq!(
-            pv.subscribers.lock().len(),
+            pv.subscriber_count(),
             0,
             "CLEAR_CHANNEL must cancel the channel's monitors (C `db_cancel_event` \
              per pevext, `camessage.c:1899`)"

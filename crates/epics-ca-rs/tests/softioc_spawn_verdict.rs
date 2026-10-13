@@ -32,6 +32,16 @@ cas WARNING: reachable with UDP unicast (a host's IP in EPICS_CA_ADDR_LIST)
 iocRun: All initialization complete
 ";
 
+/// C's stderr when only the UDP port was held, by a socket without
+/// SO_REUSEPORT: measured, verbatim up to the stack dump `cantProceed` prints
+/// before it suspends `_main_` for good.
+const UDP_HELD: &str = "\
+Starting iocInit
+Warning: Duplicate EPICS CA Address list entry \"127.0.0.1:5165\" discarded
+CAS: No TCP server started
+CRITICAL ERROR Thread _main_ (0x600456b6e4f0) can't proceed, suspending.
+";
+
 /// C's stderr when the database will not load, measured on the same binary
 /// (`softIoc -S -d` on a record of an unknown type). The colour escapes C
 /// wraps each `ERROR:` in are elided; nothing else is. The point is the
@@ -66,6 +76,13 @@ fn a_fallback_outranks_the_ready_line_c_prints_in_both_cases() {
     assert!(PORT_HELD.contains("iocRun: All initialization complete"));
     assert_eq!(softioc_verdict(PORT_HELD), SoftIocVerdict::PortTaken);
     assert_eq!(softioc_verdict(CLEAN_BOOT), SoftIocVerdict::Up);
+}
+
+/// A held UDP port never reaches `iocRun` and C names no port: the
+/// `cantProceed` line alone is the steal.
+#[test]
+fn a_held_udp_port_is_a_stolen_port() {
+    assert_eq!(softioc_verdict(UDP_HELD), SoftIocVerdict::PortTaken);
 }
 
 /// Everything else is `Silent`, which the spawn turns into a panic rather than

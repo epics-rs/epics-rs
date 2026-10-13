@@ -109,24 +109,6 @@ fn a_read_only_connect_processes_the_cp_holder_as_softioc_does() {
          RULE(1, READ) { CALC(\"B=0\") } RULE(1, WRITE) { CALC(\"A=1\") } }\n\
          ASG(OPEN) { RULE(1, WRITE) }\n",
     );
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db = dir.path().join("holder.db");
-    std::fs::write(&db, LinkHolder::DB).expect("write the holder db");
-
-    let mut c_cmd = std::process::Command::new("softIoc");
-    c_cmd.env(
-        "EPICS_CAS_SERVER_PORT",
-        named_port::free_for_tcp_and_udp().to_string(),
-    );
-    let mut rs_cmd = std::process::Command::new(env!("CARGO_BIN_EXE_softioc-rs"));
-    rs_cmd.args(["--port", "0"]);
-    let mut holders = [
-        ("softIoc", LinkHolder::spawn(c_cmd, &db, server.udp_port)),
-        (
-            "softioc-rs",
-            LinkHolder::spawn(rs_cmd, &db, server.udp_port),
-        ),
-    ];
     let put = |pv, value| {
         assert!(
             c_ca_tools::run_caput(&server.ca_addr_list(), server.udp_port, pv, value),
@@ -134,6 +116,54 @@ fn a_read_only_connect_processes_the_cp_holder_as_softioc_does() {
             server.console()
         );
     };
+    // asCa's eventCallback updates the ACF inputs outside asLock, so an
+    // initial event landing inside asComputeAllAsg has its inpChanged bit
+    // cleared (asLibRoutines.c:966, :979) and READ stays denied until the
+    // input posts again. Post each input once after boot, when nothing
+    // else evaluates the rules, and hold the holders until UP is readable.
+    put("GW", "0");
+    put("GR", "0");
+    let readable = || {
+        c_ca_tools::run_caget(&server.ca_addr_list(), server.udp_port, "UP")
+            .is_some_and(|v| !v.contains("no read access"))
+    };
+    let end = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while !readable() && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        readable(),
+        "softIoc grants READ on UP:\n{}",
+        server.console()
+    );
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("holder.db");
+    std::fs::write(&db, LinkHolder::DB).expect("write the holder db");
+
+    // The holder's own RSRV takes a candidate number too, so a steal of it
+    // is retried as the server's is, instead of suspending its iocInit.
+    let c_holder = named_port::on_a_named_port(|port| {
+        let mut cmd = std::process::Command::new("softIoc");
+        cmd.env("EPICS_CAS_SERVER_PORT", port.to_string());
+        let h = LinkHolder::spawn(cmd, &db, server.udp_port);
+        let settled = h.err.wait_for(fact_budget::FACT_BUDGET, |t| {
+            c_ca_tools::softioc_verdict(t) != c_ca_tools::SoftIocVerdict::Silent
+        });
+        assert!(settled, "the C link-holder did not boot:\n{}", h.console());
+        match c_ca_tools::softioc_verdict(&h.err.text()) {
+            c_ca_tools::SoftIocVerdict::Up => Some(h),
+            _ => None,
+        }
+    });
+    let mut rs_cmd = std::process::Command::new(env!("CARGO_BIN_EXE_softioc-rs"));
+    rs_cmd.args(["--port", "0"]);
+    let mut holders = [
+        ("softIoc", c_holder),
+        (
+            "softioc-rs",
+            LinkHolder::spawn(rs_cmd, &db, server.udp_port),
+        ),
+    ];
 
     // Connected read-only with the first value, then one more value: the
     // count is the connect's processings plus one.

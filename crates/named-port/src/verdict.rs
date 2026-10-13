@@ -21,6 +21,12 @@ pub const IOC_IS_UP: &str = "iocRun: All initialization complete";
 /// the discriminator either.
 pub const PORT_WAS_TAKEN: &str = "cas WARNING: Configured TCP port was unavailable.";
 
+/// C's report when the UDP port alone was taken. `tryBind` returns on
+/// EADDRINUSE without a word (caservertask.c:131-145), so this `cantProceed`
+/// line (:751-752) is all the console says. Any other bind error prints a
+/// `CAS: ... bind` line first and suspends before reaching it.
+pub const NO_TCP_SERVER: &str = "CAS: No TCP server started";
+
 /// What a spawned `softIoc`'s stderr says about the port it was given.
 ///
 /// A separate function from the spawner so the verdict can be pinned
@@ -31,7 +37,8 @@ pub enum SoftIocVerdict {
     /// [`IOC_IS_UP`] — serving on the number it was given.
     Up,
     /// [`PORT_WAS_TAKEN`] — RSRV bound a different TCP port than the one asked
-    /// for, so the candidate is spent and the caller retries.
+    /// for — or [`NO_TCP_SERVER`] with no bind error before it — so the
+    /// candidate is spent and the caller retries.
     PortTaken,
     /// Neither line. **Not** a retry: a different port fixes none of the ways
     /// an IOC can be broken, and retrying here would turn a regression into
@@ -44,7 +51,11 @@ pub enum SoftIocVerdict {
 /// assigned TCP port (`caservertask.c:582-590` @R7.0.10). An IOC serving on
 /// a number the test did not name is not the subject the test asked for.
 pub fn softioc_verdict(console: &str) -> SoftIocVerdict {
-    if console.contains(PORT_WAS_TAKEN) {
+    let udp_taken = console.contains(NO_TCP_SERVER)
+        && !console
+            .lines()
+            .any(|l| l.starts_with("CAS: ") && l.contains(" bind "));
+    if console.contains(PORT_WAS_TAKEN) || udp_taken {
         SoftIocVerdict::PortTaken
     } else if console.contains(IOC_IS_UP) {
         SoftIocVerdict::Up

@@ -316,3 +316,22 @@ pub fn run_caput(addr_list: &str, server_port: u16, pv: &str, value: &str) -> bo
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A UDP socket without SO_REUSEPORT on the candidate takes it from
+    /// `softIoc` while leaving TCP free: the spawn spends the candidate
+    /// instead of waiting out the budget on a suspended IOC.
+    #[test]
+    fn a_held_udp_port_spends_the_candidate() {
+        if !require_tool("softIoc") {
+            return;
+        }
+        let port = named_port::free_for_tcp_and_udp();
+        let _held = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("hold the UDP port");
+        let db = db_file("record(ai, \"T:AI\") {}\n");
+        assert!(softioc_on(&db, None, port).is_none());
+    }
+}

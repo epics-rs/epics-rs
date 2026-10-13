@@ -194,11 +194,12 @@ impl FlowCtrl {
     }
 
     /// Park `cx` as the consumer. Taken under the polled queue's lock, so a
-    /// post landing after the consumer's check finds it parked.
-    fn park(&self, cx: &std::task::Context<'_>) {
+    /// post landing after the consumer's check finds it parked. The waker it
+    /// displaces goes to `retired`: the last waker of a task drops its future.
+    fn park(&self, cx: &std::task::Context<'_>, retired: &mut Retired) {
         let mut parked = self.ppendsem();
         if !parked.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-            *parked = Some(cx.waker().clone());
+            retired.waker = parked.replace(cx.waker().clone());
         }
     }
 }
@@ -527,7 +528,7 @@ impl QueInner {
     /// (`dbEvent.c:542-558`), and `db_cancel_event`'s deferred free once a
     /// cancelled subscription's last entry has left (`dbEvent.c:999-1002`).
     /// The ONLY place `npend` falls. `true` when the entry is to be delivered.
-    fn release(&mut self, id: AttachId) -> bool {
+    fn release(&mut self, id: AttachId, retired: &mut Retired) -> bool {
         let Some(sub) = self.sub_mut(id) else {
             debug_assert!(false, "a slot is held while it has entries");
             return false;
@@ -539,27 +540,32 @@ impl QueInner {
             self.n_duplicates -= 1;
         }
         if gone && drained {
-            self.free_slot(id);
+            self.free_slot(id, retired);
         }
         !gone
     }
 
-    fn free_slot(&mut self, id: AttachId) {
-        self.subs[usize::from(id.slot())] = None;
+    /// Detach `id`'s subscription into `retired`. Its context can own the
+    /// last reference to a PV whose subscribers close their sinks on this
+    /// queue, so it is dropped after the lock, never here (C frees the
+    /// `evSubscrip` under `LOCKEVQUE`, but it runs no destructor).
+    fn free_slot(&mut self, id: AttachId, retired: &mut Retired) {
+        let sub = self.subs[usize::from(id.slot())].take();
+        retired.subs.extend(sub);
         self.free.push(id.slot());
         self.quota -= EVENT_ENTRIES;
     }
 
     /// Take the ring's head entry, whoever it belongs to. The log is moved
     /// out; nothing is freed here.
-    fn pop(&mut self) -> Option<(AttachId, PostLog, bool)> {
+    fn pop(&mut self, retired: &mut Retired) -> Option<(AttachId, PostLog, bool)> {
         if self.used == 0 {
             return None;
         }
         let Entry { id, log } = self.ring[self.getix].take().expect("occupied");
         self.getix = self.ix(1);
         self.used -= 1;
-        let live = self.release(id);
+        let live = self.release(id, retired);
         // C's drain loop ends at `EVENTQEMPTY`.
         self.draining = self.used > 0;
         Some((id, log, live))
@@ -568,12 +574,12 @@ impl QueInner {
     /// C `event_read`'s `evque[getix]`: the ring's oldest live entry, if the
     /// EVENTS_OFF gate lets it go; a cancelled subscription's entries are
     /// dropped on the way, as C frees them (`dbEvent.c:969-1002`).
-    fn take_oldest(&mut self, flow_ctrl_on: bool) -> Option<CircuitEvent> {
+    fn take_oldest(&mut self, flow_ctrl_on: bool, retired: &mut Retired) -> Option<CircuitEvent> {
         if self.used == 0 || !self.may_drain(flow_ctrl_on) {
             return None;
         }
         self.draining = true;
-        while let Some((id, log, live)) = self.pop() {
+        while let Some((id, log, live)) = self.pop(retired) {
             if !live {
                 continue;
             }
@@ -595,13 +601,13 @@ impl QueInner {
     /// subscription's entries at the head go first, as the circuit consumer
     /// would drop them; an entry further back is moved to the head, the
     /// entries ahead of it one place down.
-    fn take_for(&mut self, id: AttachId) -> Option<PostLog> {
+    fn take_for(&mut self, id: AttachId, retired: &mut Retired) -> Option<PostLog> {
         while self.used > 0 {
             let head = self.ring[self.getix].as_ref().expect("occupied").id;
             if self.sub(head).is_some_and(|s| !s.reader_gone()) {
                 break;
             }
-            self.pop();
+            self.pop(retired);
         }
         let k =
             (0..self.used).find(|&k| self.ring[self.ix(k)].as_ref().is_some_and(|e| e.id == id))?;
@@ -617,7 +623,7 @@ impl QueInner {
                 }
             }
         }
-        let (taken, log, live) = self.pop()?;
+        let (taken, log, live) = self.pop(retired)?;
         debug_assert!(taken == id && live);
         Some(log)
     }
@@ -677,6 +683,42 @@ pub struct EvQue {
     inner: Mutex<QueInner>,
 }
 
+/// What a holder of a queue's lock displaced: subscriptions freed from their
+/// slots and a parked waker replaced. Either can own user state whose drop
+/// takes this lock again, so it is dropped only by [`QueGuard`], after the
+/// lock. No constructor outside [`EvQue::lock_retiring`], so nothing else can hold one.
+struct Retired {
+    subs: Vec<SubQ>,
+    waker: Option<std::task::Waker>,
+}
+
+/// [`EvQue`]'s lock, carrying the [`Retired`] its holder displaced.
+struct QueGuard<'a> {
+    // Fields drop in declaration order: the lock is released before
+    // `retired` drops.
+    q: std::sync::MutexGuard<'a, QueInner>,
+    retired: Retired,
+}
+
+impl QueGuard<'_> {
+    fn parts(&mut self) -> (&mut QueInner, &mut Retired) {
+        (&mut self.q, &mut self.retired)
+    }
+}
+
+impl std::ops::Deref for QueGuard<'_> {
+    type Target = QueInner;
+    fn deref(&self) -> &QueInner {
+        &self.q
+    }
+}
+
+impl std::ops::DerefMut for QueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut QueInner {
+        &mut self.q
+    }
+}
+
 impl EvQue {
     fn new(flow: Arc<FlowCtrl>) -> Self {
         let replace_threshold = events_per_que();
@@ -707,6 +749,18 @@ impl EvQue {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`Self::lock`] for a holder that may free a slot or displace a parked
+    /// waker; the post path takes the plain lock and pays nothing for it.
+    fn lock_retiring(&self) -> QueGuard<'_> {
+        QueGuard {
+            q: self.lock(),
+            retired: Retired {
+                subs: Vec::new(),
+                waker: None,
+            },
+        }
     }
 
     /// C `epicsEventSignal(ppendsem)`: wake the consumer parked on this
@@ -824,8 +878,9 @@ impl EvQue {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<MonitorEvent>> {
         use std::task::Poll;
-        let mut q = self.lock();
+        let mut guard = self.lock_retiring();
         let flow_on = self.flow.is_on();
+        let (q, retired) = guard.parts();
         let Some(sub) = q.sub(id) else {
             return Poll::Ready(None);
         };
@@ -834,14 +889,14 @@ impl EvQue {
         if has_entry {
             if q.may_drain(flow_on) {
                 q.draining = true;
-                return Poll::Ready(q.take_for(id).map(MonitorEvent::of_log));
+                return Poll::Ready(q.take_for(id, retired).map(MonitorEvent::of_log));
             }
             // Suspended by EVENTS_OFF: park, C's event_read returns without
             // delivering.
         } else if producer_gone {
             return Poll::Ready(None);
         }
-        self.flow.park(cx);
+        self.flow.park(cx, retired);
         Poll::Pending
     }
 
@@ -850,19 +905,21 @@ impl EvQue {
     /// park `cx` in the circuit's `ppendsem` slot.
     fn poll_oldest(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<CircuitEvent> {
         use std::task::Poll;
-        let mut q = self.lock();
+        let mut guard = self.lock_retiring();
         let flow_on = self.flow.is_on();
-        if let Some(step) = q.take_oldest(flow_on).or_else(|| q.take_ended()) {
+        let (q, retired) = guard.parts();
+        if let Some(step) = q.take_oldest(flow_on, retired).or_else(|| q.take_ended()) {
             return Poll::Ready(step);
         }
-        self.flow.park(cx);
+        self.flow.park(cx, retired);
         Poll::Pending
     }
 
     /// Non-blocking [`Self::next`]: same gate, no suspension.
     fn try_next(&self, id: AttachId) -> Result<MonitorEvent, TryRecvError> {
-        let mut q = self.lock();
+        let mut guard = self.lock_retiring();
         let flow_on = self.flow.is_on();
+        let (q, retired) = guard.parts();
         let Some(sub) = q.sub(id) else {
             return Err(TryRecvError::Disconnected);
         };
@@ -878,7 +935,7 @@ impl EvQue {
             return Err(TryRecvError::Empty);
         }
         q.draining = true;
-        q.take_for(id)
+        q.take_for(id, retired)
             .map(MonitorEvent::of_log)
             .ok_or(TryRecvError::Empty)
     }
@@ -908,13 +965,14 @@ impl EvQue {
     /// slot keeps its quota until the last has gone.
     fn close_reader(&self, id: AttachId) {
         {
-            let mut q = self.lock();
+            let mut guard = self.lock_retiring();
+            let (q, retired) = guard.parts();
             let Some(sub) = q.sub_mut(id) else {
                 return;
             };
             sub.gone |= SubQ::READER_GONE;
             if sub.npend == 0 {
-                q.free_slot(id);
+                q.free_slot(id, retired);
             }
         }
         self.wake_readers();
@@ -2608,6 +2666,100 @@ mod tests {
         assert_eq!(reader_a.queue().report(reader_a.id()).ring_space, size);
     }
 
+    /// Run `f` on its own thread; a deadlock fails the test instead of
+    /// hanging it.
+    fn finishes(f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("deadlocked: user state dropped under the EvQue lock");
+    }
+
+    /// A PV whose monitor context is its own last owner, and a second
+    /// monitor of it on the same queue whose sink closes when the PV drops.
+    fn pv_owned_by_its_slot(user: &EventUser) -> (EventReader, EventReader) {
+        use crate::server::pv::ProcessVariable;
+        use crate::types::DbFieldType;
+        let pv = Arc::new(ProcessVariable::new(
+            "EVQ:LAST".into(),
+            EpicsValue::Double(1.0),
+        ));
+        let mask = (EventMask::VALUE | EventMask::LOG).bits();
+        let ctx: DeliveryContext = Arc::new(pv.clone());
+        let owner = pv
+            .add_subscriber_on(user, 1, DbFieldType::Double, mask, &ctx)
+            .unwrap();
+        let other = pv
+            .add_subscriber_on(user, 2, DbFieldType::Double, mask, no_context())
+            .unwrap();
+        (owner, other)
+    }
+
+    /// The circuit consumer drops a cancelled monitor's last entry and frees
+    /// its slot, whose context held the last PV reference (`poll_oldest` ->
+    /// `pop` -> `release` -> `free_slot`).
+    #[test]
+    fn a_slot_freed_by_the_circuit_drops_its_context_after_the_lock() {
+        let user = EventUser::new();
+        let (owner, other) = pv_owned_by_its_slot(&user);
+        let pv = user.context(owner.id()).unwrap();
+        pv.downcast_ref::<Arc<crate::server::pv::ProcessVariable>>()
+            .unwrap()
+            .set(EpicsValue::Double(2.0));
+        drop(pv);
+        assert_eq!(owner.npend(), 1);
+        drop(owner);
+        finishes(move || {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            while user.poll_next(&mut cx).is_ready() {}
+            drop(other);
+        });
+    }
+
+    /// A monitor cancelled with nothing queued frees its slot at once
+    /// (`close_reader` -> `free_slot`).
+    #[test]
+    fn a_slot_freed_by_its_reader_drops_its_context_after_the_lock() {
+        let user = EventUser::new();
+        let (owner, other) = pv_owned_by_its_slot(&user);
+        assert_eq!(owner.npend(), 0);
+        finishes(move || {
+            drop(owner);
+            drop(other);
+            drop(user);
+        });
+    }
+
+    /// A parked waker displaced by the next park can be its task's last
+    /// reference, whose drop drops the task's readers.
+    #[test]
+    fn a_displaced_waker_drops_after_the_lock() {
+        struct HoldsReader(std::sync::Mutex<Option<EventReader>>);
+        impl std::task::Wake for HoldsReader {
+            fn wake(self: Arc<Self>) {
+                self.0.lock().unwrap().take();
+            }
+        }
+        let user = EventUser::new();
+        let (_sink, mut reader) = attach(&user, 1, LogKind::Val);
+        let (_held_sink, held) = attach(&user, 2, LogKind::Val);
+        let first =
+            std::task::Waker::from(Arc::new(HoldsReader(std::sync::Mutex::new(Some(held)))));
+        assert!(
+            reader
+                .poll_recv(&mut std::task::Context::from_waker(&first))
+                .is_pending()
+        );
+        drop(first);
+        finishes(move || {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(reader.poll_recv(&mut cx).is_pending());
+        });
+    }
+
     #[test]
     fn only_the_post_that_fills_an_empty_ring_wakes() {
         let user = EventUser::new();
@@ -2615,7 +2767,7 @@ mod tests {
         let (counter, waker) = count_waker();
         let cx = std::task::Context::from_waker(&waker);
         let flow = sink.que.flow.clone();
-        flow.park(&cx);
+        flow.park(&cx, &mut sink.que.lock_retiring().retired);
         sink.post(ev(1));
         assert_eq!(
             counter.0.load(Ordering::SeqCst),
@@ -2623,7 +2775,7 @@ mod tests {
             "empty ring: first post wakes"
         );
         for v in 2..10 {
-            flow.park(&cx);
+            flow.park(&cx, &mut sink.que.lock_retiring().retired);
             sink.post(ev(v));
         }
         assert_eq!(

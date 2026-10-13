@@ -829,7 +829,7 @@ impl MotorRecord {
         self.set_phase(MotionPhase::BacklashFinal);
         self.stat.mip = MipFlags::MOVE_BL;
         self.mark(m::MIP);
-        let frac = self.retry.frac;
+        let frac = f64::from(self.retry.frac);
         if self.use_relative_moves() {
             // C relative: relpos = (dval - drbv) * frac / mres
             let rel_distance = (self.pos.dval - self.pos.drbv) * frac;
@@ -848,7 +848,7 @@ impl MotorRecord {
             let position = pretarget + frac * (self.pos.dval - pretarget);
             // C 967: the FRAC-scaled commanded raw position is posted to
             // RVAL; 973 derives CDIR from the unscaled raw error.
-            self.pos.rval = (position / self.conv.mres).round() as i64;
+            self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
@@ -907,7 +907,7 @@ impl MotorRecord {
 
     /// Start jog backlash phase 2 (final approach at backlash velocity).
     fn start_jog_backlash_final(&mut self, effects: &mut ProcessEffects) {
-        let frac = self.retry.frac;
+        let frac = f64::from(self.retry.frac);
         self.stat.mip = MipFlags::JOG_BL2;
         self.mark(m::MIP);
         self.internal.backlash_pending = false;
@@ -932,7 +932,7 @@ impl MotorRecord {
             let position = pretarget + frac * (self.pos.dval - pretarget);
             // C 1016: the FRAC-scaled commanded raw position is posted to
             // RVAL; 1020 derives CDIR from the unscaled raw error.
-            self.pos.rval = (position / self.conv.mres).round() as i64;
+            self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,

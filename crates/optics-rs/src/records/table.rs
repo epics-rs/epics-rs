@@ -2893,7 +2893,7 @@ impl Record for TableRecord {
             "LEGU" => Some(EpicsValue::String(self.legu.clone())),
             "AEGU" => Some(EpicsValue::String(self.aegu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
-            "MMAP" => Some(EpicsValue::Long(self.mmap as i32)),
+            "MMAP" => Some(EpicsValue::ULong(self.mmap)),
             "GEOM" => Some(EpicsValue::Enum(self.geom as u16)),
             "TORAD" => Some(EpicsValue::Double(self.torad)),
             "AUNIT" => Some(EpicsValue::Enum(self.aunit as u16)),

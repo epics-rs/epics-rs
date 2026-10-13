@@ -187,7 +187,11 @@ impl MotorRecord {
         // negative count (raw -2.5 -> C -2, Rust .round() -> -3). The other raw
         // conversions in this file (rdif, rval, URIP rrbv) use C NINT
         // (motorRecord.cc) == Rust .round(), so they must stay .round().
-        self.pos.rmp = (status.position / self.conv.mres + 0.5).floor() as i64;
+        // RMP/REP/RVEL are a direct `(epicsInt32)floor(..)` there, so an
+        // out-of-range count is INT_MIN (x86), not a 64-bit truncation.
+        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32(
+            (status.position / self.conv.mres + 0.5).floor(),
+        );
 
         // C devMotorAsyn.c:459-464 — REP is the raw encoder count,
         // independent of UEIP (C rounds the count the asyn layer already
@@ -196,7 +200,9 @@ impl MotorRecord {
         // it). MRES is only a fallback for an invalid runtime ERES.
         let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
         if eres_valid {
-            self.pos.rep = (status.encoder_position / self.conv.eres + 0.5).floor() as i64;
+            self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
+                (status.encoder_position / self.conv.eres + 0.5).floor(),
+            );
         } else {
             if self.conv.ueip {
                 tracing::warn!(
@@ -204,7 +210,9 @@ impl MotorRecord {
                     self.conv.eres
                 );
             }
-            self.pos.rep = (status.encoder_position / self.conv.mres + 0.5).floor() as i64;
+            self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
+                (status.encoder_position / self.conv.mres + 0.5).floor(),
+            );
         }
 
         // RRBV depends on UEIP
@@ -223,7 +231,7 @@ impl MotorRecord {
                 } else {
                     1.0
                 };
-                self.pos.rrbv = ((rdbl_value * rres) / self.conv.mres).round() as i64;
+                self.pos.rrbv = coordinate::to_long(((rdbl_value * rres) / self.conv.mres).round());
             }
         }
 
@@ -252,7 +260,7 @@ impl MotorRecord {
         self.pos.diff = self.pos.dval - self.pos.drbv;
         // C: rdif = NINT(diff / mres) -- raw step difference
         self.pos.rdif = if self.conv.mres != 0.0 {
-            (self.pos.diff / self.conv.mres).round() as i64
+            coordinate::to_long((self.pos.diff / self.conv.mres).round())
         } else {
             0
         };
@@ -398,7 +406,7 @@ impl MotorRecord {
         // driver convention is EGU (AsynMotor docs), so convert through
         // MRES at the record boundary exactly like RMP above.
         self.stat.rvel = if self.conv.mres != 0.0 {
-            (status.velocity / self.conv.mres).floor() as i64
+            epics_base_rs::types::c_cast::f64_to_i32((status.velocity / self.conv.mres).floor())
         } else {
             0
         };
@@ -419,7 +427,7 @@ impl MotorRecord {
         // equivalent of the dial value — NINT(dval/mres) — never RRBV,
         // which is encoder counts under UEIP=Yes (or the RDBL scaling
         // under URIP) and differs whenever ERES != MRES.
-        self.pos.rval = (self.pos.dval / self.conv.mres).round() as i64;
+        self.pos.rval = coordinate::to_long((self.pos.dval / self.conv.mres).round());
         self.pos.diff = 0.0;
         self.pos.rdif = 0;
         self.internal.lval = self.pos.val;

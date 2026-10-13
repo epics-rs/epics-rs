@@ -23,7 +23,7 @@ No C dependencies. Just `cargo build`.
 - Acceleration as ACCL (time) or ACCS (EGU/sec²) selected by ACCU; driver-bound rate is EGU/sec²
 - RSTM restore mode (Never/Always/NearZero/Conditional) with MRES-mismatch interlock
 - SYNC trigger, RVEL actual velocity
-- 64-bit raw fields (RVAL/RRBV/RMP/REP/RDIF) for high-resolution / long-travel axes
+- Raw fields (RVAL/RRBV/RMP/REP/RDIF/RVEL/LRVL) are DBF_LONG as in motorRecord.dbd
 - Device support via asyn motor interface (move, home, moveToHome, stop, profile)
 - Builder pattern for easy motor setup
 - SimMotor for testing (time-based linear interpolation)

@@ -1014,7 +1014,7 @@ fn move_start_notify_posts_diff_and_rdif() {
     );
     assert_eq!(
         rdif,
-        Some(&EpicsValue::Int64(10000)),
+        Some(&EpicsValue::Long(10000)),
         "move-start notify posts RDIF = NINT(diff/mres)"
     );
 }

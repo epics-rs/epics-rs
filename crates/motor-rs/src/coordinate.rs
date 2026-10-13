@@ -13,10 +13,8 @@ pub fn user_to_dial(user: f64, dir: MotorDir, off: f64) -> f64 {
 }
 
 /// Convert dial position to raw steps.
-/// raw = round(dial / mres)
-/// 64-bit result to cover high-resolution / long-travel axes
-/// (epics-modules/motor #192).
-pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i64, MotorError> {
+/// raw = round(dial / mres), stored as C's DBF_LONG (`epicsInt32`).
+pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i32, MotorError> {
     if mres == 0.0 {
         return Err(MotorError::InvalidFieldValue("MRES cannot be zero".into()));
     }
@@ -28,12 +26,18 @@ pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i64, MotorError> {
             "dial/mres is not finite (dial={dial}, mres={mres})"
         )));
     }
-    Ok(raw.round() as i64)
+    Ok(to_long(raw.round()))
+}
+
+/// Assign a rounded step count to a DBF_LONG field: C `NINT` yields a
+/// `long` (motor.h:88) that the `epicsInt32` field assignment truncates.
+pub fn to_long(v: f64) -> i32 {
+    epics_base_rs::types::c_cast::f64_to_c_long(v) as i32
 }
 
 /// Convert raw steps to dial position.
 /// dial = raw * mres
-pub fn raw_to_dial(raw: i64, mres: f64) -> f64 {
+pub fn raw_to_dial(raw: i32, mres: f64) -> f64 {
     raw as f64 * mres
 }
 
@@ -75,7 +79,7 @@ pub fn cascade_from_val(
     mres: f64,
     set_mode: bool,
     current_dval: f64,
-) -> Result<(f64, i64, f64), MotorError> {
+) -> Result<(f64, i32, f64), MotorError> {
     if set_mode {
         // SET mode: redefine offset, no move
         let new_off = calc_offset(val, current_dval, dir);
@@ -100,7 +104,7 @@ pub fn cascade_from_dval(
     mres: f64,
     set_mode: bool,
     current_val: f64,
-) -> Result<(f64, i64, f64), MotorError> {
+) -> Result<(f64, i32, f64), MotorError> {
     let rval = dial_to_raw(dval, mres)?;
     if set_mode {
         let new_off = calc_offset(current_val, dval, dir);
@@ -115,7 +119,7 @@ pub fn cascade_from_dval(
 /// Update position cascade when RVAL is written.
 /// Returns (new_val, new_dval, new_off).
 pub fn cascade_from_rval(
-    rval: i64,
+    rval: i32,
     dir: MotorDir,
     off: f64,
     _foff: FreezeOffset,

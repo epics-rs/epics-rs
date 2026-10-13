@@ -307,7 +307,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     );
     assert_eq!(
         db.get_pv("M1.MIP").unwrap(),
-        EpicsValue::Short(0),
+        EpicsValue::UShort(0),
         "MIP collapses to DONE after the retry converges"
     );
 }
@@ -474,7 +474,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
         .await
         .unwrap();
     assert_eq!(db.get_pv("M1.DMOV").unwrap(), EpicsValue::Short(1));
-    assert_eq!(db.get_pv("M1.MIP").unwrap(), EpicsValue::Short(0));
+    assert_eq!(db.get_pv("M1.MIP").unwrap(), EpicsValue::UShort(0));
     assert_eq!(db.get_pv("M1.RBV").unwrap(), EpicsValue::Double(1.0));
     assert_eq!(
         loads.load(Ordering::SeqCst),

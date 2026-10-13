@@ -275,7 +275,7 @@ fn test_process_motor_info_marks_diff_rdif() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     let mmap = |rec: &MotorRecord| match rec.get_field("MMAP") {
-        Some(EpicsValue::Long(v)) => v,
+        Some(EpicsValue::ULong(v)) => v,
         other => panic!("MMAP: {other:?}"),
     };
     assert_eq!(mmap(&rec) & diff_rdif, 0, "a fresh record has no mark");
@@ -3418,45 +3418,104 @@ fn test_retry_when_diff_exceeds_rdbd() {
     assert_eq!(rec.retry.rcnt, 1);
 }
 
-// --- 64-bit raw fields (epics-modules/motor #192) ---
+// --- raw fields are DBF_LONG (motorRecord.dbd), not 64-bit ---
 
 #[test]
-fn test_rval_holds_value_beyond_32bit_range() {
-    // 3e9 exceeds i32::MAX (~2.15e9); must round-trip without overflow.
-    let big: i64 = 3_000_000_000;
+fn test_rval_put_takes_the_c_long_conversion() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     rec.conv.set = true; // SET mode: RVAL write redefines, no move
-    rec.put_field("RVAL", EpicsValue::Int64(big)).unwrap();
-    assert_eq!(rec.pos.rval, big);
-    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::Int64(big)));
+    // dbPut DOUBLE->LONG is the x86 (epicsInt32) cast: overflow is INT_MIN.
+    rec.put_field("RVAL", EpicsValue::Double(3.0e9)).unwrap();
+    assert_eq!(rec.pos.rval, i32::MIN);
+    // An integer request narrows by truncation, as putInt64Long does.
+    rec.put_field("RVAL", EpicsValue::Int64(3_000_000_000))
+        .unwrap();
+    assert_eq!(rec.pos.rval, 3_000_000_000_u32 as i32);
+    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::Long(rec.pos.rval)));
+}
+
+// devMotorAsyn.c:452/459/469 is a direct `(epicsInt32)floor(..)`: out of
+// range is INT_MIN on x86, not a 64-bit truncation. One case per arm.
+fn overflowed(
+    mres: f64,
+    eres: f64,
+    status: asyn_rs::interfaces::motor::MotorStatus,
+) -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = mres;
+    rec.conv.eres = eres;
+    rec.process_motor_info(&status);
+    rec
 }
 
 #[test]
-fn test_rrbv_rmp_rep_are_int64_fields() {
+fn test_rmp_overflows_to_int_min() {
     use asyn_rs::interfaces::motor::MotorStatus;
-    let mut rec = MotorRecord::new();
-    rec.conv.mres = 1.0;
-    // Driver position beyond 32-bit
-    let status = MotorStatus {
-        position: 5_000_000_000.0,
-        encoder_position: 5_000_000_000.0,
-        ..Default::default()
-    };
-    rec.process_motor_info(&status);
-    assert_eq!(rec.pos.rmp, 5_000_000_000_i64);
-    match rec.get_field("RRBV") {
-        Some(EpicsValue::Int64(v)) => assert_eq!(v, 5_000_000_000),
-        other => panic!("RRBV should be Int64, got {other:?}"),
-    }
-    match rec.get_field("RMP") {
-        Some(EpicsValue::Int64(_)) => {}
-        other => panic!("RMP should be Int64, got {other:?}"),
-    }
-    match rec.get_field("REP") {
-        Some(EpicsValue::Int64(_)) => {}
-        other => panic!("REP should be Int64, got {other:?}"),
-    }
+    let rec = overflowed(
+        1.0,
+        0.0,
+        MotorStatus {
+            position: 5_000_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.pos.rmp, i32::MIN);
+    assert_eq!(rec.pos.rrbv, i32::MIN);
+    assert!(matches!(
+        rec.get_field("RMP"),
+        Some(EpicsValue::Long(i32::MIN))
+    ));
+}
+
+#[test]
+fn test_rep_eres_arm_overflows_to_int_min() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let rec = overflowed(
+        1.0,
+        1.0,
+        MotorStatus {
+            encoder_position: 5_000_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.pos.rep, i32::MIN);
+    assert!(matches!(
+        rec.get_field("REP"),
+        Some(EpicsValue::Long(i32::MIN))
+    ));
+}
+
+#[test]
+fn test_rep_mres_fallback_arm_overflows_to_int_min() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let rec = overflowed(
+        1.0,
+        0.0,
+        MotorStatus {
+            encoder_position: 5_000_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.pos.rep, i32::MIN);
+}
+
+#[test]
+fn test_rvel_overflows_to_int_min() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let rec = overflowed(
+        1.0,
+        0.0,
+        MotorStatus {
+            velocity: -2_500_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.stat.rvel, i32::MIN);
+    assert!(matches!(
+        rec.get_field("RVEL"),
+        Some(EpicsValue::Long(i32::MIN))
+    ));
 }
 
 #[test]
@@ -3726,7 +3785,7 @@ fn test_rvel_is_floored_raw_velocity() {
     };
     rec.process_motor_info(&status);
     // C devMotorAsyn: rvel = floor(raw velocity); mres=1 → floor(3.7)
-    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Int64(3)));
+    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Long(3)));
 }
 
 #[test]
@@ -3744,7 +3803,7 @@ fn test_rvel_converts_egu_velocity_to_raw_steps() {
     rec.process_motor_info(&status);
     assert_eq!(
         rec.get_field("RVEL"),
-        Some(EpicsValue::Int64(2500)),
+        Some(EpicsValue::Long(2500)),
         "2.5 EGU/s at 0.001 EGU/step = 2500 steps/s"
     );
 
@@ -3756,7 +3815,7 @@ fn test_rvel_converts_egu_velocity_to_raw_steps() {
     rec.process_motor_info(&status);
     assert_eq!(
         rec.get_field("RVEL"),
-        Some(EpicsValue::Int64(-2)),
+        Some(EpicsValue::Long(-2)),
         "floor(-1.5) = -2, matching C floor()"
     );
 }
@@ -3773,7 +3832,7 @@ fn test_rvel_is_independent_of_velo_setpoint() {
     rec.process_motor_info(&status);
     // VELO setpoint and RVEL raw velocity are separate values
     assert_eq!(rec.get_field("VELO"), Some(EpicsValue::Double(10.0)));
-    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Int64(7)));
+    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Long(7)));
 }
 
 // --- ACCL safety when VELO==VBAS (C: b201e40e PR #75) ---
@@ -4797,7 +4856,7 @@ fn test_closed_loop_rval_put_is_raw_struct_write() {
     rec.pos.dval = 10.0;
     rec.stat.msta = MstaFlags::DONE;
 
-    rec.put_field("RVAL", EpicsValue::Int64(5000)).unwrap();
+    rec.put_field("RVAL", EpicsValue::Long(5000)).unwrap();
     assert_eq!(rec.pos.rval, 5000, "field takes the raw write");
     assert_eq!(rec.pos.dval, 10.0, "no RVAL->DVAL propagation");
     assert_eq!(rec.pos.val, 10.0);
@@ -4805,7 +4864,7 @@ fn test_closed_loop_rval_put_is_raw_struct_write() {
     assert!(effects.commands.is_empty(), "inert under closed loop");
 
     rec.conv.set = true;
-    rec.put_field("RVAL", EpicsValue::Int64(7000)).unwrap();
+    rec.put_field("RVAL", EpicsValue::Long(7000)).unwrap();
     assert_eq!(rec.pos.rval, 7000);
     assert_eq!(rec.pos.dval, 10.0, "no SET redefinition under closed loop");
 }
@@ -6180,7 +6239,7 @@ fn paused_move_setup() -> MotorRecord {
 fn complete_stop_at(rec: &mut MotorRecord, pos: f64) -> ProcessEffects {
     rec.pos.drbv = pos;
     rec.pos.rbv = pos;
-    rec.pos.rrbv = pos as i64;
+    rec.pos.rrbv = pos as i32;
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.movn = false;
     rec.check_completion()

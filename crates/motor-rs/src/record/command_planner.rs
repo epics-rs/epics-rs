@@ -572,7 +572,7 @@ impl MotorRecord {
             self.mark(m::DIFF);
         }
         self.pos.rdif = if self.conv.mres != 0.0 {
-            (self.pos.diff / self.conv.mres).round() as i64
+            coordinate::to_long((self.pos.diff / self.conv.mres).round())
         } else {
             0
         };
@@ -844,7 +844,7 @@ impl MotorRecord {
             self.internal.pp = true;
         }
 
-        let frac = self.retry.frac;
+        let frac = f64::from(self.retry.frac);
         // C 2268: currpos ("where we are") is LDVL — the previously
         // dispatched target, NOT the readback. The absolute FRAC dispatch
         // (2488/2513) walks from the previous target toward the new one:
@@ -1751,7 +1751,7 @@ impl MotorRecord {
         self.internal.ldvl = self.pos.dval;
         self.internal.lval = self.pos.val;
         if self.conv.mres != 0.0 {
-            let rval = (self.pos.dval / self.conv.mres).round() as i64;
+            let rval = coordinate::to_long((self.pos.dval / self.conv.mres).round());
             if self.pos.rval != rval {
                 self.mark(m::RVAL);
             }
@@ -1988,7 +1988,7 @@ impl MotorRecord {
         // error, like CDIR itself (2526): under MRES < 0 the dial sign
         // inverts, and a sub-half-step error rounds to 0 (forward).
         let rdif = if self.conv.mres != 0.0 {
-            (diff / self.conv.mres).round() as i64
+            coordinate::to_long((diff / self.conv.mres).round())
         } else {
             0
         };

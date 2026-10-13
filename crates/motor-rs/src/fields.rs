@@ -10,15 +10,14 @@ pub struct PositionFields {
     pub rlv: f64,
     pub off: f64,
     pub diff: f64,
-    /// Raw step difference. 64-bit to cover high-resolution / long-travel
-    /// axes beyond the 32-bit range (epics-modules/motor #192).
-    pub rdif: i64,
+    /// Raw step difference (DBF_LONG).
+    pub rdif: i32,
     pub dval: f64,
     pub drbv: f64,
-    pub rval: i64,
-    pub rrbv: i64,
-    pub rmp: i64,
-    pub rep: i64,
+    pub rval: i32,
+    pub rrbv: i32,
+    pub rmp: i32,
+    pub rep: i32,
 }
 
 impl Default for PositionFields {
@@ -169,7 +168,7 @@ impl Default for VelocityFields {
 #[derive(Debug, Clone)]
 pub struct RetryFields {
     pub bdst: f64,
-    pub frac: f64,
+    pub frac: f32,
     pub rdbd: f64,
     pub spdb: f64,
     pub rtry: i16,
@@ -282,9 +281,8 @@ pub struct StatusFields {
     pub stup: i16,
     /// Raw velocity reported by the driver, in motor steps/sec.
     /// C: `motorRecord.dbd` `field(RVEL,DBF_LONG)` "Raw Velocity"; devMotorAsyn
-    /// fills it with `floor(status.velocity)`. 64-bit here for consistency
-    /// with the other raw fields (epics-modules/motor #192).
-    pub rvel: i64,
+    /// fills it with `floor(status.velocity)`.
+    pub rvel: i32,
 }
 
 impl Default for StatusFields {
@@ -477,7 +475,7 @@ pub mod m {
 pub struct InternalFields {
     pub lval: f64,
     pub ldvl: f64,
-    pub lrvl: i64,
+    pub lrvl: i32,
     /// Last RLV value posted (C `motorRecord.dbd` LRLV, DBF_DOUBLE, SPC_NOMOD).
     pub lrlv: f64,
     /// C `mmap` (low word) and `nmap` (high word): the fields the next

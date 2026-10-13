@@ -21,13 +21,13 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "RLV" => Some(EpicsValue::Double(rec.pos.rlv)),
         "OFF" => Some(EpicsValue::Double(rec.pos.off)),
         "DIFF" => Some(EpicsValue::Double(rec.pos.diff)),
-        "RDIF" => Some(EpicsValue::Int64(rec.pos.rdif)),
+        "RDIF" => Some(EpicsValue::Long(rec.pos.rdif)),
         "DVAL" => Some(EpicsValue::Double(rec.pos.dval)),
         "DRBV" => Some(EpicsValue::Double(rec.pos.drbv)),
-        "RVAL" => Some(EpicsValue::Int64(rec.pos.rval)),
-        "RRBV" => Some(EpicsValue::Int64(rec.pos.rrbv)),
-        "RMP" => Some(EpicsValue::Int64(rec.pos.rmp)),
-        "REP" => Some(EpicsValue::Int64(rec.pos.rep)),
+        "RVAL" => Some(EpicsValue::Long(rec.pos.rval)),
+        "RRBV" => Some(EpicsValue::Long(rec.pos.rrbv)),
+        "RMP" => Some(EpicsValue::Long(rec.pos.rmp)),
+        "REP" => Some(EpicsValue::Long(rec.pos.rep)),
         // Conversion
         "DIR" => Some(EpicsValue::Short(rec.conv.dir as i16)),
         "FOFF" => Some(EpicsValue::Short(rec.conv.foff as i16)),
@@ -69,7 +69,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "SBAK" => Some(EpicsValue::Double(rec.vel.sbak)),
         // Retry
         "BDST" => Some(EpicsValue::Double(rec.retry.bdst)),
-        "FRAC" => Some(EpicsValue::Double(rec.retry.frac)),
+        "FRAC" => Some(EpicsValue::Float(rec.retry.frac)),
         "RDBD" => Some(EpicsValue::Double(rec.retry.rdbd)),
         "SPDB" => Some(EpicsValue::Double(rec.retry.spdb)),
         "RTRY" => Some(EpicsValue::Short(rec.retry.rtry)),
@@ -109,13 +109,13 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         // Status
         "DMOV" => Some(EpicsValue::Short(if rec.stat.dmov { 1 } else { 0 })),
         "MOVN" => Some(EpicsValue::Short(if rec.stat.movn { 1 } else { 0 })),
-        "MSTA" => Some(EpicsValue::Long(rec.stat.msta.bits() as i32)),
-        "MIP" => Some(EpicsValue::Short(rec.stat.mip.bits() as i16)),
+        "MSTA" => Some(EpicsValue::ULong(rec.stat.msta.bits())),
+        "MIP" => Some(EpicsValue::UShort(rec.stat.mip.bits())),
         "CDIR" => Some(EpicsValue::Short(if rec.stat.cdir { 1 } else { 0 })),
         "TDIR" => Some(EpicsValue::Short(if rec.stat.tdir { 1 } else { 0 })),
         "ATHM" => Some(EpicsValue::Short(if rec.stat.athm { 1 } else { 0 })),
         "STUP" => Some(EpicsValue::Short(rec.stat.stup)),
-        "RVEL" => Some(EpicsValue::Int64(rec.stat.rvel)),
+        "RVEL" => Some(EpicsValue::Long(rec.stat.rvel)),
         // PID
         "PCOF" => Some(EpicsValue::Double(rec.pid.pcof)),
         "ICOF" => Some(EpicsValue::Double(rec.pid.icof)),
@@ -154,18 +154,18 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "HOPR" => Some(EpicsValue::Double(rec.disp.hopr)),
         "LOPR" => Some(EpicsValue::Double(rec.disp.lopr)),
         // Last-value / monitor-map surface (SPC_NOMOD, read-only). LRVL mirrors
-        // RVAL's 64-bit exposure; MMAP/NMAP appear as DBF_LONG over CA.
+        // RVAL; MMAP/NMAP appear as DBF_LONG over CA.
         "LVAL" => Some(EpicsValue::Double(rec.internal.lval)),
         "LDVL" => Some(EpicsValue::Double(rec.internal.ldvl)),
-        "LRVL" => Some(EpicsValue::Int64(rec.internal.lrvl)),
+        "LRVL" => Some(EpicsValue::Long(rec.internal.lrvl)),
         "LRLV" => Some(EpicsValue::Double(rec.internal.lrlv)),
         "ALST" => Some(EpicsValue::Double(rec.disp.alst)),
         "MLST" => Some(EpicsValue::Double(rec.disp.mlst)),
-        "MMAP" => Some(EpicsValue::Long(
-            (rec.internal.mmap & ((1 << 29) - 1)) as i32,
+        "MMAP" => Some(EpicsValue::ULong(
+            (rec.internal.mmap & ((1 << 29) - 1)) as u32,
         )),
-        "NMAP" => Some(EpicsValue::Long(
-            ((rec.internal.mmap & m::MONITOR) >> 32) as i32,
+        "NMAP" => Some(EpicsValue::ULong(
+            ((rec.internal.mmap & m::MONITOR) >> 32) as u32,
         )),
         // C `pmr->pp` — post-process armed for the motion in flight
         // (15 write sites, motorRecord.cc:825..2523).
@@ -289,11 +289,22 @@ pub(crate) fn motor_put_field(
             Ok(())
         }
         "RVAL" => {
-            // RVAL is 64-bit (epics-modules/motor #192). Accept Int64 or a
-            // 32-bit Long from older clients.
-            let v: i64 = match value {
-                EpicsValue::Int64(v) => v,
-                EpicsValue::Long(v) => v as i64,
+            // RVAL is DBF_LONG (motorRecord.dbd): any scalar number takes
+            // the C put conversion to epicsInt32.
+            let v: i32 = match value {
+                EpicsValue::Long(v) => v,
+                v @ (EpicsValue::Double(_)
+                | EpicsValue::Float(_)
+                | EpicsValue::Short(_)
+                | EpicsValue::UShort(_)
+                | EpicsValue::Char(_)
+                | EpicsValue::Int64(_)
+                | EpicsValue::UInt64(_)
+                | EpicsValue::ULong(_)
+                | EpicsValue::Enum(_)) => match v.convert_to(DbFieldType::Long) {
+                    EpicsValue::Long(v) => v,
+                    _ => return Err(CaError::TypeMismatch(name.into())),
+                },
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
             // C special() has no RVAL cascade — the RVAL->DVAL
@@ -968,9 +979,13 @@ pub(crate) fn motor_put_field(
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "FRAC" => match value {
-            EpicsValue::Double(v) => {
+            EpicsValue::Float(v) => {
                 // C: FRAC clamped to [0.1, 1.5]
                 rec.retry.frac = v.clamp(0.1, 1.5);
+                Ok(())
+            }
+            EpicsValue::Double(v) => {
+                rec.retry.frac = (v as f32).clamp(0.1, 1.5);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

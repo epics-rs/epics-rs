@@ -7779,6 +7779,39 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("{record_type}: {e}"))
     }
 
+    /// A DBF_FLOAT or unsigned field reads in its own variant: C's dbAddr
+    /// carries the declared type, so transformRecord.dbd:17 VERS answers the
+    /// float-rounded 5.800000190734863 on a DOUBLE get; likewise
+    /// sCalcoutRecord.dbd:420 DLYA, busyRecord.dbd:64/117/122,
+    /// aCalcoutRecord.dbd:813 and aSubRecord.dbd:749 for the unsigned types.
+    #[test]
+    fn a_float_or_unsigned_field_reads_in_its_declared_variant() {
+        let mut checked = 0usize;
+        for record_type in super::super::dbd_generated::RECORD_TYPES {
+            let r = any_record(record_type);
+            for d in r.field_list() {
+                if d.runtime_typed
+                    || d.unreadable()
+                    || !matches!(
+                        d.dbf_type,
+                        DbFieldType::Float
+                            | DbFieldType::UChar
+                            | DbFieldType::UShort
+                            | DbFieldType::ULong
+                    )
+                {
+                    continue;
+                }
+                let Some(v) = r.get_field(d.name) else {
+                    continue;
+                };
+                assert_eq!(v.db_field_type(), d.dbf_type, "{record_type}.{}", d.name);
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "{checked} float and unsigned fields");
+    }
+
     /// Every field of `record` as `get_field` reads it, NaN-safe.
     fn image(record: &dyn Record) -> Vec<String> {
         record
@@ -8312,34 +8345,6 @@ pub(crate) mod tests {
                 assert!(r.take_process_posted_fields().is_empty(), "{record_type}");
             }
         }
-    }
-
-    /// A DBF_USHORT/ULONG/UCHAR field reads in its own variant, as C's
-    /// dbAddr carries the declared type (sCalcoutRecord.dbd:420 DLYA,
-    /// busyRecord.dbd:64/117/122, aCalcoutRecord.dbd:813, aSubRecord.dbd:749).
-    #[test]
-    fn an_unsigned_field_reads_in_its_declared_variant() {
-        let mut checked = 0usize;
-        for record_type in super::super::dbd_generated::RECORD_TYPES {
-            let r = any_record(record_type);
-            for d in r.field_list() {
-                if d.runtime_typed
-                    || d.unreadable()
-                    || !matches!(
-                        d.dbf_type,
-                        DbFieldType::UShort | DbFieldType::ULong | DbFieldType::UChar
-                    )
-                {
-                    continue;
-                }
-                let Some(v) = r.get_field(d.name) else {
-                    continue;
-                };
-                assert_eq!(v.db_field_type(), d.dbf_type, "{record_type}.{}", d.name);
-                checked += 1;
-            }
-        }
-        assert!(checked > 100, "{checked} unsigned fields");
     }
 
     /// A field only the event path posts (waveform HASH from

@@ -36,7 +36,7 @@ const POSTED_FIELDS: &[&str] = &[
 const COMMENT_SIZE: usize = 39;
 
 /// Code version reported by `VERS` (C `transformRecord.c:92 #define VERSION 5.8`).
-const VERSION: f64 = 5.8;
+const VERSION: f32 = 5.8;
 
 /// C `transformRecord.c:752-767` `get_precision` names `VERS` and answers a
 /// LITERAL 2, ahead of the `fieldIndex >= transformRecordVAL` arm that serves
@@ -872,7 +872,7 @@ impl Record for TransformRecord {
         if name == "VERS" {
             // Fixed code-version constant, C `ptran->vers = VERSION` in
             // init_record; never the `.dbd` initial.
-            return Some(EpicsValue::Double(VERSION));
+            return Some(EpicsValue::Float(VERSION));
         }
         if let Some(idx) = Self::channel_index(name) {
             return Some(EpicsValue::Double(self.vals[idx]));
@@ -1392,9 +1392,9 @@ mod tests {
     #[test]
     fn vers_is_the_version_constant_and_ignores_writes() {
         let mut rec = TransformRecord::new();
-        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(5.8)));
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(5.8)));
         assert!(rec.put_field("VERS", EpicsValue::Double(99.0)).is_ok());
-        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(5.8)));
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(5.8)));
     }
 
     /// C's `init_record` tail, `*plvalue = *pvalue` (`transformRecord.c:490`).

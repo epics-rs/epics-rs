@@ -499,9 +499,9 @@ const MOVE_FIELDS: [(&str, DbFieldType); 12] = [
     ("DRBV", DbFieldType::Double),
     ("DIFF", DbFieldType::Double),
     ("RDIF", DbFieldType::Long),
-    ("MSTA", DbFieldType::Long),
+    ("MSTA", DbFieldType::ULong),
     ("TDIR", DbFieldType::Short),
-    ("MIP", DbFieldType::Short),
+    ("MIP", DbFieldType::UShort),
     ("MOVN", DbFieldType::Short),
     ("DMOV", DbFieldType::Short),
 ];

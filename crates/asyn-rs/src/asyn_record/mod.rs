@@ -4528,7 +4528,7 @@ impl Record for AsynRecord {
             "DRTO" => Some(EpicsValue::Enum(self.drto as u16)),
             "UCMD" => Some(EpicsValue::Enum(self.ucmd as u16)),
             "ACMD" => Some(EpicsValue::Enum(self.acmd as u16)),
-            "SPR" => Some(EpicsValue::Char(self.spr as u8)),
+            "SPR" => Some(EpicsValue::UChar(self.spr as u8)),
             "TMSK" => Some(EpicsValue::Long(self.tmsk)),
             "TB0" => Some(EpicsValue::Enum(self.tb0 as u16)),
             "TB1" => Some(EpicsValue::Enum(self.tb1 as u16)),
@@ -4561,7 +4561,7 @@ impl Record for AsynRecord {
                 buf.resize(ERR_SIZE, 0);
                 Some(EpicsValue::CharArray(buf.into()))
             }
-            "AQR" => Some(EpicsValue::Char(self.aqr as u8)),
+            "AQR" => Some(EpicsValue::UChar(self.aqr as u8)),
             _ => None,
         }
     }

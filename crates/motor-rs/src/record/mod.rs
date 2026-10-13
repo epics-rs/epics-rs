@@ -1003,11 +1003,11 @@ mod tests {
                 (name, rec.get_field(name).unwrap())
             })
             .collect();
-        let mip = rec.stat.mip.bits() as i16;
+        let mip = rec.stat.mip.bits();
         assert!(
             fields
                 .iter()
-                .any(|(n, v)| *n == "MIP" && *v == EpicsValue::Short(mip)),
+                .any(|(n, v)| *n == "MIP" && *v == EpicsValue::UShort(mip)),
             "move-start notify must carry MIP: {fields:?}"
         );
         assert!(

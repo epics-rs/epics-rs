@@ -115,27 +115,18 @@ fn server_setup_failure_text(server_info: &str, e: &socket::SetupError) -> Strin
     match e.step {
         socket::SetupStep::Create => format!("Can't create socket: {err}"),
         // C's own SO_REUSEADDR call (:448-454); the fanout helper's earlier
-        // one fails silently in C and then fails here the same way.
+        // one only logs.
         socket::SetupStep::ReuseAddress => {
             format!("Error calling setsockopt {server_info}: {err}")
         }
         socket::SetupStep::Bind => format!("Error in binding {server_info}: {err}"),
         // Two spaces, as C has them (:467-469).
         socket::SetupStep::Listen => format!("Error calling listen() on {server_info}:  {err}"),
-        // The UDP server's fanout (:444-447): C's helper logs this and goes on
-        // (osdSockAddrReuse.cpp:51-57); rs fails the setup instead.
-        // Where SO_REUSEPORT is undefined C's helper sets, and names,
-        // SO_REUSEADDR, as libcom degrades the request.
-        socket::SetupStep::ReusePort => format!(
-            "epicsSocketEnablePortUseForDatagramFanout: unable to set {}?",
-            if cfg!(unix) {
-                "SO_REUSEPORT"
-            } else {
-                "SO_REUSEADDR"
-            }
-        ),
-        // Neither is requested on a server socket.
-        socket::SetupStep::Broadcast | socket::SetupStep::NonBlocking => {
+        // None is requested on a server socket: the fanout helper's options
+        // log and never fail (drvAsynIPServerPort.c:444-447).
+        socket::SetupStep::Broadcast
+        | socket::SetupStep::ReusePort
+        | socket::SetupStep::NonBlocking => {
             format!("Error calling setsockopt {server_info}: {err}")
         }
     }
@@ -1061,9 +1052,10 @@ impl DrvAsynIPServerPort {
         // SO_REUSEPORT (where available) followed by SO_REUSEADDR — so
         // multiple IOCs can bind the same UDP port and the kernel fans
         // each datagram out to them. The TCP listener gets only
-        // SO_REUSEADDR (:448); the fanout helper is SOCK_DGRAM-only. That
-        // pairing is `SocketOptions::FANOUT`, and the seam is what keeps the
-        // options ahead of the bind on both hosted and embedded targets.
+        // SO_REUSEADDR (:448); the fanout helper is SOCK_DGRAM-only, and an
+        // option it cannot set is logged, not fatal. That pairing is
+        // `SocketOptions::FANOUT`, and the seam is what keeps the options
+        // ahead of the bind on both hosted and embedded targets.
         let socket = socket::udp_socket(addr, socket::SocketOptions::FANOUT)
             .map_err(|e| self.setup_failure(&e))?;
         // Read timeout caps shutdown latency — recv wakes every
@@ -1114,8 +1106,8 @@ impl DrvAsynIPServerPort {
     ///
     /// An IP literal (IPv4, or bracketless IPv6 such as `::1`) binds
     /// verbatim, preserving the existing explicit-address paths without a
-    /// name lookup; any other host name is resolved like the client
-    /// driver (`ip_port.rs::connect_udp`). The earlier
+    /// name lookup; any other host name is resolved as C resolves it,
+    /// IPv4 only ([`socket::host_to_ip_addr`]). The earlier
     /// `SocketAddr::parse` of `host:port` rejected empty-host,
     /// `localhost`, and every hostname.
     fn resolve_bind_addr(&self) -> AsynResult<SocketAddr> {
@@ -1132,20 +1124,17 @@ impl DrvAsynIPServerPort {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }
-        // Otherwise resolve the name (C hostToIPAddr, :431). C's text
-        // (:432-434) appends `sockerrmsg`, but hostToIPAddr never sets errno, so
-        // that suffix is whatever an earlier call left; the words are kept and
-        // the stale errno is not.
-        use std::net::ToSocketAddrs;
-        let lookup_failed = || AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("using ANY interface, cannot lookup '{host}'"),
-        };
-        (host, port)
-            .to_socket_addrs()
-            .map_err(|_| lookup_failed())?
-            .next()
-            .ok_or_else(lookup_failed)
+        // Otherwise resolve the name (C hostToIPAddr, :431) and, on failure,
+        // print the errno the resolver left (:432-434).
+        socket::host_to_ip_addr(host)
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "using ANY interface, cannot lookup '{host}': {}",
+                    super::ip_port::sock_err_text(&e)
+                ),
+            })
     }
 
     fn bind_with_options(&self, addr: SocketAddr) -> AsynResult<TcpListener> {
@@ -2066,15 +2055,6 @@ mod tests {
         )
     }
 
-    /// osdSockAddrReuse.cpp:51-57, reached from drvAsynIPServerPort.c:444-447.
-    #[test]
-    fn a_fanout_option_that_fails_is_reported_in_c_s_words() {
-        assert_eq!(
-            server_setup_failure(socket::SetupStep::ReusePort),
-            "epicsSocketEnablePortUseForDatagramFanout: unable to set SO_REUSEPORT?"
-        );
-    }
-
     /// drvAsynIPServerPort.c:413-417.
     #[test]
     fn a_server_socket_that_cannot_be_created_is_reported_in_c_s_words() {
@@ -2102,16 +2082,23 @@ mod tests {
         );
     }
 
-    /// A bind host that does not resolve is C's lookup text without its stale
-    /// errno suffix (drvAsynIPServerPort.c:431-434). `.invalid` never resolves
-    /// (RFC 6761).
+    /// A bind host that does not resolve is C's lookup text with the errno the
+    /// resolver left (drvAsynIPServerPort.c:431-434), as libCom prints it on
+    /// this box: a bare name the resolver gives up on leaves EAGAIN, and
+    /// `.invalid` (RFC 6761), refused locally, leaves 0.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn an_unresolvable_bind_host_is_reported_in_c_s_words() {
-        let srv = DrvAsynIPServerPort::new("rb_invalid", "no-such-nic.invalid:0").unwrap();
-        assert_eq!(
-            srv.resolve_bind_addr().unwrap_err().message(),
-            "using ANY interface, cannot lookup 'no-such-nic.invalid'"
-        );
+    fn an_unresolvable_bind_host_is_reported_with_the_resolver_s_errno() {
+        for (host, errno_text) in [
+            ("nonexistent-host-xyz", "Resource temporarily unavailable"),
+            ("no-such-nic.invalid", "Success"),
+        ] {
+            let srv = DrvAsynIPServerPort::new("rb_unresolved", &format!("{host}:0")).unwrap();
+            assert_eq!(
+                srv.resolve_bind_addr().unwrap_err().message(),
+                format!("using ANY interface, cannot lookup '{host}': {errno_text}")
+            );
+        }
     }
 
     /// DRV-19: bind-host resolution. C `createServerSocket`

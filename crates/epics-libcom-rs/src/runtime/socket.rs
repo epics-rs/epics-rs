@@ -39,7 +39,7 @@
 //!
 //! # The C authority for each branch
 //!
-//! Option selection follows EPICS base
+//! Option selection follows EPICS base (R7.0.10-146-g8f5015b66)
 //! `libcom/src/osi/os/default/osdSockAddrReuse.cpp`: the datagram-fanout helper
 //! sets `SO_REUSEPORT` (where defined) *and then* `SO_REUSEADDR`; the
 //! time-wait helper sets `SO_REUSEADDR` alone. Both `SO_REUSEPORT` constants
@@ -47,23 +47,23 @@
 //! so neither takes the `#ifndef SO_REUSEPORT` fallback the C comment describes
 //! for older systems.
 //!
-//! Connect behaviour follows asyn `drvAsynIPPort.c`, whose three branches this
+//! Connect behaviour follows asyn (R4-46) `drvAsynIPPort.c`, whose three branches this
 //! module reproduces exactly:
 //!
 //! | target | connect | timeout honoured | C authority |
 //! |---|---|---|---|
 //! | hosted | non-blocking, then `poll(POLLOUT)` and `SO_ERROR` | yes | `:516-566` |
-//! | VxWorks | non-blocking, then `select()` via `FAKE_POLL` | yes | `:76`, `:139-164`, `:178` |
+//! | VxWorks | non-blocking, then `select()` via `FAKE_POLL` | yes | `:76`, `:139-171`, `:178` |
 //! | RTEMS | **blocking** | **no** | `:71-72` — `__rtems__` takes `USE_SOCKTIMEOUT`, and both `setNonBlock` and the poll block sit inside `#ifdef USE_POLL` |
 //!
 //! The RTEMS row is not an omission. C genuinely has no connect timeout there;
 //! it bounds the *transfer* instead, with `SO_RCVTIMEO`/`SO_SNDTIMEO`
-//! (`:618-623`, `:744-749`). Honouring the deadline there anyway would be a
+//! (`:670-676`, `:800-806`). Honouring the deadline there anyway would be a
 //! deviation invented by the port, so [`tcp_connect`] documents the difference
 //! rather than papering over it.
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::Duration;
 
 /// Options applied to a fresh socket *before* it is bound or connected.
@@ -79,15 +79,20 @@ pub struct SocketOptions {
     pub reuse_address: bool,
     /// `SO_REUSEPORT`, where the platform defines it.
     pub reuse_port: bool,
+    /// C `epicsSocketEnableAddressUseForDatagramFanout`: `SO_REUSEPORT` where
+    /// defined, then `SO_REUSEADDR`, each one that fails logged and skipped,
+    /// never failing the setup (osdSockAddrReuse.cpp:46-68).
+    pub datagram_fanout: bool,
 }
 
 impl SocketOptions {
-    /// The datagram-fanout pair: `SO_REUSEPORT` **and** `SO_REUSEADDR`, matching
-    /// C `epicsSocketEnableAddressUseForDatagramFanout`, which sets both.
+    /// The UDP server's pair: the fanout helper, then its own `SO_REUSEADDR`,
+    /// which does fail the setup (drvAsynIPServerPort.c:444-454).
     pub const FANOUT: Self = Self {
         broadcast: false,
         reuse_address: true,
-        reuse_port: true,
+        reuse_port: false,
+        datagram_fanout: true,
     };
 
     /// `SO_REUSEADDR` alone, matching C
@@ -97,7 +102,16 @@ impl SocketOptions {
         broadcast: false,
         reuse_address: true,
         reuse_port: false,
+        datagram_fanout: false,
     };
+}
+
+/// C `setfanout`'s report of an option it could not set
+/// (osdSockAddrReuse.cpp:46-58); the setup goes on without it.
+fn fanout_refused(optname: &str) {
+    crate::runtime::log::errlog_vprintf(format_args!(
+        "epicsSocketEnablePortUseForDatagramFanout: unable to set {optname}?\n"
+    ));
 }
 
 /// Open a UDP socket, apply `opts`, and bind it to `local`.
@@ -115,7 +129,7 @@ pub fn tcp_listener(
 }
 
 /// The setup call that failed before any `connect()`. C `connectIt` words each
-/// one differently (`drvAsynIPPort.c:443-524`), so the caller needs to know which.
+/// one differently (`drvAsynIPPort.c:443-523`), so the caller needs to know which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupStep {
     /// `socket()`.
@@ -244,7 +258,7 @@ pub fn tcp_connect(
 ///
 /// The error is returned, not swallowed. C treats this option as required —
 /// `create_tcp_client` calls `destroy_client` and refuses the connection when
-/// it fails (`caservertask.c:1457-1463`) — so the caller gets to make C's
+/// it fails (`caservertask.c:1456-1462`) — so the caller gets to make C's
 /// decision.
 ///
 /// Only the flag is set, which is all C sets. The idle/probe tuning the hosted
@@ -257,6 +271,28 @@ pub fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
     sys::enable_keepalive(sock)
 }
 
+/// C `hostToIPAddr`: the first IPv4 address of `name`. The error is the
+/// `errno` the resolver leaves, which is all a C caller's
+/// `epicsSocketConvertErrnoToString` can print; `getaddrinfo` does not promise
+/// one, so it may be `0` or left over from an earlier call, as it is in C.
+pub fn host_to_ip_addr(name: &str) -> Result<Ipv4Addr, io::Error> {
+    sys::host_to_ip_addr(name)
+}
+
+/// [`host_to_ip_addr`] through `std`'s resolver, for the targets whose C
+/// `hostToIPAddr` is not the `getaddrinfo(AF_INET)` one.
+#[cfg(any(epics_embedded_target, not(unix)))]
+fn std_host_to_ip_addr(name: &str) -> Result<Ipv4Addr, io::Error> {
+    use std::net::ToSocketAddrs;
+    let found = (name, 0).to_socket_addrs().ok().and_then(|mut addrs| {
+        addrs.find_map(|a| match a {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
+        })
+    });
+    found.ok_or_else(io::Error::last_os_error)
+}
+
 #[cfg(not(epics_embedded_target))]
 mod sys {
     //! Hosted: `socket2` owns the pre-bind option surface; the connect deadline
@@ -264,8 +300,49 @@ mod sys {
 
     use super::{SetupError, SetupStep, SocketOptions, TcpConnectError};
     use std::io;
-    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::time::Duration;
+
+    /// The `USE_INFO` `hostToIPAddr` (osdSock.c:250-273): `getaddrinfo` with an
+    /// `AF_INET` hint, the first answer, and on failure nothing between the
+    /// call and the caller's `errno` read.
+    #[cfg(unix)]
+    pub(super) fn host_to_ip_addr(name: &str) -> Result<Ipv4Addr, io::Error> {
+        let Ok(node) = std::ffi::CString::new(name) else {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        };
+        // SAFETY: zeroed `addrinfo` is the hint C builds with `memset`.
+        let mut hint: libc::addrinfo = unsafe { std::mem::zeroed() };
+        hint.ai_family = libc::AF_INET;
+        let mut result: *mut libc::addrinfo = std::ptr::null_mut();
+        // SAFETY: `node` is NUL-terminated, `hint` and `result` outlive the call.
+        let ret = unsafe { libc::getaddrinfo(node.as_ptr(), std::ptr::null(), &hint, &mut result) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut found = None;
+        let mut ai = result;
+        while !ai.is_null() {
+            // SAFETY: `ai` walks the list `getaddrinfo` returned, freed below.
+            let entry = unsafe { &*ai };
+            if entry.ai_family == libc::AF_INET && !entry.ai_addr.is_null() {
+                // SAFETY: an `AF_INET` entry's `ai_addr` is a `sockaddr_in`.
+                let sin = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in) };
+                found = Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+                break;
+            }
+            ai = entry.ai_next;
+        }
+        let err = io::Error::last_os_error();
+        // SAFETY: `result` came from a successful `getaddrinfo` and is freed once.
+        unsafe { libc::freeaddrinfo(result) };
+        found.ok_or(err)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn host_to_ip_addr(name: &str) -> Result<Ipv4Addr, io::Error> {
+        super::std_host_to_ip_addr(name)
+    }
 
     fn new_socket(
         addr_is_v6: bool,
@@ -285,9 +362,17 @@ mod sys {
                 .set_broadcast(true)
                 .map_err(SetupError::at(SetupStep::Broadcast))?;
         }
-        // C's fanout helper sets SO_REUSEPORT first, then SO_REUSEADDR; keep
-        // that order so a platform that rejects the second after the first
-        // fails the same way it does in C.
+        if opts.datagram_fanout {
+            // Windows defines no SO_REUSEPORT, so C's helper sets only the
+            // second (osdSockAddrReuse.cpp:63-66).
+            #[cfg(unix)]
+            if socket.set_reuse_port(true).is_err() {
+                super::fanout_refused("SO_REUSEPORT");
+            }
+            if socket.set_reuse_address(true).is_err() {
+                super::fanout_refused("SO_REUSEADDR");
+            }
+        }
         if opts.reuse_port {
             #[cfg(unix)]
             let set = socket.set_reuse_port(true);
@@ -457,9 +542,15 @@ mod sys {
 
     use super::{SetupError, SetupStep, SocketOptions, TcpConnectError};
     use std::io;
-    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::os::fd::{FromRawFd, RawFd};
     use std::time::Duration;
+
+    /// RTEMS takes C's `USE_BY` `gethostbyname` (osdSock.c:44-48) and VxWorks
+    /// its own; neither has been probed for the `errno` it leaves.
+    pub(super) fn host_to_ip_addr(name: &str) -> Result<Ipv4Addr, io::Error> {
+        super::std_host_to_ip_addr(name)
+    }
 
     /// An fd that closes on drop, so every `?` between `socket()` and the
     /// hand-off to a `std` type releases it. Without this each early return is
@@ -522,6 +613,14 @@ mod sys {
         if opts.broadcast {
             set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_BROADCAST)
                 .map_err(SetupError::at(SetupStep::Broadcast))?;
+        }
+        if opts.datagram_fanout {
+            if set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT).is_err() {
+                super::fanout_refused("SO_REUSEPORT");
+            }
+            if set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR).is_err() {
+                super::fanout_refused("SO_REUSEADDR");
+            }
         }
         if opts.reuse_port {
             set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT)
@@ -619,7 +718,7 @@ mod sys {
 
     /// Put `fd` into non-blocking mode.
     ///
-    /// C `drvAsynIPPort.c::setNonBlock` (`:176-199`) branches exactly here:
+    /// C `drvAsynIPPort.c::setNonBlock` (`:176-200`) branches exactly here:
     /// VxWorks uses `ioctl(fd, FIONBIO, &flags)` — note it passes the address
     /// of the flag, not the flag itself — where a POSIX target uses `fcntl`.
     /// Only the VxWorks arm exists: RTEMS takes the blocking `connect_fd`
@@ -661,11 +760,10 @@ mod sys {
     ///
     /// C parity, not a shortcut: `__rtems__` selects `USE_SOCKTIMEOUT`
     /// (`drvAsynIPPort.c:71-72`), which compiles out both the `setNonBlock`
-    /// under `USE_POLL` (`:536` at the `e2a281e2` pin) and the `poll(POLLOUT)`
-    /// connect deadline (`:544` as of asyn PR #211 `e1987063`, which is also
-    /// what moved `setNonBlock` ahead of the connect). The
-    /// transfer bound C keeps there is `SO_RCVTIMEO`/`SO_SNDTIMEO`, applied by
-    /// the read/write path rather than here.
+    /// under `USE_POLL` (`:515-524`) and the `poll(POLLOUT)` connect deadline
+    /// (`:540-567`). The transfer bound C keeps there is
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO`, applied by the read/write path rather than
+    /// here.
     #[cfg(target_os = "rtems")]
     fn connect_fd(
         owned: &OwnedFd,
@@ -690,13 +788,11 @@ mod sys {
     /// VxWorks: non-blocking connect bounded by `poll(POLLOUT)`, then
     /// `SO_ERROR`.
     ///
-    /// This is C's `USE_POLL` path (`drvAsynIPPort.c:529-556`) as of asyn
-    /// PR #211 `e1987063` — later than the `e2a281e2` pin, whose `connectIt`
-    /// still connects blocking and only goes non-blocking afterwards, at
-    /// `:536`. VxWorks takes it via `FAKE_POLL`. C fakes `poll` with `select()`
-    /// because its VxWorks headers lack `poll`; the Rust `libc` binding for the
-    /// triple exposes `poll` directly, so the fake is unnecessary and the
-    /// observable behaviour is the same.
+    /// This is C's `USE_POLL` path (`drvAsynIPPort.c:515-567`). VxWorks takes
+    /// it via `FAKE_POLL`. C fakes `poll` with `select()` because its VxWorks
+    /// headers lack `poll`; the Rust `libc` binding for the triple exposes
+    /// `poll` directly, so the fake is unnecessary and the observable
+    /// behaviour is the same.
     #[cfg(target_os = "vxworks")]
     fn connect_fd(
         owned: &OwnedFd,
@@ -753,7 +849,7 @@ mod sys {
         }
 
         // C reads SO_ERROR and treats a non-zero value as the connect failure
-        // (`:545-560`); poll reporting the fd ready says only that the attempt
+        // (`:555-565`); poll reporting the fd ready says only that the attempt
         // finished, not that it succeeded.
         let mut so_error: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -986,7 +1082,7 @@ mod tests {
     }
 
     /// connect() failing outright is C's `sockerrmsg` with no poll behind it
-    /// (drvAsynIPPort.c:532-539): a multicast destination is unreachable at once.
+    /// (drvAsynIPPort.c:534-539): a multicast destination is unreachable at once.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_connect_that_fails_at_once_is_not_deferred() {

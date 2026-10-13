@@ -1231,8 +1231,8 @@ fn setup_failure_text(device: &str, e: &socket::SetupError) -> String {
         socket::SetupStep::ReusePort => {
             format!("Can't set {device} socket SO_REUSEPORT option: {err}")
         }
-        // Not C's: SO_REUSEADDR rides only on the local bind rs keeps usable
-        // across TIME_WAIT; worded as C words its options.
+        // Not C's, and no client socket requests SO_REUSEADDR alone; worded
+        // as C words its options.
         socket::SetupStep::ReuseAddress => {
             format!("Can't set {device} socket SO_REUSEADDR option: {err}")
         }
@@ -1606,6 +1606,7 @@ impl DrvAsynIPPort {
             broadcast: self.config.protocol.broadcast(),
             reuse_port: self.config.protocol.reuse_port(),
             reuse_address: false,
+            datagram_fanout: false,
         }
     }
 
@@ -1648,11 +1649,9 @@ impl DrvAsynIPPort {
                         (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
                     }
                 });
-            let mut opts = self.socket_options();
-            // Not C's: a fixed local port would otherwise be unusable for the
-            // TIME_WAIT lifetime of the previous connection. Only meaningful
-            // when a local bind actually happens.
-            opts.reuse_address = local_addr.is_some();
+            // No SO_REUSEADDR before the local bind (:499-509): during the last
+            // connection's TIME_WAIT, C's reconnect fails the bind.
+            let opts = self.socket_options();
             // C bounds the connect by `pasynBase->autoConnectTimeout`, read here
             // and now (drvAsynIPPort.c:541-566).
             let timeout = crate::runtime::config::connect_poll_timeout();
@@ -3708,6 +3707,38 @@ mod tests {
             err.message(),
             "unable to bind to local port: Address already in use"
         );
+    }
+
+    /// C binds a fixed local port with no SO_REUSEADDR (drvAsynIPPort.c:499-509),
+    /// so the client socket carries none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_local_port_bind_sets_no_reuse_address() {
+        use std::os::fd::AsRawFd;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = server.local_addr().unwrap().port();
+        let local = std::net::TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
+        let stream = drv.connect_tcp().unwrap();
+        assert_eq!(stream.local_addr().unwrap().port(), local);
+        let mut on: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `on`/`len` describe a c_int the call writes into.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                (&mut on as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(on, 0, "SO_REUSEADDR on the client socket");
     }
 
     /// An AF_UNIX connect failure reads as C's, naming the whole hostInfo

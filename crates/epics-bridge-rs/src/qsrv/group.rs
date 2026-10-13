@@ -6277,7 +6277,7 @@ mod tests {
         let rec = db.get_record("SUBF:ai").expect("record exists");
         let filters_installed = {
             let inst = rec.read();
-            inst.subscribers_of("VAL").any(|s| !s.filters.is_empty())
+            inst.subscribers_of("VAL").any(|s| s.has_filters())
         };
         assert!(
             filters_installed,

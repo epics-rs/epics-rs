@@ -4320,7 +4320,7 @@ fn cmd_dbel() -> CommandDef {
             let mut subs: Vec<(&str, &crate::server::pv::Subscriber)> = inst
                 .field_subscribers()
                 .iter()
-                .map(|entry| (entry.field(), &entry.sub))
+                .map(|entry| (entry.field(), entry.sub()))
                 .collect();
             subs.sort_by_key(|(_, sub)| sub.sid);
 

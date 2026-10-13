@@ -622,8 +622,10 @@ pub struct Subscriber {
     /// Server-side channel filter chain (epics-base 3.15.7).
     /// Defaults to empty — every event passes unchanged. Populated
     /// by the subscription path when the channel name carries a
-    /// `.{filter:opts}` JSON suffix (`dbnd`, `arr`, `ts`, ...).
-    pub filters: crate::server::database::filters::FilterChain,
+    /// `.{filter:opts}` JSON suffix (`dbnd`, `arr`, `ts`, ...). Private:
+    /// its filters are `Arc`s, and a reader of a shared entry must not be
+    /// able to clone one and become its last owner.
+    filters: crate::server::database::filters::FilterChain,
     /// Delivery gate. `true` (the default) delivers events normally;
     /// `false` suppresses every post to this subscriber at the source —
     /// nothing reaches the event queue, no filter is evaluated — so a
@@ -631,13 +633,47 @@ pub struct Subscriber {
     /// downstream frame. Mirrors EPICS `db_event_disable` / pvxs
     /// `onStart(false)` (singlesource.cpp:151-173, groupsource.cpp:151-281):
     /// the subscription object survives, only its event flow is gated, so
-    /// the same subscriber resumes on re-enable. Flipped only under the
-    /// owner's write lock via [`super::record::record_instance::RecordInstance::set_subscriber_active`]
-    /// (records) — the post paths read it under the matching read lock.
-    pub active: bool,
+    /// the same subscriber resumes on re-enable. Atomic so a rights change
+    /// flips it in a shared entry, never by replacing the entry.
+    active: std::sync::atomic::AtomicBool,
 }
 
 impl Subscriber {
+    /// An enabled monitor with no filters, posting into `sink`.
+    pub(crate) fn new(sid: u32, data_type: DbFieldType, mask: u16, sink: EventSink) -> Self {
+        Self {
+            sid,
+            data_type,
+            mask,
+            sink,
+            filters: crate::server::database::filters::FilterChain::new(),
+            active: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Whether this monitor runs a channel-filter chain.
+    pub fn has_filters(&self) -> bool {
+        !self.filters.is_empty()
+    }
+
+    /// Append `filter` to this monitor's chain, before it is shared.
+    pub(crate) fn push_filter(
+        &mut self,
+        filter: Arc<dyn crate::server::database::filters::SubscriptionFilter>,
+    ) {
+        self.filters.push(filter);
+    }
+
+    /// Whether posts reach this monitor (`db_event_enable` state).
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// C `db_event_enable` (`true`) / `db_event_disable` (`false`).
+    pub(crate) fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
     /// The mask this subscriber's field log carries for `post`, or `None`
     /// when the post is not for it.
     ///
@@ -1170,7 +1206,7 @@ impl ProcessVariable {
             // Paused subscribers (`db_event_disable`) receive nothing —
             // skip before any work so a disabled monitor stops the event
             // flow at the source.
-            if !sub.active {
+            if !sub.is_active() {
                 continue;
             }
             // Gate and narrow in one step: `Subscriber::delivered_mask`
@@ -1315,14 +1351,7 @@ impl ProcessVariable {
         }
         let kind = crate::server::event_queue::LogKind::of_value(&self.value.read());
         let (sink, reader) = crate::server::event_queue::attach_with(user, sid, kind, context);
-        subs.push(Subscriber {
-            sid,
-            data_type,
-            mask,
-            sink,
-            filters: crate::server::database::filters::FilterChain::new(),
-            active: true,
-        });
+        subs.push(Subscriber::new(sid, data_type, mask, sink));
         Ok(reader)
     }
 
@@ -1369,9 +1398,9 @@ impl ProcessVariable {
     /// subscriber holding slot `id`; see
     /// [`RecordInstance::set_subscriber_active`](crate::server::record::record_instance::RecordInstance::set_subscriber_active).
     pub fn set_subscriber_active(&self, id: AttachId, active: bool) {
-        let mut subs = self.subscribers.lock();
-        if let Some(sub) = subs.iter_mut().find(|s| s.id() == id) {
-            sub.active = active;
+        let subs = self.subscribers.lock();
+        if let Some(sub) = subs.iter().find(|s| s.id() == id) {
+            sub.set_active(active);
         }
     }
 

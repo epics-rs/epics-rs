@@ -6330,7 +6330,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                     }
                 }
                 ChannelTarget::RecordField { record, field } => {
-                    let mut instance = record.write();
+                    let instance = record.write();
                     if new_read {
                         instance.set_subscriber_active(id, true);
                     }

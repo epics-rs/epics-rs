@@ -4051,7 +4051,7 @@ pub struct FieldSubscriber {
     /// The walk's per-field answers for this monitor's field, settled as a
     /// published entry's are.
     roles: Roles,
-    pub sub: Subscriber,
+    sub: Subscriber,
 }
 
 /// How [`RecordInstance::collect_subscriber_posts`] reaches a monitor's field
@@ -4069,6 +4069,11 @@ enum SubWalk {
 }
 
 impl FieldSubscriber {
+    /// The monitor itself.
+    pub fn sub(&self) -> &Subscriber {
+        &self.sub
+    }
+
     /// The field this monitor watches, as attached.
     pub fn field(&self) -> &str {
         match &self.name {
@@ -11259,7 +11264,7 @@ impl RecordInstance {
                 let sub = &entry.sub;
                 // Paused subscriber (`db_event_disable`): suppress at
                 // the source — no delivery, no coalesce.
-                if !sub.active {
+                if !sub.is_active() {
                     continue;
                 }
                 // Gate and narrow in one step through
@@ -11514,7 +11519,7 @@ impl RecordInstance {
                 let sub = &entry.sub;
                 // Paused subscriber (`db_event_disable`): suppress at
                 // the source — no delivery, no coalesce.
-                if !sub.active {
+                if !sub.is_active() {
                     continue;
                 }
                 // Same single owner as the snapshot path: gate and
@@ -11603,14 +11608,7 @@ impl RecordInstance {
         let kind =
             crate::server::event_queue::LogKind::of_field(desc, || self.resolve_field(field));
         let (sink, reader) = crate::server::event_queue::attach_with(user, sid, kind, context);
-        let subscriber = Subscriber {
-            sid,
-            data_type,
-            mask,
-            sink,
-            filters: crate::server::database::filters::FilterChain::new(),
-            active: true,
-        };
+        let subscriber = Subscriber::new(sid, data_type, mask, sink);
         let declared = declared_desc(desc, field);
         let ix = FieldIx::of(self.record.as_ref(), declared.or(desc));
         let entry = FieldSubscriber {
@@ -11684,7 +11682,7 @@ impl RecordInstance {
             .find(|sub| sub.watches_str(field))
         {
             Some(entry) => {
-                entry.sub.filters.push(filter);
+                entry.sub.push_filter(filter);
                 true
             }
             None => false,
@@ -11806,16 +11804,12 @@ impl RecordInstance {
     /// still delivered, exactly as in C: `db_event_disable` only unlinks the
     /// subscription from the record's monitor list (`dbEvent.c:524-535`) and
     /// never reaches into the event queue. No-op if no subscriber holds slot
-    /// `id`. The caller holds the record write lock, so this is exclusive with
-    /// the read-locked post paths that consult `Subscriber::active`.
-    pub fn set_subscriber_active(
-        &mut self,
-        id: crate::server::event_queue::AttachId,
-        active: bool,
-    ) {
-        for entry in self.subscribers.iter_mut() {
+    /// `id`. Takes `&self`: the flag is atomic in the shared entry, so a post
+    /// reading the same entry sees the change with no list rebuilt.
+    pub fn set_subscriber_active(&self, id: crate::server::event_queue::AttachId, active: bool) {
+        for entry in self.subscribers.iter() {
             if entry.sub.id() == id {
-                entry.sub.active = active;
+                entry.sub.set_active(active);
             }
         }
     }

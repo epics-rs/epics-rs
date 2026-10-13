@@ -22,10 +22,9 @@
 //! returns `false` if `softIoc` / `caget` / `caput` aren't on PATH —
 //! the test then becomes a noisy no-op rather than a hard failure.
 //!
-//! Both backends. The Rust half of each differential pair is the in-process
-//! async `CaServer`, which now takes its listener capability from the tokio
-//! runtime the test entered rather than from the seam `Reactor`, so the C
-//! `caget` reaches it under the exec backend too.
+//! Tokio backend only: the Rust half of each differential pair is the
+//! in-process async `CaServer`, served from the tokio runtime the test
+//! entered.
 
 #![cfg(tokio_backend)]
 

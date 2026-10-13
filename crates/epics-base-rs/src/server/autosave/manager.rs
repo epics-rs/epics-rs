@@ -236,12 +236,11 @@ impl AutosaveManager {
     /// starting from OK (:903, :1044).
     async fn report_status(&self, db: &PvDatabase, prefix: &str) {
         let mut shutdown_rx = self.shutdown.subscribe();
-        let mut ticker = crate::runtime::task::interval(std::time::Duration::from_secs(1));
         let mut heartbeat = 0i16;
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                _ = stopped(&mut shutdown_rx) => return,
+            // The first pass is immediate, as C's loop runs before it waits.
+            if is_stopped(&shutdown_rx) {
+                return;
             }
             let sets = self.sets();
             let statuses: Vec<_> = sets.iter().map(|(set, _)| set.list_status()).collect();
@@ -282,6 +281,11 @@ impl AutosaveManager {
             for (index, ((set, _), status)) in sets.iter().zip(statuses).enumerate().take(8) {
                 report_list(db, &format!("{prefix}SR_{index}_"), set, status).await;
             }
+            tokio::select! {
+                biased;
+                _ = stopped(&mut shutdown_rx) => return,
+                _ = crate::runtime::task::sleep(std::time::Duration::from_secs(1)) => {}
+            }
         }
     }
 
@@ -302,19 +306,21 @@ impl AutosaveManager {
         let handle = match set.config().strategy.clone() {
             SaveStrategy::Periodic { interval } => {
                 outer.spawn(async move {
-                    let mut ticker = crate::runtime::task::interval(interval);
-                    ticker.tick().await; // first tick is immediate, skip it
                     loop {
                         tokio::select! {
-                            _ = ticker.tick() => {
+                            biased;
+                            _ = stopped(&mut shutdown_rx) => break,
+                            _ = crate::runtime::task::sleep(interval) => {
                                 // No watermark to gate: a Periodic set
                                 // re-saves the whole set every interval,
-                                // so the next tick retries a failed save
+                                // so the next pass retries a failed save
                                 // by construction.
                                 let _guard = lock.lock().await;
+                                if is_stopped(&shutdown_rx) {
+                                    break;
+                                }
                                 let _ = set.save_once(&db).await;
                             }
-                            _ = stopped(&mut shutdown_rx) => break,
                         }
                     }
                 })
@@ -325,7 +331,6 @@ impl AutosaveManager {
                 poll_interval,
             } => {
                 outer.spawn(async move {
-                    let mut ticker = crate::runtime::task::interval(poll_interval);
                     let mut watermark = ChangeWatermark::new(
                         TriggerState {
                             last_value: None,
@@ -334,14 +339,19 @@ impl AutosaveManager {
                         set,
                         lock,
                         db,
+                        shutdown_rx.clone(),
                     );
 
+                    // The first poll is immediate: it is the baseline.
                     loop {
+                        if is_stopped(&shutdown_rx) {
+                            break;
+                        }
+                        triggered_poll(&mut watermark, &trigger_pv, mode).await;
                         tokio::select! {
-                            _ = ticker.tick() => {
-                                triggered_poll(&mut watermark, &trigger_pv, mode).await;
-                            }
+                            biased;
                             _ = stopped(&mut shutdown_rx) => break,
+                            _ = crate::runtime::task::sleep(poll_interval) => {}
                         }
                     }
                 })
@@ -350,15 +360,19 @@ impl AutosaveManager {
                 min_interval,
                 float_epsilon,
             } => outer.spawn(async move {
-                let mut ticker = crate::runtime::task::interval(min_interval);
-                let mut watermark = ChangeWatermark::new(HashMap::new(), set, lock, db);
+                let mut watermark =
+                    ChangeWatermark::new(HashMap::new(), set, lock, db, shutdown_rx.clone());
 
+                // The first poll is immediate: it is the baseline.
                 loop {
+                    if is_stopped(&shutdown_rx) {
+                        break;
+                    }
+                    onchange_poll(&mut watermark, float_epsilon).await;
                     tokio::select! {
-                        _ = ticker.tick() => {
-                            onchange_poll(&mut watermark, float_epsilon).await;
-                        }
+                        biased;
                         _ = stopped(&mut shutdown_rx) => break,
+                        _ = crate::runtime::task::sleep(min_interval) => {}
                     }
                 }
             }),
@@ -459,6 +473,15 @@ impl AutosaveManager {
 /// must `send_replace`, since `send` stores nothing while no task listens.
 async fn stopped(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
+}
+
+/// Whether the manager has been shut down or dropped, without waiting.
+///
+/// Read immediately before a save starts: the loops' `select!` only sees a
+/// stop between passes, and a pass can sit on the set lock behind a slow
+/// save while the manager goes away. Once this is true no save may start.
+pub(super) fn is_stopped(rx: &watch::Receiver<bool>) -> bool {
+    *rx.borrow() || rx.has_changed().is_err()
 }
 
 /// Compare two stringified values with float epsilon tolerance.

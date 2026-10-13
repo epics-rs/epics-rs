@@ -43,6 +43,7 @@ pub(super) struct ChangeWatermark<W> {
     set: Arc<SaveSet>,
     lock: Arc<Mutex<()>>,
     db: Arc<PvDatabase>,
+    stop: tokio::sync::watch::Receiver<bool>,
 }
 
 impl<W> ChangeWatermark<W> {
@@ -51,12 +52,14 @@ impl<W> ChangeWatermark<W> {
         set: Arc<SaveSet>,
         lock: Arc<Mutex<()>>,
         db: Arc<PvDatabase>,
+        stop: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
             state,
             set,
             lock,
             db,
+            stop,
         }
     }
 
@@ -84,6 +87,11 @@ impl<W> ChangeWatermark<W> {
         };
 
         let _guard = self.lock.lock().await;
+        // The wait for the lock can outlast the manager: no save starts
+        // once it is gone.
+        if super::manager::is_stopped(&self.stop) {
+            return;
+        }
         let result = self.set.save_once(&self.db).await;
         if result.is_ok() {
             self.state = candidate;

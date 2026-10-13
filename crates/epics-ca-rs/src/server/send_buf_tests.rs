@@ -220,6 +220,21 @@ fn circuit_monitored_pvs(
     user: &Arc<EventUser>,
     ctl_tx: &mpsc::UnboundedSender<EventTaskControl>,
 ) -> Vec<Arc<epics_base_rs::server::pv::ProcessVariable>> {
+    gated_circuit_monitored_pvs(n, user, ctl_tx)
+        .into_iter()
+        .map(|(pv, _)| pv)
+        .collect()
+}
+
+/// [`circuit_monitored_pvs`] with each monitor's gate, for cancelling one.
+fn gated_circuit_monitored_pvs(
+    n: u32,
+    user: &Arc<EventUser>,
+    ctl_tx: &mpsc::UnboundedSender<EventTaskControl>,
+) -> Vec<(
+    Arc<epics_base_rs::server::pv::ProcessVariable>,
+    crate::server::outbox::MonitorGate,
+)> {
     use epics_base_rs::server::pv::ProcessVariable;
     use epics_base_rs::types::DBR_DOUBLE;
 
@@ -230,6 +245,7 @@ fn circuit_monitored_pvs(
                 format!("CIRCUIT:{cid}"),
                 EpicsValue::Double(0.0),
             ));
+            let gate = crate::server::outbox::MonitorGate::open();
             let context: epics_base_rs::server::event_queue::DeliveryContext =
                 Arc::new(crate::server::tcp::CircuitMonitor {
                     target: ChannelTarget::SimplePv(pv.clone()),
@@ -239,7 +255,7 @@ fn circuit_monitored_pvs(
                     data_type: DBR_DOUBLE,
                     data_count: 0,
                     denied: Arc::new(AtomicBool::new(false)),
-                    gate: crate::server::outbox::MonitorGate::open(),
+                    gate: gate.clone(),
                     stage: crate::server::DeliveryStage::plain(),
                     reply: crate::server::tcp::ReplyContext {
                         req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
@@ -264,7 +280,7 @@ fn circuit_monitored_pvs(
                     cid,
                 })))
                 .unwrap();
-            pv
+            (pv, gate)
         })
         .collect()
 }
@@ -293,19 +309,136 @@ fn updates_ready_together_reach_the_wire_in_one_write() {
     assert!(poll_once(task.as_mut()).is_ready());
 }
 
-/// The send made before waiting is where a gone peer shows up when nothing
-/// filled the buffer, and it ends the task as a failed stage does.
+/// What [`run_event_task`] asked of its sink, in order.
+#[derive(Clone, Default)]
+struct Calls(Arc<Mutex<Vec<&'static str>>>);
+
+impl crate::server::tcp::EventSink for Calls {
+    fn stage(&mut self, _: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().push("stage");
+        Ok(())
+    }
+    fn send(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().push("send");
+        Ok(())
+    }
+}
+
+/// C `read_reply` sends when `eventsRemaining` is false: an entry with more
+/// behind it in its queue stays staged, the last one sends, and the send
+/// before waiting finds nothing left.
 #[test]
-fn a_failed_send_before_waiting_ends_the_task() {
+fn the_last_event_of_a_drained_queue_sends_what_is_staged() {
+    let user = Arc::new(EventUser::new());
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let pvs = circuit_monitored_pvs(2, &user, &ctl_tx);
+    let calls = Calls::default();
+    let mut task = pin!(run_event_task(user, ctl_rx, calls.clone()));
+    assert!(poll_once(task.as_mut()).is_pending());
+    calls.0.lock().unwrap().clear();
+    for pv in &pvs {
+        pv.set(EpicsValue::Double(1.0));
+    }
+    assert!(poll_once(task.as_mut()).is_pending());
+    assert_eq!(*calls.0.lock().unwrap(), ["stage", "stage", "send", "send"]);
+    drop(ctl_tx);
+    assert!(poll_once(task.as_mut()).is_ready());
+}
+
+/// An entry cancelled while in flight is the queue's last but sends nothing:
+/// C `event_read` runs no callback for a log whose `user_sub` is NULL
+/// (`dbEvent.c:978-993`), so `read_reply` never reaches its send.
+#[test]
+fn a_cancelled_last_event_sends_nothing() {
+    let user = Arc::new(EventUser::new());
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let pvs = gated_circuit_monitored_pvs(2, &user, &ctl_tx);
+    let calls = Calls::default();
+    let mut task = pin!(run_event_task(user, ctl_rx, calls.clone()));
+    assert!(poll_once(task.as_mut()).is_pending());
+    calls.0.lock().unwrap().clear();
+    for (pv, _) in &pvs {
+        pv.set(EpicsValue::Double(1.0));
+    }
+    pvs[1].1.revoke();
+    assert!(poll_once(task.as_mut()).is_pending());
+    assert_eq!(
+        *calls.0.lock().unwrap(),
+        ["stage", "send"],
+        "the first entry stays staged until the send before waiting"
+    );
+    drop(ctl_tx);
+    assert!(poll_once(task.as_mut()).is_ready());
+}
+
+/// A [`Calls`] whose sends fail once the peer is gone.
+#[derive(Clone, Default)]
+struct GoneCalls(Calls, Arc<AtomicBool>);
+
+impl crate::server::tcp::EventSink for GoneCalls {
+    fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        self.0.stage(frame)
+    }
+    fn send(&mut self) -> std::io::Result<()> {
+        self.0.send()?;
+        if self.1.load(Ordering::Relaxed) {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        Ok(())
+    }
+}
+
+/// The send at the end of a drained queue is where a peer that went away
+/// after the last successful send shows up first, and it ends the task there:
+/// a retirement already waiting in the control queue is never staged.
+#[test]
+fn a_failed_send_at_a_drained_queue_ends_the_task() {
     let user = Arc::new(EventUser::new());
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = circuit_monitored_pvs(1, &user, &ctl_tx);
+    let sink = GoneCalls::default();
+    let mut task = pin!(run_event_task(user, ctl_rx, sink.clone()));
+    assert!(poll_once(task.as_mut()).is_pending());
+    assert_eq!(*sink.0.0.lock().unwrap(), ["send"], "the peer was there");
+    sink.0.0.lock().unwrap().clear();
+    sink.1.store(true, Ordering::Relaxed);
+    pvs[0].set(EpicsValue::Double(1.0));
+    // A channel destroyed before its `Add` arrives, on another circuit's
+    // queue: its retirement is one staged frame, reached only if the task
+    // outlives the drained-queue send.
+    let db = PvDatabase::new();
+    let retired = monitored_pvs(&db, &Arc::new(EventUser::new()), 1);
+    destroy(&db, 1);
+    for d in retired {
+        ctl_tx.send(EventTaskControl::Add(Box::new(d))).unwrap();
+    }
+    assert!(
+        poll_once(task.as_mut()).is_ready(),
+        "the control sender is still held, so only the send error can end it"
+    );
+    assert_eq!(
+        *sink.0.0.lock().unwrap(),
+        ["stage", "send", "send"],
+        "update staged, drained-queue send failed, exit flush"
+    );
+}
+
+/// Frames no queue drain sends, such as a retirement, go out at the send
+/// before waiting, and a gone peer there ends the task too.
+#[test]
+fn a_failed_send_before_waiting_ends_the_task() {
+    let db = PvDatabase::new();
+    let user = Arc::new(EventUser::new());
+    let subs = monitored_pvs(&db, &user, 1);
+    destroy(&db, 1);
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    for d in subs {
+        ctl_tx.send(EventTaskControl::Add(Box::new(d))).unwrap();
+    }
     let wire = Arc::new(Wire::default());
+    wire.broken.store(true, Ordering::Relaxed);
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
     let mut task = pin!(run_event_task(user, ctl_rx, sink));
-    assert!(poll_once(task.as_mut()).is_pending());
-    wire.broken.store(true, Ordering::Relaxed);
-    pvs[0].set(EpicsValue::Double(1.0));
     assert!(
         poll_once(task.as_mut()).is_ready(),
         "the control sender is still held, so only the send error can end it"

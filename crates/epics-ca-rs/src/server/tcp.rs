@@ -5835,12 +5835,13 @@ pub(crate) enum EventTaskControl {
 
 /// What one `select` cycle of [`run_event_task`] resolved to.
 enum EventStep {
-    /// The circuit's oldest entry and the monitor it is for. Not boxed: a
-    /// step lives on this task's stack for one turn, and a box is one
-    /// allocation per delivered event.
+    /// The circuit's oldest entry, the monitor it is for, and C's
+    /// `eventsRemaining`. Not boxed: a step lives on this task's stack for
+    /// one turn, and a box is one allocation per delivered event.
     Delivered(
         epics_base_rs::server::event_queue::DeliveryContext,
         epics_base_rs::server::pv::MonitorEvent,
+        bool,
     ),
     /// Subscription `idx`'s producer is gone and its entries are delivered.
     Ended(usize),
@@ -5903,8 +5904,13 @@ async fn next_event_step(
     let readers = std::future::poll_fn(|cx| {
         loop {
             match std::task::ready!(events.poll_next(cx)) {
-                CircuitEvent::Event { context, event, .. } => {
-                    return std::task::Poll::Ready(EventStep::Delivered(context, event));
+                CircuitEvent::Event {
+                    context,
+                    event,
+                    remaining,
+                    ..
+                } => {
+                    return std::task::Poll::Ready(EventStep::Delivered(context, event, remaining));
                 }
                 CircuitEvent::Ended(id) => {
                     if let Some(idx) = subs.iter().position(|s| s.reader.id() == id) {
@@ -5974,9 +5980,9 @@ impl<S: EventSink> Drop for FlushOnExit<S> {
 /// send lock. So there is no third socket writer — monitors and write
 /// completions share this one owner.
 ///
-/// Frames are staged into the client's send buffer and sent once nothing more
-/// is ready (see [`EventSink`]); on the first error (peer gone) the thread
-/// exits. It returns when the control sender is dropped (clean disconnect) so
+/// Frames are staged into the client's send buffer and sent at the end of a
+/// drained queue, or once nothing more is ready (see [`EventSink`]); on the
+/// first error (peer gone) the thread exits. It returns when the control sender is dropped (clean disconnect) so
 /// the dispatch thread can join it.
 pub(crate) async fn run_event_task(
     events: Arc<epics_base_rs::server::event_queue::EventUser>,
@@ -6004,9 +6010,10 @@ pub(crate) async fn run_event_task(
     let (ev_outbox, mut ev_drain) = crate::server::outbox::channel();
     let mut sink = FlushOnExit(sink);
     loop {
-        // C `read_reply` sends only `if (!eventsRemaining)`
-        // (`camessage.c:593-594`): what this turn staged goes out when the
-        // task is about to wait, never per frame and never on a timer.
+        // C `read_reply` sends a delivered frame only `if (!eventsRemaining)`
+        // (`camessage.c:525`, `:536`, `:593`), below. The frames the other
+        // arms stage go out when the task is about to wait, never per frame
+        // and never on a timer.
         let step = {
             let next = next_event_step(&events, &mut subs, &mut pending_writes, &mut control);
             let mut next = std::pin::pin!(next);
@@ -6088,7 +6095,7 @@ pub(crate) async fn run_event_task(
                     break;
                 }
             }
-            EventStep::Delivered(context, event) => {
+            EventStep::Delivered(context, event, remaining) => {
                 let Some(m) = context.downcast_ref::<CircuitMonitor>() else {
                     continue;
                 };
@@ -6164,8 +6171,14 @@ pub(crate) async fn run_event_task(
                 match step {
                     // Cancelled mid-flight: the frame is dropped and the
                     // reader stays in `subs` until the `Cancel` control
-                    // message that follows the confirmation removes it.
-                    None | Some(DeliverStep::Delivered) => {}
+                    // message that follows the confirmation removes it. C
+                    // runs no callback for it, so it sends nothing either.
+                    None => {}
+                    Some(DeliverStep::Delivered) => {
+                        if !remaining && sink.0.send().is_err() {
+                            break;
+                        }
+                    }
                     Some(DeliverStep::PeerGone) => break,
                 }
             }

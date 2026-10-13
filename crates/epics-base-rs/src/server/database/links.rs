@@ -4146,7 +4146,7 @@ impl PvDatabase {
     /// so it is NOT alias-resolved. It MUST equal the name the calink/pvalink
     /// monitor dispatches under: that monitor is opened through the lset,
     /// which strips the `ca://` / `pva://` scheme first, so its `pv_name`
-    /// (passed to [`Self::dispatch_external_cp_targets`]) is the bare PV.
+    /// (passed to [`super::ExternalCpProcess::new`]) is the bare PV.
     /// Stripping the same schemes here — the set `Self::resolve_external_pv`
     /// already knows — guarantees the registry key and the dispatch key can
     /// never diverge. The `target_record` (the local holder) IS alias-resolved
@@ -4188,7 +4188,7 @@ impl PvDatabase {
     /// Every external PV name that has at least one CP/CPP holder edge.
     /// The calink/pvalink integration warms (opens a monitor for) each of
     /// these at iocInit so the remote source has a live subscription whose
-    /// callback can drive [`Self::dispatch_external_cp_targets`] — a Passive
+    /// callback can drive an [`super::ExternalCpProcess`] — a Passive
     /// CP holder is otherwise never read and its monitor never opens.
     pub async fn external_cp_pv_names(&self) -> Vec<String> {
         self.inner
@@ -4637,7 +4637,7 @@ impl PvDatabase {
         }
         // Warm external CP/CPP links. A Passive holder of an external CP
         // link is never scanned, so its link never opens lazily and the
-        // calink monitor that drives `dispatch_external_cp_targets` is never
+        // calink monitor that drives its `ExternalCpProcess` is never
         // created (chicken-and-egg). Open each external CP PV now so its
         // monitor is live at iocInit — the C `dbCa.c` "add the link at init"
         // analogue (`dbCaAddLink`). `resolve_external_pv` routes through the

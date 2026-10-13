@@ -119,10 +119,14 @@ fn a_read_only_connect_processes_the_cp_holder_as_softioc_does() {
     // asCa's eventCallback updates the ACF inputs outside asLock, so an
     // initial event landing inside asComputeAllAsg has its inpChanged bit
     // cleared (asLibRoutines.c:966, :979) and READ stays denied until the
-    // input posts again. Post each input once after boot, when nothing
-    // else evaluates the rules, and hold the holders until UP is readable.
-    put("GW", "0");
-    put("GR", "0");
+    // input posts again. Post each input after boot, when nothing else
+    // evaluates the rules, and hold the holders until UP is readable. A bo
+    // posts on a VAL change, so each goes 1 then back to 0: a repeated 0
+    // posts only the first time, when STAT leaves UDF.
+    for pv in ["GW", "GR"] {
+        put(pv, "1");
+        put(pv, "0");
+    }
     let readable = || {
         c_ca_tools::run_caget(&server.ca_addr_list(), server.udp_port, "UP")
             .is_some_and(|v| !v.contains("no read access"))

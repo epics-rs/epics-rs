@@ -183,9 +183,9 @@ mod demo_db {
         // independent link's monitor→record latency and on timer callbacks
         // sharing the `cbMedium` band (§5.4).
         //
-        // `RTEMS:CA:FAST` is the chain head — an external CP link, so
-        // `run_monitor`'s inline `dispatch_external_cp_targets` is what
-        // processes it, on the band worker that received the event. Its
+        // `RTEMS:CA:FAST` is the chain head — an external CP link, so the
+        // link's `run_processor` task processes it when `run_monitor`
+        // requests it, on the client reactor's band worker. Its
         // FLNK runs C1..C8: nine records processed inline per upstream
         // event, which is the shape §5.4 says is unbounded.
         "record(ai, \"RTEMS:CA:FAST\") {\n",
@@ -1344,8 +1344,8 @@ mod ioc {
         //
         // (a) The band-occupancy tick. A `runtime::task::spawn` +
         //     `runtime::task::sleep` loop, which on this target IS a
-        //     `cbMedium` band task — the same band `run_monitor` and its
-        //     inline `dispatch_external_cp_targets` run on (§5.4). Each
+        //     `cbMedium` band task — the same band `run_monitor` and the
+        //     link's `run_processor` run on (§5.4). Each
         //     wake writes an incrementing count to `RTEMS:CA:TICK`, so a
         //     host `camonitor` on that record measures the band's timer
         //     jitter directly: `Instant` is 1-second-quantized on target

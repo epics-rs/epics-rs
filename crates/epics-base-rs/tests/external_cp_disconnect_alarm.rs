@@ -19,9 +19,17 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalCpProcess, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
+
+/// One request taken by the link's worker: the only way a holder of an
+/// external CP link processes.
+fn process_holders(db: &PvDatabase) {
+    let process = ExternalCpProcess::new("UP:PV".to_string());
+    process.request();
+    process.run_pending(Some(db));
+}
 
 /// An lset with a switchable circuit, modelling `CaLink`'s servability
 /// gate: while `up` is false every value-derived accessor reports `None`,
@@ -108,7 +116,7 @@ async fn a_dispatch_on_a_dropped_link_commits_link_invalid() {
     let db = holder_db(lset.clone()).await;
 
     // Circuit up: the CP dispatch is the ordinary monitor-event path.
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         db.get_pv("HOLDER").ok(),
         Some(EpicsValue::Double(42.5)),
@@ -125,7 +133,7 @@ async fn a_dispatch_on_a_dropped_link_commits_link_invalid() {
     // processed again, and reports its last good value with SEVR=0 for
     // the whole outage.
     lset.set_up(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
 
     assert_eq!(
         alarm_of(&db, "HOLDER"),
@@ -148,11 +156,11 @@ async fn the_link_alarm_clears_on_the_next_event_after_recovery() {
     let db = holder_db(lset.clone()).await;
 
     lset.set_up(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(alarm_of(&db, "HOLDER").1, 3, "outage must raise INVALID");
 
     lset.set_up(true);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         alarm_of(&db, "HOLDER"),
         (0, 0),

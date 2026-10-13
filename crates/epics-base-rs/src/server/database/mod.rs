@@ -29,7 +29,8 @@ pub(crate) use links::{
 };
 pub(crate) use processing::NotifiedRead;
 pub use processing::{
-    AsyncDbHandle, AsyncToken, InputLinkTexts, PostItem, PostRule, ProcStack, TokenWatch,
+    AsyncDbHandle, AsyncToken, ExternalCpProcess, InputLinkTexts, PostItem, PostRule, ProcStack,
+    TokenWatch,
 };
 pub(crate) use record_lock::{FrameGate, InFrame, LockRecord, SetGuard};
 pub use record_lock::{LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard};
@@ -770,8 +771,8 @@ struct PvDatabaseInner {
     /// → holder edges to process when that remote PV changes. The local
     /// [`Self::cp_links`] index is keyed by a local source RECORD that
     /// processes here; a cross-IOC source never processes locally, so its
-    /// only trigger is the calink/pvalink CA monitor callback, which calls
-    /// [`PvDatabase::dispatch_external_cp_targets`]. Parity with C
+    /// only trigger is the calink/pvalink CA monitor callback, which requests
+    /// it through an [`ExternalCpProcess`]. Parity with C
     /// `dbCa.c:958-962` `eventCallback` adding `CA_DBPROCESS`.
     ///
     /// Read-modify-write cell; sole writer `CpRegistry::set_link`, so

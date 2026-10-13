@@ -177,7 +177,8 @@ fn db_file(db_content: &str) -> std::path::PathBuf {
 /// Spawn a `softIoc` on `port`, or `None` when that number was taken between
 /// the probe and C's bind.
 ///
-/// `None` means [`softioc_verdict::PORT_WAS_TAKEN`] and nothing else. Every other way this can
+/// `None` means [`softioc_verdict::PORT_WAS_TAKEN`] or a lone
+/// [`softioc_verdict::NO_TCP_SERVER`] and nothing else. Every other way this can
 /// go wrong — the binary refusing to start, the IOC dying, neither line
 /// arriving inside the budget — panics with the console, because none of them
 /// gets better on a different port.
@@ -244,7 +245,8 @@ fn softioc_on(db_path: &Path, acf_path: Option<&Path>, port: u16) -> Option<Mana
 /// once the IOC has said it is serving.
 ///
 /// The port is a candidate, not a reservation — see the `named-port` crate
-/// for the rule and [`softioc_verdict::PORT_WAS_TAKEN`] for the evidence this one retries on.
+/// for the rule, and [`softioc_verdict::PORT_WAS_TAKEN`] and
+/// [`softioc_verdict::NO_TCP_SERVER`] for the evidence this one retries on.
 ///
 /// Panics instead of reporting an absence. The absent-prerequisite skip is
 /// owned by [`require_tool`] at the call site, so by the time this runs

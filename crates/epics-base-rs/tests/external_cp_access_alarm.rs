@@ -22,9 +22,17 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalCpProcess, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
+
+/// One request taken by the link's worker: the only way a holder of an
+/// external CP link processes.
+fn process_holders(db: &PvDatabase) {
+    let process = ExternalCpProcess::new("UP:PV".to_string());
+    process.request();
+    process.run_pending(Some(db));
+}
 
 /// An lset with a switchable READ gate, modelling `CaLink::value()`'s
 /// access-rights gate: while `readable` is false the value read reports
@@ -121,7 +129,7 @@ async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
     // write loss too (`dbCa.c:1029`), but `dbCaGetLink` does not consult
     // `hasWriteAccess`, so the dispatched holder reads a good value and
     // lands no alarm.
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         db.get_pv("HOLDER").ok(),
         Some(EpicsValue::Double(42.5)),
@@ -135,7 +143,7 @@ async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
 
     // READ access revoked, circuit still up.
     lset.set_readable(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
 
     assert_eq!(
         alarm_of(&db, "HOLDER"),
@@ -160,7 +168,7 @@ async fn the_link_alarm_clears_on_the_next_event_after_read_access_returns() {
     let db = holder_db(lset.clone()).await;
 
     lset.set_readable(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         alarm_of(&db, "HOLDER").1,
         3,
@@ -168,7 +176,7 @@ async fn the_link_alarm_clears_on_the_next_event_after_read_access_returns() {
     );
 
     lset.set_readable(true);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         alarm_of(&db, "HOLDER"),
         (0, 0),

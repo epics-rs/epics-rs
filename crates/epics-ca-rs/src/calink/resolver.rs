@@ -18,7 +18,8 @@ use crate::protocol::{DBE_ALARM, DBE_VALUE};
 use arc_swap::ArcSwap;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+    ExternalCpProcess, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
+    PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::DBR_CTRL_DOUBLE;
@@ -227,14 +228,13 @@ struct LinkConnState {
     /// (`dbCa.c:847-849`), and the next `dbCaGetLink` re-sets it; this port
     /// leaves it set, so the two disagree only inside that window.
     used_input_native: AtomicBool,
-    /// C `CA_DBPROCESS` in `pca->link_action` (`dbCa.c:155`): set by
-    /// [`Self::request_process`], cleared by [`run_processor`] before it
-    /// processes, so requests raised before the worker runs are one process.
-    process_pending: AtomicBool,
+    /// C `CA_DBPROCESS` in `pca->link_action` (`dbCa.c:155`): requested by
+    /// [`Self::request_process`], taken by [`run_processor`]. It owns the
+    /// holders' dispatch, so nothing here can process them inline.
+    process: ExternalCpProcess,
     /// The `workListEvent` signal (`dbCa.c:160`), sent on the 0→1 edge only.
     process_wake: epics_base_rs::runtime::sync::Notify,
     db: Arc<RwLock<Option<PvDatabase>>>,
-    pv_name: String,
 }
 
 impl LinkConnState {
@@ -246,10 +246,9 @@ impl LinkConnState {
             n_disconnect: AtomicU64::new(0),
             connects_seen: AtomicU64::new(0),
             used_input_native: AtomicBool::new(false),
-            process_pending: AtomicBool::new(false),
+            process: ExternalCpProcess::new(pv_name),
             process_wake: epics_base_rs::runtime::sync::Notify::new(),
             db,
-            pv_name,
         }
     }
 
@@ -261,7 +260,7 @@ impl LinkConnState {
     /// CP/CPP holder of this link is processed. A request made while one is
     /// pending merges into it, as the OR into `link_action` does.
     fn request_process(&self) {
-        if !self.process_pending.swap(true, Ordering::AcqRel) {
+        if self.process.request() {
             self.process_wake.notify_one();
         }
     }
@@ -269,16 +268,10 @@ impl LinkConnState {
     /// One step of [`run_processor`]: take the pending request and, if
     /// there was one, process the holders. Returns whether it processed.
     fn process_pending(&self) -> bool {
-        if !self.process_pending.swap(false, Ordering::AcqRel) {
-            return false;
-        }
         // Drop the read guard before dispatching: the dispatch runs record
         // processing.
         let db_handle = self.db.read().clone();
-        if let Some(db_handle) = db_handle {
-            db_handle.dispatch_external_cp_targets(&self.pv_name);
-        }
-        true
+        self.process.run_pending(db_handle.as_ref())
     }
 
     /// Mark the link live. Returns `true` on the false→true edge.
@@ -633,9 +626,9 @@ pub struct CaLinkResolver {
     client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
     /// Open links keyed by bare PV name (`ca://` scheme stripped).
     links: Arc<RwLock<HashMap<String, Arc<CaLink>>>>,
-    /// Database handle the monitor callback uses to process external
+    /// Database handle the link's processor uses to process external
     /// CP/CPP holder records on each remote change
-    /// ([`PvDatabase::dispatch_external_cp_targets`]). `None` until
+    /// ([`ExternalCpProcess::run_pending`]). `None` until
     /// [`Self::attach_database`] is called at IOC assembly. Late-bound
     /// behind a lock so the cheaply-`Clone`d resolver can have the DB
     /// attached after construction — the same shape as `pvalink`'s
@@ -691,9 +684,9 @@ impl CaLinkResolver {
             .await
     }
 
-    /// Attach the database handle the monitor callback uses to process
+    /// Attach the database handle the link's processor uses to process
     /// external CP/CPP holder records on each remote change
-    /// ([`PvDatabase::dispatch_external_cp_targets`]). Called by
+    /// ([`ExternalCpProcess::run_pending`]). Called by
     /// [`install_calink_resolver`] at IOC assembly — before iocInit's
     /// `setup_cp_links` warms any external CP link — so the handle is
     /// always present by the time the first monitor event fires. The
@@ -881,6 +874,26 @@ async fn run_processor(state: Arc<LinkConnState>) {
     }
 }
 
+/// One good monitor event: C `dbCa.c eventCallback` refreshes the cached
+/// value, then adds `CA_DBPROCESS` (`dbCa.c:891`, `:958-962`). The cache is
+/// stored first, so the holder's INP read sees the fresh value.
+fn note_monitor_value(
+    cache: &ArcSwap<Option<CachedSnapshot>>,
+    connected: &LinkConnState,
+    snapshot: Snapshot,
+    native_count: u32,
+) {
+    // A delivered monitor event is itself proof of liveness — mark the link
+    // connected even if the `Connected` lifecycle event has not been observed
+    // yet (race-free, mirrors `pvalink`'s callback).
+    connected.mark_connected();
+    cache.store(Arc::new(Some(CachedSnapshot {
+        snapshot,
+        native_count,
+    })));
+    connected.request_process();
+}
+
 /// Monitor task: drain the subscription, refresh the cache on every
 /// event. Ends when the channel is dropped (`recv` returns `None`).
 ///
@@ -897,11 +910,6 @@ async fn run_monitor(
     while let Some(event) = monitor.recv().await {
         match event {
             Ok(snapshot) => {
-                // A delivered monitor event is itself proof of
-                // liveness — mark the link connected even if the
-                // `Connected` lifecycle event has not been observed
-                // yet (race-free, mirrors `pvalink`'s callback).
-                connected.mark_connected();
                 // Capture the channel's native element count this event was
                 // produced under, so a later type/count change makes the
                 // cache unservable (the DBR type is intrinsic to the
@@ -912,15 +920,7 @@ async fn run_monitor(
                 let native_count = channel
                     .element_count()
                     .unwrap_or_else(|_| snapshot.value.count());
-                cache.store(Arc::new(Some(CachedSnapshot {
-                    snapshot,
-                    native_count,
-                })));
-                // C `dbCa.c eventCallback` refreshes the cached value, then
-                // adds `CA_DBPROCESS` (`dbCa.c:891`, `:958-962`). The cache is
-                // stored ABOVE first, so the holder's INP read sees the fresh
-                // value — the C ordering.
-                connected.request_process();
+                note_monitor_value(&cache, &connected, snapshot, native_count);
             }
             // A monitor error event (e.g. a transient server-side
             // problem) leaves the last cached value in place — the
@@ -1408,7 +1408,7 @@ fn strip_ca_scheme(name: &str) -> &str {
 pub async fn install_calink_resolver(db: &PvDatabase) -> CaLinkResolver {
     let resolver = CaLinkResolver::new();
     // Attach the DB before registering the lset, so the monitor callback
-    // can drive `dispatch_external_cp_targets` from the first event on.
+    // can request the holders' process from the first event on.
     // This runs before iocInit's `setup_cp_links` warms any external CP
     // link, so the handle is always
     // present when the first warmed-link event arrives.
@@ -1649,6 +1649,63 @@ mod tests {
         (state, lset, db)
     }
 
+    /// One processing of `UP:PV`'s holders, taken by a worker of its own.
+    fn process_once(db: &PvDatabase) {
+        let process = ExternalCpProcess::new("UP:PV".to_string());
+        process.request();
+        process.run_pending(Some(db));
+    }
+
+    /// C `accessRightsCallback` only adds `CA_DBPROCESS` (`dbCa.c:1029`):
+    /// a rights change processes the holder when the processor takes it,
+    /// and two before it runs are one process.
+    #[test]
+    fn a_rights_change_processes_the_cp_holder_only_on_the_processor() {
+        let (state, lset, db) = cp_holder();
+        let reads = || lset.reads.load(Ordering::Relaxed);
+        let base = reads();
+        process_once(&db);
+        let one = reads() - base;
+        state.mark_connected();
+
+        let base = reads();
+        assert!(state.note_access_rights(false, false));
+        assert!(state.note_access_rights(true, false));
+        assert_eq!(reads(), base, "the rights callback processed inline");
+        assert!(state.process_pending());
+        assert_eq!(reads() - base, one);
+        assert!(!state.process_pending());
+    }
+
+    /// C `eventCallback` only adds `CA_DBPROCESS` (`dbCa.c:958-962`): a
+    /// monitor event processes the holder when the processor takes it, and
+    /// two before it runs are one process.
+    #[test]
+    fn a_monitor_event_processes_the_cp_holder_only_on_the_processor() {
+        let (state, lset, db) = cp_holder();
+        let reads = || lset.reads.load(Ordering::Relaxed);
+        let base = reads();
+        process_once(&db);
+        let one = reads() - base;
+        let cache = ArcSwap::from_pointee(None);
+        let event = || {
+            Snapshot::new(
+                EpicsValue::Double(1.0),
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+        };
+
+        let base = reads();
+        note_monitor_value(&cache, &state, event(), 1);
+        note_monitor_value(&cache, &state, event(), 1);
+        assert_eq!(reads(), base, "the monitor callback processed inline");
+        assert!(state.process_pending());
+        assert_eq!(reads() - base, one);
+        assert!(!state.process_pending());
+    }
+
     /// C `addAction` (`dbCa.c:132-161`) per boundary, with the processor
     /// stepped by hand: requests raised before it runs are one process, and
     /// one raised during the process is a second.
@@ -1659,7 +1716,7 @@ mod tests {
         assert!(!state.process_pending(), "nothing requested");
         // What one processing of the holder reads, the unit counted below.
         let base = reads();
-        db.dispatch_external_cp_targets("UP:PV");
+        process_once(&db);
         let one = reads() - base;
         assert!(one > 0);
 
@@ -1697,7 +1754,7 @@ mod tests {
 
         state.sync(fold(true, RW, 0));
         let before = reads();
-        db.dispatch_external_cp_targets("UP:PV");
+        process_once(&db);
         let one = reads() - before;
         let before = reads();
 

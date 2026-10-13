@@ -8269,7 +8269,7 @@ impl PvDatabase {
     /// links in a bare `epics-base-rs` IOC). `posts` is what restores the C
     /// rule on top of that shape: the same `DBE_VALUE|DBE_ALARM` gate the
     /// cross-IOC path gets from its remote monitor
-    /// ([`Self::dispatch_external_cp_targets`]), so "CP dispatch" means one
+    /// (`Self::dispatch_external_cp_targets`), so "CP dispatch" means one
     /// thing on both paths.
     ///
     /// The dispatch itself is the moral equivalent of dbCaTask's
@@ -8301,7 +8301,7 @@ impl PvDatabase {
     /// Process a single CP/CPP target edge, applying the CPP passive gate.
     /// This is the single owner of the scan-time CP-dispatch decision, shared
     /// by the local-source path ([`Self::dispatch_cp_targets`]) and the
-    /// cross-IOC path ([`Self::dispatch_external_cp_targets`]) so both honour
+    /// cross-IOC path (`Self::dispatch_external_cp_targets`) so both honour
     /// the same `dbCa.c` semantics.
     ///
     /// The passive gate is the ONLY thing decided here. C's `CA_DBPROCESS`
@@ -8356,7 +8356,10 @@ impl PvDatabase {
     /// A fresh `visited` set starts a new process chain —
     /// the monitor event is an independent external trigger, like a scan,
     /// not a continuation of an in-flight local chain.
-    pub fn dispatch_external_cp_targets(&self, external_pv: &str) {
+    ///
+    /// Private: [`ExternalCpProcess::run_pending`] is the only caller, so a
+    /// link callback can request a process but never run one inline.
+    fn dispatch_external_cp_targets(&self, external_pv: &str) {
         let targets = self.get_external_cp_targets(external_pv);
         if targets.is_empty() {
             return;
@@ -10187,6 +10190,44 @@ fn db_get_link_failed(
     }
     let mut instance = rec.write();
     crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
+}
+
+/// C `CA_DBPROCESS` in one link's `pca->link_action` (`dbCa.c:132-161`):
+/// link callbacks [`Self::request`] a process of `external_pv`'s CP/CPP
+/// holders and the link's worker, `dbCaTask`'s twin, runs it with
+/// [`Self::run_pending`], which takes the request before processing
+/// (`dbCa.c:1190-1195`). Requests raised before the worker runs are one
+/// process; one raised during it is another.
+pub struct ExternalCpProcess {
+    pending: std::sync::atomic::AtomicBool,
+    external_pv: String,
+}
+
+impl ExternalCpProcess {
+    pub fn new(external_pv: String) -> Self {
+        Self {
+            pending: std::sync::atomic::AtomicBool::new(false),
+            external_pv,
+        }
+    }
+
+    /// Request a process. Returns `true` on the 0→1 edge, the one request
+    /// that must wake the worker (`dbCa.c:160`).
+    pub fn request(&self) -> bool {
+        !self.pending.swap(true, Ordering::AcqRel)
+    }
+
+    /// Take the pending request and, if there was one, process the holders
+    /// in `db`. Returns whether a request was taken.
+    pub fn run_pending(&self, db: Option<&PvDatabase>) -> bool {
+        if !self.pending.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        if let Some(db) = db {
+            db.dispatch_external_cp_targets(&self.external_pv);
+        }
+        true
+    }
 }
 
 #[cfg(test)]

@@ -115,10 +115,11 @@ fn nturi_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
                 "query".into(),
                 FieldDesc::Structure {
                     struct_id: "".into(),
-                    fields: query_desc,
+                    fields: query_desc.into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     };
     (desc, PvField::Structure(root))
 }
@@ -327,7 +328,7 @@ fn direct_struct_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
     s.fields = fields;
     let desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: desc_fields,
+        fields: desc_fields.into(),
     };
     (desc, PvField::Structure(s))
 }
@@ -438,7 +439,7 @@ impl ChannelSource for FailAtDataSource {
     async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         })
     }
     // The data-phase failure: INIT negotiated a descriptor, but the
@@ -512,7 +513,7 @@ impl ChannelSource for PanicSource {
     async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         })
     }
     async fn get_value(&self, _: &str) -> Option<PvField> {

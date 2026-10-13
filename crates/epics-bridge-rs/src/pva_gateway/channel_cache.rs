@@ -1824,7 +1824,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
@@ -1866,7 +1867,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
@@ -1922,7 +1924,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");

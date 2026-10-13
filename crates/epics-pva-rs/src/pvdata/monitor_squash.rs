@@ -160,7 +160,8 @@ mod tests {
                 ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("c".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         }
     }
 

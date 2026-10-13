@@ -78,7 +78,8 @@ fn type_code_roundtrip_structure_named_with_id() {
         fields: vec![
             ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
             ("descriptor".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     };
     both_orders(d);
 }
@@ -89,7 +90,7 @@ fn type_code_roundtrip_structure_empty_id() {
     // decode must yield the same empty id.
     let d = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("v".into(), FieldDesc::Scalar(ScalarType::Int))],
+        fields: vec![("v".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
     };
     both_orders(d);
 }
@@ -98,7 +99,7 @@ fn type_code_roundtrip_structure_empty_id() {
 fn type_code_roundtrip_structure_array() {
     let d = FieldDesc::StructureArray {
         struct_id: String::new(),
-        fields: vec![("v".into(), FieldDesc::Scalar(ScalarType::Int))],
+        fields: vec![("v".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
     };
     both_orders(d);
 }
@@ -197,7 +198,7 @@ fn bounded_string_nested_in_structure_interop_normalizes_to_plain_string() {
         // String scalar tag.
         let canonical_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("s".into(), FieldDesc::Scalar(ScalarType::String))],
+            fields: vec![("s".into(), FieldDesc::Scalar(ScalarType::String))].into(),
         };
         let mut canonical = Vec::new();
         encode_type_desc(&canonical_desc, order, &mut canonical);
@@ -240,18 +241,19 @@ fn type_code_roundtrip_nested_structure() {
     // exercises the recursive descent in `encode_structure_body`.
     let inner = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))],
+        fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
     };
     let middle = FieldDesc::StructureArray {
         struct_id: String::new(),
-        fields: vec![("inner".into(), inner)],
+        fields: vec![("inner".into(), inner)].into(),
     };
     let outer = FieldDesc::Structure {
         struct_id: "outer:1.0".into(),
         fields: vec![
             ("seq".into(), FieldDesc::Scalar(ScalarType::ULong)),
             ("payload".into(), middle),
-        ],
+        ]
+        .into(),
     };
     both_orders(outer);
 }

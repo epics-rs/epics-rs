@@ -45,7 +45,7 @@ async fn interop_rpc_pvxcall_against_rust_server() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "rpc_in".into(),
-            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "rpc_in".into(),
@@ -84,7 +84,7 @@ async fn interop_rpc_pvxcall_against_rust_server() {
         };
         let out_desc = FieldDesc::Structure {
             struct_id: "rpc_out".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         let out_val = PvField::Structure(PvStructure {
             struct_id: "rpc_out".into(),
@@ -147,7 +147,7 @@ async fn interop_get_field_pvxinfo_against_rust_server() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".into(),

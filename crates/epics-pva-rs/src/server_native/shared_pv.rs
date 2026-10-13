@@ -1801,7 +1801,7 @@ mod tests {
     fn nt_scalar_int_desc() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         }
     }
 
@@ -1849,14 +1849,16 @@ mod tests {
                 ),
                 ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("timeStamp".into(), time_t),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -1918,7 +1920,7 @@ mod tests {
         // Descriptor says NTScalar<Double>, value is NTScalar<Int>.
         let double_desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let double_value = || {
             let mut s = crate::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");

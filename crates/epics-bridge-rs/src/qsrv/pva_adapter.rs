@@ -2108,7 +2108,7 @@ mod tests {
         // Canonical descriptor: NTScalar<Double>.
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let handle = PvaPvHandle::new(Some(desc));
 
@@ -2247,7 +2247,7 @@ mod tests {
 
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let handle = PvaPvHandle::new(Some(desc));
 
@@ -3387,7 +3387,8 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
-            ],
+            ]
+            .into(),
         };
         // Mark ONLY member a; b carries its unmarked type default.
         let mut changed = BitSet::new();
@@ -3506,7 +3507,8 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
-            ],
+            ]
+            .into(),
         };
         let changed = BitSet::new(); // nothing marked
         let mut delta = PvStructure::new("structure");

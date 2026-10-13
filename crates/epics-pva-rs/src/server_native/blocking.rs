@@ -1497,7 +1497,7 @@ pub(super) mod tests {
     fn scalar_intro() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         }
     }
 
@@ -1846,7 +1846,7 @@ pub(super) mod tests {
         // only job here is to be defined once and referenced later.
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         };
         const SLOT: u16 = 0x0001;
         const INIT: u8 = 0x08;
@@ -2141,7 +2141,7 @@ pub(super) mod tests {
         encode_type_desc(
             &FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: Vec::new(),
+                fields: Vec::new().into(),
             },
             order,
             &mut init,

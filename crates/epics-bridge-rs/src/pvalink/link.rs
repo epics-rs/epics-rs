@@ -2998,7 +2998,8 @@ mod tests {
                         Status::ok().write_into(ORDER, &mut p);
                         let intro = FieldDesc::Structure {
                             struct_id: "epics:nt/NTScalar:1.0".into(),
-                            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+                            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))]
+                                .into(),
                         };
                         epics_pva_rs::pvdata::encode::encode_type_desc(&intro, ORDER, &mut p);
                     } else {
@@ -4216,7 +4217,7 @@ mod tests {
         pv.open(
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
             },
             PvField::Structure(PvStructure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -4299,7 +4300,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::ScalarArray(ScalarType::Long)),
                 ("aux".into(), FieldDesc::ScalarArray(ScalarType::Long)),
-            ],
+            ]
+            .into(),
         };
         let initial = PvField::Structure(PvStructure {
             struct_id: "structure".into(),
@@ -4404,7 +4406,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("setpoint".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         }
     }
 

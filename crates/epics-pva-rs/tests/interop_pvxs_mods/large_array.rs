@@ -43,7 +43,7 @@ const N: usize = 100_000;
 fn build_large_array_pv() -> SharedPV {
     let desc = FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
     };
     let values: Vec<ScalarValue> = (0..N)
         .map(|i| ScalarValue::Double(i as f64 * 0.5))

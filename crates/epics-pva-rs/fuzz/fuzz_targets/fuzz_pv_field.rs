@@ -28,7 +28,8 @@ fn intro() -> &'static FieldDesc {
                         ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
             (
@@ -39,10 +40,12 @@ fn intro() -> &'static FieldDesc {
                         ("secondsPastEpoch".into(), FieldDesc::Scalar(ScalarType::Long)),
                         ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::UInt)),
                         ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     })
 }
 

@@ -1111,7 +1111,7 @@ mod tests {
             async {
                 Some(FieldDesc::Structure {
                     struct_id: "epics:nt/NTScalar:1.0".into(),
-                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
                 })
             }
         }

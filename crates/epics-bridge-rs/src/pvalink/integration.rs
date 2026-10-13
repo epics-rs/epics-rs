@@ -4498,7 +4498,7 @@ mod tests {
         // PVA server hosting a `long[]` / `ulong[]`-valued PV.
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(elem_type))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(elem_type))].into(),
         };
         let initial = PvField::Structure(epics_pva_rs::pvdata::PvStructure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),

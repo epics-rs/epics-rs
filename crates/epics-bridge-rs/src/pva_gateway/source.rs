@@ -2935,7 +2935,8 @@ ASG(DEFAULT) {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         // The merged snapshot: `b` moved in an event this subscriber never saw.
         let merged = {

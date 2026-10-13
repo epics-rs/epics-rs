@@ -278,7 +278,8 @@ impl ControlSource {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Long)),
                 ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -810,7 +811,7 @@ mod tests {
 
         let empty_req = || FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
 
         // cacheSize must aggregate the non-first tenant's two entries.
@@ -967,7 +968,7 @@ mod tests {
                 checked("gw:flush").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1000,7 +1001,7 @@ mod tests {
                 "gw:flush",
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
             )
@@ -1024,7 +1025,7 @@ mod tests {
                 checked("gw:flush").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1048,7 +1049,7 @@ mod tests {
                 checked("gw:flush").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("intruder", "ca"),
@@ -1066,7 +1067,7 @@ mod tests {
                 checked("gw:drop").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1085,7 +1086,7 @@ mod tests {
                 checked("gw:drop").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 nturi_with_arg("pv", "NO:SUCH:PV"),
                 ctx("ops", "ca"),
@@ -1108,7 +1109,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1135,7 +1136,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 nturi_with_arg("path", path.to_str().unwrap()),
                 ctx("ops", "ca"),
@@ -1162,7 +1163,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1184,7 +1185,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 nturi_with_arg("path", path.to_str().unwrap()),
                 ctx("ops", "ca"),

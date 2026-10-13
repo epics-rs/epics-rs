@@ -881,7 +881,10 @@ fn decode_structure_body_cached_at_depth(
             cur, order, cache, policy, depth,
         )?);
     }
-    Ok(FieldDesc::Structure { struct_id, fields })
+    Ok(FieldDesc::Structure {
+        struct_id,
+        fields: fields.into(),
+    })
 }
 
 // Union twin of [`decode_structure_body_cached_at_depth`] — decodes into
@@ -2852,10 +2855,12 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -2921,7 +2926,8 @@ mod tests {
             fields: vec![
                 ("name".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("value".into(), FieldDesc::Variant),
-            ],
+            ]
+            .into(),
         };
         for order in [ByteOrder::Little, ByteOrder::Big] {
             let mut buf = Vec::new();
@@ -2944,11 +2950,11 @@ mod tests {
     fn struct_array_element_accepts_type_cache_markers() {
         let element = FieldDesc::Structure {
             struct_id: "elem_t".into(),
-            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let expected = FieldDesc::StructureArray {
             struct_id: "elem_t".into(),
-            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         for order in [ByteOrder::Little, ByteOrder::Big] {
             // Inline element struct descriptor bytes (`0x80 ...`).
@@ -3195,21 +3201,24 @@ mod tests {
                 ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         };
         let nt_double = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("alarm".into(), alarm.clone()),
-            ],
+            ]
+            .into(),
         };
         let nt_int = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("alarm".into(), alarm.clone()),
-            ],
+            ]
+            .into(),
         };
 
         let order = ByteOrder::Little;
@@ -3263,7 +3272,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("alarm".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
 
         let mut prior_struct = PvStructure::new("test:S:1.0");
@@ -3336,7 +3346,7 @@ mod tests {
         for _ in 0..n {
             d = FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: vec![("f0".into(), d)],
+                fields: vec![("f0".into(), d)].into(),
             };
         }
         d
@@ -3483,7 +3493,7 @@ mod tests {
         for desc in [
             FieldDesc::StructureArray {
                 struct_id: "S".into(),
-                fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             },
             FieldDesc::UnionArray {
                 struct_id: String::new(),
@@ -3570,10 +3580,12 @@ mod tests {
                         fields: vec![
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -3611,7 +3623,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -3625,10 +3638,12 @@ mod tests {
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -3956,13 +3971,16 @@ mod tests {
                                 "status".into(),
                                 FieldDesc::Structure {
                                     struct_id: String::new(),
-                                    fields: Vec::new(),
+                                    fields: Vec::new().into(),
                                 },
-                            )],
+                            )]
+                            .into(),
                         },
-                    )],
+                    )]
+                    .into(),
                 },
-            )],
+            )]
+            .into(),
         };
 
         // request_to_mask names alarm (bit 2) + alarm.status (bit 4); the
@@ -4049,7 +4067,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -4063,10 +4082,12 @@ mod tests {
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         // pvRequest `field(timeStamp, alarm.status)`.
         let req = FieldDesc::Structure {
@@ -4080,7 +4101,7 @@ mod tests {
                             "timeStamp".into(),
                             FieldDesc::Structure {
                                 struct_id: String::new(),
-                                fields: Vec::new(),
+                                fields: Vec::new().into(),
                             },
                         ),
                         (
@@ -4091,14 +4112,17 @@ mod tests {
                                     "status".into(),
                                     FieldDesc::Structure {
                                         struct_id: String::new(),
-                                        fields: Vec::new(),
+                                        fields: Vec::new().into(),
                                     },
-                                )],
+                                )]
+                                .into(),
                             },
                         ),
-                    ],
+                    ]
+                    .into(),
                 },
-            )],
+            )]
+            .into(),
         };
 
         let mask = request_to_mask(&value_desc, Some(&req)).unwrap();
@@ -4379,7 +4403,8 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
-            ],
+            ]
+            .into(),
         }
     }
 

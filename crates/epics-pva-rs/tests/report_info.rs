@@ -49,7 +49,7 @@ impl ChannelSource for InfoSource {
         async {
             Some(FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             })
         }
     }
@@ -149,7 +149,7 @@ async fn default_source_leaves_report_info_none() {
             async {
                 Some(FieldDesc::Structure {
                     struct_id: "epics:nt/NTScalar:1.0".into(),
-                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
                 })
             }
         }

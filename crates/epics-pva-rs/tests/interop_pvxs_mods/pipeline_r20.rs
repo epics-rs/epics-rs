@@ -47,7 +47,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
-            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),

@@ -199,7 +199,8 @@ impl ServerInfoSource {
             fields: vec![
                 ("implLang".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("version".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -471,10 +472,11 @@ mod tests {
                     "query".into(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: vec![("op".into(), FieldDesc::Scalar(ScalarType::String))],
+                        fields: vec![("op".into(), FieldDesc::Scalar(ScalarType::String))].into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         (desc, PvField::Structure(root))
     }

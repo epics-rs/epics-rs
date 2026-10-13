@@ -312,7 +312,8 @@ fn record_options_inner_field_desc() -> FieldDesc {
         fields: vec![
             ("queueSize".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("atomic".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -539,7 +540,7 @@ fn set_nested_field_desc_recursive(
             // element type.
             let (struct_id, elem_fields) = match leaf {
                 FieldDesc::Structure { struct_id, fields } => (struct_id, fields),
-                _ => (String::new(), Vec::new()),
+                _ => (String::new(), Vec::new().into()),
             };
             let sa = FieldDesc::StructureArray {
                 struct_id,
@@ -552,80 +553,43 @@ fn set_nested_field_desc_recursive(
             }
             return;
         }
-        let elem_fields = get_or_create_struct_array_desc(fields, &comp.name);
-        set_nested_field_desc_recursive(elem_fields, &components[1..], leaf);
+        // A field that exists but is not a `StructureArray` is replaced.
+        let pos = member_slot(fields, &comp.name);
+        let (struct_id, mut elem) = match std::mem::replace(&mut fields[pos].1, FieldDesc::Variant)
+        {
+            FieldDesc::StructureArray { struct_id, fields } => (struct_id, fields.into_vec()),
+            _ => (String::new(), Vec::new()),
+        };
+        set_nested_field_desc_recursive(&mut elem, &components[1..], leaf);
+        fields[pos].1 = FieldDesc::StructureArray {
+            struct_id,
+            fields: elem.into(),
+        };
         return;
     }
 
-    // Find or create the intermediate structure descriptor
-    let sub_fields: &mut Vec<(String, FieldDesc)> =
-        if let Some(pos) = fields.iter().position(|(n, _)| n == &comp.name) {
-            match &mut fields[pos].1 {
-                FieldDesc::Structure { fields: f, .. } => f,
-                other => {
-                    *other = FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: Vec::new(),
-                    };
-                    if let FieldDesc::Structure { fields: f, .. } = &mut fields[pos].1 {
-                        f
-                    } else {
-                        unreachable!()
-                    }
-                }
-            }
-        } else {
-            fields.push((
-                comp.name.clone(),
-                FieldDesc::Structure {
-                    struct_id: String::new(),
-                    fields: Vec::new(),
-                },
-            ));
-            if let FieldDesc::Structure { fields: f, .. } = &mut fields.last_mut().unwrap().1 {
-                f
-            } else {
-                unreachable!()
-            }
-        };
-
-    set_nested_field_desc_recursive(sub_fields, &components[1..], leaf);
+    // Find or create the intermediate structure descriptor. It is rebuilt
+    // around the grown member list so its bit count covers the new leaf.
+    let pos = member_slot(fields, &comp.name);
+    let (struct_id, mut sub) = match std::mem::replace(&mut fields[pos].1, FieldDesc::Variant) {
+        FieldDesc::Structure { struct_id, fields } => (struct_id, fields.into_vec()),
+        _ => (String::new(), Vec::new()),
+    };
+    set_nested_field_desc_recursive(&mut sub, &components[1..], leaf);
+    fields[pos].1 = FieldDesc::Structure {
+        struct_id,
+        fields: sub.into(),
+    };
 }
 
-/// Find or create a named `StructureArray` descriptor within `fields`,
-/// returning its element field list. Symmetric with
-/// [`get_or_create_struct_array_field`] on the value side; a field that
-/// exists but is not a `StructureArray` is replaced.
-fn get_or_create_struct_array_desc<'a>(
-    fields: &'a mut Vec<(String, FieldDesc)>,
-    name: &str,
-) -> &'a mut Vec<(String, FieldDesc)> {
+/// Index of the member `name` in `fields`, appending a placeholder member
+/// (overwritten by the caller) when there is none.
+fn member_slot(fields: &mut Vec<(String, FieldDesc)>, name: &str) -> usize {
     if let Some(pos) = fields.iter().position(|(n, _)| n == name) {
-        if !matches!(fields[pos].1, FieldDesc::StructureArray { .. }) {
-            fields[pos].1 = FieldDesc::StructureArray {
-                struct_id: String::new(),
-                fields: Vec::new(),
-            };
-        }
-        if let FieldDesc::StructureArray { fields: f, .. } = &mut fields[pos].1 {
-            f
-        } else {
-            unreachable!()
-        }
-    } else {
-        fields.push((
-            name.to_string(),
-            FieldDesc::StructureArray {
-                struct_id: String::new(),
-                fields: Vec::new(),
-            },
-        ));
-        if let FieldDesc::StructureArray { fields: f, .. } = &mut fields.last_mut().unwrap().1 {
-            f
-        } else {
-            unreachable!()
-        }
+        return pos;
     }
+    fields.push((name.to_string(), FieldDesc::Variant));
+    fields.len() - 1
 }
 
 // ---------------------------------------------------------------------------
@@ -2193,7 +2157,7 @@ impl super::provider::Channel for GroupChannel {
                     let sid = member.def.struct_id.as_deref().unwrap_or("");
                     FieldDesc::Structure {
                         struct_id: sid.into(),
-                        fields: Vec::new(),
+                        fields: Vec::new().into(),
                     }
                 }
                 FieldMapping::Const => {
@@ -2260,7 +2224,7 @@ impl super::provider::Channel for GroupChannel {
         // `hoist_record_member` owns.
         hoist_record_member(&mut fields, || FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         });
         set_nested_field_desc(
             &mut fields,
@@ -2270,7 +2234,7 @@ impl super::provider::Channel for GroupChannel {
 
         Ok(FieldDesc::Structure {
             struct_id: struct_id.into(),
-            fields,
+            fields: fields.into(),
         })
     }
 }
@@ -2871,7 +2835,8 @@ fn meta_desc() -> FieldDesc {
                         ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
             (
@@ -2885,10 +2850,12 @@ fn meta_desc() -> FieldDesc {
                         ),
                         ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -2948,7 +2915,7 @@ fn pv_field_to_field_desc(field: &PvField) -> FieldDesc {
         | PvField::VariantArray(_)
         | PvField::Null => FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         },
     }
 }
@@ -3577,11 +3544,12 @@ mod tests {
                     "a".into(),
                     FieldDesc::StructureArray {
                         struct_id: "structure".into(),
-                        fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+                        fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
                     },
                 ),
                 ("p".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         };
         let mask = BitSet::all_set(intro.total_bits());
         let changed = epics_pva_rs::pvdata::encode::marked_wire_changed_bitset(&intro, &v, &mask);
@@ -3853,6 +3821,52 @@ mod tests {
     // -----------------------------------------------------------------
     // FieldDesc nested schema tests (for get_field introspection)
     // -----------------------------------------------------------------
+
+    #[test]
+    fn nested_desc_rebuilds_every_ancestor_count() {
+        use epics_pva_rs::pvdata::ScalarType;
+
+        fn recount(d: &FieldDesc) -> usize {
+            match d {
+                FieldDesc::Structure { fields, .. } => {
+                    1 + fields.iter().map(|(_, c)| recount(c)).sum::<usize>()
+                }
+                _ => 1,
+            }
+        }
+        let mut fields: Vec<(String, FieldDesc)> = Vec::new();
+        for path in ["a.b.x", "a.b.y", "a.c", "s[0].p.q", "s[1].r"] {
+            set_nested_field_desc(&mut fields, path, FieldDesc::Scalar(ScalarType::Double));
+        }
+        let root = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: fields.into(),
+        };
+        fn walk(d: &FieldDesc, recount: fn(&FieldDesc) -> usize) {
+            assert_eq!(d.total_bits(), recount(d), "{d}");
+            if let FieldDesc::Structure { fields, .. } | FieldDesc::StructureArray { fields, .. } =
+                d
+            {
+                for (_, c) in fields {
+                    walk(c, recount);
+                }
+            }
+        }
+        walk(&root, recount);
+        // root, a, b, x, y, c, s (an array is one bit)
+        assert_eq!(root.total_bits(), 7);
+        let FieldDesc::Structure { fields, .. } = &root else {
+            unreachable!()
+        };
+        let FieldDesc::StructureArray { fields: elem, .. } = &fields[1].1 else {
+            panic!("s is not a structure array")
+        };
+        // element: p { q }, r
+        assert_eq!(
+            elem.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["p", "r"]
+        );
+    }
 
     #[test]
     fn nested_desc_simple() {

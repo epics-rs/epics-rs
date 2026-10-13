@@ -61,7 +61,7 @@ impl ChannelSource for StreamingSource {
     async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         })
     }
     async fn get_value(&self, _: &str) -> Option<PvField> {

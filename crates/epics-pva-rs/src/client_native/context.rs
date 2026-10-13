@@ -47,7 +47,7 @@ fn empty_pv_request() -> (FieldDesc, PvField) {
     (
         FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         },
         PvField::Structure(crate::pvdata::PvStructure::new("")),
     )

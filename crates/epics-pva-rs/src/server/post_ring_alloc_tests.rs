@@ -332,9 +332,10 @@ fn a_structure_array_encodes_by_reference_body() {
             "a".to_string(),
             FieldDesc::StructureArray {
                 struct_id: "e".into(),
-                fields,
+                fields: fields.into(),
             },
-        )],
+        )]
+        .into(),
     };
     let element = |x| {
         let mut e = PvStructure::new("e");

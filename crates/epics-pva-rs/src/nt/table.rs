@@ -52,13 +52,14 @@ impl NTTable {
                     "value".into(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: value_fields,
+                        fields: value_fields.into(),
                     },
                 ),
                 ("descriptor".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("alarm".into(), alarm_desc()),
                 ("timeStamp".into(), time_desc()),
-            ],
+            ]
+            .into(),
         }
     }
 

@@ -58,7 +58,7 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
         .open(
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))].into(),
             },
             PvField::Structure(PvStructure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -74,7 +74,7 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
         .open(
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             },
             PvField::Structure(PvStructure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),

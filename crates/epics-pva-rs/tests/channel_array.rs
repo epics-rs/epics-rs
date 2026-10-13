@@ -62,7 +62,7 @@ impl ChannelSource for NoArraySource {
     async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
         })
     }
     async fn get_value(&self, _: &str) -> Option<PvField> {
@@ -136,7 +136,7 @@ impl ChannelSource for ArraySource {
     async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
         })
     }
     async fn get_value(&self, _: &str) -> Option<PvField> {

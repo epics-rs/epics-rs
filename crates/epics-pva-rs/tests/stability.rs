@@ -177,7 +177,7 @@ fn make_nt_scalar(v: f64) -> PvField {
 fn nt_scalar_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
     }
 }
 
@@ -193,7 +193,7 @@ fn make_nt_double_array(vals: &[f64]) -> PvField {
 fn nt_double_array_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
     }
 }
 
@@ -1997,7 +1997,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     let order = ByteOrder::Little;
     let auth_desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+        fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))].into(),
     };
     let mut auth_struct = PvStructure::new("");
     auth_struct.fields.push((
@@ -2188,7 +2188,7 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
     let order = ByteOrder::Little;
     let auth_desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("host".into(), FieldDesc::Scalar(ScalarType::String))],
+        fields: vec![("host".into(), FieldDesc::Scalar(ScalarType::String))].into(),
     };
     let mut auth_struct = PvStructure::new("");
     auth_struct.fields.push((

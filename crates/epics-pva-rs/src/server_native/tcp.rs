@@ -9657,7 +9657,7 @@ mod tests {
         fn nt_scalar_desc(st: ScalarType) -> FieldDesc {
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(st))],
+                fields: vec![("value".into(), FieldDesc::Scalar(st))].into(),
             }
         }
 
@@ -9773,7 +9773,7 @@ mod tests {
             let value = PvField::Structure(s);
             let desc = FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalarArray:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::UInt))],
+                fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::UInt))].into(),
             };
             let MonitorFilterOutcome::Transformed(PvField::Structure(out)) =
                 apply_monitor_filter_chain(&chain, &value, &desc)
@@ -9820,7 +9820,7 @@ mod tests {
             let value = PvField::Structure(s);
             let desc = FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalarArray:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Byte))],
+                fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Byte))].into(),
             };
             match apply_monitor_filter_chain(&chain, &value, &desc) {
                 MonitorFilterOutcome::DescriptorMismatch => {
@@ -9929,7 +9929,7 @@ mod tests {
             };
             let desc = |st| FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalarArray:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::ScalarArray(st))],
+                fields: vec![("value".into(), FieldDesc::ScalarArray(st))].into(),
             };
             // Element type matches descriptor.
             assert!(transformed_leaf_fits_descriptor(
@@ -10097,10 +10097,12 @@ mod tests {
                     "alarm".into(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         // The client asked for `field(value)` only.
         let mut mask = BitSet::new();
@@ -10262,14 +10264,16 @@ mod tests {
                                 FieldDesc::Scalar(ScalarType::Long),
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let empty_struct = || FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         };
         // pvRequest `field(timeStamp.<leaf>)`, built as the wire type is.
         let request = |leaf: &str| FieldDesc::Structure {
@@ -10282,11 +10286,13 @@ mod tests {
                         "timeStamp".into(),
                         FieldDesc::Structure {
                             struct_id: String::new(),
-                            fields: vec![(leaf.into(), empty_struct())],
+                            fields: vec![(leaf.into(), empty_struct())].into(),
                         },
-                    )],
+                    )]
+                    .into(),
                 },
-            )],
+            )]
+            .into(),
         };
         let post = || crate::server_native::MonitorUpdate {
             value: PvField::Scalar(ScalarValue::Int(1)).into(),
@@ -10391,7 +10397,7 @@ mod tests {
     fn a_monitor_frame_is_one_buffer_sized_by_the_last() {
         let intro = FieldDesc::Structure {
             struct_id: "structure".into(),
-            fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut s = PvStructure::new("structure");
         s.fields
@@ -10430,10 +10436,12 @@ mod tests {
                         fields: vec![
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let upd = |marked: Marks| crate::server_native::MonitorUpdate {
             value: PvField::Scalar(ScalarValue::Int(0)).into(),
@@ -10480,10 +10488,12 @@ mod tests {
                         fields: vec![
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let upd = |tag: i32, marked: Option<&[&str]>| crate::server_native::MonitorUpdate {
             value: PvField::Scalar(ScalarValue::Int(tag)).into(),
@@ -11296,11 +11306,13 @@ mod tests {
                             "value".to_string(),
                             FieldDesc::Structure {
                                 struct_id: String::new(),
-                                fields: vec![],
+                                fields: vec![].into(),
                             },
-                        )],
+                        )]
+                        .into(),
                     },
-                )],
+                )]
+                .into(),
             };
             let buf: &[u8] = &[];
             let mut cur = std::io::Cursor::new(buf);
@@ -11601,7 +11613,7 @@ mod tests {
         // INIT: empty `structure {}` descriptor, no value body.
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -16009,7 +16021,7 @@ mod tests {
         let ioid = 0x1234;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut value = PvStructure::new("epics:nt/NTScalar:1.0");
         value
@@ -16066,7 +16078,8 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         };
         let mut s = PvStructure::new("structure");
         s.fields
@@ -16129,7 +16142,8 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         };
         let mk = |a: f64, b: f64| {
             let mut s = PvStructure::new("structure");
@@ -16213,7 +16227,8 @@ mod tests {
                 ("a".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("c".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         };
         let all = BitSet::all_set(intro.total_bits());
 
@@ -16285,7 +16300,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -16299,10 +16315,12 @@ mod tests {
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let mut alarm = PvStructure::new("alarm_t");
         alarm
@@ -17371,7 +17389,7 @@ mod tests {
         let pv = SharedPV::build_mailbox();
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
         initial
@@ -17409,7 +17427,7 @@ mod tests {
         // Use an empty Structure pvRequest (full mask).
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let req_val = PvField::Structure(PvStructure::new(""));
         let mut init_payload = Vec::new();
@@ -17576,7 +17594,7 @@ mod tests {
         // mask, so nothing but the source's marks can narrow the readback.
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let mut init_payload = Vec::new();
         init_payload.put_u32(sid, order);
@@ -17722,7 +17740,7 @@ mod tests {
         let pv = SharedPV::build_mailbox();
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
         initial
@@ -17756,7 +17774,7 @@ mod tests {
 
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let req_val = PvField::Structure(PvStructure::new(""));
         let mut init_payload = Vec::new();
@@ -17865,7 +17883,7 @@ mod tests {
 
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let pv = SharedPV::new();
         let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -18087,7 +18105,7 @@ mod tests {
         // cache and reference.
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         };
         const SLOT: u16 = 0x0001;
 
@@ -18311,7 +18329,7 @@ mod tests {
         // Bit numbering: root=0, `v`=1.
         let intro = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("v".into(), FieldDesc::Variant)],
+            fields: vec![("v".into(), FieldDesc::Variant)].into(),
         };
         let inner_desc = FieldDesc::Scalar(ScalarType::Int);
         let inner_val = ScalarValue::Int(7);
@@ -18387,7 +18405,8 @@ mod tests {
                 ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("c".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -18606,7 +18625,7 @@ mod tests {
         // PUT INIT.
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let req_val = PvField::Structure(PvStructure::new(""));
         let mut init_payload = Vec::new();
@@ -18749,7 +18768,7 @@ mod tests {
         // PUT_GET INIT (subcmd 0x08).
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let req_val = PvField::Structure(PvStructure::new(""));
         let mut init_payload = Vec::new();
@@ -20825,7 +20844,7 @@ mod tests {
 
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let pv = SharedPV::new();
         let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -22409,7 +22428,7 @@ mod tests {
     fn bfr13_init_pv_request(order: ByteOrder, payload: &mut Vec<u8>) {
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let req_val = PvField::Structure(PvStructure::new(""));
         crate::pvdata::encode::encode_type_desc(&req_desc, order, payload);
@@ -22921,7 +22940,7 @@ mod tests {
         // reports `EmptyMask`, pvxs's "must select at least one field".
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("field".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("field".to_string(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         let mut req_struct = PvStructure::new("");
         req_struct.set("field", PvField::Scalar(ScalarValue::Int(0)));
@@ -23082,7 +23101,7 @@ mod tests {
         use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
         let auth_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+            fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))].into(),
         };
         let mut auth_struct = PvStructure::new("");
         auth_struct.fields.push((
@@ -23219,7 +23238,7 @@ mod tests {
         use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
         let auth_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+            fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))].into(),
         };
         let mut auth_struct = PvStructure::new("");
         auth_struct.fields.push((
@@ -23416,7 +23435,7 @@ mod autoexec_tests {
         let pv = SharedPV::build_mailbox();
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
         initial
@@ -23799,7 +23818,7 @@ mod bfr15_tests {
     fn nt_scalar_desc() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         }
     }
 

@@ -33,7 +33,7 @@ fn empty_arg() -> (FieldDesc, PvField) {
     (
         FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         },
         PvField::Structure(PvStructure::new("")),
     )
@@ -80,7 +80,7 @@ async fn rpc_handler_returning_a_value_is_still_a_value_reply() {
     pv.on_rpc(|_pv, _desc, _arg| {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         let mut s = PvStructure::new("");
         s.set("value", PvField::Scalar(ScalarValue::Int(7)));

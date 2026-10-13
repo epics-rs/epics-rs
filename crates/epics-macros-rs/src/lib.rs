@@ -1513,7 +1513,7 @@ pub fn derive_nt_scalar(input: TokenStream) -> TokenStream {
                 let __fields = __rt::ensure_nt_meta_desc(&__sid, __fields);
                 __rt::FieldDesc::Structure {
                     struct_id: __sid,
-                    fields: __fields,
+                    fields: __fields.into(),
                 }
             }
 
@@ -1831,7 +1831,7 @@ pub fn derive_nt_table(input: TokenStream) -> TokenStream {
                     ("labels".into(), __rt::FieldDesc::ScalarArray(__rt::ScalarType::String)),
                     ("value".into(), __rt::FieldDesc::Structure {
                         struct_id: "".into(),
-                        fields: __value_fields,
+                        fields: __value_fields.into(),
                     }),
                 ];
                 // pvxs `NTTable::build()` (nt.cpp:170-176) always carries
@@ -1841,7 +1841,7 @@ pub fn derive_nt_table(input: TokenStream) -> TokenStream {
                 let __fields = __rt::ensure_nt_meta_desc("epics:nt/NTTable:1.0", __fields);
                 __rt::FieldDesc::Structure {
                     struct_id: "epics:nt/NTTable:1.0".into(),
-                    fields: __fields,
+                    fields: __fields.into(),
                 }
             }
 

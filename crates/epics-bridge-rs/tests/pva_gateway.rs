@@ -60,7 +60,7 @@ use epics_pva_rs::server_native::{
 fn nt_double_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
     }
 }
 
@@ -773,7 +773,8 @@ async fn br_r6_gateway_typed_put_passthrough() {
         fields: vec![(
             "value".to_string(),
             FieldDesc::ScalarArray(ScalarType::String),
-        )],
+        )]
+        .into(),
     };
     let initial = PvField::Structure({
         let mut s = PvStructure::new("test:strarray/1.0");
@@ -910,7 +911,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     let pv = SharedPV::new();
     let desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
     };
     let initial = PvField::Structure({
         let mut s = PvStructure::new("");
@@ -1518,7 +1519,7 @@ impl ChannelSource for UpstreamArraySource {
     async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
         })
     }
     async fn get_value(&self, _: &str) -> Option<PvField> {
@@ -2029,7 +2030,8 @@ fn partial_desc() -> FieldDesc {
         fields: vec![
             ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
             ("spare".into(), FieldDesc::Scalar(ScalarType::Double)),
-        ],
+        ]
+        .into(),
     }
 }
 

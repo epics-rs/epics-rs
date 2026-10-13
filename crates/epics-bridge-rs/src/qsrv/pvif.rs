@@ -1155,7 +1155,7 @@ pub fn build_nt_scalar_desc(scalar_type: ScalarType) -> FieldDesc {
     }
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields,
+        fields: fields.into(),
     }
 }
 
@@ -1175,7 +1175,8 @@ pub fn build_nt_enum_desc() -> FieldDesc {
                     fields: vec![
                         ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
             ("alarm".into(), alarm_desc()),
@@ -1184,10 +1185,12 @@ pub fn build_nt_enum_desc() -> FieldDesc {
                 "display".into(),
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))]
+                        .into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1210,7 +1213,7 @@ pub fn build_nt_scalar_array_desc(element_type: ScalarType) -> FieldDesc {
     }
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields,
+        fields: fields.into(),
     }
 }
 
@@ -1459,7 +1462,8 @@ fn alarm_desc() -> FieldDesc {
             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1473,7 +1477,8 @@ fn timestamp_desc() -> FieldDesc {
             ),
             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1485,7 +1490,8 @@ fn form_desc() -> FieldDesc {
         fields: vec![
             ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1504,7 +1510,7 @@ fn display_desc(scalar_type: ScalarType, numeric: bool) -> FieldDesc {
     FieldDesc::Structure {
         // Anonymous id to match the value builder / pvxs (see `build_display`).
         struct_id: String::new(),
-        fields,
+        fields: fields.into(),
     }
 }
 
@@ -1515,7 +1521,8 @@ fn control_desc(scalar_type: ScalarType) -> FieldDesc {
             ("limitLow".into(), FieldDesc::Scalar(scalar_type)),
             ("limitHigh".into(), FieldDesc::Scalar(scalar_type)),
             ("minStep".into(), FieldDesc::Scalar(scalar_type)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1601,7 +1608,8 @@ fn value_alarm_desc(scalar_type: ScalarType) -> FieldDesc {
                 FieldDesc::Scalar(ScalarType::Int),
             ),
             ("hysteresis".into(), FieldDesc::Scalar(ScalarType::Double)),
-        ],
+        ]
+        .into(),
     }
 }
 

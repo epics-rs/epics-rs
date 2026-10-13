@@ -197,6 +197,17 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
         .await
         .expect("subscribe");
 
+    // `pvmonitor_handle` returns before the subscription exists; a put
+    // ahead of the first update is lost to the stream.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while received.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no first monitor update on W:INT within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     // Drive pvxput to update the value 5 times. Sleep between
     // each so the pvxs server can dispatch one MONITOR DATA frame
     // per put.
@@ -207,7 +218,7 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
         let p = pvxput_p.clone();
         let s = server_str.clone();
         let l = lib.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let out = tokio::task::spawn_blocking(move || {
             pvxs_command(&p)
                 .arg("-w")
                 .arg("3")
@@ -218,7 +229,15 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
                 .env(env_key(), l)
                 .pvxs_output()
         })
-        .await;
+        .await
+        .expect("pvxput task")
+        .expect("spawn pvxput");
+        assert!(
+            out.status.success(),
+            "pvxput W:INT {val} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -227,9 +246,8 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
     drop(srv);
 
     let seen = received.lock().unwrap().clone();
-    // 5 puts fire, but the subscribe-establishment race can swallow
-    // the first one or two on slow CI. ≥3 distinct events out of 5
-    // is enough to prove the MONITOR stream itself works.
+    // The first update plus 5 puts; ≥3 proves the MONITOR stream works
+    // without counting on every put arriving as its own update.
     assert!(
         seen.len() >= 3,
         "expected ≥3 monitor events on Rust client, got {}: {seen:?}",

@@ -100,10 +100,24 @@ impl PortManager {
     pub fn register_port_with_config<D: PortDriver>(
         &self,
         driver: D,
-        mut config: RuntimeConfig,
+        config: RuntimeConfig,
         owner: &Arc<InterruptGate>,
     ) -> AsynResult<PortRuntimeHandle> {
         let name = driver.base().port_name.to_string();
+        // The `asynPortDriver` constructor's `registerPort` failure: the line
+        // on stdout, then the error is the constructor's throw
+        // (asynPortDriver.cpp:4036-4040).
+        self.register_port_inner(driver, config, owner, &name)
+            .inspect_err(|_| report_port_driver_register_failure(&name))
+    }
+
+    fn register_port_inner<D: PortDriver>(
+        &self,
+        driver: D,
+        mut config: RuntimeConfig,
+        owner: &Arc<InterruptGate>,
+        name: &str,
+    ) -> AsynResult<PortRuntimeHandle> {
         // Pre-flight: refuse before we spawn the runtime thread, so a
         // rejected duplicate doesn't burn a thread + create a
         // half-initialized PortRuntimeHandle. The manager map catches a
@@ -112,12 +126,14 @@ impl PortManager {
         // other creator (drvAsyn*PortConfigure, plugins, hand-registered).
         {
             let ph = self.port_handles.lock();
-            if ph.contains_key(&name) {
-                return Err(AsynError::PortAlreadyRegistered(name));
+            if ph.contains_key(name) {
+                crate::registry::report_already_registered(name);
+                return Err(AsynError::PortAlreadyRegistered(name.to_string()));
             }
         }
-        if crate::registry::get_port(&name).is_some() {
-            return Err(AsynError::PortAlreadyRegistered(name));
+        if crate::registry::get_port(name).is_some() {
+            crate::registry::report_already_registered(name);
+            return Err(AsynError::PortAlreadyRegistered(name.to_string()));
         }
         // The manager's services, not the config's default global ones — a
         // caller-supplied `RuntimeConfig` cannot detach a port from the trace
@@ -137,14 +153,14 @@ impl PortManager {
         // claim means a concurrent registrant won between the pre-flight
         // and here: drop the runtime we just built and report the
         // duplicate.
-        if let Err(e) = crate::registry::register_port(&name, handle.port_handle().clone(), owner) {
+        if let Err(e) = crate::registry::register_port(name, handle.port_handle().clone(), owner) {
             handle.shutdown();
             return Err(e);
         }
         let mut ph = self.port_handles.lock();
         let mut rh = self.runtime_handles.lock();
-        ph.insert(name.clone(), handle.port_handle().clone());
-        rh.insert(name.clone(), handle.clone());
+        ph.insert(name.to_string(), handle.port_handle().clone());
+        rh.insert(name.to_string(), handle.clone());
         drop(rh);
         drop(ph);
 
@@ -252,6 +268,19 @@ impl PortManager {
         names.extend(crate::registry::port_names());
         names.into_iter().collect()
     }
+}
+
+/// The line an `asynPortDriver` constructor prints, on stdout, when its
+/// `registerPort` fails, before it throws (asynPortDriver.cpp:4036-4040).
+///
+/// Called by [`PortManager::register_port_with_config`], by
+/// `port_runtime_unavailable` (the constructor-shaped plugin runtimes that
+/// abort), and by the `*Configure` commands of `asynPortDriver`-derived
+/// drivers that hold the error themselves (modbus-rs, mqtt-rs, ad-core's
+/// `PluginManager`). A driver C builds without `asynPortDriver`
+/// (`drvAsynIPPort`, …) does not call it.
+pub fn report_port_driver_register_failure(port_name: &str) {
+    println!("asynPortDriver:asynPortDriver ERROR: Can't register port: {port_name}");
 }
 
 impl Default for PortManager {
@@ -865,5 +894,91 @@ mod tests {
 
         // After shutdown, operations should fail
         assert!(handle.port_handle().write_int32_blocking(0, 0, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod register_port_line_tests {
+    use super::*;
+    use crate::param::ParamType;
+    use crate::port::{PortDriver, PortDriverBase, PortFlags};
+
+    struct P(PortDriverBase);
+    impl PortDriver for P {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    fn port(name: &str) -> P {
+        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        P(base)
+    }
+
+    /// A refused registerPort prints C's two stdout lines, the manager's
+    /// (asynManager.c:2056) then the constructor's, and the error is the
+    /// constructor's throw (asynPortDriver.cpp:4036-4040). The
+    /// refusal here is a duplicate name, which `registerPort` also fails on.
+    #[test]
+    fn a_refused_register_port_prints_the_constructor_line() {
+        const CHILD: &str = "ASYN_RS_REGISTER_LINE_CHILD";
+        const TEST: &str = "manager::register_port_line_tests::a_refused_register_port_prints_the_constructor_line";
+        if std::env::var_os(CHILD).is_some() {
+            let mgr = PortManager::new();
+            let owner = crate::registry::open_owner();
+            let _first = mgr.register_port(port("dupLine"), &owner).unwrap();
+            match mgr.register_port(port("dupLine"), &owner) {
+                Err(AsynError::PortAlreadyRegistered(n)) => println!("ERR={n}"),
+                Err(e) => println!("OTHER={e}"),
+                Ok(_) => println!("REGISTERED"),
+            }
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        let lines: Vec<&str> = stdout.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "asynCommon:registerDriver dupLine already registered")
+            .unwrap_or_else(|| panic!("no already-registered line:\n{stdout}"));
+        assert_eq!(
+            lines.get(at + 1).copied(),
+            Some("asynPortDriver:asynPortDriver ERROR: Can't register port: dupLine"),
+            "{stdout}"
+        );
+        assert!(stdout.lines().any(|l| l == "ERR=dupLine"), "{stdout}");
+        assert!(!stderr.contains("Can't register port"), "{stderr}");
+    }
+
+    /// A port that registers prints nothing.
+    #[test]
+    fn a_registered_port_prints_no_constructor_line() {
+        const CHILD: &str = "ASYN_RS_REGISTER_OK_CHILD";
+        const TEST: &str =
+            "manager::register_port_line_tests::a_registered_port_prints_no_constructor_line";
+        if std::env::var_os(CHILD).is_some() {
+            let mgr = PortManager::new();
+            let _h = mgr
+                .register_port(port("okLine"), &crate::registry::open_owner())
+                .unwrap();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec the test binary");
+        assert!(out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("Can't register port"));
     }
 }

@@ -470,6 +470,8 @@ fn port_thread_unavailable(port_name: &str, err: &std::io::Error) -> AsynError {
 /// Callers that *can* report the failure must return the error instead; see
 /// [`create_port_runtime_boxed`].
 pub fn port_runtime_unavailable(port_name: &str, err: &AsynError) -> ! {
+    // C prints this before it throws, ahead of anything the process says next.
+    crate::manager::report_port_driver_register_failure(port_name);
     eprintln!(
         "FATAL: the IOC could not create the runtime for asyn port '{port_name}': {err}. \
          Continuing would leave records bound to a port whose actor thread does not \
@@ -590,6 +592,35 @@ mod tests {
         );
         assert!(stdout.lines().any(|l| l == "FAILED"), "{stdout}");
         assert!(stdout.lines().any(|l| l == "THREAD=false"), "{stdout}");
+    }
+
+    /// The constructor-shaped runtimes (ad-core plugins, NDTimeSeries) abort
+    /// the process when the thread is refused, and C prints the
+    /// `asynPortDriver` line before it throws (asynPortDriver.cpp:4036-4040).
+    #[test]
+    fn port_runtime_unavailable_prints_the_constructor_line_before_it_aborts() {
+        const CHILD: &str = "ASYN_RS_UNAVAILABLE_CHILD";
+        const TEST: &str = "runtime::port::tests::port_runtime_unavailable_prints_the_constructor_line_before_it_aborts";
+        if std::env::var_os(CHILD).is_some() {
+            port_runtime_unavailable(
+                "unavail_port",
+                &AsynError::PortNotFound("unavail_port".into()),
+            );
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "the child must abort");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l
+                    == "asynPortDriver:asynPortDriver ERROR: Can't register port: unavail_port"),
+            "{stdout}"
+        );
     }
 
     #[test]

@@ -159,14 +159,18 @@ impl CommandHandler for MqttConfigHandler {
         // it (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
         // The `?` is the same error channel the duplicate-name failure below
         // already uses.
-        let (runtime_handle, _actor_jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
+        let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+            .map_err(|e| {
+                asyn_rs::manager::report_port_driver_register_failure(&port_name);
+                e.to_string()
+            })?;
         let port_handle = runtime_handle.port_handle().clone();
 
         let owner = ctx.db().scan_control().interrupt_gate();
         if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), owner)
         {
             // Nothing published this port, so ask the actor to stop.
+            asyn_rs::manager::report_port_driver_register_failure(&port_name);
             runtime_handle.shutdown();
             return Err(e.to_string());
         }

@@ -2099,7 +2099,10 @@ impl CommandHandler for ModbusConfigHandler {
         // The `?` is the same error channel the duplicate-name failure below
         // already uses.
         let (runtime, _jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
+            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                asyn_rs::manager::report_port_driver_register_failure(&port_name);
+                e.to_string()
+            })?;
         let port_handle = runtime.port_handle().clone();
         // Owned by the database this command's IOC runs, so its seed waits
         // for that database's open.
@@ -2107,6 +2110,7 @@ impl CommandHandler for ModbusConfigHandler {
         if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), owner)
         {
             // Nothing published this port, so ask the actor to stop.
+            asyn_rs::manager::report_port_driver_register_failure(&port_name);
             runtime.shutdown();
             return Err(e.to_string());
         }
@@ -3525,6 +3529,79 @@ mod tests {
             Arc::new(epics_base_rs::server::database::PvDatabase::new()),
             epics_base_rs::runtime::task::BlockingBridge::capture(),
         )
+    }
+
+    /// `drvModbusAsyn` derives from `asynPortDriver`, so a configure whose
+    /// `registerPort` is refused prints C's two stdout lines — the manager's
+    /// `already registered` (asynManager.c:2056) and the constructor's
+    /// (asynPortDriver.cpp:4036-4040) — and the command fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duplicate_modbus_port_prints_the_two_register_port_lines() {
+        use epics_base_rs::server::iocsh::registry::ArgValue;
+        const CHILD: &str = "MODBUS_RS_DUP_PORT_CHILD";
+        const TEST: &str = "ioc::tests::a_duplicate_modbus_port_prints_the_two_register_port_lines";
+        if std::env::var_os(CHILD).is_some() {
+            record_interpose(
+                "OCTET_DUPLINE",
+                InterposeSettings {
+                    link: LinkType::Rtu,
+                    timeout: crate::driver::READ_TIMEOUT,
+                    write_delay: Duration::ZERO,
+                },
+            );
+            let octet = BufferedOctetPort {
+                base: PortDriverBase::new("OCTET_DUPLINE", 1, PortFlags::default()),
+                pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                replies: Default::default(),
+                written: Arc::new(Mutex::new(Vec::new())),
+            };
+            let (octet_rt, _jh) = create_port_runtime(octet, RuntimeConfig::default())
+                .expect("octet runtime must start");
+            asyn_rs::asyn_record::register_port(
+                "OCTET_DUPLINE",
+                octet_rt.port_handle().clone(),
+                &asyn_rs::registry::open_owner(),
+            )
+            .expect("the octet port must publish");
+            let handler = ModbusConfigHandler {
+                handle: tokio::runtime::Handle::current(),
+            };
+            let args = [
+                ArgValue::String("MB_DUPLINE".into()),
+                ArgValue::String("OCTET_DUPLINE".into()),
+                ArgValue::Int(1),
+                ArgValue::Int(3),
+                ArgValue::Int(0),
+                ArgValue::Int(4),
+                ArgValue::String("UINT16".into()),
+                ArgValue::Int(0),
+            ];
+            handler.call(&args, &make_ctx()).expect("first configure");
+            println!("SECOND={}", handler.call(&args, &make_ctx()).is_err());
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "asynCommon:registerDriver MB_DUPLINE already registered")
+            .unwrap_or_else(|| panic!("no already-registered line:\n{stdout}"));
+        assert_eq!(
+            lines.get(at + 1).copied(),
+            Some("asynPortDriver:asynPortDriver ERROR: Can't register port: MB_DUPLINE"),
+            "{stdout}"
+        );
+        assert!(lines.contains(&"SECOND=true"), "{stdout}");
     }
 
     /// Finding 6: C creates the read-poller thread on `needReadThread` alone

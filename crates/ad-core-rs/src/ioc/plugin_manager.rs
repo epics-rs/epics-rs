@@ -67,7 +67,8 @@ impl PluginManager {
 
         // Claim the port name first: a duplicate must not leave a wiring
         // output or a parked handle behind for a plugin that was refused.
-        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)?;
+        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)
+            .inspect_err(|_| asyn_rs::manager::report_port_driver_register_failure(&port_name))?;
 
         // Register this plugin's output in the wiring registry
         self.wiring
@@ -99,7 +100,8 @@ impl PluginManager {
     ) -> asyn_rs::error::AsynResult<()> {
         let port_handle = runtime.port_handle().clone();
         let port_name = port_handle.port_name().to_string();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)?;
+        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)
+            .inspect_err(|_| asyn_rs::manager::report_port_driver_register_failure(&port_name))?;
         self.port_runtimes.lock().push(runtime);
         Ok(())
     }

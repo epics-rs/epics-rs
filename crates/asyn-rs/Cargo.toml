@@ -141,6 +141,10 @@ name = "asyn_portless_errs_posts_once"
 required-features = ["epics"]
 
 [[test]]
+name = "interrupt_gate_follows_the_database"
+required-features = ["epics"]
+
+[[test]]
 name = "asyn_special_posts_in_c_order"
 required-features = ["epics"]
 

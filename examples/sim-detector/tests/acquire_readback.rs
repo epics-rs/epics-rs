@@ -38,7 +38,9 @@ async fn acquire_bo_returns_to_zero_after_single() {
     // opens it at the `iocInit`/`scan_run` barrier. This test wires the record
     // and acquisition path by hand with no scan facility, so it must establish
     // that post-`iocInit` precondition itself.
-    epics_base_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+    // The record's database is the gate's owner; its `run()` is that barrier.
+    let db = Arc::new(PvDatabase::new());
+    db.scan_control().run();
 
     let rt = create_sim_detector("RBK_TEST", 32, 32, 10_000_000, NDArrayOutput::new()).unwrap();
     let handle = rt.port_handle().clone();
@@ -59,7 +61,6 @@ async fn acquire_bo_returns_to_zero_after_single() {
 
     // Build the Acquire command bo wired to the driver's ACQUIRE param
     // via asyn:READBACK.
-    let db = Arc::new(PvDatabase::new());
     db.add_record("Acquire", Box::new(BoRecord::new(0)))
         .await
         .unwrap();

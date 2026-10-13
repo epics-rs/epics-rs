@@ -191,7 +191,7 @@ async fn main() -> ExitCode {
 
     // C iocInit owns scan start (scanInit/scanRun) — neither the CA nor
     // the PVA front-end scans. One core-owned scan owner covers whichever
-    // subset of the two servers is enabled; `try_claim_scan_start` keeps
+    // subset of the two servers is enabled; `ScanControl::try_claim` keeps
     // any redundant start parked, so the shared database never
     // double-scans. Held to process end.
     let db = ioc.database().clone();

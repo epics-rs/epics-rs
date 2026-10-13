@@ -5096,7 +5096,7 @@ mod tests {
         // `interruptAccept` — a real IOC opens it at the `iocInit`/`scan_run`
         // barrier. This unit test drives `poll_cycle` with no scan facility, so
         // it must establish that post-`iocInit` precondition itself.
-        epics_base_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+        let _gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::opened();
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         // The statistics params live at addr 0; their monitors must have

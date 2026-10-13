@@ -847,6 +847,17 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// during builder wiring; not called again at runtime.
     fn apply_record_info(&mut self, _info: &std::collections::HashMap<String, String>) {}
 
+    /// Tell the device which database's `interruptAccept` its interrupt
+    /// subscription belongs to, before [`io_intr_receiver`](Self::io_intr_receiver)
+    /// is asked. C has one database per process, so the gate is global there;
+    /// a device that subscribes to a port the process shares with other
+    /// databases binds the port to this gate. Default: ignore.
+    fn bind_interrupt_gate(
+        &mut self,
+        _gate: &std::sync::Arc<crate::runtime::interrupt_accept::InterruptGate>,
+    ) {
+    }
+
     /// Return a receiver for I/O Intr scan notifications.
     /// Called for records with `SCAN="I/O Intr"`, and for any device that
     /// reports [`io_intr_scan_independent`](Self::io_intr_scan_independent).

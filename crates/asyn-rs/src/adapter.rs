@@ -2796,6 +2796,13 @@ impl DeviceSupport for AsynDeviceSupport {
         ))))
     }
 
+    fn bind_interrupt_gate(
+        &mut self,
+        gate: &Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+    ) {
+        self.handle.interrupts().bind_gate(gate.clone());
+    }
+
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
         // Activate the driver-callback path for either:
         //   1. records with `SCAN="I/O Intr"` (legacy behaviour), OR

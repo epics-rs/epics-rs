@@ -1761,7 +1761,7 @@ impl PortDriverBase {
         // acquisition/array task can call this before `iocInit` has wired the
         // `_RBV` records, and a read-only seed must survive to the one-shot
         // flush the scan facility fires when the gate goes true.
-        if !epics_libcom_rs::runtime::interrupt_accept::interrupts_accepted() {
+        if !self.interrupts.accepting() {
             return Ok(());
         }
         let changed = self.params.take_changed(addr)?;
@@ -1820,7 +1820,7 @@ impl PortDriverBase {
         // C `interruptAccept` gate — see `call_param_callbacks`: preserve the
         // changed-flag (do not `take_changed_single`) until the IOC accepts
         // interrupts, so a pre-`iocInit` flush cannot strand a seeded value.
-        if !epics_libcom_rs::runtime::interrupt_accept::interrupts_accepted() {
+        if !self.interrupts.accepting() {
             return Ok(());
         }
         if self.params.take_changed_single(reason, addr)? {
@@ -2947,6 +2947,7 @@ pub(crate) fn octet_flush_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
     /// A driver whose `io_read_octet_eom` hands back one scripted chunk per
     /// call, with the driver-level eomReason C would report (CNT when the
@@ -3098,15 +3099,17 @@ mod tests {
     /// subscribe — cleared the flag, and a read-only seed
     /// (`Manufacturer`, `MaxSizeX`) was lost for the life of the process.
     ///
-    /// This mutates a process-global flag; nextest isolates each test in its
-    /// own process, so it does not race with the crate's other port tests.
+    /// The gate is the record's own database's, so the test does not touch
+    /// any process-wide state.
     #[test]
     fn call_param_callbacks_before_interrupt_accept_preserves_the_seed() {
         use crate::interrupt::{InterruptFilter, InterruptValue};
-        use epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted;
         use std::sync::{Arc, Mutex};
 
+        // The record's database: its gate is closed until `scan_run`.
+        let gate = InterruptGate::new();
         let mut base = PortDriverBase::new("gate", 1, PortFlags::default());
+        base.interrupts.bind_gate(gate.clone());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
 
         let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3129,7 +3132,7 @@ mod tests {
         // record registered), the driver seeds a read-only value, and its own
         // task fires a callback — which must deliver NOTHING and leave the flag
         // pending.
-        set_interrupts_accepted(false);
+        gate.set(false);
         base.set_int32_param(val, 0, 640).unwrap();
         base.call_param_callbacks(0).unwrap();
         assert!(
@@ -3140,7 +3143,7 @@ mod tests {
 
         // iocInit accepts interrupts; the flush the scan facility now performs
         // delivers the preserved seed exactly once.
-        set_interrupts_accepted(true);
+        gate.set(true);
         base.call_param_callbacks(0).unwrap();
         assert_eq!(
             *seen.lock().unwrap(),
@@ -3164,8 +3167,8 @@ mod tests {
             // `interruptAccept = 1` (`asynPortDriver.cpp:23-25`). The seed-
             // preservation regression test builds its own `PortDriverBase` and
             // drives the gate itself, so it is unaffected.
-            epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
             let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+            base.interrupts.bind_gate(InterruptGate::opened());
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("TEMP", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -3507,7 +3510,7 @@ mod tests {
         use crate::param::{EnumEntry, ParamValue};
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
-        epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("test_enum_cb", 1, PortFlags::default());
         base.create_param("MODE", ParamType::Enum).unwrap();
         let mut rx = base.interrupts.subscribe_async();
@@ -3555,7 +3558,7 @@ mod tests {
     fn do_callbacks_enum_by_param_type() {
         use crate::param::{EnumEntry, ParamValue};
 
-        epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("test_cb_enum", 1, PortFlags::default());
         let owner = base.create_param("MODE", ParamType::Enum).unwrap();
         let plain = base.create_param("GAIN", ParamType::Int32).unwrap();
@@ -3611,7 +3614,7 @@ mod tests {
         use crate::param::ParamValue;
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
-        epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("test_gp_cb", 1, PortFlags::default());
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
         let mut rx = base.interrupts.subscribe_async();
@@ -4071,7 +4074,7 @@ mod tests {
     #[test]
     fn test_timestamp_source_in_callbacks() {
         // Post-`iocInit` precondition — see `TestDriver::new`.
-        epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("ts_cb", 1, PortFlags::default());
         base.create_param("V", ParamType::Int32).unwrap();
         let mut rx = base.interrupts.subscribe_async();

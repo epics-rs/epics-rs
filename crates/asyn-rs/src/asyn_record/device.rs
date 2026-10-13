@@ -65,6 +65,15 @@ impl DeviceSupport for AsynRecordDevice {
         ASYN_RECORD_DTYP
     }
 
+    fn bind_interrupt_gate(
+        &mut self,
+        gate: &std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+    ) {
+        if let Some(scan) = &self.scan {
+            scan.bind_gate(gate.clone());
+        }
+    }
+
     /// C `getIoIntInfo`'s `*iopvt = pasynRecPvt->ioScanPvt` (asynRecord.c:595) —
     /// the scan list the driver callbacks fire into. Taking it also arms the
     /// record's `interruptAccept` gate: this call happens at `iocInit`, which is

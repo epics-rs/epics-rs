@@ -332,6 +332,17 @@ pub struct InterruptSharedState {
     notify_count: AtomicU64,
     /// Number of times a mailbox value was overwritten before the consumer read it.
     coalesce_count: AtomicU64,
+    /// The databases' `interruptAccept` gates the records subscribed here
+    /// bound — see [`InterruptManager::accepting`].
+    gates: std::sync::OnceLock<Box<GateSlot>>,
+}
+
+/// One bound gate in an append-only chain: written once at bind time, read
+/// with plain atomic loads, so the flush path takes no lock and frees
+/// nothing.
+struct GateSlot {
+    gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+    next: std::sync::OnceLock<Box<GateSlot>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +371,7 @@ impl InterruptManager {
                 sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
+                gates: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -369,6 +381,48 @@ impl InterruptManager {
     /// the same subscription list and broadcast channel.
     pub fn from_shared_state(state: Arc<InterruptSharedState>) -> Self {
         Self { state }
+    }
+
+    /// Record that a subscription on this port belongs to the database that
+    /// owns `gate`. Idempotent per gate.
+    pub fn bind_gate(&self, gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>) {
+        let mut cell = &self.state.gates;
+        loop {
+            match cell.get() {
+                Some(slot) if Arc::ptr_eq(&slot.gate, &gate) => return,
+                Some(slot) => cell = &slot.next,
+                None => {
+                    let slot = Box::new(GateSlot {
+                        gate: gate.clone(),
+                        next: std::sync::OnceLock::new(),
+                    });
+                    // Losing the race means another gate took this cell;
+                    // look again from the same cell.
+                    if cell.set(slot).is_ok() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// C `interruptAccept` as this port reads it: a port whose records bound
+    /// their databases accepts while any of those databases' gates is open;
+    /// a port no record bound reads the process-wide fallback. The unbound
+    /// arm is the single place a port's gate is not its own databases'.
+    pub fn accepting(&self) -> bool {
+        let Some(mut slot) = self.state.gates.get() else {
+            return epics_libcom_rs::runtime::interrupt_accept::any_gate_open();
+        };
+        loop {
+            if slot.gate.is_open() {
+                return true;
+            }
+            match slot.next.get() {
+                Some(next) => slot = next,
+                None => return false,
+            }
+        }
     }
 
     /// Get the shared state for cross-manager sharing.
@@ -387,6 +441,7 @@ impl InterruptManager {
                 sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
+                gates: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -642,6 +697,27 @@ impl InterruptManager {
 
 #[cfg(test)]
 mod tests {
+    /// Boundary — a bound port follows its own gates only; an unbound one
+    /// reads whether any live database's gate is open.
+    #[test]
+    fn a_bound_port_follows_its_gates_and_an_unbound_one_the_live_ones() {
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
+        let unbound = InterruptManager::new(4);
+        let bound = InterruptManager::new(4);
+        let mine = InterruptGate::new();
+        bound.bind_gate(mine.clone());
+        let elsewhere = InterruptGate::opened();
+
+        assert!(unbound.accepting(), "unbound: a live gate is open");
+        assert!(!bound.accepting(), "bound: its own gate is closed");
+        mine.set(true);
+        assert!(bound.accepting());
+        mine.set(false);
+        drop(elsewhere);
+        assert!(!unbound.accepting(), "no live gate is open");
+    }
+
     use super::*;
 
     #[tokio::test]

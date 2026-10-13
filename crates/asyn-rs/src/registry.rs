@@ -147,7 +147,7 @@ pub fn register_port(name: &str, handle: PortHandle) -> AsynResult<()> {
 fn arm_boot_flush() {
     static ARMED: OnceLock<()> = OnceLock::new();
     ARMED.get_or_init(|| {
-        epics_libcom_rs::runtime::interrupt_accept::on_interrupts_accepted(|| {
+        epics_libcom_rs::runtime::interrupt_accept::on_any_gate_open(|| {
             // C's callbackThread is a dedicated thread precisely so it does not
             // block the caller that set interruptAccept (the scan facility on
             // the iocRun path). Match that: the sweep uses the port actors'

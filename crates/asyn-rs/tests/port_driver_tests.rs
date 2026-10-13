@@ -278,12 +278,14 @@ fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     // test has no scan facility, so it establishes the precondition itself —
     // the analogue of C linking the non-IOC translation unit's
     // `interruptAccept = 1`. See `interrupt_accept` in `epics-libcom-rs`.
-    epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+    // The database's gate, opened as `scan_run` would and bound to the port.
+    let gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
     let mgr = PortManager::new();
     let rt = mgr
         .register_port(TestScopeDriver::new(&unique_name("SCOPE")))
         .unwrap();
     let handle = rt.port_handle().clone();
+    handle.interrupts().bind_gate(gate);
     (mgr, handle)
 }
 

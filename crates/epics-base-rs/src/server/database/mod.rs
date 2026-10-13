@@ -919,7 +919,9 @@ struct PvDatabaseInner {
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
-    scan_started: std::sync::atomic::AtomicBool,
+    /// This database's `scanCtl` and the scan-start claim; see
+    /// [`ScanControl`](crate::server::scan::ScanControl).
+    scan_ctl: Arc<crate::server::scan::ScanControl>,
     /// True once PINI processing has completed. Non-owner schedulers await
     /// this before running their hooks, preserving the "PINI before hooks"
     /// ordering contract.
@@ -1540,7 +1542,7 @@ impl PvDatabase {
                 record_init_waiting: std::sync::Mutex::new(HashMap::new()),
                 empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
-                scan_started: std::sync::atomic::AtomicBool::new(false),
+                scan_ctl: Arc::new(crate::server::scan::ScanControl::new()),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
@@ -1785,20 +1787,11 @@ impl PvDatabase {
             .collect()
     }
 
-    /// Atomically claim the right to start the scan scheduler for this DB.
-    /// Returns `true` on the first call, `false` on subsequent calls.
-    /// Used by `ScanScheduler::run` to prevent duplicate scan tasks
-    /// when multiple protocol servers (CA + PVA) both try to start scanning.
-    pub fn try_claim_scan_start(&self) -> bool {
-        self.inner
-            .scan_started
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
+    /// This database's scan control cell: C's one `scanCtl`, scoped to the
+    /// database so one process can run several without any of them
+    /// reaching another's facility.
+    pub fn scan_control(&self) -> &Arc<crate::server::scan::ScanControl> {
+        &self.inner.scan_ctl
     }
 
     /// Mark PINI processing complete. Wakes any non-owner scan schedulers

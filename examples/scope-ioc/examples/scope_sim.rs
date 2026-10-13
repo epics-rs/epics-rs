@@ -40,7 +40,9 @@ async fn main() {
     // (asynPortDriver.cpp:23-25); here the non-IOC program opens it itself.
     // Subscribed first, above, so the one-shot flush of the driver's
     // construction seeds is delivered rather than missed.
-    epics_base_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+    // The gate is a database's; this program has none, so it holds an open
+    // one for as long as the demo runs (an unbound port follows any open gate).
+    let _gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::opened();
 
     // 5. Spawn background simulation task
     let sim_handle = port_handle.clone();

@@ -755,7 +755,7 @@ mod ioc {
         //      its waker registered nowhere is dropped by the executor,
         //      taking the `ScanStopGuard` — and every `scan-%g` thread —
         //      with it. Redundant starts stay parked non-owners
-        //      (`try_claim_scan_start`), so exactly one set of `scan-%g`
+        //      (`ScanControl::try_claim`), so exactly one set of `scan-%g`
         //      threads exists no matter how many entry points start one.
         //      Held to the end of `main`: this IOC scans for as long as it
         //      serves.

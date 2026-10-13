@@ -730,7 +730,7 @@ impl PvDatabase {
     pub async fn post_event(&self) {
         // C `postEvent` (`dbScan.c:536-539`): an event posted while the
         // facility is not running queues nothing at all.
-        if !crate::server::scan::scan_is_running() {
+        if !self.inner.scan_ctl.is_running() {
             return;
         }
         if let Some(list) = ScanType::Event.scan_list() {
@@ -757,7 +757,7 @@ impl PvDatabase {
         // (dbIocRegister.c:478) call `eventNameToHandle` before `postEvent`.
         self.inner.scan_index.events.handle(want);
         // C `postEvent` (`dbScan.c:538-539`).
-        if !crate::server::scan::scan_is_running() {
+        if !self.inner.scan_ctl.is_running() {
             return;
         }
         let Some(list) = ScanType::Event.scan_list() else {

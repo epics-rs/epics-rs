@@ -516,6 +516,56 @@ mod tests {
         assert_pvxs_bits(&NTEnum::new().build(), PVXS_NTENUM);
     }
 
+    /// pvxs 1.5.3 `TypeDef(Struct, {Int32 before, StructA arr {Float64 x,
+    /// Struct inner {Int32 a, Int32 b}}, Int32 after, Struct tail {String s,
+    /// Float64 d}})`, `iall()` order: the array is one bit, its element
+    /// members are not numbered.
+    const PVXS_STRUCT_ARRAY: &[&str] = &["before", "arr", "after", "tail", "tail.s", "tail.d"];
+
+    #[test]
+    fn struct_array_member_spans_one_bit_like_pvxs() {
+        let int = || FieldDesc::Scalar(ScalarType::Int);
+        let elem = vec![
+            ("x".into(), FieldDesc::Scalar(ScalarType::Double)),
+            (
+                "inner".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![("a".into(), int()), ("b".into(), int())].into(),
+                },
+            ),
+        ];
+        let desc = FieldDesc::Structure {
+            struct_id: "sa_t".into(),
+            fields: vec![
+                ("before".into(), int()),
+                (
+                    "arr".into(),
+                    FieldDesc::StructureArray {
+                        struct_id: "elem_t".into(),
+                        fields: elem.into(),
+                    },
+                ),
+                ("after".into(), int()),
+                (
+                    "tail".into(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![
+                            ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+                            ("d".into(), FieldDesc::Scalar(ScalarType::Double)),
+                        ]
+                        .into(),
+                    },
+                ),
+            ]
+            .into(),
+        };
+        assert_pvxs_bits(&desc, PVXS_STRUCT_ARRAY);
+        assert_eq!(desc.bit_span_for_path("arr"), Some((2, 3)));
+        assert_eq!(desc.bit_span_for_path("tail"), Some((4, 7)));
+    }
+
     fn nt_scalar_double() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),

@@ -1522,11 +1522,21 @@ fn encode_structure_fields(
     order: ByteOrder,
     out: &mut Vec<u8>,
 ) {
-    for (name, child_desc) in fields {
-        match s.get_field(name) {
+    for (i, (name, child_desc)) in fields.iter().enumerate() {
+        match member_at(s, i, name) {
             Some(v) => encode_pv_field(v, child_desc, order, out),
             None => encode_pv_field(&default_value_for(child_desc), child_desc, order, out),
         }
+    }
+}
+
+/// The member of `s` the descriptor names `name` at index `i`. A value
+/// built from its descriptor holds it at `i`; one assembled by hand in
+/// another order is still found by name.
+fn member_at<'a>(s: &'a PvStructure, i: usize, name: &str) -> Option<&'a PvField> {
+    match s.fields.get(i) {
+        Some((n, v)) if n == name => Some(v),
+        _ => s.get_field(name),
     }
 }
 
@@ -1550,20 +1560,6 @@ pub fn encode_pv_field_with_bitset(
     order: ByteOrder,
     out: &mut Vec<u8>,
 ) {
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
-    }
-
     match desc {
         FieldDesc::Scalar(_)
         | FieldDesc::ScalarArray(_)
@@ -1584,15 +1580,15 @@ pub fn encode_pv_field_with_bitset(
                 encode_pv_field(value, desc, order, out);
                 return;
             }
-            if !any_descendant_set(bitset, bit_offset, desc) {
+            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
                 return;
             }
             // Recurse into each child; emit only set ones.
             let mut child_bit = bit_offset + 1;
-            for (name, child_desc) in fields {
+            for (i, (name, child_desc)) in fields.iter().enumerate() {
                 let missing;
                 let child_value = match value {
-                    PvField::Structure(s) => s.get_field(name),
+                    PvField::Structure(s) => member_at(s, i, name),
                     _ => None,
                 };
                 let child_value = match child_value {
@@ -1626,22 +1622,6 @@ pub fn decode_pv_field_with_bitset(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
 ) -> Result<PvField, DecodeError> {
-    // Helper: true iff the bit at `pos` is set, OR any descendant of
-    // a structure starting at `pos` (with `desc_local`) is set.
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
-    }
-
     // The bit at `bit_offset` represents this descriptor itself.
     // For Structure, recurse into children. For scalar/leaf, decode iff
     // the bit is set.
@@ -1669,7 +1649,7 @@ pub fn decode_pv_field_with_bitset(
             }
             // The struct is "present" only if some descendant bit is
             // set. If none, return a default-filled structure.
-            if !any_descendant_set(bitset, bit_offset, desc) {
+            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
                 return Ok(default_value_for(desc));
             }
             let mut s = PvStructure::new(struct_id);
@@ -1696,20 +1676,6 @@ pub fn decode_pv_field_with_bitset_cached(
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<PvField, DecodeError> {
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
-    }
-
     match desc {
         FieldDesc::Scalar(_)
         | FieldDesc::ScalarArray(_)
@@ -1728,7 +1694,7 @@ pub fn decode_pv_field_with_bitset_cached(
             if bitset.get(bit_offset) {
                 return decode_pv_field_cached(desc, cur, order, cache);
             }
-            if !any_descendant_set(bitset, bit_offset, desc) {
+            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
                 return Ok(default_value_for(desc));
             }
             let mut s = PvStructure::new(struct_id);
@@ -1770,20 +1736,6 @@ pub fn decode_pv_field_with_bitset_into(
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<(), DecodeError> {
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
-    }
-
     match desc {
         FieldDesc::Scalar(_)
         | FieldDesc::ScalarArray(_)
@@ -1802,7 +1754,7 @@ pub fn decode_pv_field_with_bitset_into(
                 *dst = decode_pv_field_cached(desc, cur, order, cache)?;
                 return Ok(());
             }
-            if !any_descendant_set(bitset, bit_offset, desc) {
+            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
                 return Ok(());
             }
             match dst {
@@ -2657,6 +2609,35 @@ fn zero_scalar(st: ScalarType) -> ScalarValue {
 mod tests {
     use super::*;
     use crate::pvdata::{UnionItem, VariantValue};
+
+    /// Members stored in another order than the descriptor's still encode
+    /// by name, through both the full and the bitset encoder.
+    #[test]
+    fn out_of_order_members_encode_like_descriptor_order() {
+        let desc = crate::nt::NTScalar::new(ScalarType::Double)
+            .with_display()
+            .build();
+        let PvField::Structure(mut s) = default_value_for(&desc) else {
+            unreachable!()
+        };
+        s.fields[0].1 = PvField::Scalar(ScalarValue::Double(4.5));
+        let ordered = PvField::Structure(s.clone());
+        s.fields.reverse();
+        let reversed = PvField::Structure(s);
+        let order = ByteOrder::Little;
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        encode_pv_field(&ordered, &desc, order, &mut a);
+        encode_pv_field(&reversed, &desc, order, &mut b);
+        assert_eq!(a, b);
+        let mut bits = crate::proto::BitSet::new();
+        bits.set(1); // value
+        bits.set(desc.bit_for_path("display.units").unwrap());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        encode_pv_field_with_bitset(&ordered, &desc, &bits, 0, order, &mut a);
+        encode_pv_field_with_bitset(&reversed, &desc, &bits, 0, order, &mut b);
+        assert_eq!(a, b);
+        assert_eq!(&a[..8], &4.5f64.to_le_bytes());
+    }
 
     /// `decode_type_desc_cached_opt` is pvxs `from_wire_type`
     /// (`dataencode.cpp:729-745`): the NULL (`0xFF`) type code consumes

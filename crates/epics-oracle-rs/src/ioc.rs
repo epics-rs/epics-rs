@@ -591,6 +591,17 @@ pub fn boot_on_free_port(
 pub fn boot_on_free_port_claiming(
     names: &BootNames,
     log: LogPolicy,
+    claim: impl FnMut(u16) -> Result<(), BootError>,
+    command: impl FnMut(u16) -> Result<Command, BootError>,
+) -> Result<BootedProcess, BootError> {
+    boot_within(names, log, BOOT_TIMEOUT, claim, command)
+}
+
+/// The boot loop, with the time each attempt has to report ready.
+fn boot_within(
+    names: &BootNames,
+    log: LogPolicy,
+    timeout: Duration,
     mut claim: impl FnMut(u16) -> Result<(), BootError>,
     mut command: impl FnMut(u16) -> Result<Command, BootError>,
 ) -> Result<BootedProcess, BootError> {
@@ -608,7 +619,7 @@ pub fn boot_on_free_port_claiming(
         }
         let mut cmd = command(port)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        match watch_boot(names, log, port, &mut cmd) {
+        match watch_boot(names, log, timeout, port, &mut cmd) {
             Ok(booted) => return Ok(booted),
             Err(e) if e.retryable => {
                 // Someone took the port between our probe and the child's
@@ -631,6 +642,7 @@ pub fn boot_on_free_port_claiming(
 fn watch_boot(
     names: &BootNames,
     log: LogPolicy,
+    timeout: Duration,
     port: u16,
     cmd: &mut Command,
 ) -> Result<BootedProcess, BootError> {
@@ -659,7 +671,7 @@ fn watch_boot(
     spawn_watcher(stdout, tx.clone(), tail.clone());
     spawn_watcher(stderr, tx, tail.clone());
 
-    let deadline = Instant::now() + BOOT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut ready = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -669,7 +681,7 @@ fn watch_boot(
             return err(
                 Side::C,
                 format!(
-                    "{what} did not report ready within {BOOT_TIMEOUT:?} on {label} {port}; \
+                    "{what} did not report ready within {timeout:?} on {label} {port}; \
                      it said: {}",
                     tail.text()
                 ),
@@ -1856,9 +1868,10 @@ mod tests {
 
     /// A stand-in `softIoc`: it binds the CA port on UDP and TCP as rsrv
     /// does, and says what rsrv says — the ready line when it got both,
-    /// `CAS: No TCP server started` and `cantProceed`'s banner when it did
-    /// not. It then idles, as `cantProceed` does, so only the harness can end
-    /// it.
+    /// `CAS: No TCP server started` and `cantProceed`'s banner when the port
+    /// was in use. Any other bind error is logged and suspends it, as `tryBind`
+    /// does (`caservertask.c:135-141`). It then idles, as `cantProceed` does,
+    /// so only the harness can end it.
     fn fake_rsrv(port: u16) -> Command {
         fake_rsrv_on("127.0.0.1", port)
     }
@@ -1866,14 +1879,24 @@ mod tests {
     /// [`fake_rsrv`] serving on `host`, as the softIoc behind a proxy does.
     fn fake_rsrv_on(host: &str, port: u16) -> Command {
         const BODY: &str = r#"
-import os, socket, sys, time
+import errno, os, socket, sys, time
 p = int(os.environ["EPICS_CA_SERVER_PORT"])
 h = os.environ.get("FAKE_RSRV_HOST", "127.0.0.1")
 try:
     u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((h, p))
     t = socket.socket(); t.bind((h, p)); t.listen()
+    said = "bound"
+except OSError as x:
+    if x.errno != errno.EADDRINUSE:
+        print(f"CAS: bind ERROR: {x.strerror}", flush=True)
+        while True: time.sleep(60)
+    said = "collided"
+e = os.environ.get("FAKE_RSRV_EVIDENCE")
+if e:
+    with open(e, "a") as f: f.write(f"{p} {said}\n")
+if said == "bound":
     print("iocRun: All initialization complete", flush=True)
-except OSError:
+else:
     print("CAS: No TCP server started", flush=True)
     print("CRITICAL ERROR Thread _main_ (0x1) can't proceed, suspending.", flush=True)
 time.sleep(60)
@@ -1895,11 +1918,14 @@ time.sleep(60)
         )
     }
 
-    /// Boundary — a port taken between probe and spawn yields a started IOC
-    /// on the second attempt, on a different port, and the caller sees one
-    /// success.
+    /// Boundary — a port taken between probe and spawn is never tried again,
+    /// and the IOC boots on a port that was free when tried. A busy box can
+    /// lose further ports to other processes, so the attempt count is not
+    /// the claim; each abandoned attempt must have collided.
     #[test]
     fn a_port_taken_after_the_probe_is_replaced_on_the_next_attempt() {
+        let dir = crate::runner::workdir(None).expect("workdir");
+        let evidence = dir.join("binds");
         let mut calls = Vec::new();
         let mut held = Vec::new();
         let mut booted = boot_on_free_port(
@@ -1910,15 +1936,35 @@ time.sleep(60)
                     held.push(hold(port));
                 }
                 calls.push(port);
-                Ok(fake_rsrv(port))
+                let mut cmd = fake_rsrv(port);
+                cmd.env("FAKE_RSRV_EVIDENCE", &evidence);
+                Ok(cmd)
             },
         )
-        .expect("the second attempt must boot");
+        .expect("a later attempt must boot");
         let _ = booted.child.kill();
         let _ = booted.child.wait();
-        assert_eq!(calls.len(), 2, "one lost port, one fresh one: {calls:?}");
-        assert_ne!(calls[0], calls[1], "the losing number must not be reused");
-        assert_eq!(booted.port, calls[1]);
+        let said = std::fs::read_to_string(&evidence).expect("evidence");
+        let _ = std::fs::remove_dir_all(&dir);
+        let want: Vec<String> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let outcome = if i + 1 == calls.len() {
+                    "bound"
+                } else {
+                    "collided"
+                };
+                format!("{p} {outcome}")
+            })
+            .collect();
+        assert_eq!(said.lines().collect::<Vec<_>>(), want, "attempts {calls:?}");
+        assert!(calls.len() >= 2, "the stolen port cannot boot: {calls:?}");
+        assert!(
+            !calls[1..].contains(&calls[0]),
+            "the stolen port must not be reused: {calls:?}"
+        );
+        assert_eq!(booted.port, *calls.last().unwrap());
         assert!(booted.tail.text().contains("iocRun: All initialization"));
     }
 
@@ -2019,6 +2065,71 @@ time.sleep(60)
         assert_eq!(calls, 1, "a non-collision failure must not be retried");
         assert!(
             e.message.contains("exited during boot") && !e.message.contains("attempts"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Boundary — a `cantProceed` that rsrv did not reach through a lost CA
+    /// port is the IOC's own death: one attempt, returned as it is.
+    #[test]
+    fn a_cant_proceed_without_a_lost_port_is_not_retried() {
+        const BODY: &str = r#"
+import time
+print("dbLoadRecords: record type not found", flush=True)
+print("CRITICAL ERROR Thread _main_ (0x1) can't proceed, suspending.", flush=True)
+time.sleep(60)
+"#;
+        let mut calls = 0;
+        let result = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |_| {
+                calls += 1;
+                let mut cmd = Command::new("python3");
+                cmd.args(["-I", "-c", BODY]).stdin(Stdio::null());
+                Ok(cmd)
+            },
+        );
+        let Err(e) = result else {
+            panic!("a process that could not proceed was reported booted");
+        };
+        assert_eq!(calls, 1, "a death must not be retried");
+        assert!(!e.retryable, "a death is not a lost port: {}", e.message);
+        assert!(
+            e.message.contains("declared itself unable to proceed")
+                && !e.message.contains("attempts"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Boundary — an IOC that never reports ready is a hang, not a lost port:
+    /// one attempt, killed at the deadline, returned as it is.
+    #[test]
+    fn a_silent_boot_times_out_once() {
+        let mut calls = 0;
+        let result = boot_within(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            Duration::from_millis(300),
+            |_| Ok(()),
+            |_| {
+                calls += 1;
+                let mut cmd = Command::new("python3");
+                cmd.args(["-I", "-c", "import time; time.sleep(60)"])
+                    .stdin(Stdio::null());
+                Ok(cmd)
+            },
+        );
+        let Err(e) = result else {
+            panic!("a process that never reported ready was reported booted");
+        };
+        assert_eq!(calls, 1, "a hang must not be retried");
+        assert!(!e.retryable, "a hang is not a lost port: {}", e.message);
+        assert!(
+            e.message.contains("did not report ready within 300ms")
+                && !e.message.contains("attempts"),
             "{}",
             e.message
         );

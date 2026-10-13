@@ -271,6 +271,40 @@ mod exec_model {
         }
     }
 
+    /// The C6 search topology is the built-in database's: a probe build
+    /// booted on a site database must not be pointed at the SLIRP host.
+    #[cfg(feature = "bringup-probes")]
+    #[test]
+    fn a_site_db_keeps_the_site_search_configuration() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("site.db");
+        std::fs::write(&db, "record(ai, \"SITE:AI\") {}\n").expect("write the db");
+        let booted = boot_on_a_named_port(
+            dir.path(),
+            |cmd, port| {
+                cmd.arg(&db)
+                    .env_remove("EPICS_CA_NAME_SERVERS")
+                    .env_remove("EPICS_CA_ADDR_LIST")
+                    .env_remove("EPICS_CA_AUTO_ADDR_LIST")
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1");
+            },
+            |console| console.contains("C6 probe: EPICS_CA_NAME_SERVERS"),
+        );
+        let console = booted.console();
+        let banner = console
+            .lines()
+            .find(|l| l.starts_with("C6 probe: EPICS_CA_NAME_SERVERS"))
+            .expect("the ready line");
+        assert_eq!(
+            banner,
+            "C6 probe: EPICS_CA_NAME_SERVERS=(unset), EPICS_CA_ADDR_LIST=(unset), \
+             EPICS_CA_AUTO_ADDR_LIST=(unset); reporting every 10 s"
+        );
+    }
+
     struct Killed(Child);
 
     impl Drop for Killed {
@@ -289,11 +323,20 @@ mod exec_model {
         use named_port::verdict::{LOCAL_ADDR_FAILED, LOCAL_ADDR_FAILED_PORT};
         let dir = tempfile::tempdir().expect("temp dir");
         let shim = named_port::getsockname_einval_shim(dir.path());
+        // A link-free db, not the built-in one: under `bringup-probes` that
+        // brings the C6 probe links, whose dial to the compiled-in name server
+        // (C dials it too, `cac.cpp:250-281`) logs DIALPROBE racing the exit.
+        // No name servers as well, so the pin does not rest on the client
+        // being made at the first remote link (C: `dbContext.cpp:99-102`).
+        let db = dir.path().join("plain.db");
+        std::fs::write(&db, "record(ai, \"LOCAL:AI\") {}\n").expect("write the db");
         let (port, stderr) = named_port::on_a_named_port(|port| {
             let err_path = dir.path().join(format!("stderr-{port}.log"));
             let err = std::fs::File::create(&err_path).expect("create the stderr log");
             let mut child = Killed(
                 Command::new(env!("CARGO_BIN_EXE_realtime-ca-ioc"))
+                    .arg(&db)
+                    .env("EPICS_CA_NAME_SERVERS", "")
                     .env("EPICS_CAS_SERVER_PORT", port.to_string())
                     .env("EPICS_CA_SERVER_PORT", port.to_string())
                     .env("LD_PRELOAD", &shim)

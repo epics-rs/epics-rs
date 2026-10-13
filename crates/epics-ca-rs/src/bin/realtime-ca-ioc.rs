@@ -1090,14 +1090,19 @@ mod ioc {
         // SAFETY (edition 2024): this runs on the single init thread
         // before `background_init` starts any other thread, so no
         // concurrent reader or writer of the environment exists.
+        //
+        // Only for the built-in database: its C6 probe records are what the
+        // topology is for, and a site database keeps the site's search.
         #[cfg(feature = "bringup-probes")]
-        for (var, compiled_in) in [
-            ("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER),
-            ("EPICS_CA_ADDR_LIST", ""),
-            ("EPICS_CA_AUTO_ADDR_LIST", "NO"),
-        ] {
-            if std::env::var_os(var).is_none() {
-                unsafe { std::env::set_var(var, compiled_in) };
+        if boot_args.is_empty() {
+            for (var, compiled_in) in [
+                ("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER),
+                ("EPICS_CA_ADDR_LIST", ""),
+                ("EPICS_CA_AUTO_ADDR_LIST", "NO"),
+            ] {
+                if std::env::var_os(var).is_none() {
+                    unsafe { std::env::set_var(var, compiled_in) };
+                }
             }
         }
 
@@ -1401,9 +1406,13 @@ mod ioc {
             let probe_db = db_for_names.clone();
             let probe_resolver = resolver.clone();
             let probe_server = server.clone();
+            let env = |var| std::env::var(var).unwrap_or_else(|_| "(unset)".to_string());
             println!(
-                "C6 probe: EPICS_CA_NAME_SERVERS={C6_NAME_SERVER} (compiled in), \
-                 EPICS_CA_ADDR_LIST empty, EPICS_CA_AUTO_ADDR_LIST=NO; reporting every 10 s",
+                "C6 probe: EPICS_CA_NAME_SERVERS={}, EPICS_CA_ADDR_LIST={}, \
+                 EPICS_CA_AUTO_ADDR_LIST={}; reporting every 10 s",
+                env("EPICS_CA_NAME_SERVERS"),
+                env("EPICS_CA_ADDR_LIST"),
+                env("EPICS_CA_AUTO_ADDR_LIST"),
             );
             let charge = ThreadCharge::fixed(StackSizeClass::Medium);
             match thread::Builder::new()

@@ -678,7 +678,12 @@ mod tests {
             },
         )
         .unwrap();
-        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+        crate::registry::register_port(
+            PORT,
+            runtime.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let entry = crate::registry::get_port(PORT).expect("published");
         assert!(
@@ -736,7 +741,7 @@ mod tests {
 
             let manager = crate::manager::PortManager::new();
             let err = manager
-                .register_port(TestPort::new(PORT))
+                .register_port(TestPort::new(PORT), &crate::registry::open_owner())
                 .err()
                 .expect("thread creation is refused, so registration must fail");
             assert!(

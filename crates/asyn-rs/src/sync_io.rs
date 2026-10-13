@@ -404,7 +404,8 @@ mod tests {
     #[test]
     fn test_sync_io_via_manager() {
         let mgr = PortManager::new();
-        mgr.register_port(TestPort::new()).unwrap();
+        mgr.register_port(TestPort::new(), &crate::registry::open_owner())
+            .unwrap();
         let sio = SyncIOHandle::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
         sio.write_int32(0, 100).unwrap();
         assert_eq!(sio.read_int32(0).unwrap(), 100);

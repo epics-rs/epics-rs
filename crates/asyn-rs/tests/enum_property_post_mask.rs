@@ -97,7 +97,8 @@ async fn enum_ioc(
         create_port_runtime(EnumPort::new(port, choices), RuntimeConfig::default())
             .expect("port runtime starts");
     let handle = runtime.port_handle().clone();
-    register_port(port, handle.clone()).expect("port name is free");
+    register_port(port, handle.clone(), &asyn_rs::registry::open_owner())
+        .expect("port name is free");
     drop(runtime);
 
     let db_text = format!(

@@ -17,7 +17,7 @@ pub use device::{ASYN_RECORD_DTYP, AsynRecordDevice};
 // — spells it `asyn_record::get_port`, and moving the definition is not a
 // reason to break them.
 pub use crate::registry::{
-    PortEntry, PortRegistry, get_port, port_names, register_port, unregister_port,
+    PortEntry, PortRegistry, get_port, open_owner, port_names, register_port, unregister_port,
 };
 
 use io_intr::{IoIntrBinding, IoIntrSample, IoIntrScan};
@@ -5816,7 +5816,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -6100,7 +6100,12 @@ mod tests {
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(name, rt.port_handle().clone()).unwrap();
+        register_port(
+            name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         rt.port_handle()
             .submit_blocking(crate::request::RequestOp::ShutdownPort, AsynUser::default())
             .unwrap();
@@ -6209,7 +6214,12 @@ mod tests {
             base.init_auto_connect(false);
             let (rt, _jh) = create_port_runtime(Link(base), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
-            register_port(name, rt.port_handle().clone()).unwrap();
+            register_port(
+                name,
+                rt.port_handle().clone(),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
             let mut rec = AsynRecord::default();
             rec.port = name.to_string();
             rec.connect_device().unwrap();
@@ -6341,7 +6351,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -6463,7 +6473,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -6641,7 +6651,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -6725,7 +6735,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -6822,7 +6832,12 @@ mod tests {
         use crate::runtime::{RuntimeConfig, create_port_runtime};
         let (rt, _jh) = create_port_runtime(port, RuntimeConfig::default())
             .expect("the port runtime thread must start");
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.connect_device().unwrap();
@@ -6955,7 +6970,12 @@ mod tests {
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -7140,7 +7160,7 @@ mod tests {
             actor_link,
             trace.clone(),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -7211,7 +7231,7 @@ mod tests {
             trace.clone(),
         );
 
-        register_port("test_asyn_rec", handle).unwrap();
+        register_port("test_asyn_rec", handle, &crate::registry::open_owner()).unwrap();
 
         let entry = crate::registry::get_port("test_asyn_rec");
         assert!(entry.is_some());
@@ -7258,7 +7278,7 @@ mod tests {
         let mut handle =
             PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
         handle.set_capabilities(true, 4);
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -7336,7 +7356,7 @@ mod tests {
                 Arc::new(TraceManager::new()),
             );
             handle.set_capabilities(multi_device, max_addr as i32);
-            register_port(port_name, handle).unwrap();
+            register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
             crate::registry::get_port(port_name).expect("the port is registered")
         }
 
@@ -7546,7 +7566,7 @@ mod tests {
             Some(port_name),
             TraceInfoMask::SOURCE | TraceInfoMask::THREAD,
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -7601,7 +7621,7 @@ mod tests {
         // it); without it the record's subscription is a no-op.
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
         trace.set_trace_info_mask(Some(port_name), TraceInfoMask::TIME);
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -7689,7 +7709,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         // ASCII read: AINP gets the (lossy) text; BINP must stay untouched.
         let mut ascii = AsynRecord::default();
@@ -7796,7 +7816,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -7895,7 +7915,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         // ASCII read failure: NORD/EOMR cleared to 0, AINP/TINP cleared to "",
         // and BINP (not the IFMT-selected field) left as it was — matching C,
@@ -8077,7 +8097,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let reg = |iface: InterfaceType, tmod: TransferMode| -> String {
             let mut rec = AsynRecord::default();
@@ -8233,7 +8253,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -8334,7 +8354,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -8435,7 +8455,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -8530,7 +8550,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -8638,7 +8658,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -8830,7 +8850,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -8983,7 +9003,7 @@ mod tests {
         );
         // echoDriver's interfaces: asynCommon and asynOctet.
         handle.set_interfaces(crate::interfaces::octet_transport_capabilities());
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
         let path = std::env::temp_dir().join(format!("as15-trace-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         trace.set_trace_file(
@@ -9372,7 +9392,7 @@ mod tests {
                 actor_link,
                 Arc::new(TraceManager::new()),
             );
-            register_port(port_name, handle).unwrap();
+            register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
             let mut rec = AsynRecord::default();
             rec.port = port_name.to_string();
@@ -9502,7 +9522,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mk = |iface: i32, tmod: TransferMode| {
             let mut rec = AsynRecord::default();
@@ -9622,7 +9642,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
         requested
     }
 
@@ -9731,7 +9751,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = read_rec(port_name, 0, 40, 0);
         rec.tmot = 0.0;
@@ -9797,7 +9817,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = read_rec(port_name, 0, 40, 0);
         rec.tmot = -1.0;
@@ -9900,7 +9920,7 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
         log
     }
 
@@ -10888,7 +10908,7 @@ mod tests {
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
         // Known baseline mask, then register the port for the record to find.
         trace.set_trace_mask(Some(port_name), TraceMask::empty());
-        crate::registry::register_port(port_name, handle).unwrap();
+        crate::registry::register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         // Build the record, hand it the database handle, and connect it —
         // connecting registers the trace exception callback with the same
@@ -11051,7 +11071,7 @@ A.TMSK 1
             trace.clone(),
         );
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
-        crate::registry::register_port(port_name, handle).unwrap();
+        crate::registry::register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let db = PvDatabase::new();
         db.add_record("A", Box::new(AsynRecord::default()))
@@ -11335,7 +11355,12 @@ A.OEOS
             base.init_auto_connect(false);
             let (rt, jh) = create_port_runtime(Echo(base), RuntimeConfig::default()).unwrap();
             std::mem::forget(jh);
-            register_port(port_name, rt.port_handle().clone()).unwrap();
+            register_port(
+                port_name,
+                rt.port_handle().clone(),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
             std::mem::forget(rt);
 
             let db = PvDatabase::new();
@@ -11504,7 +11529,7 @@ A.OEOS
         let (rt, jh) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
         std::mem::forget(jh);
         let handle = rt.port_handle().clone();
-        register_port(port_name, handle.clone()).unwrap();
+        register_port(port_name, handle.clone(), &crate::registry::open_owner()).unwrap();
         std::mem::forget(rt);
 
         let db = PvDatabase::new();
@@ -11610,7 +11635,7 @@ A.OEOS
         // `monitorStatus`): TMSK = ERROR, all IO bits clear.
         trace.set_trace_mask(Some(port_name), TraceMask::ERROR);
         trace.set_trace_io_mask(Some(port_name), TraceIoMask::empty());
-        crate::registry::register_port(port_name, handle).unwrap();
+        crate::registry::register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "TRACE_POSTIFNEW_REC";
@@ -11757,7 +11782,7 @@ A.OEOS
             trace.clone(),
         );
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
-        crate::registry::register_port(port_name, handle).unwrap();
+        crate::registry::register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "ERRS_POST_REC";
@@ -11873,7 +11898,7 @@ A.OEOS
             trace.clone(),
         );
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
-        crate::registry::register_port(port_name, handle).unwrap();
+        crate::registry::register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "ERRS_ORDER_REC";
@@ -12037,7 +12062,7 @@ A.OEOS
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         // A record in the database with no port yet: BAUD/IEOS/PCNCT are at their
         // defaults, and the operator is watching them.
@@ -12147,7 +12172,7 @@ A.OEOS
             actor_link,
             Arc::new(TraceManager::new()),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "R18_86_REC";
@@ -12249,7 +12274,8 @@ A.OEOS
             actor_link,
             trace.clone(),
         );
-        crate::registry::register_port(port_name, handle.clone()).unwrap();
+        crate::registry::register_port(port_name, handle.clone(), &crate::registry::open_owner())
+            .unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "EXCEPT_CNCT_REC";
@@ -12342,7 +12368,8 @@ A.OEOS
             actor_link,
             trace.clone(),
         );
-        crate::registry::register_port(port_name, handle.clone()).unwrap();
+        crate::registry::register_port(port_name, handle.clone(), &crate::registry::open_owner())
+            .unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "EXCEPT_CONVERGES_REC";
@@ -12465,7 +12492,7 @@ A.OEOS
             actor_link,
             trace.clone(),
         );
-        register_port(port_name, handle.clone()).unwrap();
+        register_port(port_name, handle.clone(), &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -12527,7 +12554,7 @@ A.OEOS
             actor_link,
             trace.clone(),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -12599,7 +12626,7 @@ A.OEOS
             actor_link,
             trace.clone(),
         );
-        register_port(port_name, handle).unwrap();
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -12646,7 +12673,12 @@ A.OEOS
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(vxi_name, vxi_rt.port_handle().clone()).unwrap();
+        register_port(
+            vxi_name,
+            vxi_rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = vxi_name.to_string();
@@ -12662,7 +12694,12 @@ A.OEOS
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(prologix_name, p_rt.port_handle().clone()).unwrap();
+        register_port(
+            prologix_name,
+            p_rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = prologix_name.to_string();
@@ -12711,7 +12748,12 @@ A.OEOS
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -12793,7 +12835,12 @@ A.OEOS
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -12842,7 +12889,12 @@ A.OEOS
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -13047,7 +13099,12 @@ A.OEOS
         )
         .expect("the port runtime thread must start");
         std::mem::forget(jh);
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         std::mem::forget(rt);
     }
 
@@ -13129,7 +13186,12 @@ A.OEOS
         )
         .expect("the port runtime thread must start");
         std::mem::forget(jh);
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         std::mem::forget(rt);
     }
 
@@ -13160,7 +13222,12 @@ A.OEOS
         let (rt, jh) = create_port_runtime(ParamDriver(base), RuntimeConfig::default())
             .expect("the port runtime thread must start");
         std::mem::forget(jh);
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         std::mem::forget(rt);
     }
 
@@ -13248,7 +13315,12 @@ A.OEOS
             let (rt, jh) = create_port_runtime(drv, RuntimeConfig::default())
                 .expect("the port runtime thread must start");
             std::mem::forget(jh);
-            register_port(port_name, rt.port_handle().clone()).unwrap();
+            register_port(
+                port_name,
+                rt.port_handle().clone(),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
             std::mem::forget(rt);
 
             let mut rec = AsynRecord::default();
@@ -13356,7 +13428,12 @@ A.OEOS
         let base = PortDriverBase::new(port_name, 1, PortFlags::default());
         let (rt, jh) = create_port_runtime(Int32Only(base), RuntimeConfig::default()).unwrap();
         std::mem::forget(jh);
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         std::mem::forget(rt);
 
         let mut rec = AsynRecord::default();
@@ -13409,7 +13486,12 @@ A.OEOS
             base.init_auto_connect(false);
             let (rt, jh) = create_port_runtime(Refuses(base), RuntimeConfig::default()).unwrap();
             std::mem::forget(jh);
-            register_port(port_name, rt.port_handle().clone()).unwrap();
+            register_port(
+                port_name,
+                rt.port_handle().clone(),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
             let mut rec = AsynRecord::default();
             rec.port = port_name.to_string();
             // A port-level user, so the Connect queue takes the request on a
@@ -13622,7 +13704,12 @@ A.OEOS
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(name, rt.port_handle().clone()).unwrap();
+        register_port(
+            name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         (rt, reads)
     }
 
@@ -14033,7 +14120,12 @@ A.OEOS
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();

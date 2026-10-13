@@ -2044,7 +2044,7 @@ fn parse_configure_args(args: &[ArgValue]) -> Result<(String, String, ModbusConf
 }
 
 impl CommandHandler for ModbusConfigHandler {
-    fn call(&self, args: &[ArgValue], _ctx: &CommandContext) -> CommandResult {
+    fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let (port_name, octet_port, config) =
             parse_configure_args(args).map_err(|e| e.to_string())?;
         let interpose = take_interpose(&octet_port);
@@ -2101,7 +2101,11 @@ impl CommandHandler for ModbusConfigHandler {
         let (runtime, _jh) =
             create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
         let port_handle = runtime.port_handle().clone();
-        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone()) {
+        // Owned by the database this command's IOC runs, so its seed waits
+        // for that database's open.
+        let owner = ctx.db().scan_control().interrupt_gate();
+        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), owner)
+        {
             // Nothing published this port, so ask the actor to stop.
             runtime.shutdown();
             return Err(e.to_string());
@@ -3553,8 +3557,12 @@ mod tests {
         };
         let (octet_rt, _jh) =
             create_port_runtime(octet, RuntimeConfig::default()).expect("octet runtime must start");
-        asyn_rs::asyn_record::register_port("OCTET_LATESTART", octet_rt.port_handle().clone())
-            .expect("the octet port must publish");
+        asyn_rs::asyn_record::register_port(
+            "OCTET_LATESTART",
+            octet_rt.port_handle().clone(),
+            &asyn_rs::registry::open_owner(),
+        )
+        .expect("the octet port must publish");
 
         // `drvModbusAsynConfigure MB_LATESTART OCTET_LATESTART 1 3 0 4 UINT16 0`
         // — the last argument is C's `pollMsec`.
@@ -5096,7 +5104,10 @@ mod tests {
         // `interruptAccept` — a real IOC opens it at the `iocInit`/`scan_run`
         // barrier. This unit test drives `poll_cycle` with no scan facility, so
         // it must establish that post-`iocInit` precondition itself.
-        let _gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::opened();
+        driver
+            .base
+            .interrupts
+            .set_owner(epics_base_rs::runtime::interrupt_accept::InterruptGate::opened());
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         // The statistics params live at addr 0; their monitors must have

@@ -115,7 +115,7 @@ async fn main() -> CaResult<()> {
             "xrtBeamlineConfig",
             vec![],
             "xrtBeamlineConfig - Configure XRT beamline simulation IOC",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
+            move |_args: &[ArgValue], ctx: &CommandContext| {
                 println!("xrtBeamlineConfig: setting up beamline...");
 
                 let sim_config = SimConfig {
@@ -150,8 +150,12 @@ async fn main() -> CaResult<()> {
                         .map_err(|e| format!("failed to create XRT detector: {e}"))?;
 
                 let xrt_handle = xrt_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("XRT", xrt_handle)
-                    .map_err(|e| e.to_string())?;
+                asyn_rs::asyn_record::register_port(
+                    "XRT",
+                    xrt_handle,
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
 
                 mgr_c.set_driver(Arc::new(ad_core_rs::ioc::GenericDriverContext::new(
                     xrt_rt.pool().clone(),

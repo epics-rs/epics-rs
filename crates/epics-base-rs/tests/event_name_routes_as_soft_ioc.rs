@@ -26,6 +26,8 @@ use epics_base_rs::types::EpicsValue;
 #[epics_macros_rs::epics_test]
 async fn event_names_fold_as_soft_ioc_folds_them() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let targets = [
         ("T5", "5.0"),
         ("TS", " 5 "),
@@ -79,6 +81,8 @@ async fn event_names_fold_as_soft_ioc_folds_them() {
 #[epics_macros_rs::epics_test]
 async fn a_hexadecimal_event_name_is_its_event_number() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     for (name, evnt) in [
         ("TH", "0x10"),
         ("TD", "16"),

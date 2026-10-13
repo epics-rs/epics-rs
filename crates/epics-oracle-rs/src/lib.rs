@@ -205,7 +205,13 @@ pub struct PortIocDevices {
 /// universal asyn factory, so no record's read fields or processing change —
 /// only the `DTYP` `value.choices` a client reads, matching the fat-C ground
 /// truth.
-pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
+///
+/// `db` is the database the IOC then boots into
+/// (`port_ioc_builder().with_database(db.clone())`): the port is owned by its
+/// `interruptAccept`.
+pub fn register_port_ioc_devices(
+    db: &std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+) -> Result<PortIocDevices, String> {
     use asyn_rs::drivers::ip_port::DrvAsynIPPort;
     use asyn_rs::manager::PortManager;
 
@@ -219,6 +225,7 @@ pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
                 false, // noProcessEos=0 — install the default EOS interpose, as C does
             )
             .map_err(|e| format!("configure {ORACLE_ASYN_PORT}: {e}"))?,
+            db.scan_control().interrupt_gate(),
         )
         .map_err(|e| format!("register {ORACLE_ASYN_PORT}: {e}"))?;
 

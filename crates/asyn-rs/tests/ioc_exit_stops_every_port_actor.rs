@@ -70,7 +70,11 @@ impl Drop for TeardownDriver {
 /// its own and prove nothing about who stopped it.
 fn publish(registry: &PortRegistry, name: &str, port: &PortRuntimeHandle) {
     registry
-        .register(name, port.port_handle().clone())
+        .register(
+            name,
+            port.port_handle().clone(),
+            &asyn_rs::registry::open_owner(),
+        )
         .expect("port name is free");
 }
 

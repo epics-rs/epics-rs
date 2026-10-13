@@ -81,7 +81,12 @@ async fn armed_time_series(port: &str) -> (Arc<PvDatabase>, EventReader) {
 async fn time_series_with_nelm(port: &str, nelm: u32) -> (Arc<PvDatabase>, EventReader) {
     let (runtime, _join) = create_port_runtime(TsPort::new(port), RuntimeConfig::default())
         .expect("port runtime starts");
-    register_port(port, runtime.port_handle().clone()).expect("port name is free");
+    register_port(
+        port,
+        runtime.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .expect("port name is free");
     // Dropping the runtime handle must not kill a registered port — that is
     // `port_runtime_lifetime.rs`'s contract, and this test leans on it.
     drop(runtime);

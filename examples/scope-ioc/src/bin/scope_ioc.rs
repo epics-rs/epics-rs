@@ -46,7 +46,7 @@ struct ConfigHandler {
 }
 
 impl CommandHandler for ConfigHandler {
-    fn call(&self, args: &[ArgValue], _ctx: &CommandContext) -> CommandResult {
+    fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let port_name = match &args[0] {
             ArgValue::String(s) => s.clone(),
             _ => return Err("portName required".into()),
@@ -64,8 +64,12 @@ impl CommandHandler for ConfigHandler {
 
         // Register port in global registry so universal asyn device support can find it
         let port_handle = runtime_handle.port_handle().clone();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone())
-            .map_err(|e| e.to_string())?;
+        asyn_rs::asyn_record::register_port(
+            &port_name,
+            port_handle.clone(),
+            ctx.db().scan_control().interrupt_gate(),
+        )
+        .map_err(|e| e.to_string())?;
 
         // Start background simulation task using the PortHandle API
         let sim_notify = notify.clone();

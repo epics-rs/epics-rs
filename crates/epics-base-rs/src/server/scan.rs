@@ -128,17 +128,15 @@ impl Drop for ScanStopGuard {
 /// event-driven processing without wedging the shell.
 /// C's fourth state, `ctlInit`, has no analogue and is deliberately
 /// absent: it is the window between the facility's creation (`scanInit`,
-/// `dbScan.c:191-208`) and the first `scanRun`, and this port has no
-/// separate creation step to open it. The build phase that occupies that
-/// window in C occupies [`ScanCtl::Pause`] here, set where C's `scanInit`
-/// sets it — inside the build, before anything can fire.
+/// `dbScan.c:191-208`) and the first `scanRun`. The cell is created in that
+/// window and reads [`ScanCtl::Pause`] there, as C's `scanInit` leaves it
+/// (`dbScan.c:199`), until `run`: a database no lifecycle has started is
+/// not running, whoever holds it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScanCtl {
-    /// C `ctlRun`, and the port's starting value: a database with no IOC
-    /// lifecycle over it (a test harness, an embedded user of
-    /// `PvDatabase`) has nothing that could have paused it.
+    /// C `ctlRun`: `scanRun` has opened this database's `interruptAccept`.
     Run,
-    /// C `ctlPause`.
+    /// C `ctlPause`, and the value from creation until the first `run`.
     Pause,
     /// C `ctlExit` — terminal for the threads that read it; a later
     /// `scan_run` re-arms the cell, which is what lets one process stand
@@ -153,20 +151,23 @@ pub enum ScanCtl {
 /// the scan-start claim, so whoever holds the claim holds the only handle
 /// that may stop the facility; another database's owner cannot reach it.
 pub struct ScanControl {
-    state: std::sync::atomic::AtomicU8,
+    /// Why the facility is not running: [`SCAN_CTL_PAUSE`] or
+    /// [`SCAN_CTL_EXIT`]. Read only while `gate` is closed; whether the
+    /// facility runs is `gate` alone.
+    stopped_as: std::sync::atomic::AtomicU8,
     claimed: std::sync::atomic::AtomicBool,
-    /// This database's `interruptAccept`, written only by `run`/`pause`/`stop`.
+    /// This database's `interruptAccept`, written only by `run`/`pause`/`stop`
+    /// and the one source of "running": open ⟺ [`ScanCtl::Run`].
     gate: Arc<crate::runtime::interrupt_accept::InterruptGate>,
 }
 
-const SCAN_CTL_RUN: u8 = 1;
 const SCAN_CTL_PAUSE: u8 = 2;
 const SCAN_CTL_EXIT: u8 = 3;
 
 impl ScanControl {
     pub(crate) fn new() -> Self {
         Self {
-            state: std::sync::atomic::AtomicU8::new(SCAN_CTL_RUN),
+            stopped_as: std::sync::atomic::AtomicU8::new(SCAN_CTL_PAUSE),
             claimed: std::sync::atomic::AtomicBool::new(false),
             gate: crate::runtime::interrupt_accept::InterruptGate::new(),
         }
@@ -180,17 +181,19 @@ impl ScanControl {
 
     /// The facility's current state — what every gate reads.
     pub fn ctl(&self) -> ScanCtl {
-        match self.state.load(std::sync::atomic::Ordering::Acquire) {
-            SCAN_CTL_PAUSE => ScanCtl::Pause,
+        if self.gate.is_open() {
+            return ScanCtl::Run;
+        }
+        match self.stopped_as.load(std::sync::atomic::Ordering::Acquire) {
             SCAN_CTL_EXIT => ScanCtl::Exit,
-            _ => ScanCtl::Run,
+            _ => ScanCtl::Pause,
         }
     }
 
     /// True while asynchronous scan sources may fire — the single test C
     /// spells `scanCtl == ctlRun` at each of its three gate sites.
     pub fn is_running(&self) -> bool {
-        self.ctl() == ScanCtl::Run
+        self.gate.is_open()
     }
 
     /// First caller wins; the claimant is the one scheduler that spawns the
@@ -209,12 +212,12 @@ impl ScanControl {
     /// C `scanRun` (`dbScan.c:210-223`). Called by the IOC lifecycle owner
     /// on the `iocRun` transition, never by a protocol server.
     pub fn run(&self) {
-        self.state
-            .store(SCAN_CTL_RUN, std::sync::atomic::Ordering::Release);
-        // C `scanRun` sets `interruptAccept = TRUE` here (`dbScan.c:218`).
-        // The false→true edge is what fires asyn's one-shot boot flush,
-        // delivering every seeded `_RBV` value to the records that
-        // registered during iocInit.
+        // C `scanRun` sets `interruptAccept = TRUE` here (`dbScan.c:218`):
+        // the running transition. The false→true edge is what fires asyn's
+        // one-shot boot flush, delivering every seeded `_RBV` value to the
+        // records that registered during iocInit.
+        self.stopped_as
+            .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
         self.gate.set(true);
     }
 
@@ -222,7 +225,7 @@ impl ScanControl {
     /// and keep their deadlines; they simply stop calling `scanList`, which
     /// is what lets `iocRun` resume without rebuilding the facility.
     pub fn pause(&self) {
-        self.state
+        self.stopped_as
             .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
         // C `scanPause` clears `interruptAccept` (`dbScan.c:241`).
         self.gate.set(false);
@@ -234,7 +237,7 @@ impl ScanControl {
     /// source that fires between the two see a stopped facility rather
     /// than a half-torn one.
     pub fn stop(&self) {
-        self.state
+        self.stopped_as
             .store(SCAN_CTL_EXIT, std::sync::atomic::Ordering::Release);
         // C `scanStop` clears `interruptAccept` (`dbScan.c:165`).
         self.gate.set(false);

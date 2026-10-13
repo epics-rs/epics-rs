@@ -1503,10 +1503,8 @@ impl IocBuild {
         // and `iocRun`'s `scanRun` is what starts it, so nothing an
         // in-flight build wires up — an I/O Intr callback, a posted event
         // — can process a record before `initHookAfterInterruptAccept`.
-        // The port's facility starts running (a bare `PvDatabase` has no
-        // lifecycle to have paused it), so the build closes the gate here
-        // rather than the facility opening it later.
-        db.scan_control().pause();
+        // A database's scan control is created paused, so the build has
+        // nothing to close.
         // C `initDatabase` registers the shutdown on the process exit list
         // (`epicsAtExit(exitDatabase, NULL)`, iocInit.c:579), and
         // `exitDatabase` is a one-line call to `iocShutdown`. Registered

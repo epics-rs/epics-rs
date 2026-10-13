@@ -61,6 +61,8 @@ async fn event_reposts_an_unchanged_name() {
         .await
         .unwrap()
         .0;
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let mut rx = EVENTS.map(|name| {
         db.get_record(name)
             .unwrap()

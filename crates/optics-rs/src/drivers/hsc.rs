@@ -548,7 +548,10 @@ impl HscHolder {
                     Err(e) => return Err(format!("failed to start HSC port: {e}")),
                 };
                 let port_handle = runtime.port_handle().clone();
-                if let Err(e) = asyn_rs::asyn_record::register_port(&port, port_handle.clone()) {
+                let owner = ctx.db().scan_control().interrupt_gate();
+                if let Err(e) =
+                    asyn_rs::asyn_record::register_port(&port, port_handle.clone(), owner)
+                {
                     runtime.shutdown();
                     return Err(format!("failed to register HSC port: {e}"));
                 }

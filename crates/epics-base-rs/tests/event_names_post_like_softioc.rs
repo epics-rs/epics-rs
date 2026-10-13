@@ -67,6 +67,8 @@ async fn event_names_post_like_softioc() {
         .await
         .unwrap()
         .0;
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     assert_eq!((text(&db, "E"), num(&db, "E.UDF")), (String::new(), 1.0));
     process(&db, "S").await;
     process(&db, "E").await;

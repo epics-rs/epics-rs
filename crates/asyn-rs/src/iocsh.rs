@@ -1822,7 +1822,11 @@ fn publish_configured_port<D: PortDriver>(
             return None;
         }
     };
-    if let Err(e) = crate::asyn_record::register_port(port, handle.port_handle().clone()) {
+    if let Err(e) = crate::asyn_record::register_port(
+        port,
+        handle.port_handle().clone(),
+        ctx.db().scan_control().interrupt_gate(),
+    ) {
         ctx.println(&format!("{command}: {e}"));
         handle.shutdown();
         return None;
@@ -2155,7 +2159,9 @@ mod tests {
 
     fn fresh_mgr_with_port(name: &str) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
-        let _ = mgr.register_port(DummyDriver::new(name)).unwrap();
+        let _ = mgr
+            .register_port(DummyDriver::new(name), &crate::registry::open_owner())
+            .unwrap();
         mgr
     }
 
@@ -2166,7 +2172,10 @@ mod tests {
     fn fresh_mgr_with_multi_device_port(name: &str, max_addr: usize) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
         let _ = mgr
-            .register_port(DummyDriver::multi_device(name, max_addr))
+            .register_port(
+                DummyDriver::multi_device(name, max_addr),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         mgr
     }
@@ -2462,10 +2471,18 @@ mod tests {
             ..RuntimeConfig::default()
         };
         let _ = mgr
-            .register_port_with_config(DummyDriver::disconnected("wc_late"), cfg.clone())
+            .register_port_with_config(
+                DummyDriver::disconnected("wc_late"),
+                cfg.clone(),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         let _ = mgr
-            .register_port_with_config(DummyDriver::disconnected("wc_never"), cfg)
+            .register_port_with_config(
+                DummyDriver::disconnected("wc_never"),
+                cfg,
+                &crate::registry::open_owner(),
+            )
             .unwrap();
 
         let cmds = build_asyn_commands(mgr.clone());
@@ -2577,11 +2594,10 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         let written = Arc::new(Mutex::new(Vec::new()));
         let _ = mgr
-            .register_port(OctetDriver::new(
-                "eos_cfg",
-                b"line1\nline2\n",
-                written.clone(),
-            ))
+            .register_port(
+                OctetDriver::new("eos_cfg", b"line1\nline2\n", written.clone()),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         let cmds = build_asyn_commands(mgr.clone());
         let ctx = make_ctx();
@@ -2654,7 +2670,10 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         let written = Arc::new(Mutex::new(Vec::new()));
         let _ = mgr
-            .register_port(OctetDriver::new("flush_cfg", b"stale", written.clone()))
+            .register_port(
+                OctetDriver::new("flush_cfg", b"stale", written.clone()),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         let cmds = build_asyn_commands(mgr.clone());
         let ctx = make_ctx();
@@ -2720,9 +2739,17 @@ mod tests {
     #[test]
     fn iocsh_enable_and_autoconnect_follow_c_find_dp_common() {
         let mgr = Arc::new(PortManager::new());
-        let _ = mgr.register_port(DummyDriver::new("edp_single")).unwrap();
         let _ = mgr
-            .register_port(DummyDriver::multi_device("edp_multi", 2))
+            .register_port(
+                DummyDriver::new("edp_single"),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
+        let _ = mgr
+            .register_port(
+                DummyDriver::multi_device("edp_multi", 2),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
 
         let seen: Arc<Mutex<Vec<(String, AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2883,10 +2910,13 @@ mod tests {
 
         let rec = Recorded::default();
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(RecordingDriver {
-            base: PortDriverBase::new("eos_port", 1, PortFlags::default()),
-            rec: rec.clone(),
-        })
+        mgr.register_port(
+            RecordingDriver {
+                base: PortDriverBase::new("eos_port", 1, PortFlags::default()),
+                rec: rec.clone(),
+            },
+            &crate::registry::open_owner(),
+        )
         .unwrap();
 
         let ctx = make_ctx();
@@ -2983,16 +3013,19 @@ mod tests {
         }
 
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(MultiPort {
-            base: PortDriverBase::new(
-                "eos_multi",
-                4,
-                PortFlags {
-                    multi_device: true,
-                    ..PortFlags::default()
-                },
-            ),
-        })
+        mgr.register_port(
+            MultiPort {
+                base: PortDriverBase::new(
+                    "eos_multi",
+                    4,
+                    PortFlags {
+                        multi_device: true,
+                        ..PortFlags::default()
+                    },
+                ),
+            },
+            &crate::registry::open_owner(),
+        )
         .unwrap();
 
         let ctx = make_ctx();
@@ -3159,13 +3192,16 @@ mod tests {
 
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(InterposedDriver {
-            base: PortDriverBase::new("echo_port", 1, PortFlags::default()),
-            link: EchoingLink {
-                sizes: sizes.clone(),
-                echo: VecDeque::new(),
+        mgr.register_port(
+            InterposedDriver {
+                base: PortDriverBase::new("echo_port", 1, PortFlags::default()),
+                link: EchoingLink {
+                    sizes: sizes.clone(),
+                    echo: VecDeque::new(),
+                },
             },
-        })
+            &crate::registry::open_owner(),
+        )
         .unwrap();
         let handle = mgr.find_port_handle("echo_port").unwrap();
 
@@ -3265,12 +3301,15 @@ mod tests {
 
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(InterposedDriver {
-            base: PortDriverBase::new("delay_port", 1, PortFlags::default()),
-            link: CountingLink {
-                sizes: sizes.clone(),
+        mgr.register_port(
+            InterposedDriver {
+                base: PortDriverBase::new("delay_port", 1, PortFlags::default()),
+                link: CountingLink {
+                    sizes: sizes.clone(),
+                },
             },
-        })
+            &crate::registry::open_owner(),
+        )
         .unwrap();
         let handle = mgr.find_port_handle("delay_port").unwrap();
 
@@ -3379,7 +3418,12 @@ mod tests {
             crate::runtime::config::RuntimeConfig::default(),
         )
         .unwrap();
-        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+        crate::registry::register_port(
+            PORT,
+            runtime.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mgr = Arc::new(PortManager::new());
         report_ports(&mgr, 0, Some(PORT));
@@ -3423,7 +3467,12 @@ mod tests {
             crate::runtime::RuntimeConfig::default(),
         )
         .unwrap();
-        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+        crate::registry::register_port(
+            PORT,
+            runtime.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         let foreign = Arc::new(PortManager::new());
         let cmds = build_asyn_commands(foreign.clone());
         let cmd = cmds

@@ -1132,7 +1132,9 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
     base.set_float64_param(reason, 0, 33.0).unwrap();
 
     let manager = PortManager::new();
-    manager.register_port(OutputPort { base }).unwrap();
+    manager
+        .register_port(OutputPort { base }, &asyn_rs::registry::open_owner())
+        .unwrap();
 
     let sync_io = SyncIOHandle::connect(&manager, "EPID_OUT_PORT", 0, Duration::from_secs(1))
         .expect("connect to output port");

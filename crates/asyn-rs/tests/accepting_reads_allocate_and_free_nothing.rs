@@ -52,30 +52,28 @@ fn counted<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 }
 
 #[test]
-fn a_bound_and_an_unbound_port_read_without_allocating_or_freeing() {
-    let bound = InterruptManager::new(4);
-    let unbound = InterruptManager::new(4);
-    let mine = InterruptGate::new();
-    bound.bind_gate(mine.clone());
-    bound.bind_gate(InterruptGate::new());
-
-    // A gate that was open and is dropped before the reads: a design that
-    // keeps a registry of gates frees it on the read side.
-    let gone = InterruptGate::opened();
-    drop(gone);
+fn an_owned_and_an_ownerless_port_read_without_allocating_or_freeing() {
+    let ownerless = InterruptManager::new(4);
+    let open = InterruptManager::new(4);
+    let closed = InterruptManager::new(4);
     let live = InterruptGate::opened();
+    open.set_owner(live.clone());
+    // An owner that was open and is dropped before the reads.
+    let gone = InterruptGate::opened();
+    closed.set_owner(gone.clone());
+    gone.set(false);
+    drop(gone);
 
-    let (open, allocs, frees) = counted(|| {
-        let mut open = 0;
+    let (counts, allocs, frees) = counted(|| {
+        let mut n = (0, 0, 0);
         for _ in 0..1000 {
-            open += usize::from(unbound.accepting()) + usize::from(bound.accepting());
+            n.0 += usize::from(ownerless.accepting());
+            n.1 += usize::from(open.accepting());
+            n.2 += usize::from(closed.accepting());
         }
-        open
+        n
     });
-    assert_eq!(
-        open, 1000,
-        "unbound reads the live gate, bound its closed own"
-    );
+    assert_eq!(counts, (0, 1000, 0), "ownerless and closed read false");
     assert_eq!((allocs, frees), (0, 0));
     drop(live);
 }

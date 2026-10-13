@@ -125,7 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same pair. A local copy here is how the two drift, and a denominator
     // measured against a different configuration than the one under test
     // reports record types unimplemented that the run measures perfectly well.
-    let _devices = register_port_ioc_devices()?;
+    let boot_db = std::sync::Arc::new(epics_base_rs::server::database::PvDatabase::new());
+    let _devices = register_port_ioc_devices(&boot_db)?;
 
     // C st-scaler.cmd configures the ports before `dbLoadRecords`, because
     // `devScalerAsyn`'s `init_record` connects to them.
@@ -136,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let ioc = match port_ioc_builder()
+        .with_database(boot_db)
         .db_file(&db_path, &macros)?
         .build_ioc()
         .await

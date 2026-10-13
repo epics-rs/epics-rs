@@ -2796,13 +2796,6 @@ impl DeviceSupport for AsynDeviceSupport {
         ))))
     }
 
-    fn bind_interrupt_gate(
-        &mut self,
-        gate: &Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
-    ) {
-        self.handle.interrupts().bind_gate(gate.clone());
-    }
-
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
         // Activate the driver-callback path for either:
         //   1. records with `SCAN="I/O Intr"` (legacy behaviour), OR
@@ -4915,7 +4908,8 @@ mod tests {
             actor_link,
             Arc::new(crate::trace::TraceManager::new()),
         );
-        crate::asyn_record::register_port("ts_factory", handle).unwrap();
+        crate::asyn_record::register_port("ts_factory", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -8182,7 +8176,8 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_wb");
-        crate::asyn_record::register_port("binwrite_wb", handle).unwrap();
+        crate::asyn_record::register_port("binwrite_wb", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -8218,7 +8213,12 @@ mod tests {
         use epics_base_rs::server::records::stringout::StringoutRecord;
 
         let (handle, _writes) = spawn_binary_write_port("octet_no_initrb");
-        crate::asyn_record::register_port("octet_no_initrb", handle).unwrap();
+        crate::asyn_record::register_port(
+            "octet_no_initrb",
+            handle,
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "stringout",
@@ -8245,7 +8245,8 @@ mod tests {
         use epics_base_rs::server::records::longout::LongoutRecord;
 
         let (handle, _writes) = spawn_binary_write_port("int32_initrb");
-        crate::asyn_record::register_port("int32_initrb", handle).unwrap();
+        crate::asyn_record::register_port("int32_initrb", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "longout",
@@ -8272,7 +8273,8 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_text");
-        crate::asyn_record::register_port("binwrite_text", handle).unwrap();
+        crate::asyn_record::register_port("binwrite_text", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -8306,7 +8308,8 @@ mod tests {
         use epics_base_rs::server::ioc_app::DeviceSupportContext;
 
         let (handle, _writes) = spawn_binary_write_port("undeclared_rt");
-        crate::asyn_record::register_port("undeclared_rt", handle).unwrap();
+        crate::asyn_record::register_port("undeclared_rt", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let bind = |record_type: &str, dtyp: &str| {
             universal_asyn_factory(&DeviceSupportContext {
@@ -8434,7 +8437,8 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_float32_array_port("f32arr_out");
-        crate::asyn_record::register_port("f32arr_out", handle).unwrap();
+        crate::asyn_record::register_port("f32arr_out", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -8854,7 +8858,12 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_factory", b"IDN-OK");
-        crate::asyn_record::register_port("cmdresp_factory", handle).unwrap();
+        crate::asyn_record::register_port(
+            "cmdresp_factory",
+            handle,
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
         // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
@@ -8907,7 +8916,8 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, _sequence)) = spawn_cmd_response_port("cmdresp_nul", b"R");
-        crate::asyn_record::register_port("cmdresp_nul", handle).unwrap();
+        crate::asyn_record::register_port("cmdresp_nul", handle, &crate::registry::open_owner())
+            .unwrap();
 
         // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
         // NUL, so only "AB" reaches the wire.
@@ -8942,7 +8952,8 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_lnul", b"OK");
-        crate::asyn_record::register_port("cmdresp_lnul", handle).unwrap();
+        crate::asyn_record::register_port("cmdresp_lnul", handle, &crate::registry::open_owner())
+            .unwrap();
 
         // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
         // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty

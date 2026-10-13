@@ -135,7 +135,12 @@ async fn a_blocking_port_reentry_allocates_nothing() {
         rt.port_handle().can_block(),
         "precondition: a blocking port"
     );
-    register_port(PORT, rt.port_handle().clone()).unwrap();
+    register_port(
+        PORT,
+        rt.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .unwrap();
     let (db, _) = IocBuilder::new()
         .register_record_type("asyn", || Box::new(AsynRecord::default()))
         .db_string(

@@ -44,6 +44,13 @@ async fn acquire_bo_returns_to_zero_after_single() {
 
     let rt = create_sim_detector("RBK_TEST", 32, 32, 10_000_000, NDArrayOutput::new()).unwrap();
     let handle = rt.port_handle().clone();
+    // What `simDetectorConfig` does: the port is owned by its database's gate.
+    asyn_rs::asyn_record::register_port(
+        "RBK_TEST",
+        handle.clone(),
+        db.scan_control().interrupt_gate(),
+    )
+    .unwrap();
 
     // Single mode, short exposure.
     handle

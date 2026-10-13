@@ -29,7 +29,7 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
                 ArgDesc { name: "maxMemory", arg_type: ArgType::Int },
             ],
             "simDetectorConfig portName [sizeX] [sizeY] [maxMemory]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
                     ArgValue::String(s) => s.clone(),
                     _ => return Err("portName required".into()),
@@ -45,7 +45,11 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
 
                 let port_handle = runtime.port_handle().clone();
 
-                asyn_rs::asyn_record::register_port(&port_name, port_handle)
+                asyn_rs::asyn_record::register_port(
+                    &port_name,
+                    port_handle,
+                    ctx.db().scan_control().interrupt_gate(),
+                )
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

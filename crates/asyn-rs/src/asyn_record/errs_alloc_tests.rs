@@ -442,7 +442,12 @@ fn a_connect_to_a_shut_down_port_reports_without_allocating() {
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        crate::registry::register_port(name, rt.port_handle().clone()).unwrap();
+        crate::registry::register_port(
+            name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         rt.port_handle()
             .submit_blocking(
                 crate::request::RequestOp::ShutdownPort,

@@ -49,6 +49,9 @@ impl PluginManager {
     /// Register a plugin. The port is registered in the global asyn port registry
     /// so the universal asyn device support factory can find it.
     ///
+    /// `owner` is the gate of the database the plugin's records load into
+    /// (the configure command's `ctx.db().scan_control().interrupt_gate()`).
+    ///
     /// Errors on a duplicate port name (the registry refuses overwrites,
     /// matching C `asynManager::registerPort`); nothing is stored in that
     /// case, so the rejected plugin's runtime shuts down when `handle`'s
@@ -57,13 +60,14 @@ impl PluginManager {
         &self,
         _dtyp: &str,
         handle: &PluginRuntimeHandle,
+        owner: &std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
     ) -> asyn_rs::error::AsynResult<()> {
         let port_handle = handle.port_runtime().port_handle().clone();
         let port_name = port_handle.port_name().to_string();
 
         // Claim the port name first: a duplicate must not leave a wiring
         // output or a parked handle behind for a plugin that was refused.
-        asyn_rs::asyn_record::register_port(&port_name, port_handle)?;
+        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)?;
 
         // Register this plugin's output in the wiring registry
         self.wiring
@@ -82,10 +86,11 @@ impl PluginManager {
         &self,
         _dtyp: &str,
         runtime: asyn_rs::runtime::port::PortRuntimeHandle,
+        owner: &std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
     ) -> asyn_rs::error::AsynResult<()> {
         let port_handle = runtime.port_handle().clone();
         let port_name = port_handle.port_name().to_string();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle)?;
+        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)?;
         self.port_runtimes.lock().push(runtime);
         Ok(())
     }

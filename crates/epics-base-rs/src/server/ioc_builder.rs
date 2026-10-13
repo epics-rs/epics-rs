@@ -49,6 +49,10 @@ pub struct IocBuilder {
     link_set_installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
     /// The link types those installers serve ([`Self::register_link_type`]).
     json_link_types: Vec<String>,
+    /// The database the build fills, when its caller made it first so a
+    /// port can be registered to its `interruptAccept` before the records
+    /// load.
+    database: Option<Arc<PvDatabase>>,
 }
 
 /// Whether the build runs the link passes of C `initDatabase`.
@@ -134,7 +138,16 @@ impl IocBuilder {
             autosave_config: None,
             link_set_installers: Vec::new(),
             json_link_types: Vec::new(),
+            database: None,
         }
+    }
+
+    /// Build into `db` instead of a fresh database. The caller owns the
+    /// database's lifecycle until `build`; it must be a database no build
+    /// has loaded into.
+    pub fn with_database(mut self, db: Arc<PvDatabase>) -> Self {
+        self.database = Some(db);
+        self
     }
 
     /// Add a simple PV to be created on build.
@@ -366,7 +379,10 @@ impl IocBuilder {
         iocinit_begins: impl FnOnce() -> Option<T>,
         link_init: LinkInit,
     ) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>, T)> {
-        let db = Arc::new(PvDatabase::new());
+        let db = self
+            .database
+            .clone()
+            .unwrap_or_else(|| Arc::new(PvDatabase::new()));
         for key in &self.json_link_types {
             db.declare_link_type(key);
         }

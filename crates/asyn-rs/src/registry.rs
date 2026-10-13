@@ -27,6 +27,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
 use crate::error::{AsynError, AsynResult};
 use crate::port_handle::PortHandle;
 use crate::trace::TraceManager;
@@ -65,13 +67,27 @@ impl PortRegistry {
     /// new port, silently shadowing legitimate I/O. To replace a port,
     /// [`Self::remove`] it first.
     ///
+    /// `owner` is the gate of the database this port serves
+    /// (`ctx.db().scan_control().interrupt_gate()`): the port accepts
+    /// callbacks while it is open, and no other gate is read.
+    /// A port is ownerless only between construction and this call, and
+    /// reads closed then, so a seed written in the constructor is kept; the
+    /// owner's `false → true` edge flushes it once (C `callbackThread`,
+    /// `asynPortDriver.cpp:923-937`), immediately if the owner is already
+    /// open here.
+    ///
     /// The entry's trace manager is the handle's own — the one the driver was
     /// bound to at `create_port_runtime` — so a mask set through the registry
     /// (`asynSetTraceMask`, asynRecord `TMSK`) is the mask the driver's
     /// `trace_print` reads. C has one `tracePvt` per port, reached through
     /// the port (asynManager.c:451-461); a registration that named a second
     /// manager published masks nothing printed against.
-    pub fn register(&self, name: &str, handle: PortHandle) -> AsynResult<()> {
+    pub fn register(
+        &self,
+        name: &str,
+        handle: PortHandle,
+        owner: &Arc<InterruptGate>,
+    ) -> AsynResult<()> {
         let mut reg = self.inner.lock().unwrap();
         match reg.entry(name.to_string()) {
             Entry::Occupied(_) => Err(AsynError::PortAlreadyRegistered(name.to_string())),
@@ -83,10 +99,34 @@ impl PortRegistry {
                 // does not know. This is the one site that claims a name in
                 // this process, so it is the one place that has to say so.
                 handle.trace().register_port(name, handle.is_multi_device());
+                handle.interrupts().set_owner(owner.clone());
                 slot.insert(PortEntry { handle });
+                // By name, so the gate does not keep a withdrawn port's
+                // actor alive.
+                let (registry, port) = (self.clone(), name.to_string());
+                owner.on_open(move || registry.flush_in_background(&port));
+                if owner.is_open() {
+                    // Behind the lock held here: the lookup sees the entry.
+                    self.flush_in_background(name);
+                }
                 Ok(())
             }
         }
+    }
+
+    /// C's `callbackThread` is its own thread so it does not block the
+    /// caller that set `interruptAccept` (the scan facility on the iocRun
+    /// path); the sweep uses the port actor's blocking bridge, which must not
+    /// run on the scan/setup thread.
+    fn flush_in_background(&self, name: &str) {
+        let (registry, name) = (self.clone(), name.to_string());
+        let _ = std::thread::Builder::new()
+            .name("asyn-boot-flush".into())
+            .spawn(move || {
+                if let Some(entry) = registry.get(&name) {
+                    flush_port(&entry.handle);
+                }
+            });
     }
 
     pub fn get(&self, name: &str) -> Option<PortEntry> {
@@ -122,59 +162,29 @@ fn global_registry() -> &'static PortRegistry {
     GLOBAL_PORT_REGISTRY.get_or_init(PortRegistry::new)
 }
 
-/// Register a port via the global registry.
+/// Register a port via the global registry, owned by `owner`'s database.
 /// Prefer using a shared `PortRegistry` instance for better test isolation.
 ///
 /// Errors with [`AsynError::PortAlreadyRegistered`] on a duplicate name —
 /// see [`PortRegistry::register`].
-pub fn register_port(name: &str, handle: PortHandle) -> AsynResult<()> {
-    global_registry().register(name, handle)?;
-    arm_boot_flush();
-    Ok(())
+pub fn register_port(name: &str, handle: PortHandle, owner: &Arc<InterruptGate>) -> AsynResult<()> {
+    global_registry().register(name, handle, owner)
 }
 
-/// Arm the one-shot boot flush, once per process.
-///
-/// C creates a `callbackThread` in every `asynPortDriver` constructor
-/// (`asynPortDriver.cpp:4111`) that waits for `interruptAccept` and then does
-/// `callParamCallbacks(addr, addr)` once per addr (`:923-937`), delivering the
-/// changed-flags that accumulated while the IOC was building. This is the
-/// crate-level equivalent: a single callback on the gate's `false → true` edge
-/// sweeps every published port instead of one thread per port. Registered on
-/// first port registration so the cost exists only in a process that has asyn
-/// ports; the edge itself never fires in a bare-port process because nothing
-/// lowers the gate there (see [`epics_libcom_rs::runtime::interrupt_accept`]).
-fn arm_boot_flush() {
-    static ARMED: OnceLock<()> = OnceLock::new();
-    ARMED.get_or_init(|| {
-        epics_libcom_rs::runtime::interrupt_accept::on_any_gate_open(|| {
-            // C's callbackThread is a dedicated thread precisely so it does not
-            // block the caller that set interruptAccept (the scan facility on
-            // the iocRun path). Match that: the sweep uses the port actors'
-            // blocking bridge, which must not run on the scan/setup thread.
-            let _ = std::thread::Builder::new()
-                .name("asyn-boot-flush".into())
-                .spawn(flush_all_ports_once);
-        });
-    });
-}
-
-/// Flush every published port's accumulated changed params once — C
-/// `callbackThread::run` (`asynPortDriver.cpp:923-937`), summed over all ports.
-///
-/// The gate is already `true` when this runs (the edge is what scheduled it),
-/// so each `call_param_callbacks` proceeds past the interruptAccept check and
-/// delivers the seeds to the now-subscribed `_RBV` records.
-fn flush_all_ports_once() {
-    for name in port_names() {
-        let Some(entry) = get_port(&name) else {
-            continue;
-        };
-        // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
-        for addr in 0..entry.handle.max_addr().max(1) {
-            let _ = entry.handle.call_param_callbacks_blocking(addr);
-        }
+/// Deliver a port's accumulated changed params once: C
+/// `callbackThread::run` (`asynPortDriver.cpp:923-937`). Blocks on the port
+/// actor, so it never runs on the scan or setup thread that opened the gate.
+pub(crate) fn flush_port(handle: &PortHandle) {
+    // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
+    for addr in 0..handle.max_addr().max(1) {
+        let _ = handle.call_param_callbacks_blocking(addr);
     }
+}
+
+/// An owner that is already open, for a hand-registered port or a test that
+/// has no scan facility: its ports deliver at once.
+pub fn open_owner() -> Arc<InterruptGate> {
+    InterruptGate::opened()
 }
 
 /// Look up a port via the global registry.
@@ -222,8 +232,9 @@ mod tests {
     #[test]
     fn register_rejects_duplicate_name() {
         let reg = PortRegistry::new();
-        reg.register("regdup", dummy_handle("regdup")).unwrap();
-        match reg.register("regdup", dummy_handle("regdup")) {
+        reg.register("regdup", dummy_handle("regdup"), &open_owner())
+            .unwrap();
+        match reg.register("regdup", dummy_handle("regdup"), &open_owner()) {
             Err(AsynError::PortAlreadyRegistered(name)) => assert_eq!(name, "regdup"),
             other => panic!("expected PortAlreadyRegistered, got {other:?}"),
         }
@@ -235,11 +246,11 @@ mod tests {
     #[test]
     fn removed_name_can_be_reregistered() {
         let reg = PortRegistry::new();
-        reg.register("regrecycle", dummy_handle("regrecycle"))
+        reg.register("regrecycle", dummy_handle("regrecycle"), &open_owner())
             .unwrap();
         reg.remove("regrecycle");
         assert!(
-            reg.register("regrecycle", dummy_handle("regrecycle"))
+            reg.register("regrecycle", dummy_handle("regrecycle"), &open_owner())
                 .is_ok(),
             "re-register after remove must succeed"
         );

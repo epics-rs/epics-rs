@@ -163,7 +163,9 @@ impl CommandHandler for MqttConfigHandler {
             create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
         let port_handle = runtime_handle.port_handle().clone();
 
-        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone()) {
+        let owner = ctx.db().scan_control().interrupt_gate();
+        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), owner)
+        {
             // Nothing published this port, so ask the actor to stop.
             runtime_handle.shutdown();
             return Err(e.to_string());

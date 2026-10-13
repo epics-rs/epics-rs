@@ -3,6 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
+use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
 use crate::error::{AsynError, AsynResult};
 use crate::exception::ExceptionManager;
 use crate::fixed_text::FixedText;
@@ -80,8 +82,16 @@ impl PortManager {
     /// now-unreachable handle, leaking resources and silently shadowing
     /// legitimate I/O). To replace a port, call
     /// [`Self::unregister_port`] first.
-    pub fn register_port<D: PortDriver>(&self, driver: D) -> AsynResult<PortRuntimeHandle> {
-        self.register_port_with_config(driver, RuntimeConfig::default())
+    ///
+    /// `owner` is the gate of the database the port serves (see
+    /// [`PortRegistry::register`](crate::registry::PortRegistry::register)); a
+    /// manager has no database of its own, so the caller names it.
+    pub fn register_port<D: PortDriver>(
+        &self,
+        driver: D,
+        owner: &Arc<InterruptGate>,
+    ) -> AsynResult<PortRuntimeHandle> {
+        self.register_port_with_config(driver, RuntimeConfig::default(), owner)
     }
 
     /// Register a port driver with custom runtime config.
@@ -91,6 +101,7 @@ impl PortManager {
         &self,
         driver: D,
         mut config: RuntimeConfig,
+        owner: &Arc<InterruptGate>,
     ) -> AsynResult<PortRuntimeHandle> {
         let name = driver.base().port_name.to_string();
         // Pre-flight: refuse before we spawn the runtime thread, so a
@@ -126,7 +137,7 @@ impl PortManager {
         // claim means a concurrent registrant won between the pre-flight
         // and here: drop the runtime we just built and report the
         // duplicate.
-        if let Err(e) = crate::registry::register_port(&name, handle.port_handle().clone()) {
+        if let Err(e) = crate::registry::register_port(&name, handle.port_handle().clone(), owner) {
             handle.shutdown();
             return Err(e);
         }
@@ -500,7 +511,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("devuser_port_1");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let mut user = DeviceUser::default();
         assert!(user.connect_device("", 0).is_err());
@@ -546,10 +558,12 @@ mod tests {
         let mut multi = DummyDriver::new("devuser_multi");
         multi.base.flags.multi_device = true;
         multi.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(multi).unwrap();
+        mgr.register_port(multi, &crate::registry::open_owner())
+            .unwrap();
         let mut single = DummyDriver::new("devuser_single");
         single.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(single).unwrap();
+        mgr.register_port(single, &crate::registry::open_owner())
+            .unwrap();
 
         let devices = |port: &str| {
             crate::registry::get_port(port)
@@ -603,7 +617,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("devuser_port_2");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let mut user = DeviceUser::default();
         user.connect_device("devuser_port_2", 0).unwrap();
@@ -631,7 +646,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("port1");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         assert!(mgr.find_port_handle("port1").is_ok());
         assert!(mgr.find_port_handle("nope").is_err());
@@ -642,7 +658,9 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("testport");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 42);
@@ -653,7 +671,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("findme");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let handle = mgr.find_port_handle("findme").unwrap();
         handle.write_int32_blocking(0, 0, 99).unwrap();
@@ -667,7 +686,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("rt_find");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let handle = mgr.find_runtime_handle("rt_find").unwrap();
         handle.port_handle().write_int32_blocking(0, 0, 77).unwrap();
@@ -688,7 +708,8 @@ mod tests {
 
         let mut drv = DummyDriver::new("exctest");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         // The runtime sends a Started event but not via the exception manager.
         // Exception manager is injected for driver-level exceptions.
@@ -698,7 +719,8 @@ mod tests {
     #[test]
     fn test_unregister_port() {
         let mgr = PortManager::new();
-        mgr.register_port(DummyDriver::new("removeme")).unwrap();
+        mgr.register_port(DummyDriver::new("removeme"), &crate::registry::open_owner())
+            .unwrap();
         assert!(mgr.find_port_handle("removeme").is_ok());
         mgr.unregister_port("removeme");
         assert!(mgr.find_port_handle("removeme").is_err());
@@ -710,8 +732,9 @@ mod tests {
         // with the same name must return PortAlreadyRegistered, not
         // silently overwrite the prior PortRuntimeHandle.
         let mgr = PortManager::new();
-        mgr.register_port(DummyDriver::new("dup")).unwrap();
-        match mgr.register_port(DummyDriver::new("dup")) {
+        mgr.register_port(DummyDriver::new("dup"), &crate::registry::open_owner())
+            .unwrap();
+        match mgr.register_port(DummyDriver::new("dup"), &crate::registry::open_owner()) {
             Err(crate::error::AsynError::PortAlreadyRegistered(name)) => {
                 assert_eq!(name, "dup")
             }
@@ -739,10 +762,10 @@ mod tests {
             crate::port_actor::ActorLink::unowned(),
             Arc::new(crate::trace::TraceManager::new()),
         );
-        crate::registry::register_port("extowned", ext).unwrap();
+        crate::registry::register_port("extowned", ext, &crate::registry::open_owner()).unwrap();
 
         let mgr = PortManager::new();
-        match mgr.register_port(DummyDriver::new("extowned")) {
+        match mgr.register_port(DummyDriver::new("extowned"), &crate::registry::open_owner()) {
             Err(crate::error::AsynError::PortAlreadyRegistered(name)) => {
                 assert_eq!(name, "extowned")
             }
@@ -758,10 +781,12 @@ mod tests {
     fn duplicate_after_unregister_succeeds() {
         // Replace-via-unregister must work cleanly.
         let mgr = PortManager::new();
-        mgr.register_port(DummyDriver::new("recycle")).unwrap();
+        mgr.register_port(DummyDriver::new("recycle"), &crate::registry::open_owner())
+            .unwrap();
         mgr.unregister_port("recycle");
         assert!(
-            mgr.register_port(DummyDriver::new("recycle")).is_ok(),
+            mgr.register_port(DummyDriver::new("recycle"), &crate::registry::open_owner())
+                .is_ok(),
             "re-register after unregister must succeed"
         );
     }
@@ -771,7 +796,9 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("f64_port");
         drv.base.create_param("TEMP", ParamType::Float64).unwrap();
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         handle
             .port_handle()
@@ -802,7 +829,9 @@ mod tests {
         // methods and no such layer answers "not implemented" (R18-71).
         drv.base
             .install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         // Drive through the public handle helper — same path as
         // asynRecord's IEOS / OEOS writes after the
@@ -827,7 +856,9 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("shutme");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         handle.shutdown_and_wait();

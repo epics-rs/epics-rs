@@ -4388,7 +4388,6 @@ mod tests {
     fn a_publish_flushes_every_address_list_it_wrote() {
         // Post-`iocInit` precondition: the scan facility has opened the
         // interruptAccept gate. See `TestDriver::new` in `port.rs`.
-        let _gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
         let mut base = PortDriverBase::new(
             "multi_addr",
             3,
@@ -4397,6 +4396,8 @@ mod tests {
                 ..PortFlags::default()
             },
         );
+        base.interrupts
+            .set_owner(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
@@ -4449,8 +4450,9 @@ mod tests {
     fn a_status_publish_delivers_the_alarm_without_touching_the_value() {
         // Post-`iocInit` precondition: the scan facility has opened the
         // interruptAccept gate. See `TestDriver::new` in `port.rs`.
-        let _gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
         let mut base = PortDriverBase::new("status_pub", 1, PortFlags::default());
+        base.interrupts
+            .set_owner(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
@@ -5533,11 +5535,10 @@ mod tests {
         }
 
         let mgr = PortManager::new();
-        mgr.register_port(TraceSpy(PortDriverBase::new(
-            "trace_link",
-            1,
-            PortFlags::default(),
-        )))
+        mgr.register_port(
+            TraceSpy(PortDriverBase::new("trace_link", 1, PortFlags::default())),
+            &crate::registry::open_owner(),
+        )
         .unwrap();
         let handle = mgr.find_port_handle("trace_link").unwrap();
         handle

@@ -181,7 +181,7 @@ async fn main() -> CaResult<()> {
             "miniBeamlineConfig",
             vec![],
             "miniBeamlineConfig - Configure mini beamline IOC",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
+            move |_args: &[ArgValue], ctx: &CommandContext| {
                 println!("miniBeamlineConfig: setting up beamline...");
 
                 // --- Beam current: background thread producing sine-wave values ---
@@ -214,8 +214,12 @@ async fn main() -> CaResult<()> {
                     let rt = point_detector::create_point_detector(port, *mode)
                         .map_err(|e| format!("failed to create PointDetector {port}: {e}"))?;
                     let port_handle = rt.port_handle().clone();
-                    asyn_rs::asyn_record::register_port(port, port_handle)
-                        .map_err(|e| e.to_string())?;
+                    asyn_rs::asyn_record::register_port(
+                        port,
+                        port_handle,
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
                     h.pd_runtimes.lock().unwrap().insert(port.to_string(), rt);
                     println!("  PointDetector '{port}' created");
                 }
@@ -251,8 +255,12 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("failed to create MovingDot: {e}"))?;
                 let dot_handle = dot_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("DOT", dot_handle)
-                    .map_err(|e| e.to_string())?;
+                asyn_rs::asyn_record::register_port(
+                    "DOT",
+                    dot_handle,
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
 
                 // Connect MovingDot as the data source for the plugin chain
                 // (NDStdArraysConfigure etc. will call connect_downstream on this)

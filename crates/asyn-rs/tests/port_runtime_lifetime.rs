@@ -68,7 +68,12 @@ impl PortDriver for TestPort {
 fn configure_port_like_iocsh(name: &str) {
     let (runtime, _join) = create_port_runtime(TestPort::new(name), RuntimeConfig::default())
         .expect("the port runtime thread must start");
-    register_port(name, runtime.port_handle().clone()).expect("port name is free");
+    register_port(
+        name,
+        runtime.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .expect("port name is free");
     // `runtime` (and the actor thread's JoinHandle) drop here — the only thing
     // still reaching this port is the registry's PortHandle.
 }
@@ -103,8 +108,12 @@ fn explicit_shutdown_still_stops_a_registered_port() {
         RuntimeConfig::default(),
     )
     .expect("the port runtime thread must start");
-    register_port("explicit_shutdown_reg", runtime.port_handle().clone())
-        .expect("port name is free");
+    register_port(
+        "explicit_shutdown_reg",
+        runtime.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .expect("port name is free");
     let registry_handle: PortHandle = get_port("explicit_shutdown_reg").unwrap().handle.clone();
 
     // Alive before.

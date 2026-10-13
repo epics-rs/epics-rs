@@ -71,6 +71,8 @@ record(seq, "SQ") {
         .await
         .unwrap()
         .0;
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let heard = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&heard);
     errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));

@@ -3109,7 +3109,7 @@ mod tests {
         // The record's database: its gate is closed until `scan_run`.
         let gate = InterruptGate::new();
         let mut base = PortDriverBase::new("gate", 1, PortFlags::default());
-        base.interrupts.bind_gate(gate.clone());
+        base.interrupts.set_owner(gate.clone());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
 
         let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3168,7 +3168,7 @@ mod tests {
             // preservation regression test builds its own `PortDriverBase` and
             // drives the gate itself, so it is unaffected.
             let mut base = PortDriverBase::new("test", 1, PortFlags::default());
-            base.interrupts.bind_gate(InterruptGate::opened());
+            base.interrupts.set_owner(InterruptGate::opened());
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("TEMP", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -3510,8 +3510,8 @@ mod tests {
         use crate::param::{EnumEntry, ParamValue};
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
-        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("test_enum_cb", 1, PortFlags::default());
+        base.interrupts.set_owner(InterruptGate::opened());
         base.create_param("MODE", ParamType::Enum).unwrap();
         let mut rx = base.interrupts.subscribe_async();
 
@@ -3558,8 +3558,8 @@ mod tests {
     fn do_callbacks_enum_by_param_type() {
         use crate::param::{EnumEntry, ParamValue};
 
-        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("test_cb_enum", 1, PortFlags::default());
+        base.interrupts.set_owner(InterruptGate::opened());
         let owner = base.create_param("MODE", ParamType::Enum).unwrap();
         let plain = base.create_param("GAIN", ParamType::Int32).unwrap();
         base.set_int32_param(plain, 0, 7).unwrap();
@@ -3614,8 +3614,8 @@ mod tests {
         use crate::param::ParamValue;
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
-        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("test_gp_cb", 1, PortFlags::default());
+        base.interrupts.set_owner(InterruptGate::opened());
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
         let mut rx = base.interrupts.subscribe_async();
 
@@ -4074,8 +4074,8 @@ mod tests {
     #[test]
     fn test_timestamp_source_in_callbacks() {
         // Post-`iocInit` precondition — see `TestDriver::new`.
-        let _gate = InterruptGate::opened();
         let mut base = PortDriverBase::new("ts_cb", 1, PortFlags::default());
+        base.interrupts.set_owner(InterruptGate::opened());
         base.create_param("V", ParamType::Int32).unwrap();
         let mut rx = base.interrupts.subscribe_async();
 

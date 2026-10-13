@@ -130,9 +130,6 @@ struct Registration {
     /// framework takes the wakeup receiver (`iocInit`'s `setup_io_intr`), which
     /// is the point the record's I/O Intr scan actually exists.
     started: bool,
-    /// The `interruptAccept` of the database the record is loaded in; the
-    /// port the subscription lands on is bound to it.
-    gate: Option<std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>>,
 }
 
 /// C `registerInterrupts`' "No %s interface" refusal (asynRecord.c:611-649),
@@ -214,14 +211,6 @@ impl IoIntrScan {
         self.refresh()
     }
 
-    /// Publish the database gate the record's subscription belongs to.
-    pub(crate) fn bind_gate(
-        &self,
-        gate: std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
-    ) {
-        self.reg.lock().unwrap().gate = Some(gate);
-    }
-
     pub(crate) fn is_active(&self) -> bool {
         self.reg.lock().unwrap().active
     }
@@ -301,9 +290,6 @@ impl IoIntrScan {
         // to the LATEST value, which is the opposite of C's rule — C keeps the
         // FIRST unprocessed value and drops the ones after it (`if (gotValue ==
         // 1) return`).
-        if let Some(gate) = &reg.gate {
-            binding.handle.interrupts().bind_gate(gate.clone());
-        }
         let sub = binding.handle.interrupts().register_sync_callback(
             filter,
             move |iv: &InterruptValue| {

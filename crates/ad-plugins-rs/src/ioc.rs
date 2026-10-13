@@ -38,7 +38,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDStdArraysConfigure",
             plugin_arg_defs(),
             "NDStdArraysConfigure portName [queueSize] ...",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, _queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 let drv = m.driver()?;
@@ -50,7 +50,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDStdArraysConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -71,7 +73,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDStatsConfigure",
             plugin_arg_defs(),
             "NDStatsConfigure portName [queueSize] ...",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 let drv = m.driver()?;
@@ -86,7 +88,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
 
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDStatsConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -107,7 +111,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDROIConfigure",
             plugin_arg_defs(),
             "NDROIConfigure portName [queueSize] ...",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 let drv = m.driver()?;
@@ -120,7 +124,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDROIConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -202,7 +208,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDOverlayConfigure",
             plugin_arg_defs_with_count("maxOverlays"),
             "NDOverlayConfigure portName [queueSize] ...".to_string(),
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 if asyn_rs::asyn_record::get_port(&port_name).is_some() {
@@ -222,7 +228,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     max_overlays,
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDOverlayConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -325,7 +333,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDGatherConfigure",
             gather_arg_defs(),
             "NDGatherConfigure portName [queueSize] [blockingCallbacks] [maxPorts]".to_string(),
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, _) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 if asyn_rs::asyn_record::get_port(&port_name).is_some() {
@@ -344,7 +352,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                     max_ports,
                 );
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDGatherConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -393,7 +403,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDAttrPlotConfig portName nAttributes cacheSize nDataBlocks NDArrayPort \
              [NDArrayAddr] [queueSize] [blockingCallbacks] [priority] [stackSize]"
                 .to_string(),
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let AttrPlotArgs {
                     port_name,
                     n_attributes,
@@ -426,7 +436,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                     max_addr,
                 );
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDAttrPlotConfig: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -537,7 +549,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDAttrConfigure",
             attr_arg_defs(),
             "NDAttrConfigure portName [queueSize] ...",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 // C arg index 5 is maxAttributes (NDPluginAttribute.cpp:245); a
                 // missing iocsh int arg defaults to 0, which C floors to 1.
@@ -558,7 +570,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &tsr,
                     max_attributes,
                 );
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDAttrConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -580,7 +594,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDROIStatConfigure",
             plugin_arg_defs_with_count("maxROIs"),
             "NDROIStatConfigure portName [queueSize] ...",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 let drv = m.driver()?;
@@ -595,7 +609,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &tsr,
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDROIStatConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -657,7 +673,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDTimeSeriesConfigure",
             plugin_arg_defs(),
             "NDTimeSeriesConfigure portName [queueSize] [blockingCallbacks] NDArrayPort",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 if asyn_rs::asyn_record::get_port(&port_name).is_some() {
@@ -693,7 +709,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                             // address is reserved at addr == maxSignals).
                             max_signals + 1,
                         );
-                        if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                        if let Err(e) =
+                            m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                        {
                             eprintln!("NDTimeSeriesConfigure: {e}");
                             return Ok(CommandOutcome::Continue);
                         }
@@ -721,7 +739,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                         ts_rx,
                         drv.pool(),
                     );
-                if let Err(e) = m.add_port(&dtyp, ts_runtime) {
+                if let Err(e) =
+                    m.add_port(&dtyp, ts_runtime, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDTimeSeriesConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -754,7 +774,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             pva_arg_defs,
             "NDPvaConfigure portName queueSize blockingCallbacks NDArrayPort NDArrayAddr pvName"
                 .to_string(),
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 if asyn_rs::asyn_record::get_port(&port_name).is_some() {
@@ -797,7 +817,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &ndarray_port,
                     m.wiring().clone(),
                 );
-                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                if let Err(e) =
+                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     eprintln!("NDPvaConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
@@ -869,7 +891,7 @@ where
         cmd_name,
         arg_defs,
         format!("{cmd_name} portName [queueSize] ..."),
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
             let dtyp = dtyp_from_port(&port_name);
             // Skip if port already exists (allows commonPlugins.cmd to be
@@ -890,7 +912,7 @@ where
             if let Some(idx) = max_threads_idx {
                 handle.set_max_threads(max_threads_arg(args, idx));
             }
-            if let Err(e) = m.add_plugin(&dtyp, &handle) {
+            if let Err(e) = m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate()) {
                 eprintln!("{cmd_name}: {e}");
                 return Ok(CommandOutcome::Continue);
             }

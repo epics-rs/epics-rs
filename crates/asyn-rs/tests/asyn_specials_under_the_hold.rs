@@ -32,7 +32,12 @@ async fn enbl_and_auct_puts_store_without_a_port_round_trip() {
         rt.port_handle().can_block(),
         "precondition: a blocking port"
     );
-    register_port("ENAUHOLD", rt.port_handle().clone()).unwrap();
+    register_port(
+        "ENAUHOLD",
+        rt.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .unwrap();
 
     let (db, _) = IocBuilder::new()
         .register_record_type("asyn", || Box::new(AsynRecord::default()))
@@ -94,7 +99,12 @@ async fn drvinfo_put_resolves_on_a_blocking_port_under_the_exemption() {
         rt.port_handle().can_block(),
         "precondition: a blocking port"
     );
-    register_port("DRVHOLD", rt.port_handle().clone()).unwrap();
+    register_port(
+        "DRVHOLD",
+        rt.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .unwrap();
 
     let (db, _) = IocBuilder::new()
         .register_record_type("asyn", || Box::new(AsynRecord::default()))

@@ -33,7 +33,12 @@ async fn special_puts_behind_a_blocked_read_are_never_refused() {
     });
     let driver = DrvAsynIPPort::new("SPQBR", &addr.to_string()).unwrap();
     let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
-    register_port("SPQBR", rt.port_handle().clone()).unwrap();
+    register_port(
+        "SPQBR",
+        rt.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .unwrap();
 
     let (db, _) = IocBuilder::new()
         .register_record_type("asyn", || Box::new(AsynRecord::default()))

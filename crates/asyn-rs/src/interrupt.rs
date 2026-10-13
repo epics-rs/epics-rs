@@ -332,17 +332,11 @@ pub struct InterruptSharedState {
     notify_count: AtomicU64,
     /// Number of times a mailbox value was overwritten before the consumer read it.
     coalesce_count: AtomicU64,
-    /// The databases' `interruptAccept` gates the records subscribed here
-    /// bound — see [`InterruptManager::accepting`].
-    gates: std::sync::OnceLock<Box<GateSlot>>,
-}
-
-/// One bound gate in an append-only chain: written once at bind time, read
-/// with plain atomic loads, so the flush path takes no lock and frees
-/// nothing.
-struct GateSlot {
-    gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
-    next: std::sync::OnceLock<Box<GateSlot>>,
+    /// The `interruptAccept` of the database that owns this port, set once
+    /// at registration — see [`InterruptManager::accepting`]. A single cell:
+    /// the flush path reads it with one atomic load, takes no lock and
+    /// frees nothing.
+    owner: std::sync::OnceLock<Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +365,7 @@ impl InterruptManager {
                 sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
-                gates: std::sync::OnceLock::new(),
+                owner: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -383,46 +377,26 @@ impl InterruptManager {
         Self { state }
     }
 
-    /// Record that a subscription on this port belongs to the database that
-    /// owns `gate`. Idempotent per gate.
-    pub fn bind_gate(&self, gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>) {
-        let mut cell = &self.state.gates;
-        loop {
-            match cell.get() {
-                Some(slot) if Arc::ptr_eq(&slot.gate, &gate) => return,
-                Some(slot) => cell = &slot.next,
-                None => {
-                    let slot = Box::new(GateSlot {
-                        gate: gate.clone(),
-                        next: std::sync::OnceLock::new(),
-                    });
-                    // Losing the race means another gate took this cell;
-                    // look again from the same cell.
-                    if cell.set(slot).is_ok() {
-                        return;
-                    }
-                }
-            }
-        }
+    /// Name the database that owns this port: the one `interruptAccept` it
+    /// reads. First owner wins; returns whether `gate` became the owner.
+    /// Called by `registry::register_port`; a hand-driven port in a test
+    /// calls it directly.
+    pub fn set_owner(
+        &self,
+        gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+    ) -> bool {
+        self.state.owner.set(gate).is_ok()
     }
 
-    /// C `interruptAccept` as this port reads it: a port whose records bound
-    /// their databases accepts while any of those databases' gates is open;
-    /// a port no record bound reads the process-wide fallback. The unbound
-    /// arm is the single place a port's gate is not its own databases'.
+    /// C `interruptAccept` as this port reads it: its owner's gate alone. A
+    /// record of another database on this port does not add a second
+    /// reading — C has one `interruptAccept` per port's IOC, and two gates
+    /// let one database's open consume the changed flags before the owner's
+    /// own records could take them. A port with no owner (between
+    /// construction and registration) reads closed, which keeps a seed
+    /// written before registration.
     pub fn accepting(&self) -> bool {
-        let Some(mut slot) = self.state.gates.get() else {
-            return epics_libcom_rs::runtime::interrupt_accept::any_gate_open();
-        };
-        loop {
-            if slot.gate.is_open() {
-                return true;
-            }
-            match slot.next.get() {
-                Some(next) => slot = next,
-                None => return false,
-            }
-        }
+        self.state.owner.get().is_some_and(|g| g.is_open())
     }
 
     /// Get the shared state for cross-manager sharing.
@@ -441,7 +415,7 @@ impl InterruptManager {
                 sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
-                gates: std::sync::OnceLock::new(),
+                owner: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -697,25 +671,26 @@ impl InterruptManager {
 
 #[cfg(test)]
 mod tests {
-    /// Boundary — a bound port follows its own gates only; an unbound one
-    /// reads whether any live database's gate is open.
+    /// Boundary — a port follows its owner's gate only; one with none is
+    /// closed whatever other databases do, and a second owner is refused.
     #[test]
-    fn a_bound_port_follows_its_gates_and_an_unbound_one_the_live_ones() {
+    fn a_port_follows_its_owner_alone_and_an_ownerless_one_is_closed() {
         use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
-        let unbound = InterruptManager::new(4);
-        let bound = InterruptManager::new(4);
+        let ownerless = InterruptManager::new(4);
+        let owned = InterruptManager::new(4);
         let mine = InterruptGate::new();
-        bound.bind_gate(mine.clone());
+        assert!(owned.set_owner(mine.clone()));
         let elsewhere = InterruptGate::opened();
 
-        assert!(unbound.accepting(), "unbound: a live gate is open");
-        assert!(!bound.accepting(), "bound: its own gate is closed");
+        assert!(!ownerless.accepting(), "ownerless: closed");
+        assert!(!owned.accepting(), "owned: its owner is closed");
+        assert!(!owned.set_owner(elsewhere.clone()), "first owner wins");
+        assert!(!owned.accepting(), "another open gate adds nothing");
         mine.set(true);
-        assert!(bound.accepting());
+        assert!(owned.accepting());
         mine.set(false);
-        drop(elsewhere);
-        assert!(!unbound.accepting(), "no live gate is open");
+        assert!(!owned.accepting());
     }
 
     use super::*;

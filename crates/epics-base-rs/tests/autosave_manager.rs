@@ -309,9 +309,13 @@ async fn test_shutdown_cleanup() {
     mgr.shutdown();
 
     // Should complete within a reasonable time
-    epics_base_rs::runtime::task::timeout(Duration::from_secs(2), handle)
+    // The event is the outer join resolving: every set task has finished its
+    // in-flight save (a tmp write, `sync_all`, rename, directory sync) and
+    // seen the stop. That save is not cancelled, so its length is the disk's;
+    // the ceiling only catches a task that never stops.
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(60), handle)
         .await
-        .expect("shutdown timed out")
+        .expect("shutdown never completed")
         .unwrap();
 }
 
@@ -403,9 +407,13 @@ async fn a_shutdown_before_the_tasks_run_still_ends_them() {
         db.clone(),
     );
     mgr.shutdown();
-    epics_base_rs::runtime::task::timeout(Duration::from_secs(2), handle)
+    // The event is the outer join resolving: every set task has finished its
+    // in-flight save (a tmp write, `sync_all`, rename, directory sync) and
+    // seen the stop. That save is not cancelled, so its length is the disk's;
+    // the ceiling only catches a task that never stops.
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(60), handle)
         .await
-        .expect("shutdown timed out")
+        .expect("shutdown never completed")
         .unwrap();
 }
 

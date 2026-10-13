@@ -1277,6 +1277,49 @@ impl StackSizeClass {
     }
 }
 
+/// A thread's stack: a class, or the byte count a C driver passes to
+/// `epicsThreadCreate` (asyn's port threads, FTDI's 500000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackSpec {
+    Class(StackSizeClass),
+    Bytes(usize),
+}
+
+impl StackSpec {
+    /// C `epicsThreadCreateOpt`'s reading of its `stackSize`
+    /// (`osdThread.c:602-603`): 0, 1, 2 are `epicsThreadStackSmall`, `Medium`,
+    /// `Big` (`epicsThread.h:92`), anything else is bytes.
+    pub fn from_c(raw: usize) -> Self {
+        match raw {
+            0 => Self::Class(StackSizeClass::Small),
+            1 => Self::Class(StackSizeClass::Medium),
+            2 => Self::Class(StackSizeClass::Big),
+            n => Self::Bytes(n),
+        }
+    }
+
+    /// The bytes the builder gets: a class as [`StackSizeClass::bytes`], a
+    /// byte count raised to `PTHREAD_STACK_MIN` if smaller. C instead only
+    /// logs the `EINVAL` and keeps the attr's default (`osdThread.c:213-214`).
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::Class(class) => class.bytes(),
+            Self::Bytes(n) => n.max(PTHREAD_STACK_MIN),
+        }
+    }
+}
+
+impl From<StackSizeClass> for StackSpec {
+    fn from(class: StackSizeClass) -> Self {
+        Self::Class(class)
+    }
+}
+
+#[cfg(unix)]
+const PTHREAD_STACK_MIN: usize = libc::PTHREAD_STACK_MIN;
+#[cfg(not(unix))]
+const PTHREAD_STACK_MIN: usize = 0;
+
 /// Outcome of a best-effort OS-scheduler priority change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriorityApplied {
@@ -3056,11 +3099,25 @@ impl MandatoryThread {
     where
         F: FnOnce() + Send + 'static,
     {
+        let stack = StackSpec::Class(self.stack);
+        self.try_spawn_sized(stack, f)
+    }
+
+    /// [`try_spawn`](Self::try_spawn) on `stack` in place of the declared
+    /// class, under the same obligation.
+    pub fn try_spawn_sized<F>(
+        self,
+        stack: StackSpec,
+        f: F,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let priority = self.priority;
-        let charge = crate::runtime::worker_pool::ThreadCharge::fixed(self.stack);
+        let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
         std::thread::Builder::new()
             .name(self.name)
-            .stack_size(self.stack.bytes())
+            .stack_size(stack.bytes())
             .spawn(move || {
                 let _charge = charge;
                 let _ = enter_ioc_thread(priority);
@@ -3746,6 +3803,75 @@ mod tests {
         );
     }
 
+    /// The running thread's stack size, as `pthread_getattr_np` reports it.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn reported_stack_bytes() -> usize {
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_getattr_np(libc::pthread_self(), &mut attr),
+                0,
+                "pthread_getattr_np"
+            );
+            let mut addr: *mut libc::c_void = std::ptr::null_mut();
+            let mut size: libc::size_t = 0;
+            assert_eq!(
+                libc::pthread_attr_getstack(&attr, &mut addr, &mut size),
+                0,
+                "pthread_attr_getstack"
+            );
+            libc::pthread_attr_destroy(&mut attr);
+            size
+        }
+    }
+
+    #[test]
+    fn from_c_reads_0_1_2_as_classes_and_the_rest_as_bytes() {
+        assert_eq!(
+            StackSpec::from_c(0),
+            StackSpec::Class(StackSizeClass::Small)
+        );
+        assert_eq!(
+            StackSpec::from_c(1),
+            StackSpec::Class(StackSizeClass::Medium)
+        );
+        assert_eq!(StackSpec::from_c(2), StackSpec::Class(StackSizeClass::Big));
+        assert_eq!(StackSpec::from_c(3), StackSpec::Bytes(3));
+        assert_eq!(StackSpec::from_c(500_000), StackSpec::Bytes(500_000));
+    }
+
+    /// A sized thread gets its bytes, raised to `PTHREAD_STACK_MIN` below it,
+    /// and a class gets exactly what `try_spawn` gives it.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_sized_thread_reports_the_stack_its_spec_asks_for() {
+        for (stack, asked) in [
+            (StackSpec::Bytes(1), libc::PTHREAD_STACK_MIN),
+            (StackSpec::Bytes(500_000), 500_000),
+            (
+                StackSpec::Class(StackSizeClass::Medium),
+                StackSizeClass::Medium.bytes(),
+            ),
+        ] {
+            assert_eq!(stack.bytes(), asked, "{stack:?}");
+            let (tx, rx) = std::sync::mpsc::channel();
+            MandatoryThread::new("stack-sized", ThreadPriority::Low, StackSizeClass::Small)
+                .try_spawn_sized(stack, move || {
+                    let _ = tx.send(reported_stack_bytes());
+                })
+                .expect("sized thread spawned")
+                .join()
+                .expect("thread joined");
+            let got = rx.recv().expect("the thread reported its stack");
+            // glibc aligns a byte count down to its stack alignment, as it
+            // does C's same `pthread_attr_setstacksize` (500000 reads 499968).
+            assert!(
+                got + 64 > asked && got < asked + 64 * 1024,
+                "{stack:?}: asked for {asked} bytes, thread reports {got}"
+            );
+        }
+    }
+
     /// The stack a caller *states* is the stack the thread *reports*.
     ///
     /// The source guard above only proves a number reached the builder. This
@@ -3764,26 +3890,6 @@ mod tests {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dedicated_thread_reports_the_stack_it_was_asked_for() {
-        fn reported_stack_bytes() -> usize {
-            unsafe {
-                let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-                assert_eq!(
-                    libc::pthread_getattr_np(libc::pthread_self(), &mut attr),
-                    0,
-                    "pthread_getattr_np"
-                );
-                let mut addr: *mut libc::c_void = std::ptr::null_mut();
-                let mut size: libc::size_t = 0;
-                assert_eq!(
-                    libc::pthread_attr_getstack(&attr, &mut addr, &mut size),
-                    0,
-                    "pthread_attr_getstack"
-                );
-                libc::pthread_attr_destroy(&mut attr);
-                size
-            }
-        }
-
         for class in [
             StackSizeClass::Small,
             StackSizeClass::Medium,

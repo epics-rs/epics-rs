@@ -94,7 +94,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
-use crate::runtime::task::{InheritedRuntime, StackSizeClass, ThreadPriority, enter_ioc_thread};
+use crate::runtime::task::{
+    InheritedRuntime, StackSizeClass, StackSpec, ThreadPriority, enter_ioc_thread,
+};
 
 /// One member of a worker set: how its thread is named, sized and banded.
 #[derive(Clone, Copy, Debug)]
@@ -1122,8 +1124,10 @@ static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
 
 /// What one thread of `stack` reserves — the whole per-thread formula, in one
 /// place, so a pool worker and a fixed IOC thread cost the account the same.
-fn thread_reservation_bytes(stack: StackSizeClass) -> usize {
-    stack.bytes() + per_thread_overhead(ThreadMemoryTarget::current()) + PER_THREAD_OBJECT_ARENA
+fn thread_reservation_bytes(stack: impl Into<StackSpec>) -> usize {
+    stack.into().bytes()
+        + per_thread_overhead(ThreadMemoryTarget::current())
+        + PER_THREAD_OBJECT_ARENA
 }
 
 /// What one thread of `role` reserves.
@@ -1229,7 +1233,7 @@ pub struct ThreadCharge {
 impl ThreadCharge {
     /// Charge one fixed thread of `stack`. Never refuses — see
     /// `Reservation::charge`.
-    pub fn fixed(stack: StackSizeClass) -> Self {
+    pub fn fixed(stack: impl Into<StackSpec>) -> Self {
         let bytes = thread_reservation_bytes(stack);
         PROCESS_RESERVATION.charge(bytes);
         Self { bytes }
@@ -2629,6 +2633,32 @@ mod tests {
             before,
             "and must be back where it started once the thread is gone"
         );
+    }
+
+    /// A sized thread charges the bytes its spec asks for, not its declared
+    /// class: 500000 against Small's 512 KiB tells the two apart.
+    #[test]
+    fn a_sized_thread_charges_its_spec_not_its_class() {
+        use crate::runtime::task::{MandatoryThread, StackSpec};
+
+        let before = PROCESS_RESERVATION.held();
+        let spec = StackSpec::Bytes(500_000);
+        let expect = thread_reservation_bytes(spec);
+        assert_ne!(expect, thread_reservation_bytes(StackSizeClass::Small));
+        let (tx, rx) = channel();
+        MandatoryThread::new("charged-sized", ThreadPriority::Low, StackSizeClass::Small)
+            .try_spawn_sized(spec, move || {
+                let _ = tx.send(PROCESS_RESERVATION.held());
+            })
+            .expect("the host can create one thread")
+            .join()
+            .expect("the thread ends cleanly");
+        assert_eq!(
+            rx.recv().expect("the thread read the account"),
+            before + expect,
+            "a Bytes spawn charges its bytes"
+        );
+        assert_eq!(PROCESS_RESERVATION.held(), before);
     }
 
     /// # Invariant

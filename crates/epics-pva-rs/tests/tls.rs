@@ -485,7 +485,7 @@ async fn mtls_client_cert_populates_x509_credentials() {
         if let Ok(mut g) = captured_hook.try_lock() {
             *g = Some((
                 cred.method.clone(),
-                cred.account.clone(),
+                cred.account.to_string(),
                 cred.authority.clone(),
             ));
         }
@@ -597,7 +597,7 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
         if let Ok(mut g) = captured_hook.try_lock() {
             *g = Some((
                 cred.method.clone(),
-                cred.account.clone(),
+                cred.account.to_string(),
                 cred.authority.clone(),
             ));
         }

@@ -221,7 +221,7 @@ unsafe extern "C" {
 /// [`ActiveBackend::new`] prints names the rule that was actually applied.
 #[cfg(target_os = "rtems")]
 fn rtems_kqueue_usable() -> (bool, String) {
-    if let Some(raw) = super::env::get("EPICS_RTEMS_KQUEUE") {
+    if let Some(raw) = super::env::get_lossy("EPICS_RTEMS_KQUEUE") {
         if let Some(forced) = parse_override(&raw) {
             return (forced, format!("EPICS_RTEMS_KQUEUE={}", raw.trim()));
         }

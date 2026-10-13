@@ -745,17 +745,16 @@ fn cmd_epics_env_show() -> CommandDef {
                 ArgValue::String(p) => Some(p.as_str()),
                 _ => None,
             };
-            for (k, v) in std::env::vars() {
+            // `vars()` panics on an entry that is not UTF-8; C matches and
+            // prints its bytes.
+            for (k, v) in std::env::vars_os() {
+                let key = k.as_encoded_bytes();
                 if let Some(pattern) = pattern
-                    && !super::commands::epics_strn_glob_match(
-                        k.as_bytes(),
-                        k.len(),
-                        pattern.as_bytes(),
-                    )
+                    && !super::commands::epics_strn_glob_match(key, key.len(), pattern.as_bytes())
                 {
                     continue;
                 }
-                ctx.println(&format!("{k}={v}"));
+                ctx.println(&format!("{}={}", k.to_string_lossy(), v.to_string_lossy()));
             }
             Ok(CommandOutcome::Continue)
         },
@@ -2026,6 +2025,30 @@ mod tests {
             std::env::remove_var("EPICS_RS_SHOW_ONE");
             std::env::remove_var("EPICS_RS_SHOW_TWO");
         }
+    }
+
+    /// An entry that is not UTF-8 is listed and matched by its bytes, as C
+    /// prints `environ`; `std::env::vars` would panic on it.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(epics_env)]
+    fn epics_env_show_lists_an_entry_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let ctx = make_ctx();
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe {
+            std::env::set_var(
+                "EPICS_RS_SHOW_BYTES",
+                std::ffi::OsStr::from_bytes(b"a\xffb"),
+            )
+        };
+        assert_eq!(
+            run_env_show(&ctx, &["EPICS_RS_SHOW_B*"]),
+            "EPICS_RS_SHOW_BYTES=a\u{FFFD}b\n"
+        );
+        assert!(!run_env_show(&ctx, &[]).is_empty());
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var("EPICS_RS_SHOW_BYTES") };
     }
 
     /// C `date` takes a format (`libComRegister.c:74`,

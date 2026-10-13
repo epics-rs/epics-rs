@@ -105,8 +105,8 @@ pub struct AssertedIdentity {
 pub struct PvaClientBuilder {
     timeout: Duration,
     server_addr: Option<SocketAddr>,
-    user: Option<String>,
-    host: Option<String>,
+    user: Option<epics_base_rs::types::PvString>,
+    host: Option<epics_base_rs::types::PvString>,
     /// Default monitor pipeline window. `0` (the default) means the
     /// default monitor is **non-pipelined**, matching pvxs
     /// `MonitorBuilder` (`clientmon.cpp:50` — `pipeline=false`): the INIT
@@ -294,12 +294,12 @@ impl PvaClientBuilder {
         self
     }
 
-    pub fn user(mut self, user: impl Into<String>) -> Self {
+    pub fn user(mut self, user: impl Into<epics_base_rs::types::PvString>) -> Self {
         self.user = Some(user.into());
         self
     }
 
-    pub fn host(mut self, host: impl Into<String>) -> Self {
+    pub fn host(mut self, host: impl Into<epics_base_rs::types::PvString>) -> Self {
         self.host = Some(host.into());
         self
     }
@@ -372,8 +372,8 @@ impl Default for PvaClientBuilder {
 struct ClientInner {
     timeout: Duration,
     server_addr: Option<SocketAddr>,
-    user: String,
-    host: String,
+    user: epics_base_rs::types::PvString,
+    host: epics_base_rs::types::PvString,
     pipeline_size: u32,
     pool: Arc<ConnectionPool>,
     channels: RwLock<HashMap<String, CacheEntry>>,
@@ -627,8 +627,8 @@ impl PvaClient {
     /// connection-config field across.
     pub fn with_asserted_identity(
         &self,
-        user: String,
-        host: String,
+        user: impl Into<epics_base_rs::types::PvString>,
+        host: impl Into<epics_base_rs::types::PvString>,
         asserted: AssertedIdentity,
     ) -> PvaClient {
         let mut builder = PvaClientBuilder::new()

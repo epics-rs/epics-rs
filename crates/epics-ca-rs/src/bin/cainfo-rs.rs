@@ -115,7 +115,7 @@ struct Args {
     diag: u8,
 
     /// PV names to query.
-    pv_names: Vec<String>,
+    pv_names: Vec<std::ffi::OsString>,
 }
 
 #[tokio::main]
@@ -151,6 +151,11 @@ async fn main() {
     if !stat_mode && !diag && args.pv_names.is_empty() {
         TOOL.no_pv_name();
     }
+    let pv_names: Vec<_> = args
+        .pv_names
+        .into_iter()
+        .map(epics_ca_rs::cli::pv_name_arg)
+        .collect();
 
     let client = CaClient::new().await.expect("failed to create CA client");
 
@@ -170,17 +175,14 @@ async fn main() {
     // `cainfo()` runs — stdout stays empty and the tool exits 1. It never
     // prints a `State: never connected` block, because a connect failure
     // means the print phase never happens.
-    let channels =
-        match epics_ca_rs::cli::connect_pvs(&client, &args.pv_names, priority, timeout).await {
-            Ok(channels) => channels,
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        };
+    let channels = match epics_ca_rs::cli::connect_pvs(&client, &pv_names, priority, timeout).await
+    {
+        Ok(channels) => channels,
+        Err(e) => e.exit(),
+    };
 
     let mut failed = false;
-    for (pv_name, ch) in args.pv_names.iter().zip(&channels) {
+    for (pv_name, ch) in pv_names.iter().zip(&channels) {
         match ch.info().await {
             Ok(info) => {
                 // C `cainfo.c::printResult`: PV name on its own
@@ -196,24 +198,29 @@ async fn main() {
                 // `ca_host_name` analog; `info.server_addr` is the raw peer
                 // address and must not reach this line.
                 let host = ch.host_name().await.unwrap_or_default();
-                println!(
-                    "{name}\n    \
+                epics_ca_rs::cli::println_named(
+                    info.pv_name.as_bytes(),
+                    format_args!(
+                        "\n    \
                      State:            connected\n    \
                      Host:             {host}\n    \
                      Access:           {rp}read, {wp}write\n    \
                      Native data type: {dbf}\n    \
                      Request type:     {dbr}\n    \
                      Element count:    {n}",
-                    name = info.pv_name,
-                    rp = read_prefix,
-                    wp = write_prefix,
-                    dbf = dbf_name(info.native_type),
-                    dbr = dbr_name(info.native_type),
-                    n = info.element_count,
+                        rp = read_prefix,
+                        wp = write_prefix,
+                        dbf = dbf_name(info.native_type),
+                        dbr = dbr_name(info.native_type),
+                        n = info.element_count,
+                    ),
                 );
             }
             Err(e) => {
-                eprintln!("{pv_name}: {e}");
+                use std::io::Write as _;
+                let mut err = std::io::stderr().lock();
+                let _ = err.write_all(pv_name.as_bytes());
+                let _ = writeln!(err, ": {e}");
                 failed = true;
             }
         }
@@ -223,7 +230,7 @@ async fn main() {
     // per-PV block. `-s` never reaches here — its non-zero mode returned
     // above, and `-s 0` is plain per-PV mode.
     if diag {
-        if !args.pv_names.is_empty() {
+        if !pv_names.is_empty() {
             println!();
         }
         println!("--- Client Diagnostics ---");

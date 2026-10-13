@@ -474,8 +474,8 @@ mod ioc {
                 config,
                 Vec::new(),
                 Vec::new(),
-                String::new(),
-                String::new(),
+                Default::default(),
+                Default::default(),
                 Duration::from_secs(1),
             )
             .await?;

@@ -83,9 +83,8 @@ use crate::proto::{
 use super::beacon_throttle::{BeaconAction, BeaconTracker};
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 use super::server_conn::{
-    DEFAULT_BUFFER_SIZE, DEFAULT_REGISTRY_SIZE, build_client_connection_validation,
-    heartbeat_interval, heartbeat_timeout, read_handshake_init, select_client_auth,
-    wait_for_validated,
+    build_client_connection_validation, heartbeat_interval, heartbeat_timeout, read_handshake_init,
+    select_client_auth, wait_for_validated,
 };
 
 /// Search retry intervals in seconds.
@@ -344,8 +343,7 @@ impl ClientSearchConfig {
     /// the broadcast port (pvxs `split_addr_into(..., udp_port)`).
     pub fn from_env() -> Self {
         let broadcast_port = crate::config::env::broadcast_port();
-        let addr_list = std::env::var("EPICS_PVA_ADDR_LIST")
-            .ok()
+        let addr_list = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_ADDR_LIST")
             .map(|s| crate::config::env::parse_endpoints_with_port(&s, broadcast_port))
             .unwrap_or_default();
         Self {
@@ -723,8 +721,8 @@ impl SearchEngine {
             reactor,
             Self::env_transport(extra_targets)?,
             name_servers,
-            String::new(),
-            String::new(),
+            Default::default(),
+            Default::default(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
@@ -749,8 +747,8 @@ impl SearchEngine {
         config: ClientSearchConfig,
         extra_targets: Vec<SocketAddr>,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
@@ -784,8 +782,8 @@ impl SearchEngine {
         reactor: &epics_base_rs::runtime::task::Reactor,
         extra_targets: Vec<SocketAddr>,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
@@ -815,8 +813,8 @@ impl SearchEngine {
     pub async fn spawn_name_servers_only(
         reactor: &epics_base_rs::runtime::task::Reactor,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
@@ -834,8 +832,8 @@ impl SearchEngine {
         reactor: &epics_base_rs::runtime::task::Reactor,
         transport: SearchTransport,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         let beacons = BeaconTracker::new();
@@ -1379,8 +1377,8 @@ async fn run_engine(
     transport: SearchTransport,
     beacons: Arc<BeaconTracker>,
     name_servers: Vec<SocketAddr>,
-    ns_user: String,
-    ns_host: String,
+    ns_user: epics_base_rs::types::PvString,
+    ns_host: epics_base_rs::types::PvString,
     ns_handshake_timeout: Duration,
 ) {
     // pvxs has no separate search counter: it reuses each channel's CID as
@@ -2939,8 +2937,8 @@ fn ns_forward_frames(handles: &[NsHandle], frames: &[Vec<u8>]) {
 /// Client identity and handshake deadline for one name-server connection,
 /// grouped so the long-lived connect/handshake task signatures stay readable.
 struct NsConnParams {
-    user: String,
-    host: String,
+    user: epics_base_rs::types::PvString,
+    host: epics_base_rs::types::PvString,
     handshake_timeout: Duration,
 }
 
@@ -3092,12 +3090,10 @@ async fn ns_run_once(
     let negotiated_auth = select_client_auth(&auth_methods);
     let reply = build_client_connection_validation(
         byte_order,
-        DEFAULT_BUFFER_SIZE,
-        DEFAULT_REGISTRY_SIZE,
-        0,
         negotiated_auth,
-        user,
-        host,
+        user.as_bytes(),
+        host.as_bytes(),
+        &super::server_conn::auth_groups(negotiated_auth),
     );
     ns_write_all(&mut writer, &reply, handshake_timeout).await?;
     wait_for_validated(&mut reader, &mut rx_buf, handshake_timeout, None)
@@ -5781,8 +5777,8 @@ mod tests {
         let engine = SearchEngine::spawn_name_servers_only(
             &crate::test_reactor(),
             vec![ns_addr],
-            String::new(),
-            String::new(),
+            Default::default(),
+            Default::default(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
@@ -5841,8 +5837,8 @@ mod tests {
             Arc::clone(&ready),
             Arc::new(AtomicUsize::new(0)),
             NsConnParams {
-                user: String::new(),
-                host: String::new(),
+                user: Default::default(),
+                host: Default::default(),
                 handshake_timeout: Duration::from_secs(5),
             },
         ));
@@ -5898,8 +5894,8 @@ mod tests {
         let engine = SearchEngine::spawn_name_servers_only(
             &crate::test_reactor(),
             vec![ns_addr],
-            String::new(),
-            String::new(),
+            Default::default(),
+            Default::default(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
@@ -6045,8 +6041,8 @@ mod tests {
         let engine = SearchEngine::spawn_name_servers_only(
             &crate::test_reactor(),
             vec![ns_addr],
-            String::new(),
-            String::new(),
+            Default::default(),
+            Default::default(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
@@ -6168,8 +6164,8 @@ mod tests {
             &crate::test_reactor(),
             Vec::new(),
             vec![ns_addr],
-            "operator".to_string(),
-            "myhost".to_string(),
+            "operator".into(),
+            "myhost".into(),
             Duration::from_secs(5),
         )
         .await

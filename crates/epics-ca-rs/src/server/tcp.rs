@@ -90,13 +90,15 @@ fn parse_opt_cap(raw: Option<String>) -> Option<usize> {
 /// Optional per-client channel cap (`EPICS_CAS_MAX_CHANNELS`).
 /// Default-unbounded (C `claim_ciu_action` parity); opt-in only.
 fn max_channels_per_client() -> Option<usize> {
-    parse_opt_cap(epics_base_rs::runtime::env::get("EPICS_CAS_MAX_CHANNELS"))
+    parse_opt_cap(epics_base_rs::runtime::env::get_lossy(
+        "EPICS_CAS_MAX_CHANNELS",
+    ))
 }
 
 /// Optional per-channel subscription cap (`EPICS_CAS_MAX_SUBS_PER_CHAN`).
 /// Default-unbounded (C `event_add_action` parity); opt-in only.
 fn max_subs_per_channel() -> Option<usize> {
-    parse_opt_cap(epics_base_rs::runtime::env::get(
+    parse_opt_cap(epics_base_rs::runtime::env::get_lossy(
         "EPICS_CAS_MAX_SUBS_PER_CHAN",
     ))
 }
@@ -832,7 +834,8 @@ pub(crate) struct ClientState {
     /// — the variant, not a runtime check at the write site, decides
     /// whether `CA_PROTO_HOST_NAME` may replace it.
     hostname: HostIdentity,
-    username: String,
+    /// C `client_name_action` keeps the `CLIENT_NAME` bytes as sent.
+    username: Vec<u8>,
     /// Authentication method for ACF `METHOD()` clause matching.
     /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
     /// `"ca"` (or empty for backwards compat) for plaintext peers.
@@ -927,16 +930,16 @@ pub(crate) struct ClientState {
 enum HostIdentity {
     /// C's default: the name the client claims. Empty until
     /// `CA_PROTO_HOST_NAME` arrives.
-    Claimed(String),
+    Claimed(Vec<u8>),
     /// Derived from the connection itself — the peer IP under
     /// `asCheckClientIP`, or an mTLS-verified cert identity. A
     /// client-supplied name never replaces it.
-    Pinned(String),
+    Pinned(Vec<u8>),
 }
 
 impl HostIdentity {
-    /// The identity string ACF/HAG matching runs against.
-    fn as_str(&self) -> &str {
+    /// The identity bytes ACF/HAG matching runs against.
+    fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Claimed(h) | Self::Pinned(h) => h,
         }
@@ -945,7 +948,7 @@ impl HostIdentity {
     /// Apply a `CA_PROTO_HOST_NAME` claim. Returns whether it was taken —
     /// `false` on a [`Self::Pinned`] identity, which is C's
     /// `host_name_action` early return under `asCheckClientIP`.
-    fn claim(&mut self, name: String) -> bool {
+    fn claim(&mut self, name: Vec<u8>) -> bool {
         match self {
             Self::Claimed(h) => {
                 *h = name;
@@ -1026,8 +1029,8 @@ impl ClientState {
             next_sid: AtomicU32::new(1),
             free_sids: Vec::new(),
             retired_subscriptions: Vec::new(),
-            hostname: HostIdentity::Claimed(String::new()),
-            username: String::new(),
+            hostname: HostIdentity::Claimed(Vec::new()),
+            username: Vec::new(),
             auth_method: String::new(),
             auth_authority: String::new(),
             acf,
@@ -1103,15 +1106,15 @@ impl ClientState {
             // Port extension, no C counterpart: an mTLS-verified cert identity
             // outranks both of C's modes and no client-supplied name replaces
             // it.
-            Some(verified) => HostIdentity::Pinned(verified),
+            Some(verified) => HostIdentity::Pinned(verified.into_bytes()),
             // C `asCheckClientIP == 1`: the peer's address is the identity and
             // CA_PROTO_HOST_NAME is ignored.
             None if epics_base_rs::server::access_security::as_check_client_ip() => {
-                HostIdentity::Pinned(peer.ip().to_string())
+                HostIdentity::Pinned(peer.ip().to_string().into_bytes())
             }
             // C's default: NULL `pHostName` — i.e. `""` to `asAddClient` —
             // until the client claims a name over CA_PROTO_HOST_NAME.
-            None => HostIdentity::Claimed(String::new()),
+            None => HostIdentity::Claimed(Vec::new()),
         };
         // PR #641: surface the mTLS authentication context to the ACF
         // check. Plaintext peers stay with empty fields — every legacy
@@ -1177,8 +1180,9 @@ impl ClientState {
             logger.log(crate::audit::AuditEvent {
                 event,
                 peer: &self.peer,
-                user: &self.username,
-                host: self.hostname.as_str(),
+                // The audit log is Rust-only JSON, which needs text.
+                user: &String::from_utf8_lossy(&self.username),
+                host: &String::from_utf8_lossy(self.hostname.as_bytes()),
                 pv,
                 value,
                 result,
@@ -1269,7 +1273,7 @@ impl ClientState {
         let calc_inputs = self.calc_inputs(cfg, asg_name);
         cfg.compute_for_name(
             asg_name,
-            self.hostname.as_str(),
+            self.hostname.as_bytes(),
             &self.username,
             &[],
             asl,
@@ -1292,7 +1296,7 @@ impl ClientState {
                 // access. The gateway audits/traps writes in its own
                 // write hook, so no TRAPWRITE rule resolves here.
                 if let Some(hook) = pv.access_hook() {
-                    let decision = hook(&self.username, self.hostname.as_str());
+                    let decision = hook(&self.username, self.hostname.as_bytes());
                     let bits = match (decision.read, decision.write) {
                         (_, true) => 3,
                         (true, false) => 1,
@@ -2789,15 +2793,16 @@ pub(crate) async fn dispatch_message(
             // fictitious `EPICS_CAS_USE_HOST_NAMES` knob (no such variable
             // exists anywhere in epics-base), so a `HOST(node)` HAG that
             // granted WRITE under C granted nothing here.
-            let claimed = String::from_utf8_lossy(&payload[..end]).to_string();
+            let claimed = payload[..end].to_vec();
             if state.hostname.claim(claimed.clone()) {
                 // Re-evaluate access rights for all existing channels.
                 reeval_access_rights(state, writer).await?;
             } else {
+                let claimed = String::from_utf8_lossy(&claimed);
                 tracing::debug!(
                     peer = %peer,
                     claimed_host = %claimed,
-                    identity = state.hostname.as_str(),
+                    identity = %String::from_utf8_lossy(state.hostname.as_bytes()),
                     "HOST_NAME ignored: identity is pinned (asCheckClientIP or mTLS)"
                 );
                 state.audit("host_name", "", &claimed, "ignored_pinned");
@@ -2847,7 +2852,7 @@ pub(crate) async fn dispatch_message(
                         .into(),
                 ));
             }
-            let raw = String::from_utf8_lossy(&payload[..end]).to_string();
+            let raw = payload[..end].to_vec();
             // When a capability-token verifier is configured AND the
             // payload arrives in `cap:<token>` form, verify the token
             // and store the resolved subject. Unverifiable tokens are
@@ -2861,8 +2866,13 @@ pub(crate) async fn dispatch_message(
                 // The previous double-strip yielded MissingPrefix on
                 // every well-formed token; cap-tokens was non-
                 // functional whenever a verifier was configured.
-                state.username = match (&state.cap_token_verifier, raw.starts_with("cap:")) {
-                    (Some(v), true) => match v.verify(&raw, state.tls_channel_binding.as_ref()) {
+                state.username = match (&state.cap_token_verifier, raw.starts_with(b"cap:")) {
+                    // A token is base64 after the prefix, so non-UTF-8 bytes
+                    // fail verification like any other malformed token.
+                    (Some(v), true) => match std::str::from_utf8(&raw)
+                        .map_err(|_| crate::cap_token::TokenError::Malformed)
+                        .and_then(|t| v.verify(t, state.tls_channel_binding.as_ref()))
+                    {
                         Ok(claims) => {
                             tracing::debug!(peer = %state.peer, sub = %claims.sub,
                                 "cap-token verified");
@@ -2878,7 +2888,7 @@ pub(crate) async fn dispatch_message(
                             // could not match a verified token.
                             state.auth_method = "cap-token".to_string();
                             state.auth_authority = claims.iss.clone();
-                            claims.sub
+                            claims.sub.into_bytes()
                         }
                         Err(e) => {
                             // Do NOT fold the raw token into the username:
@@ -2891,7 +2901,7 @@ pub(crate) async fn dispatch_message(
                             // deny; the reason is in the warn log.
                             tracing::warn!(peer = %state.peer, error = %e,
                                 "cap-token verification failed");
-                            "unverified".to_string()
+                            b"unverified".to_vec()
                         }
                     },
                     _ => raw,
@@ -2949,8 +2959,22 @@ pub(crate) async fn dispatch_message(
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(scan_end);
-            let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
             let client_cid = hdr.cid;
+            // A non-UTF-8 name names no PV in the UTF-8-keyed database (C
+            // compares the bytes, and so finds none either).
+            let Ok(pv_name) = std::str::from_utf8(&payload[..end]) else {
+                let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                fail.cid = client_cid;
+                writer.push(fail.to_bytes().to_vec());
+                state.audit(
+                    "create_chan",
+                    &String::from_utf8_lossy(&payload[..end]),
+                    "",
+                    "not_found",
+                );
+                return Ok(());
+            };
+            let pv_name = pv_name.to_string();
             // epics-base 3.15.7 channel-filter suffix
             // (`REC.{"dbnd":{"d":0.5}}`). Split the JSON suffix off
             // for the record lookup, but keep `pv_name` verbatim so
@@ -4048,7 +4072,9 @@ pub(crate) async fn dispatch_message(
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(scan_end);
-            let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
+            // A non-UTF-8 name names no PV in the UTF-8-keyed database (C
+            // compares the bytes, and so finds none either).
+            let pv_name = std::str::from_utf8(&payload[..end]);
 
             // Thread the connection peer into the existence check just
             // like TCP CREATE_CHANNEL (`find_entry_from(.., Some(peer))`)
@@ -4058,7 +4084,11 @@ pub(crate) async fn dispatch_message(
             // host's TCP SEARCH could resolve (and lazily instantiate) a
             // PV the pvlist forbids — parity with C `pvExistTest` passing
             // the client host to `gateAs::findEntry`.
-            if db.has_name_from(&pv_name, Some(peer)).await {
+            let found = match pv_name {
+                Ok(name) => db.has_name_from(name, Some(peer)).await,
+                Err(_) => false,
+            };
+            if found {
                 // C parity: `search_reply_tcp`
                 // (`rsrv/camessage.c:2275-2277`) sends:
                 //   m_postsize  = 0  (no payload — TCP search reply
@@ -4914,7 +4944,7 @@ pub(crate) async fn serve_write_head(
                     .map(|e| e.target.audit_name())
                     .unwrap_or_default(),
                 user: state.username.clone(),
-                host: state.hostname.as_str().to_string(),
+                host: state.hostname.as_bytes().to_vec(),
                 peer: state.peer.clone(),
                 value_str: display_value.clone(),
                 // C `asTrapWriteWithData` (`camessage.c:768-771`) logs
@@ -4956,7 +4986,7 @@ pub(crate) async fn serve_write_head(
                     if let Some(hook) = pv.write_hook() {
                         let ctx = epics_base_rs::server::pv::WriteContext {
                             user: state.username.clone(),
-                            host: state.hostname.as_str().to_string(),
+                            host: state.hostname.as_bytes().to_vec(),
                             peer: state.peer.clone(),
                         };
                         hook(new_value, ctx).await.map(|()| ProcessCompletion::Sync)
@@ -8378,8 +8408,8 @@ mod put_notify_serialize_tests {
 
         let guard = TrapWriteGuard::begin(TrapWriteFields {
             pv_name: "overdue:trap".to_string(),
-            user: "u".to_string(),
-            host: "h".to_string(),
+            user: b"u".to_vec(),
+            host: b"h".to_vec(),
             peer: "h:5064".to_string(),
             value_str: "1".to_string(),
             dbr_type: epics_base_rs::types::DBR_LONG,
@@ -9198,19 +9228,22 @@ mod host_identity_tests {
     fn claimed_identity_takes_the_client_supplied_name() {
         // C's default path: `create_tcp_client` leaves pHostName NULL, so
         // the identity is "" until the client claims one.
-        let mut id = HostIdentity::Claimed(String::new());
+        let mut id = HostIdentity::Claimed(Vec::new());
         assert_eq!(
-            id.as_str(),
-            "",
+            id.as_bytes(),
+            b"",
             "no claim yet — C passes \"\" to asAddClient"
         );
 
         assert!(id.claim("opi-01.lab".into()), "a claimed identity takes it");
         assert_eq!(
-            id.as_str(),
-            "opi-01.lab",
+            id.as_bytes(),
+            b"opi-01.lab",
             "C stores the client-supplied name unconditionally (camessage.c:849-872)"
         );
+        // `host_name_action` keeps the name's bytes as the client sent them.
+        assert!(id.claim(b"opi\xff".to_vec()));
+        assert_eq!(id.as_bytes(), b"opi\xff");
     }
 
     #[test]
@@ -9225,8 +9258,8 @@ mod host_identity_tests {
             "a pinned identity refuses the claim"
         );
         assert_eq!(
-            id.as_str(),
-            "10.0.0.7",
+            id.as_bytes(),
+            b"10.0.0.7",
             "a client cannot spoof its way past a pinned identity"
         );
     }
@@ -9241,14 +9274,16 @@ mod host_identity_tests {
 
         let peer: SocketAddr = "192.168.4.9:44321".parse().unwrap();
         let decide = |verified: Option<String>| match verified {
-            Some(v) => HostIdentity::Pinned(v),
-            None if as_check_client_ip() => HostIdentity::Pinned(peer.ip().to_string()),
-            None => HostIdentity::Claimed(String::new()),
+            Some(v) => HostIdentity::Pinned(v.into_bytes()),
+            None if as_check_client_ip() => {
+                HostIdentity::Pinned(peer.ip().to_string().into_bytes())
+            }
+            None => HostIdentity::Claimed(Vec::new()),
         };
 
         // C default: claimable, empty until CA_PROTO_HOST_NAME.
         set_as_check_client_ip(false);
-        assert_eq!(decide(None), HostIdentity::Claimed(String::new()));
+        assert_eq!(decide(None), HostIdentity::Claimed(Vec::new()));
 
         // asCheckClientIP=1: pinned to the peer's dotted-quad address.
         set_as_check_client_ip(true);
@@ -9464,8 +9499,8 @@ mod non_graceful_disconnect_teardown_tests {
 
     /// Build a CA_PROTO_CREATE_CHAN request for `pv_name` with the
     /// given client cid. Payload is the 8-aligned, NUL-terminated name.
-    pub(super) fn create_chan_frame(cid: u32, pv_name: &str) -> Vec<u8> {
-        let name = pad_string(pv_name);
+    pub(super) fn create_chan_frame(cid: u32, pv_name: impl AsRef<[u8]>) -> Vec<u8> {
+        let name = crate::protocol::pad_bytes(pv_name.as_ref());
         let mut h = CaHeader::new(CA_PROTO_CREATE_CHAN);
         h.cid = cid;
         h.available = CA_MINOR_VERSION as u32;
@@ -9903,6 +9938,59 @@ mod non_graceful_disconnect_teardown_tests {
             client.flush().await.expect("flush create_chan");
             let hdr = read_create_chan_result(&mut client, Duration::from_secs(3)).await;
             assert_eq!(hdr.cmmd, cmmd, "{name}");
+        }
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// rsrv looks the CREATE_CHAN name up by its bytes, so `a\xff` does not
+    /// find a PV named `a\u{FFFD}`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_utf8_create_chan_name_is_not_decoded_lossily() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("a\u{FFFD}", EpicsValue::Double(1.0))
+            .await
+            .expect("add pv");
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55227".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        for (cid, name, cmmd) in [
+            (0xC0, "a\u{FFFD}".as_bytes(), CA_PROTO_CREATE_CHAN),
+            (0xC1, b"a\xff".as_slice(), CA_PROTO_CREATE_CH_FAIL),
+        ] {
+            client
+                .write_all(&create_chan_frame(cid, name))
+                .await
+                .expect("create_chan");
+            client.flush().await.expect("flush create_chan");
+            let hdr = read_create_chan_result(&mut client, Duration::from_secs(3)).await;
+            assert_eq!(hdr.cmmd, cmmd, "{name:?}");
         }
 
         drop(client);
@@ -13847,7 +13935,7 @@ mod access_change_walk_tests {
     /// reaches `reeval_access_rights` on that driver once a channel exists
     /// (HOST_NAME and CLIENT_NAME are refused after the first channel, and it
     /// has no ACF-reload listener), so this pins its link, not the wire.
-    // RTEMS-EXEC-MODEL-ALLOW(2): both run and pass under
+    // RTEMS-EXEC-MODEL-ALLOW(3): all three run and pass under
     // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
     #[tokio::test]
     async fn an_access_change_reaches_a_monitor_held_outside_the_async_registry() {
@@ -13935,6 +14023,42 @@ mod access_change_walk_tests {
         assert_eq!(access_rights(&out[0]), (0x1234, 3));
         assert_eq!(next_event(&state), Some((false, 1.5)), "the restore frame");
         assert_eq!(next_event(&state), None);
+    }
+    #[tokio::test]
+    async fn a_non_utf8_client_name_reaches_the_acf_check_byte_for_byte() {
+        use epics_base_rs::server::access_security::{AccessLevel, new_acf_cell, parse_acf};
+        // The member is what a lossy decode of the name would produce.
+        let acf =
+            "UAG(ops) { \"op\u{fffd}\" }\nASG(DEFAULT) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
+        let db = Arc::new(PvDatabase::new());
+        let mut state = ClientState::new(
+            new_acf_cell(Some(parse_acf(acf).unwrap())),
+            5064,
+            db.clone(),
+        );
+        let (outbox, _drain) = crate::server::outbox::channel();
+        let payload = b"op\xff\0\0\0\0\0".to_vec();
+        let mut hdr = CaHeader::new(CA_PROTO_CLIENT_NAME);
+        hdr.postsize = payload.len() as u16;
+        dispatch_message(
+            &hdr,
+            &payload,
+            &mut state,
+            &db,
+            &outbox,
+            "127.0.0.1:55991".parse().unwrap(),
+            None,
+            SubscriptionDelivery::HandOff,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.username, b"op\xff");
+        assert_eq!(
+            state
+                .access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0)
+                .0,
+            AccessLevel::NoAccess
+        );
     }
 }
 

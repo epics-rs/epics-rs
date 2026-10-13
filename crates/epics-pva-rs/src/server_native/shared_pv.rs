@@ -2218,7 +2218,7 @@ mod tests {
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
             creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
-                account: String::new(),
+                account: Default::default(),
                 method: "anonymous".into(),
                 host: String::new(),
                 authority: String::new(),

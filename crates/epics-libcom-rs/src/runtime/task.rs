@@ -1607,8 +1607,8 @@ impl RtPolicy {
         static POLICY: std::sync::OnceLock<RtPolicy> = std::sync::OnceLock::new();
         *POLICY.get_or_init(|| {
             RtPolicy::from_env(
-                std::env::var_os(C_RT_PRIORITY_ENV).as_deref(),
-                std::env::var_os(RT_PRIORITY_ENV).as_deref(),
+                super::env::get(C_RT_PRIORITY_ENV).as_deref(),
+                super::env::get(RT_PRIORITY_ENV).as_deref(),
             )
         })
     }

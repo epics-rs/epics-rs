@@ -4,10 +4,10 @@ use std::time::SystemTime;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::runtime::sync::broadcast;
-use epics_base_rs::types::WallTime;
+use epics_base_rs::types::{PvString, WallTime};
 use epics_ca_rs::cli::{
-    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_time,
-    format_value_segment, sevr_to_str, stat_to_str,
+    CountPrefix, FloatFormat, FloatStyle, ValueFormat, format_time, format_value_segment,
+    name_column, println_named, sevr_to_str, stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
 use epics_ca_rs::copt::{self, CTool};
@@ -237,7 +237,7 @@ struct Args {
 
     /// PV names to monitor. NOT clap-`required` — see `caget-rs`; C checks
     /// `nPvs < 1` after the getopt loop (`camonitor.c:363-367`).
-    pv_names: Vec<String>,
+    pv_names: Vec<std::ffi::OsString>,
 }
 
 impl Args {
@@ -307,11 +307,15 @@ async fn main() {
     if args.pv_names.is_empty() {
         TOOL.no_pv_name();
     }
+    let pv_names: Vec<PvString> = args
+        .pv_names
+        .into_iter()
+        .map(epics_ca_rs::cli::pv_name_arg)
+        .collect();
 
     let client = CaClient::new().await.expect("failed to create CA client");
 
-    let connected_flags: Vec<Arc<AtomicBool>> = args
-        .pv_names
+    let connected_flags: Vec<Arc<AtomicBool>> = pv_names
         .iter()
         .map(|_| Arc::new(AtomicBool::new(false)))
         .collect();
@@ -344,16 +348,13 @@ async fn main() {
     // `connect_pvs` barrier, because camonitor has no all-channels wait —
     // and returns its code before the event loop starts. The name gate is
     // the same one, so it lives in the same owner.
-    let channels = match epics_ca_rs::cli::create_pvs(&client, &args.pv_names, priority) {
+    let channels = match epics_ca_rs::cli::create_pvs(&client, &pv_names, priority) {
         Ok(channels) => channels,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
+        Err(e) => e.exit(),
     };
 
     let mut handles = Vec::new();
-    for (i, (pv_name, (channel, conn_rx))) in args.pv_names.iter().zip(channels).enumerate() {
+    for (i, (pv_name, (channel, conn_rx))) in pv_names.iter().zip(channels).enumerate() {
         let pv = pv_name.clone();
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();
@@ -396,14 +397,13 @@ async fn main() {
     // owner — re-reading the raw argument here would be a second source for
     // one C global (`fieldSeparator`).
     let sep = fmt.field_separator;
-    for (i, pv_name) in args.pv_names.iter().enumerate() {
+    for (i, pv_name) in pv_names.iter().enumerate() {
         if !connected_flags[i].load(Ordering::Acquire) {
-            let name_col = if sep == ' ' {
-                format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
-            } else {
-                pv_name.clone()
-            };
-            println!("{name_col}{sep}*** Not connected (PV not found)");
+            let name_col = name_column(pv_name.as_bytes(), sep == ' ');
+            println_named(
+                &name_col,
+                format_args!("{sep}*** Not connected (PV not found)"),
+            );
         }
     }
 
@@ -423,7 +423,7 @@ fn format_server_timestamp(ts: SystemTime) -> String {
 async fn monitor_pv(
     channel: CaChannel,
     mut conn_rx: broadcast::Receiver<ConnectionEvent>,
-    pv_name: String,
+    pv_name: PvString,
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
     float_as_string: bool,
@@ -461,12 +461,8 @@ async fn monitor_pv(
                     // disconnect event carries no element count, so we
                     // gate on the separator alone — identical to C for
                     // the common scalar case.
-                    let name_col = if sep == ' ' {
-                        format!("{pv:<width$}", width = PV_NAME_WIDTH)
-                    } else {
-                        pv.clone()
-                    };
-                    println!("{name_col}{sep}{now} *** disconnected");
+                    let name_col = name_column(pv.as_bytes(), sep == ' ');
+                    println_named(&name_col, format_args!("{sep}{now} *** disconnected"));
                 }
                 _ => {}
             }
@@ -537,22 +533,24 @@ async fn monitor_pv(
                     CountPrefix::IfRequestedOrArray,
                 );
                 let is_scalar = snap.value.count() == 1;
-                let name_col = if is_scalar && sep == ' ' {
-                    format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
-                } else {
-                    pv_name.clone()
-                };
+                let name_col = name_column(pv_name.as_bytes(), is_scalar && sep == ' ');
                 let stat = snap.alarm.status;
                 let sevr = snap.alarm.severity;
                 if stat == 0 && sevr == 0 {
                     // C `tool_lib.c` line 500: print `<sep><sep>` —
                     // two empty alarm fields trailing the value.
-                    println!("{name_col}{sep}{time_seg}{value_seg}{sep}{sep}");
+                    println_named(
+                        &name_col,
+                        format_args!("{sep}{time_seg}{value_seg}{sep}{sep}"),
+                    );
                 } else {
-                    println!(
-                        "{name_col}{sep}{time_seg}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
-                        stat_str = stat_to_str(stat),
-                        sevr_str = sevr_to_str(sevr),
+                    println_named(
+                        &name_col,
+                        format_args!(
+                            "{sep}{time_seg}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
+                            stat_str = stat_to_str(stat),
+                            sevr_str = sevr_to_str(sevr),
+                        ),
                     );
                 }
             }
@@ -1266,11 +1264,10 @@ mod tests {
             .await
             .expect("CA client");
 
-        let (channel, conn_rx) =
-            epics_ca_rs::cli::create_pvs(&client, &["CAMON:PIN".to_string()], 0)
-                .expect("a creatable name")
-                .pop()
-                .unwrap();
+        let (channel, conn_rx) = epics_ca_rs::cli::create_pvs(&client, &["CAMON:PIN".into()], 0)
+            .expect("a creatable name")
+            .pop()
+            .unwrap();
         for _ in 0..2 {
             channel
                 .wait_connected(fact_budget::FACT_BUDGET)
@@ -1291,7 +1288,7 @@ mod tests {
         let task = tokio::spawn(super::monitor_pv(
             channel,
             conn_rx,
-            "CAMON:PIN".to_string(),
+            "CAMON:PIN".into(),
             flag.clone(),
             Arc::new(fmt),
             false,

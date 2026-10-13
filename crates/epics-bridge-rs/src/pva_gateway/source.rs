@@ -198,7 +198,7 @@ fn default_asg_resolver() -> AsgResolver {
 /// to the asserted upstream credential MUST add it here too.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct UpstreamIdentityKey {
-    account: String,
+    account: epics_base_rs::types::PvString,
     method: String,
     host: String,
     authority: String,
@@ -785,7 +785,7 @@ impl GatewayChannelSource {
         mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>,
     )> {
         // default ON — opt out via EPICS_PVA_GW_RAW_FRAMES=NO.
-        if let Some(v) = epics_base_rs::runtime::env::get("EPICS_PVA_GW_RAW_FRAMES") {
+        if let Some(v) = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_GW_RAW_FRAMES") {
             if v.eq_ignore_ascii_case("NO") || v.eq_ignore_ascii_case("FALSE") || v == "0" {
                 return None;
             }
@@ -2033,7 +2033,7 @@ mod tests {
         ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
             creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
-                account: account.to_string(),
+                account: account.into(),
                 method: method.to_string(),
                 host: host.to_string(),
                 authority: String::new(),
@@ -2620,7 +2620,7 @@ ASG(DEFAULT) {
         let ctx = ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
             creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
-                account: "alice".to_string(),
+                account: "alice".into(),
                 method: "x509".to_string(),
                 host: "ws01.lab".to_string(),
                 authority: "Lab Root CA".to_string(),

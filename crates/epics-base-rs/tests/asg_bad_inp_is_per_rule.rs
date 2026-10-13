@@ -123,7 +123,7 @@ ASG(G) {
 "#,
     )
     .unwrap();
-    let rules = &cfg.asg["G"].rules;
+    let rules = &cfg.asg[b"G".as_slice()].rules;
     assert_eq!(rules[0].inp_used, 0b001, "\"A=1\" reads A");
     assert_eq!(rules[1].inp_used, 0b110, "\"B+C>0\" reads B and C");
     assert_eq!(rules[2].inp_used, 0, "a rule with no CALC reads nothing");

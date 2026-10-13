@@ -518,7 +518,7 @@ impl MacroTable {
         if !self.opts.env_fallback || name.is_empty() {
             return None;
         }
-        let value = crate::runtime::env::get(name)?;
+        let value = crate::runtime::env::get_lossy(name)?;
         Some(self.put(name, KIND_ENVIRONMENT, value))
     }
 

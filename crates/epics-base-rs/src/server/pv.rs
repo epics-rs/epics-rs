@@ -39,7 +39,7 @@ impl From<crate::server::event_queue::Closed> for SubscribeRefused {
 /// per-PV `Vec<Subscriber>` under abuse. Override via
 /// `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`.
 pub(crate) fn max_subscribers_per_pv() -> usize {
-    crate::runtime::env::get("EPICS_CAS_MAX_SUBSCRIBERS_PER_PV")
+    crate::runtime::env::get_lossy("EPICS_CAS_MAX_SUBSCRIBERS_PER_PV")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1024)
         .max(8)
@@ -72,11 +72,11 @@ pub fn dropped_monitor_events() -> u64 {
 /// putlog) can make decisions without re-deriving them.
 #[derive(Debug, Clone, Default)]
 pub struct WriteContext {
-    /// CA `CLIENT_NAME` username, or empty if unknown.
-    pub user: String,
-    /// CA `HOST_NAME` hostname (or peer IP fallback), used for ACF
-    /// matching against `HAG(...)` groups.
-    pub host: String,
+    /// CA `CLIENT_NAME` username as the client sent it, or empty if unknown.
+    pub user: Vec<u8>,
+    /// CA `HOST_NAME` bytes as the client sent them (or the peer IP), used
+    /// for ACF matching against `HAG(...)` groups.
+    pub host: Vec<u8>,
     /// Raw `peer.ip():peer.port()` string, retained for audit/log use.
     pub peer: String,
 }
@@ -166,7 +166,7 @@ pub struct AccessDecision {
 /// synchronous (it only reads an in-memory `ArcSwap`, no `.await`); the
 /// server consults it at `CREATE_CHAN` and on access-rights
 /// re-evaluation.
-pub type AccessHook = Arc<dyn Fn(&str, &str) -> AccessDecision + Send + Sync>;
+pub type AccessHook = Arc<dyn Fn(&[u8], &[u8]) -> AccessDecision + Send + Sync>;
 
 /// per-PV read hook consulted by the CA server's one-shot GET path
 /// (`CA_PROTO_READ` / `CA_PROTO_READ_NOTIFY`) when set. A bare PV serves

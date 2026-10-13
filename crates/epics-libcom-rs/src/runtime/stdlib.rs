@@ -420,9 +420,9 @@ pub fn epics_scan_double(s: &str) -> Option<f64> {
 /// as `u32` directly would diverge on any non-ASCII name. The shifts are
 /// C's on a 32-bit `unsigned int`, so they wrap rather than overflow.
 #[must_use]
-pub fn epics_str_hash(s: &str, seed: u32) -> u32 {
+pub fn epics_str_hash(s: impl AsRef<[u8]>, seed: u32) -> u32 {
     let mut hash = seed;
-    let bytes = s.as_bytes();
+    let bytes = s.as_ref();
     let mut i = 0;
     while i < bytes.len() {
         let c = i32::from(bytes[i] as i8) as u32;

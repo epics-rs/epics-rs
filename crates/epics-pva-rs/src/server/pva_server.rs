@@ -154,7 +154,7 @@ impl PvaServer {
     /// subsequent checks see the new one. Unlike the `RwLock` this replaced,
     /// the reload does not wait for in-flight checks to finish.
     pub async fn reload_acf_from(&self, path: &std::path::Path) -> CaResult<()> {
-        let content = std::fs::read_to_string(path).map_err(epics_base_rs::error::CaError::Io)?;
+        let content = std::fs::read(path).map_err(epics_base_rs::error::CaError::Io)?;
         let cfg = access_security::parse_acf(&content)?;
         self.acf.store(Some(std::sync::Arc::new(cfg)));
         // Bump the shared ACL generation so monitor tasks

@@ -85,7 +85,7 @@ async fn a_value_the_field_refuses_is_putfail_not_badtype() {
     let (client, server) = serve_one_ai().await;
 
     for (field, value) in [("PHAS", "32768"), ("RVAL", "notanumber")] {
-        let chan = client.create_channel(&format!("PUTSTAT:A.{field}"));
+        let chan = client.create_channel(format!("PUTSTAT:A.{field}"));
         chan.wait_connected(fact_budget::FACT_BUDGET)
             .await
             .expect("connect");

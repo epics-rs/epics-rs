@@ -330,7 +330,7 @@ async fn run_beacon_monitor_inner(
     let mut verified_tuples: HashMap<(u32, u16, u32), std::time::Instant> = HashMap::new();
     #[cfg(feature = "cap-tokens")]
     let require_signed = !matches!(
-        epics_base_rs::runtime::env::get("EPICS_CA_BEACON_REQUIRE_SIGNED").as_deref(),
+        epics_base_rs::runtime::env::get_lossy("EPICS_CA_BEACON_REQUIRE_SIGNED").as_deref(),
         Some("NO" | "no" | "0" | "false" | "FALSE")
     );
     let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();

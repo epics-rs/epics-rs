@@ -294,19 +294,19 @@ fn as_init_file(filename: &str, substitutions: Option<&str>) -> Option<AccessSec
     // C diagnoses only the `fopen`; a failure part-way through the read is
     // a NULL `fgets` to it, which `myInputFunction` reports as end of input
     // (`asLibRoutines.c:222`) and the parser then accepts as a short file.
-    // One `read_to_string` cannot tell those apart, so a mid-read failure
+    // One `read` cannot tell those apart, so a mid-read failure
     // takes this line too rather than silently activating a truncated ACF.
     // A directory named as the ACF lands here for the same reason (`Err`
-    // from `read_to_string`), which is the answer an operator needs.
+    // from `read`), which is the answer an operator needs.
     //
     // C also has a second diagnostic this port has no place for:
     // `asLibRoutines.c:184-189` checks `fclose` and reports
-    // `asInitFile: fclose failed!`. `read_to_string` closes the descriptor
+    // `asInitFile: fclose failed!`. `read` closes the descriptor
     // as it drops the handle and Rust's `File` has no fallible close, so
     // reproducing it would mean opening the file through `libc` and closing
     // the raw fd by hand — new `unsafe` for a status the whole content has
     // already been read past. Deliberately absent.
-    let raw = match std::fs::read_to_string(filename) {
+    let raw = match std::fs::read(filename) {
         Ok(raw) => raw,
         Err(_) => {
             eprintln!("{}", cant_open_file(filename));
@@ -315,12 +315,20 @@ fn as_init_file(filename: &str, substitutions: Option<&str>) -> Option<AccessSec
     };
     let content = match substitutions {
         Some(subs) if !subs.is_empty() => {
-            let macros = super::commands::parse_macro_string(subs);
+            // macLib is char-typed but C's expands bytes. Each byte travels
+            // as the char of the same value, which is exact: its syntax and
+            // `c_isspace` are ASCII and C's handle has no environment
+            // (`macCreateHandle(&macHandle, NULL)`, asLibRoutines.c:241).
+            let latin1 = |b: &[u8]| b.iter().map(|&b| char::from(b)).collect::<String>();
+            let macros = super::commands::parse_macro_string(&latin1(subs.as_bytes()));
             // Per line, as C `asInitFile` feeds `macExpandString` one
             // `fgets` line at a time (`asLibRoutines.c:202-219`) — a
             // quote in one ACF comment must not suppress `$(...)` on
             // the lines after it.
-            crate::server::db_loader::substitute_macros_per_line(&raw, &macros)
+            crate::server::db_loader::substitute_macros_per_line(&latin1(&raw), &macros)
+                .chars()
+                .map(|c| u8::try_from(c).expect("macLib emits only the chars it was given"))
+                .collect()
         }
         _ => raw,
     };
@@ -404,11 +412,7 @@ fn cmd_asdbdump() -> CommandDef {
             // Delegate to the single dump-format owner in
             // `access_security.rs` (shared with the CA gateway R3 report),
             // printing each rendered line through the shell.
-            with_config(ctx, |cfg| {
-                for line in cfg.dump_report().lines() {
-                    ctx.println(line);
-                }
-            })
+            with_config(ctx, |cfg| println_dump(ctx, &cfg.dump_report()))
         },
     )
 }
@@ -417,11 +421,16 @@ fn cmd_asdbdump() -> CommandDef {
 /// Delegates to [`AccessSecurityConfig::fmt_asg`] — the single owner of
 /// the rule-dump format shared with `asdbdump` and the CA gateway R3
 /// report — then prints each rendered line through the shell.
-fn print_asg(ctx: &CommandContext, cfg: &AccessSecurityConfig, name: &str) {
-    let mut buf = String::new();
+fn print_asg(ctx: &CommandContext, cfg: &AccessSecurityConfig, name: &[u8]) {
+    let mut buf = Vec::new();
     cfg.fmt_asg(name, &mut buf);
-    for line in buf.lines() {
-        ctx.println(line);
+    println_dump(ctx, &buf);
+}
+
+/// Print a rendered dump line by line, as the bytes C's `%s` writes.
+fn println_dump(ctx: &CommandContext, dump: &[u8]) {
+    for line in dump.split_inclusive(|&b| b == b'\n') {
+        ctx.println_bytes(line.strip_suffix(b"\n").unwrap_or(line));
     }
 }
 
@@ -444,12 +453,12 @@ fn cmd_aspuag() -> CommandDef {
                 let mut names: Vec<_> = cfg.uag.keys().collect();
                 names.sort();
                 for name in names {
-                    if filter.is_some_and(|f| f != name) {
+                    if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
                         continue;
                     }
-                    ctx.println(&format!("UAG({name})"));
+                    ctx.println_bytes(&[b"UAG(", name.as_slice(), b")"].concat());
                     for m in &cfg.uag[name] {
-                        ctx.println(&format!("\t{m}"));
+                        ctx.println_bytes(&[b"\t", m.as_slice()].concat());
                     }
                 }
             })
@@ -476,12 +485,12 @@ fn cmd_asphag() -> CommandDef {
                 let mut names: Vec<_> = cfg.hag.keys().collect();
                 names.sort();
                 for name in names {
-                    if filter.is_some_and(|f| f != name) {
+                    if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
                         continue;
                     }
-                    ctx.println(&format!("HAG({name})"));
+                    ctx.println_bytes(&[b"HAG(", name.as_slice(), b")"].concat());
                     for h in &cfg.hag[name] {
-                        ctx.println(&format!("\t{h}"));
+                        ctx.println_bytes(&[b"\t", h.as_slice()].concat());
                     }
                 }
             })
@@ -508,10 +517,10 @@ fn cmd_asprules() -> CommandDef {
                 let mut names: Vec<_> = cfg.asg.keys().collect();
                 names.sort();
                 for name in names {
-                    if filter.is_some_and(|f| f != name) {
+                    if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
                         continue;
                     }
-                    ctx.println(&format!("ASG({name})"));
+                    ctx.println_bytes(&[b"ASG(", name.as_slice(), b")"].concat());
                     print_asg(ctx, cfg, name);
                 }
             })
@@ -678,11 +687,19 @@ fn cmd_ascar() -> CommandDef {
                 asgs.sort();
                 for name in asgs {
                     for inp in &cfg.asg[name].inp {
-                        let letter = (b'A' + inp.index) as char;
-                        ctx.println(&format!(
-                            "ASG({name}) INP{letter} \"{}\" — not connected",
-                            inp.link
-                        ));
+                        let letter = [b'A' + inp.index];
+                        ctx.println_bytes(
+                            &[
+                                b"ASG(".as_slice(),
+                                name,
+                                b") INP",
+                                &letter,
+                                b" \"",
+                                &inp.link,
+                                "\" — not connected".as_bytes(),
+                            ]
+                            .concat(),
+                        );
                         total += 1;
                     }
                 }
@@ -731,7 +748,7 @@ fn cmd_as_dump_hash() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             for line in dump_as_hash(&cfg) {
-                ctx.println(&line);
+                ctx.println_bytes(&line);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -751,29 +768,37 @@ const AS_HASH_SEED_HAG: u32 = 0x6861_6700; // "hag\0"
 /// bucket count, then one line per non-empty bucket carrying its entry
 /// count and up to three `name owner` pairs before wrapping, then the
 /// empty-bucket tally.
-fn dump_as_hash(cfg: &AccessSecurityConfig) -> Vec<String> {
-    let mut buckets: Vec<Vec<(String, String)>> = vec![Vec::new(); AS_HASH_BUCKETS];
+fn dump_as_hash(cfg: &AccessSecurityConfig) -> Vec<Vec<u8>> {
+    let mut buckets: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); AS_HASH_BUCKETS];
     let mask = (AS_HASH_BUCKETS - 1) as u32;
-    let mut push = |member: &str, owner: String, seed: u32| {
+    let mut push = |member: &[u8], owner: Vec<u8>, seed: u32| {
         let h = (crate::runtime::stdlib::epics_str_hash(member, seed) & mask) as usize;
-        buckets[h].push((member.to_string(), owner));
+        buckets[h].push((member.to_vec(), owner));
     };
-    let mut uags: Vec<&String> = cfg.uag.keys().collect();
+    let mut uags: Vec<&Vec<u8>> = cfg.uag.keys().collect();
     uags.sort();
     for name in uags {
         for user in &cfg.uag[name] {
-            push(user, format!("UAG({name})"), AS_HASH_SEED_UAG);
+            push(
+                user,
+                [b"UAG(", name.as_slice(), b")"].concat(),
+                AS_HASH_SEED_UAG,
+            );
         }
     }
-    let mut hags: Vec<&String> = cfg.hag.keys().collect();
+    let mut hags: Vec<&Vec<u8>> = cfg.hag.keys().collect();
     hags.sort();
     for name in hags {
         for host in &cfg.hag[name] {
-            push(host, format!("HAG({name})"), AS_HASH_SEED_HAG);
+            push(
+                host,
+                [b"HAG(", name.as_slice(), b")"].concat(),
+                AS_HASH_SEED_HAG,
+            );
         }
     }
 
-    let mut out = vec![format!("Hash table has {AS_HASH_BUCKETS} buckets")];
+    let mut out = vec![format!("Hash table has {AS_HASH_BUCKETS} buckets").into_bytes()];
     let mut empty = 0usize;
     for (h, entries) in buckets.iter().enumerate() {
         if entries.is_empty() {
@@ -782,17 +807,17 @@ fn dump_as_hash(cfg: &AccessSecurityConfig) -> Vec<String> {
         }
         // C prints `\n [%3d] %3d  ` then `  %s %p` per entry, breaking the
         // line after every third (`if (!(++i % 3))`).
-        let mut line = format!(" [{h:3}] {:3}  ", entries.len());
+        let mut line = format!(" [{h:3}] {:3}  ", entries.len()).into_bytes();
         for (i, (member, owner)) in entries.iter().enumerate() {
             if i > 0 && i % 3 == 0 {
                 out.push(line);
-                line = "            ".to_string();
+                line = b"            ".to_vec();
             }
-            line.push_str(&format!("  {member} {owner}"));
+            line.extend_from_slice(&[b"  ", member.as_slice(), b" ", owner].concat());
         }
         out.push(line);
     }
-    out.push(format!("{empty} buckets empty."));
+    out.push(format!("{empty} buckets empty.").into_bytes());
     out
 }
 
@@ -867,6 +892,18 @@ mod tests {
         // Config is now active in the context's live cell — the one
         // the IOC's servers gate on.
         assert!(ctx.acf().load().is_some());
+    }
+
+    #[test]
+    fn a_non_utf8_acf_file_loads_with_its_bytes() {
+        let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
+        std::fs::write(
+            tmp.path(),
+            b"UAG(ops) { \"op\xff\" }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(ops) } }\n",
+        )
+        .unwrap();
+        let cfg = as_init_file(tmp.path().to_str().unwrap(), None).expect("C loads it");
+        assert_eq!(cfg.uag[b"ops".as_slice()], [b"op\xff".to_vec()]);
     }
 
     /// Run one `as*` command and return `(outcome, everything it printed)`.
@@ -966,24 +1003,29 @@ mod tests {
 
     /// Run `asDumpHash` and return everything it printed.
     fn run_as_dump_hash(ctx: &CommandContext) -> String {
+        String::from_utf8(run_bytes(ctx, "asDumpHash")).unwrap()
+    }
+
+    /// Run an argument-less command and return the bytes it printed.
+    fn run_bytes(ctx: &CommandContext, name: &str) -> Vec<u8> {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
-        let cmd = reg.get("asDumpHash").unwrap();
+        let cmd = reg.get(name).unwrap();
         let args = parse_args(&[], &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         ctx.with_output(std::fs::File::create(&path).unwrap(), || {
             cmd.handler.call(&args, ctx).unwrap();
         });
-        std::fs::read_to_string(&path).unwrap()
+        std::fs::read(&path).unwrap()
     }
 
     /// Load `acf` through asSetFilename/asInit.
-    fn load_acf(ctx: &CommandContext, acf: &str) -> tempfile::NamedTempFile {
+    fn load_acf(ctx: &CommandContext, acf: impl AsRef<[u8]>) -> tempfile::NamedTempFile {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
-        write!(tmp.as_file(), "{acf}").unwrap();
+        tmp.as_file().write_all(acf.as_ref()).unwrap();
         let set = reg.get("asSetFilename").unwrap();
         let a = parse_args(&[tmp.path().to_string_lossy().into()], &set.args).unwrap();
         set.handler.call(&a, ctx).unwrap();
@@ -991,6 +1033,58 @@ mod tests {
         let a = parse_args(&[], &init.args).unwrap();
         init.handler.call(&a, ctx).unwrap();
         tmp
+    }
+
+    /// C `asInitFile` runs `macExpandString` over the file's bytes
+    /// (asLibRoutines.c:207): substitution must not replace the bytes
+    /// around a macro, nor a value's own.
+    #[test]
+    fn as_init_file_substitutes_without_touching_non_utf8_bytes() {
+        let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
+        tmp.as_file()
+            .write_all(b"UAG(u\xff) { \"$(M)\" }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(u\xff) } }\n")
+            .unwrap();
+        let cfg = as_init_file(tmp.path().to_str().unwrap(), Some("M=\"b\u{e9}\"")).unwrap();
+        assert_eq!(
+            cfg.uag[b"u\xff".as_slice()],
+            vec!["b\u{e9}".as_bytes().to_vec()]
+        );
+    }
+
+    /// C `asDumpFP`, `asDumpHagFP`, `asDumpRulesFP` and `gphDumpFP` print
+    /// names, hosts and links with `%s` (asLibRoutines.c:539-608,
+    /// gpHashLib.c:232): a non-UTF-8 byte reaches the console unreplaced.
+    #[test]
+    fn as_display_commands_print_non_utf8_names_as_bytes() {
+        let _guard = as_state_test_guard();
+        reset_as_state_for_test();
+        let (_db, ctx) = make_ctx();
+        let _tmp = load_acf(
+            &ctx,
+            b"UAG(u\xff) { \"a\xfe\" }\nHAG(h\xff) { \"x\xfd\" }\n\
+              ASG(g\xff) { INPA(\"pv\xfc\") RULE(1, WRITE) { UAG(u\xff) HAG(h\xff) } }\n",
+        );
+        let has = |out: &[u8], needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+        let dump = run_bytes(&ctx, "asdbdump");
+        for needle in [
+            b"UAG(u\xff)".as_slice(),
+            b"HAG(h\xff)",
+            b"ASG(g\xff)",
+            b"\tINPA(\"pv\xfc\")",
+            b"\t\tUAG(u\xff)",
+            b"\t\tHAG(h\xff)",
+        ] {
+            assert!(has(&dump, needle), "{needle:?} in {dump:?}");
+        }
+        let hag = run_bytes(&ctx, "asphag");
+        assert!(has(&hag, b"HAG(h\xff)\n\tx\xfd\n"), "{hag:?}");
+        let rules = run_bytes(&ctx, "asprules");
+        assert!(has(&rules, b"ASG(g\xff)\n\tINPA(\"pv\xfc\")"), "{rules:?}");
+        let car = run_bytes(&ctx, "ascar");
+        assert!(has(&car, b"ASG(g\xff) INPA \"pv\xfc\""), "{car:?}");
+        let hash = run_bytes(&ctx, "asDumpHash");
+        assert!(has(&hash, b"  a\xfe UAG(u\xff)"), "{hash:?}");
+        assert!(has(&hash, b"  x\xfd HAG(h\xff)"), "{hash:?}");
     }
 
     /// Boundary: access security not active. C `asDumpHashFP` is
@@ -1123,7 +1217,7 @@ mod tests {
         let (_db, ctx) = make_ctx();
         let _tmp = load_acf(
             &ctx,
-            &format!(
+            format!(
                 "UAG(g) {{ {} }}\nASG(DEFAULT) {{ RULE(1, WRITE) {{ UAG(g) }} }}\n",
                 names.join(", ")
             ),
@@ -1184,7 +1278,7 @@ mod tests {
         let config = ctx.acf().load();
         let config = config.as_ref().expect("config must be active");
         assert!(
-            config.uag.contains_key("ops"),
+            config.uag.contains_key(b"ops".as_slice()),
             "UAG($(G)) must have expanded to UAG(ops)"
         );
     }

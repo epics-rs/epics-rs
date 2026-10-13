@@ -333,7 +333,7 @@ impl QsrvPvStore {
         host: &str,
     ) -> Option<super::group::GroupChannel> {
         let creds = super::provider::ClientCreds {
-            user: user.to_string(),
+            user: user.to_string().into(),
             host: host.to_string(),
             ..Default::default()
         };
@@ -1213,8 +1213,8 @@ static QSRV2_DECISION: OnceLock<Qsrv2Decision> = OnceLock::new();
 /// [`Qsrv2Decision`].
 fn qsrv2_decision() -> &'static Qsrv2Decision {
     QSRV2_DECISION.get_or_init(|| {
-        let ignore = std::env::var("EPICS_IOC_IGNORE_SERVERS").ok();
-        let enable = std::env::var("PVXS_QSRV_ENABLE").ok();
+        let ignore = epics_base_rs::runtime::env::get_lossy("EPICS_IOC_IGNORE_SERVERS");
+        let enable = epics_base_rs::runtime::env::get_lossy("PVXS_QSRV_ENABLE");
         let decision = resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref());
         if let Some(e) = &decision.error {
             eprintln!("{e}");

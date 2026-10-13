@@ -1562,7 +1562,7 @@ impl GroupChannel {
         let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
-            user: &self.access.creds.user,
+            user: self.access.creds.user.as_bytes(),
             host: &self.access.creds.host,
             peer: &self.access.creds.host,
             dbr_type: value.dbr_type() as u16,
@@ -1616,7 +1616,7 @@ impl GroupChannel {
         let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
-            user: &self.access.creds.user,
+            user: self.access.creds.user.as_bytes(),
             host: &self.access.creds.host,
             peer: &self.access.creds.host,
             dbr_type: value.dbr_type() as u16,
@@ -4632,7 +4632,7 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
+            async fn can_write(&self, channel: &str, _: &[u8], _: &str) -> bool {
                 channel != self.0
             }
         }
@@ -5764,7 +5764,7 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
+            async fn can_write(&self, channel: &str, _user: &[u8], _host: &str) -> bool {
                 channel != self.0
             }
         }
@@ -5848,7 +5848,7 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
+            async fn can_write(&self, channel: &str, _user: &[u8], _host: &str) -> bool {
                 channel != self.0
             }
         }

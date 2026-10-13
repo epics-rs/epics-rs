@@ -1290,7 +1290,7 @@ pub enum AuditResult {
 /// the `Denied` kind.
 fn make_audit_event(
     name: &str,
-    user: &str,
+    user: impl AsRef<[u8]>,
     host: &str,
     result: &Result<(), OpError>,
 ) -> AuditEvent {
@@ -1307,7 +1307,8 @@ fn make_audit_event(
     AuditEvent {
         pv: name.to_string(),
         event: AuditEventKind::Put,
-        user: user.to_string(),
+        // The gateway audit record is Rust-only and text.
+        user: String::from_utf8_lossy(user.as_ref()).into_owned(),
         host: host.to_string(),
         result: kind,
         timestamp: std::time::SystemTime::now(),
@@ -2660,7 +2661,7 @@ mod tests {
             true
         }
         async fn has_pv_checked(&self, _name: &str, ctx: ChannelContext) -> bool {
-            *self.checked_has_pv_account.lock().unwrap() = Some(ctx.creds.account.clone());
+            *self.checked_has_pv_account.lock().unwrap() = Some(ctx.creds.account.to_string());
             true
         }
         async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
@@ -2672,7 +2673,7 @@ mod tests {
             _name: &str,
             ctx: ChannelContext,
         ) -> Option<FieldDesc> {
-            *self.checked_intro_account.lock().unwrap() = Some(ctx.creds.account.clone());
+            *self.checked_intro_account.lock().unwrap() = Some(ctx.creds.account.to_string());
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
         async fn get_value(&self, _name: &str) -> Option<PvField> {

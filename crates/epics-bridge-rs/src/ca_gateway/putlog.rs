@@ -43,7 +43,7 @@
 //! [`PutLogLine::TrapWrite`] writes the C default valueless line,
 //! [`PutLogLine::AllWrites`] writes the value/old/outcome audit line.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the exec-backend
 // suite.
 
 /// Which client writes the put log records. Selected by the write hook
@@ -176,8 +176,8 @@ impl PutLog {
     /// `old_value == NULL` → `acOldVal = "?"` (`gateResources.cc:476-480`).
     pub async fn log(
         &self,
-        user: &str,
-        host: &str,
+        user: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
         pv: &str,
         line: PutLogLine<'_>,
     ) -> BridgeResult<()> {
@@ -187,26 +187,24 @@ impl PutLog {
         // HH:MM:SS, NO year, NO subseconds. Use `Local` (not `Utc`) to
         // mirror `localtime()`.
         let timestamp = Local::now().format("%b %d %H:%M:%S").to_string();
-        let line = match line {
+        // C `fprintf`s the user's bytes (`gateVc.cc:240`), so the record is
+        // assembled as bytes, not text.
+        let mut record = format!("{timestamp} ").into_bytes();
+        record.extend_from_slice(user.as_ref());
+        record.push(b'@');
+        record.extend_from_slice(host.as_ref());
+        let rest = match line {
             // C default build (`#ifndef WITH_CAPUTLOG`, gateVc.cc:240):
             // timestamp, user@host, PV — no value, no old, no token.
-            PutLogLine::TrapWrite => format!("{timestamp} {user}@{host} {pv}"),
+            PutLogLine::TrapWrite => format!(" {pv}"),
             // Opt-in fail-loud audit line: value, cached old=, outcome.
             PutLogLine::AllWrites {
                 value,
                 old,
                 outcome,
-            } => format!(
-                "{} {}@{} {} {} old={} {}",
-                timestamp,
-                user,
-                host,
-                pv,
-                value,
-                old,
-                outcome.as_str()
-            ),
+            } => format!(" {pv} {value} old={old} {}", outcome.as_str()),
         };
+        record.extend_from_slice(rest.as_bytes());
 
         // THE write point. Every record — both line shapes, and any shape
         // added later — is framed here and nowhere else: the escape and the
@@ -214,7 +212,8 @@ impl PutLog {
         // no field can carry the line ending and no future field can be
         // added "raw". `user`, `host`, `pv`, `value` and `old` are all
         // attacker-reachable off the CA wire; see the fn docs.
-        let line = format!("{}\n", epics_base_rs::runtime::log::single_line(&line));
+        let mut line = epics_base_rs::runtime::log::single_line_bytes(&record).into_owned();
+        line.push(b'\n');
 
         let mut guard = self.file.lock().await;
         if guard.is_none() {
@@ -231,7 +230,7 @@ impl PutLog {
         }
 
         if let Some(f) = guard.as_mut() {
-            f.write_all(line.as_bytes()).await?;
+            f.write_all(&line).await?;
             f.flush().await?;
         }
         let mut counter = self.bytes_written.lock().await;
@@ -492,6 +491,22 @@ mod tests {
             "default putlog line must not carry an `old=` field, got {line:?}"
         );
 
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_user_and_host_are_written_byte_for_byte() {
+        let temp =
+            std::env::temp_dir().join(format!("ca_gateway_putlog_u8_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&temp);
+
+        let log = PutLog::new(temp.clone());
+        log.log(b"op\xff", b"ws\xfe", "TEMP", PutLogLine::TrapWrite)
+            .await
+            .unwrap();
+
+        let content = std::fs::read(&temp).unwrap();
+        assert!(content.ends_with(b" op\xff@ws\xfe TEMP\n"), "{content:?}");
         let _ = std::fs::remove_file(&temp);
     }
 

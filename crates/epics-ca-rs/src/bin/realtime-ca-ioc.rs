@@ -1406,7 +1406,9 @@ mod ioc {
             let probe_db = db_for_names.clone();
             let probe_resolver = resolver.clone();
             let probe_server = server.clone();
-            let env = |var| std::env::var(var).unwrap_or_else(|_| "(unset)".to_string());
+            let env = |var| {
+                epics_base_rs::runtime::env::get_lossy(var).unwrap_or_else(|| "(unset)".to_string())
+            };
             println!(
                 "C6 probe: EPICS_CA_NAME_SERVERS={}, EPICS_CA_ADDR_LIST={}, \
                  EPICS_CA_AUTO_ADDR_LIST={}; reporting every 10 s",

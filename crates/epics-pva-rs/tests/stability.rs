@@ -814,8 +814,11 @@ async fn the_clients_ca_credential_arrives_filled_at_the_server() {
         udp_port: 0,
         max_connections: 16,
         auth_complete: Some(Arc::new(move |_peer, cred: &ClientCredentials| {
-            *seen_hook.lock().expect("hook lock") =
-                Some((cred.method.clone(), cred.account.clone(), cred.host.clone()));
+            *seen_hook.lock().expect("hook lock") = Some((
+                cred.method.clone(),
+                cred.account.to_string(),
+                cred.host.clone(),
+            ));
         })),
         ..Default::default()
     };
@@ -1977,7 +1980,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
         max_connections: 16,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
-            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.to_string()));
         })),
         ..Default::default()
     };
@@ -2083,7 +2086,7 @@ async fn r70_anonymous_method_yields_account_anonymous() {
         max_connections: 16,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
-            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.to_string()));
         })),
         ..Default::default()
     };
@@ -2169,7 +2172,7 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
         max_connections: 16,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
-            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.to_string()));
         })),
         ..Default::default()
     };

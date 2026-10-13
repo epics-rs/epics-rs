@@ -934,7 +934,12 @@ pub fn align8(size: usize) -> usize {
 
 /// Build a padded, null-terminated, 8-byte aligned payload from a string
 pub fn pad_string(s: &str) -> Vec<u8> {
-    let mut bytes = s.as_bytes().to_vec();
+    pad_bytes(s.as_bytes())
+}
+
+/// [`pad_string`] for a payload that is bytes, not text.
+pub fn pad_bytes(s: &[u8]) -> Vec<u8> {
+    let mut bytes = s.to_vec();
     bytes.push(0); // null terminator
     let padded_len = align8(bytes.len());
     bytes.resize(padded_len, 0);

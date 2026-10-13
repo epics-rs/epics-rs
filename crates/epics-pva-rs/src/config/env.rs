@@ -1,6 +1,6 @@
 //! Environment-variable parsers for `EPICS_PVA_*` / `EPICS_PVAS_*`.
 //!
-//! Pure functions — they read `std::env::var(...)` directly so the
+//! Pure functions — they read the environment directly so the
 //! caller doesn't need to thread a Config struct. Where pvxs has
 //! Config::fromEnv() that builds an internal config object, we expose
 //! one helper per variable. Server-side helpers fall back to the
@@ -8,55 +8,60 @@
 //! not set, matching pvxs's `Config::server()` behavior.
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
+
+use epics_base_rs::runtime::env;
+use epics_base_rs::runtime::env::get_lossy as getenv;
 
 /// Expand `$(VAR)` and `${VAR}` references in `input` against the
 /// process environment. Mirrors pvxs `Config::expand()` (server.h:219).
 /// Unrecognised refs (no env entry) substitute to an empty string —
 /// matching the C IOC `dbLoadRecords` macro-expansion behaviour. A
 /// literal `$` followed by non-`(`/`{` is preserved verbatim.
-pub fn expand_dollar_vars(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            let close = match chars.peek() {
-                Some('(') => Some(')'),
-                Some('{') => Some('}'),
-                _ => None,
-            };
-            if let Some(end) = close {
-                chars.next(); // consume '(' or '{'
-                let mut name = String::new();
-                let mut closed = false;
-                for nc in chars.by_ref() {
-                    if nc == end {
-                        closed = true;
-                        break;
-                    }
-                    name.push(nc);
+pub fn expand_dollar_vars(input: impl AsRef<OsStr>) -> OsString {
+    // Bytes, as pvxs's `std::string`: a value is `getenv`'s, spliced in
+    // unchecked, and every cut below is at an ASCII byte.
+    let bytes = input.as_ref().as_encoded_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let close = match bytes.get(i + 1) {
+            Some(b'(') if bytes[i] == b'$' => Some(b')'),
+            Some(b'{') if bytes[i] == b'$' => Some(b'}'),
+            _ => None,
+        };
+        let Some(end) = close else {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        };
+        let name = &bytes[i + 2..];
+        match name.iter().position(|&b| b == end) {
+            Some(j) => {
+                // SAFETY: cut from `input`'s encoded bytes at ASCII bytes.
+                let name = unsafe { OsStr::from_encoded_bytes_unchecked(&name[..j]) };
+                // Unset → empty (pvxs Config::expand parity).
+                if let Some(val) = epics_base_rs::runtime::env::get(name) {
+                    out.extend_from_slice(val.as_encoded_bytes());
                 }
-                if closed {
-                    if let Ok(val) = std::env::var(&name) {
-                        out.push_str(&val);
-                    }
-                    // Unset → empty (pvxs Config::expand parity).
-                    continue;
-                }
+                i += 3 + j;
+            }
+            None => {
                 // Unterminated $( … — emit as-is including the open
                 // bracket so the caller's parser can fail loudly
                 // rather than silently consuming text.
-                out.push('$');
-                out.push(if end == ')' { '(' } else { '{' });
-                out.push_str(&name);
-                continue;
+                out.extend_from_slice(&bytes[i..]);
+                i = bytes.len();
             }
         }
-        out.push(c);
     }
-    out
+    // SAFETY: `out` is `input`'s bytes and whole env values, joined at ASCII
+    // bytes.
+    unsafe { OsString::from_encoded_bytes_unchecked(out) }
 }
 
 /// Seed a name→value map of EPICS_PVA / EPICS_PVAS overrides into the
@@ -79,7 +84,7 @@ pub fn expand_dollar_vars(input: &str) -> String {
 pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool) -> usize {
     let mut applied = 0usize;
     for (name, value) in map {
-        let exists = std::env::var(name).is_ok();
+        let exists = std::env::var_os(name).is_some();
         if exists && !replace_existing {
             continue;
         }
@@ -406,7 +411,8 @@ pub fn parse_endpoints_with_port(env: &str, default_port: u16) -> Vec<Endpoint> 
     // `EPICS_PVA_ADDR_LIST="$(IOC_HOST):5076"` (matching the dbLoad
     // macro-expansion convention).
     let env = expand_dollar_vars(env);
-    env.split_whitespace()
+    env.to_string_lossy()
+        .split_whitespace()
         .filter_map(|tok| Endpoint::parse(tok, default_port))
         .collect()
 }
@@ -623,10 +629,7 @@ pub fn parse_port_env(raw: &str) -> Option<u16> {
 /// An unparseable value also falls back to 5076 (pvxs leaves `udp_port` at
 /// its default on a parse error).
 pub fn broadcast_port() -> u16 {
-    match std::env::var("EPICS_PVA_BROADCAST_PORT")
-        .ok()
-        .and_then(|s| parse_port_env(&s))
-    {
+    match getenv("EPICS_PVA_BROADCAST_PORT").and_then(|s| parse_port_env(&s)) {
         Some(0) => {
             tracing::warn!("ignoring EPICS_PVA_BROADCAST_PORT=0; using default 5076");
             5076
@@ -642,9 +645,8 @@ pub fn broadcast_port() -> u16 {
 /// caller-supplied port when the env is silent (pvxs `PickOne`,
 /// `config.cpp:397-437`).
 pub fn server_broadcast_port_opt() -> Option<u16> {
-    std::env::var("EPICS_PVAS_BROADCAST_PORT")
-        .ok()
-        .or_else(|| std::env::var("EPICS_PVA_BROADCAST_PORT").ok())
+    getenv("EPICS_PVAS_BROADCAST_PORT")
+        .or_else(|| getenv("EPICS_PVA_BROADCAST_PORT"))
         .and_then(|s| parse_port_env(&s))
 }
 
@@ -669,9 +671,8 @@ pub fn server_broadcast_port() -> u16 {
 /// (pvxs `split_addr_into` `config.cpp:167-168`), so both the bare token and
 /// `host:0` resolve to `5075`.
 pub fn server_port() -> u16 {
-    let parsed = std::env::var("EPICS_PVA_SERVER_PORT")
-        .ok()
-        .or_else(|| std::env::var("EPICS_PVAS_SERVER_PORT").ok())
+    let parsed = getenv("EPICS_PVA_SERVER_PORT")
+        .or_else(|| getenv("EPICS_PVAS_SERVER_PORT"))
         .and_then(|s| parse_port_env(&s))
         .unwrap_or(5075);
     // pvxs Config::expand(): a zero effective client TCP port → 5075.
@@ -693,9 +694,8 @@ pub fn pvas_server_port() -> u16 {
 /// `EPICS_PVAS_SERVER_PORT` nor `EPICS_PVA_SERVER_PORT` is set, so
 /// `with_env` preserves a caller-supplied `tcp_port`.
 pub fn pvas_server_port_opt() -> Option<u16> {
-    std::env::var("EPICS_PVAS_SERVER_PORT")
-        .ok()
-        .or_else(|| std::env::var("EPICS_PVA_SERVER_PORT").ok())
+    getenv("EPICS_PVAS_SERVER_PORT")
+        .or_else(|| getenv("EPICS_PVA_SERVER_PORT"))
         .and_then(|s| parse_port_env(&s))
 }
 
@@ -712,20 +712,19 @@ pub fn pvas_server_port_opt() -> Option<u16> {
 /// [`crate::server_native::PvaServerConfig::default`], not here, so an absent
 /// variable never overwrites the caller value.
 pub fn pvas_tls_port_opt() -> Option<u16> {
-    std::env::var("EPICS_PVAS_TLS_PORT")
-        .ok()
-        .or_else(|| std::env::var("EPICS_PVA_TLS_PORT").ok())
+    getenv("EPICS_PVAS_TLS_PORT")
+        .or_else(|| getenv("EPICS_PVA_TLS_PORT"))
         .and_then(|s| parse_port_env(&s))
 }
 
 /// `EPICS_PVA_AUTO_ADDR_LIST` — default YES. When truthy, the search
 /// engine adds per-NIC broadcast addresses to the SEARCH targets list.
 pub fn auto_addr_list_enabled() -> bool {
-    match std::env::var("EPICS_PVA_AUTO_ADDR_LIST") {
+    match getenv("EPICS_PVA_AUTO_ADDR_LIST") {
         // Present-but-invalid preserves the default (`true`), matching
         // pvxs which leaves `autoAddrList` untouched on a bad value.
-        Ok(v) => parse_bool("EPICS_PVA_AUTO_ADDR_LIST", &v).unwrap_or(true),
-        Err(_) => true,
+        Some(v) => parse_bool("EPICS_PVA_AUTO_ADDR_LIST", &v).unwrap_or(true),
+        None => true,
     }
 }
 
@@ -751,12 +750,9 @@ pub fn auto_beacon_addr_list_enabled_opt() -> Option<bool> {
     // preserves the caller-supplied `auto_beacon` (matching pvxs's
     // leave-destination-unchanged-on-invalid contract), instead of the
     // old `false` collapse.
-    let (name, raw) = std::env::var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST")
+    let (name, raw) = getenv("EPICS_PVAS_AUTO_BEACON_ADDR_LIST")
         .map(|v| ("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", v))
-        .or_else(|_| {
-            std::env::var("EPICS_PVA_AUTO_ADDR_LIST").map(|v| ("EPICS_PVA_AUTO_ADDR_LIST", v))
-        })
-        .ok()?;
+        .or_else(|| getenv("EPICS_PVA_AUTO_ADDR_LIST").map(|v| ("EPICS_PVA_AUTO_ADDR_LIST", v)))?;
     parse_bool(name, &raw)
 }
 
@@ -778,8 +774,7 @@ pub fn beacon_period() -> Duration {
 /// is unset (or rejected as non-positive/non-finite), so `with_env`
 /// preserves a caller-supplied `beacon_period`.
 pub fn beacon_period_opt() -> Option<Duration> {
-    std::env::var("EPICS_PVAS_BEACON_PERIOD")
-        .ok()
+    getenv("EPICS_PVAS_BEACON_PERIOD")
         // Negatives, zero, NaN, infinity, and out-of-range values are
         // rejected by the shared resolver, so the conversion cannot panic.
         .and_then(|s| parse_timeout_env("EPICS_PVAS_BEACON_PERIOD", &s))
@@ -792,8 +787,7 @@ pub fn beacon_period_opt() -> Option<Duration> {
 /// Sub-second precision preserved via [`Duration::from_secs_f64`] with a
 /// post-conversion 100ms floor, same as [`beacon_period`].
 pub fn beacon_period_long() -> Option<Duration> {
-    std::env::var("EPICS_PVAS_BEACON_PERIOD_LONG")
-        .ok()
+    getenv("EPICS_PVAS_BEACON_PERIOD_LONG")
         .and_then(|s| parse_timeout_env("EPICS_PVAS_BEACON_PERIOD_LONG", &s))
         .map(Duration::from_secs_f64)
         .map(|d| d.max(Duration::from_millis(100)))
@@ -809,8 +803,7 @@ pub fn max_connections() -> usize {
 /// Presence-aware [`max_connections`] — `None` when
 /// `EPICS_PVAS_MAX_CONNECTIONS` is unset or non-positive.
 pub fn max_connections_opt() -> Option<usize> {
-    std::env::var("EPICS_PVAS_MAX_CONNECTIONS")
-        .ok()
+    getenv("EPICS_PVAS_MAX_CONNECTIONS")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
 }
@@ -837,9 +830,7 @@ pub fn conn_timeout_secs() -> f64 {
 /// `enforceTimeout`), not to this parser, so the raw positive-finite
 /// double is returned unscaled.
 pub fn conn_timeout_secs_opt() -> Option<f64> {
-    std::env::var("EPICS_PVA_CONN_TMO")
-        .ok()
-        .and_then(|s| parse_timeout_env("EPICS_PVA_CONN_TMO", &s))
+    getenv("EPICS_PVA_CONN_TMO").and_then(|s| parse_timeout_env("EPICS_PVA_CONN_TMO", &s))
 }
 
 /// `EPICS_PVAS_SEND_TMO` — server-side per-write timeout (default 5s).
@@ -853,8 +844,7 @@ pub fn send_timeout_secs() -> f64 {
 /// Presence-aware [`send_timeout_secs`] — `None` when `EPICS_PVAS_SEND_TMO`
 /// is unset (or non-positive/non-finite).
 pub fn send_timeout_secs_opt() -> Option<f64> {
-    std::env::var("EPICS_PVAS_SEND_TMO")
-        .ok()
+    getenv("EPICS_PVAS_SEND_TMO")
         .and_then(|s| parse_timeout_env("EPICS_PVAS_SEND_TMO", &s))
         .map(|v| v.max(0.1))
 }
@@ -872,8 +862,7 @@ pub fn tls_handshake_timeout_secs() -> f64 {
 /// Presence-aware [`tls_handshake_timeout_secs`] — `None` when
 /// `EPICS_PVAS_TLS_HANDSHAKE_TMO` is unset (or non-positive/non-finite).
 pub fn tls_handshake_timeout_secs_opt() -> Option<f64> {
-    std::env::var("EPICS_PVAS_TLS_HANDSHAKE_TMO")
-        .ok()
+    getenv("EPICS_PVAS_TLS_HANDSHAKE_TMO")
         .and_then(|s| parse_timeout_env("EPICS_PVAS_TLS_HANDSHAKE_TMO", &s))
         .map(|v| v.max(1.0))
 }
@@ -893,11 +882,10 @@ pub fn tls_handshake_timeout_secs_opt() -> Option<f64> {
 /// indirections. Returns `None` when neither variable is set; an empty
 /// string is preserved as `Some("")` (a deliberately password-less
 /// PKCS#12 is distinct from "unset").
-pub fn server_tls_keychain_password() -> Option<String> {
-    std::env::var("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD")
-        .or_else(|_| std::env::var("EPICS_PVA_TLS_KEYCHAIN_PASSWORD"))
-        .ok()
-        .map(|s| expand_dollar_vars(&s))
+pub fn server_tls_keychain_password() -> Option<OsString> {
+    env::get("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD")
+        .or_else(|| env::get("EPICS_PVA_TLS_KEYCHAIN_PASSWORD"))
+        .map(expand_dollar_vars)
 }
 
 /// Keychain path for a server-side TLS endpoint.
@@ -912,11 +900,10 @@ pub fn server_tls_keychain_password() -> Option<String> {
 /// `EPICS_PVA_TLS_KEYCHAIN`-only (pvxs `config.cpp:654`, `tls` `b3a10bf0`).
 /// `$(VAR)` / `${VAR}` refs are expanded (PVA-466 parity). Returns `None`
 /// when neither variable is set.
-pub fn server_tls_keychain() -> Option<String> {
-    std::env::var("EPICS_PVAS_TLS_KEYCHAIN")
-        .or_else(|_| std::env::var("EPICS_PVA_TLS_KEYCHAIN"))
-        .ok()
-        .map(|s| expand_dollar_vars(&s))
+pub fn server_tls_keychain() -> Option<OsString> {
+    env::get("EPICS_PVAS_TLS_KEYCHAIN")
+        .or_else(|| env::get("EPICS_PVA_TLS_KEYCHAIN"))
+        .map(expand_dollar_vars)
 }
 
 /// TLS option string for a server-side endpoint.
@@ -933,8 +920,8 @@ pub fn server_tls_keychain() -> Option<String> {
 /// option tokens like `client_cert=require`, not a path). Empty when neither
 /// set.
 pub fn server_tls_options() -> String {
-    std::env::var("EPICS_PVAS_TLS_OPTIONS")
-        .or_else(|_| std::env::var("EPICS_PVA_TLS_OPTIONS"))
+    getenv("EPICS_PVAS_TLS_OPTIONS")
+        .or_else(|| getenv("EPICS_PVA_TLS_OPTIONS"))
         .unwrap_or_default()
 }
 
@@ -976,10 +963,8 @@ pub fn server_tls_disable_plaintext_opt() -> Option<bool> {
 /// ONLY when the keychain spec carries no inline `;` suffix. Reads
 /// `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`; `$(VAR)` / `${VAR}` refs are
 /// expanded. Returns `None` when unset.
-pub fn client_tls_keychain_password() -> Option<String> {
-    std::env::var("EPICS_PVA_TLS_KEYCHAIN_PASSWORD")
-        .ok()
-        .map(|s| expand_dollar_vars(&s))
+pub fn client_tls_keychain_password() -> Option<OsString> {
+    env::get("EPICS_PVA_TLS_KEYCHAIN_PASSWORD").map(expand_dollar_vars)
 }
 
 /// Split a TLS keychain spec into `(path, inline_password)` the way pvxs
@@ -1000,18 +985,28 @@ pub fn client_tls_keychain_password() -> Option<String> {
 /// `None` (no inline password — the caller may then consult the non-pvxs
 /// `*_TLS_KEYCHAIN_PASSWORD` fallback). The inline suffix is the pvxs
 /// source of truth and takes precedence at the call sites.
-pub fn split_keychain_spec(spec: &str) -> (String, Option<String>) {
-    match spec.split_once(';') {
-        Some((path, password)) => (path.to_string(), Some(password.to_string())),
-        None => (spec.to_string(), None),
+pub fn split_keychain_spec(spec: impl AsRef<OsStr>) -> (PathBuf, Option<OsString>) {
+    let spec = spec.as_ref();
+    let bytes = spec.as_encoded_bytes();
+    match bytes.iter().position(|&b| b == b';') {
+        Some(i) => {
+            // SAFETY: both halves are cut from `spec` at an ASCII `;`.
+            let (path, password) = unsafe {
+                (
+                    OsStr::from_encoded_bytes_unchecked(&bytes[..i]),
+                    OsStr::from_encoded_bytes_unchecked(&bytes[i + 1..]),
+                )
+            };
+            (path.into(), Some(password.to_owned()))
+        }
+        None => (spec.into(), None),
     }
 }
 
 /// Parse `EPICS_PVA_NAME_SERVERS` into TCP socket addresses. Default
 /// port 5075. Empty when the variable is unset.
 pub fn name_servers() -> Vec<SocketAddr> {
-    std::env::var("EPICS_PVA_NAME_SERVERS")
-        .ok()
+    getenv("EPICS_PVA_NAME_SERVERS")
         .map(|s| parse_addr_list_with_port(&s, server_port()))
         .unwrap_or_default()
 }
@@ -1019,8 +1014,7 @@ pub fn name_servers() -> Vec<SocketAddr> {
 /// Parse `EPICS_PVA_ADDR_LIST` (or empty) — client-side unicast
 /// SEARCH targets. Each entry pinned to `EPICS_PVA_BROADCAST_PORT`.
 pub fn server_addr_list() -> Vec<SocketAddr> {
-    std::env::var("EPICS_PVA_ADDR_LIST")
-        .ok()
+    getenv("EPICS_PVA_ADDR_LIST")
         .map(|s| parse_addr_list_with_port(&s, broadcast_port()))
         .unwrap_or_default()
 }
@@ -1057,6 +1051,7 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 pub fn resolve_intf_addr_list(value: &str, default_port: u16) -> Vec<SocketAddr> {
     // PVA-466: expand $(VAR) / ${VAR} refs before tokenising.
     let value = expand_dollar_vars(value);
+    let value = value.to_string_lossy();
     let mut printed: Vec<(String, SocketAddr, SocketAddr)> = Vec::new();
     for token in value.split_whitespace() {
         match Endpoint::parse(token, 0) {
@@ -1123,7 +1118,7 @@ pub(crate) fn sock_addr_text(addr: SocketAddr) -> String {
 /// (IPv4-preferred) and `$(VAR)` / `${VAR}` refs expand; see
 /// `resolve_intf_addr_list`.
 pub fn list_intf_addresses() -> Vec<IpAddr> {
-    let addrs = std::env::var("EPICS_PVA_INTF_ADDR_LIST")
+    let addrs = getenv("EPICS_PVA_INTF_ADDR_LIST")
         .map(|s| resolve_intf_addr_list(&s, 0))
         .unwrap_or_default();
     let mut out: Vec<IpAddr> = Vec::new();
@@ -1139,8 +1134,8 @@ pub fn list_intf_addresses() -> Vec<IpAddr> {
 /// `EPICS_PVAS_INTF_ADDR_LIST` is unset, so `with_env` preserves a
 /// caller-supplied `interfaces`.
 pub fn server_intf_addr_list_opt() -> Option<Vec<SocketAddr>> {
-    std::env::var("EPICS_PVAS_INTF_ADDR_LIST")
-        .is_ok()
+    getenv("EPICS_PVAS_INTF_ADDR_LIST")
+        .is_some()
         .then(server_intf_addr_list)
 }
 
@@ -1155,7 +1150,7 @@ pub fn server_intf_addr_list() -> Vec<SocketAddr> {
     // [`resolve_intf_addr_list`]. A DNS NIC name (`ioc-public-nic`) must
     // resolve to its IPv4 address, not be dropped, so the server binds the
     // named interface instead of falling back to wildcard.
-    std::env::var("EPICS_PVAS_INTF_ADDR_LIST")
+    getenv("EPICS_PVAS_INTF_ADDR_LIST")
         .map(|s| resolve_intf_addr_list(&s, pvas_server_port()))
         .unwrap_or_default()
 }
@@ -1181,7 +1176,7 @@ pub fn server_intf_addr_list() -> Vec<SocketAddr> {
 ///   requested restriction is empty; fail loudly instead of binding all
 ///   interfaces.
 pub fn server_intf_addr_list_checked() -> Result<Option<Vec<SocketAddr>>, String> {
-    let Ok(raw) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") else {
+    let Some(raw) = getenv("EPICS_PVAS_INTF_ADDR_LIST") else {
         return Ok(None);
     };
     // The server reads `EPICS_PVAS_SERVER_PORT` before the interface list
@@ -1201,7 +1196,11 @@ pub fn resolve_server_intf_addr_list(
     // `resolve_intf_addr_list` expands `$(VAR)` internally; expand here too
     // so the "did the operator name any interface" test sees the same text
     // (an env-ref that expands to nothing counts as unset → wildcard).
-    let had_token = expand_dollar_vars(raw).split_whitespace().next().is_some();
+    let had_token = expand_dollar_vars(raw)
+        .to_string_lossy()
+        .split_whitespace()
+        .next()
+        .is_some();
     if !had_token {
         return Ok(None);
     }
@@ -1229,8 +1228,8 @@ pub fn resolve_server_intf_addr_list(
 /// `EPICS_PVAS_IGNORE_ADDR_LIST` is unset, so `with_env` preserves a
 /// caller-supplied `ignore_addrs`.
 pub fn server_ignore_addr_list_opt() -> Option<Vec<(IpAddr, u16)>> {
-    std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST")
-        .is_ok()
+    getenv("EPICS_PVAS_IGNORE_ADDR_LIST")
+        .is_some()
         .then(server_ignore_addr_list)
 }
 
@@ -1252,10 +1251,14 @@ pub fn server_ignore_addr_list_opt() -> Option<Vec<(IpAddr, u16)>> {
 /// Like INTF this is the **all**-bad gate (not pvxs's per-token **any**-bad
 /// throw); the partial-list leniency is the documented shared residual.
 pub fn server_ignore_addr_list_checked() -> Result<Option<Vec<(IpAddr, u16)>>, String> {
-    let Ok(raw) = std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST") else {
+    let Some(raw) = getenv("EPICS_PVAS_IGNORE_ADDR_LIST") else {
         return Ok(None);
     };
-    let had_token = expand_dollar_vars(&raw).split_whitespace().next().is_some();
+    let had_token = expand_dollar_vars(&raw)
+        .to_string_lossy()
+        .split_whitespace()
+        .next()
+        .is_some();
     if !had_token {
         return Ok(None);
     }
@@ -1273,11 +1276,12 @@ pub fn server_ignore_addr_list_checked() -> Result<Option<Vec<(IpAddr, u16)>>, S
 }
 
 pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
-    let Ok(raw) = std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST") else {
+    let Some(raw) = getenv("EPICS_PVAS_IGNORE_ADDR_LIST") else {
         return Vec::new();
     };
     // PVA-466: expand $(VAR) refs before tokenising.
     let raw = expand_dollar_vars(&raw);
+    let raw = raw.to_string_lossy();
     // Whitespace-only split (pvxs `split_addr_into`, config.cpp:151-183):
     // the comma is endpoint syntax, not a list separator.
     raw.split_whitespace()
@@ -1366,9 +1370,8 @@ pub fn server_beacon_addr_list_opt() -> Option<Vec<SocketAddr>> {
 /// (`evhelper.cpp:556-592`). Same env source + fallback
 /// (`EPICS_PVAS_BEACON_ADDR_LIST` → `EPICS_PVA_ADDR_LIST`, `config.cpp:426-432`).
 pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
-    std::env::var("EPICS_PVAS_BEACON_ADDR_LIST")
-        .ok()
-        .or_else(|| std::env::var("EPICS_PVA_ADDR_LIST").ok())
+    getenv("EPICS_PVAS_BEACON_ADDR_LIST")
+        .or_else(|| getenv("EPICS_PVA_ADDR_LIST"))
         .map(|s| parse_endpoints_with_port(&s, server_broadcast_port()))
 }
 
@@ -1618,8 +1621,7 @@ impl Config {
     /// [`Self::expand`] before use.
     pub fn from_client_env() -> Self {
         let udp_port = broadcast_port();
-        let address_list = std::env::var("EPICS_PVA_ADDR_LIST")
-            .ok()
+        let address_list = getenv("EPICS_PVA_ADDR_LIST")
             .map(|s| parse_endpoints_with_port(&s, udp_port))
             .unwrap_or_default();
         Self {
@@ -2617,6 +2619,35 @@ mod tests {
         }
     }
 
+    /// pvxs `pickone` takes the first variable `getenv` returns, bytes and
+    /// all: a PVAS value that is not UTF-8 still wins over the PVA one.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(epics_env)]
+    fn server_tls_options_takes_a_pvas_value_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let prev_pvas = std::env::var_os("EPICS_PVAS_TLS_OPTIONS");
+        let prev_pva = std::env::var_os("EPICS_PVA_TLS_OPTIONS");
+        unsafe {
+            std::env::set_var(
+                "EPICS_PVAS_TLS_OPTIONS",
+                std::ffi::OsStr::from_bytes(b"client_cert=require \xff"),
+            );
+            std::env::set_var("EPICS_PVA_TLS_OPTIONS", "client_cert=optional");
+        }
+        assert_eq!(server_tls_options(), "client_cert=require \u{FFFD}");
+        unsafe {
+            match prev_pvas {
+                Some(v) => std::env::set_var("EPICS_PVAS_TLS_OPTIONS", v),
+                None => std::env::remove_var("EPICS_PVAS_TLS_OPTIONS"),
+            }
+            match prev_pva {
+                Some(v) => std::env::set_var("EPICS_PVA_TLS_OPTIONS", v),
+                None => std::env::remove_var("EPICS_PVA_TLS_OPTIONS"),
+            }
+        }
+    }
+
     /// `disable_plaintext` is parsed out of the server TLS options the way
     /// `parseTLSOptions` does (config.cpp:453-460 on the fork branch
     /// `fork/fix/tls-peer-identity-and-downgrade` `6547f25`): `true` /
@@ -2677,11 +2708,17 @@ mod tests {
             std::env::set_var("EPICS_PVAS_TLS_KEYCHAIN", "/srv/server.p12");
             std::env::set_var("EPICS_PVA_TLS_KEYCHAIN", "/cli/client.p12");
         }
-        assert_eq!(server_tls_keychain().as_deref(), Some("/srv/server.p12"));
+        assert_eq!(
+            server_tls_keychain().as_deref(),
+            Some(OsStr::new("/srv/server.p12"))
+        );
         unsafe {
             std::env::remove_var("EPICS_PVAS_TLS_KEYCHAIN");
         }
-        assert_eq!(server_tls_keychain().as_deref(), Some("/cli/client.p12"));
+        assert_eq!(
+            server_tls_keychain().as_deref(),
+            Some(OsStr::new("/cli/client.p12"))
+        );
         unsafe {
             std::env::remove_var("EPICS_PVA_TLS_KEYCHAIN");
         }
@@ -2704,32 +2741,59 @@ mod tests {
     /// trailing `;` → explicit empty password. One case per boundary.
     #[test]
     fn split_keychain_spec_matches_pvxs_first_semicolon() {
+        fn split_text(spec: &str) -> (String, Option<String>) {
+            let (path, password) = split_keychain_spec(spec);
+            (
+                path.into_os_string().into_string().unwrap(),
+                password.map(|p| p.into_string().unwrap()),
+            )
+        }
         // No `;`: whole spec is the path, no inline password.
-        assert_eq!(
-            split_keychain_spec("cert.p12"),
-            ("cert.p12".to_string(), None)
-        );
+        assert_eq!(split_text("cert.p12"), ("cert.p12".to_string(), None));
         // `;secret`: path + non-empty password.
         assert_eq!(
-            split_keychain_spec("cert.p12;secret"),
+            split_text("cert.p12;secret"),
             ("cert.p12".to_string(), Some("secret".to_string()))
         );
         // Trailing `;`: explicit empty password (distinct from None).
         assert_eq!(
-            split_keychain_spec("cert.p12;"),
+            split_text("cert.p12;"),
             ("cert.p12".to_string(), Some(String::new()))
         );
         // Multiple `;`: split at the FIRST only; the rest is the password
         // verbatim (pvxs find_first_of + substr(sep+1)).
         assert_eq!(
-            split_keychain_spec("cert.p12;a;b"),
+            split_text("cert.p12;a;b"),
             ("cert.p12".to_string(), Some("a;b".to_string()))
         );
         // Leading `;`: empty path, password is the remainder (pvxs would
         // then fail to open the empty path — we preserve the same split).
         assert_eq!(
-            split_keychain_spec(";onlypw"),
+            split_text(";onlypw"),
             (String::new(), Some("onlypw".to_string()))
+        );
+    }
+
+    /// The keychain spec is `getenv`'s bytes: a non-UTF-8 path and password
+    /// reach the loader unchanged, `$(VAR)` values included.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn a_non_utf8_keychain_spec_keeps_its_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let key = "EPICS_RS_TEST_KEYCHAIN_DIR";
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, OsStr::from_bytes(b"/d\xff")) };
+        let spec = expand_dollar_vars(OsStr::from_bytes(
+            b"$(EPICS_RS_TEST_KEYCHAIN_DIR)/k\xfe.p12;p\xfdw",
+        ));
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+        let (path, password) = split_keychain_spec(&spec);
+        assert_eq!(path.as_os_str().as_bytes(), b"/d\xff/k\xfe.p12");
+        assert_eq!(
+            password.as_deref().map(OsStr::as_bytes),
+            Some(&b"p\xfdw"[..])
         );
     }
 

@@ -1,19 +1,27 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::cli::{
-    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_time, format_value,
-    format_value_segment, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    CountPrefix, ValueFormat, ca_error_marker, format_time, format_value, format_value_segment,
+    name_column, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::copt::{self, CTool};
 use epics_ca_rs::{CaError, CaOp, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
-/// One `Old : ...` / `New : ...` line in long-mode shape:
+/// `printf("%s\n", line)` with a name column that is the name's bytes.
+fn print_line(line: &[u8]) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(line);
+    let _ = out.write_all(b"\n");
+}
+
+/// One `Old : ...` / `New : ...` line in long-mode shape, after the name:
 ///   `{name-padded}<sep><ts>{sep}<value>{sep}{stat?}{sep}{sevr?}`
 /// Mirrors `tool_lib.c::print_time_val_sts` — when alarm is
 /// (NO_ALARM, NO_ALARM) the trailing two fields are emitted empty.
-fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> String {
+fn long_line(sep: char, snap: &Snapshot, fmt: &ValueFormat) -> String {
     let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
     // C `caput.c:535,583` calls its `caget()` with `reqElems = 0`, so the
     // count prefix reduces to `nElems > 1` and the `-S` long-string gate to
@@ -34,10 +42,10 @@ fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> S
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
     if stat == 0 && sevr == 0 {
-        format!("{name_col}{sep}{ts}{val}{sep}{sep}")
+        format!("{sep}{ts}{val}{sep}{sep}")
     } else {
         format!(
-            "{name_col}{sep}{ts}{val}{sep}{stat_str}{sep}{sevr_str}",
+            "{sep}{ts}{val}{sep}{stat_str}{sep}{sevr_str}",
             stat_str = stat_to_str(stat),
             sevr_str = sevr_to_str(sevr),
         )
@@ -86,38 +94,39 @@ fn readback_stderr(rb: &Readback) -> Option<&'static str> {
 /// exit status (`caput.c:583,589`).
 fn readback_line(
     rb: &Readback,
-    name_col: &str,
+    name_col: &[u8],
     sep: char,
     fmt: &ValueFormat,
     terse: bool,
     long_mode: bool,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
+    let named = |rest: String| [name_col, rest.as_bytes()].concat();
     match rb {
         // C treats a timed-out read exactly like a successful one here: the
         // zeroed buffer is still a buffer (see `zero_readback`).
         Readback::Value(v, snap) | Readback::TimedOut(v, snap) => {
             let rendered = format_value(v, fmt, None, CountPrefix::IfRequestedOrArray);
             if terse {
-                return Some(rendered);
+                return Some(rendered.into_bytes());
             }
-            Some(match (long_mode, snap) {
-                (true, Some(s)) => long_line(name_col, sep, s, fmt),
-                (true, None) => format!("{name_col}{sep}*{sep}{rendered}{sep}{sep}"),
-                (false, _) => format!("{name_col}{sep}{rendered}"),
-            })
+            Some(named(match (long_mode, snap) {
+                (true, Some(s)) => long_line(sep, s, fmt),
+                (true, None) => format!("{sep}*{sep}{rendered}{sep}{sep}"),
+                (false, _) => format!("{sep}{rendered}"),
+            }))
         }
         Readback::Disconnected => None,
         Readback::Other(e) => {
             let marker = ca_error_marker(e.to_eca_status(CaOp::Read));
             Some(if terse {
-                marker
+                marker.into_bytes()
             } else if long_mode {
-                format!(
-                    "{name_col}{sep}{ts} {marker}",
+                named(format!(
+                    "{sep}{ts} {marker}",
                     ts = format_client_timestamp()
-                )
+                ))
             } else {
-                format!("{name_col}{sep}{marker}")
+                named(format!("{sep}{marker}"))
             })
         }
     }
@@ -298,7 +307,7 @@ struct Args {
 
     /// Positional PV name. NOT clap-`required` — see `caget-rs`; C checks
     /// `nPvs < 1` after the getopt loop (`caput.c:457-461`).
-    pv_name: Option<String>,
+    pv_name: Option<std::ffi::OsString>,
 
     /// Positional values. In `-a` mode the first element is the
     /// count, the rest are the values. Negative numeric values are
@@ -378,7 +387,7 @@ async fn main() {
 
     // C `caput.c:374-381`: PV name first, then value — both are post-getopt
     // checks with C's own one-line diagnostic and status 1.
-    let Some(pv_name) = args.pv_name else {
+    let Some(pv_name) = args.pv_name.map(epics_ca_rs::cli::pv_name_arg) else {
         TOOL.no_pv_name();
     };
 
@@ -395,10 +404,7 @@ async fn main() {
     let names = [pv_name.clone()];
     let ch = match epics_ca_rs::cli::connect_pvs(&client, &names, priority, timeout).await {
         Ok(mut channels) => channels.remove(0),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
+        Err(e) => e.exit(),
     };
 
     // The channel's native field type drives how the value to WRITE is
@@ -485,11 +491,7 @@ async fn main() {
     // C pads the PV-name column on the READ element count (`pvs[n].reqElems <=
     // 1 && fieldSeparator == ' '`, caput.c:196-198), which caput knows before
     // the put — it never depends on the value that comes back.
-    let name_col = if read_elems <= 1 && sep == ' ' {
-        format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
-    } else {
-        pv_name.clone()
-    };
+    let name_col = name_column(pv_name.as_bytes(), read_elems <= 1 && sep == ' ');
 
     // C caput.c:532-535 gates the pre-put "Old :" read+print on
     // `if (format != terse)`. Terse mode prints only the new value, so the
@@ -550,7 +552,7 @@ async fn main() {
             eprintln!("{warning}");
         }
         match readback_line(&rb, &name_col, sep, &fmt, false, long_mode) {
-            Some(line) => println!("{line}"),
+            Some(line) => print_line(&line),
             // C printed the `Old : ` prefix and nothing else — not even a
             // newline. Flush it so the put's stderr diagnostic does not race a
             // buffered partial line.
@@ -625,7 +627,7 @@ async fn main() {
         eprintln!("{warning}");
     }
     match readback_line(&rb, &name_col, sep, &fmt, terse, long_mode) {
-        Some(line) => println!("{line}"),
+        Some(line) => print_line(&line),
         // `!nConn`: C's `caget()` returns 1 from `caput.c:181` BEFORE its
         // print loop, so it emits NOTHING for this PV — no stdout line (not
         // even a newline after the `New : ` prefix) and no stderr
@@ -1141,7 +1143,7 @@ mod tests {
         let a = Args::try_parse_from(["caput", "-#", "3", "PV", "42"])
             .expect("C's getopt accepts -# (caput.c:290); clap must too");
         assert_eq!(a.max_elements, vals(&["3"]));
-        assert_eq!(a.pv_name.as_deref(), Some("PV"));
+        assert_eq!(a.pv_name.as_deref(), Some(std::ffi::OsStr::new("PV")));
         assert_eq!(a.values, vals(&["42"]));
         // The count that reaches the wire comes from the values, never from
         // `-#` — C overwrites it at caput.c:441. The scan is still performed
@@ -1307,7 +1309,7 @@ mod tests {
         assert_eq!(readback_stderr(&Readback::Disconnected), None);
         for (terse, long_mode) in [(false, false), (true, false), (false, true)] {
             assert_eq!(
-                readback_line(&Readback::Disconnected, "PV", ' ', &fmt, terse, long_mode),
+                readback_line(&Readback::Disconnected, b"PV", ' ', &fmt, terse, long_mode),
                 None,
                 "C never reaches its print loop (terse={terse}, long={long_mode})"
             );
@@ -1323,9 +1325,9 @@ mod tests {
         // STDOUT, via the marker, and still says nothing on stderr.
         let other = Readback::Other(CaError::ServerError(epics_ca_rs::protocol::ECA_NORDACCESS));
         assert_eq!(readback_stderr(&other), None);
-        let line = readback_line(&other, "PV", ' ', &fmt, true, false)
+        let line = readback_line(&other, b"PV", ' ', &fmt, true, false)
             .expect("a CA error still reaches C's print loop");
-        assert_eq!(line, "*** no read access");
+        assert_eq!(line, b"*** no read access");
 
         // A good readback is silent on stderr too.
         assert_eq!(

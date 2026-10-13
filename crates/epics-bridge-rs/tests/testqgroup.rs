@@ -846,7 +846,7 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     struct DenySpecific(String);
     #[async_trait::async_trait]
     impl AccessControl for DenySpecific {
-        async fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
+        async fn can_write(&self, channel: &str, _: &[u8], _: &str) -> bool {
             channel != self.0
         }
     }

@@ -2962,19 +2962,31 @@ mod tests {
 /// Applying it to already-escaped output is a no-op, because a correct
 /// encoder has already removed every raw control byte.
 pub fn single_line(record: &str) -> std::borrow::Cow<'_, str> {
-    fn must_escape(c: char) -> bool {
-        (c as u32) < 0x20 || c as u32 == 0x7F
+    match single_line_bytes(record.as_bytes()) {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(record),
+        // Only ASCII bytes are replaced, by ASCII, so the UTF-8 survives.
+        std::borrow::Cow::Owned(out) => {
+            std::borrow::Cow::Owned(String::from_utf8(out).expect("ASCII-for-ASCII escape"))
+        }
     }
-    if !record.contains(must_escape) {
+}
+
+/// [`single_line`] over bytes, for records that carry a client's bytes
+/// undecoded (a CA user name). Bytes `>= 0x80` pass through.
+pub fn single_line_bytes(record: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    fn must_escape(b: u8) -> bool {
+        b < 0x20 || b == 0x7F
+    }
+    if !record.iter().copied().any(must_escape) {
         return std::borrow::Cow::Borrowed(record);
     }
-    let mut out = String::with_capacity(record.len() + 8);
-    for c in record.chars() {
-        if must_escape(c) {
-            use std::fmt::Write;
-            let _ = write!(out, "\\x{:02x}", c as u32);
+    let mut out = Vec::with_capacity(record.len() + 8);
+    for &b in record {
+        if must_escape(b) {
+            use std::io::Write;
+            let _ = write!(out, "\\x{b:02x}");
         } else {
-            out.push(c);
+            out.push(b);
         }
     }
     std::borrow::Cow::Owned(out)

@@ -58,7 +58,7 @@ async fn many_concurrent_channels_connect() {
 
     // Open all 10 stress PVs concurrently.
     let channels: Vec<_> = (0..10)
-        .map(|i| client.create_channel(&format!("S:{i}")))
+        .map(|i| client.create_channel(format!("S:{i}")))
         .collect();
 
     // Wait for every one to connect.

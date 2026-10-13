@@ -1443,7 +1443,7 @@ impl ChannelSource for PvDatabaseSource {
             let peer = ctx.peer.to_string();
             let meta = acs::TrapWriteMeta {
                 pv_name: &name,
-                user: &ctx.creds.account,
+                user: ctx.creds.account.as_bytes(),
                 host: &ctx.creds.host,
                 peer: &peer,
                 dbr_type,
@@ -2513,7 +2513,7 @@ mod tests {
         ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
             creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
-                account: account.to_string(),
+                account: account.into(),
                 method: method.to_string(),
                 host: host.to_string(),
                 authority: String::new(),
@@ -5779,7 +5779,7 @@ ASG(AUDIT) {
 
         // Filter by PV so the assertion holds even under a single-process
         // `cargo test` where another test's put shares the registry.
-        type Seen = Arc<Mutex<Vec<(TrapWriteOp, Option<String>, String, String, u32)>>>;
+        type Seen = Arc<Mutex<Vec<(TrapWriteOp, Option<String>, Vec<u8>, String, u32)>>>;
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
@@ -5787,7 +5787,7 @@ ASG(AUDIT) {
                 sink.lock().unwrap().push((
                     msg.op,
                     msg.status.map(str::to_string),
-                    msg.user.to_string(),
+                    msg.user.to_vec(),
                     msg.value_str.to_string(),
                     msg.no_elements,
                 ));
@@ -5809,7 +5809,7 @@ ASG(AUDIT) {
         assert_eq!(got[0].1, None, "BeforeWrite carries no status");
         assert_eq!(got[1].0, TrapWriteOp::AfterWrite);
         assert_eq!(got[1].1, Some("ok".to_string()), "successful put -> ok");
-        assert_eq!(got[0].2, "op", "the authenticated account is logged");
+        assert_eq!(got[0].2, b"op", "the authenticated account is logged");
         assert_eq!(got[0].4, 1, "scalar put -> no_elements = 1");
         assert!(
             got[0].3.contains("7.5"),

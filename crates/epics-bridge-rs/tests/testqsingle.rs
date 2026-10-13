@@ -1026,8 +1026,8 @@ use epics_bridge_rs::qsrv::{AccessContext, AccessControl, ClientCreds, WriteGran
 struct CapturedTrap {
     op: TrapWriteOp,
     pv_name: String,
-    user: String,
-    host: String,
+    user: Vec<u8>,
+    host: Vec<u8>,
     value_str: String,
     dbr_type: u16,
     no_elements: u32,
@@ -1064,8 +1064,8 @@ fn capture_listener_for(
         sink.lock().unwrap().push(CapturedTrap {
             op: msg.op,
             pv_name: msg.pv_name.to_string(),
-            user: msg.user.to_string(),
-            host: msg.host.to_string(),
+            user: msg.user.to_vec(),
+            host: msg.host.to_vec(),
             value_str: msg.value_str.to_string(),
             dbr_type: msg.dbr_type,
             no_elements: msg.no_elements,
@@ -1119,8 +1119,8 @@ async fn trapped_single_put_emits_before_after_astrapwrite() {
     );
     for e in [before, after] {
         assert_eq!(e.pv_name, "TEST:trap_li.VAL");
-        assert_eq!(e.user, "operator");
-        assert_eq!(e.host, "host.acme");
+        assert_eq!(e.user, b"operator");
+        assert_eq!(e.host, b"host.acme");
         assert_eq!(e.value_str, "42");
         assert_eq!(e.dbr_type, DbFieldType::Long as u16);
         assert_eq!(e.no_elements, 1);
@@ -1182,7 +1182,7 @@ async fn denied_single_put_emits_nothing() {
     struct DenyAll;
     #[async_trait::async_trait]
     impl AccessControl for DenyAll {
-        async fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
+        async fn can_write(&self, _: &str, _: &[u8], _: &str) -> bool {
             false
         }
     }

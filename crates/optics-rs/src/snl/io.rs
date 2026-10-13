@@ -543,48 +543,48 @@ pub async fn run(config: IoConfig) -> Result<(), Box<dyn std::error::Error + Sen
 
     // Connect PVs
     let ch_emono = client.create_channel(&config.mono_pv);
-    let ch_e_using = client.create_channel(&format!("{p}E_using"));
-    let ch_flux = client.create_channel(&format!("{p}flux"));
-    let ch_ion_photons = client.create_channel(&format!("{p}ionPhotons"));
-    let ch_ion_abs = client.create_channel(&format!("{p}ionAbs"));
-    let ch_detector = client.create_channel(&format!("{p}detector"));
+    let ch_e_using = client.create_channel(format!("{p}E_using"));
+    let ch_flux = client.create_channel(format!("{p}flux"));
+    let ch_ion_photons = client.create_channel(format!("{p}ionPhotons"));
+    let ch_ion_abs = client.create_channel(format!("{p}ionAbs"));
+    let ch_detector = client.create_channel(format!("{p}detector"));
 
-    let ch_cnt = client.create_channel(&format!("{vsc}.CNT"));
-    let ch_clock_rate = client.create_channel(&format!("{vsc}.FREQ"));
-    let ch_ticks = client.create_channel(&format!("{vsc}.S1"));
+    let ch_cnt = client.create_channel(format!("{vsc}.CNT"));
+    let ch_clock_rate = client.create_channel(format!("{vsc}.FREQ"));
+    let ch_ticks = client.create_channel(format!("{vsc}.S1"));
 
     // Connect scaler channels 2-15
     let mut ch_scalers: Vec<CaChannel> = Vec::new();
     for i in 2..=15 {
-        ch_scalers.push(client.create_channel(&format!("{vsc}.S{i}")));
+        ch_scalers.push(client.create_channel(format!("{vsc}.S{i}")));
     }
 
     // Connect scaler channel-name fields 2-15 ({VSC}.NMn): C copies the
     // selected channel's name into {P}scaler.DESC (Io.st:351-364).
     let mut ch_scaler_names: Vec<CaChannel> = Vec::new();
     for i in 2..=15 {
-        ch_scaler_names.push(client.create_channel(&format!("{vsc}.NM{i}")));
+        ch_scaler_names.push(client.create_channel(format!("{vsc}.NM{i}")));
     }
 
-    let ch_v_per_a = client.create_channel(&format!("{p}VperA"));
-    let ch_v2f = client.create_channel(&format!("{p}v2f"));
-    let ch_x_n2 = client.create_channel(&format!("{p}xN2"));
-    let ch_x_ar = client.create_channel(&format!("{p}xAr"));
-    let ch_x_he = client.create_channel(&format!("{p}xHe"));
-    let ch_x_air = client.create_channel(&format!("{p}xAir"));
-    let ch_x_co2 = client.create_channel(&format!("{p}xCO2"));
-    let ch_active_len = client.create_channel(&format!("{p}activeLen"));
-    let ch_dead_front = client.create_channel(&format!("{p}deadFront"));
-    let ch_dead_rear = client.create_channel(&format!("{p}deadRear"));
-    let ch_kapton1 = client.create_channel(&format!("{p}kapton1"));
-    let ch_kapton2 = client.create_channel(&format!("{p}kapton2"));
-    let ch_he_path = client.create_channel(&format!("{p}HePath"));
-    let ch_air_path = client.create_channel(&format!("{p}airPath"));
-    let ch_be = client.create_channel(&format!("{p}Be"));
-    let ch_d_eff = client.create_channel(&format!("{p}efficiency"));
-    let ch_scaler_ch = client.create_channel(&format!("{p}scaler"));
-    let ch_scaler_desc = client.create_channel(&format!("{p}scaler.DESC"));
-    let ch_ar_pcntr = client.create_channel(&format!("{p}ArPcntr"));
+    let ch_v_per_a = client.create_channel(format!("{p}VperA"));
+    let ch_v2f = client.create_channel(format!("{p}v2f"));
+    let ch_x_n2 = client.create_channel(format!("{p}xN2"));
+    let ch_x_ar = client.create_channel(format!("{p}xAr"));
+    let ch_x_he = client.create_channel(format!("{p}xHe"));
+    let ch_x_air = client.create_channel(format!("{p}xAir"));
+    let ch_x_co2 = client.create_channel(format!("{p}xCO2"));
+    let ch_active_len = client.create_channel(format!("{p}activeLen"));
+    let ch_dead_front = client.create_channel(format!("{p}deadFront"));
+    let ch_dead_rear = client.create_channel(format!("{p}deadRear"));
+    let ch_kapton1 = client.create_channel(format!("{p}kapton1"));
+    let ch_kapton2 = client.create_channel(format!("{p}kapton2"));
+    let ch_he_path = client.create_channel(format!("{p}HePath"));
+    let ch_air_path = client.create_channel(format!("{p}airPath"));
+    let ch_be = client.create_channel(format!("{p}Be"));
+    let ch_d_eff = client.create_channel(format!("{p}efficiency"));
+    let ch_scaler_ch = client.create_channel(format!("{p}scaler"));
+    let ch_scaler_desc = client.create_channel(format!("{p}scaler.DESC"));
+    let ch_ar_pcntr = client.create_channel(format!("{p}ArPcntr"));
 
     // Subscriptions
     let mut sub_emono = ch_emono.subscribe().await?;

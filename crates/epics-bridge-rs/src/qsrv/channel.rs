@@ -792,7 +792,7 @@ impl BridgeChannel {
         // rendered from the value inside the helper.
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &self.pv_name,
-            user: &self.access.creds.user,
+            user: self.access.creds.user.as_bytes(),
             host: &self.access.creds.host,
             peer: &self.access.creds.host,
             dbr_type: self.value_dbf as u16,
@@ -1286,7 +1286,7 @@ mod tests {
         struct DenyWrites;
         #[async_trait::async_trait]
         impl AccessControl for DenyWrites {
-            async fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
+            async fn can_write(&self, _: &str, _: &[u8], _: &str) -> bool {
                 false
             }
         }

@@ -1584,7 +1584,7 @@ impl IocBuild {
         // channels). Default 10s timeout, override via
         // `EPICS_RS_INIT_LINK_TIMEOUT` (seconds, fractional accepted).
         // Pass-through when no CA link set is registered.
-        let link_wait_secs = crate::runtime::env::get("EPICS_RS_INIT_LINK_TIMEOUT")
+        let link_wait_secs = crate::runtime::env::get_lossy("EPICS_RS_INIT_LINK_TIMEOUT")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(10.0)
             .max(0.0);

@@ -543,23 +543,23 @@ pub async fn run(config: FlexConfig) -> Result<(), Box<dyn std::error::Error + S
     let client = CaClient::new().await?;
 
     // Connect PVs
-    let ch_set_point = client.create_channel(&config.set_point_pv());
-    let ch_mode = client.create_channel(&config.mode_pv());
-    let ch_deadband = client.create_channel(&config.deadband_pv());
-    let ch_retries = client.create_channel(&config.retries_pv());
-    let ch_max_retries = client.create_channel(&config.max_retries_pv());
-    let ch_pos_monitor = client.create_channel(&config.pos_monitor_pv());
-    let ch_fine_val = client.create_channel(&config.fine_val_pv());
-    let ch_fine_rbv = client.create_channel(&config.fine_rbv_pv());
-    let ch_coarse_rlv = client.create_channel(&config.coarse_rlv_pv());
-    let ch_coarse_mres = client.create_channel(&config.coarse_mres_pv());
-    let ch_coarse_dmov = client.create_channel(&config.coarse_dmov_pv());
-    let ch_coarse_stop = client.create_channel(&config.coarse_stop_pv());
-    let ch_upper_limit = client.create_channel(&config.upper_limit_pv());
-    let ch_lower_limit = client.create_channel(&config.lower_limit_pv());
-    let ch_home_pos = client.create_channel(&config.home_pos_pv());
-    let ch_stop = client.create_channel(&config.stop_pv());
-    let ch_busy = client.create_channel(&config.busy_pv());
+    let ch_set_point = client.create_channel(config.set_point_pv());
+    let ch_mode = client.create_channel(config.mode_pv());
+    let ch_deadband = client.create_channel(config.deadband_pv());
+    let ch_retries = client.create_channel(config.retries_pv());
+    let ch_max_retries = client.create_channel(config.max_retries_pv());
+    let ch_pos_monitor = client.create_channel(config.pos_monitor_pv());
+    let ch_fine_val = client.create_channel(config.fine_val_pv());
+    let ch_fine_rbv = client.create_channel(config.fine_rbv_pv());
+    let ch_coarse_rlv = client.create_channel(config.coarse_rlv_pv());
+    let ch_coarse_mres = client.create_channel(config.coarse_mres_pv());
+    let ch_coarse_dmov = client.create_channel(config.coarse_dmov_pv());
+    let ch_coarse_stop = client.create_channel(config.coarse_stop_pv());
+    let ch_upper_limit = client.create_channel(config.upper_limit_pv());
+    let ch_lower_limit = client.create_channel(config.lower_limit_pv());
+    let ch_home_pos = client.create_channel(config.home_pos_pv());
+    let ch_stop = client.create_channel(config.stop_pv());
+    let ch_busy = client.create_channel(config.busy_pv());
 
     // Subscriptions
     let mut sub_set_point = ch_set_point.subscribe().await?;

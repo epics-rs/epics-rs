@@ -175,7 +175,16 @@ pub fn pvxsr_command() -> CommandDef {
                     // src/server.cpp:342 per-channel).
                     if detail >= 3 {
                         if let Some((account, method)) = &peer.credentials {
-                            ctx.println(&format!("    credentials: {account}/{method}"));
+                            // pvxs streams `cred->account` as its bytes.
+                            ctx.println_bytes(
+                                &[
+                                    b"    credentials: ".as_slice(),
+                                    account.as_bytes(),
+                                    b"/",
+                                    method.as_bytes(),
+                                ]
+                                .concat(),
+                            );
                         }
                         for ch in &peer.channels_detail {
                             ctx.println(&format!("      {} tx={} rx={}", ch.name, ch.tx, ch.rx));

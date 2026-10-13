@@ -126,7 +126,7 @@ static EVENTS_PER_QUE: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 pub fn configure_events_per_que() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let raw = crate::runtime::env::get("EPICS_CAS_MAX_EVENTS_PER_CHAN");
+        let raw = crate::runtime::env::get_lossy("EPICS_CAS_MAX_EVENTS_PER_CHAN");
         EVENTS_PER_QUE.store(events_per_que_from(raw.as_deref()), Ordering::Relaxed);
     });
 }

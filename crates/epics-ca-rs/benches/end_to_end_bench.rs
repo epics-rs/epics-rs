@@ -160,7 +160,7 @@ fn bench_bulk_get_many(c: &mut Criterion) {
     let channels = rt.block_on(async {
         let mut channels = Vec::with_capacity(100);
         for i in 0..100 {
-            channels.push(client.create_channel(&format!("BENCH:PV:{i}")));
+            channels.push(client.create_channel(format!("BENCH:PV:{i}")));
         }
         let connected = futures_util::future::join_all(
             channels
@@ -201,7 +201,7 @@ fn bench_bulk_get_many_scaling(c: &mut Criterion) {
     let channels = rt.block_on(async {
         let mut channels = Vec::with_capacity(100);
         for i in 0..100 {
-            channels.push(client.create_channel(&format!("BENCH:PV:{i}")));
+            channels.push(client.create_channel(format!("BENCH:PV:{i}")));
         }
         let connected = futures_util::future::join_all(
             channels

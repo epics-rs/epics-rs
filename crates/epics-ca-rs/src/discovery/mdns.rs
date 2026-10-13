@@ -185,7 +185,11 @@ impl MdnsAnnouncer {
         txt: Vec<(String, String)>,
     ) -> Result<Self, mdns_sd::Error> {
         let daemon = ServiceDaemon::new()?;
-        let hostname = epics_base_rs::runtime::env::hostname();
+        // mDNS has no C counterpart and its records are text.
+        let hostname = epics_base_rs::runtime::env::hostname().map_or_else(
+            || "localhost".into(),
+            |h| String::from_utf8_lossy(&h).into_owned(),
+        );
         let host_target = format!("{hostname}.local.");
 
         // Discover routable IPv4 addresses on every up, non-loopback

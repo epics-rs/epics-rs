@@ -1,10 +1,10 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG};
+use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG, PvString};
 use epics_ca_rs::cli::{
-    CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
-    ca_error_marker, dbr_value_field_type, format_c_g, format_time, format_value,
-    format_value_segment, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, ValueFormat, ca_error_marker,
+    dbr_value_field_type, format_c_g, format_time, format_value, format_value_segment, name_column,
+    println_named, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
@@ -379,7 +379,7 @@ struct Args {
     /// PV names to read. NOT clap-`required`: C's getopt loop has no
     /// required positional — it parses, then `main` checks `nPvs < 1` and
     /// reports C's own diagnostic (`CTool::no_pv_name`, caget.c:527-531).
-    pv_names: Vec<String>,
+    pv_names: Vec<std::ffi::OsString>,
 }
 
 impl Args {
@@ -610,15 +610,14 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
 /// extended-metadata block (for any type `> DBR_DOUBLE`). Returns the
 /// full block including its trailing newline.
 fn specified_dbr_report(
-    pv_name: &str,
+    pv_name: &[u8],
     native: Option<DbFieldType>,
     req_type: u16,
     snap: &Snapshot,
     fmt: &ValueFormat,
-) -> String {
+) -> Vec<u8> {
     use std::fmt::Write;
     let mut out = String::new();
-    let _ = writeln!(out, "{pv_name}");
     let _ = writeln!(
         out,
         "    Native data type: {}",
@@ -650,7 +649,7 @@ fn specified_dbr_report(
             let _ = writeln!(out, "{ext}");
         }
     }
-    out
+    [pv_name, b"\n", out.as_bytes()].concat()
 }
 
 /// Resolve the CA READ_NOTIFY element count for `caget`'s two request
@@ -688,7 +687,7 @@ fn caget_req_count(callback: bool, req_elems: u64, native: u32) -> ReqCount {
 /// the flag has to survive alongside the (possibly successful-looking)
 /// outcome.
 struct PvRead {
-    name: String,
+    name: PvString,
     outcome: Result<GetResult, ReadError>,
     timed_out: bool,
 }
@@ -756,19 +755,20 @@ fn format_client_timestamp() -> String {
 ///   `!onceConnected` line — reached exactly when the channel was NOT
 ///   connected at read time, so it carries no timestamp — or the client's
 ///   current time, a literal space, and the marker.
-fn print_read_error(mode: OutputMode, name_col: &str, pv_name: &str, sep: char, e: &ReadError) {
+fn print_read_error(mode: OutputMode, name_col: &[u8], pv_name: &[u8], sep: char, e: &ReadError) {
     let marker = e.marker();
     match mode {
         OutputMode::Terse => println!("{marker}"),
-        OutputMode::SpecifiedDbr => println!("{pv_name}\n    {marker}"),
-        OutputMode::Plain => println!("{name_col}{sep}{marker}"),
+        OutputMode::SpecifiedDbr => println_named(pv_name, format_args!("\n    {marker}")),
+        OutputMode::Plain => println_named(name_col, format_args!("{sep}{marker}")),
         OutputMode::All => match e {
-            ReadError::Disconnected => {
-                println!("{name_col}{sep}*** Not connected (PV not found)")
-            }
-            _ => println!(
-                "{name_col}{sep}{ts} {marker}",
-                ts = format_client_timestamp()
+            ReadError::Disconnected => println_named(
+                name_col,
+                format_args!("{sep}*** Not connected (PV not found)"),
+            ),
+            _ => println_named(
+                name_col,
+                format_args!("{sep}{ts} {marker}", ts = format_client_timestamp()),
             ),
         },
     }
@@ -857,6 +857,11 @@ async fn main() {
     if args.pv_names.is_empty() {
         TOOL.no_pv_name();
     }
+    let pv_names: Vec<PvString> = args
+        .pv_names
+        .into_iter()
+        .map(epics_ca_rs::cli::pv_name_arg)
+        .collect();
 
     let client = CaClient::new().await.expect("failed to create CA client");
     let timeout = epics_ca_rs::cli::timeout_duration(ca_timeout);
@@ -865,19 +870,11 @@ async fn main() {
     // aborts before `caget()` runs, so stdout carries zero value lines and
     // the tool exits 1 — a connected PV's value is NEVER printed alongside
     // a missing PV's marker.
-    let channels =
-        match epics_ca_rs::cli::connect_pvs(&client, &args.pv_names, priority, timeout).await {
-            Ok(channels) => args
-                .pv_names
-                .iter()
-                .cloned()
-                .zip(channels)
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        };
+    let channels = match epics_ca_rs::cli::connect_pvs(&client, &pv_names, priority, timeout).await
+    {
+        Ok(channels) => pv_names.into_iter().zip(channels).collect::<Vec<_>>(),
+        Err(e) => e.exit(),
+    };
 
     // Read all PVs in parallel within a single timeout window
     // (C: connect_pvs → ca_pend_io → ca_array_get → ca_pend_io).
@@ -1075,13 +1072,8 @@ async fn main() {
     // 30 characters only when the value is a scalar AND the field
     // separator is the default space. Custom `-F` separator and
     // arrays both fall back to the bare PV name + sep + value shape.
-    let pad_name = |is_scalar: bool, name: &str| -> String {
-        if is_scalar && sep == ' ' {
-            format!("{name:<width$}", width = PV_NAME_WIDTH)
-        } else {
-            name.to_string()
-        }
-    };
+    let pad_name =
+        |is_scalar: bool, name: &PvString| name_column(name.as_bytes(), is_scalar && sep == ' ');
     for PvRead {
         name: pv_name,
         outcome: result,
@@ -1095,7 +1087,10 @@ async fn main() {
                 if mode == OutputMode::Terse {
                     println!("{rendered}");
                 } else {
-                    println!("{}{}{}", pad_name(is_scalar, pv_name), sep, rendered);
+                    println_named(
+                        &pad_name(is_scalar, pv_name),
+                        format_args!("{sep}{rendered}"),
+                    );
                 }
             }
             Ok(GetResult::Time(snap)) => {
@@ -1118,19 +1113,17 @@ async fn main() {
                 let ts = format_time(snap.timestamp);
                 let stat = snap.alarm.status;
                 let sevr = snap.alarm.severity;
+                let name = pad_name(is_scalar, pv_name);
                 if stat == 0 && sevr == 0 {
-                    println!(
-                        "{name}{sep}{ts}{value_seg}{sep}{sep}",
-                        name = pad_name(is_scalar, pv_name),
-                        sep = sep,
-                    );
+                    println_named(&name, format_args!("{sep}{ts}{value_seg}{sep}{sep}"));
                 } else {
-                    println!(
-                        "{name}{sep}{ts}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
-                        name = pad_name(is_scalar, pv_name),
-                        sep = sep,
-                        stat_str = stat_to_str(stat),
-                        sevr_str = sevr_to_str(sevr),
+                    println_named(
+                        &name,
+                        format_args!(
+                            "{sep}{ts}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
+                            stat_str = stat_to_str(stat),
+                            sevr_str = sevr_to_str(sevr),
+                        ),
                     );
                 }
             }
@@ -1139,15 +1132,15 @@ async fn main() {
                 req_type,
                 snap,
             }) => {
-                print!(
-                    "{}",
-                    specified_dbr_report(pv_name, *native, *req_type, snap, &fmt)
-                );
+                use std::io::Write as _;
+                let report =
+                    specified_dbr_report(pv_name.as_bytes(), *native, *req_type, snap, &fmt);
+                let _ = std::io::stdout().lock().write_all(&report);
             }
             Err(e) => {
                 // A failed PV never carries a value, so C's name column takes
                 // the scalar padding (`nElems == 0 <= 1`).
-                print_read_error(mode, &pad_name(true, pv_name), pv_name, sep, e);
+                print_read_error(mode, &pad_name(true, pv_name), pv_name.as_bytes(), sep, e);
             }
         }
     }
@@ -1219,8 +1212,19 @@ mod tests {
     use super::{
         Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, TOOL, caget_req_count,
         dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_dbr_type,
-        resolve_format, specified_dbr_report,
+        resolve_format,
     };
+
+    fn specified_dbr_report(
+        pv_name: &str,
+        native: Option<DbFieldType>,
+        req_type: u16,
+        snap: &Snapshot,
+        fmt: &ValueFormat,
+    ) -> String {
+        let out = super::specified_dbr_report(pv_name.as_bytes(), native, req_type, snap, fmt);
+        String::from_utf8(out).expect("a UTF-8 report")
+    }
     use clap::{CommandFactory, FromArgMatches, Parser};
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
     use epics_base_rs::types::WallTime;
@@ -1252,6 +1256,24 @@ mod tests {
     ///
     /// Verified against the compiled C `caget` (EPICS 7.0.10.1-DEV):
     ///   `caget -0x TST:LO` → `TST:LO   0xC8`.
+    /// C takes `argv[i]` as the name's bytes; clap must not refuse them.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_pv_name_argument_is_kept_as_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let argv = [
+            std::ffi::OsStr::new("caget"),
+            std::ffi::OsStr::from_bytes(b"T:\xff"),
+        ];
+        let a = Args::try_parse_from(argv).expect("a non-UTF-8 name parses");
+        let names: Vec<_> = a
+            .pv_names
+            .into_iter()
+            .map(epics_ca_rs::cli::pv_name_arg)
+            .collect();
+        assert_eq!(names[0].as_bytes(), b"T:\xff");
+    }
+
     #[test]
     fn base_options_take_a_single_dash_argument_like_c_getopt() {
         for argv in [

@@ -130,11 +130,11 @@ pub(crate) fn prefix_with_separator(bare: &str) -> String {
 /// Returned as the bare namespace; the `:` separator is added by
 /// `prefix_with_separator` at publish time.
 pub fn default_stats_prefix() -> String {
-    let host = epics_base_rs::runtime::env::hostname();
-    if host.is_empty() {
-        "gateway".to_string()
-    } else {
-        host
+    // C takes `uname().nodename` (gateResources.cc:125-128); the stats PV
+    // names here are text, so a non-UTF-8 name is replaced.
+    match epics_base_rs::runtime::env::hostname() {
+        Some(host) if !host.is_empty() => String::from_utf8_lossy(&host).into_owned(),
+        _ => "gateway".to_string(),
     }
 }
 

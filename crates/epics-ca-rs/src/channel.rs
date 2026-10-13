@@ -1,4 +1,4 @@
-use epics_base_rs::types::DbFieldType;
+use epics_base_rs::types::{DbFieldType, PvString};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -64,7 +64,7 @@ impl fmt::Display for AccessRights {
 /// Channel metadata returned by cainfo
 #[derive(Debug)]
 pub struct ChannelInfo {
-    pub pv_name: String,
+    pub pv_name: PvString,
     pub server_addr: SocketAddr,
     pub native_type: DbFieldType,
     pub element_count: u32,

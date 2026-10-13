@@ -268,7 +268,7 @@ async fn rights_after_an_unresponsive_window(
         .expect("ensure_subscribed returns")
         .unwrap_or_else(|e| panic!("subscribe through the proxy: {e}\n{}", rig.console()));
     let rights = |hook: &epics_base_rs::server::pv::AccessHook| {
-        let r = hook("alice", "host1");
+        let r = hook(b"alice", b"host1");
         (r.read, r.write)
     };
     let hook = db

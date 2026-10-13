@@ -113,7 +113,7 @@ mod tests {
     fn meta(pv: &str) -> TrapWriteMeta<'_> {
         TrapWriteMeta {
             pv_name: pv,
-            user: "u",
+            user: b"u",
             host: "h",
             peer: "h:5075",
             dbr_type: 5,

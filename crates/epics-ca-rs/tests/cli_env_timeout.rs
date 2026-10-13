@@ -96,3 +96,23 @@ fn a_scannable_env_timeout_is_silent() {
         );
     }
 }
+
+/// C's `getenv` hands `epicsScanDouble` the bytes, so a value that is not
+/// UTF-8 is set, rejected and warned about, never silently unset.
+#[cfg(unix)]
+#[test]
+fn an_env_timeout_that_is_not_utf8_warns() {
+    use std::os::unix::ffi::OsStrExt;
+    let out = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .env("EPICS_CLI_TIMEOUT", std::ffi::OsStr::from_bytes(b"1\xff"))
+        .output()
+        .expect("spawn the CA tool");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .lines()
+            .next()
+            .is_some_and(|l| l.ends_with("is not a valid timeout value (from 'EPICS_CLI_TIMEOUT' in the environment) - ignored. (use '-h' for help.)")),
+        "stderr was:\n{stderr}"
+    );
+}

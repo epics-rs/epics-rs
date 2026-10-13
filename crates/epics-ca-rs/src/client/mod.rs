@@ -281,12 +281,12 @@ const ONE_SHOT_CHANNEL_CACHE_CAPACITY: usize = 4096;
 
 #[derive(Default)]
 struct OneShotChannelCache {
-    channels: HashMap<String, CaChannel>,
-    order: VecDeque<String>,
+    channels: HashMap<PvString, CaChannel>,
+    order: VecDeque<PvString>,
 }
 
 impl OneShotChannelCache {
-    fn get_or_create(&mut self, client: &CaClient, pv_name: String) -> CaChannel {
+    fn get_or_create(&mut self, client: &CaClient, pv_name: PvString) -> CaChannel {
         if let Some(channel) = self.channels.get(&pv_name) {
             return channel.clone();
         }
@@ -510,7 +510,7 @@ pub struct CaClient {
 enum CoordRequest {
     RegisterChannel {
         cid: u32,
-        pv_name: String,
+        pv_name: PvString,
         /// CA priority the channel was created at; stored on
         /// the coordinator's `ChannelInner` and threaded into every
         /// `TransportCommand` the coordinator builds for this channel.
@@ -674,7 +674,7 @@ impl CaClient {
             // for hostname-bound certs. Without this, the SNI falls back
             // to the server's IP literal — which only validates against
             // IP-bound certs.
-            c.tls_server_name = epics_base_rs::runtime::env::get("EPICS_CA_TLS_SERVER_NAME");
+            c.tls_server_name = epics_base_rs::runtime::env::get_lossy("EPICS_CA_TLS_SERVER_NAME");
             c
         };
         #[cfg(not(feature = "experimental-rust-tls"))]
@@ -963,7 +963,7 @@ impl CaClient {
         let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
         let client_identity: types::ClientIdentitySlot =
-            Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_env()));
+            Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_os()));
         // Built before the transport, because the circuit's receive path — not
         // the coordinator — is what raises server exceptions (C ref:
         // `cac::exceptionRespAction`, `cac.cpp:1079-1117`, runs inside
@@ -1098,8 +1098,9 @@ impl CaClient {
     }
 
     /// Override the user name this client advertises to servers
-    /// (`CA_PROTO_CLIENT_NAME`). libca takes the user name from `$USER`
-    /// at context creation; this lets it be changed at runtime.
+    /// (`CA_PROTO_CLIENT_NAME`). libca takes the user name from
+    /// `osiGetUserName` at context creation; this lets it be changed at
+    /// runtime.
     ///
     /// Applies to circuits opened **after** this call: the shared
     /// identity slot is read when each new circuit handshakes (before its
@@ -1109,7 +1110,7 @@ impl CaClient {
     /// channel (`rsrv/camessage.c` `client_name_action`: `chanCount != 0`
     /// → `ECA_INTERNAL`, name ignored), so there is no in-band way to
     /// rename a live circuit.
-    pub fn set_user_name(&self, user: impl Into<String>) {
+    pub fn set_user_name(&self, user: impl Into<Vec<u8>>) {
         self.client_identity.write().user = user.into();
     }
 
@@ -1119,7 +1120,7 @@ impl CaClient {
     /// circuits keep their host name (the EPICS server ignores
     /// `CA_PROTO_HOST_NAME` after the first channel — `host_name_action`,
     /// `chanCount != 0` → `ECA_INTERNAL`).
-    pub fn set_host_name(&self, host: impl Into<String>) {
+    pub fn set_host_name(&self, host: impl Into<Vec<u8>>) {
         self.client_identity.write().host = host.into();
     }
 
@@ -1160,8 +1161,9 @@ impl CaClient {
     ///
     /// Uses CA `priorityDefault` (0). To request a specific virtual-circuit
     /// priority, use [`Self::create_channel_with_priority`].
-    pub fn create_channel(&self, name: &str) -> CaChannel {
-        self.create_channel_expanded(expand_pv_name(name), 0).0
+    pub fn create_channel(&self, name: impl AsRef<[u8]>) -> CaChannel {
+        self.create_channel_expanded(expand_pv_name(name.as_ref()), 0)
+            .0
     }
 
     /// [`Self::create_channel_with_priority`] plus a
@@ -1171,10 +1173,10 @@ impl CaClient {
     /// the race, together with the access rights it carries.
     pub fn create_channel_with_events(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         priority: u8,
     ) -> (CaChannel, broadcast::Receiver<ConnectionEvent>) {
-        self.create_channel_expanded(expand_pv_name(name), priority.min(99))
+        self.create_channel_expanded(expand_pv_name(name.as_ref()), priority.min(99))
     }
 
     /// Create a persistent channel at a specific CA priority (`0..=99`,
@@ -1188,14 +1190,14 @@ impl CaClient {
     /// `CA_PROTO_VERSION` message's data-type field. Values above 99 are
     /// clamped to 99 to match libca's range check
     /// (`cac.cpp:512-520`).
-    pub fn create_channel_with_priority(&self, name: &str, priority: u8) -> CaChannel {
-        self.create_channel_expanded(expand_pv_name(name), priority.min(99))
+    pub fn create_channel_with_priority(&self, name: impl AsRef<[u8]>, priority: u8) -> CaChannel {
+        self.create_channel_expanded(expand_pv_name(name.as_ref()), priority.min(99))
             .0
     }
 
     fn create_channel_expanded(
         &self,
-        pv_name: String,
+        pv_name: PvString,
         priority: u8,
     ) -> (CaChannel, broadcast::Receiver<ConnectionEvent>) {
         // reserve the cid against the live-set. Released by the
@@ -1217,7 +1219,7 @@ impl CaClient {
         // CaChannel sits in Disconnected and times out naturally
         // when callers await connect, matching libca's client-side
         // reject semantic.
-        let padded_len = crate::protocol::pad_string(&pv_name).len();
+        let padded_len = crate::protocol::pad_bytes(pv_name.as_bytes()).len();
         let name_empty = pv_name.is_empty();
         let name_too_long = padded_len >= 0xFFFF;
         let valid = !name_empty && !name_too_long;
@@ -1252,7 +1254,7 @@ impl CaClient {
             cid,
             coord_tx: self.coord_tx.clone(),
         });
-        let channel_pv_name: Arc<str> = Arc::from(pv_name.as_str());
+        let channel_pv_name: Arc<[u8]> = Arc::from(pv_name.as_bytes());
         let channel = CaChannel {
             cid,
             pv_name: channel_pv_name,
@@ -1272,7 +1274,7 @@ impl CaClient {
         (channel, conn_rx)
     }
 
-    fn cached_one_shot_channel(&self, name: &str) -> CaChannel {
+    fn cached_one_shot_channel(&self, name: &[u8]) -> CaChannel {
         let pv_name = expand_pv_name(name);
         self.one_shot_channels.lock().get_or_create(self, pv_name)
     }
@@ -1303,7 +1305,7 @@ impl CaClient {
         let _ = self.search_tx.send(SearchRequest::SetAddressList(list));
     }
 
-    pub async fn caget(&self, pv_name: &str) -> CaResult<(DbFieldType, EpicsValue)> {
+    pub async fn caget(&self, pv_name: impl AsRef<[u8]>) -> CaResult<(DbFieldType, EpicsValue)> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
         let result = ch.get().await;
@@ -1323,7 +1325,7 @@ impl CaClient {
     /// Results are returned in input order.
     pub async fn caget_many<S>(&self, pv_names: &[S]) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
     where
-        S: AsRef<str> + Sync,
+        S: AsRef<[u8]> + Sync,
     {
         self.caget_many_with_timeout(pv_names, Duration::from_secs(30))
             .await
@@ -1336,7 +1338,7 @@ impl CaClient {
         timeout: Duration,
     ) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
     where
-        S: AsRef<str> + Sync,
+        S: AsRef<[u8]> + Sync,
     {
         let channels: Vec<CaChannel> = pv_names
             .iter()
@@ -1415,7 +1417,7 @@ impl CaClient {
     }
 
     /// Fire-and-forget write (CA_PROTO_WRITE). Matches C `caput` behavior.
-    pub async fn caput(&self, pv_name: &str, value_str: &str) -> CaResult<()> {
+    pub async fn caput(&self, pv_name: impl AsRef<[u8]>, value_str: &str) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
@@ -1430,7 +1432,7 @@ impl CaClient {
     /// Write with completion callback (CA_PROTO_WRITE_NOTIFY). Matches C `caput -c`.
     pub async fn caput_callback(
         &self,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         value_str: &str,
         timeout_secs: f64,
     ) -> CaResult<()> {
@@ -1450,7 +1452,7 @@ impl CaClient {
         Ok(())
     }
 
-    pub async fn cainfo(&self, pv_name: &str) -> CaResult<ChannelInfo> {
+    pub async fn cainfo(&self, pv_name: impl AsRef<[u8]>) -> CaResult<ChannelInfo> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
@@ -1462,7 +1464,7 @@ impl CaClient {
     }
 
     /// Monitor a PV with callback (legacy API).
-    pub async fn camonitor<F>(&self, pv_name: &str, mut callback: F) -> CaResult<()>
+    pub async fn camonitor<F>(&self, pv_name: impl AsRef<[u8]>, mut callback: F) -> CaResult<()>
     where
         F: FnMut(EpicsValue),
     {
@@ -1716,7 +1718,7 @@ fn validate_put_strings(value: &EpicsValue) -> CaResult<()> {
 #[derive(Clone)]
 pub struct CaChannel {
     cid: u32,
-    pv_name: Arc<str>,
+    pv_name: Arc<[u8]>,
     /// CA priority (0..=99) this channel was created at. With
     /// the channel's resolved `server_addr` it forms the
     /// [`types::CircuitKey`] every hot-path `TransportCommand` targets,
@@ -1820,7 +1822,7 @@ impl CaChannel {
         });
         CaChannel {
             cid,
-            pv_name: Arc::from("test:pv"),
+            pv_name: Arc::from(b"test:pv".as_slice()),
             priority: 0,
             coord_tx,
             transport_tx,
@@ -1904,7 +1906,9 @@ impl CaChannel {
         });
         epics_base_rs::runtime::task::timeout(timeout, reply_rx)
             .await
-            .map_err(|_| CaError::ChannelNotFound(self.pv_name.to_string()))?
+            .map_err(|_| {
+                CaError::ChannelNotFound(String::from_utf8_lossy(&self.pv_name).into_owned())
+            })?
             .map_err(|_| CaError::Shutdown)
     }
 
@@ -1913,7 +1917,7 @@ impl CaChannel {
     pub async fn info(&self) -> CaResult<ChannelInfo> {
         let snap = self.snapshot()?;
         Ok(ChannelInfo {
-            pv_name: self.pv_name.to_string(),
+            pv_name: PvString::from(&*self.pv_name),
             server_addr: snap.server_addr,
             native_type: snap.native_type,
             element_count: snap.element_count,
@@ -3183,7 +3187,7 @@ impl CaChannel {
         float_as_string: bool,
         req_count: Option<u32>,
     ) -> CaResult<MonitorHandle> {
-        let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
+        let env = epics_base_rs::runtime::env::get_lossy("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
         let (callback_tx, callback_rx) = mpsc::channel(queue_size);
@@ -3908,7 +3912,7 @@ async fn run_coordinator(
                             {
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid: ch.cid,
-                                    pv_name: ch.pv_name.to_string(),
+                                    pv_name: ch.pv_name.clone(),
                                     reason: SearchReason::BeaconAnomaly,
                                 });
                             }
@@ -3951,7 +3955,7 @@ async fn run_coordinator(
                                 server_channels.entry((server_addr, priority)).or_default().insert(cid);
                                 let _ = transport_tx.send(TransportCommand::CreateChannel {
                                     cid,
-                                    pv_name: ch.pv_name.to_string(),
+                                    pv_name: ch.pv_name.clone(),
                                     server_addr,
                                     priority,
                                 });
@@ -4264,7 +4268,7 @@ async fn run_coordinator(
                             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
-                                pv_name: ch.pv_name.to_string(),
+                                pv_name: ch.pv_name.clone(),
                                 reason: SearchReason::Reconnect,
                             });
                             // Notify search engine of failed connect (penalty box).
@@ -4618,7 +4622,7 @@ fn handle_server_disconnect(
     snapshots: &ChannelSnapshots,
     exception_slot: &types::CaExceptionSlot,
 ) {
-    let mut pv_name = String::new();
+    let mut pv_name = PvString::default();
     let affected = disconnect_channels(
         channels,
         subscriptions,
@@ -4627,10 +4631,10 @@ fn handle_server_disconnect(
         DisconnectKind::CircuitGone,
         |ch| ch.cid == cid && ch.server_addr == Some(server_addr),
         |ch| {
-            pv_name = ch.pv_name.to_string();
+            pv_name = ch.pv_name.clone();
             let _ = search_tx.send(SearchRequest::Schedule {
                 cid: ch.cid,
-                pv_name: ch.pv_name.to_string(),
+                pv_name: ch.pv_name.clone(),
                 reason: SearchReason::Reconnect,
             });
         },
@@ -4723,7 +4727,7 @@ fn handle_disconnect(
             // `initial_lane = reconnect_count.clamp(1, 8)`.
             let _ = search_tx.send(SearchRequest::Schedule {
                 cid: ch.cid,
-                pv_name: ch.pv_name.to_string(),
+                pv_name: ch.pv_name.clone(),
                 reason: SearchReason::Reconnect,
             });
         },
@@ -5240,6 +5244,37 @@ mod enum_readback_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod expand_shell_vars_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    #[serial(epics_env)]
+    fn a_value_is_spliced_in_as_bytes() {
+        let key = "EPICS_RS_TEST_SHELL_VAR_BYTES";
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, std::ffi::OsStr::from_bytes(b"\xffb")) };
+        let out = expand_shell_vars(format!("é:${{{key}}}:$({key})").as_bytes());
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(out, b"\xc3\xa9:\xffb:\xffb");
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn a_non_utf8_name_and_variable_name_expand_as_bytes() {
+        let key = std::ffi::OsStr::from_bytes(b"EPICS_RS_TEST_SHELL_VAR_\xff");
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, "v") };
+        let out = expand_shell_vars(b"a\xfe:${EPICS_RS_TEST_SHELL_VAR_\xff}");
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(out, b"a\xfe:v");
+    }
+}
+
 #[cfg(test)]
 mod ignore_servers_tests {
     use super::*;
@@ -5405,29 +5440,26 @@ mod addr_entry_tests {
     }
 }
 
-/// Apply libca-compatible PV-name expansion when
-/// `EPICS_CA_USE_SHELL_VARS=YES`.
-fn expand_pv_name(name: &str) -> String {
-    // EPICS_CA_USE_SHELL_VARS=YES expands ${VAR}/$(VAR) tokens in PV
-    // names against the process environment, matching libca behaviour.
+/// Apply PV-name expansion when `EPICS_CA_USE_SHELL_VARS=YES`. libca has no
+/// such variable; the name stays the caller's bytes either way.
+fn expand_pv_name(name: &[u8]) -> PvString {
     // Not an EPICS Base `ENV_PARAM` — it is in no `envDefs.h`, so there is no
     // compiled default and the caller owns the fallback (`getenv`-shaped).
     if epics_base_rs::runtime::env::get("EPICS_CA_USE_SHELL_VARS")
         .is_some_and(|v| v.eq_ignore_ascii_case("YES"))
     {
-        expand_shell_vars(name)
+        expand_shell_vars(name).into()
     } else {
-        name.to_string()
+        name.into()
     }
 }
 
-/// Expand shell-style `${VAR}` and `$(VAR)` references in `s` against the
-/// process environment. Unknown variables expand to the empty string,
-/// matching libca's expandedClient behaviour. Plain `$` and unmatched
-/// braces/parens are left intact.
-fn expand_shell_vars(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
+/// Expand shell-style `${VAR}` and `$(VAR)` references in `bytes` against
+/// the process environment. Unknown variables expand to the empty string.
+/// Plain `$` and unmatched braces/parens are left intact. A value is
+/// `getenv`'s bytes, spliced in unchecked.
+fn expand_shell_vars(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'$' && i + 1 < bytes.len() {
@@ -5438,18 +5470,27 @@ fn expand_shell_vars(s: &str) -> String {
             };
             if let Some(end) = close {
                 if let Some(j) = bytes[i + 2..].iter().position(|&b| b == end) {
-                    let name = &s[i + 2..i + 2 + j];
-                    let value = epics_base_rs::runtime::env::get(name).unwrap_or_default();
-                    out.push_str(&value);
+                    if let Some(value) = env_var_bytes(&bytes[i + 2..i + 2 + j]) {
+                        out.extend_from_slice(&value);
+                    }
                     i += 3 + j;
                     continue;
                 }
             }
         }
-        out.push(s.as_bytes()[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
+}
+
+/// `getenv` on a variable name given as bytes.
+fn env_var_bytes(name: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    let name = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(name);
+    #[cfg(not(unix))]
+    let name = std::str::from_utf8(name).ok()?;
+    epics_base_rs::runtime::env::get(name).map(|v| v.into_encoded_bytes())
 }
 
 /// Live SNI / cert-verification-name registry, shared between the
@@ -5534,7 +5575,7 @@ impl SniOverrides {
 /// the client.
 #[cfg(feature = "experimental-rust-tls")]
 fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
-    let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_TLS_SNI_MAP") else {
+    let Some(list) = epics_base_rs::runtime::env::get_lossy("EPICS_CA_TLS_SNI_MAP") else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -5655,7 +5696,7 @@ pub(crate) fn parse_nameserver_list() -> Vec<AddrEntry> {
 /// unparseable entries. Reads at every call site so tests that mutate
 /// the env see the updated list without a process restart.
 pub(crate) fn epics_rs_client_ignore() -> Vec<Ipv4Addr> {
-    let Some(list) = epics_base_rs::runtime::env::get("EPICS_RS_CLIENT_IGNORE") else {
+    let Some(list) = epics_base_rs::runtime::env::get_lossy("EPICS_RS_CLIENT_IGNORE") else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -6336,7 +6377,7 @@ mod disconnect_transition_tests {
         let (conn_tx, conn_rx) = state::ConnEvents::new(16);
         let ch = ChannelInner {
             cid,
-            pv_name: format!("TEST:PV{cid}"),
+            pv_name: format!("TEST:PV{cid}").into(),
             priority,
             state: ChannelState::Connected,
             sid: 7,

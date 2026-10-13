@@ -37,7 +37,7 @@ use crate::error::{BridgeError, BridgeResult};
 #[derive(Debug, Clone, Default)]
 pub struct ClientCreds {
     /// Account name (e.g. "alice", "CN=alice" for x509).
-    pub user: String,
+    pub user: epics_base_rs::types::PvString,
     /// Client host name (reverse-resolved or empty).
     pub host: String,
     /// Auth method ("anonymous", "ca", "x509", …).
@@ -50,7 +50,7 @@ pub struct ClientCreds {
     /// Group/role claims. ACF UAG entries of the form `role/name` match
     /// against this list. pvxs `ClientCredentials::roles()`
     /// (pvxs/include/pvxs/srvcommon.h:55).
-    pub roles: Vec<String>,
+    pub roles: Vec<epics_base_rs::types::PvString>,
 }
 
 /// Outcome of a QSRV write authorization.
@@ -92,12 +92,12 @@ pub struct WriteGrant {
 #[async_trait::async_trait]
 pub trait AccessControl: Send + Sync {
     /// Check if the client can read this channel.
-    async fn can_read(&self, _channel: &str, _user: &str, _host: &str) -> bool {
+    async fn can_read(&self, _channel: &str, _user: &[u8], _host: &str) -> bool {
         true
     }
 
     /// Check if the client can write to this channel.
-    async fn can_write(&self, _channel: &str, _user: &str, _host: &str) -> bool {
+    async fn can_write(&self, _channel: &str, _user: &[u8], _host: &str) -> bool {
         true
     }
 
@@ -108,12 +108,14 @@ pub trait AccessControl: Send + Sync {
     /// `AcfAccessControl` overrides to pass the full credential set to
     /// `check_access_method`.
     async fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
-        self.can_read(channel, &creds.user, &creds.host).await
+        self.can_read(channel, creds.user.as_bytes(), &creds.host)
+            .await
     }
 
     /// Method/authority/roles-aware write check.
     async fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
-        self.can_write(channel, &creds.user, &creds.host).await
+        self.can_write(channel, creds.user.as_bytes(), &creds.host)
+            .await
     }
 
     /// Authorize a write and surface the matched ACF/ASG rule's
@@ -176,11 +178,11 @@ pub struct AcfAccessControl {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct GrantKey {
     channel: String,
-    user: String,
+    user: epics_base_rs::types::PvString,
     host: String,
     method: String,
     authority: String,
-    roles: Vec<String>,
+    roles: Vec<epics_base_rs::types::PvString>,
 }
 
 impl GrantKey {
@@ -277,17 +279,18 @@ impl AcfAccessControl {
     /// - "ca" method (or no method): plain account name, path-suffix stripped.
     /// - other methods: `"method/account"`.
     /// - each role: `"role/rolename"`.
-    fn credential_strings(creds: &ClientCreds) -> Vec<String> {
+    fn credential_strings(creds: &ClientCreds) -> Vec<Vec<u8>> {
+        let user = creds.user.as_bytes();
         let mut v = Vec::new();
         let primary = if creds.method == "ca" || creds.method.is_empty() {
-            let pos = creds.user.rfind('/').map(|p| p + 1).unwrap_or(0);
-            creds.user[pos..].to_string()
+            let pos = user.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+            user[pos..].to_vec()
         } else {
-            format!("{}/{}", creds.method, creds.user)
+            [creds.method.as_bytes(), b"/", user].concat()
         };
         v.push(primary);
         for role in &creds.roles {
-            v.push(format!("role/{role}"));
+            v.push([b"role/", role.as_bytes()].concat());
         }
         v
     }
@@ -413,11 +416,11 @@ enum AccessLevelLite {
 
 #[async_trait::async_trait]
 impl AccessControl for AcfAccessControl {
-    async fn can_read(&self, channel: &str, user: &str, host: &str) -> bool {
+    async fn can_read(&self, channel: &str, user: &[u8], host: &str) -> bool {
         self.can_read_creds(
             channel,
             &ClientCreds {
-                user: user.to_string(),
+                user: user.into(),
                 host: host.to_string(),
                 ..Default::default()
             },
@@ -425,11 +428,11 @@ impl AccessControl for AcfAccessControl {
         .await
     }
 
-    async fn can_write(&self, channel: &str, user: &str, host: &str) -> bool {
+    async fn can_write(&self, channel: &str, user: &[u8], host: &str) -> bool {
         self.can_write_creds(
             channel,
             &ClientCreds {
-                user: user.to_string(),
+                user: user.into(),
                 host: host.to_string(),
                 ..Default::default()
             },
@@ -484,7 +487,7 @@ impl AccessContext {
         Self {
             access,
             creds: Arc::new(ClientCreds {
-                user,
+                user: user.into(),
                 host,
                 ..Default::default()
             }),
@@ -800,10 +803,10 @@ impl LiveAccessProxy {
 
 #[async_trait::async_trait]
 impl AccessControl for LiveAccessProxy {
-    async fn can_read(&self, channel: &str, user: &str, host: &str) -> bool {
+    async fn can_read(&self, channel: &str, user: &[u8], host: &str) -> bool {
         self.policy().can_read(channel, user, host).await
     }
-    async fn can_write(&self, channel: &str, user: &str, host: &str) -> bool {
+    async fn can_write(&self, channel: &str, user: &[u8], host: &str) -> bool {
         self.policy().can_write(channel, user, host).await
     }
     async fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
@@ -942,13 +945,13 @@ impl BridgeProvider {
     }
 
     /// Check if a client can write to a channel.
-    pub async fn can_write(&self, channel: &str, user: &str, host: &str) -> bool {
+    pub async fn can_write(&self, channel: &str, user: &[u8], host: &str) -> bool {
         let policy = self.access_cell.read().clone();
         policy.can_write(channel, user, host).await
     }
 
     /// Check if a client can read from a channel.
-    pub async fn can_read(&self, channel: &str, user: &str, host: &str) -> bool {
+    pub async fn can_read(&self, channel: &str, user: &[u8], host: &str) -> bool {
         let policy = self.access_cell.read().clone();
         policy.can_read(channel, user, host).await
     }
@@ -1395,12 +1398,13 @@ impl BridgeProvider {
         group: &str,
         field: &str,
         value: epics_base_rs::types::EpicsValue,
-        user: &str,
+        user: &[u8],
         host: &str,
     ) -> BridgeResult<()> {
         if !self.can_write(group, user, host).await {
             return Err(crate::error::BridgeError::PutRejected(format!(
-                "write denied for group {group} (user='{user}' host='{host}')"
+                "write denied for group {group} (user='{}' host='{host}')",
+                String::from_utf8_lossy(user)
             )));
         }
         let (channel, mapping) = self
@@ -1566,7 +1570,7 @@ impl BridgeProvider {
         self.create_channel_with_creds(
             name,
             ClientCreds {
-                user: user.to_string(),
+                user: user.into(),
                 host: host.to_string(),
                 ..Default::default()
             },
@@ -2161,7 +2165,7 @@ mod tests {
     struct ReadOnly;
     #[async_trait::async_trait]
     impl AccessControl for ReadOnly {
-        async fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
+        async fn can_write(&self, _: &str, _: &[u8], _: &str) -> bool {
             false
         }
     }
@@ -2170,10 +2174,10 @@ mod tests {
     struct DenySpecific(String);
     #[async_trait::async_trait]
     impl AccessControl for DenySpecific {
-        async fn can_read(&self, channel: &str, _: &str, _: &str) -> bool {
+        async fn can_read(&self, channel: &str, _: &[u8], _: &str) -> bool {
             channel != self.0
         }
-        async fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
+        async fn can_write(&self, channel: &str, _: &[u8], _: &str) -> bool {
             channel != self.0
         }
     }
@@ -2211,11 +2215,11 @@ ASG(SECURE) {
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Anyone can read.
-        assert!(acl.can_read("AI:SEC", "guest", "anywhere").await);
-        assert!(acl.can_read("AI:SEC", "admin", "anywhere").await);
+        assert!(acl.can_read("AI:SEC", b"guest", "anywhere").await);
+        assert!(acl.can_read("AI:SEC", b"admin", "anywhere").await);
         // Only admin can write.
-        assert!(acl.can_write("AI:SEC", "admin", "anywhere").await);
-        assert!(!acl.can_write("AI:SEC", "guest", "anywhere").await);
+        assert!(acl.can_write("AI:SEC", b"admin", "anywhere").await);
+        assert!(!acl.can_write("AI:SEC", b"guest", "anywhere").await);
     }
 
     /// The grant cache must repoint when the record's ASG changes
@@ -2247,14 +2251,14 @@ ASG(LOCKED) {
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Twice: the second call is the cache-hit path.
-        assert!(acl.can_write("AI:MOVE", "guest", "anywhere").await);
-        assert!(acl.can_write("AI:MOVE", "guest", "anywhere").await);
+        assert!(acl.can_write("AI:MOVE", b"guest", "anywhere").await);
+        assert!(acl.can_write("AI:MOVE", b"guest", "anywhere").await);
 
         // The field-I/O layer's `dbPut record.ASG` sequence: mutate,
         // then notify.
         rec.write().common.asg = "LOCKED".to_string();
         notify_asg_field_changed();
-        assert!(!acl.can_write("AI:MOVE", "guest", "anywhere").await);
+        assert!(!acl.can_write("AI:MOVE", b"guest", "anywhere").await);
     }
 
     /// Regression: AcfAccessControl must honor method, authority,
@@ -2334,13 +2338,13 @@ ASG(ROLE_GATED) {
         // ── Axis 4: field ASL ────────────────────────────────────────────
         // ASL=0 record: RULE(0, WRITE) applies.
         assert!(
-            acl.can_write("AI:ASL0", "alice", "h").await,
+            acl.can_write("AI:ASL0", b"alice", "h").await,
             "ASL=0: alice should be allowed to write"
         );
         // ASL=1 record: RULE(0, WRITE) is skipped (epics-base asLibRoutines.c:1006:
         // `if(pasgclient->level > pasgrule->level) goto next_rule`).
         assert!(
-            !acl.can_write("AI:ASL1", "alice", "h").await,
+            !acl.can_write("AI:ASL1", b"alice", "h").await,
             "ASL=1: RULE(0,WRITE) must be skipped → write denied"
         );
 
@@ -2348,7 +2352,7 @@ ASG(ROLE_GATED) {
         // x509 client: METHOD("x509") rule matches → write allowed.
         // Pre-fix: hardcoded method="anonymous" caused x509 clients to be denied.
         let x509_creds = ClientCreds {
-            user: "alice".to_string(),
+            user: "alice".to_string().into(),
             host: "h".to_string(),
             method: "x509".to_string(),
             authority: String::new(),
@@ -2359,7 +2363,7 @@ ASG(ROLE_GATED) {
             "x509 client must match METHOD(\"x509\") rule"
         );
         let ca_creds = ClientCreds {
-            user: "alice".to_string(),
+            user: "alice".to_string().into(),
             host: "h".to_string(),
             method: "ca".to_string(),
             authority: String::new(),
@@ -2372,7 +2376,7 @@ ASG(ROLE_GATED) {
 
         // ── Axis 2: authority ────────────────────────────────────────────
         let trusted_creds = ClientCreds {
-            user: "alice".to_string(),
+            user: "alice".to_string().into(),
             host: "h".to_string(),
             method: "x509".to_string(),
             authority: "Trusted Root".to_string(),
@@ -2383,7 +2387,7 @@ ASG(ROLE_GATED) {
             "correct authority must match AUTHORITY(\"Trusted Root\")"
         );
         let other_ca_creds = ClientCreds {
-            user: "alice".to_string(),
+            user: "alice".to_string().into(),
             host: "h".to_string(),
             method: "x509".to_string(),
             authority: "Other CA".to_string(),
@@ -2398,18 +2402,18 @@ ASG(ROLE_GATED) {
         // "role/ops" credential string matches UAG(ops_role) { role/ops }.
         // Pre-fix: roles were not built into credential strings at all.
         let ops_creds = ClientCreds {
-            user: "bob".to_string(),
+            user: "bob".to_string().into(),
             host: "h".to_string(),
             method: "ca".to_string(),
             authority: String::new(),
-            roles: vec!["ops".to_string()],
+            roles: vec!["ops".to_string().into()],
         };
         assert!(
             acl.can_write_creds("AI:ROLE", &ops_creds).await,
             "client with role 'ops' must match UAG entry 'role/ops'"
         );
         let no_role_creds = ClientCreds {
-            user: "bob".to_string(),
+            user: "bob".to_string().into(),
             host: "h".to_string(),
             method: "ca".to_string(),
             authority: String::new(),
@@ -2457,13 +2461,13 @@ ASG(ROLE_GATED) {
         let db = Arc::new(PvDatabase::new());
         let provider = BridgeProvider::new(db);
         // Default policy
-        assert!(provider.can_read("X", "u", "h").await);
-        assert!(provider.can_write("X", "u", "h").await);
+        assert!(provider.can_read("X", b"u", "h").await);
+        assert!(provider.can_write("X", b"u", "h").await);
 
         // Swap to read-only
         provider.set_access_control(Arc::new(ReadOnly));
-        assert!(provider.can_read("X", "u", "h").await);
-        assert!(!provider.can_write("X", "u", "h").await);
+        assert!(provider.can_read("X", b"u", "h").await);
+        assert!(!provider.can_write("X", b"u", "h").await);
     }
 
     #[tokio::test]
@@ -2614,13 +2618,13 @@ ASG(ANON_GATED) {
         // Legacy 3-arg path (create_channel / create_channel_for
         // funnel through these). Empty method on the branch.
         assert!(
-            acl.can_read("AI:ANON", "alice", "h").await,
+            acl.can_read("AI:ANON", b"alice", "h").await,
             "legacy can_read must match METHOD(\"anonymous\") rule"
         );
 
         // Explicit-identity context: also a no-method legacy path.
         let id_creds = ClientCreds {
-            user: "alice".to_string(),
+            user: "alice".to_string().into(),
             host: "h".to_string(),
             method: String::new(),
             authority: String::new(),
@@ -2635,7 +2639,7 @@ ASG(ANON_GATED) {
         // into anonymous — the normalization only fills an *empty*
         // method, so a ca client still fails the anonymous-only rule.
         let ca_creds = ClientCreds {
-            user: "alice".to_string(),
+            user: "alice".to_string().into(),
             host: "h".to_string(),
             method: "ca".to_string(),
             authority: String::new(),

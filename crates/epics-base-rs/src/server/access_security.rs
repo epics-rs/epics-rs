@@ -153,10 +153,10 @@ pub struct AccessGate {
 struct CheckKey {
     pv_name: String,
     host: String,
-    user: String,
+    user: Vec<u8>,
     method: String,
     authority: String,
-    roles: Vec<String>,
+    roles: Vec<crate::types::PvString>,
 }
 
 #[derive(Clone, Copy)]
@@ -536,8 +536,9 @@ fn report_asg_inp_refused(
         )
     };
     let level = config.map_or(AccessLevel::ReadWrite, |c| {
-        let user = std::env::var("USER").unwrap_or_default();
-        c.check_access_asl(&asg, &crate::runtime::env::hostname(), &user, asl)
+        // asCa's libca circuit names itself as `cac.cpp:176-178` does.
+        let user = crate::runtime::env::user_name().unwrap_or_default();
+        c.check_access_asl(&asg, crate::runtime::env::ca_local_host_name(), &user, asl)
     });
     crate::runtime::log::errlog_vprintf(format_args!(
         "dbCa:exceptionCallback stat \"Unable to allocate additional dynamic memory\" \
@@ -709,7 +710,7 @@ impl AccessGate {
         &self,
         pv_name: impl Into<String>,
         host: &str,
-        user: &str,
+        user: impl AsRef<[u8]>,
         method: &str,
         authority: &str,
     ) -> AccessChecked {
@@ -725,8 +726,8 @@ impl AccessGate {
         &self,
         pv_name: impl Into<String>,
         host: &str,
-        user: &str,
-        roles: &[String],
+        user: impl AsRef<[u8]>,
+        roles: &[crate::types::PvString],
         method: &str,
         authority: &str,
     ) -> AccessChecked {
@@ -751,7 +752,7 @@ impl AccessGate {
                         let key = self.inp_resolver.is_none().then(|| CheckKey {
                             pv_name: pv_name.clone(),
                             host: host.to_string(),
-                            user: user.to_string(),
+                            user: user.as_ref().to_vec(),
                             method: method.to_string(),
                             authority: authority.to_string(),
                             roles: roles.to_vec(),
@@ -781,11 +782,13 @@ impl AccessGate {
                             None => None,
                             Some(ref res) => {
                                 let mut inputs = AsgInputs::default();
-                                if let Some(group) =
-                                    cfg.asg.get(&asg).or_else(|| cfg.asg.get("DEFAULT"))
-                                {
+                                if let Some(group) = cfg.asg_or_default(asg.as_bytes()) {
                                     for inp in &group.inp {
-                                        inputs.record(inp.index, res(inp.link.clone()).await);
+                                        let value = match inp.record_link() {
+                                            Some(link) => res(link.to_owned()).await,
+                                            None => None,
+                                        };
+                                        inputs.record(inp.index, value);
                                     }
                                 }
                                 Some(inputs)
@@ -794,7 +797,7 @@ impl AccessGate {
                         let (level, rule_was_trap) = cfg.compute_for_name(
                             &asg,
                             host,
-                            user,
+                            user.as_ref(),
                             roles,
                             asl,
                             method,
@@ -955,19 +958,19 @@ pub struct AccessRule {
     /// Three-way access this rule grants when it matches. C
     /// `asLib.y:259-267` distinguishes `NONE`/`READ`/`WRITE`.
     pub access: RuleAccess,
-    pub uag: Vec<String>,
-    pub hag: Vec<String>,
+    pub uag: Vec<Vec<u8>>,
+    pub hag: Vec<Vec<u8>>,
     /// Authentication method scope (epics-base PR #563). When set,
     /// the rule only applies when the requesting client authenticated
     /// via one of the listed methods. Common values: `"anonymous"`,
     /// `"ca"`, `"x509"`, `"cap-token"`. Empty vector means "any method".
-    pub method: Vec<String>,
+    pub method: Vec<Vec<u8>>,
     /// Cert authority / issuer scope (epics-base PR #563 + #618).
     /// When set, the rule only applies when the client's authenticator
     /// was vouched by one of the listed authorities — e.g. an
     /// X.509 issuer DN, or the cap-token issuer ID. Empty means "any
     /// authority".
-    pub authority: Vec<String>,
+    pub authority: Vec<Vec<u8>>,
     /// Write-trap mask (epics-base `asLib.y:272-283` `rule_log_option`,
     /// `AS_TRAP_WRITE`). `true` when the RULE header carried the
     /// `TRAPWRITE` option, `false` for `NOTRAPWRITE` or no option.
@@ -985,7 +988,7 @@ pub struct AccessRule {
     /// `RULE(...) { CALC("A=1") }`). `None` means an unconditional
     /// rule. When `Some`, the rule only grants access while the
     /// expression evaluates to 1 against the ASG's `INP*` link values.
-    pub calc: Option<String>,
+    pub calc: Option<Vec<u8>>,
     /// The expression compiled at ACF parse — C compiles a RULE's CALC
     /// once at load (`asAsgRuleCalc` runs `postfix()`), then every
     /// `asComputePvt` evaluates the stored RPN. `parse_acf` upholds
@@ -1109,7 +1112,15 @@ pub struct AsgInp {
     /// Letter index: 0 = `A`, .. 20 = `U`.
     pub index: u8,
     /// The link string (typically a record.field PV name).
-    pub link: String,
+    pub link: Vec<u8>,
+}
+
+impl AsgInp {
+    /// The link as a record name. Database names are text, so a link that is
+    /// not UTF-8 names no record and its input is bad, as an unknown name is.
+    pub fn record_link(&self) -> Option<&str> {
+        std::str::from_utf8(&self.link).ok()
+    }
 }
 
 /// Split an ASG `INP*` link into the `(record, field)` it names — C's
@@ -1127,15 +1138,17 @@ pub fn inp_link_target(link: &str) -> (&str, &str) {
 /// Access Security Configuration parsed from an ACF file.
 #[derive(Debug, Clone)]
 pub struct AccessSecurityConfig {
-    pub uag: HashMap<String, Vec<String>>,
-    pub hag: HashMap<String, Vec<String>>,
+    /// Names and members as the file spells them: C keys and compares every
+    /// ACF token by its bytes (`gphFind`, `strcmp`).
+    pub uag: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    pub hag: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     /// The HAG members exactly as spelled in the ACF, keyed like `hag`.
     /// `hag` stores `hag_members` resolution *output* (dotted quads
     /// under `asCheckClientIP`), which cannot be re-resolved after a
     /// DNS change; [`Self::with_refreshed_hags`] re-runs the resolution
     /// from these raw spellings (epics-base#863 / UI-107).
-    pub hag_raw: HashMap<String, Vec<String>>,
-    pub asg: HashMap<String, AccessSecurityGroup>,
+    pub hag_raw: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    pub asg: HashMap<Vec<u8>, AccessSecurityGroup>,
     pub unknown_access: AccessLevel,
 }
 
@@ -1152,7 +1165,7 @@ impl AccessSecurityConfig {
     /// refresh) — this is the sibling of the CA-side `refresh_dns`
     /// deviation that closed the client half of that issue.
     pub fn with_refreshed_hags(&self) -> Option<Self> {
-        let refreshed: HashMap<String, Vec<String>> = self
+        let refreshed: HashMap<Vec<u8>, Vec<Vec<u8>>> = self
             .hag_raw
             .iter()
             .map(|(name, raw)| (name.clone(), hag_members(raw)))
@@ -1166,7 +1179,7 @@ impl AccessSecurityConfig {
     }
 
     /// Render the parsed ACF (UAG/HAG/ASG with their `INP*` links and
-    /// RULEs) in C `asDumpFP` shape, as a `String`.
+    /// RULEs) in C `asDumpFP` shape, as the raw bytes C's `%s` prints.
     ///
     /// This is the single owner of the dump format: the `asdbdump` iocsh
     /// command and the CA gateway's R3 access-security report both render
@@ -1180,32 +1193,32 @@ impl AccessSecurityConfig {
     /// the `aspmem` iocsh command, which derives membership by scanning
     /// records rather than from an `asgMemberList`). The dump therefore
     /// covers the parsed configuration structures only.
-    pub fn dump_report(&self) -> String {
-        let mut out = String::new();
+    pub fn dump_report(&self) -> Vec<u8> {
+        let mut out = Vec::new();
         let mut uags: Vec<_> = self.uag.keys().collect();
         uags.sort();
         for name in uags {
-            out.push_str(&format!("UAG({name})\n"));
+            push_all(&mut out, &[b"UAG(", name, b")\n"]);
             for m in &self.uag[name] {
-                out.push('\t');
+                out.push(b'\t');
                 dump_quoted(&mut out, m);
-                out.push('\n');
+                out.push(b'\n');
             }
         }
         let mut hags: Vec<_> = self.hag.keys().collect();
         hags.sort();
         for name in hags {
-            out.push_str(&format!("HAG({name})\n"));
+            push_all(&mut out, &[b"HAG(", name, b")\n"]);
             for h in &self.hag[name] {
-                out.push('\t');
+                out.push(b'\t');
                 dump_quoted(&mut out, h);
-                out.push('\n');
+                out.push(b'\n');
             }
         }
         let mut asgs: Vec<_> = self.asg.keys().collect();
         asgs.sort();
         for name in asgs {
-            out.push_str(&format!("ASG({name})\n"));
+            push_all(&mut out, &[b"ASG(", name, b")\n"]);
             self.fmt_asg(name, &mut out);
         }
         out
@@ -1214,13 +1227,13 @@ impl AccessSecurityConfig {
     /// Append one ASG's `INP*` links and RULEs to `out`, in C `asDumpFP`
     /// shape. Shared by [`Self::dump_report`] and the `asprules` iocsh
     /// command's per-ASG renderer so the rule format has one owner.
-    pub fn fmt_asg(&self, name: &str, out: &mut String) {
-        let Some(asg) = self.asg.get(name) else {
+    pub fn fmt_asg(&self, name: impl AsRef<[u8]>, out: &mut Vec<u8>) {
+        let Some(asg) = self.asg.get(name.as_ref()) else {
             return;
         };
         for inp in &asg.inp {
-            let letter = (b'A' + inp.index) as char;
-            out.push_str(&format!("\tINP{letter}(\"{}\")\n", inp.link));
+            let letter = [b'A' + inp.index];
+            push_all(out, &[b"\tINP", &letter, b"(\"", &inp.link, b"\")\n"]);
         }
         for rule in &asg.rules {
             let access = match rule.access {
@@ -1229,21 +1242,23 @@ impl AccessSecurityConfig {
                 RuleAccess::Write => "WRITE",
             };
             let disabled = if rule.ignore { " [DISABLED]" } else { "" };
-            out.push_str(&format!("\tRULE({},{access}){disabled}\n", rule.level));
+            out.extend_from_slice(
+                format!("\tRULE({},{access}){disabled}\n", rule.level).as_bytes(),
+            );
             for u in &rule.uag {
-                out.push_str(&format!("\t\tUAG({u})\n"));
+                push_all(out, &[b"\t\tUAG(", u, b")\n"]);
             }
             for h in &rule.hag {
-                out.push_str(&format!("\t\tHAG({h})\n"));
+                push_all(out, &[b"\t\tHAG(", h, b")\n"]);
             }
             for m in &rule.method {
-                out.push_str(&format!("\t\tMETHOD(\"{m}\")\n"));
+                push_all(out, &[b"\t\tMETHOD(\"", m, b"\")\n"]);
             }
             for a in &rule.authority {
-                out.push_str(&format!("\t\tAUTHORITY(\"{a}\")\n"));
+                push_all(out, &[b"\t\tAUTHORITY(\"", a, b"\")\n"]);
             }
             if let Some(calc) = &rule.calc {
-                out.push_str(&format!("\t\tCALC(\"{calc}\")\n"));
+                push_all(out, &[b"\t\tCALC(\"", calc, b"\")\n"]);
             }
         }
     }
@@ -1255,7 +1270,12 @@ impl AccessSecurityConfig {
     /// rules typically declared at level 0/1. New code should call
     /// [`Self::check_access_asl`] so a per-record ASL can correctly
     /// disable a rule whose level is below the record's ASL.
-    pub fn check_access(&self, asg_name: &str, host: &str, user: &str) -> AccessLevel {
+    pub fn check_access(
+        &self,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
+    ) -> AccessLevel {
         self.check_access_asl(asg_name, host, user, 0)
     }
 
@@ -1267,9 +1287,9 @@ impl AccessSecurityConfig {
     /// (legacy behaviour preserved).
     pub fn check_access_method(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
         record_asl: u8,
         method: &str,
         authority: &str,
@@ -1301,32 +1321,35 @@ impl AccessSecurityConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn compute_for_name(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
-        roles: &[String],
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
+        roles: &[crate::types::PvString],
         record_asl: u8,
         method: &str,
         authority: &str,
         inputs: Option<&AsgInputs>,
     ) -> (AccessLevel, bool) {
-        let asg = match self.asg.get(asg_name) {
-            Some(a) => a,
-            None => match self.asg.get("DEFAULT") {
-                Some(a) => a,
-                None => return (AccessLevel::NoAccess, false),
-            },
+        let Some(asg) = self.asg_or_default(asg_name.as_ref()) else {
+            return (AccessLevel::NoAccess, false);
         };
         self.compute_rules(
-            asg, host, user, roles, record_asl, method, authority, inputs,
+            asg,
+            host.as_ref(),
+            user.as_ref(),
+            roles,
+            record_asl,
+            method,
+            authority,
+            inputs,
         )
     }
 
     pub fn check_access_method_trap(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
         record_asl: u8,
         method: &str,
         authority: &str,
@@ -1339,15 +1362,10 @@ impl AccessSecurityConfig {
         // that by always inserting an (empty) `DEFAULT`. A missing
         // `DEFAULT` here would mean the config was built by hand
         // bypassing `parse_acf`; fail CLOSED rather than open.
-        let asg = match self.asg.get(asg_name) {
-            Some(a) => a,
-            None => match self.asg.get("DEFAULT") {
-                Some(a) => a,
-                // Never grant ReadWrite on an ASG-lookup
-                // miss. C resolves every miss to the always-present
-                // empty `DEFAULT` ⇒ `asNOACCESS`.
-                None => return (AccessLevel::NoAccess, false),
-            },
+        // Never grant ReadWrite on an ASG-lookup miss. C resolves every miss
+        // to the always-present empty `DEFAULT` ⇒ `asNOACCESS`.
+        let Some(asg) = self.asg_or_default(asg_name.as_ref()) else {
+            return (AccessLevel::NoAccess, false);
         };
         // C `asComputePvt` (asLibRoutines.c:983) initialises
         // `access = asNOACCESS` and only ever *raises* it on a matching
@@ -1368,7 +1386,16 @@ impl AccessSecurityConfig {
         // outcome therefore always carries `trap = false`.
         // No INP* resolution on this sync path, so a CALC-gated rule has no
         // values to evaluate against and fails CLOSED — see `compute_rules`.
-        self.compute_rules(asg, host, user, &[], record_asl, method, authority, None)
+        self.compute_rules(
+            asg,
+            host.as_ref(),
+            user.as_ref(),
+            &[],
+            record_asl,
+            method,
+            authority,
+            None,
+        )
     }
 
     /// The single rule-matching loop — C `asComputePvt`
@@ -1389,9 +1416,9 @@ impl AccessSecurityConfig {
     pub(crate) fn compute_rules(
         &self,
         asg: &AccessSecurityGroup,
-        host: &str,
-        user: &str,
-        roles: &[String],
+        host: &[u8],
+        user: &[u8],
+        roles: &[crate::types::PvString],
         record_asl: u8,
         method: &str,
         authority: &str,
@@ -1436,10 +1463,10 @@ impl AccessSecurityConfig {
                                 // strings and passes them as `user`), OR
                                 // a `role/<name>` member matches when the
                                 // client's `roles` slice carries that role.
-                                m == user
+                                m.as_slice() == user
                                     || matches!(
-                                        m.strip_prefix("role/"),
-                                        Some(role) if roles.iter().any(|r| r == role)
+                                        m.strip_prefix(b"role/"),
+                                        Some(role) if roles.iter().any(|r| r.as_bytes() == role)
                                     )
                             })
                         })
@@ -1451,19 +1478,21 @@ impl AccessSecurityConfig {
             // HAG: host comparison is case-insensitive. C stores
             // every HAG host lowercased (`asHagAddHost`) and lowercases
             // the connecting client's host before `asComputePvt`.
-            let host_lc = host.to_ascii_lowercase();
             let host_match = rule.hag.is_empty()
                 || rule.hag.iter().any(|g| {
                     self.hag
                         .get(g)
-                        .map(|members| members.iter().any(|m| m.eq_ignore_ascii_case(&host_lc)))
+                        .map(|members| members.iter().any(|m| m.eq_ignore_ascii_case(host)))
                         .unwrap_or(false)
                 });
             if !host_match {
                 continue;
             }
             let method_match = rule.method.is_empty()
-                || rule.method.iter().any(|m| m.eq_ignore_ascii_case(method));
+                || rule
+                    .method
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(method.as_bytes()));
             if !method_match {
                 continue;
             }
@@ -1471,7 +1500,7 @@ impl AccessSecurityConfig {
                 || rule
                     .authority
                     .iter()
-                    .any(|a| a.eq_ignore_ascii_case(authority));
+                    .any(|a| a.eq_ignore_ascii_case(authority.as_bytes()));
             if !authority_match {
                 continue;
             }
@@ -1519,17 +1548,25 @@ impl AccessSecurityConfig {
     /// does for an ASG that declares none.
     pub fn resolve_asg_inputs(
         &self,
-        asg_name: &str,
+        asg_name: impl AsRef<[u8]>,
         resolve: &dyn Fn(&str) -> Option<f64>,
     ) -> AsgInputs {
         let mut inputs = AsgInputs::default();
-        let Some(group) = self.asg.get(asg_name).or_else(|| self.asg.get("DEFAULT")) else {
+        let Some(group) = self.asg_or_default(asg_name.as_ref()) else {
             return inputs;
         };
         for inp in &group.inp {
-            inputs.record(inp.index, resolve(&inp.link));
+            inputs.record(inp.index, inp.record_link().and_then(resolve));
         }
         inputs
+    }
+
+    /// `asg_name`'s group, or `DEFAULT` for a name the file does not declare
+    /// (C `asAddMemberPvt`).
+    fn asg_or_default(&self, asg_name: &[u8]) -> Option<&AccessSecurityGroup> {
+        self.asg
+            .get(asg_name)
+            .or_else(|| self.asg.get(b"DEFAULT".as_slice()))
     }
 
     /// Every distinct `(record, field)` an `INP*` link in this policy names,
@@ -1538,8 +1575,8 @@ impl AccessSecurityConfig {
     pub fn inp_link_targets(&self) -> Vec<(String, String)> {
         let mut targets = std::collections::BTreeSet::new();
         for group in self.asg.values() {
-            for inp in &group.inp {
-                let (record, field) = inp_link_target(&inp.link);
+            for link in group.inp.iter().filter_map(AsgInp::record_link) {
+                let (record, field) = inp_link_target(link);
                 targets.insert((record.to_string(), field.to_string()));
             }
         }
@@ -1556,9 +1593,9 @@ impl AccessSecurityConfig {
     /// is silently equivalent to ASL 0.
     pub fn check_access_asl(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
         record_asl: u8,
     ) -> AccessLevel {
         // Forward to the method-aware path with default scopes
@@ -1615,8 +1652,9 @@ pub enum TrapWriteOp {
 pub struct TrapWriteMessage<'a> {
     pub op: TrapWriteOp,
     pub pv_name: &'a str,
-    pub user: &'a str,
-    pub host: &'a str,
+    /// C `asTrapWriteMessage::userid`: the client's bytes, never decoded.
+    pub user: &'a [u8],
+    pub host: &'a [u8],
     pub peer: &'a str,
     /// Pre-rendered value string. Empty when the listener subsystem
     /// is being notified at audit-off cost (caller may pass `""` to
@@ -1781,8 +1819,8 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
 /// connection tears down.
 pub struct TrapWriteFields {
     pub pv_name: String,
-    pub user: String,
-    pub host: String,
+    pub user: Vec<u8>,
+    pub host: Vec<u8>,
     pub peer: String,
     pub value_str: String,
     pub dbr_type: u16,
@@ -1899,8 +1937,8 @@ pub struct TrapWriteMeta<'a> {
     /// The channel (`record.FIELD`) being written — pvxs passes
     /// `dbChannelName(pChan)`.
     pub pv_name: &'a str,
-    /// Authenticated account name (pvxs `cred->account`).
-    pub user: &'a str,
+    /// Authenticated account name (pvxs `cred->account`), as bytes.
+    pub user: &'a [u8],
     /// Client host (pvxs `cred->host`).
     pub host: &'a str,
     /// Client peer ("ip:port") when the caller has the socket address;
@@ -1994,8 +2032,8 @@ where
 fn trap_fields(meta: &TrapWriteMeta<'_>, value: &crate::types::EpicsValue) -> TrapWriteFields {
     TrapWriteFields {
         pv_name: meta.pv_name.to_string(),
-        user: meta.user.to_string(),
-        host: meta.host.to_string(),
+        user: meta.user.to_vec(),
+        host: meta.host.as_bytes().to_vec(),
         peer: meta.peer.to_string(),
         value_str: value.display_truncated(64),
         dbr_type: meta.dbr_type,
@@ -2077,12 +2115,18 @@ pub fn subscribe_asg_changes() -> tokio::sync::broadcast::Receiver<()> {
 /// C `asDumpQuoted` (asLibRoutines.c:660-666, epics-base #871): print a
 /// UAG/HAG member as `"` + `epicsStrPrintEscaped` + `"`. C passes
 /// `strlen(s)`, so the escape never runs past a NUL byte.
-fn dump_quoted(out: &mut String, s: &str) {
-    let bytes = s.as_bytes();
+fn dump_quoted(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    out.push('"');
-    out.push_str(&crate::runtime::epics_string::print_escaped(&bytes[..len]));
-    out.push('"');
+    out.push(b'"');
+    out.extend_from_slice(crate::runtime::epics_string::print_escaped(&bytes[..len]).as_bytes());
+    out.push(b'"');
+}
+
+/// C `asDumpFP` prints names, links and CALC with `%s`: the bytes as stored.
+fn push_all(out: &mut Vec<u8>, parts: &[&[u8]]) {
+    for p in parts {
+        out.extend_from_slice(p);
+    }
 }
 
 /// The ACF reader, and the single owner of the line counter every rejection
@@ -2096,7 +2140,8 @@ fn dump_quoted(out: &mut String, s: &str) {
 /// sentences and simply says where they happened, because an ACF that fails
 /// on line 240 of 900 is otherwise unlocatable.
 struct AcfScanner<'a> {
-    src: &'a str,
+    /// C lexes bytes: a quoted string takes any byte but `"`, `\n` and `\`.
+    src: &'a [u8],
     /// Byte offset of the next character. The text stays addressable behind
     /// the cursor so a diagnostic can quote what the operator wrote without
     /// consuming it — see [`Self::offending`].
@@ -2106,7 +2151,7 @@ struct AcfScanner<'a> {
 }
 
 impl<'a> AcfScanner<'a> {
-    fn new(content: &'a str) -> Self {
+    fn new(content: &'a [u8]) -> Self {
         Self {
             src: content,
             pos: 0,
@@ -2114,15 +2159,15 @@ impl<'a> AcfScanner<'a> {
         }
     }
 
-    fn peek(&mut self) -> Option<char> {
-        self.src[self.pos..].chars().next()
+    fn peek(&mut self) -> Option<u8> {
+        self.src.get(self.pos).copied()
     }
 
     /// The one place the input advances, so the one place `line` moves.
-    fn next(&mut self) -> Option<char> {
-        let c = self.src[self.pos..].chars().next()?;
-        self.pos += c.len_utf8();
-        if c == '\n' {
+    fn next(&mut self) -> Option<u8> {
+        let c = *self.src.get(self.pos)?;
+        self.pos += 1;
+        if c == b'\n' {
             self.line += 1;
         }
         Some(c)
@@ -2143,11 +2188,14 @@ impl<'a> AcfScanner<'a> {
     /// the operator's console.
     fn offending(&self, accepted: &str) -> String {
         const CAP: usize = 32;
-        let rest: String = self.src[self.pos..]
-            .chars()
-            .take_while(|c| !c.is_whitespace() && !matches!(c, '(' | ')' | '{' | '}' | ',' | '#'))
+        let rest: Vec<u8> = self.src[self.pos..]
+            .iter()
+            .copied()
+            .take_while(|c| {
+                !c.is_ascii_whitespace() && !matches!(c, b'(' | b')' | b'{' | b'}' | b',' | b'#')
+            })
             .collect();
-        let token: String = accepted.chars().chain(rest.chars()).collect();
+        let token = format!("{accepted}{}", String::from_utf8_lossy(&rest));
         if token.chars().count() > CAP {
             let head: String = token.chars().take(CAP).collect();
             format!("{head}…")
@@ -2156,16 +2204,37 @@ impl<'a> AcfScanner<'a> {
         }
     }
 
+    /// The body of a quoted token, its opening `"` already consumed:
+    /// asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`, which
+    /// C stores from `yytext+1` with every `\x` pair verbatim. A newline or
+    /// EOF before the closing quote is C's "Newline in quoted string" error.
+    fn quoted(&mut self) -> CaResult<Vec<u8>> {
+        let opened = self.line;
+        let mut body = Vec::new();
+        loop {
+            match self.next() {
+                Some(b'"') => return Ok(body),
+                Some(b'\\') => match self.next() {
+                    Some(c) if c != b'\n' => body.extend([b'\\', c]),
+                    _ => break,
+                },
+                Some(b'\n') | None => break,
+                Some(c) => body.push(c),
+            }
+        }
+        Err(self.reject_at(opened, "unterminated quoted string"))
+    }
+
     /// Whitespace and `#` comments are not tokens; a comment runs to the end
     /// of its line and the newline that ends it still counts.
     fn skip_ws_comments(&mut self) {
         while let Some(c) = self.peek() {
-            if c.is_whitespace() {
+            if c.is_ascii_whitespace() {
                 self.next();
-            } else if c == '#' {
+            } else if c == b'#' {
                 while let Some(c) = self.peek() {
                     self.next();
-                    if c == '\n' {
+                    if c == b'\n' {
                         break;
                     }
                 }
@@ -2200,7 +2269,7 @@ impl<'a> AcfScanner<'a> {
     }
 }
 
-pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
+pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
         hag: HashMap::new(),
@@ -2218,9 +2287,9 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     // placeholder below.
     config
         .asg
-        .insert("DEFAULT".to_string(), AccessSecurityGroup::default());
+        .insert(b"DEFAULT".to_vec(), AccessSecurityGroup::default());
 
-    let mut sc = AcfScanner::new(content);
+    let mut sc = AcfScanner::new(content.as_ref());
     let mut buf = String::new();
 
     while sc.peek().is_some() {
@@ -2263,7 +2332,8 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 //     A file of only `(((` or only `}` is genuine
                 //     garbage and must fail closed.
                 match sc.peek() {
-                    Some(c) if matches!(c, '(' | ')' | '{' | '}' | ',') => {
+                    Some(c) if matches!(c, b'(' | b')' | b'{' | b'}' | b',') => {
+                        let c = c as char;
                         return Err(sc.reject(format!(
                             "unexpected '{c}' where a top-level block keyword is expected"
                         )));
@@ -2325,7 +2395,7 @@ fn skip_unknown_top_level_block(keyword: &str, sc: &mut AcfScanner) -> CaResult<
     sc.skip_ws_comments();
     // C `generic_head` requires a `(` here. A bare keyword with another
     // word or EOF after it matches no production ⇒ hard parse error.
-    if sc.peek() != Some('(') {
+    if sc.peek() != Some(b'(') {
         return Err(sc.reject_at(
             at,
             format!(
@@ -2340,8 +2410,8 @@ fn skip_unknown_top_level_block(keyword: &str, sc: &mut AcfScanner) -> CaResult<
     while let Some(c) = sc.peek() {
         sc.next();
         match c {
-            '(' => depth += 1,
-            ')' => {
+            b'(' => depth += 1,
+            b')' => {
                 depth -= 1;
                 if depth == 0 {
                     closed = true;
@@ -2360,14 +2430,14 @@ fn skip_unknown_top_level_block(keyword: &str, sc: &mut AcfScanner) -> CaResult<
     sc.skip_ws_comments();
     // The `{...}` body is optional (the `tokenSTRING generic_head` bare
     // form). If present it must be balanced.
-    if sc.peek() == Some('{') {
+    if sc.peek() == Some(b'{') {
         let mut depth = 0;
         let mut closed = false;
         while let Some(c) = sc.peek() {
             sc.next();
             match c {
-                '{' => depth += 1,
-                '}' => {
+                b'{' => depth += 1,
+                b'}' => {
                     depth -= 1;
                     if depth == 0 {
                         closed = true;
@@ -2445,43 +2515,56 @@ pub fn set_as_check_client_ip(on: bool) {
 /// The two halves are read from the same flag on purpose: a mixed
 /// configuration (names on one side, IPs on the other) matches nothing,
 /// which is precisely the R7-16 defect.
-fn hag_members(members: &[String]) -> Vec<String> {
+fn hag_members(members: &[Vec<u8>]) -> Vec<Vec<u8>> {
     if !as_check_client_ip() {
+        // C `tolower` in the C locale moves only ASCII letters.
         return members.iter().map(|m| m.to_ascii_lowercase()).collect();
     }
 
-    use std::net::ToSocketAddrs;
+    let unresolved = |m: &[u8]| [b"unresolved:".as_slice(), m].concat();
     members
         .iter()
-        .map(|m| match format!("{m}:0").to_socket_addrs() {
-            // C `aToIPAddr` resolves via `AF_INET` and the CA server keys ACF on
-            // an IPv4 peer address, so a HAG host must store its **IPv4** dotted
-            // quad. Taking `iter.next()` blindly would store an IPv6 address on a
-            // dual-stack host that resolves `::1` first (e.g. `localhost` on many
-            // CI runners) — an entry no IPv4 CA peer could ever match. A host with
-            // no IPv4 address is stored as the `unresolved:` sentinel, exactly as
-            // C does when `aToIPAddr` yields nothing.
-            Ok(iter) => match iter.filter(|sa| sa.is_ipv4()).map(|sa| sa.ip()).next() {
-                Some(ip) => ip.to_string(),
-                None => format!("unresolved:{m}"),
-            },
-            Err(e) => {
-                tracing::warn!(
-                    target: "epics_base_rs::access_security",
-                    host = %m,
-                    error = %e,
-                    "ACF: Unable to resolve host (asCheckClientIP=1)"
-                );
-                format!("unresolved:{m}")
-            }
+        .map(|m| {
+            // Name resolution takes text; bytes that are not UTF-8 name no host.
+            let Ok(name) = std::str::from_utf8(m) else {
+                return unresolved(m);
+            };
+            resolve_hag_host(name).unwrap_or_else(|| unresolved(m))
         })
         .collect()
 }
 
+/// `aToIPAddr` for one HAG host: its IPv4 dotted quad, or `None`.
+fn resolve_hag_host(m: &str) -> Option<Vec<u8>> {
+    use std::net::ToSocketAddrs;
+    match format!("{m}:0").to_socket_addrs() {
+        // C `aToIPAddr` resolves via `AF_INET` and the CA server keys ACF on
+        // an IPv4 peer address, so a HAG host must store its **IPv4** dotted
+        // quad. Taking `iter.next()` blindly would store an IPv6 address on a
+        // dual-stack host that resolves `::1` first (e.g. `localhost` on many
+        // CI runners) — an entry no IPv4 CA peer could ever match. A host with
+        // no IPv4 address is stored as the `unresolved:` sentinel, exactly as
+        // C does when `aToIPAddr` yields nothing.
+        Ok(iter) => iter
+            .filter(|sa| sa.is_ipv4())
+            .map(|sa| sa.ip().to_string().into_bytes())
+            .next(),
+        Err(e) => {
+            tracing::warn!(
+                target: "epics_base_rs::access_security",
+                host = %m,
+                error = %e,
+                "ACF: Unable to resolve host (asCheckClientIP=1)"
+            );
+            None
+        }
+    }
+}
+
 fn read_word(sc: &mut AcfScanner, buf: &mut String) {
     while let Some(c) = sc.peek() {
-        if c.is_alphanumeric() || c == '_' {
-            buf.push(c);
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            buf.push(c as char);
             sc.next();
         } else {
             break;
@@ -2489,9 +2572,9 @@ fn read_word(sc: &mut AcfScanner, buf: &mut String) {
     }
 }
 
-fn read_paren_name(sc: &mut AcfScanner) -> CaResult<String> {
+fn read_paren_name(sc: &mut AcfScanner) -> CaResult<Vec<u8>> {
     sc.skip_ws_comments();
-    if sc.next() != Some('(') {
+    if sc.next() != Some(b'(') {
         return Err(sc.reject("expected '('"));
     }
     let opened = sc.line;
@@ -2502,39 +2585,28 @@ fn read_paren_name(sc: &mut AcfScanner) -> CaResult<String> {
     // before `)` is a parse error rather than being silently merged
     // (`UAG(my group)` must NOT become `mygroup`). EOF before `)` is
     // also an error.
-    let mut name = String::new();
-    if sc.peek() == Some('"') {
+    let mut name = Vec::new();
+    if sc.peek() == Some(b'"') {
         sc.next();
-        let mut closed = false;
-        while let Some(c) = sc.peek() {
-            sc.next();
-            if c == '"' {
-                closed = true;
-                break;
-            }
-            name.push(c);
-        }
-        if !closed {
-            return Err(sc.reject_at(opened, "unterminated quoted name"));
-        }
+        let name = sc.quoted()?;
         sc.skip_ws_comments();
-        if sc.next() != Some(')') {
+        if sc.next() != Some(b')') {
             return Err(sc.reject("expected ')' after quoted name"));
         }
         return Ok(name);
     }
     loop {
         match sc.peek() {
-            Some(')') => {
+            Some(b')') => {
                 sc.next();
                 break;
             }
-            Some(c) if c.is_whitespace() => {
+            Some(c) if c.is_ascii_whitespace() => {
                 // Whitespace ends the name. Allow only trailing
                 // whitespace before `)`; reject embedded whitespace.
                 sc.skip_ws_comments();
                 match sc.peek() {
-                    Some(')') => {
+                    Some(b')') => {
                         sc.next();
                         break;
                     }
@@ -2558,23 +2630,23 @@ fn read_paren_name(sc: &mut AcfScanner) -> CaResult<String> {
     Ok(name)
 }
 
-fn read_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
+fn read_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<Vec<u8>>> {
     sc.skip_ws_comments();
-    if sc.next() != Some('{') {
+    if sc.next() != Some(b'{') {
         return Err(sc.reject("expected '{'"));
     }
     let opened = sc.line;
     let mut items = Vec::new();
-    let mut current = String::new();
+    let mut current = Vec::new();
 
     loop {
         sc.skip_ws_comments();
         match sc.peek() {
-            Some('}') => {
+            Some(b'}') => {
                 sc.next();
                 break;
             }
-            Some(',') => {
+            Some(b',') => {
                 sc.next();
                 if !current.is_empty() {
                     items.push(current.clone());
@@ -2584,42 +2656,35 @@ fn read_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
             // Quoted string: asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`
             // where stringchar is [^"\n\\]. Allows '/' so "role/groupname" entries work.
             // pvxs/documentation/ioc.rst shows: UAG(special) { someone, "role/op" }
-            Some('"') => {
+            Some(b'"') => {
                 sc.next(); // consume opening '"'
-                let quote_opened = sc.line;
                 if !current.is_empty() {
                     items.push(current.clone());
                     current.clear();
                 }
-                let mut quoted = String::new();
-                loop {
-                    match sc.next() {
-                        Some('"') => break,
-                        Some('\\') => {
-                            if let Some(esc) = sc.next() {
-                                quoted.push(esc);
-                            }
-                        }
-                        Some('\n') | None => {
-                            return Err(sc.reject_at(quote_opened, "unterminated quoted string"));
-                        }
-                        Some(c) => quoted.push(c),
-                    }
-                }
+                let quoted = sc.quoted()?;
                 if !quoted.is_empty() {
                     items.push(quoted);
                 }
             }
             // Unquoted name: asLib_lex.l `name [a-zA-Z0-9_\-+:.\[\]<>;]`
             Some(c)
-                if c.is_alphanumeric()
-                    || matches!(c, '_' | '.' | '-' | '+' | ':' | '[' | ']' | '<' | '>' | ';') =>
+                if c.is_ascii_alphanumeric()
+                    || matches!(
+                        c,
+                        b'_' | b'.' | b'-' | b'+' | b':' | b'[' | b']' | b'<' | b'>' | b';'
+                    ) =>
             {
                 current.push(c);
                 sc.next();
             }
-            Some(_) => {
-                sc.next();
+            // asLib_lex.l `.`: any other byte is a yyerror.
+            Some(c) => {
+                return Err(sc.reject(if c.is_ascii_graphic() || c == b' ' {
+                    format!("Invalid character '{}'", c as char)
+                } else {
+                    format!("Invalid character 0x{c:02x}")
+                }));
             }
             None => return Err(sc.reject_at(opened, "unterminated '{'")),
         }
@@ -2632,7 +2697,7 @@ fn read_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
 
 fn parse_asg_body(sc: &mut AcfScanner) -> CaResult<AccessSecurityGroup> {
     sc.skip_ws_comments();
-    if sc.next() != Some('{') {
+    if sc.next() != Some(b'{') {
         return Err(sc.reject("expected '{' after ASG name"));
     }
     let opened = sc.line;
@@ -2642,7 +2707,7 @@ fn parse_asg_body(sc: &mut AcfScanner) -> CaResult<AccessSecurityGroup> {
     loop {
         sc.skip_ws_comments();
         match sc.peek() {
-            Some('}') => {
+            Some(b'}') => {
                 sc.next();
                 break;
             }
@@ -2706,7 +2771,7 @@ fn parse_inp_index(suffix: &str) -> Option<u8> {
 
 fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
     sc.skip_ws_comments();
-    if sc.next() != Some('(') {
+    if sc.next() != Some(b'(') {
         return Err(sc.reject("expected '(' after RULE"));
     }
 
@@ -2717,12 +2782,12 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
     // rather than silently re-read as level 1.
     sc.skip_ws_comments();
     let mut level_str = String::new();
-    if matches!(sc.peek(), Some('+') | Some('-')) {
-        level_str.push(sc.next().unwrap());
+    if matches!(sc.peek(), Some(b'+') | Some(b'-')) {
+        level_str.push(sc.next().unwrap() as char);
     }
     while let Some(c) = sc.peek() {
         if c.is_ascii_digit() {
-            level_str.push(c);
+            level_str.push(c as char);
             sc.next();
         } else {
             break;
@@ -2742,7 +2807,7 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
         .map_err(|_| sc.reject(format!("RULE level out of range: {level_num}")))?;
 
     sc.skip_ws_comments();
-    if sc.peek() == Some(',') {
+    if sc.peek() == Some(b',') {
         sc.next();
     }
 
@@ -2789,7 +2854,7 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
     // subsystem not present in this crate (see the UNFIXED note).
     let mut trap = false;
     sc.skip_ws_comments();
-    if sc.peek() == Some(',') {
+    if sc.peek() == Some(b',') {
         sc.next();
         sc.skip_ws_comments();
         let mut log_opt = String::new();
@@ -2805,7 +2870,7 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
     }
 
     sc.skip_ws_comments();
-    if sc.peek() == Some(')') {
+    if sc.peek() == Some(b')') {
         sc.next();
     }
 
@@ -2817,15 +2882,15 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
     // The CALC clause travels with the line it was written on: the two
     // rejections below name the expression, and a rule body can close many
     // lines after the `CALC(...)` that is wrong.
-    let mut calc: Option<(u32, String)> = None;
+    let mut calc: Option<(u32, Vec<u8>)> = None;
 
     sc.skip_ws_comments();
-    if sc.peek() == Some('{') {
+    if sc.peek() == Some(b'{') {
         sc.next();
         loop {
             sc.skip_ws_comments();
             match sc.peek() {
-                Some('}') => {
+                Some(b'}') => {
                     sc.next();
                     break;
                 }
@@ -2833,11 +2898,9 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
                     let mut kw = String::new();
                     read_word(sc, &mut kw);
                     if kw == "UAG" {
-                        let name = read_paren_name(sc)?;
-                        uag.push(name);
+                        uag.push(read_paren_name(sc)?);
                     } else if kw == "HAG" {
-                        let name = read_paren_name(sc)?;
-                        hag.push(name);
+                        hag.push(read_paren_name(sc)?);
                     } else if kw == "METHOD" {
                         // PR #563: METHOD("ca", "x509", ...)
                         method.extend(read_paren_string_list(sc)?);
@@ -2870,7 +2933,7 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
                         );
                         ignore = true;
                         sc.skip_ws_comments();
-                        if sc.peek() == Some('(') {
+                        if sc.peek() == Some(b'(') {
                             let _ = read_paren_name(sc)?;
                         }
                     }
@@ -2901,8 +2964,12 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
     let mut inp_used: u32 = 0;
     let calc_compiled = match calc {
         Some((at, ref expr)) => {
-            let compiled = crate::calc::compile(expr)
-                .map_err(|e| sc.reject_at(at, format!("bad CALC expression '{expr}': {e}")))?;
+            let shown = String::from_utf8_lossy(expr);
+            // A byte that is not UTF-8 is no CALC token, as in C `postfix`.
+            let compiled = std::str::from_utf8(expr)
+                .map_err(|e| e.to_string())
+                .and_then(|text| crate::calc::compile(text).map_err(|e| e.to_string()))
+                .map_err(|e| sc.reject_at(at, format!("bad CALC expression '{shown}': {e}")))?;
             // C `asAsgRuleCalc` (`asLibRoutines.c:1416-1425`) runs
             // `calcArgUsage` right after `postfix()` and refuses the rule when
             // the expression stores into an argument:
@@ -2923,7 +2990,7 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
             if stores != 0 {
                 return Err(sc.reject_at(
                     at,
-                    format!("assignment operator used in CALC expression '{expr}'"),
+                    format!("assignment operator used in CALC expression '{shown}'"),
                 ));
             }
             inp_used = used;
@@ -2952,31 +3019,25 @@ fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
 /// spaces that `read_paren_name` would mangle (it strips whitespace).
 /// Accepts `( "expr" )` or `( expr )`; whitespace around the parens is
 /// skipped, whitespace *inside* a quoted body is preserved.
-fn read_paren_name_raw(sc: &mut AcfScanner) -> CaResult<String> {
+fn read_paren_name_raw(sc: &mut AcfScanner) -> CaResult<Vec<u8>> {
     sc.skip_ws_comments();
-    if sc.next() != Some('(') {
+    if sc.next() != Some(b'(') {
         return Err(sc.reject("expected '(' after CALC"));
     }
     let opened = sc.line;
     sc.skip_ws_comments();
-    let mut body = String::new();
-    if sc.peek() == Some('"') {
+    let mut body = Vec::new();
+    if sc.peek() == Some(b'"') {
         sc.next();
-        while let Some(c) = sc.peek() {
-            sc.next();
-            if c == '"' {
-                break;
-            }
-            body.push(c);
-        }
+        body = sc.quoted()?;
         sc.skip_ws_comments();
-        if sc.next() != Some(')') {
+        if sc.next() != Some(b')') {
             return Err(sc.reject_at(opened, "expected ')' after CALC expression"));
         }
     } else {
         // Unquoted form — read until the closing paren.
         while let Some(c) = sc.peek() {
-            if c == ')' {
+            if c == b')' {
                 sc.next();
                 break;
             }
@@ -2984,7 +3045,7 @@ fn read_paren_name_raw(sc: &mut AcfScanner) -> CaResult<String> {
             sc.next();
         }
     }
-    Ok(body.trim().to_string())
+    Ok(body.trim_ascii().to_vec())
 }
 
 /// Parse `(item1, "item 2", ...)` — commas separate items, optional
@@ -2992,30 +3053,29 @@ fn read_paren_name_raw(sc: &mut AcfScanner) -> CaResult<String> {
 /// rule clauses (epics-base PR #563/#618). Whitespace inside an
 /// unquoted item is preserved verbatim *between* word characters but
 /// trimmed at the boundaries; the typical caller passes quoted strings.
-fn read_paren_string_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
+fn read_paren_string_list(sc: &mut AcfScanner) -> CaResult<Vec<Vec<u8>>> {
     sc.skip_ws_comments();
-    if sc.next() != Some('(') {
+    if sc.next() != Some(b'(') {
         return Err(sc.reject("expected '(' after METHOD/AUTHORITY"));
     }
     let opened = sc.line;
     let mut items = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
+    let mut current = Vec::new();
     loop {
         match sc.peek() {
-            Some('"') => {
+            Some(b'"') => {
                 sc.next();
-                in_quotes = !in_quotes;
+                current.extend(sc.quoted()?);
             }
-            Some(')') if !in_quotes => {
+            Some(b')') => {
                 sc.next();
                 break;
             }
-            Some(',') if !in_quotes => {
+            Some(b',') => {
                 sc.next();
-                let trimmed = current.trim().to_string();
+                let trimmed = current.trim_ascii();
                 if !trimmed.is_empty() {
-                    items.push(trimmed);
+                    items.push(trimmed.to_vec());
                 }
                 current.clear();
             }
@@ -3028,9 +3088,9 @@ fn read_paren_string_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
             }
         }
     }
-    let trimmed = current.trim().to_string();
+    let trimmed = current.trim_ascii();
     if !trimmed.is_empty() {
-        items.push(trimmed);
+        items.push(trimmed.to_vec());
     }
     Ok(items)
 }
@@ -3038,6 +3098,10 @@ fn read_paren_string_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bs(items: &[&str]) -> Vec<Vec<u8>> {
+        items.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
 
     /// [`AS_CHECK_CLIENT_IP`] is a process-global flag, mirroring C's
     /// global IOC variable — every `parse_acf` call whose ACF has a
@@ -3071,10 +3135,16 @@ ASG(DEFAULT) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        assert_eq!(config.uag.get("admins").unwrap(), &["user1", "user2"]);
-        assert_eq!(config.hag.get("operators").unwrap(), &["host1", "host2"]);
-        assert!(config.asg.contains_key("DEFAULT"));
-        assert_eq!(config.asg["DEFAULT"].rules.len(), 2);
+        assert_eq!(
+            config.uag[b"admins".as_slice()],
+            [b"user1".to_vec(), b"user2".to_vec()]
+        );
+        assert_eq!(
+            config.hag.get(b"operators".as_slice()).unwrap(),
+            &bs(&["host1", "host2"])
+        );
+        assert!(config.asg.contains_key(b"DEFAULT".as_slice()));
+        assert_eq!(config.asg[b"DEFAULT".as_slice()].rules.len(), 2);
     }
 
     #[test]
@@ -3094,8 +3164,11 @@ ASG(SECURE) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        assert_eq!(config.uag["ops"], vec!["alice", "bob"]);
-        assert_eq!(config.hag["lab"], vec!["lab-pc1.invalid"]);
+        assert_eq!(
+            config.uag[b"ops".as_slice()],
+            [b"alice".to_vec(), b"bob".to_vec()]
+        );
+        assert_eq!(config.hag[b"lab".as_slice()], bs(&["lab-pc1.invalid"]));
     }
 
     /// R7-16 / C `asHagAddHost` (`asLibRoutines.c:1218-1256`): with
@@ -3118,8 +3191,8 @@ ASG(DEFAULT) {
 "#;
         let config = parse_acf(acf).unwrap();
         assert_eq!(
-            config.hag["local"],
-            vec!["localhost"],
+            config.hag[b"local".as_slice()],
+            bs(&["localhost"]),
             "C stores the lowercased literal name and resolves nothing"
         );
         assert_eq!(
@@ -3150,8 +3223,8 @@ ASG(DEFAULT) {
         let config = parse_acf(acf).unwrap();
         set_as_check_client_ip(false); // restore before asserting
         assert_eq!(
-            config.hag["local"],
-            vec!["127.0.0.1"],
+            config.hag[b"local".as_slice()],
+            bs(&["127.0.0.1"]),
             "C resolves the host to its IP under asCheckClientIP"
         );
         assert_eq!(
@@ -3170,7 +3243,10 @@ ASG(DEFAULT) {
         set_as_check_client_ip(true);
         let config = parse_acf("HAG(lab) { lab-pc1.invalid }\n").unwrap();
         set_as_check_client_ip(false);
-        assert_eq!(config.hag["lab"], vec!["unresolved:lab-pc1.invalid"]);
+        assert_eq!(
+            config.hag[b"lab".as_slice()],
+            bs(&["unresolved:lab-pc1.invalid"])
+        );
     }
 
     #[test]
@@ -3188,14 +3264,14 @@ ASG(DEFAULT) {
 }
 "#;
         let config = parse_acf(acf).expect("parser must not abort on bad DNS");
-        let entries = &config.hag["quarantine"];
+        let entries = &config.hag[b"quarantine".as_slice()];
         assert_eq!(
             entries.len(),
             2,
             "literal entries preserved verbatim; no resolved IPs appended"
         );
-        assert_eq!(entries[0], "gone.invalid");
-        assert_eq!(entries[1], "alive.invalid");
+        assert_eq!(entries[0], b"gone.invalid");
+        assert_eq!(entries[1], b"alive.invalid");
     }
 
     /// UI-107 / epics-base#863 (access-security half): under
@@ -3207,20 +3283,20 @@ ASG(DEFAULT) {
         let _guard = lock_as_check_client_ip();
         set_as_check_client_ip(true);
         let mut config = parse_acf("HAG(local) { localhost }\n").unwrap();
-        assert_eq!(config.hag_raw["local"], vec!["localhost"]);
+        assert_eq!(config.hag_raw[b"local".as_slice()], bs(&["localhost"]));
 
         // Simulate DNS moving after load: the stored quad no longer
         // matches what `localhost` resolves to.
-        config.hag.insert("local".into(), vec!["192.0.2.1".into()]);
+        config.hag.insert(b"local".to_vec(), bs(&["192.0.2.1"]));
 
         let refreshed = config
             .with_refreshed_hags()
             .expect("a moved resolution must produce a refreshed config");
         set_as_check_client_ip(false);
-        assert_eq!(refreshed.hag["local"], vec!["127.0.0.1"]);
+        assert_eq!(refreshed.hag[b"local".as_slice()], bs(&["127.0.0.1"]));
         assert_eq!(
-            refreshed.hag_raw["local"],
-            vec!["localhost"],
+            refreshed.hag_raw[b"local".as_slice()],
+            bs(&["localhost"]),
             "raw spellings survive the refresh for the next round"
         );
     }
@@ -3250,8 +3326,8 @@ ASG(DEFAULT) {
         let _guard = lock_as_check_client_ip();
         set_as_check_client_ip(false);
         let config = parse_acf("HAG(local) { LocalHost }\n").unwrap();
-        assert_eq!(config.hag_raw["local"], vec!["LocalHost"]);
-        assert_eq!(config.hag["local"], vec!["localhost"]);
+        assert_eq!(config.hag_raw[b"local".as_slice()], bs(&["LocalHost"]));
+        assert_eq!(config.hag[b"local".as_slice()], bs(&["localhost"]));
         assert!(config.with_refreshed_hags().is_none());
     }
 
@@ -3285,6 +3361,109 @@ ASG(READONLY) {
             config.check_access("READONLY", "host1", "regular"),
             AccessLevel::Read
         );
+    }
+
+    /// C `asCompute` compares the user with `strcmp`: bytes, so a non-UTF-8
+    /// user matches only its own bytes, never its U+FFFD rendering.
+    #[test]
+    fn a_uag_member_matches_the_user_s_bytes() {
+        let _guard = lock_as_check_client_ip();
+        let acf = "UAG(ops) { \"op\u{fffd}\", \"op\u{e9}\" }\nASG(G) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.check_access("G", "h", b"op\xff"),
+            AccessLevel::NoAccess
+        );
+        assert_eq!(
+            config.check_access("G", "h", "op\u{e9}"),
+            AccessLevel::ReadWrite
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_uag_member_keeps_its_bytes() {
+        let _guard = lock_as_check_client_ip();
+        let acf = b"UAG(ops) { \"op\xff\" }\nASG(G) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(config.uag[b"ops".as_slice()], [b"op\xff".to_vec()]);
+        assert_eq!(
+            config.check_access("G", "h", b"op\xff"),
+            AccessLevel::ReadWrite
+        );
+        assert_eq!(
+            config.check_access("G", "h", "op\u{fffd}"),
+            AccessLevel::NoAccess
+        );
+        // Unquoted, the byte is outside C's name class.
+        assert!(parse_acf(b"UAG(ops) { op\xff }\n").is_err());
+    }
+
+    /// C keys groups and compares HAG hosts by their bytes, lowercasing only
+    /// ASCII letters (`asLibRoutines.c:1233-1236`, `:378-381`).
+    #[test]
+    fn non_utf8_group_names_and_hosts_keep_their_bytes() {
+        let _guard = lock_as_check_client_ip();
+        let acf = b"HAG(\"h\xff\") { \"Lab\xc0pc\" }\n\
+                    ASG(\"g\xff\") {\n    RULE(1, WRITE) { HAG(\"h\xff\") }\n}\n";
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(config.hag[b"h\xff".as_slice()], [b"lab\xc0pc".to_vec()]);
+        assert_eq!(
+            config.check_access(b"g\xff", b"LAB\xc0PC", "u"),
+            AccessLevel::ReadWrite
+        );
+        assert_eq!(
+            config.check_access("g\u{fffd}", b"lab\xc0pc", "u"),
+            AccessLevel::NoAccess
+        );
+        assert_eq!(
+            config.check_access(b"g\xff", "lab\u{fffd}pc", "u"),
+            AccessLevel::NoAccess
+        );
+    }
+
+    /// asLib_lex.l keeps a quoted token's `\\x` pairs verbatim (`yytext+1`),
+    /// in every position a quoted token can take.
+    #[test]
+    fn quoted_tokens_keep_their_escapes_verbatim() {
+        let _guard = lock_as_check_client_ip();
+        let acf = br#"UAG("u\"g") { "op\"x", "a\\b" }
+HAG(h) { "lab\-pc" }
+ASG(G) {
+    RULE(1, WRITE) { UAG("u\"g") }
+    RULE(1, READ) { METHOD("c\"a") }
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.uag[br#"u\"g"#.as_slice()],
+            [br#"op\"x"#.to_vec(), br#"a\\b"#.to_vec()]
+        );
+        assert_eq!(config.hag[b"h".as_slice()], [br"lab\-pc".to_vec()]);
+        let rule = &config.asg[b"G".as_slice()].rules[1];
+        assert_eq!(rule.method, [br#"c\"a"#.to_vec()]);
+        assert_eq!(
+            config.check_access("G", "h", br#"op\"x"#),
+            AccessLevel::ReadWrite
+        );
+        assert_eq!(
+            config.check_access("G", "h", "op\"x"),
+            AccessLevel::NoAccess
+        );
+        // `\` before a newline is no escape: the string never closes.
+        assert!(parse_acf(b"UAG(\"a\\\n\") { x }\n").is_err());
+        assert!(parse_acf(b"UAG(a) { \"x\ny\" }\n").is_err());
+    }
+
+    /// No record has a name that is not UTF-8, so such a link is a bad input;
+    /// a byte outside UTF-8 is no CALC token.
+    #[test]
+    fn a_non_utf8_inp_link_is_bad_and_a_non_utf8_calc_is_refused() {
+        let config = parse_acf(b"ASG(G) {\n    INPA(\"r\xff\")\n    RULE(1, WRITE)\n}\n").unwrap();
+        assert_eq!(config.asg[b"G".as_slice()].inp[0].link, b"r\xff");
+        let inputs = config.resolve_asg_inputs("G", &|_| panic!("no record to read"));
+        assert_eq!(inputs.bad, 1);
+        assert!(config.inp_link_targets().is_empty());
+        assert!(parse_acf(b"ASG(G) {\n    RULE(1, WRITE) { CALC(\"A\xff\") }\n}\n").is_err());
     }
 
     #[test]
@@ -3347,10 +3526,11 @@ ASG(DEFAULT) {
         let cfg =
             parse_acf("UAG(special) { someone, \"role/op\", \"a\\\"b\" }\nHAG(hosts) { HostA }\n")
                 .unwrap();
-        let dump = cfg.dump_report();
+        let dump = String::from_utf8(cfg.dump_report()).unwrap();
         assert!(dump.contains("\t\"someone\"\n"), "{dump}");
         assert!(dump.contains("\t\"role/op\"\n"), "{dump}");
-        assert!(dump.contains("\t\"a\\\"b\"\n"), "{dump}");
+        // The member keeps its `\"`; `epicsStrPrintEscaped` escapes both bytes.
+        assert!(dump.contains("\t\"a\\\\\\\"b\"\n"), "{dump}");
         // HAG members are stored lowercased; quoted the same way.
         assert!(dump.contains("\t\"hosta\"\n"), "{dump}");
     }
@@ -3369,10 +3549,10 @@ ASG(SECURE) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        let asg = &config.asg["SECURE"];
+        let asg = &config.asg[b"SECURE".as_slice()];
         assert_eq!(asg.rules.len(), 2);
-        assert_eq!(asg.rules[0].method, vec!["ca", "x509"]);
-        assert_eq!(asg.rules[0].authority, vec!["ANL CA"]);
+        assert_eq!(asg.rules[0].method, bs(&["ca", "x509"]));
+        assert_eq!(asg.rules[0].authority, bs(&["ANL CA"]));
         assert!(
             asg.rules[1].method.is_empty(),
             "READ rule must not inherit METHOD list",
@@ -3511,7 +3691,7 @@ ASG(MIXED_CASE) {
         let config = parse_acf("UAG(ops) { alice }").unwrap();
         // `DEFAULT` is auto-synthesised by parse_acf (C asInitialize
         // always calls asAsgAdd("DEFAULT")) and has no rules.
-        assert!(config.asg.contains_key("DEFAULT"));
+        assert!(config.asg.contains_key(b"DEFAULT".as_slice()));
         assert_eq!(
             config.check_access("TYPO", "host", "alice"),
             AccessLevel::NoAccess,
@@ -3564,7 +3744,7 @@ ASG(MIXED_CASE) {
 
         // A pathological run does not put the whole file on the console.
         let long = "z".repeat(4096);
-        let e = parse_acf(&format!("ASG(G) {{ RULE({long}, READ) }}"))
+        let e = parse_acf(format!("ASG(G) {{ RULE({long}, READ) }}"))
             .unwrap_err()
             .to_string();
         assert!(e.contains('…') && e.len() < 200, "uncapped quote: {e:?}");
@@ -3614,7 +3794,7 @@ ASG(MIXED_CASE) {
         let tail = "\n\n\n\n\n";
         for (acf, line, needle) in [
             (format!("UAG(a{tail}"), 1, "missing ')'"),
-            (format!("UAG(\"abc{tail}"), 1, "unterminated quoted name"),
+            (format!("UAG(\"abc{tail}"), 1, "unterminated quoted string"),
             (format!("UAG(a) {{ x{tail}"), 1, "unterminated '{'"),
             (
                 format!("UAG(a) {{ \"unterminated{tail}"),
@@ -3704,8 +3884,11 @@ ASG(MIXED_CASE) {
     #[test]
     fn rule_unsupported_access_keyword_is_inert() {
         let config = parse_acf("ASG(B) { RULE(0, WRIET) }").unwrap();
-        assert_eq!(config.asg["B"].rules.len(), 1);
-        assert!(config.asg["B"].rules[0].ignore, "bad keyword ⇒ inert rule");
+        assert_eq!(config.asg[b"B".as_slice()].rules.len(), 1);
+        assert!(
+            config.asg[b"B".as_slice()].rules[0].ignore,
+            "bad keyword ⇒ inert rule"
+        );
         assert_eq!(
             config.check_access("B", "host", "user"),
             AccessLevel::NoAccess
@@ -3767,7 +3950,7 @@ ASG(DEFAULT) { RULE(1, READ) }
     fn unknown_block_bare_head_parses_ok() {
         let acf = "VENDOR(x) ASG(DEFAULT) { RULE(1, READ) }";
         let config = parse_acf(acf).expect("bare unknown-block head must warn-and-continue");
-        assert!(config.asg.contains_key("DEFAULT"));
+        assert!(config.asg.contains_key(b"DEFAULT".as_slice()));
     }
 
     /// Genuine garbage — a bare token where a top-level block keyword
@@ -3879,15 +4062,21 @@ ASG(C) {
     fn rule_trapwrite_log_option_parses() {
         let config =
             parse_acf("ASG(T) { RULE(1, WRITE, TRAPWRITE) RULE(1, READ, NOTRAPWRITE) }").unwrap();
-        assert_eq!(config.asg["T"].rules.len(), 2);
-        assert_eq!(config.asg["T"].rules[0].access, RuleAccess::Write);
+        assert_eq!(config.asg[b"T".as_slice()].rules.len(), 2);
+        assert_eq!(
+            config.asg[b"T".as_slice()].rules[0].access,
+            RuleAccess::Write
+        );
         assert!(
-            config.asg["T"].rules[0].trap,
+            config.asg[b"T".as_slice()].rules[0].trap,
             "TRAPWRITE must set the trap mask"
         );
-        assert_eq!(config.asg["T"].rules[1].access, RuleAccess::Read);
+        assert_eq!(
+            config.asg[b"T".as_slice()].rules[1].access,
+            RuleAccess::Read
+        );
         assert!(
-            !config.asg["T"].rules[1].trap,
+            !config.asg[b"T".as_slice()].rules[1].trap,
             "NOTRAPWRITE must clear the trap mask"
         );
     }
@@ -4012,7 +4201,7 @@ ASG(LOCKED)    { }
     #[test]
     fn calc_rule_is_conditionally_active_and_fails_closed_without_resolver() {
         let config = parse_acf(r#"ASG(G) { INPA("ref") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
-        let rule = &config.asg["G"].rules[0];
+        let rule = &config.asg[b"G".as_slice()].rules[0];
         assert!(rule.calc.is_some(), "CALC clause must be parsed and stored");
         // a CALC rule is no longer hard-disabled — it is
         // conditionally active and gated at check time.
@@ -4101,8 +4290,16 @@ ASG(LOCKED)    { }
         let cfg =
             parse_acf(r#"UAG(special) { "role/op" } ASG(G) { RULE(1, WRITE) { UAG(special) } }"#)
                 .unwrap();
-        let (lvl, _) =
-            cfg.compute_for_name("G", "h", "acct", &["op".to_string()], 0, "ca", "", None);
+        let (lvl, _) = cfg.compute_for_name(
+            "G",
+            "h",
+            "acct",
+            &["op".to_string().into()],
+            0,
+            "ca",
+            "",
+            None,
+        );
         assert_eq!(
             lvl,
             AccessLevel::ReadWrite,
@@ -4136,12 +4333,12 @@ ASG(G) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        let inp = &config.asg["G"].inp;
+        let inp = &config.asg[b"G".as_slice()].inp;
         assert_eq!(inp.len(), 2);
         assert_eq!(inp[0].index, 0);
-        assert_eq!(inp[0].link, "rec1.VAL");
+        assert_eq!(inp[0].link, b"rec1.VAL");
         assert_eq!(inp[1].index, 2);
-        assert_eq!(inp[1].link, "rec3.VAL");
+        assert_eq!(inp[1].link, b"rec3.VAL");
     }
 
     #[test]
@@ -4177,7 +4374,7 @@ ASG(G) {
     #[test]
     fn paren_name_accepts_quoted_form() {
         let config = parse_acf(r#"UAG("my group") { x }"#).unwrap();
-        assert!(config.uag.contains_key("my group"));
+        assert!(config.uag.contains_key(b"my group".as_slice()));
     }
 
     /// ASL gate still works: a low-level WRITE rule does not apply to
@@ -4222,8 +4419,8 @@ ASG(G) {
     fn trap_fields(pv: &'static str) -> TrapWriteFields {
         TrapWriteFields {
             pv_name: pv.to_string(),
-            user: "u".to_string(),
-            host: "h".to_string(),
+            user: b"u".to_vec(),
+            host: b"h".to_vec(),
             peer: "h:5064".to_string(),
             value_str: "42".to_string(),
             dbr_type: 5,
@@ -4274,6 +4471,29 @@ ASG(G) {
                 (TrapWriteOp::AfterWrite, Some("superseded".to_string())),
             ]
         );
+    }
+
+    #[test]
+    fn a_non_utf8_user_reaches_the_trap_listener_byte_for_byte() {
+        let users = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = users.clone();
+        let _handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
+            if msg.pv_name == "trap:nonutf8" {
+                sink.lock().unwrap().push(msg.user.to_vec());
+            }
+        }));
+        let meta = TrapWriteMeta {
+            pv_name: "trap:nonutf8",
+            user: b"op\xff",
+            host: "h",
+            peer: "h:5064",
+            dbr_type: 5,
+        };
+        put_with_trap_blocking(true, meta, crate::types::EpicsValue::Long(1), |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(*users.lock().unwrap(), vec![b"op\xff".to_vec(); 2]);
     }
 }
 

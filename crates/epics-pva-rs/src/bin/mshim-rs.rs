@@ -254,8 +254,7 @@ async fn main() {
     let default_port = args
         .port
         .or_else(|| {
-            std::env::var("EPICS_PVA_BROADCAST_PORT")
-                .ok()
+            epics_base_rs::runtime::env::get_lossy("EPICS_PVA_BROADCAST_PORT")
                 // pvxs-compatible port parse (uint64 + low-16 truncate,
                 // whitespace-tolerant) instead of a strict u16 parse.
                 .and_then(|s| epics_pva_rs::config::env::parse_port_env(&s))

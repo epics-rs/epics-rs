@@ -93,8 +93,8 @@ pub struct Channel {
     /// Pulsed whenever the state changes. Monitor loops await this to learn
     /// of disconnect / reconnect.
     pub state_changed: Notify,
-    user: String,
-    host: String,
+    user: epics_base_rs::types::PvString,
+    host: epics_base_rs::types::PvString,
     op_timeout: std::time::Duration,
     /// TCP idle timeout threaded through to `ConnectionPool::get_or_connect`
     /// and ultimately into the per-connection heartbeat task.
@@ -336,8 +336,8 @@ impl ConnectionPool {
         self: &Arc<Self>,
         reactor: &epics_base_rs::runtime::task::Reactor,
         addr: std::net::SocketAddr,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         op_timeout: std::time::Duration,
         tcp_timeout: std::time::Duration,
     ) -> PvaResult<Arc<ServerConn>> {
@@ -613,8 +613,8 @@ impl Channel {
     pub fn new(
         reactor: Reactor,
         pv_name: String,
-        user: String,
-        host: String,
+        user: epics_base_rs::types::PvString,
+        host: epics_base_rs::types::PvString,
         op_timeout: std::time::Duration,
         tcp_timeout: std::time::Duration,
         pool: Arc<ConnectionPool>,
@@ -648,8 +648,8 @@ impl Channel {
     pub fn new_direct(
         reactor: Reactor,
         pv_name: String,
-        user: String,
-        host: String,
+        user: epics_base_rs::types::PvString,
+        host: epics_base_rs::types::PvString,
         op_timeout: std::time::Duration,
         tcp_timeout: std::time::Duration,
         pool: Arc<ConnectionPool>,
@@ -987,8 +987,8 @@ impl Channel {
                     .get_or_connect(
                         self.reactor(),
                         cand.addr,
-                        &self.user,
-                        &self.host,
+                        self.user.as_bytes(),
+                        self.host.as_bytes(),
                         self.op_timeout,
                         self.tcp_timeout,
                     )
@@ -1447,8 +1447,8 @@ mod tests {
             p1.get_or_connect(
                 &crate::test_reactor(),
                 addr,
-                "u",
-                "h",
+                b"u",
+                b"h",
                 op_timeout,
                 tcp_timeout,
             )
@@ -1459,8 +1459,8 @@ mod tests {
             p2.get_or_connect(
                 &crate::test_reactor(),
                 addr,
-                "u",
-                "h",
+                b"u",
+                b"h",
                 op_timeout,
                 tcp_timeout,
             )
@@ -1563,8 +1563,8 @@ mod tests {
             .get_or_connect(
                 &crate::test_reactor(),
                 probe_addr,
-                "u",
-                "h",
+                b"u",
+                b"h",
                 Duration::from_millis(300),
                 Duration::from_secs(40),
             )

@@ -1079,7 +1079,7 @@ struct UdpRateLimiter {
 #[cfg(tokio_backend)]
 impl UdpRateLimiter {
     fn from_env() -> Self {
-        let cap = epics_base_rs::runtime::env::get("EPICS_CAS_UDP_SEARCH_RATE_LIMIT")
+        let cap = epics_base_rs::runtime::env::get_lossy("EPICS_CAS_UDP_SEARCH_RATE_LIMIT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0u32);
         Self {

@@ -518,8 +518,8 @@ impl ServerConn {
     pub async fn connect(
         reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_pva(target, conn.op_timeout, conn.tcp_timeout).await?;
@@ -551,8 +551,8 @@ impl ServerConn {
     pub async fn connect_blocking(
         reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout).await?;
@@ -570,8 +570,8 @@ impl ServerConn {
         target: SocketAddr,
         server_name: &str,
         tls: Arc<crate::auth::TlsClientConfig>,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let stream = timeout(conn.op_timeout, tokio::net::TcpStream::connect(target))
@@ -627,8 +627,8 @@ impl ServerConn {
         mut reader: DynRead,
         writer: DynWrite,
         server_identity: Option<crate::auth::X509Credentials>,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let ConnConfig {
@@ -648,12 +648,10 @@ impl ServerConn {
         let mut writer_owned = writer;
         let reply = build_client_connection_validation(
             byte_order,
-            DEFAULT_BUFFER_SIZE,
-            DEFAULT_REGISTRY_SIZE,
-            0,
             negotiated_auth,
             user,
             host,
+            &auth_groups(negotiated_auth),
         );
         timeout(op_timeout, writer_owned.write_all(&reply))
             .await
@@ -1921,19 +1919,26 @@ fn maybe_destroy_stale_create_channel(
     let _ = writer_tx.send(frame_out);
 }
 
+/// The POSIX groups a `ca` AuthZ carries; no account lookup for any other.
+pub(super) fn auth_groups(auth: &str) -> Vec<epics_base_rs::types::PvString> {
+    if auth == "ca" {
+        crate::auth::posix_groups()
+    } else {
+        Vec::new()
+    }
+}
+
 pub(super) fn build_client_connection_validation(
     order: ByteOrder,
-    buffer_size: u32,
-    registry_size: u16,
-    qos: u16,
     auth: &str,
-    user: &str,
-    host: &str,
+    user: &[u8],
+    host: &[u8],
+    groups: &[epics_base_rs::types::PvString],
 ) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.put_u32(buffer_size, order);
-    payload.put_u16(registry_size, order);
-    payload.put_u16(qos, order);
+    payload.put_u32(DEFAULT_BUFFER_SIZE, order);
+    payload.put_u16(DEFAULT_REGISTRY_SIZE, order);
+    payload.put_u16(0, order); // qos
     encode_string_into(auth, order, &mut payload);
 
     // pvxs always reads a Variant payload after the auth method string —
@@ -1943,7 +1948,6 @@ pub(super) fn build_client_connection_validation(
     // server-side ACF can match `group:foo` rules — pvxs ca-auth
     // parity (osgroups.cpp).
     if auth == "ca" {
-        let groups = crate::auth::posix_groups();
         // Variant tag (0xFD) + inline AuthZ structure carrying
         // user (str) + host (str) [+ groups (str[])].
         payload.put_u8(0xFD);
@@ -1963,14 +1967,14 @@ pub(super) fn build_client_connection_validation(
             payload.extend_from_slice(b"groups");
             payload.put_u8(0x68); // string[]
         }
-        encode_string_into(user, order, &mut payload);
-        encode_string_into(host, order, &mut payload);
+        crate::proto::encode_string_bytes_into(user, order, &mut payload);
+        crate::proto::encode_string_bytes_into(host, order, &mut payload);
         if !groups.is_empty() {
             // string-array length prefix (size_t encoding) + each
             // string.
             crate::proto::encode_size_into(groups.len() as u32, order, &mut payload);
-            for g in &groups {
-                encode_string_into(g, order, &mut payload);
+            for g in groups {
+                crate::proto::encode_string_bytes_into(g.as_bytes(), order, &mut payload);
             }
         }
     } else {
@@ -1999,6 +2003,30 @@ fn _suppress(_: HeaderFlags, _: Status) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pvxs `buildCAMethod` stores the `osiGetUserName` and `gethostname`
+    /// bytes (client.cpp:519-533); both go on the wire as they are.
+    #[test]
+    fn a_non_utf8_user_and_host_are_sent_byte_for_byte() {
+        let reply =
+            build_client_connection_validation(ByteOrder::Little, "ca", b"op\xff", b"h\xfe", &[]);
+        assert!(
+            reply.windows(7).any(|w| w == b"\x03op\xff\x02h\xfe"),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_group_is_sent_byte_for_byte() {
+        let reply = build_client_connection_validation(
+            ByteOrder::Little,
+            "ca",
+            b"op",
+            b"h",
+            &[epics_base_rs::types::PvString::from(&b"gr\xff"[..])],
+        );
+        assert!(reply.ends_with(b"\x01\x03gr\xff"));
+    }
 
     // The auth-selection rule shared by the normal TCP connection path and the
     // TCP name-server path (pvxs has no name-server auth exception): prefer "ca"
@@ -3009,8 +3037,8 @@ mod tests {
         let conn = ServerConn::connect(
             &crate::test_reactor(),
             addr,
-            "testuser",
-            "testhost",
+            b"testuser",
+            b"testhost",
             ConnConfig {
                 op_timeout,
                 tcp_timeout,
@@ -3136,8 +3164,8 @@ mod tests {
         let conn = ServerConn::connect(
             &crate::test_reactor(),
             addr,
-            "testuser",
-            "testhost",
+            b"testuser",
+            b"testhost",
             ConnConfig {
                 op_timeout: Duration::from_secs(2),
                 tcp_timeout: Duration::from_secs(2),
@@ -3228,8 +3256,8 @@ mod tests {
         let conn = ServerConn::connect_blocking(
             &crate::test_reactor(),
             addr,
-            "testuser",
-            "testhost",
+            b"testuser",
+            b"testhost",
             ConnConfig {
                 op_timeout: Duration::from_secs(2),
                 tcp_timeout: Duration::from_secs(30),

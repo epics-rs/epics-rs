@@ -167,7 +167,7 @@ pub struct PeerEntry {
     /// peer credentials `(account, method)` once the
     /// connection-validation handshake establishes them. pvxs
     /// `Server::report` includes `ReportInfo`/credentials per peer.
-    pub(crate) credentials: parking_lot::Mutex<Option<(String, String)>>,
+    pub(crate) credentials: parking_lot::Mutex<Option<(epics_base_rs::types::PvString, String)>>,
     /// Live channels currently open on this connection, keyed by server
     /// channel id (SID). Each value is the SAME `Arc<ChannelStat>` the
     /// connection task holds in its channel table, so the report reads the
@@ -204,8 +204,8 @@ impl PeerEntry {
 
     /// record the validated peer credentials (set once at
     /// connection validation).
-    pub(crate) fn set_credentials(&self, account: &str, method: &str) {
-        *self.credentials.lock() = Some((account.to_string(), method.to_string()));
+    pub(crate) fn set_credentials(&self, account: &epics_base_rs::types::PvString, method: &str) {
+        *self.credentials.lock() = Some((account.clone(), method.to_string()));
     }
 
     /// Register a newly-opened channel: bump the live + lifetime counts
@@ -447,7 +447,7 @@ pub struct PeerSnapshot {
     pub tls: bool,
     /// validated peer credentials `(account, method)`, or
     /// `None` before the connection-validation handshake completes.
-    pub credentials: Option<(String, String)>,
+    pub credentials: Option<(epics_base_rs::types::PvString, String)>,
     /// Per-channel report entries for the channels currently open on this
     /// peer — name + per-channel tx/rx counters + optional `ReportInfo`
     /// (pvxs `Report::Connection::channels`, src/server.cpp:260-268).
@@ -554,7 +554,7 @@ mod tests {
         let reg = PeerRegistry::new();
         let addr: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let e = PeerEntry::new(true);
-        e.set_credentials("op", "ca");
+        e.set_credentials(&"op".into(), "ca");
         let x = ChannelStat::new("X:PV".into());
         let y = ChannelStat::new("Y:PV".into());
         e.channel_opened(1, x.clone());

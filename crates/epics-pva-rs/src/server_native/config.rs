@@ -569,7 +569,7 @@ pub struct ClientCredentials {
     /// Account name (e.g., the `ca` auth's `user` field, or the x509
     /// leaf cert subject CommonName). Empty when the auth method does
     /// not carry one.
-    pub account: String,
+    pub account: epics_base_rs::types::PvString,
     /// Host identity of the peer, as the ACF `HAG(...)` gate matches it:
     /// the connection's peer address in numeric form, port stripped and
     /// IPv4-mapped IPv6 collapsed to IPv4 (QSRV `ioc/credentials.cpp:27-29`).
@@ -603,5 +603,5 @@ pub struct ClientCredentials {
     /// trusting it would let `account="nobody", roles=["admin"]` satisfy
     /// any group-gated rule — an ACL bypass. Every constructor funnels
     /// through `with_server_derived`, so a wire value can never reach here.
-    pub roles: Vec<String>,
+    pub roles: Vec<epics_base_rs::types::PvString>,
 }

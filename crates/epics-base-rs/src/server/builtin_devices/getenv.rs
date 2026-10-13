@@ -36,7 +36,7 @@ use crate::server::device_support::{
 use crate::server::recgbl::alarm_status;
 use crate::server::record::{AlarmSeverity, ProcessContext, Record};
 use crate::server::records::lsi::LsiRecord;
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, PvString};
 
 /// Reads the environment variable named by the INST_IO `INP` on every record
 /// process. The variable name is resolved once from `ctx.inp` at construction.
@@ -100,7 +100,7 @@ impl DeviceSupport for GetenvDeviceSupport {
         let val = if self.var.is_empty() {
             None
         } else {
-            std::env::var(&self.var).ok()
+            crate::runtime::env::get(&self.var)
         };
         // C `read_lsi` / `read_stringin` (devEnviron.c:52-67, :105-118) write
         // VAL and `prec->udf` and return 0; the unset branch also raises
@@ -115,8 +115,13 @@ impl DeviceSupport for GetenvDeviceSupport {
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<LsiRecord>())
         {
-            Some(lsi) => lsi.read_environ(val.as_deref().map(str::as_bytes)),
-            None => record.put_field("VAL", EpicsValue::String(val.unwrap_or_default().into()))?,
+            Some(lsi) => lsi.read_environ(val.as_deref().map(std::ffi::OsStr::as_encoded_bytes)),
+            None => record.put_field(
+                "VAL",
+                EpicsValue::String(PvString::from_bytes(
+                    val.unwrap_or_default().into_encoded_bytes(),
+                )),
+            )?,
         }
         Ok(DeviceReadOutcome::converted(udf))
     }
@@ -172,6 +177,24 @@ mod tests {
         assert_eq!(GetenvDeviceSupport::new("  PATH  ").var, "PATH");
         assert!(GetenvDeviceSupport::new("@").var.is_empty());
         assert_eq!(GetenvDeviceSupport::new("@PATH").dtyp(), "getenv");
+    }
+
+    /// C `read_stringin` copies `getenv`'s bytes into VAL unchecked.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn a_non_utf8_value_reaches_val_byte_for_byte() {
+        use crate::server::records::stringin::StringinRecord;
+        use std::os::unix::ffi::OsStrExt;
+        let key = "EPICS_RS_TEST_DEVENVIRON_BYTES";
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, std::ffi::OsStr::from_bytes(b"a\xffb")) };
+        let mut dev = GetenvDeviceSupport::new(&format!("@{key}"));
+        let mut rec = StringinRecord::new("");
+        dev.read(&mut rec).unwrap();
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(rec.val.as_bytes(), b"a\xffb");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::sync::{mpsc, oneshot};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
@@ -227,7 +227,7 @@ pub struct CaException {
     pub kind: CaExceptionKind,
     pub message: String,
     pub server_addr: Option<SocketAddr>,
-    pub pv_name: Option<String>,
+    pub pv_name: Option<PvString>,
     /// ECA status code when applicable (server-error path).
     pub status: Option<u32>,
     /// Which operation failed. libca puts this in `exception_handler_args.op`
@@ -409,12 +409,13 @@ pub(crate) fn unresponsive_circuit_exception(server_addr: SocketAddr) -> CaExcep
 /// channel) overload, so the text prints verbatim — but it goes through
 /// `exception(…, __FILE__, __LINE__)`, so the `Source File:` line is there.
 pub(crate) fn multiply_defined_pv_exception(
-    pv_name: String,
+    pv_name: PvString,
     accepted: SocketAddr,
     ignored: SocketAddr,
 ) -> CaException {
     CaException {
         kind: CaExceptionKind::ServerError,
+        // `message` is text, so the name in it is decoded lossily.
         message: format!("Channel: \"{pv_name}\", Connecting to: {accepted}, Ignored: {ignored}"),
         server_addr: Some(ignored),
         pv_name: Some(pv_name),
@@ -481,14 +482,14 @@ pub(crate) fn print_default_exception(exc: &CaException) {
 
     if let Some(block) = render_default_exception(exc, &exception_timestamp()) {
         // One `write_all`: two exceptions racing must not interleave mid-block.
-        let _ = std::io::stderr().write_all(block.as_bytes());
+        let _ = std::io::stderr().write_all(&block);
     }
 }
 
 /// The block itself, split out from the stderr write so the exact C text is
 /// testable. `None` means C prints nothing for this exception.
-pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<String> {
-    use std::fmt::Write as _;
+pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<Vec<u8>> {
+    use std::io::Write as _;
 
     // `CA_PROTO_SERVER_DISCONN` never reaches libca's `vSignal`: it goes to
     // `cac::verifyAndDisconnectChan` and out through the channel's connection
@@ -508,19 +509,23 @@ pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<S
     let status = exc.status.unwrap_or(crate::protocol::ECA_INTERNAL);
     let severity = SEVERITY[(crate::protocol::eca_severity(status) & 0x7) as usize];
 
-    let mut block = String::with_capacity(320);
-    block.push_str("CA.Client.Exception...............................................\n");
+    let mut block = Vec::with_capacity(320);
+    block
+        .extend_from_slice(b"CA.Client.Exception...............................................\n");
     let _ = writeln!(
         block,
         "    {severity}: \"{}\"",
         crate::protocol::eca_message(status)
     );
-    let _ = writeln!(block, "    Context: \"{}\"", exception_context(exc));
+    block.extend_from_slice(b"    Context: \"");
+    write_exception_context(&mut block, exc);
+    block.extend_from_slice(b"\"\n");
     if let ExceptionSite::At(file, line) = exc.source {
         let _ = writeln!(block, "    Source File: {file} line {line}");
     }
     let _ = writeln!(block, "    Current Time: {now}");
-    block.push_str("..................................................................\n");
+    block
+        .extend_from_slice(b"..................................................................\n");
     Some(block)
 }
 
@@ -536,16 +541,23 @@ pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<S
 ///
 /// `data_type` is the discriminator because it is set only where libca has a
 /// `caHdrLargeArray` to take it from — a channel exception.
-fn exception_context(exc: &CaException) -> String {
+/// `channel=%s` is the name's bytes.
+fn write_exception_context(out: &mut Vec<u8>, exc: &CaException) {
+    use std::io::Write as _;
+
     match (&exc.pv_name, exc.data_type) {
-        (Some(pv), Some(dbr)) => format!(
-            "op={}, channel={pv}, type={}, count={}, ctx=\"{}\"",
-            exc.op.code(),
-            epics_base_rs::types::dbr_type_to_text(dbr),
-            exc.count.unwrap_or(0),
-            exc.message,
-        ),
-        _ => exc.message.clone(),
+        (Some(pv), Some(dbr)) => {
+            let _ = write!(out, "op={}, channel=", exc.op.code());
+            out.extend_from_slice(pv.as_bytes());
+            let _ = write!(
+                out,
+                ", type={}, count={}, ctx=\"{}\"",
+                epics_base_rs::types::dbr_type_to_text(dbr),
+                exc.count.unwrap_or(0),
+                exc.message,
+            );
+        }
+        _ => out.extend_from_slice(exc.message.as_bytes()),
     }
 }
 
@@ -565,27 +577,26 @@ fn exception_timestamp() -> String {
 /// User and host names advertised to servers on every CA virtual-circuit
 /// handshake (`CA_PROTO_CLIENT_NAME` / `CA_PROTO_HOST_NAME`).
 ///
-/// libca resolves these once at context creation — user from `$USER`
-/// (then `$USERNAME` on Windows), host from the local hostname — and the
+/// libca resolves these once at context creation — user from
+/// `osiGetUserName` (`cac.cpp:176`), host from the local hostname — and the
 /// `tcpiiu` constructor (`tcpiiu.cpp:755-762`) queues them on every new
 /// circuit. This port keeps them in a shared slot instead so the names
 /// can be overridden at runtime; the handshake builder reads the slot
 /// rather than the environment.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientIdentity {
-    pub(crate) user: String,
-    pub(crate) host: String,
+    /// The passwd name's bytes, sent as they are.
+    pub(crate) user: Vec<u8>,
+    /// libca `localHostName`'s bytes, sent as they are.
+    pub(crate) host: Vec<u8>,
 }
 
 impl ClientIdentity {
-    /// Resolve the identity from the environment the way libca does:
-    /// user from `$USER` falling back to `$USERNAME`, host from the
-    /// local hostname.
-    pub(crate) fn from_env() -> Self {
-        let user = epics_base_rs::runtime::env::get("USER")
-            .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let host = epics_base_rs::runtime::env::hostname();
+    /// Resolve the identity the way libca does; a failed
+    /// `osiGetUserName` is an empty name (`cac.cpp:177-178`).
+    pub(crate) fn from_os() -> Self {
+        let user = epics_base_rs::runtime::env::user_name().unwrap_or_default();
+        let host = epics_base_rs::runtime::env::ca_local_host_name();
         Self { user, host }
     }
 }
@@ -729,7 +740,7 @@ pub(crate) struct InFlightOps {
     /// `m_available`, and a circuit answers in order, so it is a fence and
     /// not a delay), `CA_PROTO_SERVER_DISCONN`, or a `DropChannel` that
     /// sent no CLEAR_CHANNEL because the channel was not operational.
-    pub(crate) write_identities: Arc<DashMap<u32, Arc<str>>>,
+    pub(crate) write_identities: Arc<DashMap<u32, Arc<[u8]>>>,
     /// monotonic `ioid` source owned by the same registry
     /// that holds the live ids. Keeping the counter here (rather than
     /// a process-global static) lets [`Self::alloc_ioid`] probe
@@ -855,12 +866,17 @@ impl CidAllocator {
 mod default_exception_tests {
     use super::*;
 
+    fn render_default_exception(exc: &CaException, now: &str) -> Option<String> {
+        super::render_default_exception(exc, now)
+            .map(|b| String::from_utf8(b).expect("a UTF-8 block"))
+    }
+
     fn put_failed() -> CaException {
         CaException {
             kind: CaExceptionKind::ServerError,
             message: "TST:LO".to_string(),
             server_addr: Some("127.0.0.1:5064".parse().unwrap()),
-            pv_name: Some("TST:LO".to_string()),
+            pv_name: Some("TST:LO".into()),
             status: Some(crate::protocol::ECA_PUTFAIL),
             op: CaOp::Put,
             data_type: Some(0), // DBR_STRING
@@ -887,6 +903,16 @@ mod default_exception_tests {
                 "..................................................................\n",
             )
         );
+    }
+
+    /// libca prints `channel=%s` from the channel's name bytes.
+    #[test]
+    fn a_non_utf8_channel_name_is_printed_as_its_bytes() {
+        let mut exc = put_failed();
+        exc.pv_name = Some(PvString::from(b"TST:\xff".as_slice()));
+        let got = super::render_default_exception(&exc, "T").expect("a block");
+        let needle = b"channel=TST:\xff, type=DBR_STRING";
+        assert!(got.windows(needle.len()).any(|w| w == needle));
     }
 
     /// R18-20: the ECA_UNRESPTMO block. `tcpiiu::unresponsiveCircuitNotify`
@@ -923,7 +949,7 @@ mod default_exception_tests {
     #[test]
     fn a_multiply_defined_pv_renders_c_s_eca_dblchnl_block() {
         let exc = multiply_defined_pv_exception(
-            "TST:AI".to_string(),
+            "TST:AI".into(),
             "127.0.0.1:15064".parse().unwrap(),
             "127.0.0.1:15065".parse().unwrap(),
         );
@@ -1013,7 +1039,7 @@ mod default_exception_tests {
             kind: CaExceptionKind::ServerDisconnect,
             message: "server-initiated channel close".to_string(),
             server_addr: None,
-            pv_name: Some("TST:LO".to_string()),
+            pv_name: Some("TST:LO".into()),
             status: None,
             op: CaOp::Other,
             data_type: None,
@@ -1137,7 +1163,7 @@ pub(crate) enum SearchRequest {
     /// Schedule a PV for searching.
     Schedule {
         cid: u32,
-        pv_name: String,
+        pv_name: PvString,
         reason: SearchReason,
     },
     /// Cancel searching for a PV (channel dropped or connected).
@@ -1200,7 +1226,7 @@ pub(crate) enum SearchResponse {
     /// matching libca's `pvMultiplyDefinedNotify` → `this->exception`
     /// path.
     MultiplyDefined {
-        pv_name: String,
+        pv_name: PvString,
         prev_addr: SocketAddr,
         new_addr: SocketAddr,
     },
@@ -1211,7 +1237,7 @@ pub(crate) enum SearchResponse {
 pub(crate) enum TransportCommand {
     CreateChannel {
         cid: u32,
-        pv_name: String,
+        pv_name: PvString,
         server_addr: SocketAddr,
         priority: u8,
     },
@@ -1431,7 +1457,7 @@ pub(crate) struct ServerErrorFrame {
     /// carries. Resolved on the circuit that owns the request, so the
     /// identity of a request that already failed does not depend on whether
     /// its channel is still open.
-    pub(crate) pv_name: Option<Arc<str>>,
+    pub(crate) pv_name: Option<Arc<[u8]>>,
 }
 
 pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFrame) {
@@ -1476,7 +1502,7 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
     let pv_name = is_channel_exception
         .then_some(pv_name)
         .flatten()
-        .map(|n| n.to_string());
+        .map(|n| PvString::from(&*n));
     // `cac::defaultExcep` folds the host into the ctx text itself
     // (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`) before raising; the channel
     // path passes the server's diagnostic through untouched. `message` stays

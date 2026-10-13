@@ -1680,7 +1680,7 @@ fn build_access_hook(
     upstream_write: Arc<AtomicBool>,
     upstream_read: Arc<AtomicBool>,
 ) -> epics_base_rs::server::pv::AccessHook {
-    Arc::new(move |user: &str, host: &str| {
+    Arc::new(move |user: &[u8], host: &[u8]| {
         let cfg = access.load();
         // Load the live `.pvlist` identity each call so a reloaded
         // ASG/ASL is enforced immediately.
@@ -1840,7 +1840,7 @@ fn build_write_hook(
                 log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::ReadOnlyField(format!(
                     "{pv_name} (asg {asg_ref}, user {})",
-                    ctx.user
+                    String::from_utf8_lossy(&ctx.user)
                 )));
             }
 
@@ -2543,20 +2543,20 @@ ASG(DEFAULT) {
         let hook = build_access_hook(acl, access, upstream_write, upstream_read);
 
         // Privileged user: read granted, write denied (no WRITE rule).
-        let alice = hook("alice", "host1");
+        let alice = hook(b"alice", b"host1");
         assert!(alice.read, "alice is in UAG(ops) → READ");
         assert!(!alice.write, "no WRITE rule → write denied even for alice");
 
         // Unprivileged user: read AND write denied — this is the gap
         // FR-1 closes (previously every shadow PV read was permissive).
-        let intruder = hook("intruder", "host1");
+        let intruder = hook(b"intruder", b"host1");
         assert!(!intruder.read, "intruder is not in UAG(ops) → no READ");
         assert!(!intruder.write, "intruder → no WRITE");
 
         // No client identity: read evaluates normally (denied here, no
         // matching UAG), write is force-denied while rules are loaded —
         // mirrors the write hook's empty-user guard.
-        let anon = hook("", "host1");
+        let anon = hook(b"", b"host1");
         assert!(!anon.read, "empty user matches no UAG → no READ");
         assert!(!anon.write, "empty user + rules → write force-denied");
     }
@@ -2570,7 +2570,7 @@ ASG(DEFAULT) {
         let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
         let hook = build_access_hook(acl, access, upstream_write, upstream_read);
-        let d = hook("anyone", "anywhere");
+        let d = hook(b"anyone", b"anywhere");
         assert!(d.read && d.write, "allow-all must grant read and write");
     }
 
@@ -2586,7 +2586,7 @@ ASG(DEFAULT) {
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
         let hook = build_access_hook(acl, access, upstream_write.clone(), upstream_read);
 
-        let d = hook("alice", "host1");
+        let d = hook(b"alice", b"host1");
         assert!(d.read, "read must still be granted by allow-all");
         assert!(
             !d.write,
@@ -2595,7 +2595,7 @@ ASG(DEFAULT) {
 
         // Restoring upstream write-access restores write permission.
         upstream_write.store(true, Ordering::Relaxed);
-        let d2 = hook("alice", "host1");
+        let d2 = hook(b"alice", b"host1");
         assert!(d2.write, "write must be granted once upstream restores it");
     }
 
@@ -2613,7 +2613,7 @@ ASG(DEFAULT) {
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
         let hook = build_access_hook(acl, access, upstream_write, upstream_read.clone());
 
-        let d = hook("alice", "host1");
+        let d = hook(b"alice", b"host1");
         assert!(
             !d.read,
             "upstream read-denied must override local allow-all"
@@ -2622,7 +2622,7 @@ ASG(DEFAULT) {
 
         // Restoring upstream read-access restores read permission.
         upstream_read.store(true, Ordering::Relaxed);
-        let d2 = hook("alice", "host1");
+        let d2 = hook(b"alice", b"host1");
         assert!(d2.read, "read must be granted once upstream restores it");
     }
 
@@ -2656,8 +2656,8 @@ ASG(NewGroup) {
         let hook = build_access_hook(acl.clone(), access, upstream_write, upstream_read);
 
         // Under OldGroup, alice has READ; bob does not.
-        assert!(hook("alice", "h").read, "OldGroup grants alice READ");
-        assert!(!hook("bob", "h").read, "OldGroup denies bob READ");
+        assert!(hook(b"alice", b"h").read, "OldGroup grants alice READ");
+        assert!(!hook(b"bob", b"h").read, "OldGroup denies bob READ");
 
         // Simulate the reload: swap the live ACL cell the hook holds.
         acl.store(Arc::new(PvAcl {
@@ -2667,11 +2667,11 @@ ASG(NewGroup) {
 
         // The same hook now computes against NewGroup: rights flip.
         assert!(
-            !hook("alice", "h").read,
+            !hook(b"alice", b"h").read,
             "after live ACL swap to NewGroup, alice's READ is revoked"
         );
         assert!(
-            hook("bob", "h").read,
+            hook(b"bob", b"h").read,
             "after live ACL swap to NewGroup, bob gains READ"
         );
     }
@@ -2789,7 +2789,7 @@ ASG(NewGroup) {
             .access_hook()
             .expect("shadow PV carries the access hook");
         assert!(
-            hook("alice", "host1").write,
+            hook(b"alice", b"host1").write,
             "the ACF grants WRITE at connect"
         );
 
@@ -2812,14 +2812,14 @@ ASG(NewGroup) {
             .expect("ensure_subscribed connects to the hosted upstream");
 
         let deadline = std::time::Instant::now() + bound;
-        while hook("alice", "host1").write {
+        while hook(b"alice", b"host1").write {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the gateway still grants a write the upstream revoked"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(hook("alice", "host1").read, "READ is still granted");
+        assert!(hook(b"alice", b"host1").read, "READ is still granted");
 
         mgr.shutdown().await;
     }

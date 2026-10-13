@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -36,8 +37,8 @@ impl Default for DbLoadConfig {
 /// is the only writer of [`set_loaded_path`].
 pub(crate) fn db_load_config(explicit_path: &str) -> DbLoadConfig {
     let include_paths = if explicit_path.is_empty() {
-        std::env::var("EPICS_DB_INCLUDE_PATH")
-            .map_or_else(|_| vec![std::path::PathBuf::from(".")], |val| db_path(&val))
+        crate::runtime::env::get("EPICS_DB_INCLUDE_PATH")
+            .map_or_else(|| vec![std::path::PathBuf::from(".")], |val| db_path(&val))
     } else {
         db_path(explicit_path)
     };
@@ -503,33 +504,43 @@ pub const PATH_LIST_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 /// the current directory, which C appends as a single `.` at the END
 /// of the list rather than at the empty element's position. A list
 /// that is entirely white space contributes nothing.
-pub fn db_add_path(list: &str) -> Vec<PathBuf> {
+pub fn db_add_path(list: impl AsRef<OsStr>) -> Vec<PathBuf> {
     use crate::runtime::stdlib::c_isspace;
+
+    // Split as bytes: the list may be `getenv`'s, and C splits it unchecked.
+    let space = |b: &u8| c_isspace(*b as char);
+    let sep = PATH_LIST_SEPARATOR as u8;
+    let dir = |d: &[u8]| {
+        let end = d.len() - d.iter().rev().take_while(|b| space(b)).count();
+        // SAFETY: `d` is cut from an `OsStr`'s encoded bytes only at ASCII
+        // bytes (the separator, white space), which keeps it valid.
+        PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(&d[..end]) })
+    };
 
     let mut out: Vec<PathBuf> = Vec::new();
     let mut expecting_path = false;
     let mut saw_missing_path = false;
-    let mut rest = list;
+    let mut rest = list.as_ref().as_encoded_bytes();
 
-    while let Some(c) = rest.chars().next() {
-        if c_isspace(c) {
-            rest = &rest[c.len_utf8()..];
+    while let Some(c) = rest.first() {
+        if space(c) {
+            rest = &rest[1..];
             continue;
         }
-        match rest.find(PATH_LIST_SEPARATOR) {
+        match rest.iter().position(|&b| b == sep) {
             Some(0) => {
                 saw_missing_path = true;
-                rest = &rest[PATH_LIST_SEPARATOR.len_utf8()..];
+                rest = &rest[1..];
             }
             Some(i) => {
                 expecting_path = true;
-                out.push(PathBuf::from(rest[..i].trim_end_matches(c_isspace)));
-                rest = &rest[i + PATH_LIST_SEPARATOR.len_utf8()..];
+                out.push(dir(&rest[..i]));
+                rest = &rest[i + 1..];
             }
             None => {
                 expecting_path = false;
-                out.push(PathBuf::from(rest.trim_end_matches(c_isspace)));
-                rest = "";
+                out.push(dir(rest));
+                rest = &[];
             }
         }
     }
@@ -544,7 +555,8 @@ pub fn db_add_path(list: &str) -> Vec<PathBuf> {
 /// REPLACES the search path, and an empty string means `.`. C tests
 /// `strlen(path)==0`, so a list that is blank rather than empty is
 /// still handed to `dbAddPath`, which contributes nothing.
-pub fn db_path(list: &str) -> Vec<PathBuf> {
+pub fn db_path(list: impl AsRef<OsStr>) -> Vec<PathBuf> {
+    let list = list.as_ref();
     if list.is_empty() {
         return vec![PathBuf::from(".")];
     }
@@ -975,7 +987,7 @@ mod db_add_path_tests {
     }
 
     fn p(list: &str) -> Vec<String> {
-        db_add_path(&sep(list))
+        db_add_path(sep(list))
             .iter()
             .map(|d| d.display().to_string())
             .collect()
@@ -1025,7 +1037,7 @@ mod db_add_path_tests {
             "an empty list is the current directory"
         );
         assert!(db_path("   ").is_empty(), "a blank list is not empty");
-        assert_eq!(db_path(&sep("a:")), db_add_path(&sep("a:")));
+        assert_eq!(db_path(sep("a:")), db_add_path(sep("a:")));
     }
 }
 
@@ -1079,6 +1091,22 @@ mod db_open_file_tests {
         assert_eq!(
             db_open_file("sub/x.db", &[on_list.path().to_path_buf()]),
             None
+        );
+    }
+
+    /// `EPICS_DB_INCLUDE_PATH` is `getenv`'s bytes; C opens a directory
+    /// whose name is not UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn db_path_keeps_a_non_utf8_directory_s_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let list = OsStr::from_bytes(b" /a\xff :/b");
+        assert_eq!(
+            db_path(list),
+            vec![
+                PathBuf::from(OsStr::from_bytes(b"/a\xff")),
+                PathBuf::from("/b")
+            ]
         );
     }
 

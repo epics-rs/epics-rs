@@ -31,7 +31,7 @@ pub use epics_base_rs::runtime::stdlib::{ParseDoubleError, epics_parse_double, e
 /// [`epics_base_rs::runtime::env_table`] and
 /// [`EnvParam::get`](epics_base_rs::runtime::env::EnvParam::get) instead.
 fn env_raw(name: &str) -> Option<String> {
-    epics_base_rs::runtime::env::get(name).filter(|s| !s.is_empty())
+    epics_base_rs::runtime::env::get_lossy(name).filter(|s| !s.is_empty())
 }
 
 /// Why [`env_double`] did not yield a value.

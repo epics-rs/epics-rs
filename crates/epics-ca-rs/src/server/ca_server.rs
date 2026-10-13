@@ -208,7 +208,7 @@ impl CaServerBuilder {
     /// Load an access security configuration file. The path is
     /// retained so `CaServer::reload_acf()` can later re-read it.
     pub fn acf_file(mut self, path: &str) -> CaResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
+        let content = std::fs::read(path).map_err(CaError::Io)?;
         self.acf = Some(access_security::parse_acf(&content)?);
         self.acf_path = Some(path.to_string());
         Ok(self)
@@ -714,12 +714,11 @@ impl CaServer {
         // made this panic for any caller reaching `reload_acf_from` off a
         // runtime — an iocsh `asInit` on the blocking driver.
         let path_owned = path.to_string();
-        let content = epics_base_rs::runtime::task::spawn_blocking(move || {
-            std::fs::read_to_string(path_owned)
-        })
-        .await
-        .map_err(|e| CaError::Io(std::io::Error::other(e)))?
-        .map_err(CaError::Io)?;
+        let content =
+            epics_base_rs::runtime::task::spawn_blocking(move || std::fs::read(path_owned))
+                .await
+                .map_err(|e| CaError::Io(std::io::Error::other(e)))?
+                .map_err(CaError::Io)?;
         let parsed = access_security::parse_acf(&content)?;
         acf.store(Some(Arc::new(parsed)));
         // Notify every active TCP client to recompute and push fresh
@@ -810,13 +809,13 @@ impl CaServer {
         };
         let paths = paths.ok_or_else(|| "no TLS source paths registered".to_string())?;
         let chain = crate::tls::load_certs(&paths.cert)
-            .map_err(|e| format!("loading {}: {e}", paths.cert))?;
+            .map_err(|e| format!("loading {}: {e}", paths.cert.display()))?;
         let key = crate::tls::load_private_key(&paths.key)
-            .map_err(|e| format!("loading {}: {e}", paths.key))?;
+            .map_err(|e| format!("loading {}: {e}", paths.key.display()))?;
         let cfg = match paths.client_ca.as_ref() {
             Some(ca) => {
                 let roots = crate::tls::load_root_store(ca)
-                    .map_err(|e| format!("loading client CA {ca}: {e}"))?;
+                    .map_err(|e| format!("loading client CA {}: {e}", ca.display()))?;
                 crate::tls::TlsConfig::server_mtls_from_pem(chain, key, roots)
                     .map_err(|e| format!("mTLS server build: {e}"))?
             }
@@ -1227,7 +1226,7 @@ impl CaServer {
         // available, but the inner Arc-shared state already implements
         // the necessary handle semantics.
         let _hag_refresh_handle = {
-            let secs = epics_base_rs::runtime::env::get("EPICS_RS_HAG_DNS_REFRESH_SECS")
+            let secs = epics_base_rs::runtime::env::get_lossy("EPICS_RS_HAG_DNS_REFRESH_SECS")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
             let path = self.acf_source_path();
@@ -1402,8 +1401,7 @@ impl CaServer {
                     let path = acf_path_clone
                         .as_ref()
                         .ok_or("no ACF source path registered")?;
-                    let content =
-                        std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+                    let content = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
                     let cfg = access_security::parse_acf(&content)
                         .map_err(|e| format!("parse {path}: {e}"))?;
                     // Avoid awaiting inside the closure — spawn a one-shot
@@ -1430,13 +1428,13 @@ impl CaServer {
                 let reload_tls_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
                     Arc::new(move || -> Result<(), String> {
                         let chain = crate::tls::load_certs(&paths.cert)
-                            .map_err(|e| format!("loading {}: {e}", paths.cert))?;
+                            .map_err(|e| format!("loading {}: {e}", paths.cert.display()))?;
                         let key = crate::tls::load_private_key(&paths.key)
-                            .map_err(|e| format!("loading {}: {e}", paths.key))?;
+                            .map_err(|e| format!("loading {}: {e}", paths.key.display()))?;
                         let cfg = match paths.client_ca.as_ref() {
                             Some(ca) => {
                                 let roots = crate::tls::load_root_store(ca)
-                                    .map_err(|e| format!("loading {ca}: {e}"))?;
+                                    .map_err(|e| format!("loading {}: {e}", ca.display()))?;
                                 crate::tls::TlsConfig::server_mtls_from_pem(chain, key, roots)
                                     .map_err(|e| format!("mTLS build: {e}"))?
                             }
@@ -1547,16 +1545,17 @@ impl CaServer {
 #[cfg(feature = "experimental-rust-tls")]
 #[derive(Debug, Clone)]
 pub struct TlsPaths {
-    pub cert: String,
-    pub key: String,
-    pub client_ca: Option<String>,
+    pub cert: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+    pub client_ca: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "experimental-rust-tls")]
 fn tls_paths_from_env() -> Option<TlsPaths> {
-    let cert = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CERT_FILE")?;
-    let key = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_KEY_FILE")?;
-    let client_ca = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CLIENT_CA_FILE");
+    let cert = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CERT_FILE")?.into();
+    let key = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_KEY_FILE")?.into();
+    let client_ca =
+        epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CLIENT_CA_FILE").map(Into::into);
     Some(TlsPaths {
         cert,
         key,
@@ -1590,13 +1589,13 @@ fn audit_from_env(
                     return Some(crate::audit::AuditLogger::new(reactor, sink));
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, path = %path,
+                    tracing::warn!(error = %e, path = %path.to_string_lossy(),
                         "EPICS_CAS_AUDIT_FILE: failed to open; audit disabled");
                 }
             }
         }
     }
-    if let Some(val) = epics_base_rs::runtime::env::get("EPICS_CAS_AUDIT") {
+    if let Some(val) = epics_base_rs::runtime::env::get_lossy("EPICS_CAS_AUDIT") {
         if val.eq_ignore_ascii_case("stderr") {
             return Some(crate::audit::AuditLogger::new(
                 reactor,
@@ -1611,7 +1610,8 @@ fn audit_from_env(
 /// `EPICS_CAS_INTROSPECTION_ADDR=<host>:<port>` enables it; defaults
 /// off.
 fn introspection_from_env() -> Option<std::net::SocketAddr> {
-    epics_base_rs::runtime::env::get("EPICS_CAS_INTROSPECTION_ADDR").and_then(|s| s.parse().ok())
+    epics_base_rs::runtime::env::get_lossy("EPICS_CAS_INTROSPECTION_ADDR")
+        .and_then(|s| s.parse().ok())
 }
 
 /// Drain grace seconds from the env. Default 30 — long enough for a
@@ -1619,7 +1619,7 @@ fn introspection_from_env() -> Option<std::net::SocketAddr> {
 /// that a Kubernetes terminationGracePeriodSeconds of 60 still leaves
 /// headroom for SIGKILL.
 fn drain_grace_from_env() -> u64 {
-    epics_base_rs::runtime::env::get("EPICS_CAS_DRAIN_GRACE_SECS")
+    epics_base_rs::runtime::env::get_lossy("EPICS_CAS_DRAIN_GRACE_SECS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(30)
 }
@@ -1781,5 +1781,34 @@ mod listeners_need_the_tokio_runtime {
         assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 4242);
 
         server_task.abort();
+    }
+}
+
+#[cfg(all(test, unix, feature = "experimental-rust-tls"))]
+mod tls_paths_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn a_non_utf8_tls_path_keeps_its_bytes() {
+        let cert = std::ffi::OsStr::from_bytes(b"/c\xff.pem");
+        let key = std::ffi::OsStr::from_bytes(b"/k\xff.pem");
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe {
+            std::env::set_var("EPICS_CAS_TLS_CERT_FILE", cert);
+            std::env::set_var("EPICS_CAS_TLS_KEY_FILE", key);
+            std::env::remove_var("EPICS_CAS_TLS_CLIENT_CA_FILE");
+        }
+        let paths = tls_paths_from_env();
+        // SAFETY: same serial group.
+        unsafe {
+            std::env::remove_var("EPICS_CAS_TLS_CERT_FILE");
+            std::env::remove_var("EPICS_CAS_TLS_KEY_FILE");
+        }
+        let paths = paths.expect("cert and key are set");
+        assert_eq!(paths.cert.as_os_str(), cert);
+        assert_eq!(paths.key.as_os_str(), key);
+        assert_eq!(paths.client_ca, None);
     }
 }

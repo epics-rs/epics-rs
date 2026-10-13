@@ -1223,7 +1223,7 @@ mod tests {
         let ctx = crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:5075".parse().expect("peer"),
             creds: Arc::new(crate::server_native::config::ClientCredentials {
-                account: String::new(),
+                account: Default::default(),
                 method: "anonymous".into(),
                 host: String::new(),
                 authority: String::new(),
@@ -1794,7 +1794,7 @@ mod tests {
             ) -> impl std::future::Future<Output = bool> + Send {
                 let acct = self.checked_account.clone();
                 async move {
-                    *acct.lock() = Some(ctx.creds.account.clone());
+                    *acct.lock() = Some(ctx.creds.account.to_string());
                     true
                 }
             }

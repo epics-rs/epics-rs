@@ -78,7 +78,7 @@ pub fn build_search_targets(extra: &[SocketAddr]) -> Vec<SocketAddr> {
         push(addr, &mut targets, &mut seen);
     }
 
-    if let Ok(env) = std::env::var("EPICS_PVA_ADDR_LIST") {
+    if let Some(env) = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_ADDR_LIST") {
         for addr in parse_addr_list(&env) {
             push(addr, &mut targets, &mut seen);
         }

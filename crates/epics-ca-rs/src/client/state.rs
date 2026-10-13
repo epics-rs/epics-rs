@@ -7,7 +7,7 @@ use std::time::Instant;
 use epics_base_rs::runtime::sync::broadcast;
 
 use crate::channel::AccessRights;
-use epics_base_rs::types::DbFieldType;
+use epics_base_rs::types::{DbFieldType, PvString};
 
 /// Channel lifecycle states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +49,7 @@ impl fmt::Display for ChannelState {
 /// Shared inner state of a channel, owned by coordinator
 pub(crate) struct ChannelInner {
     pub cid: u32,
-    pub pv_name: String,
+    pub pv_name: PvString,
     /// CA priority (0..=99) this channel was created at. Fixed
     /// for the channel's lifetime; combined with `server_addr` it forms
     /// the [`crate::client::types::CircuitKey`] the channel rides on, so

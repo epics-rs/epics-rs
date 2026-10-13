@@ -3168,7 +3168,7 @@ impl ClientCredentials {
     /// wire value unable to reach the field at all, instead of merely
     /// corrected after the fact.
     fn with_server_derived(mut self, peer: std::net::SocketAddr) -> Self {
-        self.roles = crate::auth::osd_get_roles(&self.account);
+        self.roles = crate::auth::osd_get_roles(self.account.as_bytes());
         self.host = Self::acf_host_from_peer(peer);
         self
     }
@@ -3191,7 +3191,7 @@ impl ClientCredentials {
     fn x509(creds: crate::auth::X509Credentials, peer: std::net::SocketAddr) -> Self {
         Self {
             method: "x509".into(),
-            account: creds.account,
+            account: creds.account.into(),
             host: String::new(),
             authority: creds.authority,
             roles: Vec::new(),
@@ -3443,7 +3443,7 @@ fn parse_client_credentials(
     // auth body — accept and treat as empty auth.
     let mut creds = ClientCredentials {
         method: method.clone(),
-        account: String::new(),
+        account: Default::default(),
         host: String::new(),
         authority: String::new(),
         roles: Vec::new(),
@@ -3472,7 +3472,7 @@ fn parse_client_credentials(
             for (name, field) in &s.fields {
                 match (name.as_str(), field) {
                     ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                        creds.account = v.as_str_lossy().into_owned();
+                        creds.account = v.clone();
                     }
                     // NOTE the absence of a `host` arm, and do not add one.
                     // A client MAY advertise `host`, and pvxs has no field to
@@ -9571,7 +9571,7 @@ mod tests {
         let ctx = crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:9001".parse().unwrap(),
             creds: Arc::new(ClientCredentials {
-                account: String::new(),
+                account: Default::default(),
                 method: "anonymous".into(),
                 host: String::new(),
                 authority: String::new(),
@@ -12679,7 +12679,7 @@ mod tests {
         crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
             creds: Arc::new(ClientCredentials {
-                account: String::new(),
+                account: Default::default(),
                 method: "anonymous".to_string(),
                 host: String::new(),
                 authority: String::new(),
@@ -16883,7 +16883,7 @@ mod tests {
         ) -> Option<PvField> {
             self.op_reads
                 .lock()
-                .push((ctx.creds.method.clone(), ctx.creds.account.clone()));
+                .push((ctx.creds.method.clone(), ctx.creds.account.to_string()));
             if !checked.allows_read() {
                 return None;
             }
@@ -16905,7 +16905,7 @@ mod tests {
         ) {
             self.opened
                 .lock()
-                .push((ctx.creds.method.clone(), ctx.creds.account.clone()));
+                .push((ctx.creds.method.clone(), ctx.creds.account.to_string()));
         }
         fn notify_channel_close(
             &self,
@@ -16914,7 +16914,7 @@ mod tests {
         ) {
             self.closed
                 .lock()
-                .push((ctx.creds.method.clone(), ctx.creds.account.clone()));
+                .push((ctx.creds.method.clone(), ctx.creds.account.to_string()));
         }
     }
 
@@ -16979,9 +16979,9 @@ mod tests {
         assert_eq!(
             (
                 completion.open_cred.method.as_str(),
-                completion.open_cred.account.as_str()
+                completion.open_cred.account.as_bytes()
             ),
-            ("ca", "alice"),
+            ("ca", b"alice".as_slice()),
             "the completion must carry the credential in force at CREATE dispatch (alice)"
         );
         let resolved = completion
@@ -19291,7 +19291,7 @@ mod tests {
         );
         assert_eq!(
             creds.roles,
-            crate::auth::osd_get_roles(fake_account),
+            crate::auth::osd_get_roles(fake_account.as_bytes()),
             "roles must be re-derived server-side from the account"
         );
     }
@@ -19327,6 +19327,43 @@ mod tests {
             "ca + null auth must yield the anonymous fallback (None), \
              not a blank-account CA credential: {parsed:?}"
         );
+    }
+
+    /// pvxs `serverconn.cpp:223-231` copies `auth["user"]` into
+    /// `cred->account` as its bytes; the account and the roles derived
+    /// from it keep a non-UTF-8 name unreplaced.
+    #[test]
+    fn parse_client_credentials_keeps_a_non_utf8_account() {
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(0x10000, order); // buffer_size
+        payload.put_u16(1, order); // intro_size
+        payload.put_u16(0, order); // qos
+        encode_string_into("ca", order, &mut payload);
+        payload.put_u8(0xFD);
+        payload.put_u16(1, order);
+        payload.put_u8(0x80);
+        payload.put_u8(0x00);
+        payload.put_u8(1); // n_fields
+        payload.put_u8(0x04);
+        payload.extend_from_slice(b"user");
+        payload.put_u8(0x60); // string
+        crate::proto::encode_string_bytes_into(b"op\xff_no_such_account", order, &mut payload);
+
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        let frame = Frame { header, payload };
+
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
+            .expect("decode must succeed")
+            .expect("ca with a user yields Some");
+        assert_eq!(creds.account.as_bytes(), b"op\xff_no_such_account");
+        #[cfg(local_account_db)]
+        assert_eq!(creds.roles, vec![creds.account.clone()]);
     }
 
     /// pvxs advertises exactly `anonymous`/`ca` (`serverconn.cpp:108-114`)
@@ -21404,7 +21441,7 @@ mod tests {
         crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
             creds: Arc::new(ClientCredentials {
-                account: String::new(),
+                account: Default::default(),
                 method: "anonymous".into(),
                 host: String::new(),
                 authority: String::new(),
@@ -23146,7 +23183,7 @@ mod tests {
                 observed_hook
                     .lock()
                     .unwrap()
-                    .push((cred.method.clone(), cred.account.clone()));
+                    .push((cred.method.clone(), cred.account.to_string()));
             })),
             ..Default::default()
         };
@@ -23182,7 +23219,7 @@ mod tests {
         );
         assert_eq!(
             *peer_entry.credentials.lock(),
-            Some(("alice".to_string(), "ca".to_string())),
+            Some(("alice".into(), "ca".to_string())),
             "peer credential record set to alice"
         );
 
@@ -23213,7 +23250,7 @@ mod tests {
         );
         assert_eq!(
             *peer_entry.credentials.lock(),
-            Some(("bob".to_string(), "ca".to_string())),
+            Some(("bob".into(), "ca".to_string())),
             "peer credential record updated to bob"
         );
 
@@ -23284,7 +23321,7 @@ mod tests {
                 observed_hook
                     .lock()
                     .unwrap()
-                    .push((cred.method.clone(), cred.account.clone()));
+                    .push((cred.method.clone(), cred.account.to_string()));
             })),
             ..Default::default()
         };
@@ -23366,7 +23403,7 @@ mod tests {
         // The per-peer credential record (the ACF/report identity) is unchanged.
         assert_eq!(
             *peer_entry.credentials.lock(),
-            Some(("alice".to_string(), "ca".to_string())),
+            Some(("alice".into(), "ca".to_string())),
             "peer credential record still alice/ca after rejected re-auth"
         );
 

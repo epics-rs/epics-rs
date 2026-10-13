@@ -210,6 +210,7 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
             let l = std::net::TcpListener::bind((local_v4, 0)).unwrap();
             l.local_addr().unwrap().port()
         };
+        let ca = named_port::free_for_tcp_and_udp();
         let mut cmd = pvxs_command(&softioc);
         cmd.arg("-D")
             .arg(&dbd_path)
@@ -224,10 +225,11 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
             )
             .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
             .env("EPICS_PVAS_BROADCAST_PORT", search_port.to_string())
-            // softIocPVX bundles a CA server too — keep it off the
-            // default ports so we don't fight other IOCs on the host.
-            .env("EPICS_CAS_SERVER_PORT", "0")
-            .env("EPICS_CA_SERVER_PORT", "0");
+            // A named CA port: `0` falls back to 5064 (`envSubr.c:410`),
+            // and a lost one is rerun through `port_collision`.
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+            .env("EPICS_CA_SERVER_PORT", ca.to_string());
         (cmd, std::net::SocketAddr::from((local_v4, pva_port)))
     };
 
@@ -270,19 +272,28 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         };
     let pva_port = tcp_addr.port();
 
-    // Wait up to 4 s for the first Discovered event from pvxs.
-    let discovered = tokio::time::timeout(Duration::from_secs(4), rx.recv()).await;
+    // Up to 4 s for pvxs's beacon, which carries its TCP server endpoint. An
+    // attempt `start_pvxs` reran beaconed before it was killed, on its own
+    // port, so other servers' events are passed over.
+    let mut seen = Vec::new();
+    let discovered = tokio::time::timeout(Duration::from_secs(4), async {
+        while let Some(event) = rx.recv().await {
+            let text = format!("{event:?}");
+            if text.contains(&pva_port.to_string()) {
+                return true;
+            }
+            seen.push(text);
+        }
+        false
+    })
+    .await;
 
     drop(ioc);
 
-    let event = discovered
-        .expect("timeout waiting for pvxs beacon")
-        .expect("discover channel closed before any beacon");
-    // pvxs's beacon carries its TCP server endpoint; assert the
-    // discovered event matches the port we know pvxs bound.
-    assert!(
-        format!("{event:?}").contains(&pva_port.to_string()),
-        "discovered event did not carry pvxs's pva_port={pva_port}: {event:?}",
+    assert_eq!(
+        discovered,
+        Ok(true),
+        "no beacon carried pvxs's pva_port={pva_port}; saw {seen:?}",
     );
 }
 

@@ -215,10 +215,15 @@ const RANDOM_UDP_ATTEMPTS: usize = 8;
 ///   registrar prints the throw (`iochooks.cpp:508`) and serves nothing.
 /// - `Server unable to bind port`: a server's picked TCP port was taken, and
 ///   it serves on another one (`serverconn.cpp:443-463`).
+/// - RSRV's report that softIocPVX's CA server lost its probed
+///   `EPICS_CAS_SERVER_PORT`, read as softIoc's is
+///   ([`named_port::verdict::softioc_verdict`]).
 pub fn port_collision(text: &str) -> bool {
     text.contains("Unable to bind random UDP")
         || text.contains("Error in pvxsBaseRegistrar : Address already in use")
         || text.contains("Server unable to bind port")
+        || named_port::verdict::softioc_verdict(text)
+            == named_port::verdict::SoftIocVerdict::PortTaken
 }
 
 /// Run `attempt` until the output `text` reads from its result does not show
@@ -396,29 +401,43 @@ pub fn pick_localhost_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
+/// softIocPVX on `db` with `-S`, serving PVA on `tcp` and CA on `ca`.
+///
+/// The CA port is named, because `0` is out of range and falls back to 5064
+/// (`envSubr.c:410`), where another IOC's steal suspends this one's iocInit.
+pub fn soft_ioc_pvx_command(ioc_bin: &Path, db: &Path, tcp: u16, ca: u16) -> Command {
+    let mut cmd = pvxs_command(ioc_bin);
+    cmd.arg("-D")
+        .arg(pvxs_dbd_dir().join("softIocPVX.dbd"))
+        .arg("-d")
+        .arg(db)
+        .arg("-S")
+        .env("EPICS_PVAS_SERVER_PORT", tcp.to_string())
+        .env(
+            "EPICS_PVAS_BROADCAST_PORT",
+            pick_localhost_port().to_string(),
+        )
+        .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+        .env("EPICS_CA_SERVER_PORT", ca.to_string());
+    cmd
+}
+
 /// softIocPVX on `db` with `-S`, its output in `dir`'s `ioc.out`/`ioc.err`,
-/// and the PVA TCP port it serves. A port [`pick_localhost_port`] released
-/// can be taken before the IOC binds it, so each attempt takes fresh ports.
+/// and the PVA TCP port it serves. A released port can be taken before the
+/// IOC binds it, so each attempt takes fresh ones and [`port_collision`]
+/// reruns a lost one.
 pub fn spawn_soft_ioc_pvx(ioc_bin: &Path, db: &Path, dir: &Path) -> (DropChild, u16) {
     let logs = PvxsLogs::in_dir(dir, "ioc");
     let build = || {
         let tcp = pick_localhost_port();
-        let mut cmd = pvxs_command(ioc_bin);
-        cmd.arg("-D")
-            .arg(pvxs_dbd_dir().join("softIocPVX.dbd"))
-            .arg("-d")
-            .arg(db)
-            .arg("-S")
-            .env("EPICS_PVAS_SERVER_PORT", tcp.to_string())
-            .env(
-                "EPICS_PVAS_BROADCAST_PORT",
-                pick_localhost_port().to_string(),
-            )
-            .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-            .env("EPICS_CAS_SERVER_PORT", "0")
-            .env("EPICS_CA_SERVER_PORT", "0");
-        (cmd, std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
+        let ca = named_port::free_for_tcp_and_udp();
+        (
+            soft_ioc_pvx_command(ioc_bin, db, tcp, ca),
+            std::net::SocketAddr::from(([127, 0, 0, 1], tcp)),
+        )
     };
     match start_pvxs(&logs, build, ioc_ready) {
         Ok((ioc, addr)) => (ioc, addr.port()),

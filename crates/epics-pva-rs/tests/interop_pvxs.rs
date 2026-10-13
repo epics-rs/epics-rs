@@ -78,6 +78,9 @@ mod search_prefix;
 #[path = "interop_pvxs_mods/server_ports_env.rs"]
 mod server_ports_env;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/soft_ioc_pvx_ca_port.rs"]
+mod soft_ioc_pvx_ca_port;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/start_pvxs_rule.rs"]
 mod start_pvxs_rule;
 #[cfg(unix)]

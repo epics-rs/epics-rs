@@ -212,6 +212,9 @@ source-guard = { path = "../source-guard" }
 # crate that derives the backend has the same hole, and a 300-line audit
 # copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
+# Dev-only, path-only: softIocPVX's CA port is probed and its RSRV steal
+# read the way softIoc's is.
+named-port = { path = "../named-port" }
 rcgen = "0.13"
 tempfile = "3"
 serial_test = "3"

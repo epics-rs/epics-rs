@@ -60,6 +60,7 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
         err: stderr_path.clone(),
     };
     let build = || {
+        let ca = named_port::free_for_tcp_and_udp();
         let mut cmd = pvxs_command(&ioc_bin);
         cmd.arg("-D")
             .arg(&dbd)
@@ -70,10 +71,11 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
             .env("EPICS_PVAS_SERVER_PORT", port.to_string())
             .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
             .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-            // Stop softIocPVX from also fighting for CA port 5064 on
-            // hosts where another IOC owns it.
-            .env("EPICS_CAS_SERVER_PORT", "0")
-            .env("EPICS_CA_SERVER_PORT", "0")
+            // A named CA port: `0` falls back to 5064 (`envSubr.c:410`),
+            // and a lost one is rerun through `port_collision`.
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+            .env("EPICS_CA_SERVER_PORT", ca.to_string())
             // The signal we depend on. `pvxs.tcp.*` rather than
             // `pvxs.tcp.setup` alone so the failure path below also captures
             // the server's per-reply flow-control decisions from `connio`

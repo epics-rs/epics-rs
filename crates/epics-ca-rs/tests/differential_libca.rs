@@ -13,10 +13,10 @@
 //! cargo test -p epics-ca-rs --test differential_libca -- --ignored --test-threads=1
 //! ```
 //!
-//! Each test allocates its own port pair (CA Rust port + C IOC port)
-//! so they can in principle run in parallel, but `--test-threads=1`
-//! is recommended because both sides shell out to `caget`/`caput`
-//! which scan environment variables for `EPICS_CA_ADDR_LIST`.
+//! The Rust server binds port 0 and the C IOC takes a probed candidate
+//! through `c_ca_tools::spawn_softioc`, which retries a stolen one;
+//! `--test-threads=1` is recommended because both sides shell out to
+//! `caget`/`caput`, which scan `EPICS_CA_ADDR_LIST`.
 //!
 //! Skipping logic: each test calls `require_libca()` first, which
 //! returns `false` if `softIoc` / `caget` / `caput` aren't on PATH —
@@ -30,7 +30,6 @@
 #![cfg(tokio_backend)]
 
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use serial_test::serial;
 
@@ -48,35 +47,6 @@ fn which(name: &str) -> Option<String> {
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() { None } else { Some(s) }
-}
-
-/// Start the C softIoc with one PV. Returns the child and the temp root
-/// holding its database — the caller must keep the root alive for the life of
-/// the child. softIoc reads its config from stdin.
-///
-/// The database used to be `<tmp>/ca-rs-diff-<port>.db`, distinguished only by
-/// an ephemeral port the OS is free to hand to another process a moment later,
-/// on a directory shared by every checkout on the host, and nothing ever
-/// removed it. An `O_EXCL` root is private to this call, and dropping it takes
-/// the database with it on every exit path including a panicking one.
-fn start_c_softioc(port: u16, db_content: &str) -> (std::process::Child, tempfile::TempDir) {
-    let (softioc, _, _) = libca_paths().expect("softIoc on PATH");
-    let dir = tempfile::tempdir().expect("fixture root");
-    let tmp = dir.path().join(format!("ca-rs-diff-{port}.db"));
-    std::fs::write(&tmp, db_content).expect("write db");
-    let child = Command::new(softioc)
-        .env("EPICS_CA_SERVER_PORT", port.to_string())
-        .env("EPICS_CAS_SERVER_PORT", port.to_string())
-        .arg("-d")
-        .arg(&tmp)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn softIoc");
-    // Give it time to initialize.
-    std::thread::sleep(Duration::from_millis(800));
-    (child, dir)
 }
 
 /// Run caget against the given port and return the parsed value as
@@ -130,22 +100,6 @@ fn run_caput(port: u16, pv: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
-// Pick a fixed pair of high ports for the rust + C softiocs.
-//
-// Using `TcpListener::bind("127.0.0.1:0")` to get an ephemeral port
-// returns numbers that the kernel keeps in TIME_WAIT for a window
-// after the listener drops; rebinding the same port for the IOC's
-// UDP responder *succeeds* but libca clients on macOS were observed
-// to fail their search reliably under that pattern. Using fixed
-// well-known-but-unlikely ports avoids the issue at the cost of
-// requiring `--test-threads=1` (already documented in the module
-// header).
-/// Port for the C `softIoc` side. The Rust server no longer needs one
-/// chosen up front — it binds port 0 and reports what it got.
-fn c_softioc_port() -> u16 {
-    49998
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "differential libca; run with --include-ignored"]
 #[serial]
@@ -155,8 +109,6 @@ async fn caget_double_matches_libca() {
         eprintln!("skipping: libca not on PATH");
         return;
     };
-    let c_port = c_softioc_port();
-
     // Rust side
     let server = epics_ca_rs::server::CaServer::builder()
         .port(0)
@@ -168,16 +120,13 @@ async fn caget_double_matches_libca() {
     let _rs_handle = tokio::spawn(async move { server.run().await });
 
     // C side
-    let (mut c_child, _db_root) = start_c_softioc(
-        c_port,
-        "record(ai, \"DIFF:VAL\") { field(VAL, \"3.14\") }\n",
-    );
+    let c_ioc = c_ca_tools::spawn_softioc("record(ai, \"DIFF:VAL\") { field(VAL, \"3.14\") }\n");
+    let c_port = c_ioc.udp_port;
 
     let rs_value = run_caget(rs_port, "DIFF:VAL");
     let c_value = run_caget(c_port, "DIFF:VAL");
 
-    let _ = c_child.kill();
-    let _ = c_child.wait();
+    drop(c_ioc);
 
     let rs = rs_value.unwrap_or_else(|| panic!("rs caget returned no value"));
     let c = c_value.unwrap_or_else(|| panic!("c caget returned no value"));
@@ -197,8 +146,6 @@ async fn caput_then_caget_matches_libca() {
         eprintln!("skipping: libca not on PATH");
         return;
     };
-    let c_port = c_softioc_port();
-
     let server = epics_ca_rs::server::CaServer::builder()
         .port(0)
         .pv("DIFF:WRITE", epics_base_rs::types::EpicsValue::Double(0.0))
@@ -208,10 +155,8 @@ async fn caput_then_caget_matches_libca() {
     let rs_port = server.udp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
 
-    let (mut c_child, _db_root) = start_c_softioc(
-        c_port,
-        "record(ao, \"DIFF:WRITE\") { field(VAL, \"0.0\") }\n",
-    );
+    let c_ioc = c_ca_tools::spawn_softioc("record(ao, \"DIFF:WRITE\") { field(VAL, \"0.0\") }\n");
+    let c_port = c_ioc.udp_port;
 
     let target = "42.5";
     let rs_put_ok = run_caput(rs_port, "DIFF:WRITE", target);
@@ -222,8 +167,7 @@ async fn caput_then_caget_matches_libca() {
     let rs_value = run_caget(rs_port, "DIFF:WRITE").expect("rs caget");
     let c_value = run_caget(c_port, "DIFF:WRITE").expect("c caget");
 
-    let _ = c_child.kill();
-    let _ = c_child.wait();
+    drop(c_ioc);
 
     let rs_f: f64 = rs_value.parse().expect("parse rs");
     let c_f: f64 = c_value.parse().expect("parse c");

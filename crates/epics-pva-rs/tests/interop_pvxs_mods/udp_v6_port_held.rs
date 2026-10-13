@@ -26,14 +26,18 @@ use std::sync::Arc;
 fn soft_ioc_pvx(ioc: &Path, db: &Path, port: u16, intf: &str) -> String {
     for _ in 0..4 {
         let out = soft_ioc_pvx_once(ioc, db, port, intf);
-        if !out.contains("Unable to bind random UDP") {
+        if !out.contains("Unable to bind random UDP")
+            && named_port::verdict::softioc_verdict(&out)
+                != named_port::verdict::SoftIocVerdict::PortTaken
+        {
             return out;
         }
     }
-    panic!("softIocPVX's client found no random UDP port in 4 tries");
+    panic!("softIocPVX lost its random UDP or its CA port in 4 tries");
 }
 
 fn soft_ioc_pvx_once(ioc: &Path, db: &Path, port: u16, intf: &str) -> String {
+    let ca = named_port::free_for_tcp_and_udp();
     let mut child = pvxs_command(ioc)
         .arg("-D")
         .arg(pvxs_dbd_dir().join("softIocPVX.dbd"))
@@ -43,8 +47,10 @@ fn soft_ioc_pvx_once(ioc: &Path, db: &Path, port: u16, intf: &str) -> String {
         .env("EPICS_PVAS_SERVER_PORT", "0")
         .env("EPICS_PVAS_INTF_ADDR_LIST", intf)
         .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-        .env("EPICS_CAS_SERVER_PORT", "0")
-        .env("EPICS_CA_SERVER_PORT", "0")
+        // A named CA port: `0` falls back to 5064 (`envSubr.c:410`).
+        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+        .env("EPICS_CA_SERVER_PORT", ca.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -56,6 +62,15 @@ fn soft_ioc_pvx_once(ioc: &Path, db: &Path, port: u16, intf: &str) -> String {
         .unwrap()
         .write_all(b"pvxsr 1\nexit\n")
         .expect("softIocPVX stdin");
+    // RSRV that lost its CA port suspends iocInit (`caservertask.c:752`), and
+    // the shell never reads the `exit`.
+    for _ in 0..100 {
+        if child.try_wait().expect("poll softIocPVX").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
     let out = child.wait_with_output().expect("softIocPVX output");
     String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
 }

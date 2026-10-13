@@ -454,9 +454,13 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                         .map(|(record, field)| (record, field, false))
                         .collect();
                 }
+                let mut attached = false;
                 pending.retain_mut(|(record, field, reported)| {
                     match attach_asg_inp(&db, record, field, &mut readers) {
-                        Ok(()) => false,
+                        Ok(()) => {
+                            attached = true;
+                            false
+                        }
                         Err(SubscribeRefused::CapReached) if !*reported => {
                             *reported = true;
                             report_asg_inp_refused(&db, config.as_deref(), record, field);
@@ -466,6 +470,12 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                     }
                 });
                 drop(db);
+                // C's `asComputeAllAsg` after the adds (asCa.c:204-205): a value
+                // posted before this attach reached no reader, so the clients
+                // that evaluated against the older one re-read it now.
+                if attached {
+                    notify_asg_field_changed();
+                }
 
                 let wake = tokio::select! {
                     r = acf_rx.recv() => match r {

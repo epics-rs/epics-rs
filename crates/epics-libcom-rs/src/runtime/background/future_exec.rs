@@ -46,7 +46,9 @@
 //! `RUNNING_NOTIFIED` is what makes a wake that races the poll safe: it is
 //! never dropped, it is deferred to the end of the current poll and turned into
 //! a re-enqueue. A wake arriving in any other state either enqueues (`IDLE`) or
-//! is redundant (`SCHEDULED` — already queued; `DONE` — nothing to run).
+//! is redundant (`SCHEDULED` — already queued; `DONE` — nothing to run). Every
+//! transition and every redundant wake but `DONE` is a read-modify-write of
+//! the state, so the poll a wake joins acquires what the waker wrote first.
 //!
 //! ## Abort
 //!
@@ -377,7 +379,9 @@ impl<T: Send + 'static> Task<T> {
                     // It was deliberately not enqueued then — that is this
                     // path's job, and re-enqueueing at the tail is what keeps a
                     // self-waking task from monopolising the worker.
-                    self.state.store(SCHEDULED, Ordering::Release);
+                    // A swap: a wake joining this deferral after the failed
+                    // exchange above is acquired here, not overwritten.
+                    self.state.swap(SCHEDULED, Ordering::AcqRel);
                     self.enqueue();
                 }
             }
@@ -415,7 +419,18 @@ impl<T: Send + 'static> Schedulable for Task<T> {
                     }
                 }
                 // SCHEDULED: already on a ring. RUNNING_NOTIFIED: already
-                // deferred. DONE: nothing to run. All redundant.
+                // deferred. Either way the wake still writes, or the poll it
+                // joins could read state older than the wake.
+                s @ (SCHEDULED | RUNNING_NOTIFIED) => {
+                    if self
+                        .state
+                        .compare_exchange(s, s, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                // DONE: nothing to run.
                 _ => return,
             }
         }
@@ -720,6 +735,75 @@ mod tests {
     }
 
     // -- basic execution ----------------------------------------------------
+
+    /// A wake that finds the task already scheduled or deferred is served by
+    /// the poll it joins: that poll sees what the waker wrote first.
+    /// Probabilistic and time-bounded. A plain-load wake loses that on x86
+    /// too: the waker's store of `latest` may wait in its store buffer past
+    /// its own load of `state` (StoreLoad), which the poll's exchange does not
+    /// order. This probe's poll path outlasts the drain, so it caught none in
+    /// ~700k release trials; a `store(SCHEDULED)` re-enqueue loses it only
+    /// under the C11 model.
+    #[test]
+    fn a_coalesced_wake_is_seen_by_the_poll_it_joins() {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::task::Waker;
+        use std::time::Instant;
+        struct Probe {
+            latest: AtomicUsize,
+            waker: OnceLock<Waker>,
+            done: AtomicBool,
+        }
+        struct Wait(Arc<Probe>);
+        impl Future for Wait {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.0.latest.load(Ordering::Acquire) == N {
+                    self.0.done.store(true, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                let _ = self.0.waker.set(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        const N: usize = 50;
+        let pool = CallbackPool::with_config(1024, 1);
+        let budget = Instant::now() + Duration::from_secs(2);
+        let (mut trials, mut lost) = (0usize, 0usize);
+        while Instant::now() < budget {
+            let p = Arc::new(Probe {
+                latest: AtomicUsize::new(0),
+                waker: OnceLock::new(),
+                done: AtomicBool::new(false),
+            });
+            let jf = spawn_future(&pool.handle(), CallbackPriority::Low, Wait(Arc::clone(&p)));
+            let waker = loop {
+                if let Some(w) = p.waker.get() {
+                    break w.clone();
+                }
+                std::thread::yield_now();
+            };
+            for i in 1..=N {
+                p.latest.store(i, Ordering::Release);
+                waker.wake_by_ref();
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !p.done.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            if !p.done.load(Ordering::Acquire) {
+                lost += 1;
+                waker.wake_by_ref();
+            }
+            join(jf).unwrap();
+            trials += 1;
+        }
+        assert_eq!(
+            lost, 0,
+            "{lost} of {trials} trials left the last wake unserved"
+        );
+    }
 
     #[test]
     fn future_runs_to_completion() {

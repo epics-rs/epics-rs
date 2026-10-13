@@ -287,7 +287,12 @@ fn load_db_into(cmd: &mut Command, db: &Path) -> Result<(), BootError> {
 /// are four different faults behind one message, and keeping twelve lines
 /// tells them apart for free.
 #[derive(Clone, Default)]
-pub struct OutputTail(Arc<Mutex<VecDeque<String>>>);
+pub struct OutputTail {
+    kept: Arc<Mutex<VecDeque<String>>>,
+    /// Every line, for the one caller that must search more than the last
+    /// twelve; `None` keeps the tail bounded.
+    all: Option<Arc<Mutex<Vec<String>>>>,
+}
 
 impl OutputTail {
     /// Enough to hold an IOC's startup banner and the line that went wrong,
@@ -298,19 +303,49 @@ impl OutputTail {
         Self::default()
     }
 
+    /// A tail that also records every line, readable through
+    /// [`Self::all_lines`]. Unbounded: for a short-lived test IOC only.
+    pub fn keeping_everything() -> Self {
+        Self {
+            kept: Arc::default(),
+            all: Some(Arc::default()),
+        }
+    }
+
     fn push(&self, line: &str) {
-        let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let line = line.trim_end().to_string();
+        if let Some(all) = &self.all {
+            all.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line.clone());
+        }
+        let mut q = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if q.len() == Self::KEEP {
             q.pop_front();
         }
-        q.push_back(line.trim_end().to_string());
+        q.push_back(line);
+    }
+
+    /// Every line since the process started, oldest first; the kept ones
+    /// only when this tail was not made with [`Self::keeping_everything`].
+    pub fn all_lines(&self) -> Vec<String> {
+        match &self.all {
+            Some(all) => all.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            None => self
+                .kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect(),
+        }
     }
 
     /// The kept lines, oldest first. Silence is a finding in its own right —
     /// an IOC that printed nothing at all did not merely boot slowly — so it
     /// is reported as such rather than as an empty string.
     pub fn text(&self) -> String {
-        let q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let q = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if q.is_empty() {
             "(the IOC printed nothing)".to_string()
         } else {
@@ -442,113 +477,248 @@ pub struct CIoc {
 
 impl CIoc {
     pub fn boot(tools: &CTools, db: &Path) -> Result<Self, BootError> {
-        let mut why = Vec::new();
-        for n in 1..=BOOT_ATTEMPTS {
-            let port = alloc_free_port()?;
-            match Self::try_boot(tools, db, port) {
-                Ok(ioc) => return Ok(ioc),
-                Err(e) if e.retryable => {
-                    // Racy by nature: someone took the port between our probe
-                    // and softIoc's bind. Discard this port entirely and get a
-                    // new one — never re-use or re-probe the losing number.
-                    why.push(format!("attempt {n} on port {port}: {}", e.message));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        err(
-            Side::C,
-            format!(
-                "C softIoc could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
-                why.join("; ")
-            ),
-        )
+        let BootedProcess { child, port, tail } =
+            boot_on_free_port(&BootNames::C_SOFTIOC, LogPolicy::Tail, |port| {
+                let mut cmd = Command::new(&tools.ioc_bin);
+                cmd.arg("-S"); // no interactive shell
+                load_db_into(&mut cmd, db)?;
+                cmd.env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                    .stdin(Stdio::null());
+                Ok(cmd)
+            })?;
+        Ok(Self { port, child, tail })
     }
+}
 
-    fn try_boot(tools: &CTools, db: &Path, port: u16) -> Result<Self, BootError> {
-        let mut cmd = Command::new(&tools.ioc_bin);
-        cmd.arg("-S"); // no interactive shell
-        load_db_into(&mut cmd, db)?;
-        let mut child = cmd
-            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CA_SERVER_PORT", port.to_string())
-            .env("EPICS_CAS_SERVER_PORT", port.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| BootError::new(Side::C, format!("spawn softIoc: {e}")))?;
+/// How [`boot_on_free_port`] words its messages for one kind of process.
+/// The texts are part of what callers and the classifier match on, so each
+/// boot keeps its own wording byte for byte.
+#[derive(Clone, Copy)]
+pub struct BootNames<'a> {
+    /// The process as the timeout, death and exhaustion messages name it.
+    what: &'a str,
+    /// The name in `spawn {spawn}: {error}`.
+    spawn: &'a str,
+    /// The port kind in `on {label} {port}`.
+    label: &'a str,
+    /// What precedes the port number in `PORT_COLLISION on …`; empty for
+    /// the C softIoc, whose collision text has always been unlabelled.
+    collision_label: &'a str,
+}
 
-        // softIoc announces readiness with "iocRun: All initialization
-        // complete". It announces a *port collision* with a `cas WARNING`
-        // about the TCP port being unavailable -- and then keeps running and
-        // serving, which is the silent-wrong-answer we must never accept. So
-        // we watch both streams and let the collision win over the ready line.
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        let (tx, rx) = mpsc::channel::<BootSignal>();
-        let tail = OutputTail::new();
-        spawn_watcher(stdout, tx.clone(), tail.clone());
-        spawn_watcher(stderr, tx, tail.clone());
+impl BootNames<'static> {
+    /// `CIoc::boot`'s wording.
+    const C_SOFTIOC: Self = Self {
+        what: "C softIoc",
+        spawn: "softIoc",
+        label: "port",
+        collision_label: "",
+    };
+    /// `PvxIoc::boot`'s wording.
+    const SOFTIOC_PVX: Self = Self {
+        what: "softIocPVX",
+        spawn: "softIocPVX",
+        label: "UDP",
+        collision_label: "UDP ",
+    };
+}
 
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        let mut ready = false;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                let _ = child.kill();
-                return err(
-                    Side::C,
-                    format!(
-                        "C softIoc did not report ready within {BOOT_TIMEOUT:?} on port {port}; \
-                         it said: {}",
-                        tail.text()
-                    ),
-                );
-            }
-            match rx.recv_timeout(left) {
-                Ok(BootSignal::PortCollision(line)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err_retryable(Side::C, format!("PORT_COLLISION on {port}: {line}"));
-                }
-                Ok(BootSignal::Died(said)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err(
-                        Side::C,
-                        format!(
-                            "C softIoc declared itself unable to proceed on port {port}; \
-                                 it said: {said}"
-                        ),
-                    );
-                }
-                Ok(BootSignal::Ready) => {
-                    ready = true;
-                    break;
-                }
-                Ok(BootSignal::Other) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                // Both streams closed without a ready line: the IOC died.
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+impl<'a> BootNames<'a> {
+    /// A process named `what` on a `label` port, spelt the same everywhere.
+    pub fn new(what: &'a str, label: &'a str) -> Self {
+        Self {
+            what,
+            spawn: what,
+            label,
+            collision_label: label,
         }
-        if !ready {
-            let status = child.try_wait().ok().flatten();
+    }
+}
+
+/// How much of the child's output [`boot_on_free_port`] keeps for the
+/// caller; what the boot does with the output does not depend on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogPolicy {
+    /// The last twelve lines: enough for a banner and the
+    /// line that went wrong, bounded for a chatty IOC.
+    Tail,
+    /// Every line, readable from [`OutputTail::all_lines`]. Unbounded: for a
+    /// short-lived test IOC only.
+    All,
+}
+
+/// A C IOC process that reported itself up on `port`: the child is the
+/// caller's to kill by its own pid, and `tail` goes on filling.
+pub struct BootedProcess {
+    pub child: Child,
+    pub port: u16,
+    pub tail: OutputTail,
+}
+
+/// The one owner of "start a C IOC on a port nothing else holds".
+///
+/// `softIoc` cannot inherit a bound fd, so the port number is allocated,
+/// released, and bound again by the child; anyone can take it in between.
+/// When that happens the IOC either prints a bind complaint or `rsrv_init`
+/// ends at `cantProceed("CAS: No TCP server started")` — both are
+/// `BootSignal::PortCollision`. This function kills that child by its own
+/// pid, takes a fresh port, and starts again, `BOOT_ATTEMPTS` times; a
+/// caller never sees a lost port. Any other failure is returned at once.
+///
+/// `command` builds the process for a port (environment, arguments, stdin);
+/// the two output streams are piped here, because the watch needs them.
+/// `names` only words the messages; `log` says how much output the returned
+/// [`OutputTail`] keeps.
+pub fn boot_on_free_port(
+    names: &BootNames,
+    log: LogPolicy,
+    command: impl FnMut(u16) -> Result<Command, BootError>,
+) -> Result<BootedProcess, BootError> {
+    boot_on_free_port_claiming(names, log, |_| Ok(()), command)
+}
+
+/// [`boot_on_free_port`] for a caller that needs the same number for a
+/// resource of its own — a proxy listener, say. `claim` runs with each
+/// candidate port before the IOC is spawned. A [`BootError::retryable`] error
+/// is a lost port like any other and the attempt moves to the next one; any
+/// other error is returned at once, as `command`'s are. Whatever `claim`
+/// bound is therefore bound before the IOC could be started on the number,
+/// and the number the returned process got is the number `claim` last
+/// succeeded on.
+pub fn boot_on_free_port_claiming(
+    names: &BootNames,
+    log: LogPolicy,
+    mut claim: impl FnMut(u16) -> Result<(), BootError>,
+    mut command: impl FnMut(u16) -> Result<Command, BootError>,
+) -> Result<BootedProcess, BootError> {
+    let BootNames { what, label, .. } = *names;
+    let mut why = Vec::new();
+    for n in 1..=BOOT_ATTEMPTS {
+        let port = alloc_free_port()?;
+        match claim(port) {
+            Ok(()) => {}
+            Err(e) if e.retryable => {
+                why.push(format!("attempt {n} on {label} {port}: {}", e.message));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+        let mut cmd = command(port)?;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        match watch_boot(names, log, port, &mut cmd) {
+            Ok(booted) => return Ok(booted),
+            Err(e) if e.retryable => {
+                // Someone took the port between our probe and the child's
+                // bind. Discard it entirely; never re-use the losing number.
+                why.push(format!("attempt {n} on {label} {port}: {}", e.message));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    err(
+        Side::C,
+        format!(
+            "{what} could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
+            why.join("; ")
+        ),
+    )
+}
+
+/// Spawn `cmd` and wait for its ready line, a collision, or its death.
+fn watch_boot(
+    names: &BootNames,
+    log: LogPolicy,
+    port: u16,
+    cmd: &mut Command,
+) -> Result<BootedProcess, BootError> {
+    let BootNames {
+        what,
+        spawn,
+        label,
+        collision_label,
+    } = *names;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| BootError::new(Side::C, format!("spawn {spawn}: {e}")))?;
+
+    // The IOC announces readiness with "iocRun: All initialization
+    // complete". It announces a *port collision* with a `cas WARNING` about
+    // the TCP port being unavailable -- and then keeps running and serving,
+    // which is the silent-wrong-answer we must never accept. So we watch both
+    // streams and let the collision win over the ready line.
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let (tx, rx) = mpsc::channel::<BootSignal>();
+    let tail = match log {
+        LogPolicy::All => OutputTail::keeping_everything(),
+        LogPolicy::Tail => OutputTail::new(),
+    };
+    spawn_watcher(stdout, tx.clone(), tail.clone());
+    spawn_watcher(stderr, tx, tail.clone());
+
+    let deadline = Instant::now() + BOOT_TIMEOUT;
+    let mut ready = false;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             let _ = child.kill();
+            let _ = child.wait();
             return err(
                 Side::C,
                 format!(
-                    "C softIoc exited during boot (status {status:?}) — db rejected? \
+                    "{what} did not report ready within {BOOT_TIMEOUT:?} on {label} {port}; \
                      it said: {}",
                     tail.text()
                 ),
             );
         }
-        Ok(Self { port, child, tail })
+        match rx.recv_timeout(left) {
+            Ok(BootSignal::PortCollision(line)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return err_retryable(
+                    Side::C,
+                    format!("PORT_COLLISION on {collision_label}{port}: {line}"),
+                );
+            }
+            Ok(BootSignal::Died(said)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return err(
+                    Side::C,
+                    format!(
+                        "{what} declared itself unable to proceed on {label} {port}; \
+                         it said: {said}"
+                    ),
+                );
+            }
+            Ok(BootSignal::Ready) => {
+                ready = true;
+                break;
+            }
+            Ok(BootSignal::Other) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            // Both streams closed without a ready line: the IOC died.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
+    if !ready {
+        let status = child.try_wait().ok().flatten();
+        let _ = child.kill();
+        let _ = child.wait();
+        return err(
+            Side::C,
+            format!(
+                "{what} exited during boot (status {status:?}) — db rejected? \
+                 it said: {}",
+                tail.text()
+            ),
+        );
+    }
+    Ok(BootedProcess { child, port, tail })
 }
 
 enum BootSignal {
@@ -1100,140 +1270,53 @@ impl PvxIoc {
     /// Boot `softIocPVX` serving `db`, loopback-isolated, on a UDP search port
     /// nothing else holds.
     pub fn boot(tools: &PvxTools, db: &Path) -> Result<Self, BootError> {
-        let mut why = Vec::new();
-        for n in 1..=BOOT_ATTEMPTS {
-            let udp = alloc_free_port()?;
-            match Self::try_boot(tools, db, udp) {
-                Ok(ioc) => return Ok(ioc),
-                Err(e) if e.retryable => {
-                    why.push(format!("attempt {n} on UDP {udp}: {}", e.message));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        err(
-            Side::C,
-            format!(
-                "softIocPVX could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
-                why.join("; ")
-            ),
-        )
-    }
-
-    fn try_boot(tools: &PvxTools, db: &Path, udp: u16) -> Result<Self, BootError> {
-        let mut cmd = Command::new(&tools.ioc_bin);
-        cmd.arg("-S"); // no interactive shell
-        // The same load route as the CA side, from the same owner: the fat
-        // `softIocPVX` is a `softMain` too, so an asyn db needs its port created
-        // before `iocInit` here exactly as it does there.
-        load_db_into(&mut cmd, db)?;
-        let mut child = cmd
-            // --- PVA server, loopback only. Names verified against pvxs
-            // `src/config.cpp:402-432`, not guessed. ---
-            .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1")
-            // Refuse auto-beaconing outright, so no frame reaches a real
-            // subnet (`config.cpp:430`).
-            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-            .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
-            // TCP is the one port that needs no allocation: pvxs binds `:0`
-            // and stamps the real port back (`server.cpp:484`), then
-            // advertises it in the search reply. A number nobody chose cannot
-            // be a number somebody else took.
-            // --- CA server: not started at all. softIocPVX links base's
-            // rsrv, which binds CA 5064 by default and would fight the host's
-            // real IOCs and the pair's other side. No CA is measured in this
-            // phase, so the CA server is removed rather than moved: base
-            // skips any `dbServer` named in `EPICS_IOC_IGNORE_SERVERS`
-            // (`db/dbServer.c:32-56`), and rsrv registers itself as `rsrv`
-            // (`rsrv/caservertask.c:1561-1569`).
-            //
-            // Moving it was the earlier fix and it could not be made sound.
-            // A port has to be *named* in the environment, so it has to be
-            // allocated and released before the child binds it, and whoever
-            // takes it in that window kills the IOC outright: rsrv's UDP bind
-            // fails silently (`caservertask.c:131-146` prints nothing on
-            // EADDRINUSE), the interface is dropped, and `rsrv_init` ends at
-            // `cantProceed("CAS: No TCP server started")`. Nor can the number
-            // be delegated to the kernel — `envGetInetPortConfigParam`
-            // (`libcom/src/env/envSubr.c:409-416`) clips a port of 0 back to
-            // the 5064 default. Not registering the server has no window at
-            // all. ---
-            .env("EPICS_IOC_IGNORE_SERVERS", "rsrv")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| BootError::new(Side::C, format!("spawn softIocPVX: {e}")))?;
-
-        // Same ready watch as `CIoc`: softIocPVX prints base's `iocRun: All
-        // initialization complete`. A search port held by a socket without
-        // `SO_REUSEPORT` prints the registrar's `Address already in use`
-        // before it, and the IOC then runs with no PVA server; one held by
-        // another pvxs server prints nothing at all (see `PvaPair::boot`).
-        // It also catches a death: `cantProceed` suspends the thread instead
-        // of exiting, so nothing else would ever end the wait.
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        let (tx, rx) = mpsc::channel::<BootSignal>();
-        let tail = OutputTail::new();
-        spawn_watcher(stdout, tx.clone(), tail.clone());
-        spawn_watcher(stderr, tx, tail.clone());
-
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        let mut ready = false;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                let _ = child.kill();
-                return err(
-                    Side::C,
-                    format!(
-                        "softIocPVX did not report ready within {BOOT_TIMEOUT:?} on UDP {udp}; \
-                         it said: {}",
-                        tail.text()
-                    ),
-                );
-            }
-            match rx.recv_timeout(left) {
-                Ok(BootSignal::PortCollision(line)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err_retryable(Side::C, format!("PORT_COLLISION on UDP {udp}: {line}"));
-                }
-                Ok(BootSignal::Died(said)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err(
-                        Side::C,
-                        format!(
-                            "softIocPVX declared itself unable to proceed on UDP {udp}; \
-                                 it said: {said}"
-                        ),
-                    );
-                }
-                Ok(BootSignal::Ready) => {
-                    ready = true;
-                    break;
-                }
-                Ok(BootSignal::Other) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        if !ready {
-            let status = child.try_wait().ok().flatten();
-            let _ = child.kill();
-            return err(
-                Side::C,
-                format!(
-                    "softIocPVX exited during boot (status {status:?}) — db rejected? \
-                     it said: {}",
-                    tail.text()
-                ),
-            );
-        }
+        let BootedProcess {
+            child,
+            port: udp,
+            tail,
+        } = boot_on_free_port(&BootNames::SOFTIOC_PVX, LogPolicy::Tail, |udp| {
+            let mut cmd = Command::new(&tools.ioc_bin);
+            cmd.arg("-S"); // no interactive shell
+            // The same load route as the CA side, from the same owner: the fat
+            // `softIocPVX` is a `softMain` too, so an asyn db needs its port
+            // created before `iocInit` here exactly as it does there.
+            load_db_into(&mut cmd, db)?;
+            cmd
+                // --- PVA server, loopback only. Names verified against pvxs
+                // `src/config.cpp:402-432`, not guessed. ---
+                .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+                .env("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1")
+                // Refuse auto-beaconing outright, so no frame reaches a real
+                // subnet (`config.cpp:430`).
+                .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+                .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
+                // TCP is the one port that needs no allocation: pvxs binds `:0`
+                // and stamps the real port back (`server.cpp:484`), then
+                // advertises it in the search reply. A number nobody chose cannot
+                // be a number somebody else took.
+                // --- CA server: not started at all. softIocPVX links base's
+                // rsrv, which binds CA 5064 by default and would fight the host's
+                // real IOCs and the pair's other side. No CA is measured in this
+                // phase, so the CA server is removed rather than moved: base
+                // skips any `dbServer` named in `EPICS_IOC_IGNORE_SERVERS`
+                // (`db/dbServer.c:32-56`), and rsrv registers itself as `rsrv`
+                // (`rsrv/caservertask.c:1561-1569`).
+                //
+                // Moving it was the earlier fix and it could not be made sound.
+                // A port has to be *named* in the environment, so it has to be
+                // allocated and released before the child binds it, and whoever
+                // takes it in that window kills the IOC outright: rsrv's UDP bind
+                // fails silently (`caservertask.c:131-146` prints nothing on
+                // EADDRINUSE), the interface is dropped, and `rsrv_init` ends at
+                // `cantProceed("CAS: No TCP server started")`. Nor can the number
+                // be delegated to the kernel — `envGetInetPortConfigParam`
+                // (`libcom/src/env/envSubr.c:409-416`) clips a port of 0 back to
+                // the 5064 default. Not registering the server has no window at
+                // all. ---
+                .env("EPICS_IOC_IGNORE_SERVERS", "rsrv")
+                .stdin(Stdio::null());
+            Ok(cmd)
+        })?;
         Ok(Self {
             port: udp,
             child,
@@ -1769,6 +1852,273 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in `softIoc`: it binds the CA port on UDP and TCP as rsrv
+    /// does, and says what rsrv says — the ready line when it got both,
+    /// `CAS: No TCP server started` and `cantProceed`'s banner when it did
+    /// not. It then idles, as `cantProceed` does, so only the harness can end
+    /// it.
+    fn fake_rsrv(port: u16) -> Command {
+        fake_rsrv_on("127.0.0.1", port)
+    }
+
+    /// [`fake_rsrv`] serving on `host`, as the softIoc behind a proxy does.
+    fn fake_rsrv_on(host: &str, port: u16) -> Command {
+        const BODY: &str = r#"
+import os, socket, sys, time
+p = int(os.environ["EPICS_CA_SERVER_PORT"])
+h = os.environ.get("FAKE_RSRV_HOST", "127.0.0.1")
+try:
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((h, p))
+    t = socket.socket(); t.bind((h, p)); t.listen()
+    print("iocRun: All initialization complete", flush=True)
+except OSError:
+    print("CAS: No TCP server started", flush=True)
+    print("CRITICAL ERROR Thread _main_ (0x1) can't proceed, suspending.", flush=True)
+time.sleep(60)
+"#;
+        let mut cmd = Command::new("python3");
+        cmd.args(["-I", "-c", BODY])
+            .env("EPICS_CA_SERVER_PORT", port.to_string())
+            .env("FAKE_RSRV_HOST", host)
+            .stdin(Stdio::null());
+        cmd
+    }
+
+    /// Take `port` on both protocols, as another process does between the
+    /// probe and the IOC's bind.
+    fn hold(port: u16) -> (UdpSocket, TcpListener) {
+        (
+            UdpSocket::bind(("127.0.0.1", port)).expect("hold udp"),
+            TcpListener::bind(("127.0.0.1", port)).expect("hold tcp"),
+        )
+    }
+
+    /// Boundary — a port taken between probe and spawn yields a started IOC
+    /// on the second attempt, on a different port, and the caller sees one
+    /// success.
+    #[test]
+    fn a_port_taken_after_the_probe_is_replaced_on_the_next_attempt() {
+        let mut calls = Vec::new();
+        let mut held = Vec::new();
+        let mut booted = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |port| {
+                if calls.is_empty() {
+                    held.push(hold(port));
+                }
+                calls.push(port);
+                Ok(fake_rsrv(port))
+            },
+        )
+        .expect("the second attempt must boot");
+        let _ = booted.child.kill();
+        let _ = booted.child.wait();
+        assert_eq!(calls.len(), 2, "one lost port, one fresh one: {calls:?}");
+        assert_ne!(calls[0], calls[1], "the losing number must not be reused");
+        assert_eq!(booted.port, calls[1]);
+        assert!(booted.tail.text().contains("iocRun: All initialization"));
+    }
+
+    /// Boundary — every attempt losing its port ends in an error that names
+    /// the attempts and the last port.
+    #[test]
+    fn exhausted_attempts_name_the_last_port() {
+        let mut calls = Vec::new();
+        let mut held = Vec::new();
+        let result = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |port| {
+                held.push(hold(port));
+                calls.push(port);
+                Ok(fake_rsrv(port))
+            },
+        );
+        let Err(e) = result else {
+            panic!("every attempt lost its port, yet a boot was reported");
+        };
+        assert_eq!(calls.len(), BOOT_ATTEMPTS);
+        let last = calls[BOOT_ATTEMPTS - 1];
+        assert!(
+            e.message.contains(&format!("{BOOT_ATTEMPTS} attempts"))
+                && e.message
+                    .contains(&format!("attempt {BOOT_ATTEMPTS} on port {last}")),
+            "{}",
+            e.message
+        );
+    }
+
+    /// The wording a caller's classifier and a reader's grep match on stays
+    /// byte-exact per boot: the C softIoc's collision text carries no port
+    /// kind, softIocPVX's says `UDP`.
+    #[test]
+    fn each_boot_keeps_its_own_collision_wording() {
+        for (names, kind, expect_prefix) in [
+            (&BootNames::C_SOFTIOC, "port", ""),
+            (&BootNames::SOFTIOC_PVX, "UDP", "UDP "),
+        ] {
+            let mut calls = Vec::new();
+            let mut held = Vec::new();
+            let Err(e) = boot_on_free_port(names, LogPolicy::Tail, |port| {
+                held.push(hold(port));
+                calls.push(port);
+                Ok(fake_rsrv(port))
+            }) else {
+                panic!("every attempt lost its port, yet a boot was reported");
+            };
+            let first = calls[0];
+            let want =
+                format!("attempt 1 on {kind} {first}: PORT_COLLISION on {expect_prefix}{first}: ");
+            assert!(e.message.contains(&want), "{want:?} not in {}", e.message);
+        }
+    }
+
+    /// The spawn failure names the binary the way each boot always did.
+    #[test]
+    fn each_boot_keeps_its_own_spawn_wording() {
+        for (names, want) in [
+            (&BootNames::C_SOFTIOC, "spawn softIoc: "),
+            (&BootNames::SOFTIOC_PVX, "spawn softIocPVX: "),
+        ] {
+            let Err(e) = boot_on_free_port(names, LogPolicy::Tail, |_| {
+                Ok(Command::new("/nonexistent/caucus-no-such-ioc"))
+            }) else {
+                panic!("a missing binary booted");
+            };
+            assert!(e.message.starts_with(want), "{}", e.message);
+        }
+    }
+
+    /// Boundary — a failure that is not a lost port returns at once: the
+    /// command is built once, nothing is retried, and the error is the
+    /// process's own, not an exhausted-attempts summary.
+    #[test]
+    fn a_non_collision_failure_is_not_retried() {
+        let mut calls = 0;
+        let result = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |_| {
+                calls += 1;
+                let mut cmd = Command::new("python3");
+                cmd.args([
+                    "-I",
+                    "-c",
+                    "import sys; print('db rejected', flush=True); sys.exit(1)",
+                ])
+                .stdin(Stdio::null());
+                Ok(cmd)
+            },
+        );
+        let Err(e) = result else {
+            panic!("a process that died at boot was reported booted");
+        };
+        assert_eq!(calls, 1, "a non-collision failure must not be retried");
+        assert!(
+            e.message.contains("exited during boot") && !e.message.contains("attempts"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Boundary — the policy given to the boot decides whether a boot that
+    /// printed past the twelve-line window still has its first line.
+    #[test]
+    fn the_log_policy_decides_whether_the_first_line_survives_the_boot() {
+        fn chatty(_: u16) -> Result<Command, BootError> {
+            let mut cmd = Command::new("python3");
+            cmd.args([
+                "-I",
+                "-c",
+                "import time\nfor i in range(30): print('line', i, flush=True)\n\
+                 print('iocRun: All initialization complete', flush=True)\ntime.sleep(60)",
+            ])
+            .stdin(Stdio::null());
+            Ok(cmd)
+        }
+        let names = BootNames::new("chatty", "port");
+        let mut first = Vec::new();
+        for policy in [LogPolicy::Tail, LogPolicy::All] {
+            let mut booted = boot_on_free_port(&names, policy, chatty).expect("boots");
+            let _ = booted.child.kill();
+            let _ = booted.child.wait();
+            first.push(booted.tail.all_lines().iter().any(|l| l == "line 0"));
+        }
+        assert_eq!(first, [false, true]);
+    }
+
+    /// Boundary — past the twelve-line window the bounded tail forgets the
+    /// first line and the keeping tail still has it.
+    #[test]
+    fn a_keeping_tail_holds_what_the_bounded_one_drops() {
+        let bounded = OutputTail::new();
+        let keeping = OutputTail::keeping_everything();
+        for i in 0..OutputTail::KEEP + 5 {
+            bounded.push(&format!("line {i}"));
+            keeping.push(&format!("line {i}"));
+        }
+        assert!(!bounded.text().contains("line 0 |") && !bounded.text().starts_with("line 0"));
+        assert_eq!(keeping.all_lines().len(), OutputTail::KEEP + 5);
+        assert_eq!(keeping.all_lines()[0], "line 0");
+        assert_eq!(keeping.text(), bounded.text());
+    }
+
+    /// Boundary — a claim the owner's candidate cannot satisfy moves the
+    /// attempt to the next port, and the resource the claim bound ends up on
+    /// the number the IOC got: the proxy-in-front-of-an-IOC shape, the proxy
+    /// on 127.0.0.1 and the IOC on 127.0.0.2.
+    #[test]
+    fn a_refused_claim_takes_the_next_port_and_the_claim_ends_on_the_iocs() {
+        let mut claims = Vec::new();
+        let mut bound: Option<TcpListener> = None;
+        let mut booted = boot_on_free_port_claiming(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |port| {
+                claims.push(port);
+                if claims.len() == 1 {
+                    return err_retryable_neither("proxy listener refused");
+                }
+                bound = Some(
+                    TcpListener::bind(("127.0.0.1", port))
+                        .map_err(|e| BootError::new(Side::C, e.to_string()))?,
+                );
+                Ok(())
+            },
+            |port| Ok(fake_rsrv_on("127.0.0.2", port)),
+        )
+        .expect("the second claim must boot");
+        let _ = booted.child.kill();
+        let _ = booted.child.wait();
+        assert_eq!(claims.len(), 2, "{claims:?}");
+        assert_ne!(claims[0], claims[1]);
+        assert_eq!(booted.port, claims[1]);
+        let listener = bound.expect("the claim bound its resource");
+        assert_eq!(listener.local_addr().unwrap().port(), booted.port);
+    }
+
+    /// Boundary — a claim that fails for a reason a fresh port cannot fix is
+    /// called once and its own error comes back, not "could not get an
+    /// exclusive port".
+    #[test]
+    fn a_fatal_claim_is_called_once_and_its_error_is_returned() {
+        let mut calls = 0;
+        let result = boot_on_free_port_claiming(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |_| {
+                calls += 1;
+                err_neither("permission denied binding the proxy")
+            },
+            |port| Ok(fake_rsrv(port)),
+        );
+        let e = result.err().expect("a fatal claim must fail the boot");
+        assert_eq!(calls, 1);
+        assert!(!e.retryable);
+        assert_eq!(e.message, "permission denied binding the proxy");
     }
 
     #[test]

@@ -14,6 +14,9 @@ use epics_bridge_rs::ca_gateway::upstream::{UpstreamManager, UpstreamManagerConf
 use epics_bridge_rs::ca_gateway::{
     AccessConfig, BeaconAnomaly, CacheMode, PutLogScope, PvCache, PvList, Stats, resolve_event_mask,
 };
+use epics_oracle_rs::ioc::{
+    BootError, BootNames, LogPolicy, OutputTail, Side, boot_on_free_port_claiming,
+};
 use tokio::sync::RwLock;
 
 async fn manager(db: Arc<PvDatabase>) -> UpstreamManager {
@@ -55,13 +58,14 @@ fn base_bin(name: &str) -> std::path::PathBuf {
 /// name-server search through the proxy leads back to it.
 struct StallRig {
     ioc: std::process::Child,
+    /// What the softIoc has said, for a failure message.
+    said: OutputTail,
     port: u16,
     frozen: tokio::sync::watch::Sender<bool>,
     /// Connections the proxy has accepted: a disconnect is redialled, an
     /// unresponsive circuit is not.
     accepted: Arc<std::sync::atomic::AtomicUsize>,
     proxy: tokio::task::JoinHandle<()>,
-    dir: tempfile::TempDir,
 }
 
 impl Drop for StallRig {
@@ -79,41 +83,50 @@ impl Drop for StallRig {
 impl StallRig {
     const IOC: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 2);
 
-    /// The proxy's number is picked on 127.0.0.1, where nothing says it is
-    /// free on 127.0.0.2; a softIoc that loses it there serves nothing, and
-    /// only then is a fresh number taken.
+    /// The proxy and the softIoc need one number. The owner's candidate is
+    /// handed to the claim hook first, which binds the proxy listener on
+    /// 127.0.0.1, so a lost number is replaced with the proxy already bound
+    /// to the one the softIoc then gets on 127.0.0.2.
     async fn start(db: &str, acf: &str) -> Self {
-        let mut lost = String::new();
-        for _ in 0..4 {
-            match Self::try_start(db, acf).await {
-                Ok(rig) => return rig,
-                Err(console) => lost = console,
-            }
-        }
-        panic!("softIoc lost its port four times:\n{lost}");
-    }
-
-    async fn try_start(db: &str, acf: &str) -> Result<Self, String> {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("proxy listener");
-        let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().expect("temp");
         std::fs::write(dir.path().join("t.db"), db).expect("write db");
         std::fs::write(dir.path().join("t.acf"), acf).expect("write acf");
-        let log = |n: &str| std::fs::File::create(dir.path().join(n)).expect("log");
-        let ioc = std::process::Command::new(base_bin("softIoc"))
-            .arg("-S")
-            .arg("-a")
-            .arg(dir.path().join("t.acf"))
-            .arg("-d")
-            .arg(dir.path().join("t.db"))
-            .envs(Self::ioc_env(port))
-            .stdin(std::process::Stdio::null())
-            .stdout(log("ioc.out"))
-            .stderr(log("ioc.err"))
-            .spawn()
-            .expect("spawn softIoc");
+        let mut bound = None;
+        let booted = boot_on_free_port_claiming(
+            &BootNames::new("softIoc", "port"),
+            LogPolicy::All,
+            |port| {
+                // A taken number is a lost port; any other failure is not one
+                // a fresh port can fix.
+                let l = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+                    let msg = format!("proxy listener on 127.0.0.1:{port}: {e}");
+                    if e.kind() == std::io::ErrorKind::AddrInUse {
+                        BootError::retryable(Side::C, msg)
+                    } else {
+                        BootError::new(Side::C, msg)
+                    }
+                })?;
+                l.set_nonblocking(true)
+                    .map_err(|e| BootError::new(Side::C, e.to_string()))?;
+                bound = Some(l);
+                Ok(())
+            },
+            |port| {
+                let mut cmd = std::process::Command::new(base_bin("softIoc"));
+                cmd.arg("-S")
+                    .arg("-a")
+                    .arg(dir.path().join("t.acf"))
+                    .arg("-d")
+                    .arg(dir.path().join("t.db"))
+                    .envs(Self::ioc_env(port))
+                    .stdin(std::process::Stdio::null());
+                Ok(cmd)
+            },
+        )
+        .unwrap_or_else(|e| panic!("softIoc: {e:?}"));
+        let (ioc, port, said) = (booted.child, booted.port, booted.tail);
+        let listener =
+            tokio::net::TcpListener::from_std(bound.expect("claimed")).expect("proxy listener");
         let (frozen, frozen_rx) = tokio::sync::watch::channel(false);
         let upstream = SocketAddr::from((Self::IOC, port));
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -132,18 +145,14 @@ impl StallRig {
         });
         let rig = Self {
             ioc,
+            said,
             port,
             frozen,
             accepted,
             proxy,
-            dir,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while tokio::net::TcpStream::connect(upstream).await.is_err() {
-            // rsrv's line when its TCP bind fails (`caservertask.c:752`).
-            if rig.console().contains("CAS: No TCP server started") {
-                return Err(rig.console());
-            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "softIoc did not listen on {upstream}:\n{}",
@@ -160,7 +169,7 @@ impl StallRig {
             // The echo watchdog arms after this much silence.
             std::env::set_var("EPICS_CA_CONN_TMO", "1");
         }
-        Ok(rig)
+        rig
     }
 
     fn ioc_env(port: u16) -> Vec<(&'static str, String)> {
@@ -216,9 +225,7 @@ impl StallRig {
     }
 
     fn console(&self) -> String {
-        ["ioc.out", "ioc.err"]
-            .map(|n| std::fs::read_to_string(self.dir.path().join(n)).unwrap_or_default())
-            .join("")
+        self.said.all_lines().join("\n")
     }
 }
 

@@ -1057,6 +1057,7 @@ dependencies = [
  "clap",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-oracle-rs",
  "epics-pva-rs",
  "epics-rtems-boot",
  "parking_lot",

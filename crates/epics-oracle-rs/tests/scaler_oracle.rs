@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use epics_oracle_rs::ioc::{CTools, RustIoc, alloc_free_port};
+use epics_oracle_rs::ioc::{BootNames, CTools, LogPolicy, RustIoc, boot_on_free_port};
 
 const DEFAULT_SCALER_IOC: &str =
     "/home/stevek/work/epics-modules/oracle-ioc/bin/linux-x86_64/oracleScalerIoc";
@@ -92,11 +92,14 @@ fn line_with(child: &mut Child, ready: &str) -> (String, Log) {
     (line, seen)
 }
 
+/// Everything an IOC printed so far, as one string.
+type Said = Box<dyn Fn() -> String>;
+
 /// One IOC under test, reachable at `addr` (`EPICS_CA_ADDR_LIST`).
 struct Served {
     _ioc: Proc,
     addr: String,
-    log: Log,
+    said: Said,
 }
 
 impl Served {
@@ -104,7 +107,7 @@ impl Served {
     fn printed(&self, text: &str) -> bool {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
-            if self.log.lock().unwrap().iter().any(|l| l.contains(text)) {
+            if (self.said)().contains(text) {
                 return true;
             }
             thread::sleep(Duration::from_millis(50));
@@ -173,26 +176,32 @@ impl Setup {
 
     fn boot_c(&self, prefix: &str) -> Served {
         let (bin, _) = scaler_ioc();
-        let port = alloc_free_port().expect("free CA port");
-        let mut child = Command::new(bin)
-            .arg(&self.st)
-            .current_dir(&self.dir)
-            .env("P", prefix)
-            .env("EPICS_CA_SERVER_PORT", port.to_string())
-            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO")
-            // The shell stays open on a held stdin, as under a terminal.
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn oracleScalerIoc");
-        let (_, log) = line_with(&mut child, "iocRun: All initialization complete");
+        // The port is taken by the library's one retry owner: a port another
+        // process takes between the probe and the IOC's bind is replaced
+        // there, and never reaches this test.
+        let booted = boot_on_free_port(
+            &BootNames::new("oracleScalerIoc", "port"),
+            LogPolicy::All,
+            |port| {
+                let mut cmd = Command::new(&bin);
+                cmd.arg(&self.st)
+                    .current_dir(&self.dir)
+                    .env("P", prefix)
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO")
+                    // The shell stays open on a held stdin, as under a terminal.
+                    .stdin(Stdio::piped());
+                Ok(cmd)
+            },
+        )
+        .unwrap_or_else(|e| panic!("boot oracleScalerIoc: {e:?}"));
+        let tail = booted.tail;
         Served {
-            _ioc: Proc(child),
-            addr: format!("127.0.0.1:{port}"),
-            log,
+            addr: format!("127.0.0.1:{}", booted.port),
+            _ioc: Proc(booted.child),
+            said: Box::new(move || tail.all_lines().join("\n")),
         }
     }
 
@@ -216,7 +225,7 @@ impl Setup {
         Served {
             _ioc: Proc(child),
             addr: format!("127.0.0.1:{port}"),
-            log,
+            said: Box::new(move || log.lock().unwrap().join("\n")),
         }
     }
 }
@@ -470,7 +479,7 @@ fn missing_input(prefix: &str, fields: &[&str]) -> (Vec<String>, Vec<String>) {
         assert!(
             served.printed(&message),
             "no {message:?}: {:?}",
-            served.log.lock().unwrap()
+            (served.said)()
         );
         caput(&tools, &served.addr, &format!("{prefix}SM.CNT"), "1");
         caput(&tools, &served.addr, &format!("{prefix}SC.CNT"), "1");

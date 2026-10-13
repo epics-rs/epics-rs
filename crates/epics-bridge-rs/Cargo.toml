@@ -316,6 +316,10 @@ source-guard = { path = "../source-guard" }
 # crate that derives the backend has the same hole, and a 300-line audit
 # copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
+# Dev-only and path-only: `boot_on_free_port`, the one owner of starting a C
+# IOC on a port nothing else took, which `gw_upstream_unresponsive_window`
+# used to re-implement.
+epics-oracle-rs = { path = "../epics-oracle-rs" }
 serial_test = "3"
 tempfile = "3"
 tracing-subscriber = "0.3"

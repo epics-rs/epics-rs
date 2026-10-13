@@ -326,16 +326,16 @@ pub fn create_port_runtime_boxed(
     // (asynManager.c:2077-2082), stackSize 0 → `epicsThreadStackMedium`. As an
     // IOC thread its park state is built at entry, not in its first contended
     // lock mid-cycle.
-    // C creates the thread, and so reads the priority, for an ASYN_CANBLOCK
-    // port only (asynManager.c:2074); a synchronous port's priority can never
-    // fail its registration.
+    // C creates the thread, and so reads the priority and stack size, for an
+    // ASYN_CANBLOCK port only (asynManager.c:2074); a synchronous port's
+    // values can never fail its registration.
     let priority = match config.priority {
         p if can_block && p != 0 => ThreadPriority::Custom(p),
         _ => ThreadPriority::Medium,
     };
     let stack = match config.stack_size {
-        0 => StackSpec::Class(StackSizeClass::Medium),
-        raw => StackSpec::from_c(raw),
+        raw if can_block && raw != 0 => StackSpec::from_c(raw),
+        _ => StackSpec::Class(StackSizeClass::Medium),
     };
     let join_handle =
         match MandatoryThread::new(port_name.clone(), priority, StackSizeClass::Medium)

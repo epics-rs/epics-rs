@@ -314,6 +314,12 @@ impl ParamChangeResult {
 /// over the whole per-frame state, not one lock per field, so a frame's
 /// reads and writes stay atomic against a concurrent frame.
 pub trait NDPluginProcess: Send + Sync + 'static {
+    /// The `asynFlags` C's plugin hands its `NDPluginDriver` constructor:
+    /// only a can-block port gets a port thread, at the `*Configure` line's
+    /// priority and stackSize (asynManager.c:2074). No default, as C's
+    /// constructor argument has none.
+    const ASYN_FLAGS: PortFlags;
+
     /// Process one array. Return output arrays and param updates.
     ///
     /// May run concurrently with itself on `NumThreads` worker threads.
@@ -1350,6 +1356,22 @@ const PLUGIN_NDARRAY_ADDR: i32 = 0;
 const PLUGIN_MAX_THREADS: i32 = 1;
 const PLUGIN_NUM_THREADS: i32 = 1;
 
+/// asyn's `0`, `ASYN_CANBLOCK` and `ASYN_MULTIDEVICE` (asynDriver.h), for
+/// [`NDPluginProcess::ASYN_FLAGS`].
+pub const ASYN_NONE: PortFlags = PortFlags {
+    multi_device: false,
+    can_block: false,
+    destructible: false,
+};
+pub const ASYN_CANBLOCK: PortFlags = PortFlags {
+    can_block: true,
+    ..ASYN_NONE
+};
+pub const ASYN_MULTIDEVICE: PortFlags = PortFlags {
+    multi_device: true,
+    ..ASYN_NONE
+};
+
 /// PortDriver implementation for a plugin's control plane.
 #[allow(dead_code)]
 pub struct PluginPortDriver {
@@ -1375,14 +1397,7 @@ impl PluginPortDriver {
         array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
         pool: &NDArrayPool,
     ) -> AsynResult<Self> {
-        let mut base = PortDriverBase::new(
-            port_name,
-            max_addr,
-            PortFlags {
-                can_block: true,
-                ..Default::default()
-            },
-        );
+        let mut base = PortDriverBase::new(port_name, max_addr, P::ASYN_FLAGS);
 
         let ndarray_params = NDArrayDriverParams::create(&mut base)?;
         let plugin_params = PluginBaseParams::create(&mut base)?;
@@ -1880,12 +1895,31 @@ pub fn plugin_priority(priority: i64) -> ThreadPriority {
 pub struct PluginThreads {
     pub priority: ThreadPriority,
     pub stack: StackSpec,
+    /// The `priority` and `stackSize` the plugin's `asynPortDriver` hands
+    /// `registerPort` (asynPortDriver.cpp:4031-4036): the `*Configure`
+    /// values before `asynNDArrayDriver.cpp:876-879` adjusts them, converted
+    /// to `unsigned int` (asynManager.c:2049).
+    pub register_priority: u32,
+    pub register_stack_size: usize,
+}
+
+impl PluginThreads {
+    /// The port's registration, with C's `registerPort` thread arguments.
+    pub fn port_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            priority: self.register_priority,
+            stack_size: self.register_stack_size,
+            ..RuntimeConfig::default()
+        }
+    }
 }
 
 /// The threads of a plugin whose `*Configure` gave neither.
 pub const DEFAULT_PLUGIN_THREADS: PluginThreads = PluginThreads {
     priority: ThreadPriority::Medium,
     stack: DEFAULT_PLUGIN_STACK,
+    register_priority: 0,
+    register_stack_size: 0,
 };
 
 /// A `*Configure` command's `priority` and `stackSize`, each read as C reads it.
@@ -1893,6 +1927,9 @@ pub fn plugin_threads(priority: i64, stack_size: i64) -> PluginThreads {
     PluginThreads {
         priority: plugin_priority(priority),
         stack: plugin_stack(stack_size),
+        // C's `int` to `unsigned int`: the low 32 bits.
+        register_priority: priority as u32,
+        register_stack_size: stack_size as u32 as usize,
     }
 }
 
@@ -1977,7 +2014,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // (iocsh.cpp:1269-1279) and the script continues by default
     // (iocsh.cpp:995, :1123), leaving the C IOC serving without the port. We
     // deviate on purpose: see `port_runtime_unavailable`.
-    let (port_runtime, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (port_runtime, _actor_jh) = create_port_runtime(driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     // Clone port handle for the data thread to write params back
@@ -3019,7 +3056,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // Fatal for the same reason as `create_plugin_runtime_multi_addr` above:
     // a constructor-shaped creator has nowhere to report to, and the only
     // alternative is a handle to a port that does not exist.
-    let (port_runtime, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (port_runtime, _actor_jh) = create_port_runtime(driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     let port_handle = port_runtime.port_handle().clone();
@@ -3187,6 +3224,7 @@ mod tests {
     struct PassthroughProcessor;
 
     impl NDPluginProcess for PassthroughProcessor {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -3201,6 +3239,7 @@ mod tests {
     }
 
     impl NDPluginProcess for ServingProcessor {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -3233,6 +3272,7 @@ mod tests {
     }
 
     impl NDPluginProcess for SinkProcessor {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3546,6 +3586,7 @@ mod tests {
         // at address 1 leaves only slot 0.
         struct Gathering;
         impl NDPluginProcess for Gathering {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::forward(array, vec![])
             }
@@ -3911,6 +3952,7 @@ mod tests {
 
         struct ParamTracker;
         impl NDPluginProcess for ParamTracker {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::arrays(vec![Arc::clone(array)])
             }
@@ -4093,6 +4135,7 @@ mod tests {
     }
 
     impl NDPluginProcess for OverlapProcessor {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let mut inside = self.probe.inside.lock();
             *inside += 1;
@@ -4185,6 +4228,7 @@ mod tests {
     }
 
     impl NDPluginProcess for StackProbe {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let bytes = epics_libcom_rs::runtime::task::current_thread_stack_bytes();
             self.callback.lock().push(bytes.expect("stack readback"));
@@ -4356,7 +4400,33 @@ mod tests {
                     "priority {raw}: {name} has {rows:?}, want {want}"
                 );
             }
+            // The port's own thread takes the raw value, as C's
+            // `registerPort` does for a can-block port (asynManager.c:2077).
+            let port_want = if raw == 0 { 50 } else { raw as u32 };
+            let rows = osipri(&port);
+            assert_eq!(rows, [port_want], "priority {raw}: the port thread");
         }
+    }
+
+    /// `registerPort` gets the `*Configure` values before
+    /// `asynNDArrayDriver.cpp:876-879` adjusts them, as `unsigned int`
+    /// (asynPortDriver.cpp:4031-4036).
+    #[test]
+    fn the_port_registers_with_the_raw_configure_values() {
+        for (priority, stack, want_priority, want_stack) in [
+            (0, 0, 0, 0),
+            (-1, -1, u32::MAX, u32::MAX as usize),
+            (30, 500_000, 30, 500_000),
+        ] {
+            let config = plugin_threads(priority, stack).port_config();
+            assert_eq!(
+                (config.priority, config.stack_size),
+                (want_priority, want_stack),
+                "Configure priority {priority}, stackSize {stack}"
+            );
+        }
+        let config = DEFAULT_PLUGIN_THREADS.port_config();
+        assert_eq!((config.priority, config.stack_size), (0, 0));
     }
 
     #[test]
@@ -4899,6 +4969,7 @@ mod tests {
         // compressed size. CompressedSize_RBV (Int32) exercises both arms.
         struct CompressProcessor;
         impl NDPluginProcess for CompressProcessor {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut out = NDArray::clone(array);
                 out.codec = Some(crate::codec::Codec {
@@ -5090,6 +5161,7 @@ mod tests {
         // DroppedArrays counter rather than back-pressuring the producer.
         struct SlowProcessor;
         impl NDPluginProcess for SlowProcessor {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             fn process_array(&self, _a: &Arc<NDArray>, _p: &NDArrayPool) -> ProcessResult {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 ProcessResult::empty()
@@ -5342,6 +5414,7 @@ mod tests {
     }
 
     impl NDPluginProcess for GatedProcessor {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.entered.fetch_add(1, Ordering::AcqRel);
             let mut open = self.open.lock();

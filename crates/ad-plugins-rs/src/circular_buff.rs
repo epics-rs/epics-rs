@@ -597,6 +597,7 @@ impl CircularBuffState {
 }
 
 impl NDPluginProcess for CircularBuffProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 

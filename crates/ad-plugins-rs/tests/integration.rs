@@ -199,6 +199,7 @@ fn test_rewire_ndarray_port_at_runtime() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
+        const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -346,6 +347,7 @@ fn test_rewire_through_real_roi_plugin() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
+        const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -469,6 +471,7 @@ fn test_roi_param_change_enables_output() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
+        const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,

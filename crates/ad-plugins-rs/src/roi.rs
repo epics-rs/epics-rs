@@ -461,6 +461,10 @@ impl ROIProcessor {
 }
 
 impl NDPluginProcess for ROIProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = asyn_rs::port::PortFlags {
+        destructible: true,
+        ..ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE
+    };
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C `NDPluginROI.cpp:105-131`: DimNMaxSize is the size of the axis ROI
         // dim N *controls*, i.e. `pArray->dims[userDims[N]].size` with

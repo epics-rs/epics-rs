@@ -67,6 +67,7 @@ impl Default for PvaProcessor {
 }
 
 impl NDPluginProcess for PvaProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let payload = ndarray_to_pv_field(array);
 

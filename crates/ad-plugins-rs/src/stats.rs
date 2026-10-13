@@ -1804,6 +1804,7 @@ impl Default for StatsProcessor {
 }
 
 impl NDPluginProcess for StatsProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let p = &self.params;
         let info = array.info();

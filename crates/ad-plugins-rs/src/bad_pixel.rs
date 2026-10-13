@@ -276,6 +276,7 @@ impl BadPixelProcessor {
 }
 
 impl NDPluginProcess for BadPixelProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let info = array.info();
         let width = info.x_size;

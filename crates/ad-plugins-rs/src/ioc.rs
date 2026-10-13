@@ -25,6 +25,93 @@ use epics_ca_rs::server::ioc_app::IocApplication;
 
 use crate::attr_plot_args::{AttrPlotArgs, parse_attr_plot_args};
 
+/// The `asynFlags` C's plugin hands its `NDPluginDriver` / `NDPluginFile`
+/// constructor, for every `*Configure` command registered here: the command,
+/// its ADCore `pluginSrc` file, and the argument as written there. NDROI's
+/// `asynFlags` is `ASYN_DESTRUCTIBLE` where asyn defines it
+/// (NDPluginROI.cpp:361-368).
+/// C creates the port thread, at the line's `priority` and `stackSize`, only
+/// for the can-block six (asynManager.c:2074).
+///
+/// | flags | commands |
+/// |---|---|
+/// | `ASYN_CANBLOCK` | NDFileTIFF, NDFileJPEG, NDFileHDF5, NDFileNetCDF, NDFileMagick, NDFileNexus |
+/// | `ASYN_MULTIDEVICE` | NDGather, NDProcess, NDROI, NDScatter, NDTransform, NDAttr, NDAttrPlot, NDOverlay, NDROIStat, NDTimeSeries, NDPosPlugin |
+/// | `0` | NDBadPixel, NDCodec, NDColorConvert, NDFFT, NDStats, NDStdArrays, NDPva, NDCircularBuff |
+///
+/// Each processor's `NDPluginProcess::ASYN_FLAGS` carries its row.
+pub const C_PLUGIN_ASYN_FLAGS: [(&str, &str, &str); 25] = [
+    ("NDFileTIFFConfigure", "NDFileTIFF.cpp", "ASYN_CANBLOCK"),
+    ("NDFileJPEGConfigure", "NDFileJPEG.cpp", "ASYN_CANBLOCK"),
+    ("NDFileHDF5Configure", "NDFileHDF5.cpp", "ASYN_CANBLOCK"),
+    ("NDFileNetCDFConfigure", "NDFileNetCDF.cpp", "ASYN_CANBLOCK"),
+    ("NDFileMagickConfigure", "NDFileMagick.cpp", "ASYN_CANBLOCK"),
+    ("NDFileNexusConfigure", "NDFileNexus.cpp", "ASYN_CANBLOCK"),
+    (
+        "NDGatherConfigure",
+        "NDPluginGather.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDProcessConfigure",
+        "NDPluginProcess.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDROIConfigure",
+        "NDPluginROI.cpp",
+        "asynFlags | ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDScatterConfigure",
+        "NDPluginScatter.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDTransformConfigure",
+        "NDPluginTransform.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDAttrConfigure",
+        "NDPluginAttribute.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDAttrPlotConfig",
+        "NDPluginAttrPlot.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDOverlayConfigure",
+        "NDPluginOverlay.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDROIStatConfigure",
+        "NDPluginROIStat.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDTimeSeriesConfigure",
+        "NDPluginTimeSeries.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    (
+        "NDPosPluginConfigure",
+        "NDPosPlugin.cpp",
+        "ASYN_MULTIDEVICE",
+    ),
+    ("NDBadPixelConfigure", "NDPluginBadPixel.cpp", "0"),
+    ("NDCodecConfigure", "NDPluginCodec.cpp", "0"),
+    ("NDColorConvertConfigure", "NDPluginColorConvert.cpp", "0"),
+    ("NDFFTConfigure", "NDPluginFFT.cpp", "0"),
+    ("NDStatsConfigure", "NDPluginStats.cpp", "0"),
+    ("NDStdArraysConfigure", "NDPluginStdArrays.cpp", "0"),
+    ("NDPvaConfigure", "NDPluginPva.cpp", "0"),
+    ("NDCircularBuffConfigure", "NDPluginCircularBuff.cpp", "0"),
+];
+
 /// Register all standard areaDetector plugin configure commands.
 ///
 /// The `PluginManager` must have its driver context set (via `set_driver()`)
@@ -154,6 +241,28 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             create_plugin_runtime(
                 port_name,
                 ProcessProcessor::new(ProcessConfig::default()),
+                pool,
+                queue_size,
+                ndarray_port,
+                wiring,
+                threads,
+            )
+        },
+    );
+    // NDPosPluginConfigure (NDPosPlugin.cpp:438-492): nine arguments, no
+    // maxThreads; Mode starts at Discard, the unset param's 0.
+    app = register_generic_plugin(
+        &mut app,
+        mgr,
+        "NDPosPluginConfigure",
+        plugin_arg_defs(),
+        None,
+        PluginThreadArgs::Arg(8),
+        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+            use crate::pos_plugin::{PosMode, PosPluginProcessor};
+            create_plugin_runtime(
+                port_name,
+                PosPluginProcessor::new(PosMode::Discard),
                 pool,
                 queue_size,
                 ndarray_port,

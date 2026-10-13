@@ -454,6 +454,7 @@ impl MagickFileProcessor {
 }
 
 impl NDPluginProcess for MagickFileProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }

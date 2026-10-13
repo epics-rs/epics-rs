@@ -1006,6 +1006,7 @@ impl ColorConvertProcessor {
 }
 
 impl NDPluginProcess for ColorConvertProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,

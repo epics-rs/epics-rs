@@ -49,7 +49,7 @@ fn ad_ioc_with_driver(upstream: &str) -> (AdIoc, IocShell) {
 /// Where each `*Configure` command carries `stackSize`, from the ADCore
 /// `iocshFuncDef` tables; `priority` is just before it in every one. `None` is
 /// `NDCircularBuffConfigure`, which takes neither and passes 0 and 2000000.
-const C_STACK_INDEX: [(&str, Option<usize>); 24] = [
+const C_STACK_INDEX: [(&str, Option<usize>); 25] = [
     ("NDFileTIFFConfigure", Some(6)),
     ("NDFileJPEGConfigure", Some(6)),
     ("NDFileHDF5Configure", Some(6)),
@@ -61,6 +61,7 @@ const C_STACK_INDEX: [(&str, Option<usize>); 24] = [
     ("NDCodecConfigure", Some(8)),
     ("NDColorConvertConfigure", Some(8)),
     ("NDFFTConfigure", Some(8)),
+    ("NDPosPluginConfigure", Some(8)),
     ("NDProcessConfigure", Some(8)),
     ("NDROIConfigure", Some(8)),
     ("NDScatterConfigure", Some(8)),

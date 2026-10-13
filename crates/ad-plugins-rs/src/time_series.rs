@@ -2,8 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use asyn_rs::param::ParamType;
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::config::RuntimeConfig;
+use asyn_rs::port::{PortDriver, PortDriverBase};
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::user::AsynUser;
 
@@ -312,14 +311,12 @@ impl TimeSeriesPortDriver {
         // template reads `TS_TIME_SERIES` at `addr == signal`
         // (`NDStats.template:396-567`, addresses 0..22). A single-address port
         // has no entry to publish a signal into.
+        // `NDPluginTimeSeries`' own flags (NDPluginTimeSeries.cpp:54), on
+        // whichever upstream this receiver is fed from.
         let mut base = PortDriverBase::new(
             port_name,
             num_channels + 1,
-            PortFlags {
-                multi_device: false,
-                can_block: false,
-                destructible: true,
-            },
+            ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE,
         );
 
         // NDPluginBase params (NDTimeSeries.template includes NDPluginBase.template)
@@ -726,7 +723,7 @@ pub fn create_ts_port_runtime(
     // does not exist. C prints and throws here (asynPortDriver.cpp:4036-4040)
     // and iocsh catches it (iocsh.cpp:1269-1279), leaving the C IOC serving
     // without the port; we deviate on purpose — see `port_runtime_unavailable`.
-    let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, actor_jh) = create_port_runtime(driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     // Spawn data ingestion thread. `NDPluginTimeSeries` derives from
@@ -873,7 +870,8 @@ mod tests {
         let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared, test_pool());
         assert_eq!(&*driver.base().port_name, "TEST_TS");
         assert_eq!(driver.num_channels, 3);
-        assert!(!driver.base().flags.multi_device);
+        let flags = driver.base().flags;
+        assert!(flags.multi_device && !flags.can_block && !flags.destructible);
     }
 
     #[test]

@@ -88,3 +88,27 @@ fn the_port_thread_takes_register_port_s_stack_size() {
         rt.shutdown();
     }
 }
+
+/// A synchronous port has no C thread, so its `stackSize` is never read
+/// (asynManager.c:2074); the port's own thread keeps Medium.
+#[test]
+fn a_synchronous_port_s_stack_size_is_not_read() {
+    let stack = Arc::new(AtomicUsize::new(0));
+    let device = Device {
+        base: PortDriverBase::new("STACK_SYNC", 1, PortFlags::default()),
+        stack: Arc::clone(&stack),
+    };
+    let config = RuntimeConfig {
+        stack_size: 2,
+        ..RuntimeConfig::default()
+    };
+    let (rt, _jh) = create_port_runtime(device, config).unwrap();
+    rt.port_handle().read_int32_blocking(0, 0).unwrap();
+    let got = stack.load(Ordering::SeqCst);
+    let asked = StackSizeClass::Medium.bytes();
+    assert!(
+        got + 64 > asked && got < asked + 64 * 1024,
+        "a synchronous port's thread has {got} bytes, want Medium's {asked}"
+    );
+    rt.shutdown();
+}

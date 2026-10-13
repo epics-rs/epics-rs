@@ -487,6 +487,7 @@ impl TransformProcessor {
 }
 
 impl NDPluginProcess for TransformProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C reads the transform type under the port lock and releases it
         // before `transformImage` (NDPluginTransform.cpp:500). A guard passed

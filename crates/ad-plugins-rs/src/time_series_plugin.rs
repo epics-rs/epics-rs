@@ -438,6 +438,7 @@ impl TimeSeriesState {
 }
 
 impl NDPluginProcess for TimeSeriesProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // C processCallbacks: this plugin only handles 1-D or 2-D arrays.
         let ndims = array.dims.len();

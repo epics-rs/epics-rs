@@ -22,6 +22,7 @@ impl PassthroughProcessor {
 }
 
 impl NDPluginProcess for PassthroughProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn plugin_type(&self) -> &str {
         &self.plugin_type
     }

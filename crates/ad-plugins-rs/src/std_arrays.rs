@@ -38,6 +38,7 @@ impl Default for StdArraysProcessor {
 }
 
 impl NDPluginProcess for StdArraysProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // The frame goes on as it is; the runtime files it in `latest_data`.
         ProcessResult::forward(array, vec![])

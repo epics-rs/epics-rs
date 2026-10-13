@@ -1759,6 +1759,7 @@ impl CodecOutcome {
 }
 
 impl NDPluginProcess for CodecProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // C reads the codec selection under the port lock and releases it
         // around every codec call (`NDPluginCodec.cpp:556`, `:596`), so the

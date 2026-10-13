@@ -78,6 +78,7 @@ struct Unlocked {
 }
 
 impl NDPluginProcess for Unlocked {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let acc = burn(array);
         *self.sink.lock() = acc;
@@ -98,6 +99,7 @@ struct Locked {
 }
 
 impl NDPluginProcess for Locked {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut sink = self.sink.lock();
         *sink = burn(array);

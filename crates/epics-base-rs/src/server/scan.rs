@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(17): the teardown test drives the scheduler from a
+// RTEMS-EXEC-MODEL-ALLOW(19): the teardown test drives the scheduler from a
 // tokio task (spawn/abort are its cancellation instrument) and the seven
 // ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
 // tick-runs-on-its-own-thread, watchdog-registration, scanOnce-creation) use
@@ -41,6 +41,10 @@ struct ScanScheduler {
     /// obligation instead of an ambient one: there is no way to build a
     /// scheduler without having already answered the question.
     driver: TickDriver,
+    /// The result of `try_claim_scan_start`, taken when the scheduler is
+    /// built so the caller learns synchronously whether it owns the
+    /// facility. A scheduler that lost the claim parks and owns nothing.
+    is_first: bool,
 }
 
 /// The periodic scan rates of the LOADED `menuScan`, slowest-first because
@@ -1410,7 +1414,12 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
 
 impl ScanScheduler {
     fn new(db: Arc<PvDatabase>, driver: TickDriver) -> Self {
-        Self { db, driver }
+        let is_first = db.try_claim_scan_start();
+        Self {
+            db,
+            driver,
+            is_first,
+        }
     }
 
     /// Run the PINI=YES pass (unless the IOC init path already ran it —
@@ -1423,9 +1432,7 @@ impl ScanScheduler {
     /// [`ScanOwner`]), this call parks as a non-owner and spawns no
     /// duplicate scan tasks.
     async fn run(&self) {
-        let is_first = self.db.try_claim_scan_start();
-
-        if !is_first {
+        if !self.is_first {
             // Another ScanScheduler already owns the periodic tasks for this DB.
             // Avoid spawning duplicates; just park this future.
             std::future::pending::<()>().await;
@@ -1606,6 +1613,10 @@ impl ScanScheduler {
 /// one tick, unjoined, exactly as under the previous server-driven
 /// cancellation).
 pub struct ScanOwner {
+    /// Whether this handle won `try_claim_scan_start`. Only the claimant
+    /// may drive the process-wide `scanCtl` cell: a parked owner's drop
+    /// must not stop the claimant's `scan-%g` threads.
+    claimed: bool,
     stop: Option<crate::runtime::sync::oneshot::Sender<()>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -1625,12 +1636,18 @@ impl ScanOwner {
             crate::server::ioc_app::IocState::Void,
             "ScanOwner::start on an IOC process; use IocBuilder::build_ioc"
         );
-        scan_run();
-        Self::start_running(db)
+        Self::spawn(db, true)
     }
 
     /// The owner thread for an IOC whose `iocRun` has already run `scanRun`.
     pub(crate) fn start_running(db: Arc<PvDatabase>) -> Self {
+        Self::spawn(db, false)
+    }
+
+    /// `run_scan` is C's `scanRun` for a database with no IOC lifecycle;
+    /// only the claimant performs it, so a redundant start cannot resume a
+    /// facility the live owner's lifecycle paused.
+    fn spawn(db: Arc<PvDatabase>, run_scan: bool) -> Self {
         let (stop_tx, stop_rx) = crate::runtime::sync::oneshot::channel::<()>();
         // The scan facility's one and only ambient capture, taken on the
         // caller's thread because neither the owner thread nor the `scan-%g`
@@ -1638,6 +1655,11 @@ impl ScanOwner {
         // scheduler, the PINI pass, every rate thread — is handed this
         // driver rather than asking again.
         let driver = TickDriver::capture();
+        let scheduler = ScanScheduler::new(db, driver.clone());
+        let claimed = scheduler.is_first;
+        if claimed && run_scan {
+            scan_run();
+        }
         // Mandatory: this thread *is* "this IOC scans". `start` has no error
         // path back to its callers (`IocApplication::run` and the entry-point
         // binaries all take a `Self`), so a thread that cannot be created takes
@@ -1656,7 +1678,6 @@ impl ScanOwner {
             StackSizeClass::Medium,
         )
         .spawn(move || {
-            let scheduler = ScanScheduler::new(db, driver.clone());
             let owner = async move {
                 tokio::select! {
                     _ = scheduler.run() => {}
@@ -1669,6 +1690,7 @@ impl ScanOwner {
             driver.drive(owner);
         });
         Self {
+            claimed,
             stop: Some(stop_tx),
             join: Some(join),
         }
@@ -1680,7 +1702,9 @@ impl Drop for ScanOwner {
         // C `scanStop` sets `ctlExit` before it signals and joins
         // (`dbScan.c:159-176`), so a source that fires between the two
         // sees a stopped facility rather than a half-torn one.
-        scan_stop();
+        if self.claimed {
+            scan_stop();
+        }
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(());
         }
@@ -3136,5 +3160,48 @@ mod tests {
             |n| n == 1,
         )
         .await;
+    }
+
+    /// Parked-owner boundary: the second owner's drop leaves the live
+    /// owner's threads running past several ticks of the fastest rate,
+    /// where a stray stop would already have ended them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_owner_drop_leaves_the_live_owners_threads_running() {
+        let db = Arc::new(PvDatabase::new());
+        let first = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + periodic_scans().len()
+        })
+        .await;
+        let with_first = Arc::strong_count(&db) - 1;
+
+        drop(ScanOwner::start(Arc::clone(&db)));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(Arc::strong_count(&db), with_first + 1);
+        assert_eq!(scan_ctl(), ScanCtl::Run);
+        drop(first);
+    }
+
+    /// Live-owner boundary: with a parked owner present, dropping the live
+    /// one stops its threads, and the parked one keeps its scheduler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_owner_drop_stops_its_threads_and_leaves_the_parked_owner() {
+        let db = Arc::new(PvDatabase::new());
+        let first = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + periodic_scans().len()
+        })
+        .await;
+        let parked = ScanOwner::start(Arc::clone(&db));
+
+        drop(first);
+        // Test handle + the parked owner's scheduler.
+        wait_for_count(&db, "scan threads still alive after live owner drop", |n| {
+            n == 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(Arc::strong_count(&db), 2);
+        drop(parked);
     }
 }

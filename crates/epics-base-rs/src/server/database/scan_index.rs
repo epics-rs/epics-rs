@@ -29,6 +29,13 @@ use super::PvDatabase;
 /// value and then takes the mutex sees the keys that produced it.
 struct ScanBucket {
     revision: std::sync::atomic::AtomicU64,
+    /// Cumulative over-runs of this list — C `periodic_scan_list::overruns`
+    /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
+    /// (`dbScan.c:408-409`). Part of the bucket, so counting one is a store
+    /// into memory the scan thread's own sweep already touched, never a
+    /// first-use allocation on that thread. Only the periodic scan threads
+    /// write it.
+    overruns: std::sync::atomic::AtomicU64,
     entries: crate::runtime::sync::PriorityInheritanceMutex<Bucket>,
 }
 
@@ -45,6 +52,7 @@ impl ScanBucket {
     fn new() -> Self {
         Self {
             revision: std::sync::atomic::AtomicU64::new(0),
+            overruns: std::sync::atomic::AtomicU64::new(0),
             entries: crate::runtime::sync::PriorityInheritanceMutex::new(Bucket {
                 keys: BTreeSet::new(),
                 ordered: None,
@@ -95,13 +103,6 @@ pub(super) struct ScanIndex {
     /// point by ordering — `dbLoadDatabase`, then `iocInit` → `initPeriodic`
     /// sizes `papPeriodic`.
     buckets: std::sync::OnceLock<Box<[ScanBucket]>>,
-    /// Cumulative over-runs per list — C `periodic_scan_list::overruns`
-    /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
-    /// (`dbScan.c:408-409`). It lives here for the same reason C puts it on
-    /// `periodic_scan_list`: one owner per rate holds both the list and its
-    /// over-run count, so the counter cannot drift away from the list it
-    /// counts. Only the periodic scan threads write it.
-    overruns: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
     /// C `pevent_list`: every event handle `eventNameToHandle` has created.
     events: EventTable,
 }
@@ -110,7 +111,6 @@ impl ScanIndex {
     pub(super) fn new() -> Self {
         Self {
             buckets: std::sync::OnceLock::new(),
-            overruns: std::sync::OnceLock::new(),
             events: EventTable::new(),
         }
     }
@@ -123,16 +123,9 @@ impl ScanIndex {
             .as_ref()[list.slot()]
     }
 
-    /// This list's over-run counter — the same lazy sizing as [`Self::bucket`].
+    /// This list's over-run counter, which its bucket owns.
     fn overrun(&self, list: ScanList) -> &std::sync::atomic::AtomicU64 {
-        &self
-            .overruns
-            .get_or_init(|| {
-                (0..ScanList::count())
-                    .map(|_| std::sync::atomic::AtomicU64::new(0))
-                    .collect()
-            })
-            .as_ref()[list.slot()]
+        &self.bucket(list).overruns
     }
 }
 

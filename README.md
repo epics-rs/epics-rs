@@ -251,6 +251,22 @@ deployment"). Measured on a real PREEMPT_RT kernel, PI collapses the
 record-gate priority inversion to its critical-section bound: worst case
 24.9 ms to 10.1 ms on the measured guest.
 
+## Release binaries for Linux x86_64 (PGO)
+
+The shipped `realtime-ca-ioc`, `realtime-pva-ioc` and `softioc-rs` binaries
+for `x86_64-unknown-linux-gnu` are built with profile-guided optimization:
+
+```bash
+scripts/pgo-train.sh   # needs `rustup component add llvm-tools`
+scripts/pgo-build.sh   # target/x86_64-unknown-linux-gnu/release/
+```
+
+The profile is a release artifact, regenerated at each tag and never
+committed: a profile older than the sources builds without error and without
+the gain, so `pgo-build.sh` refuses one. Every other build stays plain —
+dev, test, RTEMS and VxWorks images, and the benchmark builds, whose
+instruction-count anchors assume the plain layout.
+
 ## Architecture
 
 The wire format is byte-identical to C EPICS; the internals are not a

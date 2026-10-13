@@ -53,28 +53,125 @@ impl std::error::Error for NotBlockable {}
 
 /// A [`Waker`] that unparks the thread that built it — the wake half of every
 /// "poll-then-park" driver ([`park_on`], asyn-rs's port reply wait). Get it
-/// through [`current_thread_waker`].
-struct ThreadWaker(std::thread::Thread);
+/// through [`ThreadDrive`].
+///
+/// `woken` is what the driver waits on, not the thread's unpark token: a
+/// `thread::park`-based wait inside the driven future (a std `mpsc` receive,
+/// an [`Event`](crate::runtime::sync::Event)) consumes that token, and a driver
+/// that trusted it would park through the wake it was owed.
+struct ThreadWaker {
+    thread: std::thread::Thread,
+    woken: std::sync::atomic::AtomicBool,
+}
 
-/// The waker over the *current* thread, for a driver that polls here and parks
-/// between polls. Built once per thread, so a park costs a refcount, not an
-/// allocation: C's `periodicTask` waits on an `epicsEvent` it created once.
-pub fn current_thread_waker() -> Waker {
-    thread_local! {
-        static WAKER: Waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+impl ThreadWaker {
+    fn current() -> Self {
+        Self {
+            thread: std::thread::current(),
+            woken: std::sync::atomic::AtomicBool::new(false),
+        }
     }
+
+    /// Park until this waker fires, `deadline` passes, or `should_cancel`
+    /// holds after an unpark. Consumes the wake.
+    fn wait(&self, deadline: Option<std::time::Instant>, mut should_cancel: impl FnMut() -> bool) {
+        use std::sync::atomic::Ordering;
+        while !self.woken.swap(false, Ordering::Acquire) {
+            match deadline {
+                None => std::thread::park(),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return;
+                    }
+                    std::thread::park_timeout(left);
+                }
+            }
+            if should_cancel() {
+                return;
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Built once per thread, so a park costs a refcount, not an allocation:
+    /// C's `periodicTask` waits on an `epicsEvent` it created once.
+    static DRIVE: Arc<ThreadWaker> = Arc::new(ThreadWaker::current());
+}
+
+/// The waker over the *current* thread. Drivers get it through
+/// [`ThreadDrive`], which owns the re-arm a nested drive needs.
+fn current_thread_waker() -> Waker {
     // Only a park from another thread-local's destructor finds it gone.
-    WAKER
-        .try_with(Waker::clone)
-        .unwrap_or_else(|_| Waker::from(Arc::new(ThreadWaker(std::thread::current()))))
+    DRIVE
+        .try_with(|drive| Waker::from(Arc::clone(drive)))
+        .unwrap_or_else(|_| Waker::from(Arc::new(ThreadWaker::current())))
+}
+
+/// One poll-then-park drive on this thread: the waker to poll with and the
+/// wait between polls.
+///
+/// Every drive on a thread shares that thread's one `woken` flag, so a drive
+/// run inside another's poll can consume the wake owed to the outer one. A
+/// completed inner drive never leaves the outer drive's wake consumed: drop
+/// re-arms the flag, which costs the outer drive at most one spurious re-poll.
+pub struct ThreadDrive {
+    waker: Waker,
+}
+
+impl ThreadDrive {
+    /// Start a drive on the calling thread.
+    pub fn enter() -> Self {
+        Self {
+            waker: current_thread_waker(),
+        }
+    }
+
+    /// The waker to poll the driven future with.
+    pub fn waker(&self) -> &Waker {
+        &self.waker
+    }
+
+    /// Park until this thread's waker has been woken since the last return,
+    /// or `deadline` passes. A spurious return only costs a re-poll.
+    pub fn park(&self, deadline: Option<std::time::Instant>) {
+        wait_for_wake(deadline, || false);
+    }
+}
+
+impl Drop for ThreadDrive {
+    fn drop(&mut self) {
+        let _ = DRIVE.try_with(|drive| {
+            drive
+                .woken
+                .store(true, std::sync::atomic::Ordering::Release)
+        });
+    }
+}
+
+fn wait_for_wake(deadline: Option<std::time::Instant>, should_cancel: impl FnMut() -> bool) {
+    if DRIVE
+        .try_with(|drive| drive.wait(deadline, should_cancel))
+        .is_err()
+    {
+        // The fallback waker's flag is not reachable from here: one park.
+        match deadline {
+            None => std::thread::park(),
+            Some(deadline) => std::thread::park_timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            ),
+        }
+    }
 }
 
 impl Wake for ThreadWaker {
     fn wake(self: Arc<Self>) {
-        self.0.unpark();
+        self.wake_by_ref();
     }
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
+        self.woken.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.unpark();
     }
 }
 
@@ -97,8 +194,8 @@ pub(crate) fn park_on_interruptible<F: Future>(
     mut should_cancel: impl FnMut() -> bool,
 ) -> Option<F::Output> {
     let mut fut = std::pin::pin!(fut);
-    let waker = current_thread_waker();
-    let mut cx = Context::from_waker(&waker);
+    let drive = ThreadDrive::enter();
+    let mut cx = Context::from_waker(drive.waker());
     loop {
         if should_cancel() {
             return None;
@@ -106,7 +203,7 @@ pub(crate) fn park_on_interruptible<F: Future>(
         if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
             return Some(value);
         }
-        std::thread::park();
+        wait_for_wake(None, &mut should_cancel);
     }
 }
 
@@ -3353,6 +3450,142 @@ fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A future that is pending until `ready` is set, keeping the last waker
+    /// it was polled with in `waker` and reporting every poll on `polled`.
+    struct Gate {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<Waker>>>,
+        polled: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Future for Gate {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+            // Reported after `ready` is read, so a poll that saw it clear
+            // returns Pending and the wake that follows is the drive's to take.
+            let ready = self.ready.load(std::sync::atomic::Ordering::Acquire);
+            let _ = self.polled.send(());
+            if ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// An inner drive run inside the outer drive's poll, with the outer's wake
+    /// firing while the inner waits: the outer still completes.
+    #[test]
+    fn an_inner_drive_keeps_the_outer_drives_wake() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (inner_polled_tx, inner_polled_rx) = std::sync::mpsc::channel();
+        let outer_waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
+        let inner_waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
+        let inner_ready = Arc::new(AtomicBool::new(false));
+
+        let (ow, iw, ir) = (
+            outer_waker.clone(),
+            inner_waker.clone(),
+            inner_ready.clone(),
+        );
+        std::thread::spawn(move || {
+            let mut polls = 0;
+            let mut inner_polled = Some(inner_polled_tx);
+
+            let outer = std::future::poll_fn(move |cx| {
+                *ow.lock().unwrap() = Some(cx.waker().clone());
+                polls += 1;
+                if polls > 1 {
+                    return Poll::Ready(());
+                }
+                park_on(Gate {
+                    ready: ir.clone(),
+                    waker: iw.clone(),
+                    polled: inner_polled.take().unwrap(),
+                });
+                Poll::Pending
+            });
+            park_on(outer);
+            let _ = done_tx.send(());
+        });
+
+        inner_polled_rx.recv().unwrap();
+        outer_waker.lock().unwrap().take().unwrap().wake();
+        // The inner drive has taken the outer's wake and re-polled; only then
+        // can the inner complete, so no later wake rescues the outer.
+        inner_polled_rx.recv().unwrap();
+        inner_ready.store(true, Ordering::Release);
+        inner_waker.lock().unwrap().take().unwrap().wake();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "the outer drive parked through the wake it was owed"
+        );
+    }
+
+    /// A canceller that unparks the thread without waking the future ends the
+    /// wait, though the `woken` flag is clear (future_exec.rs and
+    /// timer_sleep.rs cancel this way).
+    #[test]
+    fn a_raw_unpark_with_cancel_ends_the_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let c = cancel.clone();
+        let driver = std::thread::spawn(move || {
+            let gate = Gate {
+                ready: Arc::new(AtomicBool::new(false)),
+                waker: Arc::new(std::sync::Mutex::new(None)),
+                polled: polled_tx,
+            };
+            let out = park_on_interruptible(gate, || c.load(Ordering::Acquire));
+            let _ = done_tx.send(out.is_none());
+        });
+        polled_rx.recv().unwrap();
+        cancel.store(true, Ordering::Release);
+        driver.thread().unpark();
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(true),
+            "a cancelled, unparked drive must return None"
+        );
+    }
+
+    /// A future whose poll blocks in a `thread::park`-based wait (an `mpsc`
+    /// receive here) while its own wake fires has had the unpark token eaten;
+    /// the drive still re-polls, because it waits on the waker's flag.
+    #[test]
+    fn a_wake_eaten_by_a_park_inside_the_poll_still_reaches_the_drive() {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut polls = 0;
+            park_on(std::future::poll_fn(|cx| {
+                polls += 1;
+                if polls > 1 {
+                    return Poll::Ready(());
+                }
+                let waker = cx.waker().clone();
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                std::thread::spawn(move || {
+                    waker.wake();
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = tx.send(());
+                });
+                let _ = rx.recv();
+                Poll::Pending
+            }));
+            let _ = done.send(());
+        });
+        assert!(
+            result.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the drive parked through a wake an inner park consumed"
+        );
+    }
 
     /// What a thread allocates starting up — std's name copy, the registry
     /// row, the first park's `ThreadData` — is done before `try_spawn` hands

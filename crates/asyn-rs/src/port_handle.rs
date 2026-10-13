@@ -61,24 +61,20 @@ use crate::user::{AsynUser, QueueDeadline};
 /// and incapable of panicking on a runtime-flavour check.
 fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
     let mut fut = pin!(fut);
-    let waker = crate::runtime::task::current_thread_waker();
-    let mut cx = Context::from_waker(&waker);
+    let drive = crate::runtime::task::ThreadDrive::enter();
+    let mut cx = Context::from_waker(drive.waker());
     loop {
         // Polled before the deadline is consulted, so a reply that landed
         // exactly at the deadline is delivered rather than discarded.
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(value) => return Some(value),
             // A spurious unpark just re-polls, which is always sound.
-            Poll::Pending => match deadline {
-                None => std::thread::park(),
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return None;
-                    }
-                    std::thread::park_timeout(remaining);
+            Poll::Pending => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return None;
                 }
-            },
+                drive.park(deadline);
+            }
         }
     }
 }

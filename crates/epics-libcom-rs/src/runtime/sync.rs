@@ -1519,6 +1519,26 @@ mod tests {
         assert!(child.join().is_err());
     }
 
+    /// The red side of the test below: a channel's wait sleeps in
+    /// `thread::park` and takes a pending unpark with it.
+    #[test]
+    fn a_channel_wait_consumes_the_waiters_unpark_token() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        std::thread::current().unpark();
+        let child = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(tx);
+        });
+        let _ = rx.recv();
+        child.join().unwrap();
+        let t0 = std::time::Instant::now();
+        std::thread::park_timeout(std::time::Duration::from_millis(300));
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(250),
+            "the channel wait left the unpark token"
+        );
+    }
+
     /// A spawner waiting on its child's start keeps the unpark meant for the
     /// future it is polling: with a channel's park-based wait, `scan-owner`
     /// lost its stop wake and `ScanOwner::drop` joined it forever.

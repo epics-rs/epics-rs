@@ -16,7 +16,6 @@ use std::time::Duration;
 use epics_base_rs::server::access_security::{AccessSecurityConfig, parse_acf};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::config::env as pva_env;
-use epics_pva_rs::error::PvaResult;
 use epics_pva_rs::server_native::source::{ChannelSource, DynSource};
 use epics_pva_rs::server_native::{
     CompositeSource, PvaServer, PvaServerConfig, runtime::ServerReport,
@@ -441,8 +440,8 @@ impl PvaGateway {
 
     /// Block until SIGINT / SIGTERM, [`Self::interrupt`], or a
     /// subsystem task fails. Mirrors `PvaServer::run`.
-    pub async fn run(self) -> PvaResult<()> {
-        self.server.run().await
+    pub async fn run(self) -> GwResult<()> {
+        self.server.run().await.map_err(GwError::Downstream)
     }
 
     /// Stop accepting new connections. Existing in-flight ops finish

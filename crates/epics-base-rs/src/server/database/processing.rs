@@ -8357,7 +8357,7 @@ impl PvDatabase {
     /// the monitor event is an independent external trigger, like a scan,
     /// not a continuation of an in-flight local chain.
     ///
-    /// Private: [`ExternalCpProcess::run_pending`] is the only caller, so a
+    /// Private: [`ExternalCpProcess::run_worker`] is the only caller, so a
     /// link callback can request a process but never run one inline.
     fn dispatch_external_cp_targets(&self, external_pv: &str) {
         let targets = self.get_external_cp_targets(external_pv);
@@ -10194,12 +10194,23 @@ fn db_get_link_failed(
 
 /// C `CA_DBPROCESS` in one link's `pca->link_action` (`dbCa.c:132-161`):
 /// link callbacks [`Self::request`] a process of `external_pv`'s CP/CPP
-/// holders and the link's worker, `dbCaTask`'s twin, runs it with
-/// [`Self::run_pending`], which takes the request before processing
-/// (`dbCa.c:1190-1195`). Requests raised before the worker runs are one
-/// process; one raised during it is another.
+/// holders, and [`Self::run_worker`], `dbCaTask`'s twin, runs it, taking the
+/// request before processing (`dbCa.c:1190-1195`). Requests raised before
+/// the worker runs are one process; one raised during it is another.
+///
+/// The worker is the only path that processes the holders, so a callback
+/// cannot run one inline:
+///
+/// ```compile_fail,E0624
+/// use epics_base_rs::server::database::ExternalCpProcess;
+/// let process = ExternalCpProcess::new("UP:PV".to_string());
+/// process.request();
+/// process.run_pending(None);
+/// ```
 pub struct ExternalCpProcess {
     pending: std::sync::atomic::AtomicBool,
+    /// The `workListEvent` signal (`dbCa.c:160`), sent on the 0→1 edge only.
+    wake: crate::runtime::sync::Notify,
     external_pv: String,
 }
 
@@ -10207,26 +10218,37 @@ impl ExternalCpProcess {
     pub fn new(external_pv: String) -> Self {
         Self {
             pending: std::sync::atomic::AtomicBool::new(false),
+            wake: crate::runtime::sync::Notify::new(),
             external_pv,
         }
     }
 
-    /// Request a process. Returns `true` on the 0→1 edge, the one request
-    /// that must wake the worker (`dbCa.c:160`).
-    pub fn request(&self) -> bool {
-        !self.pending.swap(true, Ordering::AcqRel)
+    /// Request a process. A request made while one is pending merges into
+    /// it, as the OR into `link_action` does.
+    pub fn request(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            self.wake.notify_one();
+        }
+    }
+
+    /// The link's worker: wait for a request, then process the holders in
+    /// the database `db` names at that moment. Never returns.
+    pub async fn run_worker(&self, db: impl Fn() -> Option<PvDatabase>) {
+        loop {
+            self.wake.notified().await;
+            self.run_pending(db().as_ref());
+        }
     }
 
     /// Take the pending request and, if there was one, process the holders
-    /// in `db`. Returns whether a request was taken.
-    pub fn run_pending(&self, db: Option<&PvDatabase>) -> bool {
+    /// in `db`.
+    fn run_pending(&self, db: Option<&PvDatabase>) {
         if !self.pending.swap(false, Ordering::AcqRel) {
-            return false;
+            return;
         }
         if let Some(db) = db {
             db.dispatch_external_cp_targets(&self.external_pv);
         }
-        true
     }
 }
 

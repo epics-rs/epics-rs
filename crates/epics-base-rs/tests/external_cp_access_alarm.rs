@@ -26,12 +26,15 @@ use epics_base_rs::server::database::{ExternalCpProcess, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
-/// One request taken by the link's worker: the only way a holder of an
-/// external CP link processes.
+/// One request taken by the link's worker, polled until it waits for the
+/// next: the only way a holder of an external CP link processes.
 fn process_holders(db: &PvDatabase) {
+    use std::future::Future as _;
     let process = ExternalCpProcess::new("UP:PV".to_string());
     process.request();
-    process.run_pending(Some(db));
+    let worker = std::pin::pin!(process.run_worker(|| Some(db.clone())));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(worker.poll(&mut cx).is_pending());
 }
 
 /// An lset with a switchable READ gate, modelling `CaLink::value()`'s

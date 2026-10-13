@@ -232,8 +232,6 @@ struct LinkConnState {
     /// [`Self::request_process`], taken by [`run_processor`]. It owns the
     /// holders' dispatch, so nothing here can process them inline.
     process: ExternalCpProcess,
-    /// The `workListEvent` signal (`dbCa.c:160`), sent on the 0→1 edge only.
-    process_wake: epics_base_rs::runtime::sync::Notify,
     db: Arc<RwLock<Option<PvDatabase>>>,
 }
 
@@ -247,7 +245,6 @@ impl LinkConnState {
             connects_seen: AtomicU64::new(0),
             used_input_native: AtomicBool::new(false),
             process: ExternalCpProcess::new(pv_name),
-            process_wake: epics_base_rs::runtime::sync::Notify::new(),
             db,
         }
     }
@@ -260,18 +257,7 @@ impl LinkConnState {
     /// CP/CPP holder of this link is processed. A request made while one is
     /// pending merges into it, as the OR into `link_action` does.
     fn request_process(&self) {
-        if self.process.request() {
-            self.process_wake.notify_one();
-        }
-    }
-
-    /// One step of [`run_processor`]: take the pending request and, if
-    /// there was one, process the holders. Returns whether it processed.
-    fn process_pending(&self) -> bool {
-        // Drop the read guard before dispatching: the dispatch runs record
-        // processing.
-        let db_handle = self.db.read().clone();
-        self.process.run_pending(db_handle.as_ref())
+        self.process.request();
     }
 
     /// Mark the link live. Returns `true` on the false→true edge.
@@ -628,7 +614,7 @@ pub struct CaLinkResolver {
     links: Arc<RwLock<HashMap<String, Arc<CaLink>>>>,
     /// Database handle the link's processor uses to process external
     /// CP/CPP holder records on each remote change
-    /// ([`ExternalCpProcess::run_pending`]). `None` until
+    /// ([`ExternalCpProcess::run_worker`]). `None` until
     /// [`Self::attach_database`] is called at IOC assembly. Late-bound
     /// behind a lock so the cheaply-`Clone`d resolver can have the DB
     /// attached after construction — the same shape as `pvalink`'s
@@ -686,7 +672,7 @@ impl CaLinkResolver {
 
     /// Attach the database handle the link's processor uses to process
     /// external CP/CPP holder records on each remote change
-    /// ([`ExternalCpProcess::run_pending`]). Called by
+    /// ([`ExternalCpProcess::run_worker`]). Called by
     /// [`install_calink_resolver`] at IOC assembly — before iocInit's
     /// `setup_cp_links` warms any external CP link — so the handle is
     /// always present by the time the first monitor event fires. The
@@ -868,10 +854,8 @@ impl CaLinkResolver {
 /// CP/CPP holder of the PV. The flag is cleared before processing, so a
 /// request raised during it processes again, as C's re-queue does.
 async fn run_processor(state: Arc<LinkConnState>) {
-    loop {
-        state.process_wake.notified().await;
-        state.process_pending();
-    }
+    // A clone per process: no read guard is held across record processing.
+    state.process.run_worker(|| state.db.read().clone()).await;
 }
 
 /// One good monitor event: C `dbCa.c eventCallback` refreshes the cached
@@ -1649,11 +1633,23 @@ mod tests {
         (state, lset, db)
     }
 
+    /// `worker` polled until it waits for the next request.
+    fn run_to_wait(worker: impl std::future::Future<Output = ()>) {
+        let worker = std::pin::pin!(worker);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(worker.poll(&mut cx).is_pending());
+    }
+
+    /// `state`'s processor, stepped by hand: every request it holds is taken.
+    fn step(state: &LinkConnState) {
+        run_to_wait(state.process.run_worker(|| state.db.read().clone()));
+    }
+
     /// One processing of `UP:PV`'s holders, taken by a worker of its own.
     fn process_once(db: &PvDatabase) {
         let process = ExternalCpProcess::new("UP:PV".to_string());
         process.request();
-        process.run_pending(Some(db));
+        run_to_wait(process.run_worker(|| Some(db.clone())));
     }
 
     /// C `accessRightsCallback` only adds `CA_DBPROCESS` (`dbCa.c:1029`):
@@ -1672,9 +1668,10 @@ mod tests {
         assert!(state.note_access_rights(false, false));
         assert!(state.note_access_rights(true, false));
         assert_eq!(reads(), base, "the rights callback processed inline");
-        assert!(state.process_pending());
+        step(&state);
         assert_eq!(reads() - base, one);
-        assert!(!state.process_pending());
+        step(&state);
+        assert_eq!(reads() - base, one, "both were taken");
     }
 
     /// C `eventCallback` only adds `CA_DBPROCESS` (`dbCa.c:958-962`): a
@@ -1701,9 +1698,10 @@ mod tests {
         note_monitor_value(&cache, &state, event(), 1);
         note_monitor_value(&cache, &state, event(), 1);
         assert_eq!(reads(), base, "the monitor callback processed inline");
-        assert!(state.process_pending());
+        step(&state);
         assert_eq!(reads() - base, one);
-        assert!(!state.process_pending());
+        step(&state);
+        assert_eq!(reads() - base, one, "both were taken");
     }
 
     /// C `addAction` (`dbCa.c:132-161`) per boundary, with the processor
@@ -1713,7 +1711,9 @@ mod tests {
     fn process_requests_merge_until_the_processor_takes_them() {
         let (state, lset, db) = cp_holder();
         let reads = || lset.reads.load(Ordering::Relaxed);
-        assert!(!state.process_pending(), "nothing requested");
+        let base = reads();
+        step(&state);
+        assert_eq!(reads(), base, "nothing requested");
         // What one processing of the holder reads, the unit counted below.
         let base = reads();
         process_once(&db);
@@ -1723,16 +1723,21 @@ mod tests {
         let base = reads();
         state.request_process();
         state.request_process();
-        assert!(state.process_pending());
+        step(&state);
         assert_eq!(reads() - base, one, "two requests before the processor ran");
-        assert!(!state.process_pending(), "both were taken");
+        step(&state);
+        assert_eq!(reads() - base, one, "both were taken");
 
         lset.request_on_read.store(true, Ordering::Relaxed);
         state.request_process();
-        assert!(state.process_pending());
-        assert!(state.process_pending(), "the request made while processing");
+        step(&state);
+        assert_eq!(
+            reads() - base,
+            3 * one,
+            "the request made while processing is a second process"
+        );
+        step(&state);
         assert_eq!(reads() - base, 3 * one);
-        assert!(!state.process_pending());
     }
 
     /// An outage that began and ended inside a lag: the receiver sees only
@@ -1781,11 +1786,8 @@ mod tests {
         assert_eq!(state.disconnect_count(), 1);
         assert!(state.is_set());
 
-        assert!(
-            state.process_pending(),
-            "the lost outage requested a process"
-        );
-        assert_eq!(reads(), before + one);
+        step(&state);
+        assert_eq!(reads(), before + one, "the lost outage requested a process");
         assert_eq!(alarm(), (0, 0), "the holder read the reconnected link");
 
         // The retained tail wakes the watcher again; the outage is counted.
@@ -1794,7 +1796,8 @@ mod tests {
             WatchStep::Applied
         );
         assert_eq!(state.disconnect_count(), 1);
-        assert!(!state.process_pending());
+        step(&state);
+        assert_eq!(reads(), before + one);
     }
 
     /// Stage C6 criterion 4 regression, at the level the invariant is

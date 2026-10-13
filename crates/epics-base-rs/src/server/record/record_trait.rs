@@ -4711,14 +4711,6 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
-    /// Fields the record posts itself via an event-driven, individually
-    /// masked path rather than the generic change-detection loop. The
-    /// framework excludes these from that loop so they are neither
-    /// double-posted nor spuriously posted on a cycle the event did not
-    /// fire. C waveform/aai/aao `monitor()` posts `HASH` this way —
-    /// `db_post_events(prec, &prec->hash, DBE_VALUE)` only when the content
-    /// hash changed (waveformRecord.c:317-319), never via VAL's change.
-    ///
     /// The CLOSED set of fields a process cycle of this record may post —
     /// the record's C `process()` + `monitor()` `db_post_events` calls,
     /// enumerated.

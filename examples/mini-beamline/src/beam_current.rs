@@ -114,7 +114,11 @@ pub mod ioc_support {
             Ok(())
         }
 
-        fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+        fn write_begin(
+            &mut self,
+            _record: &mut dyn Record,
+            _done: &epics_base_rs::server::database::WriteDoneSource<'_>,
+        ) -> CaResult<WriteStart> {
             Ok(WriteStart::Synchronous)
         }
 

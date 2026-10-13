@@ -298,6 +298,85 @@ impl crate::runtime::background::CallbackBody for ProcessReentry {
     }
 }
 
+/// The completion of an asynchronous device write: C devAsyn's
+/// `callbackRequestProcessCallback(&pPvt->processCallback, pr->prio, pr)` from
+/// the port thread once the driver write ran, which re-enters the record's
+/// `process()` on a callback band to end the cycle (devAsynFloat64.c:351).
+///
+/// A preallocated cell the device support builds once from a
+/// [`WriteDoneSource`] and requests per write; the outcome rides in it to the
+/// completing pass, as C's `pPvt->result.status` does.
+#[derive(Clone)]
+pub struct WriteDone(Arc<crate::runtime::background::CallbackCell<WriteReentry>>);
+
+impl WriteDone {
+    /// Hand the write's outcome to the record and queue the completing pass on
+    /// `priority`. `Err` is a full band, which C's caller ignores as well.
+    pub fn complete(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        outcome: CaResult<()>,
+    ) -> Result<(), crate::runtime::background::CallbackError> {
+        *self.0.body().outcome.lock().unwrap() = Some(outcome);
+        crate::runtime::task::request_cell(priority, &self.0)
+    }
+}
+
+/// What [`DeviceSupport::write_begin`](crate::server::device_support::DeviceSupport::write_begin)
+/// is given to answer [`WriteStart::Pending`](crate::server::device_support::WriteStart::Pending):
+/// the record's [`WriteDone`] and the band its `PRIO` selects.
+pub struct WriteDoneSource<'a> {
+    db: &'a PvDatabase,
+    name: &'a str,
+    priority: crate::runtime::task::CallbackPriority,
+}
+
+impl<'a> WriteDoneSource<'a> {
+    pub fn new(
+        db: &'a PvDatabase,
+        name: &'a str,
+        priority: crate::runtime::task::CallbackPriority,
+    ) -> Self {
+        Self { db, name, priority }
+    }
+
+    /// The record's band, C `pr->prio`.
+    pub fn priority(&self) -> crate::runtime::task::CallbackPriority {
+        self.priority
+    }
+
+    /// A new completion cell for this record. Allocates: build it once and keep
+    /// it, as C keeps `processCallback` in the record's `devPvt`.
+    pub fn write_done(&self) -> WriteDone {
+        WriteDone(crate::runtime::background::CallbackCell::new(
+            WriteReentry {
+                db: Arc::downgrade(&self.db.inner),
+                name: self.name.to_string(),
+                outcome: std::sync::Mutex::new(None),
+            },
+        ))
+    }
+}
+
+/// The body of a [`WriteDone`].
+struct WriteReentry {
+    db: std::sync::Weak<super::PvDatabaseInner>,
+    name: String,
+    outcome: std::sync::Mutex<Option<CaResult<()>>>,
+}
+
+impl crate::runtime::background::CallbackBody for WriteReentry {
+    fn run(&self) {
+        let Some(outcome) = self.outcome.lock().unwrap().take() else {
+            return;
+        };
+        let Some(inner) = self.db.upgrade() else {
+            return;
+        };
+        let _ = PvDatabase { inner }.complete_async_write(&self.name, outcome);
+    }
+}
+
 /// [`AsyncToken::is_current`], held apart from the token.
 pub struct TokenWatch {
     generation: Arc<AtomicU64>,
@@ -6722,45 +6801,19 @@ impl PvDatabase {
                             if let Some(mut dev) = instance.device.take() {
                                 // Try async write_begin() first
                                 use crate::server::device_support::WriteStart;
-                                match dev.write_begin(&mut *instance.record) {
-                                    Ok(WriteStart::Pending(completion)) => {
+                                let done = WriteDoneSource::new(
+                                    self,
+                                    &instance.name,
+                                    instance.common.callback_priority(),
+                                );
+                                match dev.write_begin(&mut *instance.record, &done) {
+                                    Ok(WriteStart::Pending) => {
                                         // Async write submitted -- set PACT, return early.
-                                        // complete_async_record will handle deadband, snapshot,
-                                        // notification, and FLNK when the write completes.
+                                        // The device's `WriteDone` re-enters the record
+                                        // on a callback band when the write lands, and
+                                        // `complete_async_write` ends the cycle there.
                                         instance.enter_pact();
                                         instance.device = Some(dev);
-                                        let rec_name = instance.name.clone();
-                                        let timeout = std::time::Duration::from_secs(5);
-                                        let db = self.clone();
-                                        let prio = instance.common.callback_priority();
-                                        crate::runtime::task::spawn_background(prio, async move {
-                                            // The write's outcome travels to the
-                                            // completing pass, which raises the
-                                            // WRITE alarm the synchronous branch
-                                            // below raises in place — C carries
-                                            // it as `pPvt->result.status` from
-                                            // `processCallbackOutput` to the
-                                            // record's `process()` re-entry
-                                            // (devAsynFloat64.c:668). A wait the
-                                            // pool never ran is an unknown
-                                            // outcome, reported the same way.
-                                            let outcome =
-                                                crate::runtime::task::spawn_blocking_background(
-                                                    prio,
-                                                    move || completion.wait(timeout),
-                                                )
-                                                .await
-                                                .unwrap_or_else(|e| {
-                                                    Err(CaError::Protocol(format!(
-                                                        "device write completion not awaited: {e}"
-                                                    )))
-                                                });
-                                            let _ = db
-                                                .complete_async_record_with_outcome(
-                                                    &rec_name, outcome,
-                                                )
-                                                .await;
-                                        });
                                         // Not an end: `complete_async_record_inner`
                                         // owns this cycle's tail now, and mints its own
                                         // token from the record when the write lands.
@@ -7883,8 +7936,8 @@ impl PvDatabase {
     /// under the SAME exclusion as the cycle that started it, and a put that
     /// arrived during the async window has either already been serialised
     /// ahead of it or waits behind it. Every caller reaches this from a
-    /// completion task holding no gate (the device-write completion spawn
-    /// above, the seq DLYn chain, the tests); nothing calls it with the gate
+    /// completion task holding no gate (a [`WriteDone`]'s
+    /// callback band, the seq DLYn chain, the tests); nothing calls it with the gate
     /// held, which would dead-lock on the non-reentrant gate.
     pub fn complete_async_record<'a>(
         &'a self,
@@ -7905,36 +7958,40 @@ impl PvDatabase {
         name: &'a str,
         outcome: CaResult<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
-        Box::pin(async move {
-            // Alias-aware entry — same pattern as
-            // `process_record_with_links_inner`. `name` may arrive as an alias
-            // from an async device-support callback that captured the original
-            // record name; normalise to canonical so the gate below, the
-            // `visited` cycle set, and downstream FLNK/OUT dispatches all see
-            // the same canonical name.
-            //
-            // Resolved HERE and not in the body, because the gate wants the
-            // record: `lock_instance` reaches the lock set through the
-            // record's own cell, where `lock_record(name)` would repeat this
-            // very lookup by hand.
-            let (canonical, rec) = match self.lookup_record(name) {
-                Some(found) => found,
-                // Nothing registered under the name. An alias whose target has
-                // gone has always reported the TARGET as missing.
-                None => {
-                    let missing = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
-                    return Err(CaError::ChannelNotFound(missing));
-                }
-            };
-            let record_gate = FrameGate::Taken(self.lock_instance(&rec));
-            let mut visited = ProcStack::new();
-            self.complete_async_record_inner(
-                canonical,
-                record_gate.frame(&rec),
-                outcome.err(),
-                &mut visited,
-            )
-        })
+        Box::pin(async move { self.complete_async_write(name, outcome) })
+    }
+
+    /// [`Self::complete_async_record_with_outcome`] on the calling thread: a
+    /// [`WriteDone`]'s callback band runs it.
+    fn complete_async_write(&self, name: &str, outcome: CaResult<()>) -> CaResult<()> {
+        // Alias-aware entry — same pattern as
+        // `process_record_with_links_inner`. `name` may arrive as an alias
+        // from an async device-support callback that captured the original
+        // record name; normalise to canonical so the gate below, the
+        // `visited` cycle set, and downstream FLNK/OUT dispatches all see
+        // the same canonical name.
+        //
+        // Resolved HERE and not in the body, because the gate wants the
+        // record: `lock_instance` reaches the lock set through the
+        // record's own cell, where `lock_record(name)` would repeat this
+        // very lookup by hand.
+        let (canonical, rec) = match self.lookup_record(name) {
+            Some(found) => found,
+            // Nothing registered under the name. An alias whose target has
+            // gone has always reported the TARGET as missing.
+            None => {
+                let missing = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
+                return Err(CaError::ChannelNotFound(missing));
+            }
+        };
+        let record_gate = FrameGate::Taken(self.lock_instance(&rec));
+        let mut visited = ProcStack::new();
+        self.complete_async_record_inner(
+            canonical,
+            record_gate.frame(&rec),
+            outcome.err(),
+            &mut visited,
+        )
     }
 
     fn complete_async_record_inner(

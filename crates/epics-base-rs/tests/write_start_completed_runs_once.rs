@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{PvDatabase, WriteDoneSource};
 use epics_base_rs::server::device_support::{DeviceSupport, WriteStart};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -23,7 +23,11 @@ impl DeviceSupport for CompletesInBegin {
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         panic!("write() after WriteStart::Completed is the second write");
     }
-    fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+    fn write_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        _done: &WriteDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         Ok(WriteStart::Completed)
     }

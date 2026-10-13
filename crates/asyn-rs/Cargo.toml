@@ -169,6 +169,10 @@ name = "non_blocking_write_reaches_the_driver_once"
 required-features = ["epics"]
 
 [[test]]
+name = "blocking_write_completes_on_the_callback_band"
+required-features = ["epics"]
+
+[[test]]
 name = "port_runtime_lifetime"
 required-features = ["epics"]
 

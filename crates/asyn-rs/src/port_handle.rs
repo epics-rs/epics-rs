@@ -196,10 +196,8 @@ impl AsyncCompletionHandle {
     /// already begun keeps running, exactly as C's `queueTimeoutCallback`
     /// (`asynManager.c:649-703`) leaves a dequeued request alone — it returns
     /// at once on `!puserPvt->isQueued` (`:657-663`). What expiry
-    /// buys the caller is the ability to report — `WriteCompletion::wait`
-    /// (`epics-base-rs/src/server/device_support.rs`) turns the `asynTimeout`
-    /// into the record's completion, where an unbounded park left the record
-    /// in `PACT` for good and never released the thread.
+    /// buys the caller is an `asynTimeout` to report instead of a thread
+    /// parked for good.
     ///
     /// Dropping the reply receiver on expiry is safe: the actor sends its
     /// reply with `let _ = reply.send(..)` and does not care that nobody is

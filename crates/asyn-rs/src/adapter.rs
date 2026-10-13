@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::{WriteDone, WriteDoneSource};
 use epics_base_rs::server::device_support::WriteStart;
 use epics_base_rs::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
-    WriteCompletion,
 };
 use epics_base_rs::server::record::{DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
@@ -784,7 +784,6 @@ impl AsynDeviceSupport {
         let mut slot = self.write_job.request.lock().unwrap();
         cell.queue(&user)?;
         self.write_job.ran.lock().unwrap().take();
-        self.write_job.outcome.lock().unwrap().take();
         *slot = Some((op, user));
         Ok(())
     }
@@ -1095,7 +1094,6 @@ fn convert_param_array_to_iface(
     }
 }
 
-/// Bridges async `AsyncCompletionHandle` to epics-base-rs `WriteCompletion`.
 /// C devAsyn's `processCallbackOutput` request: the record's one `asynUser`,
 /// queued from `process` (devAsynFloat64.c:661). Queued as a [`RequestCell`],
 /// whose queue slot is reserved when the cell is made, so a put on a blocking
@@ -1105,9 +1103,10 @@ struct WriteJob {
     request: std::sync::Mutex<Option<(RequestOp, AsynUser)>>,
     /// The write's result while its cell is still queued.
     ran: std::sync::Mutex<Option<AsynResult<()>>>,
-    /// The result once the cell is free, so the woken put can queue again.
-    outcome: std::sync::Mutex<Option<AsynResult<()>>>,
-    landed: std::sync::Condvar,
+    /// The record's completion and its band, C `pPvt->processCallback` and
+    /// `pr->prio`; set by the put that queued the write.
+    reentry:
+        std::sync::Mutex<Option<(WriteDone, epics_libcom_rs::runtime::task::CallbackPriority)>>,
 }
 
 impl WriteJob {
@@ -1139,33 +1138,19 @@ impl CellBody for WriteJob {
         }));
     }
 
+    /// C `processCallbackOutput`'s last line,
+    /// `callbackRequestProcessCallback(&pPvt->processCallback, pr->prio, pr)`,
+    /// on the port thread: devAsynInt32.c:526, devAsynInt64.c:418,
+    /// devAsynUInt32Digital.c:434, devAsynFloat64.c:351, devAsynOctet.c:830.
     /// Under the request slot, so a put queued meanwhile has already cleared
     /// this request's result rather than receiving it.
     fn done(self: Arc<Self>) {
         let _slot = self.request.lock().unwrap();
         if let Some(result) = self.ran.lock().unwrap().take() {
-            *self.outcome.lock().unwrap() = Some(result);
-            self.landed.notify_all();
-        }
-    }
-}
-
-struct AsynAsyncWriteCompletion(Arc<WriteJob>);
-
-impl WriteCompletion for AsynAsyncWriteCompletion {
-    fn wait(&self, timeout: Duration) -> CaResult<()> {
-        let outcome = self.0.outcome.lock().unwrap();
-        let (mut outcome, _) = self
-            .0
-            .landed
-            .wait_timeout_while(outcome, timeout, |o| o.is_none())
-            .unwrap();
-        match outcome.take() {
-            Some(Ok(())) => Ok(()),
-            Some(Err(e)) => Err(CaError::Protocol(e.to_string())),
-            None => Err(CaError::Protocol(format!(
-                "write timed out after {timeout:?} waiting for the port"
-            ))),
+            if let Some((reentry, prio)) = &*self.reentry.lock().unwrap() {
+                let _ =
+                    reentry.complete(*prio, result.map_err(|e| CaError::Protocol(e.to_string())));
+            }
         }
     }
 }
@@ -2765,7 +2750,11 @@ impl DeviceSupport for AsynDeviceSupport {
         }
     }
 
-    fn write_begin(&mut self, record: &mut dyn Record) -> CaResult<WriteStart> {
+    fn write_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &WriteDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
         // Same raw-output anchor as the synchronous write() — the async path
         // (blocking ports, e.g. motors) must not bypass the RVAL/OVAL anchor.
         let val = match self.device_output_value(record) {
@@ -2789,11 +2778,16 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(WriteStart::Completed);
         }
 
+        {
+            let mut reentry = self.write_job.reentry.lock().unwrap();
+            match &mut *reentry {
+                Some((_, prio)) => *prio = done.priority(),
+                None => *reentry = Some((done.write_done(), done.priority())),
+            }
+        }
         let user = self.process_user();
         self.queue_write(op, user).map_err(asyn_to_ca_error)?;
-        Ok(WriteStart::Pending(Box::new(AsynAsyncWriteCompletion(
-            Arc::clone(&self.write_job),
-        ))))
+        Ok(WriteStart::Pending)
     }
 
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
@@ -6565,8 +6559,9 @@ mod tests {
 
     /// C devAsyn queues its output on the record's own `asynUser`, which
     /// `queueRequest` links onto the port queue without allocating
-    /// (asynManager.c:1605-1628). A put on a blocking port queues the same way:
-    /// the one allocation left is the `Box` that `WriteStart::Pending` carries.
+    /// (asynManager.c:1605-1628), and requests the record's `processCallback`
+    /// it made at init (devAsynFloat64.c:351). A put on a blocking port queues
+    /// and completes the same way: nothing past the first put allocates.
     #[test]
     fn a_put_on_a_blocking_port_queues_its_write_without_allocating() {
         epics_libcom_rs::runtime::task::test_ioc_thread(|| {
@@ -6607,18 +6602,32 @@ mod tests {
             let mut rec = AoRecord::new(1.5);
             ads.init(&mut rec).unwrap();
 
+            let db = epics_base_rs::server::database::PvDatabase::new();
+            let source = WriteDoneSource::new(
+                &db,
+                "TEST:WRITEALLOC",
+                epics_libcom_rs::runtime::task::CallbackPriority::Low,
+            );
             let mut put = || {
                 let before = thread_allocs();
-                let start = ads.write_begin(&mut rec).unwrap();
+                let start = ads.write_begin(&mut rec, &source).unwrap();
                 let allocs = thread_allocs() - before;
-                let WriteStart::Pending(done) = start else {
-                    panic!("a blocking port queues the write");
-                };
-                done.wait(Duration::from_secs(5)).unwrap();
+                assert!(
+                    matches!(start, WriteStart::Pending),
+                    "a blocking port queues the write"
+                );
+                // Queued behind the write at its band: back once the write ran
+                // and its cell is free for the next put.
+                rt.port_handle()
+                    .submit_blocking(
+                        RequestOp::Float64Read,
+                        AsynUser::new(0).with_priority(QueuePriority::Low),
+                    )
+                    .unwrap();
                 allocs
             };
             put();
-            assert_eq!(put(), 1, "WriteStart::Pending's Box and nothing else");
+            assert_eq!(put(), 0, "a put after the first allocates nothing");
         });
     }
 

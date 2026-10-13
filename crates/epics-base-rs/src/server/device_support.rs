@@ -402,14 +402,6 @@ impl PartialEq<&str> for Dtyp {
     }
 }
 
-/// Handle for waiting on asynchronous write completion.
-/// Returned by [`DeviceSupport::write_begin`] when the write is submitted
-/// to a worker queue rather than executed synchronously.
-pub trait WriteCompletion: Send + 'static {
-    /// Block until the write completes or timeout expires.
-    fn wait(&self, timeout: std::time::Duration) -> CaResult<()>;
-}
-
 /// What [`DeviceSupport::write_begin`] did with the record's output.
 ///
 /// Three answers, each its own variant: the two that end with the value at
@@ -424,9 +416,10 @@ pub enum WriteStart {
     /// The write ran to completion inside `write_begin` (a port that cannot
     /// block, C `ASYN_CANBLOCK` clear); nothing remains to be done.
     Completed,
-    /// The write was submitted to a worker queue; the framework waits on
-    /// the handle outside the record lock and ends the cycle when it lands.
-    Pending(Box<dyn WriteCompletion>),
+    /// The write was submitted to a worker queue and the record stays PACT;
+    /// the device ends the cycle through the source's
+    /// [`WriteDone`](crate::server::database::WriteDone) when the write lands.
+    Pending,
 }
 
 /// What a device support `read()` produced.
@@ -954,7 +947,11 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// Begin the record's output write — see [`WriteStart`] for the three
     /// outcomes. The default has no submit-only path and asks for
     /// [`write()`](DeviceSupport::write).
-    fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+    fn write_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        _done: &crate::server::database::WriteDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
         Ok(WriteStart::Synchronous)
     }
 

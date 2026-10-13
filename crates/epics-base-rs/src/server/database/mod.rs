@@ -30,7 +30,7 @@ pub(crate) use links::{
 pub(crate) use processing::NotifiedRead;
 pub use processing::{
     AsyncDbHandle, AsyncToken, ExternalCpProcess, InputLinkTexts, PostItem, PostRule, ProcStack,
-    ProcessCallback, TokenWatch,
+    ProcessCallback, TokenWatch, WriteDone, WriteDoneSource,
 };
 pub(crate) use record_lock::{FrameGate, InFrame, InitPass, LockRecord, SetGuard};
 pub use record_lock::{

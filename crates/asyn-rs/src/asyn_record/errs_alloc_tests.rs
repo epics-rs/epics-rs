@@ -42,6 +42,11 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// Allocation calls this thread has made so far.
+pub(crate) fn thread_allocs() -> u64 {
+    ALLOCS.with(Cell::get)
+}
+
 const LONG: &str = "Error in GPIB Serial Poll read, a driver diagnostic long enough \
                     that ERR_SIZE cuts it before its end";
 
@@ -145,7 +150,7 @@ fn a_blocking_port_cycle_queues_and_completes_without_allocating() {
         }
     }
 
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let actor = PortActor::new(
         Box::new(Device {
             base: PortDriverBase::new("ALLOCIO", 1, PortFlags::default()),
@@ -233,7 +238,7 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
         }
     }
 
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let actor = PortActor::new(
         Box::new(Device {
             base: PortDriverBase::new("ALLOCSP", 1, PortFlags::default()),
@@ -267,11 +272,7 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
         rec.special(field, true).unwrap();
         let allocs = ALLOCS.with(Cell::get) - before;
         assert_eq!(rec.errs, "", "{field} was queued");
-        let settled = |rec: &AsynRecord| {
-            rec.special_lane.in_flight.load(Ordering::Acquire) == 0
-                && rec.special_cells.iter().all(|s| !s.cell.is_outstanding())
-        };
-        while !settled(rec) {
+        while !rec.specials_settled() {
             std::thread::yield_now();
         }
         allocs
@@ -315,7 +316,7 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
 
     let mut base = PortDriverBase::new("ALLOCRF", 1, PortFlags::default());
     base.set_enabled(false).unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let actor = PortActor::new(Box::new(Device { base }), rx);
     let link = actor.link();
     std::thread::spawn(move || actor.run());
@@ -426,7 +427,7 @@ fn a_queued_cell_times_out_while_the_driver_blocks() {
 
     let (entered_tx, entered) = mpsc::sync_channel(1);
     let (release, release_rx) = mpsc::channel();
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let actor = PortActor::new(
         Box::new(Gated {
             base: PortDriverBase::new("QTIMER", 1, PortFlags::default()),

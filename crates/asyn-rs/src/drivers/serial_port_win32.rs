@@ -478,7 +478,7 @@ impl DrvAsynSerialPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynSerialPortWin32.c:798-799): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -504,7 +504,7 @@ impl DrvAsynSerialPort {
     ) -> AsynResult<Self> {
         let mut driver = Self::new(port_name, config_str)?;
         if no_auto_connect {
-            driver.base.auto_connect = false;
+            driver.base.init_auto_connect(false);
         }
         if !no_process_eos {
             driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));

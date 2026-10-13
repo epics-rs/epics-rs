@@ -61,7 +61,7 @@ use parking_lot::Mutex;
 use crate::asyn_trace;
 use crate::drivers::ip_port::{
     BoundNextRead, DrvAsynIPPort, OWNED_NONBLOCKING, is_nonfatal_read_timeout, maxchars_zero_error,
-    socket_poll_timeout, write_with_retry,
+    sock_err_text, socket_poll_timeout, write_with_retry,
 };
 use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -548,13 +548,13 @@ impl ClientSlot {
         {
             return SlotFailure::kept(AsynError::Status {
                 status: AsynStatus::Timeout,
-                message: "read timeout".to_string(),
+                message: format!("{device} timeout: {}", sock_err_text(&e)),
             });
         }
         self.clear();
         SlotFailure::closed(AsynError::Status {
             status: AsynStatus::Error,
-            message: format!("{device} read error: {e}"),
+            message: format!("{device} read error: {}", sock_err_text(&e)),
         })
     }
 
@@ -902,7 +902,7 @@ impl DrvAsynIPServerPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         let mut slots = Vec::with_capacity(max);
         for _ in 0..max {
             slots.push(Arc::new(ClientSlot::new_empty()));
@@ -2279,6 +2279,13 @@ mod tests {
         let mut buf = [0u8; 64];
         let err = child.read_octet(&user, &mut buf).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        // C `readIt`'s `"%s timeout: %s"` with the recv errno's `strerror`
+        // (drvAsynIPPort.c:861-865).
+        assert!(
+            err.message()
+                .ends_with(" timeout: Resource temporarily unavailable"),
+            "got {err:?}"
+        );
         assert!(
             srv.slots[0].is_occupied(),
             "with the option off a read timeout leaves the socket intact (C :810-811)"
@@ -2304,6 +2311,12 @@ mod tests {
         // branch as asynError, never as a retryable asynTimeout (:801-806).
         let err = child.read_octet(&user, &mut buf).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        // `"%s read error: %s"` (drvAsynIPPort.c:852-859).
+        assert!(
+            err.message()
+                .ends_with(" read error: Resource temporarily unavailable"),
+            "got {err:?}"
+        );
         assert!(
             !srv.slots[0].is_occupied(),
             "disconnectOnReadTimeout=Y frees the slot on a read timeout \
@@ -3152,7 +3165,7 @@ mod tests {
             1,
             "a child gets the default EOS interpose"
         );
-        assert!(!child.base().auto_connect, "C passes noAutoConnect=1");
+        assert!(!child.base().is_auto_connect(), "C passes noAutoConnect=1");
 
         // noProcessEos=1 suppresses the EOS layer and NOTHING else.
         let srv = build("child_eos_off", true);
@@ -3163,7 +3176,7 @@ mod tests {
             0,
             "noProcessEos must suppress the EOS interpose"
         );
-        assert!(!child.base().auto_connect);
+        assert!(!child.base().is_auto_connect());
     }
 
     /// The parent's own EOS state is not the child's: C's parent server port

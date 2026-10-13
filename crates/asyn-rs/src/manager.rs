@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use crate::error::{AsynError, AsynResult};
 use crate::exception::ExceptionManager;
 use crate::fixed_text::FixedText;
-use crate::port::PortDriver;
+use crate::port::{DpCells, PortDriver};
 use crate::port_handle::PortHandle;
 use crate::registry::PortEntry;
 use crate::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
@@ -291,7 +291,9 @@ const ERROR_MESSAGE_SIZE: usize = 160;
 /// later `findDpCommon` reads it back, so a caller cannot ask about one device
 /// on a user bound to another.
 pub struct DeviceUser {
-    device: Option<PortEntry>,
+    /// C `userPvt->pport`, with the cells of the `dpCommon` C's `findDpCommon`
+    /// resolves this user to — `pdevice`'s, or the port's own.
+    device: Option<(PortEntry, DpCells)>,
     /// C `userPvt->pdevice`, as the address that selects it. `-1` is C's null
     /// `pdevice`: `connectDevice` creates a device node only for `addr >= 0`
     /// (asynManager.c:1349-1352), and `findDpCommon` then answers from the
@@ -315,7 +317,7 @@ impl Default for DeviceUser {
 impl DeviceUser {
     /// The port this user is connected to — C `userPvt->pport`.
     pub fn device(&self) -> Option<&PortEntry> {
-        self.device.as_ref()
+        self.device.as_ref().map(|(entry, _)| entry)
     }
 
     /// The last diagnostic any call below left on this user — C
@@ -352,12 +354,15 @@ impl DeviceUser {
         // its device list, so the creation is the port actor's; C's call
         // cannot fail, and the one way this one can - the actor is gone -
         // is a port that is no longer the one the registry answered with.
-        if let Err(e) = entry.handle.connect_device_blocking(addr) {
-            return Err(self.fail(format_args!(
-                "asynManager:connectDevice port {port_name} not found: {e}"
-            )));
-        }
-        self.device = Some(entry.clone());
+        let dp = match entry.handle.connect_device_blocking(addr) {
+            Ok(dp) => dp,
+            Err(e) => {
+                return Err(self.fail(format_args!(
+                    "asynManager:connectDevice port {port_name} not found: {e}"
+                )));
+            }
+        };
+        self.device = Some((entry.clone(), dp));
         self.addr = addr;
         Ok(entry)
     }
@@ -376,58 +381,41 @@ impl DeviceUser {
         self.addr = -1;
     }
 
-    /// C `isConnected` (asynManager.c:2331-2343).
-    ///
-    /// C reads `pdpCommon->connected`, a field read that cannot fail once the
-    /// user is bound. The actor query behind [`PortHandle`] can — a shut-down
-    /// port, or a call made from the actor's own thread, where waiting would be
-    /// the actor waiting on itself — and those answer `false` rather than
-    /// writing the buffer: they are not C's "not connected to device", and a
-    /// diagnostic C never writes must not displace one it did. Same for the two
-    /// below.
+    /// C `isConnected` (asynManager.c:2331-2343): a read of the bound
+    /// `dpCommon`, which never queues — so a record may ask it under its lock
+    /// while the port sits in a driver call.
     pub fn is_connected(&mut self) -> Result<bool, DeviceError> {
-        let addr = self.addr;
-        Ok(self
-            .handle_for("isConnected")?
-            .is_connected_blocking(addr)
-            .unwrap_or(false))
+        Ok(self.dp("isConnected")?.connected())
     }
 
     /// C `isEnabled` (asynManager.c:2345-2359).
     pub fn is_enabled(&mut self) -> Result<bool, DeviceError> {
-        let addr = self.addr;
-        Ok(self
-            .handle_for("isEnabled")?
-            .is_enabled_blocking(addr)
-            .unwrap_or(false))
+        Ok(self.dp("isEnabled")?.enabled())
     }
 
     /// C `isAutoConnect` (asynManager.c:2361-2373).
     pub fn is_auto_connect(&mut self) -> Result<bool, DeviceError> {
-        let addr = self.addr;
-        Ok(self
-            .handle_for("isAutoConnect")?
-            .is_auto_connect_blocking(addr)
-            .unwrap_or(false))
+        Ok(self.dp("isAutoConnect")?.auto_connect())
     }
 
     /// Bind to an already-resolved port, for tests that build a [`PortEntry`]
     /// by hand rather than publishing it to the process registry.
     #[cfg(all(test, feature = "epics"))]
     pub(crate) fn attach_for_test(&mut self, entry: PortEntry, addr: i32) {
-        self.device = Some(entry);
+        let dp = entry.handle.connect_device_blocking(addr).unwrap();
+        self.device = Some((entry, dp));
         self.addr = addr;
     }
 
     /// The bound port, or C's `findDpCommon` failure: the `is*` calls share one
     /// message shape and one buffer, so they share this.
-    fn handle_for(&mut self, which: &str) -> Result<PortHandle, DeviceError> {
-        if let Some(entry) = self.device.as_ref() {
-            return Ok(entry.handle.clone());
+    fn dp(&mut self, which: &str) -> Result<&DpCells, DeviceError> {
+        if self.device.is_none() {
+            return Err(self.fail(format_args!(
+                "asynManager:{which} asynUser not connected to device"
+            )));
         }
-        Err(self.fail(format_args!(
-            "asynManager:{which} asynUser not connected to device"
-        )))
+        Ok(&self.device.as_ref().unwrap().1)
     }
 
     fn fail(&mut self, message: std::fmt::Arguments<'_>) -> DeviceError {
@@ -728,7 +716,7 @@ mod tests {
         // must block manager registration too — the registry is the
         // process-wide authority on port names, matching C
         // asynManager::registerPort.
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         // Stands in for a port published by another creator; no actor loop
         // runs behind it, so its `ActorId` is never current on any thread.
         let ext = crate::port_handle::PortHandle::new(

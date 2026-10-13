@@ -137,6 +137,10 @@ name = "asyn_special_posts_in_c_order"
 required-features = ["epics"]
 
 [[test]]
+name = "special_puts_queue_behind_a_blocked_read"
+required-features = ["epics"]
+
+[[test]]
 name = "enum_property_post_mask"
 required-features = ["epics"]
 

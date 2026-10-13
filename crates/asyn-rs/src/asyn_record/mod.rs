@@ -1,13 +1,13 @@
-// RTEMS-EXEC-MODEL-ALLOW(15): checked, not waived — all 15 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(16): checked, not waived — all 16 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1138/1138). asyn-rs became a census subject when its
+// --all-features`, 1148/1148). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 pub mod device;
 #[cfg(test)]
-mod errs_alloc_tests;
+pub(crate) mod errs_alloc_tests;
 mod io_intr;
 pub use device::{ASYN_RECORD_DTYP, AsynRecordDevice};
 // The port registry itself is [`crate::registry`], not this module's: it is the
@@ -2090,7 +2090,10 @@ impl SpecialUser {
             // (asynRecord.c:571-572, :1281, :1297).
             .with_queue_timeout(QUEUE_TIMEOUT);
         match self.queue {
-            OptionQueue::Normal => user,
+            // C's `asynQueuePriorityLow` (asynRecord.c:564, :1296) — the
+            // process read's band, so a special put waits behind a read already
+            // queued, as C's FIFO keeps it, instead of the `AsynUser` default.
+            OptionQueue::Normal => user.with_priority(crate::port::QueuePriority::Low),
             OptionQueue::EvenIfNotConnected => user.queue_even_if_not_connected(),
         }
     }
@@ -2445,11 +2448,11 @@ fn read_eos(port: &mut dyn PortCalls, user: SpecialUser) -> Result<(String, Stri
 #[derive(Default)]
 struct SpecialLane {
     done: Mutex<SpecialQueue>,
-    /// Requests queued and not yet applied: raised under the hold before the
-    /// request is queued, lowered by the drainer once applied.
-    in_flight: std::sync::atomic::AtomicUsize,
     /// The record the drainer applies results to, set at `add_record`.
     record: Mutex<Option<(String, AsyncDbHandle)>>,
+    /// Held by a test to stop the drainer before it takes the next result.
+    #[cfg(test)]
+    gate: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -2479,6 +2482,8 @@ impl SpecialLane {
     fn drain(&self) {
         let record = self.record.lock().unwrap().clone();
         loop {
+            #[cfg(test)]
+            let _gate = self.gate.lock().unwrap();
             let done = {
                 let mut queue = self.done.lock().unwrap();
                 match queue.done.pop_front() {
@@ -2490,11 +2495,10 @@ impl SpecialLane {
                 }
             };
             let Some((name, db)) = &record else {
-                self.in_flight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 continue;
             };
             db.with_record(name, |rec| {
+                let _hold = crate::port_handle::HoldPath::enter();
                 if let Some(rec) = rec
                     .as_any_mut()
                     .and_then(|any| any.downcast_mut::<AsynRecord>())
@@ -2502,9 +2506,13 @@ impl SpecialLane {
                     rec.complete_special(done);
                 }
             });
-            self.in_flight
-                .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// No result is waiting or being applied.
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        !self.done.lock().unwrap().draining
     }
 }
 
@@ -2900,6 +2908,7 @@ impl AsynRecord {
             };
             rt.spawn_blocking(move || {
                 db.with_record(&name, |rec| {
+                    let _hold = crate::port_handle::HoldPath::enter();
                     if let Some(rec) = rec
                         .as_any_mut()
                         .and_then(|any| any.downcast_mut::<AsynRecord>())
@@ -3126,6 +3135,12 @@ impl AsynRecord {
     /// C's `queueRequest` refuses before anything is queued, so its refusal is
     /// reported here, under the hold and before the put returns
     /// (asynRecord.c:571-578, :1281-1285, :1297-1301).
+    /// Every special request queued so far has run and been applied.
+    #[cfg(test)]
+    fn specials_settled(&self) -> bool {
+        self.special_cells.iter().all(|s| !s.cell.is_outstanding()) && self.special_lane.is_idle()
+    }
+
     fn queue_port_request(&mut self, mut handle: PortHandle, special: SpecialCell) {
         let (user, queued_by) = {
             let request = special.body.request.lock().unwrap();
@@ -3136,13 +3151,7 @@ impl AsynRecord {
             return;
         }
         if handle.can_block() && self.async_ctx.is_some() {
-            self.special_lane
-                .in_flight
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Err(refusal) = special.cell.queue(&user) {
-                self.special_lane
-                    .in_flight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 self.report_queue_refused(refusal.status(), format_args!("{refusal}"), queued_by);
             }
         } else {
@@ -3546,6 +3555,7 @@ impl AsynRecord {
     /// A failing query lands as 0, exactly as C's `else` branches do
     /// (:1087,:1092,:1097).
     fn monitor_status(&mut self) {
+        let _hold = crate::port_handle::HoldPath::enter();
         // C `REMEMBER_STATE` on the fields another thread can move
         // (:1045-1064): they post only if this refresh moves them.
         let cur = self.status_values();
@@ -5785,7 +5795,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let port_name = "errs_attach_readback_refused";
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(NullOctetPort::new(port_name)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -6133,7 +6143,7 @@ mod tests {
         let attach = |name: &'static str, connected: bool| {
             let mut base = PortDriverBase::new(name, 1, PortFlags::default());
             base.init_connected(connected);
-            base.auto_connect = false;
+            base.init_auto_connect(false);
             let (rt, _jh) = create_port_runtime(Link(base), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
             register_port(name, rt.port_handle().clone()).unwrap();
@@ -6257,7 +6267,7 @@ mod tests {
             base.params.create_param("FIRST", ParamType::Int32).unwrap(),
             0
         );
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(ParamDriver(base)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -6370,9 +6380,9 @@ mod tests {
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
         // The port is down and nothing will bring it back: C's `autoConnectDevice`
         // is not consulted for a waived request, and must not be needed for one.
-        base.auto_connect = false;
+        base.init_auto_connect(false);
         base.set_connected(false);
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(DeadLineDriver {
                 base,
@@ -6551,7 +6561,7 @@ mod tests {
 
         let port_name = "r10_48_unknown_option";
         let sets = Arc::new(Mutex::new(Vec::new()));
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(LoggingDriver {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -6634,7 +6644,7 @@ mod tests {
         }
 
         let port_name = "r9_51_tfil";
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TfilDriver(PortDriverBase::new(
                 port_name,
@@ -7048,7 +7058,7 @@ mod tests {
         }
 
         let port_name = "r9_52_tsiz";
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TsizDriver(PortDriverBase::new(
                 port_name,
@@ -7125,7 +7135,7 @@ mod tests {
         }
 
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(TestDriver::new()), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -7174,7 +7184,7 @@ mod tests {
             ..PortFlags::default()
         };
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(MdDriver(PortDriverBase::new(port_name, 4, flags))),
             rx,
@@ -7248,7 +7258,7 @@ mod tests {
                 ..PortFlags::default()
             };
             let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, rx) = mpsc::channel(256);
+            let (tx, rx) = mpsc::unbounded_channel();
             let actor = PortActor::new(
                 Box::new(DpDriver(PortDriverBase::new(port_name, max_addr, flags))),
                 rx,
@@ -7459,7 +7469,7 @@ mod tests {
 
         let port_name = "test_trace_info_sync";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
             rx,
@@ -7515,7 +7525,7 @@ mod tests {
 
         let port_name = "test_trace_info_live";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
             rx,
@@ -7598,7 +7608,7 @@ mod tests {
 
         let port_name = "test_ifmt_octet_read";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(OctetDriver(PortDriverBase::new(
                 port_name,
@@ -7705,7 +7715,7 @@ mod tests {
 
         let port_name = "r17_48_escape_bounds";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(LongDriver(PortDriverBase::new(
                 port_name,
@@ -7804,7 +7814,7 @@ mod tests {
 
         let port_name = "test_octet_error_reset";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FailingOctetDriver(PortDriverBase::new(
                 port_name,
@@ -7986,7 +7996,7 @@ mod tests {
 
         let port_name = "test_register_errs_text";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(AllFailDriver(PortDriverBase::new(
                 port_name,
@@ -8142,7 +8152,7 @@ mod tests {
 
         let port_name = "test_option_eos_reread";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(StubbornDriver(PortDriverBase::new(
                 port_name,
@@ -8243,7 +8253,7 @@ mod tests {
 
         let port_name = "test_flush_failure_discarded";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FlushFailsDriver(PortDriverBase::new(
                 port_name,
@@ -8345,7 +8355,7 @@ mod tests {
 
         let port_name = "test_octet_read_errs_text";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(StatusDriver {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -8439,7 +8449,7 @@ mod tests {
 
         let port_name = "test_octet_partial_read";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PartialThenTimeout(PortDriverBase::new(
                 port_name,
@@ -8544,7 +8554,7 @@ mod tests {
         let port_name = "test_cnct_transport";
         let connects = Arc::new(AtomicUsize::new(0));
         let disconnects = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(CountingDriver {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -8736,7 +8746,7 @@ mod tests {
         let port_name = "r14_46_gate_refusal";
         let log = Arc::new(Mutex::new(Log::default()));
         let connects = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(GateDriver {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -8890,7 +8900,7 @@ mod tests {
         }
 
         let port_name = "as15_P";
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
             rx,
@@ -9021,7 +9031,7 @@ mod tests {
         // The port comes back on its own retry timer, with no request of its
         // own running (asynManager.c:3252-3283).
         base.seconds_between_port_connect = Duration::from_millis(20);
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(Drops {
                 base,
@@ -9131,7 +9141,7 @@ mod tests {
 
         fn writer(port_name: &'static str, accept: usize, fail: bool) -> AsynRecord {
             let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, rx) = mpsc::channel(256);
+            let (tx, rx) = mpsc::unbounded_channel();
             let actor = PortActor::new(
                 Box::new(ShortWriteDriver {
                     base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -9261,7 +9271,7 @@ mod tests {
 
         let port_name = "test_io_alarm_fail";
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FailDriver(PortDriverBase::new(
                 port_name,
@@ -9380,7 +9390,7 @@ mod tests {
 
         let requested = Arc::new(Mutex::new(None));
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FillDriver {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -9491,7 +9501,7 @@ mod tests {
 
         let port_name = "test_tmot_zero_to_driver";
         let seen = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TimeoutSpy {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -9557,7 +9567,7 @@ mod tests {
 
         let port_name = "test_tmot_forever_to_driver";
         let seen = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TimeoutSpy {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -9660,7 +9670,7 @@ mod tests {
 
         let log = Arc::new(Mutex::new(Vec::new()));
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PhaseLogDriver {
                 base: PortDriverBase::new(port_name, 1, PortFlags::default()),
@@ -10281,7 +10291,7 @@ mod tests {
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         base.set_int32_param(val, 0, value).unwrap();
 
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(ReadDriver { base }), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -10422,7 +10432,7 @@ mod tests {
 
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(BlockingReadDriver {
                 base: PortDriverBase::new("ASYNSPQ", 1, PortFlags::default()),
@@ -10463,15 +10473,17 @@ mod tests {
         assert_eq!(rec.special_cells.len(), 2);
         assert!(rec.special_cells.iter().all(|s| s.cell.is_outstanding()));
 
+        // Both requests run and release their cells while the drainer is held,
+        // so their results are still unapplied.
+        let lane = Arc::clone(&rec.special_lane);
+        let gate = lane.gate.lock().unwrap();
         release.wait();
-        let settled = |rec: &AsynRecord| {
-            rec.special_lane
-                .in_flight
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
-                && rec.special_cells.iter().all(|s| !s.cell.is_outstanding())
-        };
-        while !settled(&rec) {
+        while rec.special_cells.iter().any(|s| s.cell.is_outstanding()) {
+            std::thread::yield_now();
+        }
+        assert!(!rec.specials_settled(), "a result is still to be applied");
+        drop(gate);
+        while !rec.specials_settled() {
             std::thread::yield_now();
         }
         rec.special("BAUD", true).unwrap();
@@ -10535,7 +10547,7 @@ mod tests {
             release: release.clone(),
         };
 
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -10638,7 +10650,7 @@ mod tests {
         }
 
         let port_name = "test_trace_immediate_post";
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TraceDriver(PortDriverBase::new(
                 port_name,
@@ -10806,7 +10818,7 @@ A.TMSK 1
         }
 
         let port_name = "test_trace_oracle_as6";
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TraceDriver(PortDriverBase::new(
                 port_name,
@@ -11107,7 +11119,7 @@ A.OEOS
             );
             base.install_octet_interpose(Box::new(EosInterpose::default()));
             base.set_connected(false);
-            base.auto_connect = false;
+            base.init_auto_connect(false);
             let (rt, jh) = create_port_runtime(Echo(base), RuntimeConfig::default()).unwrap();
             std::mem::forget(jh);
             register_port(port_name, rt.port_handle().clone()).unwrap();
@@ -11129,10 +11141,7 @@ A.OEOS
                             .as_any_mut()
                             .and_then(|any| any.downcast_mut::<AsynRecord>())
                             .unwrap();
-                        rec.special_lane
-                            .in_flight
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            == 0
+                        rec.specials_settled()
                     };
                     if idle {
                         return;
@@ -11300,10 +11309,7 @@ A.OEOS
                         .as_any_mut()
                         .and_then(|any| any.downcast_mut::<AsynRecord>())
                         .unwrap();
-                    rec.special_lane
-                        .in_flight
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        == 0
+                    rec.specials_settled()
                 };
                 if idle {
                     return;
@@ -11365,7 +11371,7 @@ A.OEOS
         }
 
         let port_name = "test_trace_post_if_new";
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TraceDriver(PortDriverBase::new(
                 port_name,
@@ -11524,8 +11530,8 @@ A.OEOS
         let port_name = "test_errs_post";
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
         base.init_connected(false);
-        base.auto_connect = false;
-        let (tx, rx) = mpsc::channel(256);
+        base.init_auto_connect(false);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(DownDriver(base)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -11640,8 +11646,8 @@ A.OEOS
         let port_name = "test_errs_post_order";
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
         base.init_connected(false);
-        base.auto_connect = false;
-        let (tx, rx) = mpsc::channel(256);
+        base.init_auto_connect(false);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(DownDriver(base)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -11807,7 +11813,7 @@ A.OEOS
         base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         let mut drv = Serialish(base);
         drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(drv), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -11917,7 +11923,7 @@ A.OEOS
 
         let port_name = "r18_86_steady";
         let base = PortDriverBase::new(port_name, 1, PortFlags::default());
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(SteadyDevice(base)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -12019,7 +12025,7 @@ A.OEOS
 
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
         base.bind_exception_sink(exceptions.clone());
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -12075,6 +12081,135 @@ A.OEOS
         assert_eq!(g.record.get_field("AUCT"), Some(EpicsValue::Enum(1)));
     }
 
+    /// The convergence case: an exception refresh queued while the record is
+    /// held, the cycle posting CNCT=0 under that hold, then the queued refresh
+    /// and a later exception running. A refresh that sampled CNCT when the
+    /// exception fired (1) and posted it after the cycle's 0 left a monitor
+    /// showing "Connected" on a dead port, against an old value that already
+    /// said 0. The refresh samples and posts under the hold, against the
+    /// `PvtOld` the cycle advanced, so the monitor sees 0 once and then 1 on
+    /// reconnect, nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_queued_behind_the_cycle_posts_no_stale_connect_state() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::database::db_access::DbSubscription;
+        use epics_base_rs::server::recgbl::EventMask;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        struct PlainDriver(PortDriverBase);
+        impl PortDriver for PlainDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_except_converges";
+        let exceptions = Arc::new(ExceptionManager::new());
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(exceptions.clone());
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        base.bind_exception_sink(exceptions.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(256)),
+            actor_link,
+            trace.clone(),
+        );
+        crate::registry::register_port(port_name, handle.clone()).unwrap();
+
+        let db = PvDatabase::new();
+        let rec_name = "EXCEPT_CONVERGES_REC";
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.set_async_context(rec_name.to_string(), db.async_handle());
+        let _ = rec.connect_device();
+        assert_eq!(rec.cnct, 1, "the port starts connected");
+        db.add_record(rec_name, Box::new(rec)).await.unwrap();
+        let mut cnct_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.CNCT"))
+            .await
+            .expect("subscribe CNCT");
+        let on_thread = |f: Box<dyn FnOnce() + Send>| std::thread::spawn(f).join().unwrap();
+
+        let inst = db.get_record(rec_name).unwrap();
+        {
+            // The cycle holds the record.
+            let mut held = inst.write();
+            // A foreign exception while the port is up: its refresh queues
+            // behind the hold. The pause is a stale sampler's window.
+            let (tm, pn) = (trace.clone(), port_name.to_string());
+            on_thread(Box::new(move || {
+                tm.set_trace_mask(Some(&pn), TraceMask::ERROR | TraceMask::FLOW)
+            }));
+            std::thread::sleep(Duration::from_millis(100));
+
+            // The port goes down inside the cycle, which refreshes and posts 0
+            // under its hold, as `raise_exception` does for its own setter.
+            let own_raise = {
+                let rec = held
+                    .record
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<AsynRecord>())
+                    .unwrap();
+                Arc::clone(&rec.own_raise)
+            };
+            own_raise.store(true, Ordering::Release);
+            let h = handle.clone();
+            on_thread(Box::new(move || h.disconnect_blocking().unwrap()));
+            own_raise.store(false, Ordering::Release);
+            let rec = held
+                .record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<AsynRecord>())
+                .unwrap();
+            rec.monitor_status();
+            assert_eq!(rec.cnct, 0);
+            let _ = held.record.take_cycle_posted_fields();
+            held.notify_field("CNCT", EventMask::VALUE | EventMask::LOG);
+        }
+        assert_eq!(cnct_sub.recv().await, Some(EpicsValue::Enum(0)));
+
+        // The queued refresh runs now and finds nothing new.
+        let stale = tokio::time::timeout(Duration::from_millis(300), cnct_sub.recv()).await;
+        assert!(
+            stale.is_err(),
+            "the queued refresh re-posted CNCT: {stale:?}"
+        );
+
+        // The next exception, port still down: nothing new either.
+        let (tm, pn) = (trace.clone(), port_name.to_string());
+        on_thread(Box::new(move || {
+            tm.set_trace_mask(Some(&pn), TraceMask::ERROR)
+        }));
+        let stale = tokio::time::timeout(Duration::from_millis(300), cnct_sub.recv()).await;
+        assert!(
+            stale.is_err(),
+            "a later exception re-posted CNCT: {stale:?}"
+        );
+
+        // Reconnect: the monitor converges on the port's state.
+        let h = handle.clone();
+        on_thread(Box::new(move || h.connect_blocking().unwrap()));
+        assert_eq!(cnct_sub.recv().await, Some(EpicsValue::Enum(1)));
+        assert_eq!(
+            inst.read().record.get_field("CNCT"),
+            Some(EpicsValue::Enum(1))
+        );
+    }
+
     /// R8-55, the no-database fallback boundary: a record with no `async_ctx`
     /// (connected outside a database, as in these unit tests) cannot post out of
     /// band, so the exception raises `status_dirty` and the next `process()`
@@ -12106,7 +12241,7 @@ A.OEOS
 
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
         base.bind_exception_sink(exceptions.clone());
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -12168,7 +12303,7 @@ A.OEOS
         trace.set_exception_sink(exceptions.clone());
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
         base.bind_exception_sink(exceptions.clone());
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
@@ -12473,6 +12608,20 @@ A.OEOS
         assert_eq!(
             rec.special_user(OptionQueue::Normal).user().queue_timeout,
             Some(QUEUE_TIMEOUT)
+        );
+
+        // A special shares the process read's Low band (asynRecord.c:343,
+        // :564), so neither overtakes the other; only HOSTINFO and the option
+        // readback go at Connect (:568, :1281).
+        assert_eq!(
+            rec.special_user(OptionQueue::Normal).user().priority,
+            crate::port::QueuePriority::Low
+        );
+        assert_eq!(
+            rec.special_user(OptionQueue::EvenIfNotConnected)
+                .user()
+                .priority,
+            crate::port::QueuePriority::Connect
         );
 
         // Negative control: a user built anywhere else (device support, iocsh,
@@ -12802,7 +12951,7 @@ A.OEOS
 
         for (port_name, connected) in [("w10_d3_eos_up", true), ("w10_d3_eos_down", false)] {
             let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
-            base.auto_connect = false;
+            base.init_auto_connect(false);
             base.init_connected(connected);
             // A port that accepts an EOS at all is one C configured with
             // `processEosIn/Out` set, so `asynOctetBase::initialize` installed
@@ -12975,7 +13124,7 @@ A.OEOS
         let start = |port_name: &'static str, connected: bool| {
             let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
             base.set_connected(connected);
-            base.auto_connect = false;
+            base.init_auto_connect(false);
             let (rt, jh) = create_port_runtime(Refuses(base), RuntimeConfig::default()).unwrap();
             std::mem::forget(jh);
             register_port(port_name, rt.port_handle().clone()).unwrap();

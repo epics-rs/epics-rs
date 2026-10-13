@@ -29,8 +29,6 @@ pub fn set_auto_connect_timeout(timeout: Duration) {
 /// Configuration for a port runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Channel capacity for the command channel.
-    pub channel_capacity: usize,
     /// Auto-connect on startup.
     pub auto_connect: bool,
     /// Backoff configuration for auto-connect retries.
@@ -57,7 +55,6 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            channel_capacity: 1024,
             auto_connect: true,
             connect_backoff: BackoffConfig::default(),
             supervision: SupervisionPolicy::default(),

@@ -276,7 +276,7 @@ pub fn create_port_runtime_boxed(
     // Connect priority buys. It re-arms itself at `secondsBetweenPortConnect` on
     // failure (C :3281), so a port whose device is down keeps trying without a
     // single request ever being submitted.
-    let connect_at_registration = driver.base().auto_connect && !driver.base().is_connected();
+    let connect_at_registration = driver.base().is_auto_connect() && !driver.base().is_connected();
     if connect_at_registration {
         driver.base_mut().connect_retry_at = Some(std::time::Instant::now());
     }
@@ -305,7 +305,7 @@ pub fn create_port_runtime_boxed(
     let handle_interrupts = Arc::new(InterruptManager::from_shared_state(shared_intr_state));
 
     // Actor channel
-    let (tx, rx) = mpsc::channel(config.channel_capacity);
+    let (tx, rx) = mpsc::unbounded_channel();
     let actor = PortActor::new(driver, rx);
     let actor_link = actor.link();
 

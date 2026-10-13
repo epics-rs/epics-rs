@@ -203,7 +203,7 @@ mod tests {
     use crate::interrupt::InterruptManager;
 
     fn dummy_handle(name: &str) -> PortHandle {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         // No actor loop runs for this handle, so its `ActorId` is never
         // published on any thread — no caller can be this port's actor,
         // which is the truth these registry tests need.

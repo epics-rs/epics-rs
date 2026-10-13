@@ -147,7 +147,7 @@ impl DrvAsynFtdiPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = !no_auto_connect;
+        base.init_auto_connect(!no_auto_connect);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynFTDIPort.cpp:616): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -274,8 +274,8 @@ mod tests {
         assert_eq!(drv.config().mode_raw, 1);
         assert_eq!(drv.priority(), 50);
         assert!(!drv.no_process_eos());
-        // no_auto_connect=true → base.auto_connect should be false
-        assert!(!drv.base().auto_connect);
+        // no_auto_connect=true → base.is_auto_connect() should be false
+        assert!(!drv.base().is_auto_connect());
         // no_process_eos=false → EOS interpose auto-installed (DRV-2 family,
         // C drvAsynFTDIPort.cpp:622-623).
         assert_eq!(drv.base().interpose_octet.len(), 1);
@@ -299,7 +299,7 @@ mod tests {
         let drv =
             DrvAsynFtdiPort::configure("ftdi0", 0x0403, 0x6014, 115_200, 16, 0, false, false, 0)
                 .unwrap();
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
     }
 
     // Only meaningful in a build without the hardware feature — with

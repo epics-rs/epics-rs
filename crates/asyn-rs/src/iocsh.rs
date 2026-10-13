@@ -1517,7 +1517,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             };
             if no_auto_connect {
-                driver.base_mut().auto_connect = false;
+                driver.base_mut().init_auto_connect(false);
             }
 
             // The child ports C pre-creates at configure (:682-708) — device

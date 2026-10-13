@@ -17,12 +17,12 @@ use epics_base_rs::server::device_support::{
 use epics_base_rs::server::record::{DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
-use crate::error::{AsynError, AsynStatus};
+use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{InterruptFilter, InterruptSubscription};
 use crate::port::DrvUserRequest;
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
-use crate::request::{RequestOp, RequestResult};
+use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
 use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
 
 /// Parsed `@asyn(portName, addr, timeout) drvInfoString` link specification.
@@ -308,6 +308,9 @@ impl Int32Mask {
 /// Adapter bridging an asyn-rs PortDriver to epics-base-rs DeviceSupport.
 pub struct AsynDeviceSupport {
     handle: PortHandle,
+    /// The record's one output request on a blocking port — see [`WriteJob`].
+    write_job: Arc<WriteJob>,
+    write_cell: Option<Arc<RequestCell>>,
     addr: i32,
     /// `None` is the link's "wait forever" — see [`AsynLink::timeout`].
     timeout: Option<Duration>,
@@ -720,12 +723,44 @@ impl AsynDeviceSupport {
             enum_shape: None,
             enum_choices: None,
             enum_interrupt_sub: None,
+            write_job: Arc::new(WriteJob::default()),
+            write_cell: None,
         }
     }
 
     /// Create with a typed interface from a [`PortHandle`].
     pub fn with_interface_handle(handle: PortHandle, link: AsynLink, iface: InterfaceType) -> Self {
         Self::from_handle(handle, link, iface.asyn_name())
+    }
+
+    /// The record's output request on this port, made once — at `init`, so the
+    /// first put allocates no more than the next.
+    fn write_cell(&mut self) -> Arc<RequestCell> {
+        match &self.write_cell {
+            Some(cell) if self.handle.owns_cell(cell) => Arc::clone(cell),
+            _ => {
+                let job: Arc<dyn CellBody> = self.write_job.clone();
+                let cell = self.handle.new_cell(job);
+                self.write_cell = Some(Arc::clone(&cell));
+                cell
+            }
+        }
+    }
+
+    /// C `queueRequest` of the output request (devAsynFloat64.c:661): its gate,
+    /// then the link. A write still queued from an earlier put is refused, as
+    /// C refuses an `asynUser` that `isQueued` (asynManager.c:1574-1579).
+    fn queue_write(&mut self, op: RequestOp, user: AsynUser) -> AsynResult<()> {
+        let cell = self.write_cell();
+        self.handle.queue_gate(&user)?;
+        // The port takes this slot before it records or lands a result, so
+        // holding it across the queue keeps the new one from being cleared.
+        let mut slot = self.write_job.request.lock().unwrap();
+        cell.queue(&user)?;
+        self.write_job.ran.lock().unwrap().take();
+        self.write_job.outcome.lock().unwrap().take();
+        *slot = Some((op, user));
+        Ok(())
     }
 
     /// Set the bit mask for UInt32Digital read/write operations.
@@ -1035,19 +1070,76 @@ fn convert_param_array_to_iface(
 }
 
 /// Bridges async `AsyncCompletionHandle` to epics-base-rs `WriteCompletion`.
-struct AsynAsyncWriteCompletion {
-    handle: parking_lot::Mutex<Option<AsyncCompletionHandle>>,
+/// C devAsyn's `processCallbackOutput` request: the record's one `asynUser`,
+/// queued from `process` (devAsynFloat64.c:661). Queued as a [`RequestCell`],
+/// whose queue slot is reserved when the cell is made, so a put on a blocking
+/// port queues its write under the record's hold without allocating.
+#[derive(Default)]
+struct WriteJob {
+    request: std::sync::Mutex<Option<(RequestOp, AsynUser)>>,
+    /// The write's result while its cell is still queued.
+    ran: std::sync::Mutex<Option<AsynResult<()>>>,
+    /// The result once the cell is free, so the woken put can queue again.
+    outcome: std::sync::Mutex<Option<AsynResult<()>>>,
+    landed: std::sync::Condvar,
 }
+
+impl WriteJob {
+    fn ran(&self, result: AsynResult<()>) {
+        *self.ran.lock().unwrap() = Some(result);
+    }
+}
+
+impl CellBody for WriteJob {
+    fn process(&self, port: &mut dyn PortCalls) {
+        let (op, user) = self
+            .request
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a write is queued with its request");
+        self.ran(port.call(op, user).map(|_| ()));
+    }
+
+    fn unrun(&self, why: Unrun) {
+        self.request.lock().unwrap().take();
+        self.ran(Err(match why {
+            Unrun::Refused(e) => e,
+            // Nothing cancels the write, and its user arms no queue timer:
+            // this is the device-not-connected exit (asynManager.c:877-886).
+            Unrun::TimedOut | Unrun::Canceled => AsynError::QueueTimeout {
+                port: String::new(),
+            },
+        }));
+    }
+
+    /// Under the request slot, so a put queued meanwhile has already cleared
+    /// this request's result rather than receiving it.
+    fn done(self: Arc<Self>) {
+        let _slot = self.request.lock().unwrap();
+        if let Some(result) = self.ran.lock().unwrap().take() {
+            *self.outcome.lock().unwrap() = Some(result);
+            self.landed.notify_all();
+        }
+    }
+}
+
+struct AsynAsyncWriteCompletion(Arc<WriteJob>);
 
 impl WriteCompletion for AsynAsyncWriteCompletion {
     fn wait(&self, timeout: Duration) -> CaResult<()> {
-        if let Some(h) = self.handle.lock().take() {
-            match h.wait_blocking(timeout) {
-                Ok(_) => Ok(()),
-                Err(e) => Err(CaError::Protocol(e.to_string())),
-            }
-        } else {
-            Ok(())
+        let outcome = self.0.outcome.lock().unwrap();
+        let (mut outcome, _) = self
+            .0
+            .landed
+            .wait_timeout_while(outcome, timeout, |o| o.is_none())
+            .unwrap();
+        match outcome.take() {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(CaError::Protocol(e.to_string())),
+            None => Err(CaError::Protocol(format!(
+                "write timed out after {timeout:?} waiting for the port"
+            ))),
         }
     }
 }
@@ -1858,6 +1950,9 @@ impl DeviceSupport for AsynDeviceSupport {
                 epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid,
             ));
+        }
+        if self.handle.can_block() {
+            self.write_cell();
         }
         if !self.reason_set {
             // C calls drvUser->create only when the port registered asynDrvUser
@@ -2694,10 +2789,10 @@ impl DeviceSupport for AsynDeviceSupport {
         let user = AsynUser::new(self.reason)
             .with_addr(self.addr)
             .with_timeout_opt(self.timeout);
-        let completion = self.handle.try_submit(op, user).map_err(asyn_to_ca_error)?;
-        Ok(WriteStart::Pending(Box::new(AsynAsyncWriteCompletion {
-            handle: parking_lot::Mutex::new(Some(completion)),
-        })))
+        self.queue_write(op, user).map_err(asyn_to_ca_error)?;
+        Ok(WriteStart::Pending(Box::new(AsynAsyncWriteCompletion(
+            Arc::clone(&self.write_job),
+        ))))
     }
 
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
@@ -3934,7 +4029,7 @@ mod tests {
         // No submit happens here, so the channels need no actor.
         let mk_handle = |name: &str| {
             let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             (
                 PortHandle::new(
                     tx,
@@ -3970,7 +4065,7 @@ mod tests {
         // The polled read path (result_to_value) must apply the nbits mask +
         // sign-extend (C processCallbackInput, devAsynInt32.c:485-488).
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
             "p".into(),
@@ -4006,7 +4101,7 @@ mod tests {
         use epics_base_rs::server::records::longin::LonginRecord;
 
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
             "p".into(),
@@ -4060,7 +4155,7 @@ mod tests {
         use crate::param::ParamValue;
 
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
             "p".into(),
@@ -4209,7 +4304,7 @@ mod tests {
     fn make_bounded_adapter(low: i32, high: i32, iface: &str) -> AsynDeviceSupport {
         let driver = BoundedPort::new(low, high);
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -4237,7 +4332,7 @@ mod tests {
     fn make_adapter(scan: ScanType) -> AsynDeviceSupport {
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -4279,7 +4374,7 @@ mod tests {
             .set_param_status(0, 0, status, 0, 0)
             .unwrap();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -4313,7 +4408,7 @@ mod tests {
     fn make_average_adapter(iface: &str) -> AsynDeviceSupport {
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -4357,7 +4452,7 @@ mod tests {
     fn make_timeseries_adapter(iface: &str) -> AsynDeviceSupport {
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -4774,7 +4869,7 @@ mod tests {
 
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -4828,7 +4923,7 @@ mod tests {
     fn make_uint32_io_intr_adapter(mask: u32) -> AsynDeviceSupport {
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -5826,7 +5921,7 @@ mod tests {
         let driver = EnumPort { base };
 
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -6324,7 +6419,7 @@ mod tests {
             base.create_param("VAL", ParamType::Int32).unwrap();
             let driver = CapPort { base, cap };
             let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = PortActor::new(Box::new(driver), rx);
             let actor_link = actor.link();
             std::thread::Builder::new()
@@ -6442,6 +6537,62 @@ mod tests {
         );
     }
 
+    /// C devAsyn queues its output on the record's own `asynUser`, which
+    /// `queueRequest` links onto the port queue without allocating
+    /// (asynManager.c:1606-1626). A put on a blocking port queues the same way:
+    /// the one allocation left is the `Box` that `WriteStart::Pending` carries.
+    #[test]
+    fn a_put_on_a_blocking_port_queues_its_write_without_allocating() {
+        use crate::asyn_record::errs_alloc_tests::thread_allocs;
+        use crate::param::ParamType;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_base_rs::server::records::ao::AoRecord;
+
+        struct Port(PortDriverBase);
+        impl PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let mut base = PortDriverBase::new(
+            "WRITEALLOC",
+            1,
+            PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            },
+        );
+        base.create_param("VAL", ParamType::Float64).unwrap();
+        let (rt, _jh) = create_port_runtime(Port(base), RuntimeConfig::default()).unwrap();
+        let link = AsynLink {
+            port_name: "WRITEALLOC".into(),
+            addr: 0,
+            timeout: Some(Duration::from_secs(1)),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynFloat64");
+        ads.set_record_info("TEST:WRITEALLOC", ScanType::Passive);
+        let mut rec = AoRecord::new(1.5);
+        ads.init(&mut rec).unwrap();
+
+        let mut put = || {
+            let before = thread_allocs();
+            let start = ads.write_begin(&mut rec).unwrap();
+            let allocs = thread_allocs() - before;
+            let WriteStart::Pending(done) = start else {
+                panic!("a blocking port queues the write");
+            };
+            done.wait(Duration::from_secs(5)).unwrap();
+            allocs
+        };
+        put();
+        assert_eq!(put(), 1, "WriteStart::Pending's Box and nothing else");
+    }
+
     /// R11-48 negative control: on a port that DOES register asynDrvUser, an
     /// unresolvable drvInfo is a bind failure — C prints and `goto bad`
     /// (devAsynInt32.c:272-276), whose body is `recGblSetSevr(pr, LINK_ALARM,
@@ -6530,7 +6681,7 @@ mod tests {
                 binds: Arc::clone(&binds),
             };
             let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = PortActor::new(Box::new(driver), rx);
             let actor_link = actor.link();
             std::thread::Builder::new()
@@ -6915,7 +7066,7 @@ mod tests {
         // Build an asynInt32Array adapter on the readback (output) path.
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -7519,7 +7670,7 @@ mod tests {
 
         let driver = F64Port::new();
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -7969,7 +8120,7 @@ mod tests {
             fail,
         };
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -8217,7 +8368,7 @@ mod tests {
             writes: writes.clone(),
         };
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -8429,7 +8580,7 @@ mod tests {
             reply: reply.to_vec(),
         };
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -8610,7 +8761,7 @@ mod tests {
         }
 
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PartialThenTimeout(PortDriverBase::new(
                 "octet_partial",

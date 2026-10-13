@@ -17,7 +17,7 @@
 //!   the record's `connectDevice` resolve a [`PortHandle`](crate::port_handle::PortHandle)
 //!   and latch PCNCT=1 (attached). That attachment is independent of the link
 //!   being open.
-//! * **`noAutoConnect`** (`base.auto_connect = false`) — the port actor never
+//! * **`noAutoConnect`** (`base.init_auto_connect(false)`) — the port actor never
 //!   fires the auto-reconnect cycle, so nothing drives the link toward
 //!   connected behind the record's back.
 //! * **Never connected** (`base.init_connected(false)`, and a [`connect`] that
@@ -63,7 +63,7 @@ impl NullOctetPort {
         // Disconnected link, noAutoConnect — the two properties that make CNCT
         // and AUCT deterministically 0.
         base.init_connected(false);
-        base.auto_connect = false;
+        base.init_auto_connect(false);
         Self { base }
     }
 }

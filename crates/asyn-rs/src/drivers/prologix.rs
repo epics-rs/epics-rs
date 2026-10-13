@@ -180,7 +180,7 @@ impl DrvAsynPrologixPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = !no_auto_connect;
+        base.init_auto_connect(!no_auto_connect);
         Ok(Self {
             base,
             inner,

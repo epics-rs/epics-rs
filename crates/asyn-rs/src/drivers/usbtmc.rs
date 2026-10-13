@@ -262,7 +262,7 @@ impl DrvAsynUsbtmcPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = !config.no_auto_connect();
+        base.init_auto_connect(!config.no_auto_connect());
         Ok(Self {
             base,
             config,
@@ -585,7 +585,7 @@ mod tests {
         // bTag starts at 1 (C drvAsynUSBTMC.c:1260).
         assert_eq!(drv.current_b_tag(), 1);
         // Auto-connect: flags=0 → auto on.
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
     }
 
     #[test]
@@ -599,7 +599,7 @@ mod tests {
             USBTMC_FLAG_NO_AUTO_CONNECT,
         )
         .unwrap();
-        assert!(!drv.base().auto_connect);
+        assert!(!drv.base().is_auto_connect());
     }
 
     // Only meaningful in a build without the hardware feature — with

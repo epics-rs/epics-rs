@@ -1061,7 +1061,7 @@ impl DrvAsynSerialPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynSerialPort.c:1125-1126): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -1096,7 +1096,7 @@ impl DrvAsynSerialPort {
     ) -> AsynResult<Self> {
         let mut driver = Self::new(port_name, config_str)?;
         if no_auto_connect {
-            driver.base.auto_connect = false;
+            driver.base.init_auto_connect(false);
         }
         if !no_process_eos {
             driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -1937,7 +1937,7 @@ mod tests {
     fn test_driver_initial_state() {
         let drv = DrvAsynSerialPort::new("serial1", "/dev/ttyUSB0").unwrap();
         assert!(!drv.base().is_connected());
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
         assert!(drv.base().flags.can_block);
         // `new` is parse-only: no EOS interpose (DRV-45).
         assert_eq!(drv.base().interpose_octet.len(), 0);
@@ -1954,7 +1954,7 @@ mod tests {
             1,
             "default serial port must auto-install the EOS interpose"
         );
-        assert!(default_port.base().auto_connect);
+        assert!(default_port.base().is_auto_connect());
 
         let suppressed =
             DrvAsynSerialPort::configure("s_eos_off", "/dev/ttyS0", true, true).unwrap();
@@ -1963,7 +1963,7 @@ mod tests {
             0,
             "noProcessEos must suppress the EOS interpose"
         );
-        assert!(!suppressed.base().auto_connect);
+        assert!(!suppressed.base().is_auto_connect());
     }
 
     #[test]

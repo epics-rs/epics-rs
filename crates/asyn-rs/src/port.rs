@@ -38,12 +38,46 @@ const CONNECT_RETRY_INITIAL: Duration = Duration::from_millis(10);
 /// attempt (asynManager.c:3281).
 const DEFAULT_SECONDS_BETWEEN_PORT_CONNECT: Duration = Duration::from_secs(20);
 
+/// One C `dpCommon`'s `connected` / `enabled` / `autoConnect`, as cells only
+/// the port's actor writes.
+///
+/// C's `isConnected` / `isEnabled` / `isAutoConnect` read the user's
+/// `dpCommon` directly and never queue (asynManager.c:2331-2373). A
+/// [`crate::manager::DeviceUser`] keeps the cells of the `dpCommon` it bound
+/// to, as C keeps `pdevice`, so those reads wait on no driver call.
+#[derive(Debug, Clone)]
+pub struct DpCells {
+    connected: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+    auto_connect: Arc<AtomicBool>,
+}
+
+impl DpCells {
+    fn new(connected: bool, enabled: bool, auto_connect: bool) -> Self {
+        Self {
+            connected: Arc::new(AtomicBool::new(connected)),
+            enabled: Arc::new(AtomicBool::new(enabled)),
+            auto_connect: Arc::new(AtomicBool::new(auto_connect)),
+        }
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn auto_connect(&self) -> bool {
+        self.auto_connect.load(Ordering::Acquire)
+    }
+}
+
 /// Per-address device state for multi-device ports.
 #[derive(Debug, Clone)]
 pub struct DeviceState {
-    pub connected: bool,
-    pub enabled: bool,
-    pub auto_connect: bool,
+    cells: DpCells,
     /// Monotonic instant of the last connect/disconnect transition or
     /// auto-connect attempt for this device — the anchor for the 2s
     /// reconnect throttle (C `dpCommon.lastConnectDisconnect`). `None`
@@ -55,11 +89,38 @@ pub struct DeviceState {
 impl Default for DeviceState {
     fn default() -> Self {
         Self {
-            connected: true,
-            enabled: true,
-            auto_connect: true,
+            cells: DpCells::new(true, true, true),
             last_connect_disconnect: None,
         }
+    }
+}
+
+impl DeviceState {
+    pub fn connected(&self) -> bool {
+        self.cells.connected()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.cells.enabled()
+    }
+
+    pub fn auto_connect(&self) -> bool {
+        self.cells.auto_connect()
+    }
+
+    /// Raw stores, with no `asynException`: the owners are
+    /// [`PortDriverBase::set_addr_connected`], [`PortDriverBase::set_addr_enabled`]
+    /// and [`PortDriverBase::set_auto_connect_addr`].
+    pub(crate) fn put_connected(&self, yes: bool) {
+        self.cells.connected.store(yes, Ordering::Release);
+    }
+
+    pub(crate) fn put_enabled(&self, yes: bool) {
+        self.cells.enabled.store(yes, Ordering::Release);
+    }
+
+    pub(crate) fn put_auto_connect(&self, yes: bool) {
+        self.cells.auto_connect.store(yes, Ordering::Release);
     }
 }
 
@@ -269,7 +330,9 @@ pub struct PortDriverBase {
     /// Whether the port is enabled — read it with [`Self::is_enabled`], move it
     /// with [`Self::set_enabled`]. A cell so that [`QueueGate`] reads it.
     enabled: Arc<AtomicBool>,
-    pub auto_connect: bool,
+    /// Read it with [`Self::is_auto_connect`], move it with
+    /// [`Self::set_auto_connect`]. A cell so that [`DpCells`] reads it.
+    auto_connect: Arc<AtomicBool>,
     /// C `dpCommon.defunct` (asynManager.c:2284) — the port was torn down via
     /// `shutdownPort` and is gone for good. Read it with [`Self::is_defunct`].
     ///
@@ -434,7 +497,7 @@ impl PortDriverBase {
             connected: Connection::Own(Arc::new(AtomicBool::new(true))),
             last_announced: true,
             enabled: Arc::new(AtomicBool::new(true)),
-            auto_connect: true,
+            auto_connect: Arc::new(AtomicBool::new(true)),
             defunct: false,
             announcer: ExceptionAnnouncer::new(port_name),
             options: HashMap::new(),
@@ -658,7 +721,7 @@ impl PortDriverBase {
             // ...and arms the port's connect timer at .01 s when the port is
             // auto-connect (asynManager.c:2181-2182), which is what makes the
             // reconnect *autonomous*: it does not wait for queued traffic.
-            if self.auto_connect {
+            if self.is_auto_connect() {
                 self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
             }
         } else {
@@ -711,11 +774,11 @@ impl PortDriverBase {
         let Some(addr) = self.dp_addr(addr) else {
             return self.set_connected(connected);
         };
-        let was = self.device_state(addr).connected;
+        let was = self.device_state(addr).connected();
         if was == connected {
             return false;
         }
-        self.device_state(addr).connected = connected;
+        self.device_state(addr).put_connected(connected);
         if !connected {
             // Per-device disconnect stamp — same throttle anchor as the
             // port-level path (C `exceptionDisconnect`, asynManager.c:2184).
@@ -782,21 +845,22 @@ impl PortDriverBase {
     /// C `findDpCommon(puserPvt)->enabled` (asynManager.c:2352) — what
     /// `pasynManager->isEnabled` answers for this address.
     pub fn dp_enabled(&self, addr: i32) -> bool {
-        self.device(addr).map_or(self.is_enabled(), |ds| ds.enabled)
+        self.device(addr)
+            .map_or(self.is_enabled(), |ds| ds.enabled())
     }
 
     /// C `findDpCommon(puserPvt)->connected` (asynManager.c:2340) — what
     /// `pasynManager->isConnected` answers for this address.
     pub fn dp_connected(&self, addr: i32) -> bool {
         self.device(addr)
-            .map_or_else(|| self.is_connected(), |ds| ds.connected)
+            .map_or_else(|| self.is_connected(), |ds| ds.connected())
     }
 
     /// C `findDpCommon(puserPvt)->autoConnect` (asynManager.c:2370) — what
     /// `pasynManager->isAutoConnect` answers for this address.
     pub fn dp_auto_connect(&self, addr: i32) -> bool {
         self.device(addr)
-            .map_or(self.auto_connect, |ds| ds.auto_connect)
+            .map_or_else(|| self.is_auto_connect(), |ds| ds.auto_connect())
     }
 
     /// Single owner for the post-attempt throttle stamp. C
@@ -860,14 +924,21 @@ impl PortDriverBase {
         if self.defunct {
             return Err(Self::shut_down_error());
         }
-        self.device_state(addr).enabled = enabled;
+        self.device_state(addr).put_enabled(enabled);
         self.announce_exception(AsynException::Enable, addr);
         Ok(())
     }
 
     /// Query whether auto-connect is enabled.
     pub fn is_auto_connect(&self) -> bool {
-        self.auto_connect
+        self.auto_connect.load(Ordering::Acquire)
+    }
+
+    /// The port's initial auto-connect flag, set while it is being
+    /// constructed: no `asynExceptionAutoConnect` and no retry timer. Every
+    /// change after that goes through [`Self::set_auto_connect`].
+    pub fn init_auto_connect(&mut self, yes: bool) {
+        self.auto_connect.store(yes, Ordering::Release);
     }
 
     /// Toggle the auto-connect flag at runtime.
@@ -875,11 +946,11 @@ impl PortDriverBase {
     /// C parity: `autoConnectAsyn` (asynManager.c:2310-2324) always
     /// fires `asynExceptionAutoConnect` regardless of prior state
     /// (no state-change guard). Mirror that — every call announces.
-    /// Driver constructors that initialise `base.auto_connect`
-    /// directly during `PortDriver::new()` keep the silent path
+    /// Driver constructors that initialise it through `init_auto_connect`
+    /// during `PortDriver::new()` keep the silent path
     /// (the port is not yet registered, so no listeners exist).
     pub fn set_auto_connect(&mut self, yes: bool) {
-        self.auto_connect = yes;
+        self.auto_connect.store(yes, Ordering::Release);
         // A DEVIATION from the pinned C, adopting asyn PR #217
         // (`87918f5e06b7`, "Queue connect timer on autoconnect enable"):
         // flipping auto-connect ON while the port is down starts the connect
@@ -909,8 +980,8 @@ impl PortDriverBase {
         };
         let device_down = {
             let dev = self.device_state(addr);
-            dev.auto_connect = yes;
-            !dev.connected
+            dev.put_auto_connect(yes);
+            !dev.connected()
         };
         // Same PR #217 deviation as `set_auto_connect`, and the PR keys its
         // check on the dpCommon `findDpCommon` resolved — the DEVICE's —
@@ -1008,7 +1079,7 @@ impl PortDriverBase {
     /// checked above — so there is nothing device-level left to refuse.
     pub fn check_device_enabled(&self, addr: i32) -> AsynResult<()> {
         if let Some(ds) = self.device(addr) {
-            if !ds.enabled {
+            if !ds.enabled() {
                 return Err(AsynError::Status {
                     status: AsynStatus::Disabled,
                     // C's double space is verbatim (asynManager.c:1564).
@@ -1025,7 +1096,7 @@ impl PortDriverBase {
     /// condition with the request's timeout callback (:884-885).
     pub fn check_device_connected(&self, addr: i32) -> AsynResult<()> {
         if let Some(ds) = self.device(addr) {
-            if !ds.connected {
+            if !ds.connected() {
                 return Err(AsynError::Status {
                     status: AsynStatus::Disconnected,
                     message: format!("port {} or device {} not connected", self.port_name, addr),
@@ -1101,7 +1172,7 @@ impl PortDriverBase {
         // with itself depending on whether anything had ever touched that
         // address.
         for ds in self.device_states.values_mut() {
-            ds.enabled = false;
+            ds.put_enabled(false);
         }
         self.defunct = true;
         self.announce_exception(AsynException::Shutdown, -1);
@@ -1144,9 +1215,11 @@ impl PortDriverBase {
     /// [`Self::set_auto_connect_addr`], each of which resolves the addr first.
     pub(crate) fn device_state(&mut self, addr: i32) -> &mut DeviceState {
         let seed = DeviceState {
-            connected: self.is_connected(),
-            enabled: self.is_enabled(),
-            auto_connect: self.auto_connect,
+            cells: DpCells::new(
+                self.is_connected(),
+                self.is_enabled(),
+                self.is_auto_connect(),
+            ),
             last_connect_disconnect: None,
         };
         self.device_states.entry(addr).or_insert(seed)
@@ -1161,9 +1234,17 @@ impl PortDriverBase {
     /// both. This is what makes `asynReport`'s `nDevices` and per-device
     /// block count a device the moment a record or `asynRecord` connects
     /// to it, before any I/O or connection transition touches it.
-    pub fn connect_user(&mut self, addr: i32) {
-        if let Some(addr) = self.dp_addr(addr) {
-            self.device_state(addr);
+    ///
+    /// Answers the cells of the `dpCommon` the user is now bound to — C's
+    /// `findDpCommon` (asynManager.c:538-546) resolved once, as `pdevice` is.
+    pub fn connect_user(&mut self, addr: i32) -> DpCells {
+        match self.dp_addr(addr) {
+            Some(addr) => self.device_state(addr).cells.clone(),
+            None => DpCells {
+                connected: Arc::clone(self.connected.cell()),
+                enabled: Arc::clone(&self.enabled),
+                auto_connect: Arc::clone(&self.auto_connect),
+            },
         }
     }
 
@@ -3736,13 +3817,13 @@ mod tests {
         assert!(base.is_device_connected(1));
 
         // Disable addr 1
-        base.device_state(1).enabled = false;
+        base.device_state(1).put_enabled(false);
         assert!(base.check_ready_addr(0).is_ok());
         let err = base.check_ready_addr(1).unwrap_err();
         assert!(format!("{err}").contains("not enabled"));
 
         // Disconnect addr 2
-        base.device_state(2).connected = false;
+        base.device_state(2).put_connected(false);
         let err = base.check_ready_addr(2).unwrap_err();
         assert!(format!("{err}").contains("not connected"));
     }
@@ -4057,7 +4138,7 @@ mod tests {
                 hits2.fetch_add(1, Ordering::Relaxed);
             }
         });
-        // base.auto_connect defaults to true — setting true again
+        // base.is_auto_connect() defaults to true — setting true again
         // still must fire (no state-change guard in C).
         base.set_auto_connect(true);
         base.set_auto_connect(false);
@@ -4104,7 +4185,7 @@ mod tests {
             ..PortFlags::default()
         };
         let mut base = PortDriverBase::new("act4", 2, multi);
-        base.device_state(1).connected = false;
+        base.device_state(1).put_connected(false);
         assert!(base.connect_retry_at.is_none());
         base.set_auto_connect_addr(1, true);
         assert!(base.connect_retry_at.is_some());
@@ -4293,7 +4374,7 @@ mod tests {
         base.shutdown_lifecycle().unwrap();
         assert!(!base.dp_enabled(1));
         assert!(
-            !base.device_state(1).enabled,
+            !base.device_state(1).enabled(),
             "a slot seeded after the shutdown must come up disabled"
         );
     }

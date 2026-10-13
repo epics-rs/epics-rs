@@ -446,7 +446,9 @@ impl BlockHolders {
 pub(crate) struct PortActor {
     id: ActorId,
     driver: Box<dyn PortDriver>,
-    rx: mpsc::Receiver<ActorMessage>,
+    /// C's port queue, as unbounded as its `ellAdd` list (asynManager.c:1613):
+    /// the only refusal a sender can meet is the actor being gone.
+    rx: mpsc::UnboundedReceiver<ActorMessage>,
     /// The other way a request reaches this actor: a [`RequestCell`] queued
     /// with no message, so queueing one allocates nothing.
     cells: Arc<CellQueue>,
@@ -531,7 +533,7 @@ impl Drop for PortActor {
 }
 
 impl PortActor {
-    pub fn new(driver: Box<dyn PortDriver>, rx: mpsc::Receiver<ActorMessage>) -> Self {
+    pub fn new(driver: Box<dyn PortDriver>, rx: mpsc::UnboundedReceiver<ActorMessage>) -> Self {
         // Whatever the driver announced before the actor existed (registration's
         // own connect edge, say) is not a signal *this* thread ever waited on —
         // C's port thread is started with the event unsignalled.
@@ -737,7 +739,7 @@ impl PortActor {
 
         // C :3258 — the port reconnected (or auto-connect was turned off)
         // while the timer was pending: nothing to do.
-        if self.driver.base().is_connected() || !self.driver.base().auto_connect {
+        if self.driver.base().is_connected() || !self.driver.base().is_auto_connect() {
             return;
         }
 
@@ -945,7 +947,7 @@ impl PortActor {
             base.port_name,
             yn(base.flags.multi_device),
             yn(base.flags.can_block),
-            yn(base.auto_connect)
+            yn(base.is_auto_connect())
         );
         if details >= 1 {
             let _ = writeln!(
@@ -1026,7 +1028,7 @@ impl PortActor {
             addrs.sort_unstable();
             for addr in addrs {
                 let ds = &base.device_states[&addr];
-                if !ds.connected || details >= 1 {
+                if !ds.connected() || details >= 1 {
                     let _ = writeln!(
                         out,
                         "    addr {} autoConnect {} enabled {} connected {} exceptionActive {}",
@@ -1036,9 +1038,9 @@ impl PortActor {
                         // port's own is on the header line. `asynAutoConnect(port,
                         // addr, 0)` turns off one device's auto-connect, and the
                         // report has to be able to say so.
-                        yn(ds.auto_connect),
-                        yn(ds.enabled),
-                        yn(ds.connected),
+                        yn(ds.auto_connect()),
+                        yn(ds.enabled()),
+                        yn(ds.connected()),
                         yn(false)
                     );
                 }
@@ -1479,7 +1481,7 @@ impl PortActor {
         if self.connect_gate().is_err() {
             return false;
         }
-        if !self.driver.base().is_connected() && self.driver.base().auto_connect {
+        if !self.driver.base().is_connected() && self.driver.base().is_auto_connect() {
             if !self
                 .driver
                 .base()
@@ -1761,8 +1763,11 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::ConnectUser => {
-                self.driver.base_mut().connect_user(user.addr);
-                Ok(RequestResult::write_ok())
+                let dp = self.driver.base_mut().connect_user(user.addr);
+                Ok(RequestResult {
+                    dp: Some(dp),
+                    ..RequestResult::write_ok()
+                })
             }
             RequestOp::SetEnable { yes } => {
                 // C `enable(pasynUser, yesNo)` (asynManager.c:2224-2251):
@@ -2388,8 +2393,8 @@ mod tests {
         base.shutdown_lifecycle().unwrap();
     }
 
-    fn spawn_actor(driver: impl PortDriver) -> mpsc::Sender<ActorMessage> {
-        let (tx, rx) = mpsc::channel(256);
+    fn spawn_actor(driver: impl PortDriver) -> mpsc::UnboundedSender<ActorMessage> {
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         std::thread::Builder::new()
             .name("test-actor".into())
@@ -2401,7 +2406,7 @@ mod tests {
     /// An actor and C `queueRequest`'s gate in front of it, as a
     /// [`crate::port_handle::PortHandle`] holds them.
     struct GatedTx {
-        tx: mpsc::Sender<ActorMessage>,
+        tx: mpsc::UnboundedSender<ActorMessage>,
         gate: QueueGate,
         multi_device: bool,
     }
@@ -2424,13 +2429,13 @@ mod tests {
     }
 
     fn send_and_wait(
-        tx: &mpsc::Sender<ActorMessage>,
+        tx: &mpsc::UnboundedSender<ActorMessage>,
         op: RequestOp,
         user: AsynUser,
     ) -> AsynResult<RequestResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
-        tx.blocking_send(msg).expect("actor channel closed");
+        tx.send(msg).expect("actor channel closed");
         reply_rx.blocking_recv().expect("actor dropped reply")
     }
 
@@ -2977,7 +2982,7 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let (reply_tx, reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(RequestOp::Int32Read, user, cancel, reply_tx);
-        tx.blocking_send(msg).unwrap();
+        tx.send(msg).unwrap();
         let result = reply_rx.blocking_recv().unwrap();
         assert!(result.is_err());
     }
@@ -3045,7 +3050,7 @@ mod tests {
     fn actor_auto_connect() {
         let mut drv = TestDriver::new();
         drv.base.init_connected(false);
-        drv.base.auto_connect = true;
+        drv.base.init_auto_connect(true);
         // Seed VAL so the read probe returns a value: the default read now
         // surfaces an unset param as ParamUndefined (C parity), so this
         // lifecycle test must assert the auto-connect outcome (the request
@@ -3089,7 +3094,7 @@ mod tests {
         let mut base = PortDriverBase::new("throttle_test", 1, PortFlags::default());
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         let drv = ThrottleDriver {
             base,
             connect_calls: connect_calls.clone(),
@@ -3169,7 +3174,7 @@ mod tests {
         let options = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut base = PortDriverBase::new("waived_test", 1, PortFlags::default());
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         let tx = spawn_actor(WaivedDriver {
             base,
             connect_calls: connect_calls.clone(),
@@ -3258,7 +3263,7 @@ mod tests {
         let connect_calls = Arc::new(AtomicUsize::new(0));
         let mut base = PortDriverBase::new("disconnect_test", 1, PortFlags::default());
         base.init_connected(true);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         let tx = spawn_actor(DisconnectDriver {
             base,
             connect_calls: connect_calls.clone(),
@@ -3319,7 +3324,7 @@ mod tests {
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let tx = spawn_actor(AddrDriver {
             base,
@@ -3390,8 +3395,8 @@ mod tests {
             base.params.set_int32(0, 1, 7).unwrap();
             // The transport dropped: port down, and the device with it.
             base.init_connected(false);
-            base.auto_connect = true;
-            base.device_state(1).connected = false;
+            base.init_auto_connect(true);
+            base.device_state(1).put_connected(false);
             let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
             (
                 MultiDriver {
@@ -3493,7 +3498,7 @@ mod tests {
         let link_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut base = PortDriverBase::new("retry_test", 1, PortFlags::default());
         base.create_param("VAL", ParamType::Int32).unwrap();
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         // Shorten C's 20 s back-off (asynManager.c:48) so the second attempt
         // lands inside the test. The first attempt always uses C's .01 s.
         base.seconds_between_port_connect = Duration::from_millis(30);
@@ -3587,7 +3592,7 @@ mod tests {
                     ..PortFlags::default()
                 },
             );
-            base.auto_connect = true;
+            base.init_auto_connect(true);
             base.set_connected(false);
             base.set_enabled(enabled).unwrap();
             if defunct {
@@ -3601,7 +3606,7 @@ mod tests {
                 connect_calls: calls.clone(),
                 connect_addr_calls: addr_calls.clone(),
             };
-            let (_tx, rx) = mpsc::channel(1);
+            let (_tx, rx) = mpsc::unbounded_channel();
             (PortActor::new(Box::new(drv), rx), calls, addr_calls, _tx)
         };
 
@@ -3648,7 +3653,7 @@ mod tests {
     #[test]
     fn disconnect_does_not_arm_retry_when_auto_connect_is_off() {
         let mut base = PortDriverBase::new("no_auto", 1, PortFlags::default());
-        base.auto_connect = false;
+        base.init_auto_connect(false);
         assert!(base.set_connected(false));
         assert!(
             base.connect_retry_at.is_none(),
@@ -3657,7 +3662,7 @@ mod tests {
 
         // ...and with auto-connect on, the same edge arms it.
         let mut base = PortDriverBase::new("auto", 1, PortFlags::default());
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         assert!(base.set_connected(false));
         assert!(base.connect_retry_at.is_some());
         // Coming back up disarms it.
@@ -3687,12 +3692,12 @@ mod tests {
     }
 
     fn send(
-        tx: &mpsc::Sender<ActorMessage>,
+        tx: &mpsc::UnboundedSender<ActorMessage>,
         op: RequestOp,
         user: AsynUser,
     ) -> oneshot::Receiver<AsynResult<RequestResult>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        tx.blocking_send(ActorMessage::new(op, user, CancelToken::new(), reply_tx))
+        tx.send(ActorMessage::new(op, user, CancelToken::new(), reply_tx))
             .expect("actor channel closed");
         reply_rx
     }
@@ -3808,9 +3813,9 @@ mod tests {
         let mut drv = multi_device_driver(true);
         // No auto-connect: nothing can bring the device back, so the request
         // reaches the timeout path rather than the connect that precedes it.
-        drv.base.auto_connect = false;
-        drv.base.device_state(1).auto_connect = false;
-        drv.base.device_state(1).connected = false;
+        drv.base.init_auto_connect(false);
+        drv.base.device_state(1).put_auto_connect(false);
+        drv.base.device_state(1).put_connected(false);
         let tx = spawn_actor(drv);
 
         let err = send_and_wait(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(1))
@@ -3824,9 +3829,9 @@ mod tests {
         // The synchronous port is the one that answers with the refusal, and its
         // text is C's (:1571).
         let mut drv = multi_device_driver(false);
-        drv.base.auto_connect = false;
-        drv.base.device_state(1).auto_connect = false;
-        drv.base.device_state(1).connected = false;
+        drv.base.init_auto_connect(false);
+        drv.base.device_state(1).put_auto_connect(false);
+        drv.base.device_state(1).put_connected(false);
         let tx = spawn_actor(drv);
         let err = send_and_wait(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(1))
             .expect_err("a synchronous port refuses a disconnected device");
@@ -3857,7 +3862,7 @@ mod tests {
         );
 
         let mut drv = multi_device_driver(true);
-        drv.base.auto_connect = false;
+        drv.base.init_auto_connect(false);
         drv.base.init_connected(false);
         let tx = spawn_gated(drv);
         let err = queue_and_wait(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(1))
@@ -4007,7 +4012,7 @@ mod tests {
             let mut base = PortDriverBase::new("enable_test", 1, PortFlags::default());
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.init_connected(false);
-            base.auto_connect = true;
+            base.init_auto_connect(true);
             base.set_enabled(enabled).unwrap();
             if defunct {
                 shut_down(&mut base);
@@ -4117,7 +4122,7 @@ mod tests {
         // pass wanted to make would be permitted. No transition means no retry
         // timer either, so nothing but a wake can produce an attempt.
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         let tx = spawn_actor(StatusDriver {
             base,
             connect_calls: calls.clone(),
@@ -4170,7 +4175,7 @@ mod tests {
         // that bypass the enabled/connected check).
         let mut drv = TestDriver::new();
         drv.base.set_enabled(false).unwrap();
-        drv.base.auto_connect = true;
+        drv.base.init_auto_connect(true);
         let tx = spawn_actor(drv);
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
@@ -4192,7 +4197,7 @@ mod tests {
     #[test]
     fn queue_even_if_not_connected_reason_waives_only_the_connected_refusal() {
         let mut drv = multi_device_driver(true);
-        drv.base.auto_connect = false; // no reconnect can rescue the request
+        drv.base.init_auto_connect(false); // no reconnect can rescue the request
         drv.base.set_connected(false);
         let tx = spawn_gated(drv);
 
@@ -4276,7 +4281,7 @@ mod tests {
         use crate::runtime::{RuntimeConfig, create_port_runtime};
 
         let mut drv = multi_device_driver(true);
-        drv.base.auto_connect = false;
+        drv.base.init_auto_connect(false);
         drv.base.set_connected(false);
         let (runtime, _jh) = create_port_runtime(drv, RuntimeConfig::default()).unwrap();
         let handle = runtime.port_handle();
@@ -4327,7 +4332,7 @@ mod tests {
     fn a_parameter_publish_lands_on_a_disconnected_or_disabled_port() {
         for (connected, enabled) in [(false, true), (true, false), (false, false)] {
             let mut drv = TestDriver::new();
-            drv.base.auto_connect = false; // no reconnect can rescue the update
+            drv.base.init_auto_connect(false); // no reconnect can rescue the update
             drv.base.set_connected(connected);
             drv.base.set_enabled(enabled).unwrap();
             let val = drv.base.find_param("VAL").unwrap();
@@ -4523,7 +4528,7 @@ mod tests {
     fn drv_user_create_resolves_on_a_disconnected_or_disabled_port() {
         for (connected, enabled) in [(false, true), (true, false), (false, false)] {
             let mut drv = TestDriver::new();
-            drv.base.auto_connect = false;
+            drv.base.init_auto_connect(false);
             drv.base.set_connected(connected);
             drv.base.set_enabled(enabled).unwrap();
             let f64_reason = drv.base.find_param("F64").unwrap();
@@ -4575,7 +4580,7 @@ mod tests {
         let srv =
             crate::drivers::ip_server_port::DrvAsynIPServerPort::new("ipsrv_rep", "127.0.0.1:0")
                 .expect("server");
-        let (_tx, rx) = mpsc::channel(1);
+        let (_tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(srv), rx);
 
         assert_eq!(
@@ -4610,13 +4615,13 @@ mod tests {
                     ..PortFlags::default()
                 },
             );
-            base.auto_connect = true;
+            base.init_auto_connect(true);
             base.init_connected(false);
             base.set_connected(true); // one published connect → numberConnects 1
-            base.device_state(0).connected = true;
-            base.device_state(1).connected = false; // a down device
+            base.device_state(0).put_connected(true);
+            base.device_state(1).put_connected(false); // a down device
             base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
-            let (_tx, rx) = mpsc::channel(1);
+            let (_tx, rx) = mpsc::unbounded_channel();
             (PortActor::new(Box::new(Plain(base)), rx), _tx)
         };
 
@@ -4729,7 +4734,7 @@ mod tests {
         for (connected, enabled) in [(false, true), (true, false), (false, false)] {
             let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut base = PortDriverBase::new("rep", 1, PortFlags::default());
-            base.auto_connect = false;
+            base.init_auto_connect(false);
             base.set_connected(connected);
             base.set_enabled(enabled).unwrap();
             let tx = spawn_actor(ReportSpy {
@@ -4788,10 +4793,10 @@ mod tests {
                     ..PortFlags::default()
                 },
             );
-            base.auto_connect = port_auto_connect;
+            base.init_auto_connect(port_auto_connect);
             base.device_state(0);
             base.device_state(1);
-            let (_tx, rx) = mpsc::channel(1);
+            let (_tx, rx) = mpsc::unbounded_channel();
             (PortActor::new(Box::new(TestDriverBase(base)), rx), _tx)
         };
 
@@ -4937,7 +4942,7 @@ mod tests {
         const CHILD_ENV: &str = "ASYN_REPORT_WRITES_TO_STDOUT_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let base = PortDriverBase::new("stdout_rep", 1, PortFlags::default());
-            let (_tx, rx) = mpsc::channel(1);
+            let (_tx, rx) = mpsc::unbounded_channel();
             let actor = PortActor::new(Box::new(TestDriverBase(base)), rx);
             actor.report_port(0);
             return;
@@ -4994,7 +4999,7 @@ mod tests {
 
         let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut base = PortDriverBase::new("disabled_port", 1, PortFlags::default());
-        base.auto_connect = false;
+        base.init_auto_connect(false);
         base.set_connected(false);
         base.set_enabled(false).unwrap(); // C `asynEnable(port, 0)`
         let tx = spawn_gated(ConnectSpy {
@@ -5083,7 +5088,7 @@ mod tests {
     fn device_addressed_connect_is_refused_only_on_a_multi_device_port() {
         // Boundary 0: single-device port, addr 0 → no device, waived, runs.
         let mut drv = TestDriver::new();
-        drv.base.auto_connect = false;
+        drv.base.init_auto_connect(false);
         drv.base.set_connected(false);
         let tx = spawn_gated(drv);
         let user = AsynUser::new(0)
@@ -5093,7 +5098,7 @@ mod tests {
             .expect("a single-device port has no device at addr 0, so the waiver holds");
 
         let mut drv = multi_device_driver(true);
-        drv.base.auto_connect = false;
+        drv.base.init_auto_connect(false);
         drv.base.set_connected(false);
         let tx = spawn_gated(drv);
 
@@ -5147,7 +5152,7 @@ mod tests {
     #[test]
     fn a_user_that_never_chose_a_device_is_port_level() {
         let mut drv = TestDriver::new();
-        drv.base.auto_connect = false;
+        drv.base.init_auto_connect(false);
         drv.base.set_connected(false);
         let tx = spawn_actor(drv);
 
@@ -5211,7 +5216,7 @@ mod tests {
         // enqueued after this read and can only answer once the actor has
         // dealt with it, so the receiver's state is settled by then.
         let (other_tx, mut other_rx) = oneshot::channel();
-        tx.blocking_send(ActorMessage::new(
+        tx.send(ActorMessage::new(
             RequestOp::Int32Read,
             AsynUser::new(0)
                 .with_addr(1)
@@ -5249,7 +5254,7 @@ mod tests {
         let stalled = AsynUser::new(0)
             .with_addr(0)
             .with_timeout(Duration::from_secs(1));
-        tx.blocking_send(ActorMessage::new(
+        tx.send(ActorMessage::new(
             RequestOp::Int32Read,
             stalled,
             CancelToken::new(),
@@ -5294,7 +5299,7 @@ mod tests {
 
         // A non-owner on address 1: only the PORT holder gates it.
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        tx.blocking_send(ActorMessage::new(
+        tx.send(ActorMessage::new(
             RequestOp::Int32Read,
             AsynUser::new(0)
                 .with_addr(1)

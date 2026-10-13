@@ -83,6 +83,35 @@ fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static HOLD_PATH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks a body that runs under a record's hold. The actor answers a round
+/// trip only after the driver call it is in, so waiting on one there holds the
+/// record for that call — a read's whole timeout. [`block_on_reply`] asserts no
+/// mark is open.
+#[cfg(feature = "epics")]
+pub(crate) struct HoldPath(());
+
+#[cfg(feature = "epics")]
+impl HoldPath {
+    pub(crate) fn enter() -> Self {
+        #[cfg(debug_assertions)]
+        HOLD_PATH.with(|d| d.set(d.get() + 1));
+        Self(())
+    }
+}
+
+#[cfg(feature = "epics")]
+impl Drop for HoldPath {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        HOLD_PATH.with(|d| d.set(d.get() - 1));
+    }
+}
+
 /// Block the calling thread on a reply that only the port actor can produce.
 ///
 /// The actor runs on its own OS thread, so the reply arrives no matter what the
@@ -91,6 +120,12 @@ fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
 /// that reasoning fails (the caller *is* the actor) is refused up front by
 /// [`guard_reentrant`], never reached here.
 fn block_on_reply<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        HOLD_PATH.with(std::cell::Cell::get),
+        0,
+        "a port round trip under a record's hold"
+    );
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         // A multi-threaded worker: hand this worker's other tasks to a sibling
         // before we park it. Purely a scheduling courtesy — correctness does
@@ -222,7 +257,7 @@ impl std::future::Future for AsyncCompletionHandle {
 /// and return a completion handle.
 #[derive(Clone)]
 pub struct PortHandle {
-    tx: mpsc::Sender<ActorMessage>,
+    tx: mpsc::UnboundedSender<ActorMessage>,
     port_name: Arc<str>,
     /// Identity of the actor on the receiving end of `tx`. Every blocking entry
     /// point compares it against the calling thread — see [`guard_reentrant`].
@@ -269,7 +304,7 @@ impl PortHandle {
     /// re-entrant call from that actor's own thread and a queueing caller reads
     /// that port's gate.
     pub(crate) fn new(
-        tx: mpsc::Sender<ActorMessage>,
+        tx: mpsc::UnboundedSender<ActorMessage>,
         port_name: String,
         interrupts: Arc<InterruptManager>,
         actor: ActorLink,
@@ -429,17 +464,7 @@ impl PortHandle {
     ) -> AsynResult<AsyncCompletionHandle> {
         crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        let msg = ActorMessage::new(op, user, cancel, reply_tx);
-        self.tx.try_send(msg).map_err(|e| {
-            let detail = match e {
-                mpsc::error::TrySendError::Full(_) => "full",
-                mpsc::error::TrySendError::Closed(_) => "closed",
-            };
-            AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("actor channel {} for port {}", detail, self.port_name),
-            }
-        })?;
+        self.send(ActorMessage::new(op, user, cancel, reply_tx))?;
         Ok(AsyncCompletionHandle {
             rx: reply_rx,
             actor: self.actor,
@@ -512,11 +537,7 @@ impl PortHandle {
         crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
         let queue_timeout = user.queue_timeout;
         let (reply_tx, reply_rx) = oneshot::channel();
-        let msg = ActorMessage::new(op, user, cancel.clone(), reply_tx);
-        self.tx.send(msg).await.map_err(|_| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("actor channel closed for port {}", self.port_name),
-        })?;
+        self.send(ActorMessage::new(op, user, cancel.clone(), reply_tx))?;
         self.await_reply(reply_rx, cancel, queue_timeout).await
     }
 
@@ -969,8 +990,13 @@ impl PortHandle {
     async fn enqueue(&self, op: RequestOp, addr: i32) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
         let (reply_tx, _) = oneshot::channel();
-        let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
-        self.tx.send(msg).await.map_err(|_| AsynError::Status {
+        self.send(ActorMessage::new(op, user, CancelToken::new(), reply_tx))
+    }
+
+    /// C `queueRequest`'s `ellAdd` + `epicsEventSignal` (asynManager.c:1613,
+    /// :1626): the queue has no capacity to refuse on, so only a gone actor does.
+    fn send(&self, msg: ActorMessage) -> AsynResult<()> {
+        self.tx.send(msg).map_err(|_| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("actor channel closed for port {}", self.port_name),
         })
@@ -1167,10 +1193,12 @@ impl PortHandle {
     /// record's device support at init, `asynRecord`'s PORT/ADDR connect —
     /// goes through here; it is not the transport `connect` of
     /// [`Self::connect_addr_blocking`].
-    pub fn connect_device_blocking(&self, addr: i32) -> AsynResult<()> {
+    /// C `connectDevice`'s `locateDevice` on the actor, answering the cells of
+    /// the `dpCommon` the user is bound to (see [`crate::port::DpCells`]).
+    pub fn connect_device_blocking(&self, addr: i32) -> AsynResult<crate::port::DpCells> {
         let user = AsynUser::new(0).with_addr(addr);
-        self.submit_blocking(RequestOp::ConnectUser, user)?;
-        Ok(())
+        let result = self.submit_blocking(RequestOp::ConnectUser, user)?;
+        Ok(result.dp.expect("ConnectUser answers its dpCommon"))
     }
 
     pub fn connect_addr_blocking(&self, addr: i32) -> AsynResult<()> {
@@ -1452,7 +1480,7 @@ mod tests {
 
     fn make_handle(driver: impl PortDriver) -> PortHandle {
         let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
         std::thread::Builder::new()
@@ -1466,6 +1494,74 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         )
+    }
+
+    /// C `queueRequest` appends to an unbounded list (asynManager.c:1610-1617):
+    /// however many requests arrive while the port thread is inside the driver,
+    /// none is refused, and each runs once it comes out.
+    #[test]
+    fn a_port_busy_in_its_driver_refuses_no_request() {
+        use std::sync::mpsc as std_mpsc;
+
+        struct Busy {
+            base: PortDriverBase,
+            entered: std_mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std_mpsc::Receiver<()>>,
+        }
+        impl PortDriver for Busy {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+                if user.reason == 1 {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                Ok(7)
+            }
+        }
+
+        let (entered_tx, entered) = std_mpsc::sync_channel(1);
+        let (release, release_rx) = std_mpsc::channel();
+        let (runtime, _jh) = crate::runtime::create_port_runtime(
+            Busy {
+                base: PortDriverBase::new(
+                    "busy",
+                    1,
+                    PortFlags {
+                        can_block: true,
+                        ..PortFlags::default()
+                    },
+                ),
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            },
+            crate::runtime::RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle();
+        let jam = handle
+            .try_submit(RequestOp::Int32Read, AsynUser::new(1))
+            .unwrap();
+        entered.recv().unwrap();
+        let queued: Vec<_> = (0..1500)
+            .map(|i| {
+                handle
+                    .try_submit(RequestOp::Int32Read, AsynUser::new(0))
+                    .unwrap_or_else(|e| panic!("request {i} refused: {e}"))
+            })
+            .collect();
+        release.send(()).unwrap();
+        jam.wait_blocking(Duration::from_secs(5)).unwrap();
+        for done in queued {
+            assert_eq!(
+                done.wait_blocking(Duration::from_secs(5)).unwrap().int_val,
+                Some(7)
+            );
+        }
     }
 
     /// A waiter's request queued just before its port went down stays queued,
@@ -1518,7 +1614,11 @@ mod tests {
         let mut base = PortDriverBase::new("park_waiter", 1, PortFlags::default());
         // The port comes back on its own retry timer (asynManager.c:3252-3283).
         base.seconds_between_port_connect = Duration::from_millis(20);
-        let (tx, rx) = mpsc::channel(16);
+        // The handle queues into `queued`; the test hands each request on to
+        // the actor, so it knows when one is queued.
+        let (tx, mut queued) = mpsc::unbounded_channel();
+        let (relay, rx) = mpsc::unbounded_channel();
+        let mut hand_on = || relay.send(queued.blocking_recv().unwrap()).unwrap();
         let actor = PortActor::new(
             Box::new(Drops {
                 base,
@@ -1545,14 +1645,14 @@ mod tests {
             std::thread::spawn(move || handle.submit_blocking(RequestOp::Int32Read, user))
         };
         let jam = submit(AsynUser::new(1));
+        hand_on();
         entered.recv().unwrap();
         let timed = submit(AsynUser::new(0).with_queue_timeout(Duration::from_millis(100)));
         let waits = submit(AsynUser::new(0));
         // Both are queued — the actor, inside the driver, has not taken them —
         // before the line drops.
-        while handle.tx.capacity() > handle.tx.max_capacity() - 2 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        hand_on();
+        hand_on();
         release.send(()).unwrap();
         jam.join().unwrap().unwrap();
 

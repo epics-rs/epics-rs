@@ -1068,8 +1068,9 @@ struct ReadFailure {
     /// the socket intact), and any non-would-block, non-EINTR error tears down
     /// unconditionally.
     disconnect: bool,
-    /// The error the caller reports: C's `asynError` + `"read error"` text on
-    /// the teardown branch, the lower layer's failure verbatim otherwise.
+    /// The error the caller reports: C's `asynError` + `"%s read error: %s"` on
+    /// the teardown branch, `asynTimeout` + `"%s timeout: %s"` on the other, and
+    /// any failure that is neither the lower layer's verbatim.
     error: AsynError,
 }
 
@@ -1096,23 +1097,31 @@ fn classify_read_failure(
     let disconnect =
         (disconnect_on_read_timeout && is_timeout && timeout.is_some_and(|t| t > Duration::ZERO))
             || e.is_fatal_transport();
-    if !disconnect {
+    if !disconnect && !is_timeout {
         return ReadFailure {
             disconnect: false,
             error: e,
         };
     }
-    // C overwrites `pasynUser->errorMessage` and the status together (:801-806)
+    // C writes `pasynUser->errorMessage` and the status together (:852-866)
     // — while the partial transfer already in the caller's buffer stands, because
-    // `*nbytesTransfered = thisRead` (:824) runs on both branches. So restamp the
+    // `*nbytesTransferred = thisRead` (:878) runs on both branches. So restamp the
     // failure and re-attach whatever the read did deliver.
     let partial = e.partial_read().cloned();
-    let restamped = AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!("{device_name} read error: {}", e.message()),
+    let cause = sock_err_cause(&e);
+    let restamped = if disconnect {
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{device_name} read error: {cause}"),
+        }
+    } else {
+        AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: format!("{device_name} timeout: {cause}"),
+        }
     };
     ReadFailure {
-        disconnect: true,
+        disconnect,
         error: match partial {
             Some(p) => restamped.with_partial_read(p),
             None => restamped,
@@ -1192,10 +1201,33 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
     if is_nonfatal_read_timeout(e.kind()) {
         AsynError::Status {
             status: AsynStatus::Timeout,
-            message: "read timeout".into(),
+            message: sock_err_text(&e),
         }
     } else {
         AsynError::Io(e)
+    }
+}
+
+/// C `epicsSocketConvertErrnoToString`: the error's own text — for an errno,
+/// `strerror`'s, without std's ` (os error N)`.
+pub(crate) fn sock_err_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(code) => match text.strip_suffix(&format!(" (os error {code})")) {
+            Some(bare) => bare.to_owned(),
+            None => text,
+        },
+        None => text,
+    }
+}
+
+/// The `sockerrmsg` a failed read carries up to [`classify_read_failure`]:
+/// the socket error's text through any partial-read carrier.
+fn sock_err_cause(e: &AsynError) -> String {
+    match e {
+        AsynError::PartialRead { source, .. } => sock_err_cause(source),
+        AsynError::Io(io) => sock_err_text(io),
+        other => other.message(),
     }
 }
 
@@ -1352,7 +1384,7 @@ impl DrvAsynIPPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynIPPort.c:1055): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -1509,7 +1541,7 @@ impl DrvAsynIPPort {
         // users, which is what drives a SCAN="I/O Intr" record.
         base.octet_interrupt_process = true;
         // `registerPort(..., !noAutoConnect, ...)`.
-        base.auto_connect = !no_auto_connect;
+        base.init_auto_connect(!no_auto_connect);
         // `asynInterposeEosConfig(portName, -1, 1, 1)` unless suppressed. Without
         // it the port has NO EOS layer at all, so an IEOS set on it is accepted,
         // reads back, and terminates nothing.
@@ -2086,7 +2118,7 @@ mod tests {
     fn test_driver_initial_state() {
         let drv = DrvAsynIPPort::new("iptest", "localhost:5025").unwrap();
         assert!(!drv.base().is_connected());
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
         assert!(drv.base().flags.can_block);
     }
 
@@ -2111,7 +2143,7 @@ mod tests {
         // (2) Disconnected, noAutoConnect — nothing arms the reconnect timer,
         // so the port stays permanently disconnected (CNCT/AUCT read 0).
         assert!(!drv.base().is_connected());
-        assert!(!drv.base().auto_connect);
+        assert!(!drv.base().is_auto_connect());
 
         // (3) The IP options the asyn record renders as HOSTINFO / DRTO.
         assert_eq!(drv.get_option("hostinfo").unwrap(), "localhost:1");
@@ -2695,10 +2727,11 @@ mod tests {
             AsynStatus::Error,
             "C readIt overwrites the status on the disconnect branch"
         );
-        assert!(
-            err.message().contains("read error"),
-            "C's teardown text (drvAsynIPPort.c:801-803), got {:?}",
-            err.message()
+        // C's teardown text, `"%s read error: %s"` with the recv errno's
+        // `strerror` (drvAsynIPPort.c:852-859).
+        assert_eq!(
+            err.message(),
+            format!("127.0.0.1:{port} read error: Resource temporarily unavailable")
         );
         assert!(
             !drv.base().is_connected(),
@@ -2736,6 +2769,12 @@ mod tests {
         // (drvAsynIPPort.c:811) — the restamp is the teardown branch's, not every
         // failed read's.
         assert_eq!(err.status(), AsynStatus::Timeout);
+        // `"%s timeout: %s"` with the recv errno's `strerror`
+        // (drvAsynIPPort.c:861-865).
+        assert_eq!(
+            err.message(),
+            format!("127.0.0.1:{port} timeout: Resource temporarily unavailable")
+        );
         assert!(
             drv.base().is_connected(),
             "a plain read timeout leaves the socket intact (C returns asynTimeout, no close)"
@@ -2817,7 +2856,7 @@ mod tests {
         let f = classify_read_failure(fatal(), false, Some(Duration::ZERO), dev);
         assert!(f.disconnect);
         assert_eq!(f.error.status(), AsynStatus::Error);
-        assert_eq!(f.error.message(), "host:1 read error: IO: cable yanked");
+        assert_eq!(f.error.message(), "host:1 read error: cable yanked");
     }
 
     #[test]
@@ -2891,13 +2930,17 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_port = server.local_addr().unwrap().port();
 
-        // Reserve a fixed local port for the driver so the "other peer"
-        // below knows where to answer.
-        let local_port = UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // The driver binds an ephemeral local port; the "other peer" below
+        // answers to the port it got. A probe bound and dropped to pick a fixed
+        // port leaves it for a parallel test to take first (EADDRINUSE).
+        let mut drv =
+            DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        let Some(IpIoInner::Udp(socket, _)) = &drv.io.inner else {
+            panic!("a udp port holds a datagram socket");
+        };
+        let local_port = socket.local_addr().unwrap().port();
 
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 256];
@@ -2909,14 +2952,6 @@ mod tests {
                 .send_to(b"pong", format!("127.0.0.1:{local_port}"))
                 .unwrap();
         });
-
-        let mut drv = DrvAsynIPPort::new(
-            "udptest",
-            &format!("127.0.0.1:{server_port}:{local_port} udp"),
-        )
-        .unwrap();
-        let user = AsynUser::default();
-        drv.connect(&user).unwrap();
 
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         drv.write_octet(&mut user, b"ping").unwrap();

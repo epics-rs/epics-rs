@@ -1011,6 +1011,8 @@ pub struct RequestResult {
     /// request layer stays bitflag-crate-free; converters live on
     /// `EomReason::from_bits_truncate`.
     pub eom_reason: u32,
+    /// The bound `dpCommon`'s cells (from ConnectUser).
+    pub dp: Option<crate::port::DpCells>,
 }
 
 impl RequestResult {
@@ -1041,6 +1043,7 @@ impl RequestResult {
             option_value: None,
             bounds: None,
             eom_reason: 0,
+            dp: None,
         }
     }
 

@@ -3,8 +3,11 @@
 //! `caInitializing` set and then runs `asComputeAllAsg` (asCa.c:204-205), so
 //! the attach is itself an evaluation point; the port reads `INP*` values at
 //! evaluation time, so a re-evaluation after the attach covers every post the
-//! subscriber missed. A post racing the attach is one of the two: both take
-//! the record's write lock.
+//! subscriber missed. A post racing the attach is covered either way:
+//! `put_pv_and_post_gated` stores and posts under two write-lock
+//! acquisitions, so an attach can land between them, but an attach before
+//! the post gets the post, and the re-evaluation that follows an attach reads
+//! the live value through `inp_resolver` at evaluation time.
 
 use std::sync::Arc;
 use std::time::Duration;

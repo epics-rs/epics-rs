@@ -37,7 +37,7 @@
 //! socket-per-NIC mapping (e.g. for diagnostics or NS-driven response
 //! correlation).
 
-// RTEMS-EXEC-MODEL-ALLOW(17): every test binds tokio::net UDP sockets, which
+// RTEMS-EXEC-MODEL-ALLOW(18): every test binds tokio::net UDP sockets, which
 // need a reactor the exec backend does not start; on the exec backend these
 // still run on the tokio driver `#[tokio::test]` builds, and pass. b3ab3ab8
 // added the three bundle-port tests without touching the count; all 17 were
@@ -214,44 +214,13 @@ impl AsyncUdpV4 {
                     );
                 }
             }
-            // BSD-family oddity (macOS, *BSD): a UDP socket bound to a
-            // specific NIC unicast IP receives only unicasts to that
-            // IP — packets sent to the subnet broadcast address are
-            // delivered ONLY to a socket bound to either the broadcast
-            // address itself or to INADDR_ANY. Mirror EPICS-base rsrv
-            // (`caservertask.c:671-709`) and bind a second RX-only
-            // socket to each NIC's broadcast address so PVA/CA SEARCH
-            // bursts sent to e.g. `192.168.1.255:5076` reach the
-            // responder. Windows: Winsock delivers subnet broadcasts
-            // to the unicast-bound socket, so the extra bind is
-            // unnecessary and skipped. Loopback has no broadcast.
-            // Per-NIC failures are logged at debug; the unicast
-            // socket above is the load-bearing one.
-            #[cfg(not(target_os = "windows"))]
-            if let Some(bcast) = info.broadcast {
-                if !info.ip.is_loopback() && !bcast.is_unspecified() {
-                    match bind_one_at(
-                        &info,
-                        bcast,
-                        port,
-                        PortUse::from_caller(port),
-                        broadcast,
-                        true,
-                    ) {
-                        Ok(nic) => sockets.push(nic),
-                        Err(e) => {
-                            tracing::debug!(
-                                target: "epics_base_rs::net",
-                                iface = %info.ip,
-                                bcast = %bcast,
-                                port,
-                                error = %e,
-                                "skipping NIC bcast bind"
-                            );
-                        }
-                    }
-                }
-            }
+            push_bcast_rx(
+                &mut sockets,
+                &info,
+                port,
+                PortUse::from_caller(port),
+                broadcast,
+            );
         }
         if sockets.is_empty() {
             return Err(io::Error::new(
@@ -374,13 +343,29 @@ impl AsyncUdpV4 {
                     io::Error::new(io::ErrorKind::Other, "could not read chosen UDP port")
                 })?;
             let mut sockets = vec![first];
+            push_bcast_rx(
+                &mut sockets,
+                first_info,
+                chosen_port,
+                PortUse::Exclusive,
+                broadcast,
+            );
             let mut dropped = 0usize;
             for info in iter {
                 // Exclusive: this port is ephemeral however non-zero it looks,
                 // so a number somebody already holds must be EADDRINUSE here
                 // rather than a silent join of their fanout group.
                 match bind_one_exclusive(info, chosen_port, broadcast) {
-                    Ok(nic) => sockets.push(nic),
+                    Ok(nic) => {
+                        sockets.push(nic);
+                        push_bcast_rx(
+                            &mut sockets,
+                            info,
+                            chosen_port,
+                            PortUse::Exclusive,
+                            broadcast,
+                        );
+                    }
                     Err(e) => {
                         dropped += 1;
                         tracing::debug!(
@@ -1371,6 +1356,50 @@ impl PortUse {
     }
 }
 
+/// The auxiliary broadcast-RX socket of one NIC, pushed onto `sockets`: the
+/// single owner of that rule, shared by the fixed-port and the ephemeral
+/// bind so the two cannot drift.
+///
+/// A UDP socket bound to a specific NIC unicast IP receives only unicasts to
+/// that IP on BSD-family hosts *and* Linux — packets sent to the subnet
+/// broadcast address are delivered ONLY to a socket bound to the broadcast
+/// address itself or to INADDR_ANY. Mirror EPICS-base rsrv
+/// (`caservertask.c:671-709`) and bind a second RX-only socket to each NIC's
+/// broadcast address so PVA/CA SEARCH bursts sent to e.g.
+/// `192.168.1.255:5076` reach the responder. pvxs does the same at the port
+/// the interface resolved, whether configured or ephemeral
+/// (`server.cpp:421-437`). Windows: Winsock delivers subnet broadcasts to the
+/// unicast-bound socket, so the extra bind is unnecessary and skipped.
+/// Loopback has no broadcast. A failure is logged at `debug`; the unicast
+/// socket is the load-bearing one.
+#[cfg_attr(target_os = "windows", allow(unused_variables))]
+fn push_bcast_rx(
+    sockets: &mut Vec<NicSocket>,
+    info: &IfaceInfo,
+    port: u16,
+    port_use: PortUse,
+    broadcast: bool,
+) {
+    #[cfg(not(target_os = "windows"))]
+    if let Some(bcast) = info.broadcast {
+        if !info.ip.is_loopback() && !bcast.is_unspecified() {
+            match bind_one_at(info, bcast, port, port_use, broadcast, true) {
+                Ok(nic) => sockets.push(nic),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "epics_base_rs::net",
+                        iface = %info.ip,
+                        bcast = %bcast,
+                        port,
+                        error = %e,
+                        "skipping NIC bcast bind"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Bind `port` on one NIC and refuse to share it. Used for the second and
 /// later NICs of an ephemeral same-port bundle, where the number is non-zero
 /// but the intent is still exclusive ownership.
@@ -1491,6 +1520,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A subnet-broadcast datagram reaches an ephemeral bundle as it reaches
+    /// a fixed-port one: pvxs registers a listener on each interface's
+    /// broadcast addresses at the port the interface resolved, `udp_port==0`
+    /// included (`server.cpp:421-437`). Linux delivers a subnet broadcast
+    /// only to a socket bound to the broadcast address or to the wildcard, so
+    /// a bundle of unicast-bound sockets alone never sees it.
+    #[tokio::test]
+    async fn an_ephemeral_bundle_receives_a_subnet_broadcast() {
+        let map = IfaceMap::new().expect("iface map");
+        let targets: Vec<_> = map
+            .all()
+            .into_iter()
+            .filter(|i| !i.ip.is_loopback() && i.broadcast.is_some_and(|b| !b.is_unspecified()))
+            .collect();
+        assert!(
+            !targets.is_empty(),
+            "this host enumerates no broadcast-capable interface; the run cannot be made here"
+        );
+        let bundle = AsyncUdpV4::bind_ephemeral_same_port(true).expect("ephemeral bundle");
+        let port = bundle.ifaces()[0].sock.local_addr().unwrap().port();
+        let sender = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("sender");
+        sender.set_broadcast(true).expect("SO_BROADCAST");
+        for info in targets {
+            let bcast = info.broadcast.unwrap();
+            sender
+                .send_to(b"bcast-search", (bcast, port))
+                .unwrap_or_else(|e| panic!("send to {bcast}:{port}: {e}"));
+            let mut buf = [0u8; 64];
+            let got = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                bundle.recv_from(&mut buf),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("a datagram to {bcast}:{port} never reached the bundle"))
+            .expect("recv");
+            assert_eq!(&buf[..got.0], b"bcast-search");
+        }
+    }
 
     #[tokio::test]
     async fn loopback_send_and_recv() {
@@ -1642,11 +1710,10 @@ mod tests {
         let map = IfaceMap::new().expect("iface map");
         let expected = select_ifaces(&map, None).len();
         let sock = AsyncUdpV4::bind_ephemeral_same_port(false).expect("bind same-port");
+        let covered = sock.ifaces().iter().filter(|n| !n.rx_only_bcast).count();
         assert_eq!(
-            sock.ifaces().len(),
-            expected,
-            "bundle covers {} of {expected} NICs",
-            sock.ifaces().len()
+            covered, expected,
+            "bundle covers {covered} of {expected} NICs"
         );
     }
 

@@ -68,9 +68,6 @@ async fn acquire_bo_returns_to_zero_after_single() {
 
     // Build the Acquire command bo wired to the driver's ACQUIRE param
     // via asyn:READBACK.
-    db.add_record("Acquire", Box::new(BoRecord::new(0)))
-        .await
-        .unwrap();
     let link = AsynLink {
         port_name: "RBK_TEST".into(),
         addr: 0,
@@ -80,11 +77,15 @@ async fn acquire_bo_returns_to_zero_after_single() {
     let mut ads = AsynDeviceSupport::from_handle(handle.clone(), link, "asynInt32");
     ads.set_record_info("Acquire", ScanType::Passive);
     ads.set_asyn_readback(true);
+    // Device init before the record joins the database: iocInit runs
+    // init_record with no dbScanLock, and this port is can-block.
+    let mut bo = BoRecord::new(0);
+    ads.init(&mut bo).unwrap();
+    db.add_record("Acquire", Box::new(bo)).await.unwrap();
     {
         let rec = db.get_record("Acquire").unwrap();
         let mut inst = rec.write();
         inst.common.dtyp = "asynInt32".into();
-        ads.init(&mut *inst.record).unwrap();
         inst.device = Some(Box::new(ads));
     }
 

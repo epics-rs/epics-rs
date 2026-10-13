@@ -136,7 +136,7 @@ impl InterruptFilter {
 ///   (asynOctetBase.c:202-210): deliver to every registered octet user whose
 ///   `addr` equals the read's. This is the rule for a device read.
 /// - [`EveryUser`](Self::EveryUser) — `drvAsynIPServerPort`'s listener thread
-///   (drvAsynIPServerPort.c:374-383 for a new connection, :312-320 for a UDP
+///   (drvAsynIPServerPort.c:388-398 for a new connection, :326-334 for a UDP
 ///   datagram): walk the interrupt list and call EVERY node, with no test at
 ///   all.
 ///
@@ -1065,7 +1065,7 @@ mod tests {
     /// The two octet fan-out rules, at their boundaries. C's octet interrupt
     /// list is keyed by `addr` alone (asynOctetBase.c:202-210) — `reason` is
     /// never consulted — and the IP-server listener applies no key at all
-    /// (drvAsynIPServerPort.c:374-383).
+    /// (drvAsynIPServerPort.c:388-398).
     ///
     /// Boundaries: reason-matches vs reason-differs (must not decide anything);
     /// addr-matches vs addr-differs under each rule; and a subscriber bound to a

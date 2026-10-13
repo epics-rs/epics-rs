@@ -32,7 +32,7 @@ use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorLink, ActorMessage};
 use crate::request::{CancelToken, DriverCall, PortCalls, RequestOp, RequestResult};
 use crate::trace::TraceManager;
-use crate::user::AsynUser;
+use crate::user::{AsynUser, QueueDeadline};
 
 /// Park the calling thread until `fut` resolves or `deadline` passes, from
 /// *any* context.
@@ -83,32 +83,27 @@ fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(feature = "epics", debug_assertions))]
 thread_local! {
-    static HOLD_PATH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static DRV_USER_ON_PUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Marks a body that runs under a record's hold. The actor answers a round
-/// trip only after the driver call it is in, so waiting on one there holds the
-/// record for that call — a read's whole timeout. [`block_on_reply`] asserts no
-/// mark is open.
-#[cfg(feature = "epics")]
-pub(crate) struct HoldPath(());
+/// [`PortHandle::drv_user_create_on_put`]'s scope.
+#[cfg(all(feature = "epics", debug_assertions))]
+struct DrvUserOnPut(());
 
-#[cfg(feature = "epics")]
-impl HoldPath {
-    pub(crate) fn enter() -> Self {
-        #[cfg(debug_assertions)]
-        HOLD_PATH.with(|d| d.set(d.get() + 1));
+#[cfg(all(feature = "epics", debug_assertions))]
+impl DrvUserOnPut {
+    fn enter() -> Self {
+        DRV_USER_ON_PUT.with(|f| f.set(true));
         Self(())
     }
 }
 
-#[cfg(feature = "epics")]
-impl Drop for HoldPath {
+#[cfg(all(feature = "epics", debug_assertions))]
+impl Drop for DrvUserOnPut {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        HOLD_PATH.with(|d| d.set(d.get() - 1));
+        DRV_USER_ON_PUT.with(|f| f.set(false));
     }
 }
 
@@ -120,12 +115,6 @@ impl Drop for HoldPath {
 /// that reasoning fails (the caller *is* the actor) is refused up front by
 /// [`guard_reentrant`], never reached here.
 fn block_on_reply<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
-    #[cfg(debug_assertions)]
-    assert_eq!(
-        HOLD_PATH.with(std::cell::Cell::get),
-        0,
-        "a port round trip under a record's hold"
-    );
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         // A multi-threaded worker: hand this worker's other tasks to a sibling
         // before we park it. Purely a scheduling courtesy — correctness does
@@ -205,8 +194,8 @@ impl AsyncCompletionHandle {
     ///
     /// `timeout` bounds the wait, not the request: a request the actor has
     /// already begun keeps running, exactly as C's `queueTimeoutCallback`
-    /// (`asynManager.c:647-701`) leaves a dequeued request alone — it returns
-    /// at once on `!puserPvt->isQueued` (`:655-661`). What expiry
+    /// (`asynManager.c:649-703`) leaves a dequeued request alone — it returns
+    /// at once on `!puserPvt->isQueued` (`:657-663`). What expiry
     /// buys the caller is the ability to report — `WriteCompletion::wait`
     /// (`epics-base-rs/src/server/device_support.rs`) turns the `asynTimeout`
     /// into the record's completion, where an unbounded park left the record
@@ -267,6 +256,9 @@ pub struct PortHandle {
     /// The port-level half of C `queueRequest`'s gate, over the actor's own
     /// cells — see [`Self::queue_gate`].
     gate: QueueGate,
+    /// The port's device list, which C's `connectDevice` reaches on the
+    /// binding thread — see [`Self::connect_device`].
+    devices: crate::port::DeviceTable,
     interrupts: Arc<InterruptManager>,
     can_block: bool,
     multi_device: bool,
@@ -275,7 +267,7 @@ pub struct PortHandle {
     /// [`crate::port::PortDriver::capabilities`] declaration, recorded when the
     /// port is registered. C's asynManager keeps the same thing as the list of
     /// `registerInterface` calls the driver made, and clients ask for it with
-    /// `findInterface` (asynManager.c:1468-1512); asynRecord uses it to fill
+    /// `findInterface` (asynManager.c:1470-1514); asynRecord uses it to fill
     /// OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV
     /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
     /// driver cannot gain or lose an interface after `registerInterface`.
@@ -316,6 +308,7 @@ impl PortHandle {
             actor: actor.id,
             cells: actor.cells,
             gate: actor.gate,
+            devices: actor.devices,
             interrupts,
             can_block: false,
             multi_device: false,
@@ -349,7 +342,7 @@ impl PortHandle {
     }
 
     /// Does the port implement this interface? The port's `findInterface`
-    /// (asynManager.c:1468-1512).
+    /// (asynManager.c:1470-1514).
     pub fn has_interface(&self, iface: InterfaceType) -> bool {
         self.interfaces
             .iter()
@@ -403,7 +396,7 @@ impl PortHandle {
     }
 
     /// C `queueRequest(pasynUser, priority, …)`'s refusals
-    /// (asynManager.c:1538-1552) for `user`, at the priority it carries,
+    /// (asynManager.c:1538-1554) for `user`, at the priority it carries,
     /// answered on the calling thread from the port's own state as C answers
     /// them under `asynManagerLock` before anything is queued. The refusal is
     /// an [`AsynError::QueueRefused`], as the actor's.
@@ -480,6 +473,18 @@ impl PortHandle {
     /// from a multi-threaded worker.
     fn blocking<T>(&self, what: &str, fut: impl Future<Output = AsynResult<T>>) -> AsynResult<T> {
         guard_reentrant(self.actor, &self.port_name, what)?;
+        // A blocking port's actor answers only after the driver call it is in,
+        // so waiting under a record's hold holds the record for that call — a
+        // read's whole timeout. C waits there only on a synchronous port's
+        // `synchronousLock` (asynManager.c:1555-1584).
+        #[cfg(all(feature = "epics", debug_assertions))]
+        assert!(
+            !(self.can_block
+                && epics_base_rs::server::database::scan_lock_held() == Some(true)
+                && !DRV_USER_ON_PUT.with(std::cell::Cell::get)),
+            "{what} on port {} under a record's hold",
+            self.port_name
+        );
         // `fut` is `submit_cancellable`, which already resolves at the
         // request's own `AsynUser::queue_timeout` — `await_reply` arms that
         // deadline on this thread like any other. That satisfies the
@@ -498,7 +503,7 @@ impl PortHandle {
     /// own port. The actor cannot service a request it is itself blocked on.
     ///
     /// The request goes through [`Self::submit_cancellable`], so an
-    /// [`AsynUser::queue_timeout`] deadline is enforced on every path: the
+    /// [`field@AsynUser::queue_timeout`] deadline is enforced on every path: the
     /// reply wait wakes at the deadline and takes a request still queued off
     /// the queue, replying [`AsynError::QueueTimeout`].
     pub fn submit_blocking(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
@@ -519,9 +524,9 @@ impl PortHandle {
     /// Submit a cancellable request and await completion, threading a
     /// caller-owned [`CancelToken`].
     ///
-    /// C parity: `asynManager::queueRequest` (`asynManager.c:1514`) enqueues
+    /// C parity: `asynManager::queueRequest` (`asynManager.c:1516`) enqueues
     /// the request on the port thread and the caller's callback runs later;
-    /// `asynManager::cancelRequest` (`asynManager.c:1630`) removes a request
+    /// `asynManager::cancelRequest` (`asynManager.c:1632`) removes a request
     /// that is still queued. A caller that may need to abort the request
     /// (asynRecord `AQR`, `asynRecord.c:393-408`) keeps the token and calls
     /// [`CancelToken::cancel`]; the actor drops a still-queued message at its
@@ -542,7 +547,7 @@ impl PortHandle {
     }
 
     /// Wait for the actor's reply, honouring the request's queue-wait deadline —
-    /// C's `epicsTimer` armed by `queueRequest` (asynManager.c:1617-1623).
+    /// C's `epicsTimer` armed by `queueRequest` (asynManager.c:1619-1625).
     ///
     /// The timer is the caller's, as it is in C: `queueTimeoutCallback` runs the
     /// *user's* `timeoutUser`, so the deadline is only worth waking for where the
@@ -561,7 +566,7 @@ impl PortHandle {
         &self,
         mut reply_rx: oneshot::Receiver<AsynResult<RequestResult>>,
         cancel: CancelToken,
-        queue_timeout: Option<Duration>,
+        queue_timeout: Option<QueueDeadline>,
     ) -> AsynResult<RequestResult> {
         let dropped = || AsynError::Status {
             status: AsynStatus::Error,
@@ -576,11 +581,11 @@ impl PortHandle {
         // `submit_blocking` on the hosted one. C arms the timer in
         // `queueRequest` regardless of what the caller is, and so does this.
         if let Some(limit) = queue_timeout {
-            match epics_libcom_rs::runtime::task::timeout(limit, &mut reply_rx).await {
+            match epics_libcom_rs::runtime::task::timeout(limit.get(), &mut reply_rx).await {
                 Ok(reply) => return reply.map_err(|_| dropped())?,
                 Err(_elapsed) => {
                     if cancel.time_out_if_queued() {
-                        // C's timer signals the port thread (asynManager.c:700)
+                        // C's timer signals the port thread (asynManager.c:702)
                         // so the request's entry leaves the queue now.
                         self.cells.poke();
                         return Err(AsynError::QueueTimeout {
@@ -684,7 +689,9 @@ impl PortHandle {
         data: &[u8],
         buf_size: usize,
     ) -> AsynResult<(Vec<u8>, crate::interpose::EomReason)> {
-        let user = AsynUser::new(reason).with_addr(addr);
+        let user = AsynUser::new(reason)
+            .with_addr(addr)
+            .locking_port(self.queue_lock_port_timeout());
         let result = self
             .submit_async(
                 RequestOp::OctetWriteRead {
@@ -874,6 +881,19 @@ impl PortHandle {
 
     // --- Sync convenience methods ---
 
+    /// The one round trip allowed under a record's hold, until the driver model
+    /// changes: asynRecord's DRVINFO resolution on a PORT/ADDR/DRVINFO put. C
+    /// calls `pasynDrvUser->create` directly under `dbScanLock`
+    /// (asynRecord.c:1249); here the driver lives on its actor, and a driver
+    /// may create the parameter in it, so there is no direct form.
+    /// The sole caller-side exemption, until the post-stage-3 driver-model item.
+    #[cfg(feature = "epics")]
+    pub(crate) fn drv_user_create_on_put(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        #[cfg(debug_assertions)]
+        let _exempt = DrvUserOnPut::enter();
+        self.drv_user_create_blocking(req)
+    }
+
     pub fn drv_user_create_blocking(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let user = AsynUser::default().with_addr(req.addr);
         let result = self.submit_blocking(RequestOp::DrvUserCreate(req.clone()), user)?;
@@ -993,8 +1013,8 @@ impl PortHandle {
         self.send(ActorMessage::new(op, user, CancelToken::new(), reply_tx))
     }
 
-    /// C `queueRequest`'s `ellAdd` + `epicsEventSignal` (asynManager.c:1613,
-    /// :1626): the queue has no capacity to refuse on, so only a gone actor does.
+    /// C `queueRequest`'s `ellAdd` + `epicsEventSignal` (asynManager.c:1615,
+    /// :1628): the queue has no capacity to refuse on, so only a gone actor does.
     fn send(&self, msg: ActorMessage) -> AsynResult<()> {
         self.tx.send(msg).map_err(|_| AsynError::Status {
             status: AsynStatus::Error,
@@ -1093,7 +1113,7 @@ impl PortHandle {
     /// C `asynOption::setOption` — the caller supplies the `AsynUser`, because in
     /// C the caller's `pasynUser` is what the option write runs under: its `addr`
     /// selects the device and its `timeout` bounds any wire traffic the write
-    /// causes (an RFC 2217 negotiation on a COM port, `asynInterposeCom.c:475`).
+    /// causes (an RFC 2217 negotiation on a COM port, `asynInterposeCom.c:488`).
     /// asynRecord passes the record's user (TMOT); iocsh `asynSetOption` passes
     /// its own, at 2 s (`asynShellCommands.c:119`). There is no default here to
     /// paper over the difference.
@@ -1192,13 +1212,18 @@ impl PortHandle {
     /// reported from the moment a user binds to it. Every user bind — a
     /// record's device support at init, `asynRecord`'s PORT/ADDR connect —
     /// goes through here; it is not the transport `connect` of
-    /// [`Self::connect_addr_blocking`].
-    /// C `connectDevice`'s `locateDevice` on the actor, answering the cells of
-    /// the `dpCommon` the user is bound to (see [`crate::port::DpCells`]).
-    pub fn connect_device_blocking(&self, addr: i32) -> AsynResult<crate::port::DpCells> {
-        let user = AsynUser::new(0).with_addr(addr);
-        let result = self.submit_blocking(RequestOp::ConnectUser, user)?;
-        Ok(result.dp.expect("ConnectUser answers its dpCommon"))
+    /// [`Self::connect_addr_blocking`]. C does it on the caller's thread under
+    /// `asynManagerLock`, so this takes the port's device-list lock and asks
+    /// nothing of the actor: `asynRecord` binds under the record's lock.
+    /// Answers the cells of the `dpCommon` the user is bound to (see
+    /// [`crate::port::DpCells`]).
+    pub fn connect_device(&self, addr: i32) -> crate::port::DpCells {
+        self.devices.connect_user(addr)
+    }
+
+    /// Was the port shut down? See [`crate::port::DeviceTable::is_defunct`].
+    pub(crate) fn is_defunct(&self) -> bool {
+        self.devices.is_defunct()
     }
 
     pub fn connect_addr_blocking(&self, addr: i32) -> AsynResult<()> {
@@ -1213,6 +1238,18 @@ impl PortHandle {
         Ok(())
     }
 
+    /// The port's C `queueLockPortTimeout`: every SyncIO call queues with at
+    /// least this deadline — see [`AsynUser::locking_port`].
+    pub fn queue_lock_port_timeout(&self) -> Duration {
+        self.devices.queue_lock_port_timeout()
+    }
+
+    /// C `pasynManager->setQueueLockPortTimeout` (asynManager.c:2393-2406),
+    /// behind the iocsh `asynSetQueueLockPortTimeout`.
+    pub fn set_queue_lock_port_timeout(&self, timeout: Duration) {
+        self.devices.set_queue_lock_port_timeout(timeout);
+    }
+
     /// C `pasynManager->enable(pasynUser, enable)` (asynManager.c:2224-2251),
     /// fired by `asynRecord` `ENBL` field writes (`asynRecord.c:484-486`).
     ///
@@ -1220,19 +1257,25 @@ impl PortHandle {
     /// one `enable`, and `findDpCommon` (:538-545) makes it land on the DEVICE's
     /// `dpCommon` for a multi-device port the caller addressed, on the port's
     /// own otherwise. `-1` names the port explicitly.
-    pub fn set_enable_blocking(&self, addr: i32, enable: bool) -> AsynResult<()> {
-        let user = AsynUser::new(0).with_addr(addr);
-        self.submit_blocking(RequestOp::SetEnable { yes: enable }, user)?;
+    ///
+    /// C stores under `asynManagerLock` on the caller's thread and then raises
+    /// the exception; asynRecord calls it under the record's lock, so the store
+    /// is made here, the exception is owed in place on the dpCommon it was
+    /// made on, and the actor is woken to raise it: no message, no allocation.
+    pub fn set_enable(&self, addr: i32, enable: bool) -> AsynResult<()> {
+        self.devices.enable(addr, enable)?;
+        self.cells.nudge();
         Ok(())
     }
 
     /// C `pasynManager->autoConnect(pasynUser, autoConnect)`
     /// (asynManager.c:2312-2329), fired by `asynRecord` `AUCT` field writes
     /// (`asynRecord.c:481-482`). Emits `asynExceptionAutoConnect`
-    /// unconditionally; `addr` resolves as in [`Self::set_enable_blocking`].
-    pub fn set_auto_connect_blocking(&self, addr: i32, yes: bool) -> AsynResult<()> {
-        let user = AsynUser::new(0).with_addr(addr);
-        self.submit_blocking(RequestOp::SetAutoConnect { yes }, user)?;
+    /// unconditionally; `addr` resolves as in [`Self::set_enable`].
+    /// Stored here and announced by the actor, as [`Self::set_enable`].
+    pub fn set_auto_connect(&self, addr: i32, yes: bool) -> AsynResult<()> {
+        self.devices.auto_connect(addr, yes);
+        self.cells.nudge();
         Ok(())
     }
 
@@ -1496,6 +1539,106 @@ mod tests {
         )
     }
 
+    /// C `connectDevice` runs on the caller's thread under `asynManagerLock`
+    /// (asynManager.c:1324-1356): it binds on a port whose actor is not running,
+    /// and the device it created is the one the actor reports.
+    #[test]
+    fn connect_device_binds_without_the_actor() {
+        use std::sync::mpsc as std_mpsc;
+
+        let mut driver = TestDriver::new();
+        driver.base.flags.multi_device = true;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(driver), rx);
+        let handle = PortHandle::new(
+            tx,
+            "cd_noactor".into(),
+            Arc::new(InterruptManager::new(256)),
+            actor.link(),
+            Arc::new(TraceManager::new()),
+        );
+        let (done_tx, done) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            let dp = handle.connect_device(3);
+            done_tx.send((handle, dp.enabled())).unwrap();
+        });
+        let (handle, enabled) = done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connectDevice waited on the actor");
+        assert!(enabled, "a new device is seeded from the port's dpCommon");
+
+        std::thread::spawn(move || actor.run());
+        let devices = handle
+            .with_driver_blocking(|d: &mut TestDriver| {
+                d.base
+                    .devices()
+                    .into_iter()
+                    .map(|(addr, _)| addr)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(devices, vec![3]);
+    }
+
+    /// C `enable` and `autoConnectAsyn` store on the caller's thread
+    /// (asynManager.c:2224-2250, :2312-2329) and asynRecord calls them under the
+    /// record's lock: both land on a port whose actor is not running, on the
+    /// device's dpCommon, and the actor announces each once it runs.
+    #[test]
+    fn enable_and_auto_connect_store_without_the_actor() {
+        use crate::exception::{AsynException, ExceptionManager};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc as std_mpsc;
+
+        let mut driver = TestDriver::new();
+        driver.base.flags.multi_device = true;
+        let exc_mgr = Arc::new(ExceptionManager::new());
+        driver.base.bind_exception_sink(exc_mgr.clone());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.addr == 2
+                && matches!(
+                    event.exception,
+                    AsynException::Enable | AsynException::AutoConnect
+                )
+            {
+                hits2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(driver), rx);
+        let handle = PortHandle::new(
+            tx,
+            "enbl_noactor".into(),
+            Arc::new(InterruptManager::new(256)),
+            actor.link(),
+            Arc::new(TraceManager::new()),
+        );
+        let (done_tx, done) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            handle.set_enable(2, false).unwrap();
+            handle.set_auto_connect(2, false).unwrap();
+            done_tx.send(handle).unwrap();
+        });
+        let handle = done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("enable/autoConnect waited on the actor");
+        let dp = handle.connect_device(2);
+        assert!(!dp.enabled() && !dp.auto_connect());
+        assert!(
+            handle.connect_device(-1).enabled(),
+            "the port's own is untouched"
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "announced by the actor");
+
+        std::thread::spawn(move || actor.run());
+        handle
+            .with_driver_blocking(|_: &mut TestDriver| ())
+            .unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+    }
+
     /// C `queueRequest` appends to an unbounded list (asynManager.c:1610-1617):
     /// however many requests arrive while the port thread is inside the driver,
     /// none is refused, and each runs once it comes out.
@@ -1565,7 +1708,7 @@ mod tests {
     }
 
     /// A waiter's request queued just before its port went down stays queued,
-    /// as C `portThread` leaves it (asynManager.c:808-810, :856-861): it times
+    /// as C `portThread` leaves it (asynManager.c:808-810, :858-863): it times
     /// out on its own queue timer, or runs once the port is back. Only one
     /// submitted while the port is down is refused, by `queueRequest`
     /// (:1549-1552).
@@ -1612,7 +1755,7 @@ mod tests {
         let (release, release_rx) = std_mpsc::channel();
         let line_up = Arc::new(AtomicBool::new(false));
         let mut base = PortDriverBase::new("park_waiter", 1, PortFlags::default());
-        // The port comes back on its own retry timer (asynManager.c:3252-3283).
+        // The port comes back on its own retry timer (asynManager.c:3283-3314).
         base.seconds_between_port_connect = Duration::from_millis(20);
         // The handle queues into `queued`; the test hands each request on to
         // the actor, so it knows when one is queued.
@@ -1687,7 +1830,7 @@ mod tests {
                 d.base.port_name.clone()
             })
             .unwrap();
-        assert_eq!(name, "handle_test");
+        assert_eq!(&*name, "handle_test");
         assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 41);
     }
 
@@ -1864,11 +2007,56 @@ mod tests {
 
     /// C parity: `asynRecord` ENBL field writes call
     /// `pasynManager->enable(...)`, which in turn flips the
-    /// per-port `enabled` flag and emits `asynExceptionEnable`. The
-    /// Rust analogue routes through `RequestOp::SetEnable` →
-    /// `PortDriver::enable/disable` → `PortDriverBase::set_enabled`.
+    /// per-port `enabled` flag and emits `asynExceptionEnable`. The handle
+    /// stores and the actor announces (`PortDriverBase::drain_announces`).
+    /// C `enable` and `autoConnectAsyn` raise their exception inline, one
+    /// call at a time (asynManager.c:2224-2250, :2312-2329), so the callbacks
+    /// see the calls' order, whatever dpCommon each was made on.
     #[test]
-    fn handle_set_enable_blocking_propagates_to_driver() {
+    fn enable_and_auto_connect_announce_in_call_order() {
+        use crate::exception::{AsynException, ExceptionManager};
+        let mut driver = TestDriver::new();
+        driver.base.flags.multi_device = true;
+        let exc_mgr = Arc::new(ExceptionManager::new());
+        driver.base.bind_exception_sink(exc_mgr.clone());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        exc_mgr.add_callback(move |event| {
+            if matches!(
+                event.exception,
+                AsynException::Enable | AsynException::AutoConnect
+            ) {
+                seen2.lock().unwrap().push((event.addr, event.exception));
+            }
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(driver), rx);
+        let handle = PortHandle::new(
+            tx,
+            "announce_order".into(),
+            Arc::new(InterruptManager::new(256)),
+            actor.link(),
+            Arc::new(TraceManager::new()),
+        );
+        handle.set_auto_connect(2, false).unwrap();
+        handle.set_enable(2, false).unwrap();
+        handle.set_enable(-1, true).unwrap();
+        std::thread::spawn(move || actor.run());
+        handle
+            .with_driver_blocking(|_: &mut TestDriver| ())
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (2, AsynException::AutoConnect),
+                (2, AsynException::Enable),
+                (-1, AsynException::Enable)
+            ]
+        );
+    }
+
+    #[test]
+    fn handle_set_enable_propagates_to_driver() {
         use crate::exception::{AsynException, ExceptionManager};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1898,9 +2086,12 @@ mod tests {
         }
 
         let handle = make_handle(Drv { base });
-        handle.set_enable_blocking(-1, false).unwrap();
-        handle.set_enable_blocking(-1, true).unwrap();
-        // C `enable` fires on every transition; both calls land.
+        // C `enable` fires on every call. Calls the actor has not drained
+        // between coalesce (`OwedAnnounces`), so each is drained here.
+        for yes in [false, true] {
+            handle.set_enable(-1, yes).unwrap();
+            handle.with_driver_blocking(|_: &mut Drv| ()).unwrap();
+        }
         assert_eq!(hits.load(Ordering::Relaxed), 2);
     }
 
@@ -1997,10 +2188,10 @@ mod tests {
     /// C parity: `asynRecord` AUCT writes call
     /// `pasynManager->autoConnect(...)`, which always emits
     /// `asynExceptionAutoConnect` — even on no-op (same-value)
-    /// writes. The Rust analogue routes through
-    /// `RequestOp::SetAutoConnect` → `set_auto_connect`.
+    /// writes. The handle stores and the actor announces
+    /// (`PortDriverBase::drain_announces`).
     #[test]
-    fn handle_set_auto_connect_blocking_propagates_to_driver() {
+    fn handle_set_auto_connect_propagates_to_driver() {
         use crate::exception::{AsynException, ExceptionManager};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2030,10 +2221,12 @@ mod tests {
         }
 
         let handle = make_handle(Drv { base });
-        // Both true→true and true→false fire (C unconditional).
-        handle.set_auto_connect_blocking(-1, true).unwrap();
-        handle.set_auto_connect_blocking(-1, false).unwrap();
-        handle.set_auto_connect_blocking(-1, false).unwrap();
+        // Both true→true and true→false fire (C unconditional); each call is
+        // drained before the next, as in the enable test.
+        for yes in [true, false, false] {
+            handle.set_auto_connect(-1, yes).unwrap();
+            handle.with_driver_blocking(|_: &mut Drv| ()).unwrap();
+        }
         assert_eq!(hits.load(Ordering::Relaxed), 3);
     }
 
@@ -2073,7 +2266,7 @@ mod tests {
 
     /// R10-49. C `queueRequest(pasynUser, priority, timeout)` arms a timer
     /// (asynManager.c:1617-1623) whose callback unlinks a still-queued request
-    /// (:647-700) and runs the caller's `timeoutUser` **instead of** its
+    /// (:649-703) and runs the caller's `timeoutUser` **instead of** its
     /// `processUser`. The port had no queue-wait deadline at all: a request
     /// behind a slow one waited as long as it took, whatever `queueRequest` was
     /// given.
@@ -2146,8 +2339,8 @@ mod tests {
 
     /// R10-49. The deadline bounds the *queue wait*, never the transfer: C's
     /// timer callback returns immediately when `!puserPvt->isQueued`
-    /// (asynManager.c:655-661), and the port thread cancels the timer as it
-    /// dequeues (:906). A request whose driver call outlives the deadline
+    /// (asynManager.c:657-663), and the port thread cancels the timer as it
+    /// dequeues (:908). A request whose driver call outlives the deadline
     /// therefore completes normally — the previous behaviour this guards against
     /// is an I/O timeout masquerading as a queue timeout.
     #[test]
@@ -2162,6 +2355,82 @@ mod tests {
             .expect("dequeued at once: the deadline never applies");
         assert_eq!(res.int_val, Some(7));
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A SyncIO read queued behind a `jam`-long read on a port whose SyncIO
+    /// floor is `port_floor`: its result and how long it waited.
+    fn syncio_behind_a_jam(
+        port_floor: Duration,
+        user_timeout: Duration,
+        jam: Duration,
+    ) -> (AsynResult<i32>, Duration) {
+        let (handle, _reads) = slow_port(jam);
+        handle.set_queue_lock_port_timeout(port_floor);
+        let jammer = handle.clone();
+        let jam = std::thread::spawn(move || {
+            jammer
+                .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+                .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let read = crate::sync_io::SyncIOHandle::from_handle(handle, 0, user_timeout).read_int32(0);
+        let waited = started.elapsed();
+        jam.join().unwrap();
+        (read, waited)
+    }
+
+    fn assert_queue_timeout_at(read: AsynResult<i32>, waited: Duration, at: Duration) {
+        assert!(
+            read.as_ref().is_err_and(|e| e.is_queue_timeout()),
+            "got {read:?}"
+        );
+        assert!(
+            waited >= at && waited < at + Duration::from_millis(400),
+            "timed out after {waited:?}, deadline {at:?}"
+        );
+    }
+
+    /// C `queueLockPort` queues with `max(queueLockPortTimeout, timeout)`
+    /// (asynManager.c:1894-1896) and `queueRequest` arms a timer only for a
+    /// positive one (:1619-1626). With both at zero there is no deadline: the
+    /// call waits its turn instead of failing the moment it queues.
+    #[test]
+    fn a_zero_floor_and_zero_timeout_syncio_call_waits_without_a_deadline() {
+        let (read, waited) =
+            syncio_behind_a_jam(Duration::ZERO, Duration::ZERO, Duration::from_millis(400));
+        assert_eq!(read.unwrap(), 7);
+        assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+    }
+
+    #[test]
+    fn a_zero_floor_syncio_call_times_out_at_its_own_timeout() {
+        let (read, waited) = syncio_behind_a_jam(
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_millis(1600),
+        );
+        assert_queue_timeout_at(read, waited, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_zero_timeout_syncio_call_times_out_at_the_port_floor() {
+        let (read, waited) = syncio_behind_a_jam(
+            Duration::from_secs(2),
+            Duration::ZERO,
+            Duration::from_millis(2600),
+        );
+        assert_queue_timeout_at(read, waited, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_syncio_timeout_above_the_port_floor_sets_the_deadline() {
+        let (read, waited) = syncio_behind_a_jam(
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_millis(5600),
+        );
+        assert_queue_timeout_at(read, waited, Duration::from_secs(5));
     }
 
     /// R10-49, the async waiter. C's `queueTimeoutCallback` fires on its own

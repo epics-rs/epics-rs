@@ -6014,6 +6014,7 @@ impl RecordInstance {
     /// whether the record's `init_record` gets past its dset test, i.e.
     /// whether the two later walks have anything to do for it.
     pub(crate) fn run_init_pass0(&mut self, name: &str) -> bool {
+        let _init = crate::server::database::InitPass::enter();
         // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
         // so this release provably frees nothing: no client put has run, so the
         // restart list is empty.
@@ -6058,6 +6059,7 @@ impl RecordInstance {
         name: &str,
         add_record_input: Option<crate::server::builtin_devices::soft_callback::AddRecordInput>,
     ) {
+        let _init = crate::server::database::InitPass::enter();
         // C `iocInit.c::doResolveLinks` (`:545-570`), the pass BETWEEN the two
         // `init_record` calls: for each device link the record type declares,
         // `pdsxt->add_record(precord)` and then `dbInitLink` for that same
@@ -6073,6 +6075,7 @@ impl RecordInstance {
     /// C `doInitRecord1`: `init_record(prec, 1)` and the init tail, for a
     /// record pass 0 reached.
     pub(crate) fn run_init_pass1(&mut self, name: &str) {
+        let _init = crate::server::database::InitPass::enter();
         if let Err(e) = self.record.init_record(1) {
             eprintln!("init_record(1) failed for {name}: {e}");
         }

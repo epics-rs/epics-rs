@@ -20,7 +20,7 @@ use epics_base_rs::types::EpicsValue;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{InterruptFilter, InterruptSubscription};
-use crate::port::DrvUserRequest;
+use crate::port::{DrvUserRequest, QueuePriority};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
 use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
 use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
@@ -728,6 +728,32 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// The record's request at process time, queued at C devAsyn's priority
+    /// for its interface: devAsynOctet.c:764 queues at Medium; devAsynInt32
+    /// (:838), devAsynInt64 (:657), devAsynFloat64 (:583), devAsynUInt32Digital
+    /// (:678) and devAsynXXXArray.cpp:295 at Low.
+    fn process_user(&self) -> AsynUser {
+        let priority = match self.iface {
+            Some(InterfaceType::Octet) => QueuePriority::Medium,
+            _ => QueuePriority::Low,
+        };
+        self.request_user(priority)
+    }
+
+    /// The record's request at `init`: C device support reads there through
+    /// SyncIO, whose `queueLockPort` queues at Low (asynManager.c:1896).
+    fn init_user(&self) -> AsynUser {
+        self.request_user(QueuePriority::Low)
+            .locking_port(self.handle.queue_lock_port_timeout())
+    }
+
+    fn request_user(&self, priority: QueuePriority) -> AsynUser {
+        AsynUser::new(self.reason)
+            .with_addr(self.addr)
+            .with_timeout_opt(self.timeout)
+            .with_priority(priority)
+    }
+
     /// Create with a typed interface from a [`PortHandle`].
     pub fn with_interface_handle(handle: PortHandle, link: AsynLink, iface: InterfaceType) -> Self {
         Self::from_handle(handle, link, iface.asyn_name())
@@ -1106,7 +1132,7 @@ impl CellBody for WriteJob {
         self.ran(Err(match why {
             Unrun::Refused(e) => e,
             // Nothing cancels the write, and its user arms no queue timer:
-            // this is the device-not-connected exit (asynManager.c:877-886).
+            // this is the device-not-connected exit (asynManager.c:878-888).
             Unrun::TimedOut | Unrun::Canceled => AsynError::QueueTimeout {
                 port: String::new(),
             },
@@ -1270,9 +1296,7 @@ impl AsynDeviceSupport {
             } else {
                 RequestOp::GetBoundsInt32
             };
-            let user = AsynUser::new(self.reason)
-                .with_addr(self.addr)
-                .with_timeout_opt(self.timeout);
+            let user = self.init_user();
             let result = match self.handle.submit_blocking(op, user) {
                 Ok(r) => r,
                 Err(_) => return,
@@ -1597,7 +1621,7 @@ impl AsynDeviceSupport {
 
     /// C `asynPrint(pPvt->pasynUser, …)` from device support: the record's
     /// user is connected to this port and address, so the print resolves the
-    /// device's trace config (`findTracePvt`, asynManager.c:546-551).
+    /// device's trace config (`findTracePvt`, asynManager.c:548-553).
     fn dev_print(
         &self,
         mask: crate::trace::TraceMask,
@@ -1666,9 +1690,7 @@ impl AsynDeviceSupport {
     /// non-blocking branch of `write_begin` end here, so the trace line and
     /// the alarm mapping cannot differ between them.
     fn write_now(&mut self, op: RequestOp, val: &EpicsValue) -> CaResult<()> {
-        let user = AsynUser::new(self.reason)
-            .with_addr(self.addr)
-            .with_timeout_opt(self.timeout);
+        let user = self.process_user();
         match self.handle.submit_blocking(op, user) {
             Ok(_) => {
                 self.trace_process(
@@ -1937,20 +1959,9 @@ impl DeviceSupport for AsynDeviceSupport {
         // before `findInterface`/`drvUser->create`, and it is that call which
         // creates the device on a multi-device port (`locateDevice(..., TRUE)`,
         // asynManager.c:1349-1352) - so `asynReport` counts an address the
-        // moment a record binds to it. C fails the record when the connect
-        // fails (:255-259, `goto bad`); here the connect fails only when the
-        // port's actor is gone.
-        if let Err(e) = self.handle.connect_device_blocking(self.addr) {
-            eprintln!(
-                "[asyn] init FAILED: port='{}' addr={} connectDevice failed, {e}",
-                self.handle.port_name(),
-                self.addr
-            );
-            return Ok(DeviceInitOutcome::dead_with_alarm(
-                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                epics_base_rs::server::record::AlarmSeverity::Invalid,
-            ));
-        }
+        // moment a record binds to it. C's failures (:255-259) are a port it
+        // cannot find, and this handle is that port.
+        self.handle.connect_device(self.addr);
         if self.handle.can_block() {
             self.write_cell();
         }
@@ -2201,9 +2212,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // an enum table makes EnumRead fail and the record keeps its .db
         // strings.
         if let Some(shape) = EnumRecordShape::of_record(record) {
-            let user = AsynUser::new(self.reason)
-                .with_addr(self.addr)
-                .with_timeout_opt(self.timeout);
+            let user = self.init_user();
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
                     self.apply_enum_table(record, &entries);
@@ -2220,9 +2229,7 @@ impl DeviceSupport for AsynDeviceSupport {
 
         if self.initial_readback {
             if let Some(op) = self.read_op() {
-                let user = AsynUser::new(self.reason)
-                    .with_addr(self.addr)
-                    .with_timeout_opt(self.timeout);
+                let user = self.init_user();
                 if let Ok(result) = self.handle.submit_blocking(op, user) {
                     // Seed the output record's value only on a successful read,
                     // mirroring C initAo/initLongout/initMbbo: `if (status ==
@@ -2368,9 +2375,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     self.write_op(&val)
                 };
                 if let Some(op) = op {
-                    let user = AsynUser::new(self.reason)
-                        .with_addr(self.addr)
-                        .with_timeout_opt(self.timeout);
+                    let user = self.process_user();
                     // Apply the write result's alarm, mirroring the read path
                     // (and C callbackWfWrite/WriteBinary: writeIt -> result.status
                     // -> finish recGblSetSevr, devAsynOctet.c:1071-1076,1086-1091).
@@ -2554,8 +2559,8 @@ impl DeviceSupport for AsynDeviceSupport {
                 // (C devAsynInt32.c:844-847; sample EPICS alarm wins, transport
                 // status fills only NO_ALARM fields). Unconditional, like the
                 // pop/overflow/output_callback_pending/timestamp above and here
-                // — C sets `time` even on a transport error (devAsynXXXArray.c:
-                // 327) and always recGblSetSevr's the mapped alarm.
+                // — C sets `time` even on a transport error
+                // (devAsynXXXArray.cpp:327) and always recGblSetSevr's the mapped alarm.
                 let (status, severity) = resolve_intr_alarm(
                     (ci.alarm_status, ci.alarm_severity),
                     ci.aux_status,
@@ -2615,9 +2620,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // re-derives UDF.
         let mut read_outcome = DeviceReadOutcome::failed();
         if let Some(op) = self.read_op() {
-            let user = AsynUser::new(self.reason)
-                .with_addr(self.addr)
-                .with_timeout_opt(self.timeout);
+            let user = self.process_user();
             match self.handle.submit_blocking(op, user) {
                 Ok(result) => {
                     // Gate the value store on the device read status, mirroring
@@ -2786,9 +2789,7 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(WriteStart::Completed);
         }
 
-        let user = AsynUser::new(self.reason)
-            .with_addr(self.addr)
-            .with_timeout_opt(self.timeout);
+        let user = self.process_user();
         self.queue_write(op, user).map_err(asyn_to_ca_error)?;
         Ok(WriteStart::Pending(Box::new(AsynAsyncWriteCompletion(
             Arc::clone(&self.write_job),
@@ -4327,6 +4328,30 @@ mod tests {
         let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
         ads.set_record_info("TEST:AI", ScanType::Passive);
         ads
+    }
+
+    /// C devAsyn queues a record's process-time request at Low for every
+    /// interface but asynOctet (devAsynOctet.c:764, Medium), and reads at init
+    /// through `queueLockPort` at Low (asynManager.c:1896).
+    #[test]
+    fn device_support_queues_at_the_c_dsets_priority() {
+        for (iface, process) in [
+            ("asynInt32", QueuePriority::Low),
+            ("asynInt64", QueuePriority::Low),
+            ("asynFloat64", QueuePriority::Low),
+            ("asynUInt32Digital", QueuePriority::Low),
+            ("asynInt32Array", QueuePriority::Low),
+            ("asynFloat64Array", QueuePriority::Low),
+            ("asynOctet", QueuePriority::Medium),
+        ] {
+            let ads = make_bounded_adapter(0, 0, iface);
+            assert_eq!(ads.process_user().priority, process, "{iface} at process");
+            assert_eq!(
+                ads.init_user().priority,
+                QueuePriority::Low,
+                "{iface} at init"
+            );
+        }
     }
 
     fn make_adapter(scan: ScanType) -> AsynDeviceSupport {
@@ -6543,54 +6568,57 @@ mod tests {
     /// the one allocation left is the `Box` that `WriteStart::Pending` carries.
     #[test]
     fn a_put_on_a_blocking_port_queues_its_write_without_allocating() {
-        use crate::asyn_record::errs_alloc_tests::thread_allocs;
-        use crate::param::ParamType;
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
-        use epics_base_rs::server::records::ao::AoRecord;
+        crate::asyn_record::errs_alloc_tests::on_record_thread(|| {
+            use crate::asyn_record::errs_alloc_tests::thread_allocs;
+            use crate::param::ParamType;
+            use crate::runtime::{RuntimeConfig, create_port_runtime};
+            use epics_base_rs::server::records::ao::AoRecord;
 
-        struct Port(PortDriverBase);
-        impl PortDriver for Port {
-            fn base(&self) -> &PortDriverBase {
-                &self.0
+            struct Port(PortDriverBase);
+            impl PortDriver for Port {
+                fn base(&self) -> &PortDriverBase {
+                    &self.0
+                }
+                fn base_mut(&mut self) -> &mut PortDriverBase {
+                    &mut self.0
+                }
             }
-            fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.0
-            }
-        }
 
-        let mut base = PortDriverBase::new(
-            "WRITEALLOC",
-            1,
-            PortFlags {
-                can_block: true,
-                ..PortFlags::default()
-            },
-        );
-        base.create_param("VAL", ParamType::Float64).unwrap();
-        let (rt, _jh) = create_port_runtime(Port(base), RuntimeConfig::default()).unwrap();
-        let link = AsynLink {
-            port_name: "WRITEALLOC".into(),
-            addr: 0,
-            timeout: Some(Duration::from_secs(1)),
-            drv_info: "VAL".into(),
-        };
-        let mut ads = AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynFloat64");
-        ads.set_record_info("TEST:WRITEALLOC", ScanType::Passive);
-        let mut rec = AoRecord::new(1.5);
-        ads.init(&mut rec).unwrap();
-
-        let mut put = || {
-            let before = thread_allocs();
-            let start = ads.write_begin(&mut rec).unwrap();
-            let allocs = thread_allocs() - before;
-            let WriteStart::Pending(done) = start else {
-                panic!("a blocking port queues the write");
+            let mut base = PortDriverBase::new(
+                "WRITEALLOC",
+                1,
+                PortFlags {
+                    can_block: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.create_param("VAL", ParamType::Float64).unwrap();
+            let (rt, _jh) = create_port_runtime(Port(base), RuntimeConfig::default()).unwrap();
+            let link = AsynLink {
+                port_name: "WRITEALLOC".into(),
+                addr: 0,
+                timeout: Some(Duration::from_secs(1)),
+                drv_info: "VAL".into(),
             };
-            done.wait(Duration::from_secs(5)).unwrap();
-            allocs
-        };
-        put();
-        assert_eq!(put(), 1, "WriteStart::Pending's Box and nothing else");
+            let mut ads =
+                AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynFloat64");
+            ads.set_record_info("TEST:WRITEALLOC", ScanType::Passive);
+            let mut rec = AoRecord::new(1.5);
+            ads.init(&mut rec).unwrap();
+
+            let mut put = || {
+                let before = thread_allocs();
+                let start = ads.write_begin(&mut rec).unwrap();
+                let allocs = thread_allocs() - before;
+                let WriteStart::Pending(done) = start else {
+                    panic!("a blocking port queues the write");
+                };
+                done.wait(Duration::from_secs(5)).unwrap();
+                allocs
+            };
+            put();
+            assert_eq!(put(), 1, "WriteStart::Pending's Box and nothing else");
+        });
     }
 
     /// R11-48 negative control: on a port that DOES register asynDrvUser, an

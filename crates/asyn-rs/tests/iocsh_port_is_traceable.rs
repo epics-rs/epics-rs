@@ -2,10 +2,10 @@
 //! — must come up with a trace configuration and an exception list.
 //!
 //! In C those are properties of the port itself: `registerPort` calls
-//! `dpCommonInit` (asynManager.c:2066), which runs
-//! `tracePvtInit(&pdpCommon->trace)` (:528) and initialises
+//! `dpCommonInit` (asynManager.c:2068), which runs
+//! `tracePvtInit(&pdpCommon->trace)` (:530) and initialises
 //! `dpc.exceptionUserList`, which `announceExceptionOccurred` walks
-//! (asynManager.c:611-637). There is no way to register a port without them.
+//! (asynManager.c:613-639). There is no way to register a port without them.
 //!
 //! Before the fix, injection lived only in `PortManager::register_port`, which
 //! the `drvAsyn*PortConfigure` iocsh commands bypass: on a port an st.cmd
@@ -137,13 +137,13 @@ fn iocsh_created_port_traces_and_announces_exceptions() {
     assert!(
         log.contains("connected to"),
         "an iocsh-created port must honour asynSetTraceMask — C traces the \
-         connect at ASYN_TRACE_FLOW (drvAsynIPPort.c:545-546); trace file held: {log:?}"
+         connect at ASYN_TRACE_FLOW (drvAsynIPPort.c:591-592); trace file held: {log:?}"
     );
 
     let evs = events.lock().unwrap();
     assert!(
         evs.iter().any(|e| matches!(e, AsynException::Connect)),
         "an iocsh-created port must announce asynExceptionConnect on the IOC's \
-         exception list (asynManager.c:611-637); observed: {evs:?}"
+         exception list (asynManager.c:613-639); observed: {evs:?}"
     );
 }

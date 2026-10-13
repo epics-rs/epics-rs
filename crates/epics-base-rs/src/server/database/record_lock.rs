@@ -599,6 +599,49 @@ fn thread_key() -> u64 {
     })
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    /// How many lock sets this thread holds — counted where the mutex is
+    /// taken and released, so no body run under a set can miss it.
+    static SETS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many [`InitPass`] scopes this thread is inside.
+    static INIT_PASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread is under a record's hold as C `dbScanLock` holds it, in
+/// a debug build; `None` in a release build, which does not count. For a
+/// caller that must never wait on another thread under the hold. An
+/// `InitPass` is not such a hold: the set it takes only guards the data.
+#[inline]
+pub fn scan_lock_held() -> Option<bool> {
+    #[cfg(debug_assertions)]
+    return Some(
+        SETS_HELD.with(std::cell::Cell::get) > 0 && INIT_PASS.with(std::cell::Cell::get) == 0,
+    );
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+/// `iocInit`'s `init_record` walks, which C runs with no `dbScanLock`
+/// (`iocInit.c:508-527`, `:545-570`): device support may wait on its port
+/// there (devAsyn's SyncIO readback).
+pub(crate) struct InitPass(());
+
+impl InitPass {
+    pub(crate) fn enter() -> Self {
+        #[cfg(debug_assertions)]
+        INIT_PASS.with(|n| n.set(n.get() + 1));
+        Self(())
+    }
+}
+
+impl Drop for InitPass {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        INIT_PASS.with(|n| n.set(n.get() - 1));
+    }
+}
+
 impl LockSet {
     /// C `dbScanLock` (`dbLock.c:180-234`) minus the reference dance: take the
     /// set's mutex, or count one more level if this thread is already inside
@@ -645,6 +688,8 @@ impl LockSet {
         unsafe { self.held.get().write(Some(guard)) };
         self.owner.store(me, Ordering::Release);
         self.depth.store(1, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        SETS_HELD.with(|n| n.set(n.get() + 1));
         Some(SetGuard::of(self))
     }
 
@@ -687,6 +732,8 @@ impl LockSet {
         unsafe { self.held.get().write(Some(guard)) };
         self.owner.store(me, Ordering::Release);
         self.depth.store(1, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        SETS_HELD.with(|n| n.set(n.get() + 1));
     }
 
     /// Release the mutex this thread holds and clear the hold. Only the
@@ -696,6 +743,8 @@ impl LockSet {
         // could publish itself and be overwritten by this store.
         self.depth.store(0, Ordering::Relaxed);
         self.owner.store(0, Ordering::Release);
+        #[cfg(debug_assertions)]
+        SETS_HELD.with(|n| n.set(n.get() - 1));
         // SAFETY: as in `lock_fresh` — the mutex is still held here.
         let guard = unsafe { (*self.held.get()).take() };
         drop(guard);
@@ -2592,6 +2641,40 @@ mod tests {
             assert_eq!(set.depth.load(Ordering::Relaxed), 1);
         }
         assert!(!set.is_locked());
+    }
+
+    /// [`scan_lock_held`] counts where the set's mutex is taken and released —
+    /// the free take, the contended take, the retake after `unheld` — so every
+    /// body under a hold reads it, a re-entry adds nothing, and an
+    /// [`InitPass`] (C `init_record`, no `dbScanLock`) reads no hold.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn scan_lock_held_follows_the_set_mutex() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "SH:REC");
+        assert_eq!(scan_lock_held(), Some(false));
+        let outer = db.lock_instance(&cell);
+        assert_eq!(scan_lock_held(), Some(true), "free take");
+        drop(db.lock_instance(&cell));
+        assert_eq!(scan_lock_held(), Some(true), "a re-entry's release");
+        cell.unheld(|| assert_eq!(scan_lock_held(), Some(false), "unheld"));
+        assert_eq!(scan_lock_held(), Some(true), "retake");
+        {
+            let _init = InitPass::enter();
+            assert_eq!(scan_lock_held(), Some(false), "init pass");
+        }
+        let (taken_tx, taken) = std::sync::mpsc::channel();
+        let db2 = db.clone();
+        let cell2 = cell.clone();
+        let h = std::thread::spawn(move || {
+            let _g = db2.lock_instance(&cell2);
+            taken_tx.send(scan_lock_held()).unwrap();
+        });
+        std::thread::sleep(SETTLE);
+        drop(outer);
+        assert_eq!(scan_lock_held(), Some(false));
+        assert_eq!(taken.recv().unwrap(), Some(true), "contended take");
+        h.join().unwrap();
     }
 
     /// Boundary: `f` unwinds out of the park. The set is retaken, so the

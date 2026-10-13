@@ -53,9 +53,9 @@ pub trait PortCalls {
 /// ways C's `userPvt` is unlinked short of `processUser`.
 #[derive(Debug)]
 pub enum Unrun {
-    /// C `cancelRequest` while `isQueued` (asynManager.c:1661-1668).
+    /// C `cancelRequest` while `isQueued` (asynManager.c:1663-1668).
     Canceled,
-    /// C `queueTimeoutCallback` (asynManager.c:649-701).
+    /// C `queueTimeoutCallback` (asynManager.c:649-703).
     TimedOut,
     /// The port refused it at dequeue, or went away with it queued.
     Refused(AsynError),
@@ -135,9 +135,9 @@ impl RequestCell {
             self.token.requeue();
         }
         // C starts the timer before it signals the port thread
-        // (asynManager.c:1617-1626).
+        // (asynManager.c:1619-1628).
         if let Some(timeout) = user.queue_timeout {
-            queue_timer().arm(self, seq, std::time::Instant::now() + timeout);
+            queue_timer().arm(self, seq, std::time::Instant::now() + timeout.get());
         }
         if self.queue.push(self, seq) {
             Ok(())
@@ -149,10 +149,23 @@ impl RequestCell {
         }
     }
 
-    /// C `cancelRequest`: `true` (C `wasQueued`) when the cell was still
-    /// queued; its body then runs [`Unrun::Canceled`].
+    /// C `cancelRequest` (asynManager.c:1663-1668): `true` (C `wasQueued`)
+    /// when the cell was still queued, which unlinks it at once, runs its body's
+    /// [`Unrun::Canceled`] and `done` here — asynRecord's `special()` reports and
+    /// requests its callback inline (asynRecord.c:396-404) — and tells the port
+    /// thread, whose entry for it is now gone (`is_gone`).
     pub fn cancel(&self) -> bool {
-        self.token.cancel()
+        {
+            let _request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.token.cancel() {
+                return false;
+            }
+        }
+        self.queue.unlink(self);
+        self.body.unrun(Unrun::Canceled);
+        self.release();
+        self.queue.poke();
+        true
     }
 
     pub(crate) fn queues_on(&self, queue: &Arc<CellQueue>) -> bool {
@@ -179,11 +192,11 @@ impl RequestCell {
     }
 
     /// The port thread's dequeue of the entry queued as `seq` (C
-    /// asynManager.c:889-891, and the timer cancel at :906).
+    /// asynManager.c:894-895, and the timer cancel at :908).
     pub(crate) fn claim(&self, seq: u64) -> Claim {
         let claim = {
             let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-            if request.seq != seq || self.token.is_timed_out() {
+            if self.left(&request, seq) {
                 Claim::Gone
             } else if self.token.begin_running() {
                 Claim::Run
@@ -210,15 +223,12 @@ impl RequestCell {
     pub(crate) fn leave(&self, seq: u64, e: AsynError) {
         let why = {
             let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-            if request.seq != seq {
+            // A later request owns the cell, or the canceller or the timer
+            // reported this one.
+            if request.seq != seq || !self.token.leave_if_queued() {
                 return;
             }
-            if self.token.is_cancelled() {
-                Unrun::Canceled
-            } else if !self.token.leave_if_queued() {
-                // The timer reported it.
-                return;
-            } else if matches!(e, AsynError::QueueTimeout { .. }) {
+            if matches!(e, AsynError::QueueTimeout { .. }) {
                 Unrun::TimedOut
             } else {
                 Unrun::Refused(e)
@@ -228,19 +238,19 @@ impl RequestCell {
         self.release();
     }
 
-    /// C `queueTimeoutCallback` (asynManager.c:649-701), on the timer thread:
+    /// C `queueTimeoutCallback` (asynManager.c:649-703), on the timer thread:
     /// the request queued as `seq` leaves the queue while the port thread may be
     /// inside the driver, its timeout callback runs, and the port thread is
-    /// told (:700).
+    /// told (:702).
     fn expire(&self, seq: u64) {
         {
             let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-            // :655-661 `if(!puserPvt->isQueued) return;`
+            // :657-663 `if(!puserPvt->isQueued) return;`
             if request.seq != seq || !self.token.time_out_if_queued() {
                 return;
             }
         }
-        // :663-672 unlinks it, so the entry is gone before the cell can be
+        // :664-674 unlinks it, so the entry is gone before the cell can be
         // queued again; one the actor already took is its to drop.
         self.queue.unlink(self);
         self.body.unrun(Unrun::TimedOut);
@@ -249,10 +259,15 @@ impl RequestCell {
     }
 
     /// Whether the actor's entry queued as `seq` is one it can drop unseen: a
-    /// later request owns the cell, or the timer took this one.
+    /// later request owns the cell, or a cancel or the timer took this one.
     pub(crate) fn is_gone(&self, seq: u64) -> bool {
         let request = self.request.lock().unwrap_or_else(|e| e.into_inner());
-        request.seq != seq || self.token.is_timed_out()
+        self.left(&request, seq)
+    }
+
+    /// [`Self::is_gone`] under the request lock.
+    fn left(&self, request: &CellRequest, seq: u64) -> bool {
+        request.seq != seq || self.token.is_timed_out() || self.token.is_cancelled()
     }
 
     fn release(&self) {
@@ -278,7 +293,7 @@ impl std::fmt::Debug for RequestCell {
 /// A port's queue of [`RequestCell`]s as the queueing side sees it: a push
 /// into capacity every registered cell reserved, and a wake of the actor —
 /// C's `ellAdd` and `epicsEventSignal(notifyPortThread)`
-/// (asynManager.c:1613, :1626).
+/// (asynManager.c:1615, :1628).
 #[derive(Default)]
 pub(crate) struct CellQueue {
     inner: Mutex<CellQueueInner>,
@@ -355,13 +370,18 @@ impl CellQueue {
             .pop_front()
     }
 
+    /// Wake the actor with nothing queued — for a store it owes announces for.
+    pub(crate) fn nudge(&self) {
+        self.wake.notify_one();
+    }
+
     /// Resolves at the next push or poke since the last wait.
     pub(crate) async fn pushed(&self) {
         self.wake.notified().await
     }
 
     /// C `queueTimeoutCallback`'s `epicsEventSignal(pport->notifyPortThread)`
-    /// (asynManager.c:700): a request left the queue off the port thread.
+    /// (asynManager.c:702): a request left the queue off the port thread.
     pub(crate) fn poke(&self) {
         self.left.store(true, std::sync::atomic::Ordering::Release);
         self.wake.notify_one();
@@ -415,6 +435,20 @@ struct Armed {
     at: std::time::Instant,
     seq: u64,
     cell: Arc<RequestCell>,
+}
+
+/// Holds the queue timer's lock on another thread for `hold`, returning once
+/// it is held: an arm in that window waits on the lock.
+#[cfg(all(test, feature = "epics"))]
+pub(crate) fn hold_queue_timer_for_test(hold: std::time::Duration) -> std::thread::JoinHandle<()> {
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _slots = queue_timer().slots.lock();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(hold);
+    });
+    held_rx.recv().unwrap();
+    holder
 }
 
 fn queue_timer() -> &'static QueueTimer {
@@ -749,10 +783,10 @@ pub enum RequestOp {
     /// `pasynManager->isAutoConnect` (`asynManager.c`).
     GetAutoConnect,
     /// C `pasynManager->blockProcessCallback(pasynUser, allDevices)`
-    /// (asynManager.c:1692-1723). `all_devices` is C's own argument, and it
+    /// (asynManager.c:1694-1725). `all_devices` is C's own argument, and it
     /// picks which of the **two** holders this block takes: the port-wide
     /// `pport->pblockProcessHolder`, or the `pblockProcessHolder` of the one
-    /// `dpCommon` the user's own `addr` resolves to (`findDpCommon`, :1765).
+    /// `dpCommon` the user's own `addr` resolves to (`findDpCommon`, :1766).
     /// devGpib takes the device form for an SRQ transaction
     /// (devSupportGpib.c:1216), which must not stall the port's other
     /// addresses.
@@ -760,7 +794,7 @@ pub enum RequestOp {
         all_devices: bool,
     },
     /// C `pasynManager->unblockProcessCallback(pasynUser, allDevices)`
-    /// (asynManager.c:1725-1774) — releases the holder at the same scope.
+    /// (asynManager.c:1727-1776) — releases the holder at the same scope.
     UnblockProcess {
         all_devices: bool,
     },
@@ -904,7 +938,7 @@ pub enum RequestOp {
     /// Install the EOS interpose on the addressed device's octet stack. C
     /// parity: `asynInterposeEosConfig(portName, addr, processEosIn,
     /// processEosOut)` (`asynInterposeEos.c:84-140`), registered with iocsh at
-    /// :393-410. The two flags select which half of the layer is live.
+    /// :394-411. The two flags select which half of the layer is live.
     PushEosInterpose {
         process_in: bool,
         process_out: bool,
@@ -1210,20 +1244,20 @@ impl RequestResult {
 
 /// Lifecycle of a queued request, mirroring C `asynManager` queue/callback
 /// state so that `AQR` cancellation reproduces the `cancelRequest` `wasQueued`
-/// split (asynManager.c:1630-1690) by construction rather than by a runtime
+/// split (asynManager.c:1632-1692) by construction rather than by a runtime
 /// guard.
 ///
 /// `cancelRequest` removes the request and reports `wasQueued==1` ONLY while it
-/// is still on the queue (asynManager.c:1661-1668); once the port thread has
+/// is still on the queue (asynManager.c:1663-1668); once the port thread has
 /// dequeued it and is running the callback (`callbackActive`) or it has already
 /// finished, `wasQueued==0` and the I/O runs to completion and is reported
 /// normally (asynManager.c:1645-1659). `Queued` is the only state a cancel can
 /// win from; the executor's `Queued -> Running` transition closes that window.
 ///
-/// The queue-wait timeout (C `queueTimeoutCallback`, asynManager.c:647-700) is
+/// The queue-wait timeout (C `queueTimeoutCallback`, asynManager.c:649-703) is
 /// the second way a request can leave the queue without running, and it obeys
 /// the same rule: the timer callback returns immediately when `!isQueued`
-/// (:655-661), so a request the port thread has already dequeued always
+/// (:657-663), so a request the port thread has already dequeued always
 /// completes. `TimedOut` is therefore a sibling of `Cancelled` — a terminal
 /// state reachable only from `Queued` — and the two together are the complete
 /// set of "this request never ran" outcomes. Which one won is what tells the
@@ -1268,9 +1302,9 @@ impl CancelToken {
             .is_ok()
     }
 
-    /// C `queueTimeoutCallback` (asynManager.c:647-700): the queue-wait deadline
+    /// C `queueTimeoutCallback` (asynManager.c:649-703): the queue-wait deadline
     /// expired. Removes the request from the queue iff it is still queued —
-    /// C's `if(!puserPvt->isQueued) { ...; return; }` guard (:655-661) — and
+    /// C's `if(!puserPvt->isQueued) { ...; return; }` guard (:657-663) — and
     /// returns whether it won.
     ///
     /// `false` means the port thread had already dequeued the request: the timer
@@ -1303,7 +1337,7 @@ impl CancelToken {
     }
 
     /// Executor at dequeue: claim the request for execution (C dequeue under
-    /// `asynManagerLock`, asynManager.c:1661-1666 is the cancel counterpart).
+    /// `asynManagerLock`, asynManager.c:1663-1668 is the cancel counterpart).
     ///
     /// Returns `false` iff the request left the queue without running — it was
     /// cancelled (`AQR`) or its queue-wait deadline expired — in which case the
@@ -1371,6 +1405,30 @@ impl Default for CancelToken {
 
 #[cfg(test)]
 mod tests {
+    /// bab72deef: the entry the actor still holds for a request the timer took
+    /// (C unlinks it, asynManager.c:666-676) must not claim the cell's next
+    /// request — `begin_running` from `Done` would run that one twice.
+    #[test]
+    fn a_timed_out_entry_does_not_claim_the_next_request() {
+        struct Nothing;
+        impl CellBody for Nothing {
+            fn process(&self, _: &mut dyn PortCalls) {}
+            fn unrun(&self, _: Unrun) {}
+            fn done(self: Arc<Self>) {}
+        }
+        let queue = Arc::new(CellQueue::default());
+        let cell = queue.new_cell(Arc::new(Nothing));
+        let user = crate::user::AsynUser::new(0);
+        cell.queue(&user).unwrap();
+        // The actor took the entry, then the timer expired the request.
+        let (_, stale) = queue.pop().unwrap();
+        cell.expire(stale);
+        cell.queue(&user).unwrap();
+        let (_, next) = queue.pop().unwrap();
+        assert!(matches!(cell.claim(stale), Claim::Gone));
+        assert!(matches!(cell.claim(next), Claim::Run));
+    }
+
     use super::*;
 
     #[test]

@@ -6,15 +6,15 @@
 //! below, not at whatever that tree's working copy holds today. These trees are
 //! checked out on local branches here and run ahead of their pins.
 //!
-//! The pin is not academic. `drvAsynIPPort.c` is 34 lines longer at the asyn
-//! checkout (`731d616e`) than at the pin, so `setNonBlock(fd, 1)` reads as
-//! `:511` there and `:536` here. A citation checked against the wrong tree
+//! The pin is not academic. `drvAsynIPPort.c` is 54 lines longer at R4-46 than
+//! at R4-45, yet `setNonBlock(fd, 1)` moved up, from `:536` there to `:516`
+//! here. A citation checked against the wrong tree
 //! looks wrong while being right, and one written against the wrong tree is
 //! wrong here — both happened this round.
 //!
 //! | tree | pinned revision |
 //! | --- | --- |
-//! | `asyn` | `R4-45-19-ge2a281e2` |
+//! | `asyn` | `R4-46` (`76f6164757d5`) |
 //! | `epics-base` | `R7.0.10` |
 //! | `modbus` | `R3-4-10-gb1009d0` |
 //! | `motor` | `R7-4-5-g78b474cd` |

@@ -167,7 +167,7 @@ pub enum Capability {
     Gpib,
     /// The `asynOption` interface (`get_option` / `set_option`). C drivers
     /// register it explicitly (`option.interfaceType = asynOptionType` in
-    /// drvAsynIPPort.c:1025, drvAsynSerialPort.c:1098, drvVxi11.c:1777,
+    /// drvAsynIPPort.c:1079, drvAsynSerialPort.c:1098, drvVxi11.c:1777,
     /// drvAsynFTDIPort.cpp:582) and asynRecord's `optioniv` is the result of
     /// `findInterface(asynOptionType)` (asynRecord.c:1177-1186).
     Option,
@@ -286,7 +286,7 @@ pub fn default_capabilities() -> Vec<Capability> {
 
 /// The interface set of a byte-transport port: `asynCommon` + `asynOctet` +
 /// `asynOption`, exactly what drvAsynIPPort / drvAsynSerialPort /
-/// drvAsynFTDIPort register (drvAsynIPPort.c:1037-1053). No register interface,
+/// drvAsynFTDIPort register (drvAsynIPPort.c:1091-1109). No register interface,
 /// so a record pointed at one with IFACE=Int32 gets C's "No asynInt32 interface"
 /// rather than a silent cache read. No `asynDrvUser` either — a byte transport
 /// has no parameters to name, so every client stays at reason 0 and asynRecord

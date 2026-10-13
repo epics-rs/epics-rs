@@ -92,7 +92,7 @@ impl PortManager {
         driver: D,
         mut config: RuntimeConfig,
     ) -> AsynResult<PortRuntimeHandle> {
-        let name = driver.base().port_name.clone();
+        let name = driver.base().port_name.to_string();
         // Pre-flight: refuse before we spawn the runtime thread, so a
         // rejected duplicate doesn't burn a thread + create a
         // half-initialized PortRuntimeHandle. The manager map catches a
@@ -167,7 +167,7 @@ impl PortManager {
     }
 
     /// Permanently shut down a `ASYN_DESTRUCTIBLE` port — mirror of
-    /// C `asynManager::shutdownPort` at asynManager.c:2251-2308.
+    /// C `asynManager::shutdownPort` at asynManager.c:2253-2310.
     ///
     /// Sends a `RequestOp::ShutdownPort` through the port's actor
     /// queue (so the lifecycle runs in the same thread that owns the
@@ -287,7 +287,7 @@ const ERROR_MESSAGE_SIZE: usize = 160;
 /// each call builds.
 ///
 /// The address is part of the binding, not a per-call argument: C stores it as
-/// `userPvt->pdevice` when the user attaches (asynManager.c:1349-1352) and every
+/// `userPvt->pdevice` when the user attaches (asynManager.c:1351-1353) and every
 /// later `findDpCommon` reads it back, so a caller cannot ask about one device
 /// on a user bound to another.
 pub struct DeviceUser {
@@ -350,18 +350,8 @@ impl DeviceUser {
             )));
         }
         // C :1349-1352 under `asynManagerLock`: `locateDevice(pport, addr,
-        // TRUE)` creates the device on a multi-device port. The port owns
-        // its device list, so the creation is the port actor's; C's call
-        // cannot fail, and the one way this one can - the actor is gone -
-        // is a port that is no longer the one the registry answered with.
-        let dp = match entry.handle.connect_device_blocking(addr) {
-            Ok(dp) => dp,
-            Err(e) => {
-                return Err(self.fail(format_args!(
-                    "asynManager:connectDevice port {port_name} not found: {e}"
-                )));
-            }
-        };
+        // TRUE)` creates the device on a multi-device port, and cannot fail.
+        let dp = entry.handle.connect_device(addr);
         self.device = Some((entry.clone(), dp));
         self.addr = addr;
         Ok(entry)
@@ -398,11 +388,27 @@ impl DeviceUser {
         Ok(self.dp("isAutoConnect")?.auto_connect())
     }
 
+    /// C `findInterface(pasynUser, asynCommonType, ...)` (asynManager.c:1470-1513)
+    /// as `connectDevice` asks it. A `PortDriver` cannot lack asynCommon, so only
+    /// C's two refusals can answer differently: no binding, or a port shut down.
+    pub fn find_common(&mut self) -> Result<(), DeviceError> {
+        let defunct = match &self.device {
+            None => {
+                return Err(self.fail(format_args!("asynManager:findInterface: not connected")));
+            }
+            Some((entry, _)) => entry.handle.is_defunct(),
+        };
+        if defunct {
+            return Err(self.fail(format_args!("asynManager:findInterface: port shut down")));
+        }
+        Ok(())
+    }
+
     /// Bind to an already-resolved port, for tests that build a [`PortEntry`]
     /// by hand rather than publishing it to the process registry.
     #[cfg(all(test, feature = "epics"))]
     pub(crate) fn attach_for_test(&mut self, entry: PortEntry, addr: i32) {
-        let dp = entry.handle.connect_device_blocking(addr).unwrap();
+        let dp = entry.handle.connect_device(addr);
         self.device = Some((entry, dp));
         self.addr = addr;
     }
@@ -479,6 +485,11 @@ mod tests {
             user.error_message(),
             "asynManager:isEnabled asynUser not connected to device"
         );
+        assert_eq!(user.find_common(), Err(DeviceError));
+        assert_eq!(
+            user.error_message(),
+            "asynManager:findInterface: not connected"
+        );
     }
 
     /// `connectDevice`'s three rejections in C's order — no port name, an
@@ -526,7 +537,7 @@ mod tests {
     /// being (`locateDevice(pport, addr, TRUE)`, asynManager.c:1349-1352):
     /// `asynReport` counts it in `nDevices` and prints its block from that
     /// moment. The boundaries: a multi-device port with `addr >= 0` allocates;
-    /// `addr < 0` on the same port binds the port's own dpCommon (:1349
+    /// `addr < 0` on the same port binds the port's own dpCommon (:1351
     /// `if(addr>=0)`); a single-device port allocates nothing whatever the
     /// addr (:576 `!(attributes&ASYN_MULTIDEVICE)`).
     #[test]
@@ -545,9 +556,11 @@ mod tests {
                 .unwrap()
                 .handle
                 .with_driver_blocking(|d: &mut DummyDriver| {
-                    let mut addrs: Vec<i32> = d.base.device_states.keys().copied().collect();
-                    addrs.sort_unstable();
-                    addrs
+                    d.base
+                        .devices()
+                        .into_iter()
+                        .map(|(addr, _)| addr)
+                        .collect::<Vec<_>>()
                 })
                 .unwrap()
         };

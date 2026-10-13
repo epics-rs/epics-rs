@@ -1513,7 +1513,7 @@ impl PortDriver for DrvAsynSerialPort {
                     }
                     _ => {
                         // C's text for this key is not of the "Invalid <key>
-                        // value." shape (drvAsynSerialPort.c:394-395).
+                        // value." shape (drvAsynSerialPort.c:392-394).
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
                             message: "Invalid parity.".into(),
@@ -1823,7 +1823,7 @@ impl DrvAsynSerialPort {
                 }
             }
             // C reports *this* key's bad value as "Invalid rs485_rts_on_send
-            // value." (drvAsynSerialPort.c:566) — a copy-paste of the previous
+            // value." (drvAsynSerialPort.c:568) — a copy-paste of the previous
             // arm's text. Deliberate deviation: the key names itself here, since
             // an operator told "rs485_rts_on_send" while writing
             // rs485_rts_after_send is being misdirected by a C typo.
@@ -2175,7 +2175,7 @@ mod tests {
             .set_option(&mut AsynUser::default(), "parity", "mark")
             .unwrap_err();
         // R11-49: C has one text for every unrecognised parity value —
-        // "Invalid parity." (drvAsynSerialPort.c:394-395). Mark/space are not a
+        // "Invalid parity." (drvAsynSerialPort.c:392-394). Mark/space are not a
         // separate case in C, and were never a separate case here either.
         assert_eq!(err.message(), "Invalid parity.");
     }

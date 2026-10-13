@@ -125,6 +125,14 @@ name = "asyn_monitor_posts_its_read_fields"
 required-features = ["epics"]
 
 [[test]]
+name = "asyn_specials_under_the_hold"
+required-features = ["epics"]
+
+[[test]]
+name = "asyn_reentry_allocates_nothing"
+required-features = ["epics"]
+
+[[test]]
 name = "asyn_errs_posts_ahead_of_the_alarm"
 required-features = ["epics"]
 

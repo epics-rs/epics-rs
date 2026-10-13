@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::database::{AsyncDbHandle, ProcessCallback};
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDeclaration,
@@ -905,8 +905,9 @@ impl Default for AsynRecord {
 struct ProcessJob {
     request: Mutex<ProcessRequest>,
     outcome: Mutex<Option<IoOutcome>>,
-    /// The record the completion re-enters, set at `add_record`.
-    reentry: Mutex<Option<(String, AsyncDbHandle)>>,
+    /// The completion's `epicsCallback`, kept in the record's private structure
+    /// as C keeps it in `asynRecPvt` (asynRecord.c:227); set at `add_record`.
+    reentry: Mutex<Option<ProcessCallback>>,
 }
 
 struct ProcessRequest {
@@ -951,18 +952,10 @@ impl CellBody for ProcessJob {
     /// the port's thread.
     fn done(self: Arc<Self>) {
         let prio = self.request.lock().unwrap().prio;
-        epics_libcom_rs::runtime::task::spawn_background(prio, async move {
-            let Some((name, db)) = self.reentry.lock().unwrap().clone() else {
-                return;
-            };
-            // A fresh token supersedes any older one; a record removed
-            // meanwhile mints none.
-            if let Some(token) = db.mint_async_token(&name) {
-                let (waitset, completion) = AsyncDbHandle::new_put_notify();
-                waitset.leave();
-                let _ = db.reprocess_on_notify(token, completion);
-            }
-        });
+        if let Some(cb) = self.reentry.lock().unwrap().as_ref() {
+            // asynRecord ignores the status (asynRecord.c:830-831).
+            let _ = cb.request(prio);
+        }
     }
 }
 
@@ -1186,7 +1179,7 @@ impl IoOutcome {
 
     /// The **refused** process request, C `process()` (asynRecord.c:342-361): the
     /// queue gate turned `queueRequest` down (`asynDisabled` / `asynDisconnected`,
-    /// asynManager.c:1541-1552), so `performIO` never ran. C reports the literal
+    /// asynManager.c:1543-1554), so `performIO` never ran. C reports the literal
     /// `"queueRequest failed"` and alarms `STATE_ALARM`/`MINOR_ALARM` — the same
     /// arm that answers a record with no port ("Not connect to a port", :356-357)
     /// — and posts no transfer field, because there was no transfer.
@@ -1952,7 +1945,7 @@ const CANCELED_MSG: &str = "I/O request canceled";
 /// requests `connectDevice` queues (:1281,:1297) — and it is the only caller in
 /// asyn that asks for one at all (device support passes 0.0, devAsynInt32.c:838).
 /// So it belongs to the record, not to the port: it rides on
-/// [`AsynUser::queue_timeout`] of the users the record builds below.
+/// [`field@AsynUser::queue_timeout`] of the users the record builds below.
 const QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// C `queueTimeoutCallbackProcess` (asynRecord.c:919-927) — the process request
@@ -2036,7 +2029,7 @@ impl OptionQueue {
     /// of every driver's option interface use, because the spelling that reaches
     /// here is not this crate's to choose: C writes the key capital-I
     /// (`"hostInfo"`, asynRecord.c:1825) and matches it with
-    /// `epicsStrCaseCmp` on both driver halves (drvAsynIPPort.c:899, :937).
+    /// `epicsStrCaseCmp` on both driver halves (drvAsynIPPort.c:953, :991).
     /// Comparing the caller's spelling against a lowercase literal would hand a
     /// C- or operator-spelled `hostInfo` the `Normal` queue, and HOSTINFO is the
     /// one option C deliberately queues on a *disconnected* port — see the
@@ -2263,7 +2256,7 @@ impl SpecialRequest {
             SpecialWhat::Connect { want } => {
                 // The connect user is the record's own, at ADDR, with no
                 // sentinel: on a disconnected multi-device port C's
-                // `checkPortConnect` refuses it (asynManager.c:1538-1552).
+                // `checkPortConnect` refuses it (asynManager.c:1538-1554).
                 let user = || AsynUser::new(0).with_addr(self.user.addr);
                 let connected = port
                     .call(RequestOp::GetConnected, user())
@@ -2498,7 +2491,6 @@ impl SpecialLane {
                 continue;
             };
             db.with_record(name, |rec| {
-                let _hold = crate::port_handle::HoldPath::enter();
                 if let Some(rec) = rec
                     .as_any_mut()
                     .and_then(|any| any.downcast_mut::<AsynRecord>())
@@ -2908,7 +2900,6 @@ impl AsynRecord {
             };
             rt.spawn_blocking(move || {
                 db.with_record(&name, |rec| {
-                    let _hold = crate::port_handle::HoldPath::enter();
                     if let Some(rec) = rec
                         .as_any_mut()
                         .and_then(|any| any.downcast_mut::<AsynRecord>())
@@ -2936,7 +2927,7 @@ impl AsynRecord {
     /// requested one.
     fn apply_option_readback(&mut self, opts: &HashMap<String, String>) {
         // C hands `getOption` a buffer the driver clears at entry
-        // (`val[0] = '\0'`, drvAsynSerialPort.c:142, drvAsynIPPort.c:894) and
+        // (`val[0] = '\0'`, drvAsynSerialPort.c:142, drvAsynIPPort.c:948) and
         // then ignores the returned status (asynRecord.c:1864-1927). So a key the
         // port does not implement is an *empty readback*, not a skipped field: an
         // IP port answers "" for `parity`, and PRTY lands on its Unknown choice
@@ -3013,7 +3004,7 @@ impl AsynRecord {
             _ => 0,
         };
         // IP options. C `strncpy(pasynRec->hostinfo, hostbuff, …)`
-        // (asynRecord.c:1928) copies the buffer whatever the get returned, so a
+        // (asynRecord.c:1927) copies the buffer whatever the get returned, so a
         // port carrying no `hostinfo` key clears the field.
         self.hostinfo = opt("hostinfo").to_string();
         self.drto = match opt("disconnectOnReadTimeout") {
@@ -3555,7 +3546,6 @@ impl AsynRecord {
     /// A failing query lands as 0, exactly as C's `else` branches do
     /// (:1087,:1092,:1097).
     fn monitor_status(&mut self) {
-        let _hold = crate::port_handle::HoldPath::enter();
         // C `REMEMBER_STATE` on the fields another thread can move
         // (:1045-1064): they post only if this refresh moves them.
         let cur = self.status_values();
@@ -3634,7 +3624,7 @@ impl AsynRecord {
     /// tail below runs `monitorStatus` over the same buffer — which is why
     /// `special()` reports the `isEnabled` text and not the connect text
     /// (asynRecord.c:515). This function's own `"Connect error, status=%d, %s"`
-    /// (asynRecord.c:1158) is what stays in ERRS for the init and PCNCT paths,
+    /// (asynRecord.c:1160) is what stays in ERRS for the init and PCNCT paths,
     /// which add no wrapper of their own.
     fn connect_device(&mut self) -> Result<(), crate::manager::DeviceError> {
         // C `connectDevice` opens with `resetError` (asynRecord.c:1151): the
@@ -3655,6 +3645,17 @@ impl AsynRecord {
 
         match self.device_user.connect_device(&self.port, self.addr) {
             Ok(entry) => {
+                // C asks for asynCommon before anything else and reports with
+                // `connectDevice`'s `asynSuccess` (asynRecord.c:1163-1171); bound
+                // to a shut-down port, that lookup is what fails.
+                if let Err(e) = self.device_user.find_common() {
+                    let errs = Errs::format(format_args!(
+                        "findInterface common: {}",
+                        self.device_user.error_message()
+                    ));
+                    self.report_errs(AsynStatus::Success, errs);
+                    return self.connect_device_bad(e);
+                }
                 // C's process request is made once, before any cycle queues it
                 // (asynRecord.c:306-308); here it belongs to the port.
                 self.process_cell_on(&entry.handle);
@@ -3675,7 +3676,7 @@ impl AsynRecord {
                         // parameter with the type this record will read it as.
                         let req = crate::port::DrvUserRequest::new(&self.drvinfo, self.addr)
                             .with_iface(InterfaceType::from_u16(self.iface as u16).as_asyn_iface());
-                        match entry.handle.drv_user_create_blocking(&req) {
+                        match entry.handle.drv_user_create_on_put(&req) {
                             Ok(info) => {
                                 self.resolved_reason = info.reason;
                                 self.reason = info.reason as i32;
@@ -3797,20 +3798,29 @@ impl AsynRecord {
                 Ok(())
             }
             Err(e) => {
-                self.pcnct = 0;
                 // C reports its own diagnostic *before* the tail below
-                // (asynRecord.c:1157-1159, then `goto bad`): `monitorStatus`
+                // (asynRecord.c:1160-1161, then `goto bad`): `monitorStatus`
                 // overwrites the manager buffer this reads.
                 self.report_connect_error();
-                // C's `bad:` → `done:` tail (:1309-1320): the same
-                // `cancelIOInterruptScan` + `monitorStatus` the success path
-                // takes, so the operator sees PCNCT and CNCT go to 0 on the
-                // record that just lost its port.
-                self.monitor_status();
-                self.publish_io_intr_binding();
-                Err(e)
+                self.connect_device_bad(e)
             }
         }
+    }
+
+    /// C `connectDevice`'s `bad:` → `done:` tail (asynRecord.c:1309-1320): unbind
+    /// whatever the attempt bound, then the same `cancelIOInterruptScan` +
+    /// `monitorStatus` the success path takes, so the operator sees PCNCT and
+    /// CNCT go to 0 on the record that just lost its port.
+    fn connect_device_bad(
+        &mut self,
+        e: crate::manager::DeviceError,
+    ) -> Result<(), crate::manager::DeviceError> {
+        self.clear_exception_callback();
+        self.device_user.disconnect();
+        self.pcnct = 0;
+        self.monitor_status();
+        self.publish_io_intr_binding();
+        Err(e)
     }
 
     /// C `connectDevice`'s own failure diagnostic (asynRecord.c:1157-1159):
@@ -3856,11 +3866,11 @@ impl AsynRecord {
     /// is three-valued, and the transports read all three:
     ///
     /// * `> 0` — bounded wait.
-    /// * `== 0` — non-blocking poll. `drvAsynIPPort.c:741-742` computes
+    /// * `== 0` — non-blocking poll. `drvAsynIPPort.c:792-793` computes
     ///   `readPollmsec = (int)(timeout * 1000.0)` and floors a zero to a 1 ms
     ///   poll; `drvAsynSerialPort.c:902-905` sets `VMIN=0, VTIME=0`, the termios
     ///   "return whatever is already buffered" read.
-    /// * `< 0` — wait forever (`readPollmsec = -1`, `drvAsynIPPort.c:743`).
+    /// * `< 0` — wait forever (`readPollmsec = -1`, `drvAsynIPPort.c:794`).
     ///
     /// The port used to substitute a 1 s wait for BOTH non-positive cases, so an
     /// operator asking for a poll got a one-second block on a silent device.
@@ -3888,7 +3898,7 @@ impl AsynRecord {
     ///
     /// C queues the option callback on a `duplicateAsynUser` of the record's own
     /// `pasynUser` (asynRecord.c:531-533), and `duplicateAsynUser` copies
-    /// `timeout` (asynManager.c:1225). The record's `pasynUser->timeout` is TMOT
+    /// `timeout` (asynManager.c:1227). The record's `pasynUser->timeout` is TMOT
     /// (asynRecord.c:818), so an RFC 2217 negotiation triggered by a BAUD/PRTY/…
     /// put is bounded by TMOT — the record's own timeout, not a constant private
     /// to the COM layer. ADDR rides along because C's option callback runs on the
@@ -4436,7 +4446,7 @@ impl Record for AsynRecord {
             let held = db.lock_for_put(&target, "SCAN", &passive);
             let _ = db.put_pv_already_locked(held, passive);
         }));
-        *self.process_job.reentry.lock().unwrap() = Some((name.clone(), db.clone()));
+        *self.process_job.reentry.lock().unwrap() = Some(db.process_callback(&name));
         *self.special_lane.record.lock().unwrap() = Some((name.clone(), db.clone()));
         self.async_ctx = Some((name, db));
     }
@@ -4913,7 +4923,7 @@ impl Record for AsynRecord {
                 if self.device_user.device().is_some() {
                     self.raise_exception(|rec| {
                         if let Some(entry) = rec.device_user.device() {
-                            let _ = entry.handle.set_enable_blocking(rec.addr, rec.enbl != 0);
+                            let _ = entry.handle.set_enable(rec.addr, rec.enbl != 0);
                         }
                     });
                 }
@@ -4927,9 +4937,7 @@ impl Record for AsynRecord {
                 if self.device_user.device().is_some() {
                     self.raise_exception(|rec| {
                         if let Some(entry) = rec.device_user.device() {
-                            let _ = entry
-                                .handle
-                                .set_auto_connect_blocking(rec.addr, rec.auct != 0);
+                            let _ = entry.handle.set_auto_connect(rec.addr, rec.auct != 0);
                         }
                     });
                 }
@@ -5115,7 +5123,7 @@ impl Record for AsynRecord {
             // C special() for AQR (asynRecord.c:393-408) calls
             // pasynManager->cancelRequest(pasynUser, &wasQueued); only when a
             // request was still queued and is removed (cancelRequest
-            // `wasQueued==true`, asynManager.c:1661-1666) does it report
+            // `wasQueued==true`, asynManager.c:1663-1668) does it report
             // "I/O request canceled", raise STATE_ALARM/MAJOR_ALARM and force
             // a completion callback. In every case it then sets
             // state = stateIdle.
@@ -5123,19 +5131,18 @@ impl Record for AsynRecord {
             // While a blocking port's request is pending (`io_pending`),
             // cancelling the record's `RequestCell` reproduces the `wasQueued`
             // split by construction: `cancel()` wins only while the request is
-            // still queued (the port thread has not claimed its token), and
-            // `ProcessJob::unrun` records the "I/O request canceled" outcome
-            // (CANCELED_MSG) — the `wasQueued==true` analogue. A cancel that
-            // arrives after the port thread claimed it loses the CAS and is a
-            // no-op: the I/O completes and applies normally, matching C
-            // `cancelRequest` returning `wasQueued==0` once the callback is
-            // active (asynManager.c:1645-1659). The completion re-entry is the
-            // single owner that applies the outcome to ERRS and clears
-            // `io_pending` (the `state = stateIdle` transition), so AQR must
-            // NOT touch `io_pending` or supersede the re-entry token here: the
-            // completion token is minted post-I/O and is always current
-            // (mint advances the generation), so `cancel_async_reentry` could
-            // only strand the record by racing the mint, never suppress it.
+            // still queued (the port thread has not claimed its token). Then,
+            // on this thread, it unlinks the request, `ProcessJob::unrun`
+            // records the "I/O request canceled" outcome (CANCELED_MSG) — the
+            // `wasQueued==true` analogue — and `done` requests the record's
+            // `ProcessCallback`, as C's `special()` does (asynRecord.c:396-404).
+            // A cancel that arrives after the port thread claimed it loses the
+            // CAS and is a no-op: the I/O completes and applies normally,
+            // matching C `cancelRequest` returning `wasQueued==0` once the
+            // callback is active (asynManager.c:1647-1661). Either way that
+            // callback's re-entry is the single owner that applies the outcome
+            // to ERRS and clears `io_pending` (the `state = stateIdle`
+            // transition), so AQR must NOT touch `io_pending` here.
             // The C `wasQueued` branch's STATE_ALARM/MAJOR_ALARM (:399) rides on
             // that same outcome: `IoOutcome::report_canceled` owns both halves of
             // the cancel event, so the re-entry commits the alarm with the message.
@@ -6060,6 +6067,59 @@ mod tests {
         );
     }
 
+    /// C `connectDevice` binds to a shut-down port — `locatePort` still finds it
+    /// — and the asynCommon lookup after it refuses (asynRecord.c:1163-1171,
+    /// asynManager.c:1487-1491): "findInterface common: %s", then the `bad:`
+    /// tail. PCNCT keeps that text; PORT wraps the `isEnabled` text the tail
+    /// left, as it does for every connect failure.
+    #[test]
+    fn a_shut_down_port_fails_the_asyn_common_lookup() {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct Port(PortDriverBase);
+        impl PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let name = "find_common_shut_down";
+        let flags = PortFlags {
+            destructible: true,
+            ..PortFlags::default()
+        };
+        let (rt, _jh) = create_port_runtime(
+            Port(PortDriverBase::new(name, 1, flags)),
+            RuntimeConfig::default(),
+        )
+        .expect("the port runtime thread must start");
+        register_port(name, rt.port_handle().clone()).unwrap();
+        rt.port_handle()
+            .submit_blocking(crate::request::RequestOp::ShutdownPort, AsynUser::default())
+            .unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = name.to_string();
+        rec.pcnct = 1;
+        rec.special("PCNCT", true).unwrap();
+        assert_eq!(
+            rec.errs,
+            "findInterface common: asynManager:findInterface: port shut down"
+        );
+        assert_eq!(rec.pcnct, 0);
+        assert!(rec.device_user.device().is_none(), "the bad: tail unbinds");
+
+        rec.special("PORT", true).unwrap();
+        assert_eq!(
+            rec.errs,
+            "connectDevice failed: asynManager:isEnabled asynUser not connected to device"
+        );
+    }
+
     /// R10-47: the list this port has to state — the dbd is C's source of truth
     /// for which puts reach `special()`, and this port's database calls `special`
     /// for every put — must be the dbd's, exactly.
@@ -6118,7 +6178,7 @@ mod tests {
     ///
     /// The gate outcome is what this pins, because it is the mechanism and it is
     /// deterministic: the auto-connect attempt riding on the same wake is
-    /// suppressed by C's own throttle window (`asynManager.c:712-713`) for two
+    /// suppressed by C's own throttle window (`asynManager.c:714-715`) for two
     /// seconds after the attach every record does at `connect_device`.
     ///
     /// Boundaries: a gate that admits (connected port) and a gate that refuses
@@ -6336,7 +6396,7 @@ mod tests {
                 value: &str,
             ) -> crate::error::AsynResult<()> {
                 // A real driver folds at the entry (`epicsStrCaseCmp`,
-                // drvAsynIPPort.c:899); a fixture that matched the caller's
+                // drvAsynIPPort.c:953); a fixture that matched the caller's
                 // spelling would answer only the record's current literal and
                 // hide a regression in what spelling the record forwards.
                 let key = option_key(key);
@@ -6468,7 +6528,7 @@ mod tests {
     /// dispatch survive it. C settles the spelling in two places and they do not
     /// agree with a lowercase literal: `asynRecord` writes the key capital-I
     /// (`"hostInfo"`, asynRecord.c:1825) and both driver halves match it with
-    /// `epicsStrCaseCmp` (drvAsynIPPort.c:899, :937), which is a fold, not a
+    /// `epicsStrCaseCmp` (drvAsynIPPort.c:953, :991), which is a fold, not a
     /// comparison.
     ///
     /// [`OptionQueue::for_key`] is the single owner of "may this option request
@@ -7902,7 +7962,7 @@ mod tests {
 
     /// R9-48: each C register handler reports its own diagnostic —
     /// "Int32 write error, %s" / "Int32 read error, %s" (asynRecord.c:1378,
-    /// :1391) and the UInt32 / Float64 twins (:1414/:1429, :1450/:1463) — with
+    /// :1391) and the UInt32 / Float64 twins (:1414/:1429, :1452/:1463) — with
     /// `pasynUser->errorMessage` as the tail. The port emitted a generic
     /// "write: {e}" / "read: {e}", which told the operator neither which
     /// interface failed nor what the driver said (`{e}` Display prefixes the
@@ -8791,8 +8851,8 @@ mod tests {
         );
 
         // --- Boundary 1: refused because the port is DISABLED
-        // (asynManager.c:1541-1546 — no waiver reaches it).
-        entry_handle.set_enable_blocking(-1, false).unwrap();
+        // (asynManager.c:1543-1548 — no waiver reaches it).
+        entry_handle.set_enable(-1, false).unwrap();
         log.lock().unwrap().option_sets.clear();
         rec.baud = baud_choice_index("19200");
         rec.special("BAUD", true).unwrap();
@@ -8831,9 +8891,9 @@ mod tests {
         );
 
         // --- Boundary 3: refused because the port is DISCONNECTED
-        // (checkPortConnect, asynManager.c:1547-1552) — an EOS put carries no
+        // (checkPortConnect, asynManager.c:1549-1554) — an EOS put carries no
         // waiver, so it is refused with the port enabled but the line down.
-        entry_handle.set_enable_blocking(-1, true).unwrap();
+        entry_handle.set_enable(-1, true).unwrap();
         entry_handle.disconnect_blocking().unwrap();
         log.lock().unwrap().eos_sets.clear();
         rec.ieos = "\\n".to_string();
@@ -8849,10 +8909,10 @@ mod tests {
         );
 
         // --- Boundary 4: the CNCT put refused, by the disabled port — the one
-        // refusal the Connect queue's waiver does not lift (:1541-1546). No
+        // refusal the Connect queue's waiver does not lift (:1543-1548). No
         // connect is attempted, and with no callback there is no monitorStatus
         // tail: CNCT keeps the operator's value instead of being snapped back.
-        entry_handle.set_enable_blocking(-1, false).unwrap();
+        entry_handle.set_enable(-1, false).unwrap();
         let connects_before = connects.load(Ordering::SeqCst);
         rec.cnct = 1;
         rec.special("CNCT", true).unwrap();
@@ -8934,13 +8994,13 @@ mod tests {
         rec.set_async_context("A".into(), db.async_handle());
         let entry_handle = rec.device_user.device().unwrap().handle.clone();
 
-        entry_handle.set_enable_blocking(-1, false).unwrap();
+        entry_handle.set_enable(-1, false).unwrap();
         rec.baud = baud_choice_index("9600");
         rec.special("BAUD", true).unwrap();
         rec.tmod = TransferMode::NoIo as i32;
         rec.process().unwrap();
         assert_eq!(rec.errs, "queueRequest failed");
-        entry_handle.set_enable_blocking(-1, true).unwrap();
+        entry_handle.set_enable(-1, true).unwrap();
         rec.tmod = TransferMode::Read as i32;
         rec.iface = InterfaceType::Int32 as i32;
         rec.process().unwrap();
@@ -8955,135 +9015,282 @@ mod tests {
         );
     }
 
+    /// A body that logs how its request ended.
+    #[derive(Default)]
+    struct EndLog(Mutex<Vec<&'static str>>);
+
+    impl crate::request::CellBody for EndLog {
+        fn process(&self, _port: &mut dyn crate::request::PortCalls) {
+            self.0.lock().unwrap().push("processed");
+        }
+        fn unrun(&self, why: crate::request::Unrun) {
+            use crate::request::Unrun;
+            self.0.lock().unwrap().push(match why {
+                Unrun::Canceled => "canceled",
+                Unrun::TimedOut => "timed out",
+                Unrun::Refused(_) => "refused",
+            });
+        }
+        fn done(self: Arc<Self>) {}
+    }
+
+    impl EndLog {
+        /// The log once it holds `n` entries, or after 5 s.
+        fn wait_for(&self, n: usize) -> Vec<&'static str> {
+            let started = std::time::Instant::now();
+            while self.0.lock().unwrap().len() < n
+                && started.elapsed() < std::time::Duration::from_secs(5)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A port whose thread is inside a driver read that drops the line on
+    /// release, with two cells queued behind it: `timed` with a 100 ms queue
+    /// timeout and `waits` with none. The line stays down until `line_up`, and
+    /// the production loop retries it every 20 ms (asynManager.c:3283-3314).
+    struct JammedPort {
+        release: std::sync::mpsc::Sender<()>,
+        jam: Option<std::thread::JoinHandle<RequestResult>>,
+        line_up: Arc<std::sync::atomic::AtomicBool>,
+        timed: Arc<EndLog>,
+        waits: Arc<EndLog>,
+        waits_cell: Arc<crate::request::RequestCell>,
+        _timed_cell: Arc<crate::request::RequestCell>,
+        _shutdown: tokio::sync::mpsc::Sender<()>,
+        /// The port stops once nobody holds a handle to it.
+        handle: PortHandle,
+    }
+
+    impl JammedPort {
+        fn new(name: &str) -> Self {
+            use crate::interrupt::InterruptManager;
+            use crate::port::{PortDriver, PortDriverBase, PortFlags};
+            use crate::port_actor::PortActor;
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            struct Drops {
+                base: PortDriverBase,
+                entered: mpsc::SyncSender<()>,
+                release: Mutex<mpsc::Receiver<()>>,
+                line_up: Arc<std::sync::atomic::AtomicBool>,
+            }
+            impl PortDriver for Drops {
+                fn base(&self) -> &PortDriverBase {
+                    &self.base
+                }
+                fn base_mut(&mut self) -> &mut PortDriverBase {
+                    &mut self.base
+                }
+                fn read_int32(&mut self, _user: &AsynUser) -> crate::error::AsynResult<i32> {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                    // The line drops while the port thread is in the driver.
+                    self.base.set_connected(false);
+                    Ok(0)
+                }
+                fn connect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
+                    if !self.line_up.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(crate::error::AsynError::Status {
+                            status: crate::error::AsynStatus::Error,
+                            message: "line down".into(),
+                        });
+                    }
+                    self.base.set_connected(true);
+                    Ok(())
+                }
+            }
+
+            let (entered_tx, entered) = mpsc::sync_channel(1);
+            let (release, release_rx) = mpsc::channel();
+            let line_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            base.seconds_between_port_connect = Duration::from_millis(20);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let actor = PortActor::new(
+                Box::new(Drops {
+                    base,
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                    line_up: line_up.clone(),
+                }),
+                rx,
+            );
+            let link = actor.link();
+            // The production loop: the test loop runs no connect-retry timer.
+            let (shutdown, shutdown_rx) = tokio::sync::mpsc::channel(1);
+            std::thread::spawn(move || actor.run_with_shutdown(shutdown_rx));
+            let handle = PortHandle::new(
+                tx,
+                name.into(),
+                Arc::new(InterruptManager::new(16)),
+                link,
+                Arc::new(TraceManager::new()),
+            );
+
+            let jammer = handle.clone();
+            let jam = std::thread::spawn(move || {
+                jammer
+                    .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+                    .unwrap()
+            });
+            entered.recv().unwrap();
+            let timed = Arc::new(EndLog::default());
+            let waits = Arc::new(EndLog::default());
+            let timed_cell = handle.new_cell(timed.clone());
+            let waits_cell = handle.new_cell(waits.clone());
+            timed_cell
+                .queue(&AsynUser::new(0).with_queue_timeout(Duration::from_millis(100)))
+                .unwrap();
+            waits_cell.queue(&AsynUser::new(0)).unwrap();
+            Self {
+                release,
+                jam: Some(jam),
+                line_up,
+                timed,
+                waits,
+                waits_cell,
+                _timed_cell: timed_cell,
+                _shutdown: shutdown,
+                handle,
+            }
+        }
+
+        /// The driver read returns and the line is down.
+        fn release(&mut self) {
+            self.release.send(()).unwrap();
+            self.jam.take().unwrap().join().unwrap();
+        }
+    }
+
     /// C `portThread` leaves a queued request where it is while its port is
-    /// disabled or down (asynManager.c:808-810, :856-861): it runs when the
-    /// port comes back, or its queue timer takes it (:649-701). It is never
+    /// disabled or down (asynManager.c:808-810, :858-863): it runs when the
+    /// port comes back, or its queue timer takes it (:649-703). It is never
     /// refused at dequeue — that refusal is `queueRequest`'s, made before it
     /// was queued.
     #[test]
     fn a_cell_queued_before_its_port_went_down_stays_queued() {
-        use crate::interrupt::InterruptManager;
-        use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::port_actor::PortActor;
-        use crate::request::{CellBody, PortCalls, Unrun};
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        let mut port = JammedPort::new("park_on_down");
+        port.release();
 
-        struct Drops {
-            base: PortDriverBase,
-            entered: mpsc::SyncSender<()>,
-            release: Mutex<mpsc::Receiver<()>>,
-            line_up: Arc<std::sync::atomic::AtomicBool>,
-        }
-        impl PortDriver for Drops {
-            fn base(&self) -> &PortDriverBase {
-                &self.base
-            }
-            fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.base
-            }
-            fn read_int32(&mut self, _user: &AsynUser) -> crate::error::AsynResult<i32> {
-                self.entered.send(()).unwrap();
-                self.release.lock().unwrap().recv().unwrap();
-                // The line drops while the port thread is in the driver.
-                self.base.set_connected(false);
-                Ok(0)
-            }
-            fn connect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
-                if !self.line_up.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(crate::error::AsynError::Status {
-                        status: crate::error::AsynStatus::Error,
-                        message: "line down".into(),
-                    });
-                }
-                self.base.set_connected(true);
-                Ok(())
-            }
-        }
-
-        #[derive(Default)]
-        struct Log(Mutex<Vec<&'static str>>);
-        impl CellBody for Log {
-            fn process(&self, _port: &mut dyn PortCalls) {
-                self.0.lock().unwrap().push("processed");
-            }
-            fn unrun(&self, why: Unrun) {
-                self.0.lock().unwrap().push(match why {
-                    Unrun::Canceled => "canceled",
-                    Unrun::TimedOut => "timed out",
-                    Unrun::Refused(_) => "refused",
-                });
-            }
-            fn done(self: Arc<Self>) {}
-        }
-        let wait_for = |log: &Log, n: usize| {
-            let started = Instant::now();
-            while log.0.lock().unwrap().len() < n && started.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            log.0.lock().unwrap().clone()
-        };
-
-        let (entered_tx, entered) = mpsc::sync_channel(1);
-        let (release, release_rx) = mpsc::channel();
-        let line_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut base = PortDriverBase::new("park_on_down", 1, PortFlags::default());
-        // The port comes back on its own retry timer, with no request of its
-        // own running (asynManager.c:3252-3283).
-        base.seconds_between_port_connect = Duration::from_millis(20);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let actor = PortActor::new(
-            Box::new(Drops {
-                base,
-                entered: entered_tx,
-                release: Mutex::new(release_rx),
-                line_up: line_up.clone(),
-            }),
-            rx,
+        assert_eq!(
+            port.timed.wait_for(1),
+            ["timed out"],
+            "queued until its timer"
         );
-        let link = actor.link();
-        // The production loop: the test loop runs no connect-retry timer.
-        let (_shutdown, shutdown_rx) = tokio::sync::mpsc::channel(1);
-        std::thread::spawn(move || actor.run_with_shutdown(shutdown_rx));
-        let handle = PortHandle::new(
-            tx,
-            "park_on_down".into(),
-            Arc::new(InterruptManager::new(16)),
-            link,
-            Arc::new(TraceManager::new()),
-        );
-
-        let jammer = handle.clone();
-        let jam = std::thread::spawn(move || {
-            jammer
-                .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
-                .unwrap()
-        });
-        entered.recv().unwrap();
-        let timed = Arc::new(Log::default());
-        let waits = Arc::new(Log::default());
-        let timed_cell = handle.new_cell(timed.clone());
-        let waits_cell = handle.new_cell(waits.clone());
-        timed_cell
-            .queue(&AsynUser::new(0).with_queue_timeout(Duration::from_millis(100)))
-            .unwrap();
-        waits_cell.queue(&AsynUser::new(0)).unwrap();
-        release.send(()).unwrap();
-        jam.join().unwrap();
-
-        assert_eq!(wait_for(&timed, 1), ["timed out"], "queued until its timer");
         assert!(
-            waits.0.lock().unwrap().is_empty(),
+            port.waits.0.lock().unwrap().is_empty(),
             "still queued, not refused"
         );
-        assert!(waits_cell.is_outstanding());
+        assert!(port.waits_cell.is_outstanding());
 
-        line_up.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.line_up
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            wait_for(&waits, 1),
+            port.waits.wait_for(1),
             ["processed"],
             "runs once the port is back"
         );
+    }
+
+    /// C `cancelRequest` unlinks a queued request at once (asynManager.c:1663-1668)
+    /// and asynRecord's `special()` reports it then (asynRecord.c:396-404): a
+    /// request parked on a down port is reported when cancelled, not when the
+    /// port comes back. The port thread, told (`poke`), drops the entry it
+    /// parked, which holds the cell.
+    #[test]
+    fn a_cancel_reports_a_request_parked_on_a_down_port() {
+        let mut port = JammedPort::new("cancel_parked");
+        port.release();
+        assert_eq!(port.timed.wait_for(1), ["timed out"]);
+        assert!(port.waits_cell.is_outstanding(), "parked");
+        assert_eq!(Arc::strong_count(&port.waits_cell), 2, "the parked entry");
+
+        assert!(port.waits_cell.cancel(), "wasQueued");
+        assert_eq!(*port.waits.0.lock().unwrap(), ["canceled"]);
+        assert!(!port.waits_cell.is_outstanding());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while Arc::strong_count(&port.waits_cell) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the port thread kept the cancelled entry"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        port.line_up
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(*port.waits.0.lock().unwrap(), ["canceled"], "never runs");
+    }
+
+    /// C `enable` and `autoConnectAsyn` never refuse (asynManager.c:2224-2250,
+    /// :2312-2329). With the port thread inside a driver call nothing drains
+    /// what the calls owe, and 200 of them are still all taken, allocating
+    /// nothing.
+    #[test]
+    fn enable_and_auto_connect_while_the_port_thread_is_busy_never_refuse() {
+        crate::asyn_record::errs_alloc_tests::on_record_thread(|| {
+            use crate::asyn_record::errs_alloc_tests::thread_allocs;
+
+            let port = JammedPort::new("owed_busy");
+            port.handle.set_enable(-1, true).unwrap();
+            port.handle.set_auto_connect(-1, true).unwrap();
+            let before = thread_allocs();
+            for i in 0..100 {
+                port.handle.set_enable(-1, i % 2 == 0).unwrap();
+                port.handle.set_auto_connect(-1, i % 2 == 0).unwrap();
+            }
+            assert_eq!(thread_allocs() - before, 0);
+        });
+    }
+
+    /// C SyncIO queues through `queueLockPort` with a deadline of
+    /// `max(queueLockPortTimeout, timeout)` (asynManager.c:1894-1896) and fails
+    /// the call when it passes (:972-990): a SyncIO read queued just before its
+    /// port drops returns an error at 2 s, not when the port comes back.
+    #[test]
+    fn a_syncio_call_queued_before_its_port_drops_fails_at_the_lock_port_deadline() {
+        use std::time::{Duration, Instant};
+
+        let mut port = JammedPort::new("syncio_park");
+        let sio = crate::sync_io::SyncIOHandle::from_handle(
+            port.handle.clone(),
+            0,
+            Duration::from_millis(200),
+        );
+        let (got_tx, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let r = sio.read_int32(0);
+            let _ = got_tx.send((started.elapsed(), r));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        port.release();
+        let (took, r) = got
+            .recv_timeout(Duration::from_secs(6))
+            .expect("the SyncIO read never returned");
+        assert!(r.unwrap_err().is_queue_timeout());
+        assert!(took >= crate::user::QUEUE_LOCK_PORT_TIMEOUT, "{took:?}");
+    }
+
+    /// The same while the port thread is inside the driver: the cancel does
+    /// not wait for it to come out, and takes the entry off the queue itself
+    /// (C `ellDelete`, asynManager.c:1667).
+    #[test]
+    fn a_cancel_reports_while_the_port_thread_is_busy() {
+        let mut port = JammedPort::new("cancel_busy");
+        assert_eq!(Arc::strong_count(&port.waits_cell), 2, "the queued entry");
+        assert!(port.waits_cell.cancel(), "wasQueued");
+        assert_eq!(*port.waits.0.lock().unwrap(), ["canceled"]);
+        assert_eq!(Arc::strong_count(&port.waits_cell), 1, "unlinked");
+        port.release();
+        port.line_up
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(*port.waits.0.lock().unwrap(), ["canceled"], "never runs");
     }
 
     /// R8-48: NAWT is what the *device* took, on both arms. C `performOctetIO`
@@ -9416,7 +9623,7 @@ mod tests {
     /// R9-46: C `asynCallbackProcess` assigns TMOT to the asynUser verbatim —
     /// `pasynUser->timeout = pasynRec->tmot` (asynRecord.c:818) — and the value
     /// is three-valued: `>0` bounded wait, `==0` non-blocking poll
-    /// (`drvAsynIPPort.c:741-742` floors the poll to 1 ms;
+    /// (`drvAsynIPPort.c:792-793` floors the poll to 1 ms;
     /// `drvAsynSerialPort.c:902-905` sets `VMIN=0,VTIME=0`), `<0` wait forever.
     /// The port substituted a 1 s wait for BOTH non-positive cases, so an
     /// operator asking for a poll got a one-second block on a silent device and
@@ -12346,6 +12553,75 @@ A.OEOS
         );
     }
 
+    /// C `connectDevice`'s `bad:` tail removes the exception callback
+    /// (asynRecord.c:1313) before it unbinds, so an exception on the port the
+    /// record just left never reaches it. Through `connect_device` the
+    /// callback is already gone (:1154 removes it first), so this drives the
+    /// tail on a bound record, as a failure after the add would reach it.
+    #[test]
+    fn the_bad_tail_stops_exceptions_from_the_old_port() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct PlainDriver(PortDriverBase);
+        impl PortDriver for PlainDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_bad_tail_drops_exceptions";
+        let exceptions = Arc::new(ExceptionManager::new());
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(exceptions.clone());
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        base.bind_exception_sink(exceptions.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(256)),
+            actor_link,
+            trace.clone(),
+        );
+        register_port(port_name, handle).unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.tmod = TransferMode::NoIo as i32;
+        let _ = rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+        let foreign_exception = |mask| {
+            let trace = trace.clone();
+            std::thread::spawn(move || trace.set_trace_mask(Some(port_name), mask))
+                .join()
+                .unwrap()
+        };
+        rec.status_dirty.store(false, Ordering::Release);
+        foreign_exception(TraceMask::ERROR | TraceMask::FLOW);
+        assert!(
+            rec.status_dirty.load(Ordering::Acquire),
+            "control: a bound record hears the port"
+        );
+
+        let _ = rec.connect_device_bad(crate::manager::DeviceError);
+        rec.status_dirty.store(false, Ordering::Release);
+        foreign_exception(TraceMask::ERROR);
+        assert!(
+            !rec.status_dirty.load(Ordering::Acquire),
+            "an exception on the old port reached the record after the bad tail"
+        );
+    }
+
     /// R10-55. A GPIB driver takes its interfaces from
     /// `pasynGpib->registerPort` (asynGpib.c:562-631) — asynCommon, asynOctet,
     /// asynGpib and asynInt32 — so on a vxi11 (drvVxi11.c:1761) or Prologix
@@ -12468,9 +12744,9 @@ A.OEOS
 
     /// R9-55. C queues the option callback on a `duplicateAsynUser` of the
     /// record's own `pasynUser` (asynRecord.c:531-533), and `duplicateAsynUser`
-    /// copies `timeout` (asynManager.c:1225), which the record set to TMOT
+    /// copies `timeout` (asynManager.c:1227), which the record set to TMOT
     /// (asynRecord.c:818). `setOption` then gets that user (:1787-1826) and an RFC
-    /// 2217 negotiation runs under it (asynInterposeCom.c:475,495). The port's
+    /// 2217 negotiation runs under it (asynInterposeCom.c:488,508). The port's
     /// option path carried no asynUser at all, so the record's TMOT never reached
     /// the driver and the negotiation used a private 2 s.
     #[test]
@@ -12603,10 +12879,10 @@ A.OEOS
 
         let mut rec = AsynRecord::default();
         let plan = rec.build_io_plan();
-        assert_eq!(io_user(&plan).queue_timeout, Some(QUEUE_TIMEOUT));
-        assert_eq!(flush_user(&plan).queue_timeout, Some(QUEUE_TIMEOUT));
+        assert_eq!(io_user(&plan).queue_timeout(), Some(QUEUE_TIMEOUT));
+        assert_eq!(flush_user(&plan).queue_timeout(), Some(QUEUE_TIMEOUT));
         assert_eq!(
-            rec.special_user(OptionQueue::Normal).user().queue_timeout,
+            rec.special_user(OptionQueue::Normal).user().queue_timeout(),
             Some(QUEUE_TIMEOUT)
         );
 
@@ -12626,8 +12902,8 @@ A.OEOS
 
         // Negative control: a user built anywhere else (device support, iocsh,
         // a driver's own request) arms no timer — C's `queueRequest(..., 0.0)`.
-        assert_eq!(AsynUser::default().queue_timeout, None);
-        assert_eq!(AsynUser::new(3).with_addr(1).queue_timeout, None);
+        assert_eq!(AsynUser::default().queue_timeout(), None);
+        assert_eq!(AsynUser::new(3).with_addr(1).queue_timeout(), None);
     }
 
     /// R10-49. C `queueTimeoutCallbackProcess` (asynRecord.c:919-927): the
@@ -12928,7 +13204,7 @@ A.OEOS
     /// C's asymmetry with the option readback is real and is asserted here too:
     /// `callbackGetEos` is queued at `asynQueuePriorityLow` with no
     /// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:1296), so on a *disconnected*
-    /// port the queue gate refuses it (asynManager.c:1547-1552) and the fields
+    /// port the queue gate refuses it (asynManager.c:1549-1554) and the fields
     /// stay blank, while the option readback — which does carry the waiver
     /// (:1277-1280) — still fills in.
     #[test]
@@ -13031,7 +13307,7 @@ A.OEOS
             // What this test is about is the *other* side of that line: a request
             // that DID run must end in the tail.
             let handle = rec.device_user.device().unwrap().handle.clone();
-            handle.set_auto_connect_blocking(-1, false).unwrap();
+            handle.set_auto_connect(-1, false).unwrap();
 
             // Now the operator puts the field. Whatever the arm does with it, C's
             // callback ends in `monitorStatus`.
@@ -13040,7 +13316,7 @@ A.OEOS
             assert_eq!(
                 rec.auct, 0,
                 "{field}: monitorStatus re-imports AUCT from isAutoConnect \
-                 (asynRecord.c:1084-1088) at the tail of every arm (:897)"
+                 (asynRecord.c:1085-1089) at the tail of every arm (:897)"
             );
         }
     }

@@ -78,7 +78,7 @@ impl PortRegistry {
             Entry::Vacant(slot) => {
                 // C `registerPort` builds the port's `dpCommon` and records
                 // its attributes in the same call that adds it to the port
-                // list (asynManager.c:2045-2095), so the trace facility can
+                // list (asynManager.c:2047-2097), so the trace facility can
                 // never be asked about a port whose `ASYN_MULTIDEVICE` bit it
                 // does not know. This is the one site that claims a name in
                 // this process, so it is the one place that has to say so.

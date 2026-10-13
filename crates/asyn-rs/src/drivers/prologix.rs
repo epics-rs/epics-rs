@@ -892,7 +892,7 @@ mod tests {
     /// the shared TCP link only for `address < 0` (:226-230) and announces on
     /// the caller's user (:231). Both resolve `findDpCommon` off that user, so
     /// they mark and fan out on exactly one device (asynManager.c:2151-2159,
-    /// :2174-2185). The bridge's TCP link is shared by every GPIB address, so
+    /// :2176-2187). The bridge's TCP link is shared by every GPIB address, so
     /// publishing the port edge from a device transition would misreport the
     /// whole bus.
     #[test]

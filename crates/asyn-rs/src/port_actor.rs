@@ -62,7 +62,7 @@ impl ActorId {
     }
 }
 
-/// Which refusals C's `queueRequest` gate (asynManager.c:1541-1552) applies
+/// Which refusals C's `queueRequest` gate (asynManager.c:1543-1554) applies
 /// to this request on a port that is (`multi_device`) or is not
 /// `ASYN_MULTIDEVICE`. `None` — C never queues it, so no gate runs.
 pub(crate) fn queue_gate(
@@ -80,9 +80,9 @@ pub(crate) fn queue_gate(
     }
 }
 
-/// C `queueRequest`'s refusals (asynManager.c:1538-1552), made before `op` is
+/// C `queueRequest`'s refusals (asynManager.c:1538-1554), made before `op` is
 /// queued. Its dequeue counterpart does not refuse: the port thread leaves a
-/// request queued on a port that went down after it (:808-810, :856-861).
+/// request queued on a port that went down after it (:808-810, :858-863).
 pub(crate) fn queue_request_gate(
     gate: &QueueGate,
     op: &RequestOp,
@@ -104,6 +104,7 @@ pub(crate) struct ActorLink {
     /// The queue the actor drains [`RequestCell`]s from.
     pub(crate) cells: Arc<CellQueue>,
     pub(crate) gate: QueueGate,
+    pub(crate) devices: crate::port::DeviceTable,
 }
 
 impl ActorLink {
@@ -117,6 +118,7 @@ impl ActorLink {
             id: ActorId::new(),
             cells,
             gate: QueueGate::open(),
+            devices: crate::port::DeviceTable::detached(),
         }
     }
 }
@@ -243,7 +245,7 @@ impl ActorMessage {
         self.refuse(AsynError::QueueTimeout { port });
     }
 
-    /// The dequeue (asynManager.c:889-891).
+    /// The dequeue (asynManager.c:894-895).
     fn claim(&self) -> Claim {
         match &self.op {
             RequestOp::Cell(cell) => cell.claim(self.seq),
@@ -253,7 +255,7 @@ impl ActorMessage {
     }
 
     /// It left the queue on another clock and was reported there — C's timer
-    /// unlinked it (asynManager.c:663-672), so the port thread never sees it.
+    /// unlinked it (asynManager.c:666-676), so the port thread never sees it.
     fn is_gone(&self) -> bool {
         match &self.op {
             RequestOp::Cell(cell) => cell.is_gone(self.seq),
@@ -290,7 +292,7 @@ impl Drop for FinishGuard {
 // Heap ordering: higher priority first, then lower seq (strict FIFO
 // within a priority). C asynManager queues each priority as a FIFO list
 // (queueRequest ellAdd to the queueList[priority] tail; portThread walks
-// ellFirst->ellNext, asynManager.c:1613/869-898) — a request's
+// ellFirst->ellNext, asynManager.c:1615/871-900) — a request's
 // timeout never reorders it relative to same-priority peers. An earlier
 // deadline-based tiebreaker let a later-submitted request with a shorter
 // timeout jump ahead of an earlier one, violating that FIFO.
@@ -327,9 +329,9 @@ enum CDispatch {
     /// C performs it as a direct call — no `queueRequest`, so no queue gate, and
     /// no queue for the block holder to divert it into. These are `pasynManager`'s
     /// own entry points, which take `asynManagerLock`, act and return: `enable`
-    /// (asynManager.c:2222-2249), `autoConnectAsyn` (:2310-2324),
-    /// `isConnected`/`isEnabled`/`isAutoConnect` (:2326-2368),
-    /// `blockProcessCallback` (:1692-1723), `shutdownPort`, `interposeInterface`.
+    /// (asynManager.c:2224-2251), `autoConnectAsyn` (:2312-2329),
+    /// `isConnected`/`isEnabled`/`isAutoConnect` (:2331-2373),
+    /// `blockProcessCallback` (:1694-1725), `shutdownPort`, `interposeInterface`.
     ///
     /// The gate must not run on them: a port disabled with `asynEnable(port,0)`
     /// could never be re-enabled if the enable itself had to pass the enabled
@@ -339,16 +341,16 @@ enum CDispatch {
     /// queue *before* it consults any connected flag (`portThread`,
     /// asynManager.c:811-855) — so the *connected* refusal is waived. `enabled`
     /// still binds: the same thread refuses to run anything at all on a disabled
-    /// port (:806-809), which is why a `CNCT=1` put cannot open the device
+    /// port (:808-811), which is why a `CNCT=1` put cannot open the device
     /// connection of a port disabled precisely to keep the IOC off the hardware
     /// (R12-48).
     ///
     /// The block holder cannot divert these either: the Connect queue is drained
     /// ahead of the lower-priority loop it gates, with no block check.
     ConnectQueue,
-    /// C hands it to `queueRequest` (asynManager.c:1517-1552), so C's gate runs.
+    /// C hands it to `queueRequest` (asynManager.c:1517-1554), so C's gate runs.
     /// Its two refusals are **independent**: `!pport->dpc.enabled → asynDisabled`
-    /// (:1541-1546) is unconditional, and only `checkPortConnect` is conditioned
+    /// (:1543-1548) is unconditional, and only `checkPortConnect` is conditioned
     /// on the priority and reason (:1538-1540). The request's own user
     /// ([`AsynUser::connect_check`]) selects the connected waiver;
     /// [`crate::port::PortDriverBase::check_queue`] enforces the split, so nothing can waive
@@ -356,12 +358,12 @@ enum CDispatch {
     ///
     /// This is also the only class the block holder can stall: C's
     /// `pblockProcessHolder` gates exactly the `processUser` dispatch in the port
-    /// thread's lower-priority loop (:887-895).
+    /// thread's lower-priority loop (:889-897).
     Queued,
 }
 
 /// Which `dpCommon` a request resolves to — C `findDpCommon`
-/// (asynManager.c:536-543). `locateDevice` (:574) hands back NULL unless the
+/// (asynManager.c:538-545). `locateDevice` (:576) hands back NULL unless the
 /// port carries `ASYN_MULTIDEVICE`, so an addr names a device only there;
 /// everywhere else the port's own `dpCommon` is the one and only slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -401,7 +403,7 @@ impl BlockHolders {
     }
 
     /// C's eligibility test, verbatim: **both** holders must be NULL or this
-    /// user (asynManager.c:887-890). One holder alone is never enough to admit
+    /// user (asynManager.c:889-892). One holder alone is never enough to admit
     /// a request, and never enough to refuse one.
     fn admits(&self, token: Option<u64>, dp: DpKey) -> bool {
         let free = |h: Option<&(u64, u32)>| match h {
@@ -412,9 +414,9 @@ impl BlockHolders {
     }
 
     /// The holder a block/unblock at this scope owns. `all_devices` is C's
-    /// argument to `blockProcessCallback` (asynManager.c:1692); the `dpCommon`
+    /// argument to `blockProcessCallback` (asynManager.c:1694); the `dpCommon`
     /// it names when the answer is "not all" comes from the user's own device,
-    /// exactly as `findDpCommon(puserPvt)` reads it (:1765).
+    /// exactly as `findDpCommon(puserPvt)` reads it (:1766).
     fn holder(&self, all_devices: bool, dp: DpKey) -> Option<(u64, u32)> {
         if all_devices {
             self.port
@@ -446,7 +448,7 @@ impl BlockHolders {
 pub(crate) struct PortActor {
     id: ActorId,
     driver: Box<dyn PortDriver>,
-    /// C's port queue, as unbounded as its `ellAdd` list (asynManager.c:1613):
+    /// C's port queue, as unbounded as its `ellAdd` list (asynManager.c:1615):
     /// the only refusal a sender can meet is the actor being gone.
     rx: mpsc::UnboundedReceiver<ActorMessage>,
     /// The other way a request reaches this actor: a [`RequestCell`] queued
@@ -455,8 +457,8 @@ pub(crate) struct PortActor {
     heap: BinaryHeap<ActorMessage>,
     /// C keeps **two** block holders, and the drain gate requires both to be
     /// NULL-or-me before a request is eligible (asynManager.c:889-892):
-    /// `pport->pblockProcessHolder` (set when `blockPortCount > 0`, :929-930)
-    /// and `pdpCommon->pblockProcessHolder` (`blockDeviceCount > 0`, :931-932).
+    /// `pport->pblockProcessHolder` (set when `blockPortCount > 0`, :931-932)
+    /// and `pdpCommon->pblockProcessHolder` (`blockDeviceCount > 0`, :933-934).
     /// devGpib takes the device form for an SRQ transaction
     /// (devSupportGpib.c:1216), so a port-wide-only model stalls every other
     /// GPIB address on the port for the duration.
@@ -469,7 +471,7 @@ pub(crate) struct PortActor {
     /// is that "still queued, not yet eligible" half of C's queue list; the heap
     /// is the eligible half (R15-47).
     parked: Vec<ActorMessage>,
-    /// C `pport->queueStateChange` (asynManager.c:868, 1615): something happened
+    /// C `pport->queueStateChange` (asynManager.c:870, 1617): something happened
     /// that could make a parked request eligible, so the queue must be rescanned.
     /// Set by an arriving request and by a request that ran (either can enable a
     /// device); *not* by a re-park, which is what keeps the loop from spinning on
@@ -477,10 +479,10 @@ pub(crate) struct PortActor {
     rescan_parked: bool,
     /// C `pport->notifyPortThread` (asynManager.c:217) — the binary event C's
     /// `portThread` waits on. It is signalled from exactly five places
-    /// (`queueRequest` :1626, `announceExceptionOccurred` :636,
-    /// `queueTimeoutCallback` :700, `cancelRequest` :1688,
-    /// `unblockProcessCallback` :1772) and everything the woken thread does —
-    /// draining the queues, and the port-level auto-connect at :856-861 — is
+    /// (`queueRequest` :1628, `announceExceptionOccurred` :638,
+    /// `queueTimeoutCallback` :702, `cancelRequest` :1690,
+    /// `unblockProcessCallback` :1774) and everything the woken thread does —
+    /// draining the queues, and the port-level auto-connect at :858-863 — is
     /// downstream of one of them.
     ///
     /// The actor's loop is woken by *any* message, status queries included, so
@@ -496,18 +498,16 @@ pub(crate) struct PortActor {
     /// [`Self::take_port_thread_wake`] is the one reader of both halves.
     ///
     /// Four of C's five signal sites set this or the exception count; the fifth,
-    /// `cancelRequest` (:1688), has no actor-side site to set it from — a cancel
-    /// is a [`CancelToken`] flip on the *caller's* thread, and the actor learns
-    /// of it when it pops the request. It sends no message, so it wakes nothing,
-    /// which is the same end state C's woken thread reaches: it rescans a queue
-    /// that lost one entry.
+    /// `cancelRequest` (:1690), is on the *caller's* thread and pokes the queue
+    /// (`CellQueue::poke`), and [`Self::drop_left`], dropping the cancelled
+    /// entry the actor still held, sets it.
     woken: bool,
     /// The port's announced-exception count as of the last
     /// [`Self::take_port_thread_wake`] — the memory that turns a monotonic
     /// counter back into C's edge-triggered signal.
     seen_exceptions: u64,
     /// The announced-exception count as of the last parked rescan: a port that
-    /// came back or was re-enabled is an exception (asynManager.c:2247), and C's
+    /// came back or was re-enabled is an exception (asynManager.c:2249), and C's
     /// port thread rescans its whole queue on every wake.
     rescanned_exceptions: u64,
 }
@@ -563,6 +563,7 @@ impl PortActor {
             id: self.id,
             cells: Arc::clone(&self.cells),
             gate: self.driver.base().queue_gate(),
+            devices: self.driver.base().device_table(),
         }
     }
 
@@ -657,7 +658,7 @@ impl PortActor {
                     // autonomous reconnect work with NO queued traffic (C's
                     // connect timer fires on its own timer queue and posts a
                     // Connect-priority request to the port thread,
-                    // asynManager.c:3252-3266); here the actor IS the port
+                    // asynManager.c:3283-3297); here the actor IS the port
                     // thread, so it wakes itself.
                     let retry_at = self.driver.base().connect_retry_at;
                     let cells = Arc::clone(&self.cells);
@@ -670,7 +671,7 @@ impl PortActor {
                             }
                         }
                         // C `queueRequest`'s `epicsEventSignal`
-                        // (asynManager.c:1626) for a queued cell.
+                        // (asynManager.c:1628) for a queued cell.
                         _ = cells.pushed() => {}
                         signal = shutdown_rx.recv(), if can_be_shut_down => {
                             match signal {
@@ -706,15 +707,15 @@ impl PortActor {
     }
 
     /// C `portConnectTimerCallback` + `portConnectProcessCallback`
-    /// (asynManager.c:3252-3283), collapsed into one step because the actor
+    /// (asynManager.c:3283-3314), collapsed into one step because the actor
     /// is both the timer's consumer and the port thread the callback would
     /// have queued onto.
     ///
     /// C's timer callback re-checks `!connected && autoConnect` before
-    /// queueing (:3258) — the port may have come back since the timer was
-    /// armed — and the process callback re-checks `isConnected` again (:3278)
+    /// queueing (:3289) — the port may have come back since the timer was
+    /// armed — and the process callback re-checks `isConnected` again (:3309)
     /// before calling `pasynCommon->connect`. On failure it re-arms at
-    /// `secondsBetweenPortConnect` (:3281), which is the 20 s retry loop that
+    /// `secondsBetweenPortConnect` (:3312), which is the 20 s retry loop that
     /// keeps a dead link trying forever.
     ///
     /// The re-arm decision keys on the port still being disconnected rather
@@ -728,7 +729,7 @@ impl PortActor {
             _ => return,
         }
         // C's timer callback reaches the port thread through `queueRequest`
-        // (:3259), so the retry is one of the five wakes — the pass it starts is
+        // (:3290), so the retry is one of the five wakes — the pass it starts is
         // allowed to end in the port-level auto-connect
         // ([`Self::port_thread_auto_connect`]) even with no traffic on the port.
         self.woken = true;
@@ -737,16 +738,16 @@ impl PortActor {
         // edge, and a stale deadline left behind here would spin the loop.
         self.driver.base_mut().connect_retry_at = None;
 
-        // C :3258 — the port reconnected (or auto-connect was turned off)
+        // C :3289 — the port reconnected (or auto-connect was turned off)
         // while the timer was pending: nothing to do.
         if self.driver.base().is_connected() || !self.driver.base().is_auto_connect() {
             return;
         }
 
-        // C :3259 — the callback does not call `pasynCommon->connect`, it posts
+        // C :3290 — the callback does not call `pasynCommon->connect`, it posts
         // a `queueRequest`, so the gate runs. A refusal (`asynDisabled` from
-        // :1541-1546) means `portConnectProcessCallback` never runs, and it is
-        // the *only* thing that re-arms the timer (:3281): `asynEnable(port,0)`
+        // :1543-1548) means `portConnectProcessCallback` never runs, and it is
+        // the *only* thing that re-arms the timer (:3312): `asynEnable(port,0)`
         // stops the retry loop dead, and a `shutdownPort`ed port never touches
         // the hardware again. So: no attempt, and no re-arm.
         if self.connect_gate().is_err() {
@@ -756,7 +757,7 @@ impl PortActor {
         // Addr -1: this is the *port's* attempt. C derives it as
         // `addr = (pdevice ? pdevice->addr : -1)` in `connectAttempt`
         // (asynManager.c:752), and the port-level caller passes
-        // `&pport->dpc`, i.e. no device (:716). A driver that reads the
+        // `&pport->dpc`, i.e. no device (:718). A driver that reads the
         // address — prologix branches on it exactly as C's `prologixConnect`
         // does — must not see this as a device 0 connect.
         let _ = self.driver.connect(&AsynUser::default().with_addr(-1));
@@ -766,14 +767,14 @@ impl PortActor {
         // the two paths interleave the same way — the timer's queued callback
         // runs, and `portThread` then reaches `autoConnectDevice(pport,0)`
         // (asynManager.c:856-861), whose `connectAttempt` stamps
-        // `lastConnectDisconnect` (:718) — so the window ends up anchored at the
+        // `lastConnectDisconnect` (:720) — so the window ends up anchored at the
         // attempt either way.
         self.driver
             .base_mut()
             .stamp_auto_connect_attempt(-1, Instant::now());
 
         if !self.driver.base().is_connected() {
-            // Still down — back off and try again (C :3281).
+            // Still down — back off and try again (C :3312).
             let retry = self.driver.base().seconds_between_port_connect;
             self.driver.base_mut().connect_retry_at = Some(Instant::now() + retry);
         }
@@ -785,8 +786,8 @@ impl PortActor {
     ///
     /// It runs on **every** wake, and an exception announcement is such a wake:
     /// `announceExceptionOccurred` signals `notifyPortThread` for every
-    /// exception on a CANBLOCK port (:635-636), and `enable` ends in
-    /// `exceptionOccurred` (:2247). That — not any re-arm inside the enable
+    /// exception on a CANBLOCK port (:637-638), and `enable` ends in
+    /// `exceptionOccurred` (:2249). That — not any re-arm inside the enable
     /// itself — is what makes `asynEnable(port,1)` bring a down port back up in
     /// C. The Rust actor previously had only the disconnect-EDGE retry timer as
     /// an autonomous connect path, so a port disabled while down stayed down
@@ -794,8 +795,8 @@ impl PortActor {
     ///
     /// What it does *not* run on is a pass C's thread would never have taken. C
     /// waits on `notifyPortThread` and only the five signal sites listed on
-    /// [`Self::woken`] reach it; `isConnected` (:2326-2337), `isEnabled` (:2340),
-    /// `isAutoConnect` (:2356) and `report` (:1136) are plain reads under
+    /// [`Self::woken`] reach it; `isConnected` (:2331-2342), `isEnabled` (:2345),
+    /// `isAutoConnect` (:2361) and `report` (:1138) are plain reads under
     /// `asynManagerLock` and signal nothing. Here every one of them is a message,
     /// and a message wakes the actor — so the wake latch, not the message, is
     /// what gates this tail (R16-46). Without it a status poller dials the
@@ -812,7 +813,7 @@ impl PortActor {
         self.auto_connect_port();
     }
 
-    /// C `epicsEventMustWait(pport->notifyPortThread)` (asynManager.c:804) —
+    /// C `epicsEventMustWait(pport->notifyPortThread)` (asynManager.c:806) —
     /// consume the wake and say whether there was one. The two halves are the
     /// latch the actor sets at C's signal sites ([`Self::woken`]) and the port's
     /// announced-exception count, which catches the announcements C signals for
@@ -829,6 +830,7 @@ impl PortActor {
     }
 
     fn drain_channel(&mut self) {
+        self.driver.base_mut().drain_announces();
         while let Ok(msg) = self.rx.try_recv() {
             self.enqueue_message(msg);
         }
@@ -862,7 +864,7 @@ impl PortActor {
     /// queue timer's (`RequestCell::expire`) or a waiter's own — which C's
     /// `queueTimeoutCallback` unlinks from wherever they sit: behind other
     /// requests, parked behind a disabled device, or held by a block
-    /// (asynManager.c:663-672). Its signal (:700) is what wakes this pass.
+    /// (asynManager.c:666-676). Its signal (:702) is what wakes this pass.
     fn drop_left(&mut self) {
         if !self.cells.take_left() {
             return;
@@ -876,22 +878,22 @@ impl PortActor {
     /// The gate every connect attempt the actor makes *on its own initiative*
     /// passes — the retry timer and both auto-connect levels. It is the same
     /// gate a request passes, asked on behalf of the connect user C builds for
-    /// the port (`pport->pconnectUser`, asynManager.c:3226-3231): `addr == -1` at
+    /// the port (`pport->pconnectUser`, asynManager.c:3257-3262): `addr == -1` at
     /// Connect priority, so `checkPortConnect` is `FALSE` (:1538-1540) and only
-    /// the unconditional enabled/defunct half binds (:1541-1546).
+    /// the unconditional enabled/defunct half binds (:1543-1548).
     ///
     /// Nothing in C reaches `pasynCommon->connect` without it — the timer
-    /// callback goes through `queueRequest` (:3259), and `portThread` refuses to
+    /// callback goes through `queueRequest` (:3290), and `portThread` refuses to
     /// run anything at all on a disabled port, its own `autoConnectDevice`
-    /// included (:806-809). Routing every attempt through the one gate is what
+    /// included (:808-811). Routing every attempt through the one gate is what
     /// makes `asynEnable(port,0)` stop the hardware retries, rather than merely
     /// stop the reads that ride on them.
     fn connect_gate(&self) -> AsynResult<()> {
         self.driver.base().check_queue(-1, ConnectCheck::Waived)
     }
 
-    /// C `reportPrintPort` (asynManager.c:1018-1122): the *manager's* report of a
-    /// port, printed before the driver's own `pasynCommon->report` (:1121-1123).
+    /// C `reportPrintPort` (asynManager.c:1020-1124): the *manager's* report of a
+    /// port, printed before the driver's own `pasynCommon->report` (:1123-1125).
     ///
     /// The manager block is the manager's to print, not the driver's — in C no
     /// driver prints its port's queue depth, enable state or trace masks, because
@@ -902,17 +904,17 @@ impl PortActor {
     /// (`numberConnects`), which interposes are stacked on it.
     ///
     /// C's shape, kept: a negative `details` suppresses the per-address block
-    /// (:1032-1035); `details >= 1` adds the state / queue / lock / exception /
+    /// (:1034-1037); `details >= 1` adds the state / queue / lock / exception /
     /// trace lines; `details >= 2` adds the interface lists; a destroyed port
-    /// prints one line and nothing else, driver included (:1038-1042) — its
+    /// prints one line and nothing else, driver included (:1040-1044) — its
     /// interfaces are gone. Disabled and disconnected are *not* such states: they
     /// report, as `enabled:No` / `connected:No`.
     fn report_port(&self, details: i32) {
         use std::io::Write as _;
         let mut out = self.manager_report(details);
-        // C ends by calling the port's `asynCommon->report` (:1113-1122) — the
+        // C ends by calling the port's `asynCommon->report` (:1115-1124) — the
         // driver's own detail, and only that. A destroyed port's interfaces are
-        // gone, so C never reaches it (:1038-1042).
+        // gone, so C never reaches it (:1040-1044).
         if !self.driver.base().is_defunct() {
             self.driver.report(&mut out, details.abs());
         }
@@ -957,7 +959,7 @@ impl PortActor {
                 yn(base.is_connected()),
                 base.number_connects
             );
-            // C counts every priority's queue (:1036-1037) and asks whether a
+            // C counts every priority's queue (:1038-1039) and asks whether a
             // `blockProcessCallback` holder owns the port (:1063). Both are the
             // actor's state: the heap is the queue, `block_holders` the holders, and
             // the requests held back behind the block or a disabled device are
@@ -966,19 +968,19 @@ impl PortActor {
             let _ = writeln!(
                 out,
                 "    nDevices {} nQueued {} blocked:{}",
-                base.device_states.len(),
+                base.devices().len(),
                 self.heap.len() + self.pending_while_blocked.len() + self.parked.len(),
                 yn(self.block_holders.any_held())
             );
             // C try-locks the two port mutexes from a *separate* report thread, so
-            // a port thread stuck inside a driver call shows `Yes` (:1049-1070).
+            // a port thread stuck inside a driver call shows `Yes` (:1051-1072).
             // The actor model has neither mutex: the driver is reachable only from
             // the actor thread, and this report *is* the actor's current request —
             // so if it prints at all, the actor is not inside a driver call. A
             // wedged driver is visible instead as a report that never prints.
             let _ = writeln!(out, "    asynManagerLock:No synchronousLock:No");
             // C's `exceptionActive` is set while `exceptionOccurred` is fanning
-            // out (:2050-2070) and its notify list holds the users waiting on that
+            // out (:2052-2072) and its notify list holds the users waiting on that
             // fan-out. Rust announces synchronously from the transition owner with
             // no deferred list, so on the actor thread neither can be pending; the
             // user count is the real number of registered callbacks.
@@ -995,7 +997,7 @@ impl PortActor {
         }
         if details >= 2 {
             // C prints the two interface lists by `interfaceType`
-            // (`reportPrintInterfaceList`, :993-1005). The pointers it prints with
+            // (`reportPrintInterfaceList`, :995-1007). The pointers it prints with
             // them have no Rust analogue; the type names do. Every octet interpose
             // registers `asynOctet` — that is what makes it an interpose of the
             // octet interface.
@@ -1023,11 +1025,8 @@ impl PortActor {
         if show_devices {
             // C walks the devices it has created and prints the disconnected ones
             // even at `details == 0` — a down device is what the operator is
-            // looking for (:1081-1094).
-            let mut addrs: Vec<i32> = base.device_states.keys().copied().collect();
-            addrs.sort_unstable();
-            for addr in addrs {
-                let ds = &base.device_states[&addr];
+            // looking for (:1083-1096).
+            for (addr, ds) in base.devices() {
                 if !ds.connected() || details >= 1 {
                     let _ = writeln!(
                         out,
@@ -1064,7 +1063,7 @@ impl PortActor {
     }
 
     /// The port's (or one device's) trace masks, as `reportPrintPort` prints them
-    /// (asynManager.c:1072-1074, :1099-1101). A port registered without a trace
+    /// (asynManager.c:1072-1074, :1101-1103). A port registered without a trace
     /// manager has no masks to print, which is C's zero-initialised `dpCommon.trace`.
     fn trace_masks(&self, addr: Option<i32>) -> (u32, u32, u32) {
         let base = self.driver.base();
@@ -1072,7 +1071,7 @@ impl PortActor {
             return (0, 0, 0);
         };
         // `snapshot` is the single owner of C's `findTracePvt` fallback chain —
-        // device, else port, else global (asynManager.c:546-551) — so the report
+        // device, else port, else global (asynManager.c:548-553) — so the report
         // prints the masks the port actually traces with.
         let snap = trace.snapshot(Some(&base.port_name), addr);
         (
@@ -1119,13 +1118,13 @@ impl PortActor {
             // record bound to a down driver resolve its DRVINFO to reason 0
             // (R13-48).
             | RequestOp::DrvUserCreate { .. }
-            // `report` (asynManager.c:1136-1171) spawns a `reportPort` thread and
-            // calls `pasynCommon->report(drvPvt, fp, details)` directly (:1121-1123).
+            // `report` (asynManager.c:1138-1173) spawns a `reportPort` thread and
+            // calls `pasynCommon->report(drvPvt, fp, details)` directly (:1123-1125).
             // No queue, no gate: a disabled port reports `enabled:No`, a
-            // disconnected one `connected:No` (:1057-1060). The diagnostic you
+            // disconnected one `connected:No` (:1059-1062). The diagnostic you
             // reach for *because* the port is down must not be the one the down
             // port refuses (W10-D6). The one state C will not report on is a
-            // destroyed port, handled in the dispatch arm (:1038-1042).
+            // destroyed port, handled in the dispatch arm (:1040-1044).
             | RequestOp::Report { .. }
             // `asynPortDriver::lock()` (asynPortDriver.cpp:3858) is a mutex take
             // on the driver's own thread: no `queueRequest`, no connected or
@@ -1194,7 +1193,7 @@ impl PortActor {
     }
 
     /// The `dpCommon` an `addr` names on THIS port — C `findDpCommon`
-    /// through `locateDevice` (asynManager.c:536-543, :574).
+    /// through `locateDevice` (asynManager.c:538-545, :576).
     fn dp_key(&self, addr: i32) -> DpKey {
         DpKey::of(self.driver.base().flags.multi_device, addr)
     }
@@ -1215,7 +1214,7 @@ impl PortActor {
 
     fn enqueue_message(&mut self, msg: ActorMessage) {
         // C `queueRequest` sets `pport->queueStateChange` and signals the port
-        // thread (asynManager.c:1615, 1626) — the queue changed, so anything the
+        // thread (asynManager.c:1615, 1628) — the queue changed, so anything the
         // thread had skipped is looked at again.
         self.rescan_parked = true;
         // …and the signal is `queueRequest`'s, so only what C *queues* raises it.
@@ -1223,7 +1222,7 @@ impl PortActor {
         // `isAutoConnect`, `report`, `enable`, `blockProcessCallback` — takes
         // `asynManagerLock`, acts and returns without touching the event
         // ([`CDispatch::Direct`]). Those that nonetheless end in an exception
-        // (`enable` → `exceptionOccurred`, :2247) wake the thread through the
+        // (`enable` → `exceptionOccurred`, :2249) wake the thread through the
         // exception count, not through here.
         if Self::c_dispatch(&msg.op) != CDispatch::Direct {
             self.woken = true;
@@ -1247,7 +1246,7 @@ impl PortActor {
         };
 
         // The queue-wait deadline is not the port thread's: C's timer thread
-        // unlinks the request (asynManager.c:649-701) while this thread may be
+        // unlinks the request (asynManager.c:649-703) while this thread may be
         // inside the driver, and so does `RequestCell::expire` or the waiter's
         // own timer here. A deadline, an `AQR` cancel and the dequeue below race
         // through one CAS on the token, and exactly one of them wins.
@@ -1257,9 +1256,9 @@ impl PortActor {
 
         // Everything down to `begin_running` is C's *queued* phase — the request
         // is still on the queue there, which is what lets a disabled device's
-        // request stay on it (:875).
+        // request stay on it (:877).
 
-        // The queue gate — C `queueRequest` (asynManager.c:1541-1552).
+        // The queue gate — C `queueRequest` (asynManager.c:1543-1554).
         // [`queue_gate`] says whether it runs at all (C queues this op or
         // performs it as a direct manager call) and, when it does, which of its
         // two independent refusals the request may waive. The *connected* waiver
@@ -1280,7 +1279,7 @@ impl PortActor {
         // connection state with no request of its own having run. Its `connected`
         // is the owner's cell, so the gate below already reads the truth; what is
         // still owed is the edge C's listener publishes explicitly when it hands
-        // the child a socket (`connectDevice`, drvAsynIPServerPort.c:358-360):
+        // the child a socket (`connectDevice`, drvAsynIPServerPort.c:372-375):
         // the `exceptionConnect` fan-out and the interpose stack's reset, which
         // drops the previous client's EOS read-ahead. Every other port is already
         // in sync here (its own `set_connected` published the edge), so this is a
@@ -1292,7 +1291,7 @@ impl PortActor {
             // C drains the Connect queue *before* `autoConnectDevice`
             // (asynManager.c:811-855): a waived request runs on the dead line
             // with no connect attempt in front of it. The attempt C makes
-            // *after* that drain (:856-861) is the actor loop's.
+            // *after* that drain (:858-863) is the actor loop's.
             if connect == ConnectCheck::Required {
                 self.auto_connect_device(msg.user.addr, msg.user.reason);
             }
@@ -1300,7 +1299,7 @@ impl PortActor {
             // on its caller's thread. A port disabled or down since then is the
             // port thread's to answer, and it answers by leaving the request
             // queued until the state changes back or its timer fires (:808-810,
-            // :856-861).
+            // :858-863).
             if self.driver.base().queue_gate().check(connect).is_err() {
                 self.parked.push(msg);
                 return;
@@ -1316,7 +1315,7 @@ impl PortActor {
             //
             // The scope is the requests C leaves in the lower-priority loop: the
             // Connect-priority queue is drained above it with no device checks at
-            // all (:811-855), and every waived request C queues rides that queue
+            // all (:813-857), and every waived request C queues rides that queue
             // (asynShellCommands.c:127,174,245,296; asynRecord.c:562-571). Hence
             // `Queued` dispatch and a `Required` connect check — the same
             // requests, asked the same way.
@@ -1324,7 +1323,7 @@ impl PortActor {
                 && self.driver.base().flags.can_block
                 && Self::c_dispatch(&msg.op) == CDispatch::Queued
             {
-                // :875 `if(!pdpCommon->enabled) continue;` — the request keeps
+                // :877 `if(!pdpCommon->enabled) continue;` — the request keeps
                 // its place in the queue. It runs when the device is re-enabled,
                 // and its queue timer still expires under it if it never is.
                 if self
@@ -1339,12 +1338,12 @@ impl PortActor {
                 // :877-886 — auto-connect has already run above (C calls it at
                 // :877); a device still down diverts the request to its
                 // *timeout* callback rather than `processUser`, but only when
-                // one was registered (`:884` guards on `timeoutUser != 0`;
+                // one was registered (`:886` guards on `timeoutUser != 0`;
                 // `createAsynUser`'s second argument is optional —
                 // asynRecord.c:307-308 passes one, devAsynInt32.c:212 passes
                 // 0). A request that asked for a timeout always has one:
                 // `queueRequest` refuses `timeout > 0.0` without it
-                // (:1590-1595). Here the reply channel *is* that callback, so
+                // (:1592-1597). Here the reply channel *is* that callback, so
                 // the request reports the same queue timeout its own timer
                 // would.
                 if self
@@ -1353,7 +1352,7 @@ impl PortActor {
                     .check_device_connected(msg.user.addr)
                     .is_err()
                 {
-                    msg.time_out(self.driver.base().port_name.clone());
+                    msg.time_out(self.driver.base().port_name.to_string());
                     return;
                 }
             }
@@ -1362,7 +1361,7 @@ impl PortActor {
         // Claim the request for execution. This is the C dequeue under
         // `asynManagerLock` (:889-891): `begin_running` transitions the cancel
         // token `Queued -> Running`, which closes the window in which an `AQR`
-        // `cancelRequest` could report `wasQueued==1` (asynManager.c:1661-1666).
+        // `cancelRequest` could report `wasQueued==1` (asynManager.c:1663-1668).
         // It fails only if the request left the queue without running — an `AQR`
         // cancel, or a queue-wait deadline the *waiter* resolved first (the
         // async path arms its own timer, `PortHandle::submit_cancellable`) — in
@@ -1373,7 +1372,7 @@ impl PortActor {
             Claim::Left => {
                 let e = if msg.cancel.is_timed_out() {
                     AsynError::QueueTimeout {
-                        port: self.driver.base().port_name.clone(),
+                        port: self.driver.base().port_name.to_string(),
                     }
                 } else {
                     AsynError::Status {
@@ -1405,7 +1404,7 @@ impl PortActor {
         // `queueRequest`'s `timeout` argument, `AsynUser::queue_timeout` here).
 
         // A request ran, so the queue state may have moved (it could have enabled
-        // a device): C's `queueStateChange` rescan (:868). A *parked* request
+        // a device): C's `queueStateChange` rescan (:870). A *parked* request
         // does not set this — that is what keeps the loop from spinning on a
         // device that is still disabled.
         self.rescan_parked = true;
@@ -1413,7 +1412,7 @@ impl PortActor {
         // Connect the user to the port it is about to run on, so every layer the
         // request passes through can trace through it — C's `pasynUser →
         // pport/pdevice` linkage, which `asynPrint`/`asynPrintIO` resolve the
-        // trace config from (`findTracePvt`, asynManager.c:546-551). The actor
+        // trace config from (`findTracePvt`, asynManager.c:548-553). The actor
         // is the single owner of the linkage: an interpose has no other handle on
         // the port, and a user that never reached a port traces nothing.
         user.trace = self.user_trace();
@@ -1452,7 +1451,7 @@ impl PortActor {
         let base = self.driver.base();
         base.trace.as_ref().map(|manager| crate::user::UserTrace {
             manager: manager.clone(),
-            port: base.port_name.as_str().into(),
+            port: Arc::clone(&base.port_name),
         })
     }
 
@@ -1463,21 +1462,21 @@ impl PortActor {
     /// C reaches it two ways, and both are here: through `autoConnectDevice`
     /// when a queued request needs the line up, and straight from `portThread`
     /// with `pdevice = 0` once the Connect-priority queue has drained
-    /// (:856-861). One attempt per 2 s window either way
-    /// (`auto_connect_throttle_ok`, C :712-713), every attempt restarting the
+    /// (:858-863). One attempt per 2 s window either way
+    /// (`auto_connect_throttle_ok`, C :714-715), every attempt restarting the
     /// window whether it succeeded or failed (`stamp_auto_connect_attempt`,
-    /// C :718).
+    /// C :720).
     ///
-    /// Returns whether the port is connected afterwards (C's `:721` bail-out),
+    /// Returns whether the port is connected afterwards (C's `:723` bail-out),
     /// or `false` outright when [`Self::connect_gate`] refuses — the whole
-    /// device level below hangs off that `false` (:755), so one gate check
+    /// device level below hangs off that `false` (:724-740), so one gate check
     /// covers both levels.
     fn auto_connect_port(&mut self) -> bool {
         // C `portThread` re-applies the queue gate's unconditional refusal
         // before it reaches *either* `autoConnectDevice` call site:
-        // `if(!pport->dpc.enabled) continue;` (:806-809) sits above the
-        // Connect-queue drain, above `autoConnectDevice(pport,0)` (:856-861)
-        // and above the per-request one (:876-883).
+        // `if(!pport->dpc.enabled) continue;` (:808-811) sits above the
+        // Connect-queue drain, above `autoConnectDevice(pport,0)` (:858-863)
+        // and above the per-request one (:878-885).
         if self.connect_gate().is_err() {
             return false;
         }
@@ -1492,7 +1491,7 @@ impl PortActor {
             // Addr -1: this is the *port's* attempt. C derives it as
             // `addr = (pdevice ? pdevice->addr : -1)` in `connectAttempt`
             // (asynManager.c:752), and the port-level caller passes
-            // `&pport->dpc`, i.e. no device (:716). A driver that reads the
+            // `&pport->dpc`, i.e. no device (:718). A driver that reads the
             // address — prologix branches on it exactly as C's `prologixConnect`
             // does — must not see this as a device 0 connect.
             let _ = self.driver.connect(&AsynUser::default().with_addr(-1));
@@ -1503,12 +1502,12 @@ impl PortActor {
         self.driver.base().is_connected()
     }
 
-    /// C `autoConnectDevice` (asynManager.c:704-739) — the single owner of
+    /// C `autoConnectDevice` (asynManager.c:706-741) — the single owner of
     /// every auto-connect attempt, port-level and device-level.
     ///
     /// The order is the whole point: C reconnects the **port** first
-    /// (`connectAttempt(&pport->dpc)` at :716) and bails out if the port is
-    /// still down (:721), only then reconnecting the device (:723-737). A
+    /// (`connectAttempt(&pport->dpc)` at :718) and bails out if the port is
+    /// still down (:723), only then reconnecting the device (:725-739). A
     /// multi-device port that skipped straight to the device would never
     /// reopen its transport — `PortDriver::connect_addr`'s default just
     /// flips the per-address `connected` flag (port.rs) and opens no socket,
@@ -1516,30 +1515,30 @@ impl PortActor {
     /// forever.
     ///
     /// Both levels are throttled to one attempt per 2 s window
-    /// (`auto_connect_throttle_ok`, C :712-713 / :729-730), and every attempt
+    /// (`auto_connect_throttle_ok`, C :714-715 / :731-732), and every attempt
     /// restarts the window whether it succeeded or failed
-    /// (`stamp_auto_connect_attempt`, C :718 / :735) — so a burst of N queued
+    /// (`stamp_auto_connect_attempt`, C :720 / :737) — so a burst of N queued
     /// requests to an offline port fires one attempt, not N. A port whose
     /// throttle window has not elapsed gives up for this request exactly as C
-    /// does (`return FALSE` at :713), without falling through to the device.
+    /// does (`return FALSE` at :715), without falling through to the device.
     ///
     /// Returns whether the addressed device is connected afterwards. The
     /// single-threaded actor owns the driver throughout, so C's
     /// `autoConnectActive` re-entry guard has no observable analogue here.
     fn auto_connect_device(&mut self, addr: i32, reason: usize) -> bool {
-        // --- Port level (C :705-721). Runs for single- and multi-device
+        // --- Port level (C :707-723). Runs for single- and multi-device
         // ports alike: in C the port `dpCommon` is reconnected before any
         // device `dpCommon` is even looked at.
         if !self.auto_connect_port() {
-            // C :721 — the port is still down, so the device cannot come up.
+            // C :723 — the port is still down, so the device cannot come up.
             return false;
         }
         if !self.driver.base().flags.multi_device {
-            // C :722 `if(!pdevice) return TRUE`.
+            // C :724 `if(!pdevice) return TRUE`.
             return true;
         }
 
-        // --- Device level (C :723-737).
+        // --- Device level (C :725-739).
         let dev_disconnected = !self.driver.base().dp_connected(addr);
         let dev_auto = self.driver.base().dp_auto_connect(addr);
         if dev_disconnected && dev_auto {
@@ -1772,13 +1771,9 @@ impl PortActor {
             RequestOp::SetEnable { yes } => {
                 // C `enable(pasynUser, yesNo)` (asynManager.c:2224-2251):
                 // `findDpCommon` resolves the slot from the requesting user's
-                // addr (:538-545), so one op serves both scopes. Routed through
-                // the driver trait so subclasses can override.
-                if *yes {
-                    self.driver.enable(user)?;
-                } else {
-                    self.driver.disable(user)?;
-                }
+                // addr (:538-545), so one op serves both scopes. A manager
+                // call, not a driver method: no driver can override it.
+                self.driver.base_mut().set_addr_enabled(user.addr, *yes)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetAutoConnect { yes } => {
@@ -1970,7 +1965,7 @@ impl PortActor {
                         self.block_holders.set_holder(*all_devices, dp, None);
                         // C `unblockProcessCallback` signals the port thread only
                         // when the block was actually released (`wasOwner`,
-                        // asynManager.c:1772) — the nested decrement above leaves
+                        // asynManager.c:1774) — the nested decrement above leaves
                         // the port blocked and signals nothing.
                         self.woken = true;
                         // Only what the *remaining* holders now admit goes back
@@ -2165,8 +2160,8 @@ impl PortActor {
             RequestOp::Report { level } => {
                 // C parity: `asynManager::report` (asynManager.c:1136-1171) walks
                 // every registered port and hands each to `reportPrintPort`
-                // (:1018-1122), which prints the *manager's* view of the port and
-                // only then calls the driver's `pasynCommon->report` (:1121-1123).
+                // (:1020-1124), which prints the *manager's* view of the port and
+                // only then calls the driver's `pasynCommon->report` (:1123-1125).
                 // The iocsh wrapper (`asynReport`) does the per-port loop; here we
                 // dispatch the per-port report from the actor thread so the driver
                 // observes its own state under the actor's serial ownership.
@@ -2373,7 +2368,7 @@ mod tests {
         }
     }
 
-    /// Take a port through C's `shutdownPort` (asynManager.c:2251-2308) — the
+    /// Take a port through C's `shutdownPort` (asynManager.c:2253-2310) — the
     /// only way to reach the defunct state, which is what keeps the invariant
     /// `defunct ⟹ !enabled` true by construction (R15-50).
     /// A driver that is nothing but its base — for the tests that assert on what
@@ -2991,7 +2986,7 @@ mod tests {
     fn actor_dequeued_request_runs_despite_elapsed_timeout() {
         // C parity: a request that reaches the head of the queue always
         // executes I/O — the queue-wait timer (when armed at all) is
-        // cancelled at dequeue (asynManager.c:906), and standard device
+        // cancelled at dequeue (asynManager.c:908), and standard device
         // support passes queueRequest(..., 0.0) so no timer exists. The
         // I/O `user.timeout` must NOT abort a dequeued request just because
         // a slow predecessor delayed it past that budget.
@@ -3103,7 +3098,7 @@ mod tests {
 
         // Three reads already queued when the port dropped. Each dequeue, and
         // each rescan of the parked ones, asks autoConnectDevice
-        // (asynManager.c:877); the port never comes back, so they stay queued.
+        // (asynManager.c:879); the port never comes back, so they stay queued.
         let replies: Vec<_> = (0..3)
             .map(|_| send(&tx, RequestOp::Int32Read, AsynUser::new(0)))
             .collect();
@@ -3132,7 +3127,7 @@ mod tests {
     /// Boundary 1 (here): the waived request runs on the dead line AND the port
     /// connect attempt follows it.
     /// Boundary 2 (below): an explicit Disconnect is not undone by the same
-    /// pass — C's 2 s throttle (:712-713) anchors on the transition it just
+    /// pass — C's 2 s throttle (:714-715) anchors on the transition it just
     /// stamped.
     #[test]
     fn a_waived_request_is_followed_by_the_port_auto_connect() {
@@ -3225,12 +3220,12 @@ mod tests {
             connect_calls.load(Ordering::SeqCst),
             1,
             "C portThread runs autoConnectDevice(pport,0) once the Connect \
-             queue has drained (asynManager.c:856-861)"
+             queue has drained (asynManager.c:858-862)"
         );
     }
 
     /// Boundary 2 of the above: the auto-connect that follows a waived request
-    /// must not undo an explicit Disconnect. C's throttle (asynManager.c:712-713)
+    /// must not undo an explicit Disconnect. C's throttle (asynManager.c:714-715)
     /// refuses an attempt within 2 s of the last transition, and the Disconnect
     /// callback stamps that transition as it runs — so C's very next
     /// `autoConnectDevice(pport,0)` on the same pass returns FALSE.
@@ -3282,16 +3277,16 @@ mod tests {
             connect_calls.load(Ordering::SeqCst),
             0,
             "the transition the Disconnect just stamped keeps the auto-connect \
-             inside its 2 s window (asynManager.c:712-713)"
+             inside its 2 s window (asynManager.c:714-715)"
         );
     }
 
     /// C's **port-level** auto-connect reaches the driver with `addr == -1`:
     /// `autoConnectDevice` calls `connectAttempt(&pport->dpc)`
-    /// (asynManager.c:716) with `pdevice == 0`, and `connectAttempt` derives
-    /// `addr = (pdevice ? pdevice->addr : -1)` (:752) before handing that user
-    /// to `pasynCommon->connect` (:775). The device-level attempt is the
-    /// separate `connectAttempt(&pdevice->dpc)` (:733), which carries the real
+    /// (asynManager.c:718) with `pdevice == 0`, and `connectAttempt` derives
+    /// `addr = (pdevice ? pdevice->addr : -1)` (:754) before handing that user
+    /// to `pasynCommon->connect` (:777). The device-level attempt is the
+    /// separate `connectAttempt(&pdevice->dpc)` (:735), which carries the real
     /// address.
     ///
     /// `AsynUser::default()` carries `addr: 0` (user.rs:153). Passing it here
@@ -3342,8 +3337,8 @@ mod tests {
     }
 
     /// R6-49: C `autoConnectDevice` reconnects the PORT first
-    /// (`connectAttempt(&pport->dpc)`, asynManager.c:716) and only then the
-    /// device (:723-737). A multi-device port whose transport dropped used to
+    /// (`connectAttempt(&pport->dpc)`, asynManager.c:718) and only then the
+    /// device (:725-739). A multi-device port whose transport dropped used to
     /// call `connect_addr` alone — whose default merely flips the per-address
     /// flag and opens no socket — so the port-level `check_ready` rejected
     /// every subsequent request forever.
@@ -3351,7 +3346,7 @@ mod tests {
     /// Boundary 1 (here): the port's connect succeeds, so the device connect
     /// runs after it and the request goes through.
     /// Boundary 2 (below): the port's connect fails, so the device connect
-    /// must NOT run (C :721 `return FALSE`).
+    /// must NOT run (C :723 `return FALSE`).
     #[test]
     fn actor_multi_device_auto_connect_reconnects_port_first() {
         struct MultiDriver {
@@ -3422,10 +3417,10 @@ mod tests {
         assert_eq!(
             calls.lock().clone(),
             vec!["connect", "connect_addr"],
-            "the PORT must be reconnected before the device (C asynManager.c:716 then :723)"
+            "the PORT must be reconnected before the device (C asynManager.c:718 then :725)"
         );
 
-        // Boundary 2: the port stays down → C bails at :721 before touching
+        // Boundary 2: the port stays down → C bails at :723 before touching
         // the device, and the request fails Disconnected.
         let (drv, calls) = mk(false);
         let tx = spawn_actor(drv);
@@ -3442,8 +3437,8 @@ mod tests {
     /// R6-47: an auto-connect port that drops must reconnect on its own, with
     /// NO queued traffic. C `exceptionDisconnect` arms the port's connect
     /// timer at .01 s (asynManager.c:2181-2182); `portConnectTimerCallback`
-    /// then posts a Connect-priority request (:3252-3266) and
-    /// `portConnectProcessCallback` calls the driver's connect (:3268-3283).
+    /// then posts a Connect-priority request (:3283-3297) and
+    /// `portConnectProcessCallback` calls the driver's connect (:3299-3314).
     /// Before this, `port_actor`'s only auto-connect attempt lived inside
     /// `process_one` — it fired only when a request was dequeued, so an
     /// I/O-Intr-only or quiescent port stayed dead forever.
@@ -3536,7 +3531,7 @@ mod tests {
         );
         assert!(
             connect_calls.load(Ordering::SeqCst) >= 2,
-            "the failed first attempt must re-arm the timer (C asynManager.c:3281), got {} call(s)",
+            "the failed first attempt must re-arm the timer (C asynManager.c:3312), got {} call(s)",
             connect_calls.load(Ordering::SeqCst)
         );
     }
@@ -3544,10 +3539,10 @@ mod tests {
     /// R14-50: no connect attempt on a port the queue gate would refuse.
     ///
     /// C's retry timer does not call `pasynCommon->connect` — it posts a
-    /// `queueRequest` (asynManager.c:3259), which a disabled or defunct port
-    /// refuses with `asynDisabled` (:1541-1546); the process callback that would
-    /// re-arm the timer (:3281) never runs. `portThread` applies the same
-    /// refusal above `autoConnectDevice` (:806-809). So `asynEnable(port,0)` and
+    /// `queueRequest` (asynManager.c:3290), which a disabled or defunct port
+    /// refuses with `asynDisabled` (:1543-1548); the process callback that would
+    /// re-arm the timer (:3312) never runs. `portThread` applies the same
+    /// refusal above `autoConnectDevice` (:808-811). So `asynEnable(port,0)` and
     /// `shutdownPort` stop the hardware retries, not just the reads.
     ///
     /// One case per gate boundary: disabled, defunct, and the enabled control
@@ -3597,7 +3592,7 @@ mod tests {
             base.set_enabled(enabled).unwrap();
             if defunct {
                 // C `shutdownPort` clears `enabled` on its way to `defunct`
-                // (:2283-2284), so the gate refuses the port as a disabled one.
+                // (:2285-2286), so the gate refuses the port as a disabled one.
                 shut_down(&mut base);
             }
             base.connect_retry_at = Some(Instant::now() - Duration::from_millis(1));
@@ -3621,7 +3616,7 @@ mod tests {
             );
             assert!(
                 actor.driver.base().connect_retry_at.is_none(),
-                "{label}: a refused queueRequest never re-arms the timer (C :3281)"
+                "{label}: a refused queueRequest never re-arms the timer (C :3312)"
             );
 
             assert!(!actor.auto_connect_port(), "{label}: no port auto-connect");
@@ -3648,7 +3643,7 @@ mod tests {
     }
 
     /// Boundary: auto-connect OFF. C arms the timer only when
-    /// `pport->dpc.autoConnect` is set (asynManager.c:2181), so a manual port
+    /// `pport->dpc.autoConnect` is set (asynManager.c:2183), so a manual port
     /// that drops must stay down until something explicitly connects it.
     #[test]
     fn disconnect_does_not_arm_retry_when_auto_connect_is_off() {
@@ -3707,10 +3702,10 @@ mod tests {
     /// re-enabled.
     ///
     /// C's device-level refusals live inside `if(!(pport->attributes &
-    /// ASYN_CANBLOCK))` in `queueRequest` (asynManager.c:1553-1575), so a
+    /// ASYN_CANBLOCK))` in `queueRequest` (asynManager.c:1555-1585), so a
     /// CANBLOCK port never returns them. Its `portThread` answers the same
     /// condition by skipping the request — `if(!pdpCommon->enabled) continue;`
-    /// (:875) — leaving it queued. Every real transport port is CANBLOCK.
+    /// (:877) — leaving it queued. Every real transport port is CANBLOCK.
     #[test]
     fn a_disabled_device_parks_a_canblock_ports_request_until_re_enable() {
         let mut drv = multi_device_driver(true);
@@ -3744,9 +3739,9 @@ mod tests {
     }
 
     /// R15-47, boundary 2: a parked request still expires on its own queue
-    /// timer. C arms an `epicsTimer` at `queueRequest` (asynManager.c:1617-1623)
+    /// timer. C arms an `epicsTimer` at `queueRequest` (asynManager.c:1619-1625)
     /// whose callback unlinks the request wherever the port thread left it
-    /// (:647-701) — so a device that is never re-enabled does not hang the
+    /// (:649-703) — so a device that is never re-enabled does not hang the
     /// caller, it times out.
     ///
     /// Uses the real runtime: the deadline of a parked request has no other
@@ -3795,7 +3790,7 @@ mod tests {
             .expect_err("a synchronous port refuses a disabled device up front");
         assert!(err.is_queue_refused(), "got {err:?}");
         assert_eq!(err.status(), AsynStatus::Disabled);
-        // C's double space, verbatim (asynManager.c:1564).
+        // C's double space, verbatim (asynManager.c:1566).
         assert!(
             err.to_string()
                 .contains("port dev_gate  or device 1 not enabled"),
@@ -3804,8 +3799,8 @@ mod tests {
     }
 
     /// R15-47, boundary 4: a disconnected device on a CANBLOCK port. C's
-    /// `portThread` auto-connects it (:877) and, if it is still down, hands the
-    /// request to its *timeout* callback (:884-885, :915-919) — it does not
+    /// `portThread` auto-connects it (:879) and, if it is still down, hands the
+    /// request to its *timeout* callback (:886-887, :917-921) — it does not
     /// refuse it with `asynDisconnected`, which is what `queueRequest` would have
     /// done had this been a synchronous port.
     #[test]
@@ -3827,7 +3822,7 @@ mod tests {
         );
 
         // The synchronous port is the one that answers with the refusal, and its
-        // text is C's (:1571).
+        // text is C's (:1575).
         let mut drv = multi_device_driver(false);
         drv.base.init_auto_connect(false);
         drv.base.device_state(1).put_auto_connect(false);
@@ -3846,7 +3841,7 @@ mod tests {
 
     /// R15-47, boundary 5: the two **port**-level refusals are unchanged on a
     /// CANBLOCK port — they are the only ones C's `queueRequest` applies to it
-    /// (asynManager.c:1541-1552).
+    /// (asynManager.c:1543-1554).
     #[test]
     fn a_canblock_port_still_applies_the_port_level_refusals() {
         let mut drv = multi_device_driver(true);
@@ -3971,9 +3966,9 @@ mod tests {
     ///
     /// C `enable` ends in `exceptionOccurred` (asynManager.c:2247);
     /// `announceExceptionOccurred` signals `notifyPortThread` for every exception
-    /// on a CANBLOCK port (:635-636); the woken `portThread` finds
+    /// on a CANBLOCK port (:637-638); the woken `portThread` finds
     /// `!pport->dpc.connected` and runs the 2 s-throttled
-    /// `autoConnectDevice(pport,0)` (:856-861). So `asynEnable(port,1)` brings a
+    /// `autoConnectDevice(pport,0)` (:858-863). So `asynEnable(port,1)` brings a
     /// port that went down while disabled back up, with no I/O request at all.
     ///
     /// One case per gate boundary: re-enabled (must attempt), disabled (must
@@ -4026,7 +4021,7 @@ mod tests {
         };
 
         // Boundary 1 — disabled: the wake finds the queue gate refusing, so no
-        // attempt reaches the hardware (C `portThread` :806-809; R14-50).
+        // attempt reaches the hardware (C `portThread` :808-811; R14-50).
         let (tx, calls) = spawn(true, false, true);
         send_and_wait(
             &tx,
@@ -4063,7 +4058,7 @@ mod tests {
         );
 
         // Boundary 4 — exception storm on a link that stays down: C's 2 s
-        // throttle (:712-713) bounds it to one attempt per window, however many
+        // throttle (:714-715) bounds it to one attempt per window, however many
         // exceptions are announced.
         let (tx, calls) = spawn(true, false, false);
         for _ in 0..5 {
@@ -4079,8 +4074,8 @@ mod tests {
     /// R16-46: a status query is a plain read and must not dial the hardware.
     ///
     /// C's `portThread` runs a pass only when `notifyPortThread` is signalled, and
-    /// `isConnected` (asynManager.c:2326-2337), `isEnabled` (:2340),
-    /// `isAutoConnect` (:2356) and `report` (:1136) signal nothing — they take
+    /// `isConnected` (asynManager.c:2331-2342), `isEnabled` (:2345),
+    /// `isAutoConnect` (:2361) and `report` (:1138) signal nothing — they take
     /// `asynManagerLock`, read a flag and return. Here every one of them is a
     /// message that wakes the actor, so before the wake latch each of them ended
     /// in `autoConnectDevice(pport,0)`: a status poller pulled a dead port's
@@ -4151,8 +4146,8 @@ mod tests {
             "an idle port with no armed retry timer must not dial the hardware"
         );
 
-        // The control — `enable` ends in `exceptionOccurred` (:2247), which *is* a
-        // wake (:635-636), so this pass reaches the auto-connect tail.
+        // The control — `enable` ends in `exceptionOccurred` (:2249), which *is* a
+        // wake (:637-638), so this pass reaches the auto-connect tail.
         //
         // The reply is sent from inside the dispatch, *before* the pass's
         // auto-connect tail runs, so a second request is what makes the tail
@@ -4187,7 +4182,7 @@ mod tests {
         assert_eq!(r.int_val, Some(1));
     }
 
-    /// C `queueRequest` (asynManager.c:1538-1552): a request queued at
+    /// C `queueRequest` (asynManager.c:1538-1554): a request queued at
     /// `asynQueuePriorityConnect` carrying `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`
     /// skips the `!pport->dpc.connected → asynDisconnected` refusal. Bare Connect
     /// priority does not (unless the user carries no device) — that is what
@@ -4201,7 +4196,7 @@ mod tests {
         drv.base.set_connected(false);
         let tx = spawn_gated(drv);
 
-        // No waiver: refused, exactly as C's :1547-1552.
+        // No waiver: refused, exactly as C's :1549-1554.
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let err = queue_and_wait(
             &tx,
@@ -4270,7 +4265,7 @@ mod tests {
     }
 
     /// C `queueRequest`'s waiver as a production [`PortHandle`] applies it
-    /// (asynManager.c:1538-1552): the connected refusal is skipped only at
+    /// (asynManager.c:1538-1554): the connected refusal is skipped only at
     /// Connect priority for a user with no device or the sentinel reason; the
     /// enabled refusal is skipped by nobody. A waived request on a disconnected
     /// port is queued and runs — the route the operator's reconnect takes.
@@ -4313,7 +4308,7 @@ mod tests {
             "no device below Connect priority"
         );
 
-        handle.set_enable_blocking(-1, false).unwrap();
+        handle.set_enable(-1, false).unwrap();
         assert_eq!(
             refused(get(connect())),
             Some(AsynStatus::Disabled),
@@ -4324,8 +4319,8 @@ mod tests {
     /// R13-47: `asynPortDriver::callParamCallbacks` (asynPortDriver.cpp:1785-1794)
     /// is a plain method call — `getParamList(list)` then `pList->callCallbacks(addr)`.
     /// It is invoked from driver code, never through `queueRequest`, so neither
-    /// the `asynDisabled` (asynManager.c:1541-1546) nor the `asynDisconnected`
-    /// (:1547-1552) refusal is reachable from it. A driver's parameter publish
+    /// the `asynDisabled` (asynManager.c:1543-1548) nor the `asynDisconnected`
+    /// (:1549-1554) refusal is reachable from it. A driver's parameter publish
     /// must land on a disconnected *and* on a disabled port — that is precisely
     /// when a driver publishes its status/health parameters.
     #[test]
@@ -4558,23 +4553,23 @@ mod tests {
     /// R14-51: `asynReport` prints C's manager block — the port state no driver
     /// owns and none of them printed.
     ///
-    /// C `reportPrintPort` (asynManager.c:1018-1122) prints, in order: the
+    /// C `reportPrintPort` (asynManager.c:1020-1124) prints, in order: the
     /// multiDevice/canBlock/autoConnect header; at `details >= 1` the
     /// enabled/connected/numberConnects line, the nDevices/nQueued/blocked line,
     /// the two lock states, the exception counts and the trace masks; at
     /// `details >= 2` the interpose and interface lists; then the per-address
-    /// block (suppressed by a *negative* `details`, :1032-1035) — and only then
+    /// block (suppressed by a *negative* `details`, :1034-1037) — and only then
     /// the driver's own `pasynCommon->report`.
     ///
     /// One case per boundary of C's `details` rules: 0, 1, 2, negative, defunct.
     /// C's `asynReport` header prints `multiDevice:` straight off
     /// `pport->attributes & ASYN_MULTIDEVICE` (asynManager.c:1043-1047), and the
     /// IP server listener is registered with plain `ASYN_CANBLOCK`
-    /// (drvAsynIPServerPort.c:625-626) — a TCP listener's asynOctet table stays
+    /// (drvAsynIPServerPort.c:646-647) — a TCP listener's asynOctet table stays
     /// the all-NULL initializer (:118-123; C fills read/write/flush in only for
-    /// SOCK_DGRAM, :652-656), so it is an interrupt source, not an addressable
+    /// SOCK_DGRAM, :686-692), so it is an interrupt source, not an addressable
     /// port. The
-    /// per-client ports are separate single-device registrations (:688-694).
+    /// per-client ports are separate single-device registrations (:709-715).
     #[test]
     fn the_ip_server_listener_reports_multidevice_no_like_c() {
         let srv =
@@ -4586,7 +4581,7 @@ mod tests {
         assert_eq!(
             actor.manager_report(0).lines().next().unwrap(),
             "ipsrv_rep multiDevice:No canBlock:Yes autoConnect:Yes",
-            "C's header line for the listener (asynManager.c:1043-1047)"
+            "C's header line for the listener (asynManager.c:1045-1049)"
         );
     }
 
@@ -4633,7 +4628,7 @@ mod tests {
         assert_eq!(
             r0.lines().next().unwrap(),
             "rep_block multiDevice:Yes canBlock:Yes autoConnect:Yes",
-            "C's header line (asynManager.c:1043-1047)"
+            "C's header line (asynManager.c:1045-1049)"
         );
         assert!(!r0.contains("enabled:"), "details 0 prints no state line");
         assert!(
@@ -4649,30 +4644,30 @@ mod tests {
         let r1 = actor.manager_report(1);
         assert!(
             r1.contains("    enabled:Yes connected:Yes numberConnects 1"),
-            "C :1057-1060 — including the count of connects: {r1}"
+            "C :1059-1062 — including the count of connects: {r1}"
         );
         assert!(
             r1.contains("    nDevices 2 nQueued 0 blocked:No"),
-            "C :1061-1064: {r1}"
+            "C :1063-1066: {r1}"
         );
         assert!(
             r1.contains("    asynManagerLock:No synchronousLock:No"),
-            "C :1065-1067: {r1}"
+            "C :1067-1069: {r1}"
         );
         assert!(
             r1.contains("    exceptionActive:No exceptionUsers 0 exceptionNotifys 0"),
-            "C :1068-1073: {r1}"
+            "C :1070-1074: {r1}"
         );
         assert!(
             r1.contains("    traceMask:0x"),
-            "C :1074-1075 prints the port's three trace masks: {r1}"
+            "C :1075-1076 prints the port's three trace masks: {r1}"
         );
         assert!(
             r1.contains("addr 0 autoConnect Yes enabled Yes connected Yes"),
             "at details 1 every device prints, connected or not (C :1087): {r1}"
         );
 
-        // details = 2: the interpose and interface lists (C :1076-1080).
+        // details = 2: the interpose and interface lists (C :1078-1082).
         let r2 = actor.manager_report(2);
         assert!(
             r2.contains("    interposeInterfaceList\n        asynOctet"),
@@ -4684,7 +4679,7 @@ mod tests {
         );
         assert!(r2.contains("        asynOctet\n"), "…asynOctet among them");
 
-        // A negative details is C's "detail, but no devices" (:1032-1035).
+        // A negative details is C's "detail, but no devices" (:1034-1037).
         let rneg = actor.manager_report(-1);
         assert!(
             rneg.contains("    enabled:Yes connected:Yes numberConnects 1"),
@@ -4695,23 +4690,23 @@ mod tests {
             "…and suppresses the per-address block: {rneg}"
         );
 
-        // A destroyed port: one line, and C never reaches the driver (:1038-1042).
+        // A destroyed port: one line, and C never reaches the driver (:1040-1044).
         let (mut actor, _tx) = build();
         actor.driver.base_mut().flags.destructible = true;
         actor.driver.base_mut().shutdown_lifecycle().unwrap();
         assert_eq!(actor.manager_report(2), "rep_block destroyed\n");
     }
 
-    /// W10-D6: C's `report` (asynManager.c:1136-1171) spawns a `reportPort` thread
-    /// and calls `pasynCommon->report(drvPvt, fp, details)` directly (:1121-1123).
+    /// W10-D6: C's `report` (asynManager.c:1138-1173) spawns a `reportPort` thread
+    /// and calls `pasynCommon->report(drvPvt, fp, details)` directly (:1123-1125).
     /// It never queues, so no gate runs: a disabled port reports `enabled:No` and
-    /// a disconnected one `connected:No` (:1057-1060). Queue-gating it made
+    /// a disconnected one `connected:No` (:1059-1062). Queue-gating it made
     /// `asynReport` on a down port print a refusal instead of the diagnostic the
     /// operator opened it for.
     ///
     /// The one port C refuses to report on is a destroyed one: `reportPrintPort`
     /// prints "<name> destroyed" and returns without touching the driver
-    /// (:1038-1042).
+    /// (:1040-1044).
     #[test]
     fn report_runs_on_a_disabled_or_disconnected_port_but_not_on_a_destroyed_one() {
         struct ReportSpy {
@@ -4757,7 +4752,7 @@ mod tests {
         }
 
         // A destroyed port: C prints "<name> destroyed" and never reaches the
-        // driver's interfaces (asynManager.c:1038-1042).
+        // driver's interfaces (asynManager.c:1041-1043).
         let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut base = PortDriverBase::new("gone", 1, PortFlags::default());
         shut_down(&mut base);
@@ -4781,7 +4776,7 @@ mod tests {
     ///
     /// Two boundaries: a device whose auto-connect was turned off individually, and
     /// a device created on a port that has auto-connect off — C seeds a new device
-    /// from the port (`dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`, :584).
+    /// from the port (`dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`, :586).
     #[test]
     fn the_per_address_line_prints_the_devices_auto_connect() {
         let build = |port_auto_connect: bool| {
@@ -4967,9 +4962,9 @@ mod tests {
 
     /// R12-48: C conditions **only** `checkPortConnect` on the priority
     /// (asynManager.c:1538-1540). `if(!pport->dpc.enabled) return asynDisabled`
-    /// (:1541-1546) sits above it and every queued request takes it — and the
+    /// (:1543-1548) sits above it and every queued request takes it — and the
     /// port thread will not drain even the Connect queue on a disabled port
-    /// (:806-809). So a `CNCT=1` put on a port disabled with `asynEnable(port,0)`
+    /// (:808-811). So a `CNCT=1` put on a port disabled with `asynEnable(port,0)`
     /// must not open the device connection: the port was disabled precisely to
     /// keep the IOC off the hardware.
     ///
@@ -5022,7 +5017,7 @@ mod tests {
             "a disabled port must not open the device connection"
         );
 
-        // Not even the option waiver buys the enabled refusal off (C's :1541-1546
+        // Not even the option waiver buys the enabled refusal off (C's :1543-1548
         // is above `checkPortConnect`, not beside it).
         let user = AsynUser::new(0)
             .with_timeout(Duration::from_secs(1))
@@ -5142,8 +5137,8 @@ mod tests {
     /// C carries the distinction as a pointer, not a number:
     /// `connectDevice` allocates `puserPvt->pdevice` only for `addr >= 0`
     /// (asynManager.c:1348-1351), `findDpCommon` returns `&pport->dpc` whenever
-    /// that pointer is NULL (:536-544), and `getAddr` renders a NULL `pdevice`
-    /// as -1 (:2004-2008) — the one place the number appears, at the driver
+    /// that pointer is NULL (:538-546), and `getAddr` renders a NULL `pdevice`
+    /// as -1 (:2006-2010) — the one place the number appears, at the driver
     /// boundary. So "no device chosen" and "device 0" are different states in
     /// C, and `AsynUser::default()` is the Rust spelling of the first. A
     /// default that said 0 would make every framework-constructed user silently
@@ -5194,7 +5189,7 @@ mod tests {
 
     /// R18-70: C keeps `pport->pblockProcessHolder` **and**
     /// `pdpCommon->pblockProcessHolder`, and admits a request only when both
-    /// are NULL-or-it (asynManager.c:889-892, :929-932). devGpib takes the
+    /// are NULL-or-it (asynManager.c:889-892, :931-934). devGpib takes the
     /// device form for an SRQ transaction (devSupportGpib.c:1216), so one GPIB
     /// address holding a block must leave every other address on the port
     /// running.
@@ -5343,7 +5338,7 @@ mod tests {
         // An UnblockProcess that waited out its nominal I/O timeout must
         // still execute once dequeued — otherwise the port stays wedged for
         // every non-owner caller forever. No dequeued request (lifecycle or
-        // I/O) is aborted by a queue deadline (C parity, asynManager.c:906).
+        // I/O) is aborted by a queue deadline (C parity, asynManager.c:908).
         let mut drv = TestDriver::new();
         // Seed VAL so the post-unblock read probe returns a value rather than
         // the C-parity ParamUndefined for an unset param; this test asserts
@@ -5506,7 +5501,7 @@ mod tests {
     /// R9-57. Every layer a request passes through must be able to trace through
     /// its `asynUser`, as in C, where `pasynUser` reaches the port's trace config
     /// through its `pport`/`pdevice` linkage (`findTracePvt`,
-    /// asynManager.c:546-551) — an interpose has no other handle on the port
+    /// asynManager.c:548-553) — an interpose has no other handle on the port
     /// (`asynInterposeCom.c:237-239`). The actor is the single owner of that
     /// linkage: it stamps the request's user with the port it is about to run on.
     #[test]

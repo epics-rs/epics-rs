@@ -497,6 +497,30 @@ impl<T> BandQueue<T> {
         }
     }
 
+    /// [`Self::push_ring`] for an entry a claim decides on. The slot is taken
+    /// before `claim` runs, as the intrusive `callbackRequest` reserves its
+    /// place before it claims the object (epics-base `proto/callback-intrusive`
+    /// `callback.c:855-868`), so a full band refuses whether or not the object
+    /// is queued already. `claim` answering `None` gives the slot back and
+    /// publishes nothing: `Ok(None)`. `Err(())` is the band being full.
+    pub(super) fn push_ring_claimed(
+        &self,
+        claim: impl FnOnce() -> Option<T>,
+        recruit: impl FnOnce(),
+    ) -> Result<Option<usize>, ()> {
+        let (i, depth) = self.nodes.alloc_ring().ok_or(())?;
+        match claim() {
+            Some(v) => {
+                self.publish(i, v, recruit);
+                Ok(Some(depth))
+            }
+            None => {
+                self.nodes.dealloc(i);
+                Ok(None)
+            }
+        }
+    }
+
     /// Ring entries in use right now — C `epicsRingPointerGetUsed`. Entries a
     /// worker has run but not yet given back are still out, so this reads
     /// above the number queued by up to [`return_batch`] per worker.

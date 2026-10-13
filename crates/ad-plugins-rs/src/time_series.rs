@@ -870,7 +870,7 @@ mod tests {
     fn test_ts_port_driver_create() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
         let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared, test_pool());
-        assert_eq!(driver.base().port_name, "TEST_TS");
+        assert_eq!(&*driver.base().port_name, "TEST_TS");
         assert_eq!(driver.num_channels, 3);
         assert!(!driver.base().flags.multi_device);
     }

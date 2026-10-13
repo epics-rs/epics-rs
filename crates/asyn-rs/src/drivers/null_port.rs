@@ -48,7 +48,7 @@ impl NullOctetPort {
     pub fn new(port_name: &str) -> Self {
         // Single-device, blocking (ASYN_CANBLOCK, mirroring a real transport
         // port like drvAsynIPPort, whose `registerPort` attributes are exactly
-        // that — drvAsynIPPort.c:1028-1029). This driver has no C original, so
+        // that — drvAsynIPPort.c:1082-1083). This driver has no C original, so
         // that mirror is the whole of its flag model: it grants no shutdown
         // rights either, because drvAsynIPPort grants none.
         let mut base = PortDriverBase::new(
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn starts_disconnected_and_no_auto_connect() {
         let drv = NullOctetPort::new("ORACLEASYN");
-        assert_eq!(drv.base().port_name, "ORACLEASYN");
+        assert_eq!(&*drv.base().port_name, "ORACLEASYN");
         assert!(
             !drv.base().is_connected(),
             "null port must start disconnected"

@@ -15,10 +15,10 @@
 //! `tcp` (default) / `udp` are accepted as the protocol token; there is
 //! **no `SO_REUSEPORT` token in upstream C asyn** (earlier versions of
 //! this module accepted one — removed for parity). `SO_REUSEADDR` is set
-//! unconditionally on the listening socket (`drvAsynIPServerPort.c:430`).
+//! unconditionally on the listening socket (`drvAsynIPServerPort.c:448`).
 //! In **UDP** mode the socket additionally enables `SO_REUSEPORT` for
 //! datagram fanout — C calls `epicsSocketEnableAddressUseForDatagramFanout`
-//! for `SOCK_DGRAM` (`drvAsynIPServerPort.c:426-429`) so multiple IOCs can
+//! for `SOCK_DGRAM` (`drvAsynIPServerPort.c:444-447`) so multiple IOCs can
 //! share the port; the TCP listener does not.
 //!
 //! - `host` may be empty / `"0.0.0.0"` (all IPv4), `"localhost"` (also
@@ -79,7 +79,7 @@ use crate::user::AsynUser;
 ///
 /// C asyn `drvAsynIPServerPortConfigure` has **no implicit max-clients
 /// default** — the caller must pass `maxClients` explicitly as the
-/// third iocsh argument (`drvAsynIPServerPort.c:729` —
+/// third iocsh argument (`drvAsynIPServerPort.c:750` —
 /// `iocshArg "max clients"`). Rust callers that construct via
 /// [`IpServerConfig::parse`] inherit this constant; callers that
 /// build `IpServerConfig` directly can override
@@ -140,7 +140,7 @@ impl IpServerConfig {
     /// Parse a `drvAsynIPServerPortConfigure`-style spec.
     ///
     /// Syntax: `"host:port [tcp|udp]"`. Matches C `sscanf(":%u %5s",
-    /// &portNumber, protocol)` in `drvAsynIPServerPort.c:582`; only
+    /// &portNumber, protocol)` in `drvAsynIPServerPort.c:603`; only
     /// `tcp` (default) and `udp` are accepted. Unknown trailing
     /// tokens are rejected. The host may be IPv4 (`0.0.0.0`,
     /// `127.0.0.1`, or specific NIC IP); IPv6 bracket form
@@ -158,7 +158,7 @@ impl IpServerConfig {
         let mut protocol = IpServerProtocol::Tcp;
         // Strip the optional protocol token from the tail. C asyn
         // accepts only `tcp` / `udp` (case-insensitive); anything
-        // else is rejected — see drvAsynIPServerPort.c:591-600.
+        // else is rejected — see drvAsynIPServerPort.c:612-621.
         if tokens.len() == 2 {
             let last = tokens.last().unwrap().to_ascii_uppercase();
             match last.as_str() {
@@ -183,7 +183,7 @@ impl IpServerConfig {
         }
         if tokens.len() != 1 {
             // Intentionally stricter than C: `sscanf(":%u %5s", ...)`
-            // (drvAsynIPServerPort.c:582) reads the port and one protocol
+            // (drvAsynIPServerPort.c:603) reads the port and one protocol
             // token and silently ignores any trailing garbage. Rejecting
             // it surfaces config typos instead of swallowing them; no
             // valid C spec carries extra tokens.
@@ -246,7 +246,7 @@ impl IpServerConfig {
 /// The `closed` half is not advice: [`ClientSlot::read_or_close`] /
 /// [`ClientSlot::write_or_close`] have *already* dropped the socket when it is
 /// set — C decides the teardown and the reported status in one statement
-/// (drvAsynIPPort.c:798-806), so no caller can take the error and forget the
+/// (drvAsynIPPort.c:851-860), so no caller can take the error and forget the
 /// `closeConnection`. What is left to the owner is the disconnect exception
 /// fan-out, which differs by port shape: the parent announces on the client's
 /// `addr`, the child port announces on its own single device and drops its
@@ -294,11 +294,11 @@ pub struct ClientSlot {
     /// C reaches the same invariant by message: on slot reuse the listener sets
     /// `pl->fd = clientFd` and calls `pasynCommonSyncIO->connectDevice(pl->pasynUser)`
     /// on the child (drvAsynIPServerPort.c:358-360), and it is the child's own
-    /// `isConnected` that the listener's free-slot scan then reads (:343-350).
+    /// `isConnected` that the listener's free-slot scan then reads (:358-365).
     /// Assignment and connectivity are not allowed to disagree in C either.
     occupied: Arc<AtomicBool>,
     /// C `tty->disconnectOnReadTimeout` on this slot's child port
-    /// (drvAsynIPPort.c:924-935, set through `asynSetOption`). It lives on the
+    /// (drvAsynIPPort.c:978-989, set through `asynSetOption`). It lives on the
     /// slot, not on a client, because C's child port outlives the connections it
     /// serves: the option a startup script sets on `srv:0` still holds for the
     /// next client that lands in slot 0.
@@ -342,7 +342,7 @@ impl ClientSlot {
     /// fd to a full `drvAsynIPPort` child (drvAsynIPServerPort.c:358-360 sets
     /// `pasynUser->reason = clientFd` and calls `connectDevice`), whose
     /// `connectIt` takes the fd from `reason` (drvAsynIPPort.c:435-436) and
-    /// then runs `setNonBlock(fd, 1)` under USE_POLL (:535-543) — the same
+    /// then runs `setNonBlock(fd, 1)` under USE_POLL (:515-524) — the same
     /// statement the client path runs, ahead of the branch that connects. A
     /// served connection is therefore non-blocking on every target that is not
     /// RTEMS (`USE_SOCKTIMEOUT` is `#if defined(__rtems__)`, :71-72), with both
@@ -363,7 +363,7 @@ impl ClientSlot {
     /// listener is non-blocking because the poll loop needs it to be.
     ///
     /// A failure drops the stream on the way out, which is C's
-    /// `epicsSocketDestroy(fd)` on the same failure (drvAsynIPPort.c:536-542).
+    /// `epicsSocketDestroy(fd)` on the same failure (drvAsynIPPort.c:516-523).
     fn assign(&self, stream: TcpStream, peer: SocketAddr) -> AsynResult<()> {
         stream
             .set_nonblocking(OWNED_NONBLOCKING)
@@ -399,13 +399,13 @@ impl ClientSlot {
     /// C serves each accepted connection with a full `drvAsynIPPort` child
     /// (drvAsynIPServerPort.c:682-708), so the read that runs is
     /// `drvAsynIPPort`'s `readIt`: it calls `closeConnection` on a TCP EOF
-    /// (:815-820) **and** on every errno that is not `EWOULDBLOCK`/`EINTR`
-    /// (:798-806), and `closeConnection` destroys the socket and issues
+    /// (:869-874) **and** on every errno that is not `EWOULDBLOCK`/`EINTR`
+    /// (:851-860), and `closeConnection` destroys the socket and issues
     /// `exceptionDisconnect` (:206-217).
     ///
     /// That teardown is what frees the slot: the listener reuses a slot exactly
     /// when its child port reports `isConnected() == false`
-    /// (drvAsynIPServerPort.c:344-350). The port tore down on EOF only, so a
+    /// (drvAsynIPServerPort.c:359-365). The port tore down on EOF only, so a
     /// client whose socket died mid-read — `ECONNRESET`, `EPIPE`, a NAT drop —
     /// kept its slot forever, and once the table filled no client could
     /// reconnect.
@@ -415,7 +415,7 @@ impl ClientSlot {
         timeout: Option<Duration>,
         device: &str,
     ) -> Result<usize, SlotFailure> {
-        // C readIt (drvAsynIPPort.c:736-740): reject maxchars == 0 before
+        // C readIt (drvAsynIPPort.c:787-791): reject maxchars == 0 before
         // touching the socket; an empty buffer would otherwise read Ok(0) and be
         // misclassified as a peer EOF, tearing down a healthy connection.
         if buf.is_empty() {
@@ -429,7 +429,7 @@ impl ClientSlot {
             }));
         };
         // C parity: the child `drvAsynIPPort`'s `readIt` floors a zero request
-        // timeout to a 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on
+        // timeout to a 1 ms poll (drvAsynIPPort.c:792-794) and re-applies it on
         // every read. `socket_poll_timeout` is the shared owner of that mapping;
         // arming it unconditionally (rather than skipping on `timeout == 0`)
         // keeps a poll request a 1 ms poll instead of blocking on the accept-time
@@ -440,12 +440,12 @@ impl ClientSlot {
         // `setNonBlock(fd, 1)` under USE_POLL (drvAsynIPPort.c:535-543), and on
         // a non-blocking socket the option governs nothing. `BoundNextRead` is
         // the same POLLIN wait the client port uses and the same one C's
-        // `readIt` uses (:758-774) — one bound for both drivers, on whichever
+        // `readIt` uses (:810-827) — one bound for both drivers, on whichever
         // mechanism the platform's mode makes real.
         //
         // It also keeps C's fall-through: a failed bound taints nothing and the
         // read below still runs (C `readIt` records a failed
-        // setsockopt(SO_RCVTIMEO) and recv()s anyway, :744-756 then :791), which
+        // setsockopt(SO_RCVTIMEO) and recv()s anyway, :795-808 then :844), which
         // is load-bearing on macOS — setsockopt(SO_RCVTIMEO) returns EINVAL on a
         // socket whose peer sent RST, and returning early there skipped the recv
         // that sees ECONNRESET, `clear()`s the slot and issues the disconnect.
@@ -470,12 +470,12 @@ impl ClientSlot {
     /// Write to this slot, applying the same rule to C's `writeIt`, which calls
     /// `closeConnection(pasynUser, tty, "Write error")` on a fatal errno
     /// (drvAsynIPPort.c:694-698) and reports `asynTimeout` — socket intact — for
-    /// the `EWOULDBLOCK`/`EINTR` class it retries (:661-672). Single owner of "a
+    /// the `EWOULDBLOCK`/`EINTR` class it retries (:710-721). Single owner of "a
     /// client slot dies on a write", shared by the parent's addressed and
     /// broadcast writes and the child port's.
     /// Bounded by `timeout` through [`write_with_retry`] — the same owner the
     /// client port writes through, so the accepted-byte count rides out on the
-    /// failure as C's `*nbytesTransfered` (drvAsynIPPort.c:678-699). This used
+    /// failure as C's `*nbytesTransfered` (drvAsynIPPort.c:727-749). This used
     /// to be a bare `write_all`, which parks forever against a peer that has
     /// stopped reading: no `asynTimeout`, no record alarm, and a parent
     /// broadcast wedged on whichever slot went silent first.
@@ -516,7 +516,7 @@ impl ClientSlot {
     }
 
     /// C's `should_disconnect` for a failed *read* on a slot, both disjuncts
-    /// (drvAsynIPPort.c:799-800):
+    /// (drvAsynIPPort.c:853-854):
     ///
     /// ```c
     /// int should_disconnect = (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
@@ -528,7 +528,7 @@ impl ClientSlot {
     /// `disconnectOnReadTimeout`: with it on, a read that merely *times out* tears
     /// the connection down — a live-looking socket whose peer has gone silent
     /// stops holding a slot the server needs. C's child here is a real
-    /// `drvAsynIPPort` (drvAsynIPServerPort.c:690), so `asynSetOption("srv:0", 0,
+    /// `drvAsynIPPort` (drvAsynIPServerPort.c:711-715), so `asynSetOption("srv:0", 0,
     /// "disconnectOnReadTimeout", "Y")` reaches exactly this statement (W10-D5).
     ///
     /// A zero-timeout request is a *poll*, not a wait, and C exempts it
@@ -541,7 +541,7 @@ impl ClientSlot {
         timeout: Option<Duration>,
     ) -> SlotFailure {
         // C's sign test: `(tty->disconnectOnReadTimeout) && (pasynUser->timeout
-        // > 0)` (drvAsynIPPort.c:799). `None` is C's negative timeout and is
+        // > 0)` (drvAsynIPPort.c:853). `None` is C's negative timeout and is
         // not `> 0`, so a forever-wait keeps its slot.
         if is_nonfatal_read_timeout(e.kind())
             && !(self.disconnect_on_read_timeout() && timeout.is_some_and(|t| t > Duration::ZERO))
@@ -560,7 +560,7 @@ impl ClientSlot {
 
     /// C's `should_disconnect` for a failed *write* (drvAsynIPPort.c:694-698):
     /// the fatal-errno disjunct only — `writeIt` has no `disconnectOnReadTimeout`
-    /// term, it retries `EWOULDBLOCK`/`EINTR` (:661-672) and reports
+    /// term, it retries `EWOULDBLOCK`/`EINTR` (:710-721) and reports
     /// `asynTimeout` with the socket intact. The branch that closes the socket is
     /// the branch that reports `asynError`.
     ///
@@ -591,9 +591,9 @@ impl ClientSlot {
     /// ([`DrvAsynIPServerPort::io_flush`]) and the child
     /// ([`DrvAsynIPSubport::io_flush`]) data paths.
     ///
-    /// Mirrors C `drvAsynIPPort::flushIt` (drvAsynIPPort.c:846-861):
+    /// Mirrors C `drvAsynIPPort::flushIt` (drvAsynIPPort.c:900-915):
     /// each accepted connection is served in C by a full `drvAsynIPPort`
-    /// child port (drvAsynIPServerPort.c:690), whose flush sets the
+    /// child port (drvAsynIPServerPort.c:711-715), whose flush sets the
     /// socket non-blocking and `recv`s until empty, discarding staged
     /// input so a flush-then-read returns only the new reply. No-op when
     /// the slot is unoccupied (C guards on `fd != INVALID_SOCKET`).
@@ -624,8 +624,8 @@ impl ClientSlot {
 }
 
 /// The accept half of the server port, detached from the driver so the listener
-/// thread can own it — C's `connectionListener` (drvAsynIPServerPort.c:284-386),
-/// which `drvAsynIPServerPortConfigure` starts at configure time (:711-714) and
+/// thread can own it — C's `connectionListener` (drvAsynIPServerPort.c:297-401),
+/// which `drvAsynIPServerPortConfigure` starts at configure time (:732-735) and
 /// which is the *only* thing in C that accepts.
 ///
 /// Everything an accept touches lives here, which is what lets the loop be the
@@ -642,20 +642,20 @@ struct Acceptor {
     announcer: ExceptionAnnouncer,
     /// The parent port's interrupt source, shared with the driver's own
     /// `base.interrupts`. C fires the octet callbacks that carry the new child
-    /// port's *name* from inside the listener thread (:374-383) — that is how
+    /// port's *name* from inside the listener thread (:389-398) — that is how
     /// an IOC learns which child port a client landed on.
     interrupts: InterruptManager,
     trace: Option<Arc<TraceManager>>,
     /// Set to stop the loop. The listener is non-blocking and the loop polls it,
     /// so the flag is observed within one poll interval — the portable stand-in
     /// for C's `tty->fd = INVALID_SOCKET`, which unblocks its blocking `accept`
-    /// (:326-331).
+    /// (:340-345).
     shutdown: Arc<AtomicBool>,
 }
 
 impl Acceptor {
     /// Copy the parent's trace masks onto the child port that just took a
-    /// connection — C `drvAsynIPServerPort.c:370-371`.
+    /// connection — C `drvAsynIPServerPort.c:385-386`.
     fn seed_child_trace(&self, child: &str) {
         let Some(trace) = &self.trace else { return };
         trace.set_trace_mask(Some(child), trace.get_trace_mask(Some(&self.port_name)));
@@ -665,10 +665,10 @@ impl Acceptor {
     /// Accept one pending connection and assign it to a free slot. Returns the
     /// slot index used, or `None` when no connection is pending.
     ///
-    /// C `connectionListener` (:326-383): accept, find the first disconnected
+    /// C `connectionListener` (:340-398): accept, find the first disconnected
     /// child port, hand it the fd, and fire the octet interrupt callbacks with
     /// that child's port name. A connection arriving with every slot occupied is
-    /// destroyed ("too many clients", :351-355) — dropping the stream here is
+    /// destroyed ("too many clients", :366-370) — dropping the stream here is
     /// that `epicsSocketDestroy`.
     fn accept_one(&self) -> AsynResult<Option<usize>> {
         let (stream, peer) = match self.listener.accept() {
@@ -693,13 +693,13 @@ impl Acceptor {
                 })?;
         }
         // First-fit slot scan — C's "search for a port which is disconnected"
-        // loop (:342-350).
+        // loop (:357-365).
         for (i, slot) in self.slots.iter().enumerate() {
             if !slot.is_occupied() {
                 slot.assign(stream, peer)?;
                 self.announcer.announce(AsynException::Connect, i as i32);
                 let child = format!("{}:{}", self.port_name, i);
-                // C :367-369 — "Set the new port to initially have the same
+                // C :382-384 — "Set the new port to initially have the same
                 // trace mask that we have". The connection is what makes the
                 // child a live port, so the accept is where it inherits the
                 // parent's tracing; `asynSetTraceMask SERVER -1 0x9` in an
@@ -713,7 +713,7 @@ impl Acceptor {
                     TraceMask::FLOW,
                     "new connection from {peer} on {child}"
                 );
-                // C :374-383 — the octet callbacks carry the child port name,
+                // C :389-398 — the octet callbacks carry the child port name,
                 // not the payload. The listener walks the interrupt list and
                 // calls EVERY node unconditionally: there is no addr test here
                 // (unlike asynOctetBase.c:202-210, which does test addr). A
@@ -745,7 +745,7 @@ impl Acceptor {
     }
 
     /// C `connectionListener`'s `while (tty->fd != INVALID_SOCKET)` loop
-    /// (:308-384). An accept error is traced and the loop continues (:335-340);
+    /// (:322-399). An accept error is traced and the loop continues (:350-355);
     /// only teardown ends it.
     fn run(&self) {
         asyn_trace!(
@@ -790,7 +790,7 @@ pub struct DrvAsynIPServerPort {
     /// lifetime of the server port, so child subports (registered
     /// `parent:N`, see [`Self::make_subport`]) can hold an Arc to
     /// their slot for the long term — mirrors C
-    /// `drvAsynIPServerPort.c:682-708` pre-creating child ports.
+    /// `drvAsynIPServerPort.c:703-729` pre-creating child ports.
     /// Unused in UDP mode.
     slots: Vec<Arc<ClientSlot>>,
 
@@ -816,7 +816,7 @@ pub struct DrvAsynIPServerPort {
     /// Stops the accept loop. Shared with the [`Acceptor`] the thread owns.
     accept_shutdown: Arc<AtomicBool>,
     /// The listener thread — C's `connectionListener`
-    /// (drvAsynIPServerPort.c:711-714). Joined on disconnect/shutdown.
+    /// (drvAsynIPServerPort.c:732-735). Joined on disconnect/shutdown.
     accept_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -881,18 +881,18 @@ impl DrvAsynIPServerPort {
             max,
             PortFlags {
                 // Single-device, like C: the listener registers plain
-                // `ASYN_CANBLOCK` (drvAsynIPServerPort.c:625-626) and a TCP
+                // `ASYN_CANBLOCK` (drvAsynIPServerPort.c:646-647) and a TCP
                 // listener's asynOctet table stays the all-NULL initializer
                 // (:118-123; C fills read/write/flush in only for SOCK_DGRAM,
-                // :652-656) — it is an interrupt source, not an I/O port.
+                // :686-692) — it is an interrupt source, not an I/O port.
                 // The per-client ports are separate
                 // single-device `drvAsynIPPortConfigure`d registrations
-                // (:688-694), which `make_subport` mirrors.
+                // (:709-715), which `make_subport` mirrors.
                 //
                 // This flag is the framework's device model, not this driver's
                 // slot table: `is_device_addr` and `device()` consult it to
                 // decide whether C's `findDpCommon` would resolve to a device's
-                // own `dpCommon` or the port's (asynManager.c:536-544), and
+                // own `dpCommon` or the port's (asynManager.c:538-546), and
                 // `asynReport` prints it verbatim (:1042-1046). Slot selection
                 // from `user.addr` and the per-slot `announce_exception` fan-out
                 // are ours and read the addr directly, so neither depends on it.
@@ -929,7 +929,7 @@ impl DrvAsynIPServerPort {
         let addr = self.resolve_bind_addr()?;
 
         // socket2 path so SO_REUSEADDR is set explicitly — mirrors
-        // C asyn's unconditional setsockopt at drvAsynIPServerPort.c:430.
+        // C asyn's unconditional setsockopt at drvAsynIPServerPort.c:448.
         let listener = self.bind_with_options(addr)?;
         listener
             .set_nonblocking(false)
@@ -973,7 +973,7 @@ impl DrvAsynIPServerPort {
             slots: self.slots.clone(),
             read_timeout: self.config.read_timeout,
             max_clients: self.config.max_clients,
-            port_name: self.base.port_name.clone(),
+            port_name: self.base.port_name.to_string(),
             announcer: self.base.exception_announcer(),
             interrupts: InterruptManager::from_shared_state(self.base.interrupts.shared_state()),
             trace: self.base.trace.clone(),
@@ -992,7 +992,7 @@ impl DrvAsynIPServerPort {
     }
 
     /// Stop the listener thread and wait for it. Every teardown path runs this —
-    /// C registers `ttyCleanup` with `epicsAtExit` for the same reason (:717).
+    /// C registers `ttyCleanup` with `epicsAtExit` for the same reason (:738).
     fn stop_accept_loop(&mut self) {
         self.accept_shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = self.accept_thread.lock().take() {
@@ -1006,12 +1006,12 @@ impl DrvAsynIPServerPort {
     fn open_udp_listener(&mut self) -> AsynResult<()> {
         let addr = self.resolve_bind_addr()?;
         // C enables datagram fanout on the UDP server socket
-        // (drvAsynIPServerPort.c:426-429): for SOCK_DGRAM it calls
+        // (drvAsynIPServerPort.c:444-447): for SOCK_DGRAM it calls
         // `epicsSocketEnableAddressUseForDatagramFanout`, which sets
         // SO_REUSEPORT (where available) followed by SO_REUSEADDR — so
         // multiple IOCs can bind the same UDP port and the kernel fans
         // each datagram out to them. The TCP listener gets only
-        // SO_REUSEADDR (:430); the fanout helper is SOCK_DGRAM-only. That
+        // SO_REUSEADDR (:448); the fanout helper is SOCK_DGRAM-only. That
         // pairing is `SocketOptions::FANOUT`, and the seam is what keeps the
         // options ahead of the bind on both hosted and embedded targets.
         let socket = socket::udp_socket(addr, socket::SocketOptions::FANOUT).map_err(|e| {
@@ -1034,8 +1034,8 @@ impl DrvAsynIPServerPort {
         let socket_t = Arc::clone(&socket);
         let cache_t = Arc::clone(&self.udp_cache);
         let shutdown_t = Arc::clone(&self.udp_shutdown);
-        let port_name = self.base.port_name.clone();
-        // The worker fires this port's octet interrupts (C :312-321), so it
+        let port_name = self.base.port_name.to_string();
+        // The worker fires this port's octet interrupts (C :326-335), so it
         // needs the same interrupt source the driver publishes on.
         let interrupts_t = InterruptManager::from_shared_state(self.base.interrupts.shared_state());
         let handle = std::thread::Builder::new()
@@ -1058,10 +1058,10 @@ impl DrvAsynIPServerPort {
     /// ([`Self::open_udp_listener`]) paths.
     ///
     /// Mirrors C `createServerSocket` (drvAsynIPServerPort.c:403-419):
-    /// the server address defaults to `INADDR_ANY` (`0.0.0.0`, :404) and
+    /// the server address defaults to `INADDR_ANY` (`0.0.0.0`, :421) and
     /// is only overridden when the host is non-empty **and** not
-    /// `"localhost"` (:412-413), in which case it is resolved by name
-    /// (`hostToIPAddr`, :414). C deliberately maps both an empty host and
+    /// `"localhost"` (:429-430), in which case it is resolved by name
+    /// (`hostToIPAddr`, :431). C deliberately maps both an empty host and
     /// `"localhost"` to `INADDR_ANY` — its comment tells callers to use
     /// `"127.0.0.1"` when they actually want the loopback interface — so
     /// this is faithful parity, not a copied bug.
@@ -1075,8 +1075,8 @@ impl DrvAsynIPServerPort {
     fn resolve_bind_addr(&self) -> AsynResult<SocketAddr> {
         let host = self.config.bind_host.trim();
         let port = self.config.bind_port;
-        // Empty or "localhost" => INADDR_ANY, exactly as C (:404,
-        // :412-413). C is IPv4-only here (PF_INET / sockaddr_in), so the
+        // Empty or "localhost" => INADDR_ANY, exactly as C (:421,
+        // :429-430). C is IPv4-only here (PF_INET / sockaddr_in), so the
         // any-address is the IPv4 0.0.0.0.
         if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
             return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
@@ -1086,7 +1086,7 @@ impl DrvAsynIPServerPort {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }
-        // Otherwise resolve the name (C hostToIPAddr, :414).
+        // Otherwise resolve the name (C hostToIPAddr, :431).
         use std::net::ToSocketAddrs;
         (host, port)
             .to_socket_addrs()
@@ -1103,10 +1103,10 @@ impl DrvAsynIPServerPort {
 
     fn bind_with_options(&self, addr: SocketAddr) -> AsynResult<TcpListener> {
         // Unconditional SO_REUSEADDR and no SO_REUSEPORT
-        // (drvAsynIPServerPort.c:430) — that is `SocketOptions::REUSE_ADDRESS`.
+        // (drvAsynIPServerPort.c:448) — that is `SocketOptions::REUSE_ADDRESS`.
         //
         // Backlog is `max_clients`, as C passes it (`listen(tty->fd,
-        // tty->maxClients)`, drvAsynIPServerPort.c:447). The two agree on how
+        // tty->maxClients)`, drvAsynIPServerPort.c:467). The two agree on how
         // many clients are served; they differ only in what the connect beyond
         // the cap sees on the wire. With C's queue depth the surplus SYN is
         // dropped and the peer retries to its own timeout; with a deep backlog
@@ -1195,7 +1195,7 @@ impl DrvAsynIPServerPort {
     /// asyn manager so device support addresses this specific slot
     /// by its port name (`<parent>:<idx>`) — same model as C
     /// asyn's `drvAsynIPPortConfigure` child-port creation at
-    /// `drvAsynIPServerPort.c:690-707`.
+    /// `drvAsynIPServerPort.c:711-728`.
     ///
     /// Returns `Err` if `idx` is out of range. The subport starts
     /// disconnected; calling `connect()` on it merely re-syncs the
@@ -1293,16 +1293,7 @@ impl PortDriver for DrvAsynIPServerPort {
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         if self.config.protocol == IpServerProtocol::Udp {
-            // C readIt (drvAsynIPServerPort.c:180-184) rejects maxchars == 0
-            // with asynError at the top of the UDP server read, before
-            // draining the datagram cache (this is also what shields C from
-            // its own (int)maxchars-1 underflow at :196). The TCP server read
-            // floors maxchars in base_read_octet; the UDP path bypasses it, so
-            // guard it here too — uniform with the TCP and client reads.
-            if buf.is_empty() {
-                return Err(maxchars_zero_error());
-            }
-            return Ok(self.udp_drain_into(buf));
+            return Ok(self.udp_read(buf)?.0);
         }
         let res = self.base_read_octet(user, buf)?;
         Ok(res.nbytes_transferred)
@@ -1314,19 +1305,9 @@ impl PortDriver for DrvAsynIPServerPort {
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
         if self.config.protocol == IpServerProtocol::Udp {
-            // C readIt (drvAsynIPServerPort.c:180-184) rejects maxchars == 0
-            // before draining the datagram cache; mirror it on this entry too
-            // (see read_octet above for the rationale).
-            if buf.is_empty() {
-                return Err(maxchars_zero_error());
-            }
-            // A UDP datagram is a message boundary: C `readIt`
-            // (drvAsynIPServerPort.c:201-207) sets ASYN_EOM_END when the
-            // datagram is fully drained, ASYN_EOM_CNT when the caller
-            // buffer is too small and more of the datagram remains. The
-            // default synthesis reports CNT-only and never END, so the
-            // EOS interpose / `asynRecord::EOMR` never see the boundary.
-            return Ok(self.udp_drain_into_eom(buf));
+            // The default synthesis reports CNT only, never the END a
+            // datagram boundary carries.
+            return self.udp_read(buf);
         }
         // TCP: surface the real end-of-message reason from the slot read
         // (CNT when the caller buffer filled, empty on a short read).
@@ -1369,9 +1350,9 @@ impl PortDriver for DrvAsynIPServerPort {
                         "broadcast write to slot failed"
                     );
                     // The slot is torn down by `write_or_close` on exactly C's
-                    // fatal-errno branch (drvAsynIPPort.c:694-698) — and *only*
+                    // fatal-errno branch (drvAsynIPPort.c:741-749) — and *only*
                     // there: a send timeout is C's `asynTimeout` with the socket
-                    // intact (:661-672), so a slow peer no longer loses its slot.
+                    // intact (:710-721), so a slow peer no longer loses its slot.
                     if f.closed {
                         self.base
                             .announce_exception(AsynException::Connect, i as i32);
@@ -1398,7 +1379,7 @@ impl PortDriver for DrvAsynIPServerPort {
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
         if self.config.protocol == IpServerProtocol::Udp {
             // C registers the UDP server's own `flushIt`
-            // (drvAsynIPServerPort.c:655); it discards the cached
+            // (drvAsynIPServerPort.c:676); it discards the cached
             // datagram by resetting `UDPbufferPos`/`UDPbufferSize`
             // (flushIt:244-245) so a flush-then-read waits for a fresh
             // datagram instead of re-returning the stale one. Clearing
@@ -1408,8 +1389,8 @@ impl PortDriver for DrvAsynIPServerPort {
             return Ok(());
         }
         // TCP: each accepted connection is served in C by a full
-        // `drvAsynIPPort` child (drvAsynIPServerPort.c:690) whose
-        // `flushIt` drains the socket (drvAsynIPPort.c:846-861). The Rust
+        // `drvAsynIPPort` child (drvAsynIPServerPort.c:711-715) whose
+        // `flushIt` drains the socket (drvAsynIPPort.c:900-915). The Rust
         // child `DrvAsynIPSubport` drains the same slot on its own flush;
         // the parent also serves clients by `addr`, so drain the
         // addressed slot here too. `addr < 0` (broadcast) drains every
@@ -1448,7 +1429,7 @@ impl DrvAsynIPServerPort {
     /// The disconnect fan-out the parent owes when [`ClientSlot`] closed a slot —
     /// C's `exceptionDisconnect` on the child port (drvAsynIPPort.c:216), which
     /// is what makes the listener's `isConnected` scan see the slot as free
-    /// (drvAsynIPServerPort.c:344-350). The socket is already gone; this is the
+    /// (drvAsynIPServerPort.c:359-365). The socket is already gone; this is the
     /// announcement half only.
     fn finish_slot_failure(&mut self, addr: i32, failure: SlotFailure) -> AsynError {
         if failure.closed {
@@ -1458,8 +1439,8 @@ impl DrvAsynIPServerPort {
     }
 
     /// C `tty->IPDeviceName` for a client slot — the name that goes into
-    /// `"%s read error: %s"` (drvAsynIPPort.c:801-803). C's child ports are named
-    /// `parent:N` (drvAsynIPServerPort.c:686).
+    /// `"%s read error: %s"` (drvAsynIPPort.c:855-857). C's child ports are named
+    /// `parent:N` (drvAsynIPServerPort.c:707).
     fn slot_device_name(&self, addr: i32) -> String {
         format!("{}:{}", self.base.port_name, addr)
     }
@@ -1475,31 +1456,32 @@ impl DrvAsynIPServerPort {
         slot.write_or_close(data, poll, cap, &self.slot_device_name(addr))
     }
 
-    /// UDP-mode read: copy at most `buf.len()` bytes from the cache,
-    /// advance pos. When the cache fully drains, clear it so the
-    /// recv worker can fetch the next datagram. Returns 0 (NOT an
-    /// error) when the cache is empty — caller polls. Mirrors C
-    /// asyn `readIt` (drvAsynIPServerPort.c lines 167-238) in
-    /// behaviour, simplified to drop the off-by-one C bug
-    /// (`maxchars - 1` copy with `+= maxchars` advance).
-    fn udp_drain_into(&self, buf: &mut [u8]) -> usize {
-        self.udp_drain_into_eom(buf).0
+    /// C `readIt` (drvAsynIPServerPort.c:166-250), the UDP server's read:
+    /// `maxchars` 0 is an error (:181-185) and a closed socket is
+    /// `asynDisconnected` (:190), both before the cache is touched. An empty
+    /// cache is a 1 ms poll returning nothing (:191-194).
+    fn udp_read(&self, buf: &mut [u8]) -> AsynResult<(usize, EomReason)> {
+        if buf.is_empty() {
+            return Err(maxchars_zero_error());
+        }
+        if self.udp_socket.lock().is_none() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: format!("{} UDP socket is closed", self.base.port_name),
+            });
+        }
+        let drained = self.udp_drain_into_eom(buf);
+        if drained.0 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(drained)
     }
 
-    /// Drain the UDP cache and report the end-of-message reason. Single
-    /// owner of the datagram-boundary decision shared by [`read_octet`]
-    /// (count only) and [`io_read_octet_eom`] (count + EOM). Mirrors C
-    /// `readIt` (drvAsynIPServerPort.c:201-207,232-235) with two
-    /// independent conditions: `ASYN_EOM_END` when the datagram is fully
-    /// drained, and `ASYN_EOM_CNT` when the caller buffer is filled. A
-    /// datagram that exactly fills the buffer meets both. (C's `:235`
-    /// CNT branch is dead only because its `:196-200` off-by-one short-
-    /// reads by one byte; with the off-by-one removed the buffer-filled
-    /// CNT condition is live, so it is honoured here.) An empty cache
-    /// yields `(0, empty)` — the caller polls (no boundary to report).
-    ///
-    /// [`read_octet`]: PortDriver::read_octet
-    /// [`io_read_octet_eom`]: PortDriver::io_read_octet_eom
+    /// The copy out of the datagram cache (C :195-217, :243-246): END when
+    /// the datagram is consumed, CNT when the caller's buffer is filled, both
+    /// on an exact fit. C's `remaining < 0` clamp (:202) has no state here to
+    /// guard: `pos` only advances by what is left. An empty cache yields
+    /// `(0, empty)`.
     fn udp_drain_into_eom(&self, buf: &mut [u8]) -> (usize, EomReason) {
         let mut cache = self.udp_cache.lock();
         if cache.is_empty() {
@@ -1511,14 +1493,10 @@ impl DrvAsynIPServerPort {
         cache.pos += n;
         let mut eom = EomReason::empty();
         if cache.is_empty() {
-            // Datagram fully consumed — end of message (C `:201-204`).
             cache.clear();
             eom |= EomReason::END;
         }
-        if n == buf.len() && !buf.is_empty() {
-            // Caller buffer filled (C `:232-235`, de-deadened). When the
-            // cache still holds more this is the sole reason; on an exact
-            // fit it accompanies END.
+        if n == buf.len() {
             eom |= EomReason::CNT;
         }
         (n, eom)
@@ -1582,9 +1560,9 @@ fn udp_recv_loop(
                     c.data.extend_from_slice(&buf[..n]);
                     c.pos = 0;
                 }
-                // C :312-321 — every registered octet callback gets the
+                // C :326-335 — every registered octet callback gets the
                 // datagram, unconditionally (no addr test, exactly as for the
-                // TCP announcement at :372-383). A datagram is a whole message,
+                // TCP announcement at :387-398). A datagram is a whole message,
                 // so C passes ASYN_EOM_END; InterruptValue carries no eom
                 // because no consumer reads one (C's own octet consumer,
                 // devAsynOctet.c:477-478, ignores the eomReason argument).
@@ -1672,10 +1650,10 @@ impl DrvAsynIPSubport {
         // a reused slot cannot leave the child stuck at `asynDisconnected`
         // (R13-50). C keeps the same two facts in agreement by having the listener
         // call `connectDevice` on the child the moment it hands it the socket
-        // (drvAsynIPServerPort.c:358-360).
+        // (drvAsynIPServerPort.c:372-375).
         base.share_connection(slot.connection_cell());
         // C's child IS a `drvAsynIPPortConfigure`d port — the listener creates it
-        // with exactly that call (drvAsynIPServerPort.c:688-694), passing
+        // with exactly that call (drvAsynIPServerPort.c:709-715), passing
         // noAutoConnect=1 and the server's own noProcessEos. So it gets the
         // configure-time shape through the same owner the client port does:
         // interruptProcess=1 (so an I/O-Intr record on `<parent>:<N>` processes)
@@ -1698,7 +1676,7 @@ impl DrvAsynIPSubport {
     /// The disconnect fan-out this child port owes when [`ClientSlot`] closed its
     /// slot — C `closeConnection`'s `exceptionDisconnect` (drvAsynIPPort.c:216),
     /// which is exactly what makes the listener see the slot as reusable
-    /// (drvAsynIPServerPort.c:344-350). The socket is already gone.
+    /// (drvAsynIPServerPort.c:359-365). The socket is already gone.
     ///
     /// Per-addr Connect carries addr=0 (this is the subport's single device
     /// slot); the port-level `set_connected(false)` fires the port-level
@@ -1723,7 +1701,7 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     /// C creates each accepted connection as a plain drvAsynIPPort
-    /// (`drvAsynIPPortConfigure`, drvAsynIPServerPort.c:690) — so a subport has
+    /// (`drvAsynIPPortConfigure`, drvAsynIPServerPort.c:711) — so a subport has
     /// the byte-transport interface set: asynCommon + asynOption + asynOctet.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
         crate::interfaces::octet_transport_capabilities()
@@ -1733,7 +1711,7 @@ impl PortDriver for DrvAsynIPSubport {
         // The child has no link of its own to dial: its socket is the slot's, and
         // the parent's accept loop is what puts one there. C's child `connectIt`
         // is likewise driven by the listener (`connectDevice`,
-        // drvAsynIPServerPort.c:358-360) and does no dialling either. So this
+        // drvAsynIPServerPort.c:372-375) and does no dialling either. So this
         // publishes the slot's state — it cannot change it.
         self.base.sync_connection_edge();
         if !self.base.is_connected() {
@@ -1745,11 +1723,11 @@ impl PortDriver for DrvAsynIPSubport {
         Ok(())
     }
 
-    /// C's child port is a full `drvAsynIPPort` (drvAsynIPServerPort.c:690), so
+    /// C's child port is a full `drvAsynIPPort` (drvAsynIPServerPort.c:711-715), so
     /// `asynSetOption("<parent>:<n>", 0, "disconnectOnReadTimeout", "Y")` lands in
-    /// `drvAsynIPPort::setOption` (:924-935), which accepts only `"Y"`/`"N"`
+    /// `drvAsynIPPort::setOption` (:978-989), which accepts only `"Y"`/`"N"`
     /// (case-insensitive) and errors on anything else. The option then arms the
-    /// first disjunct of `readIt`'s `should_disconnect` (:799-800) — see
+    /// first disjunct of `readIt`'s `should_disconnect` (:853-854) — see
     /// `ClientSlot::classify_read_error`.
     ///
     /// The other key C's `setOption` takes, `hostInfo`, re-dials an outbound
@@ -1766,7 +1744,7 @@ impl PortDriver for DrvAsynIPSubport {
 
     fn get_option(&self, key: &str) -> AsynResult<String> {
         if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
-            // C prints the flag as "Y"/"N" (drvAsynIPPort.c:896-898).
+            // C prints the flag as "Y"/"N" (drvAsynIPPort.c:950-952).
             return Ok(if self.slot.disconnect_on_read_timeout() {
                 "Y".to_string()
             } else {
@@ -1810,8 +1788,8 @@ impl PortDriver for DrvAsynIPSubport {
 
     fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
         // C parity: this child port is a full `drvAsynIPPort`
-        // (drvAsynIPServerPort.c:690) whose `flushIt` tosses all pending
-        // socket input (drvAsynIPPort.c:846-861) so a flush-then-read
+        // (drvAsynIPServerPort.c:711-715) whose `flushIt` tosses all pending
+        // socket input (drvAsynIPPort.c:900-915) so a flush-then-read
         // returns only the new reply. Drain this slot's stream through
         // the shared owner.
         self.slot.drain_input();
@@ -1824,7 +1802,7 @@ mod tests {
     use super::*;
 
     /// The listener thread is the only acceptor — C `connectionListener`
-    /// (drvAsynIPServerPort.c:284-386) — so a test observes an accept by waiting
+    /// (drvAsynIPServerPort.c:297-401) — so a test observes an accept by waiting
     /// for the slot to fill, not by driving the accept itself. Returns `idx`.
     fn wait_for_slot(srv: &DrvAsynIPServerPort, idx: usize) -> usize {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1891,13 +1869,13 @@ mod tests {
     ///   server's first read — on macOS/BSD it can take an extra poll interval —
     ///   so a `read()` may first return a retryable `asynTimeout` (C's caller
     ///   likewise re-drives `readIt` rather than treating one `EWOULDBLOCK` as a
-    ///   disconnect, drvAsynIPPort.c:807-812). Never accept that `Timeout` as
+    ///   disconnect, drvAsynIPPort.c:861-866). Never accept that `Timeout` as
     ///   teardown; keep polling.
     /// * The close does not surface as the *same* status on every platform.
     ///   C runs `closeConnection` — which frees the slot (`exceptionDisconnect`,
-    ///   :216 → drvAsynIPServerPort.c:344-350) — on BOTH a fatal errno
-    ///   (`asynError`, :805) and a stream EOF `recv()==0` (`asynSuccess`+END,
-    ///   :819). Linux delivers an abortive close as `ECONNRESET` (the port's
+    ///   :216 → drvAsynIPServerPort.c:359-365) — on BOTH a fatal errno
+    ///   (`asynError`, :859) and a stream EOF `recv()==0` (`asynSuccess`+END,
+    ///   :873). Linux delivers an abortive close as `ECONNRESET` (the port's
     ///   `asynError`); macOS/BSD can deliver the very same close as a plain
     ///   `recv()==0` EOF (the port's `asynDisconnected`). So accept either.
     ///
@@ -1919,7 +1897,7 @@ mod tests {
             match res {
                 Ok(n) => panic!("a reset peer cannot deliver {n} bytes"),
                 // A retryable asynTimeout means the RST is not yet visible and the
-                // socket is still intact (C readIt :807-811). Never teardown.
+                // socket is still intact (C readIt :861-865). Never teardown.
                 Err(e) if e.status() == AsynStatus::Timeout => {}
                 // Any other status is C's teardown — fatal-errno asynError, or a
                 // recv()==0 EOF asynDisconnected. `read_or_close` clears the slot
@@ -1958,7 +1936,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_so_reuseport_token() {
-        // C asyn drvAsynIPServerPort.c:597 prints "Unknown protocol"
+        // C asyn drvAsynIPServerPort.c:618 prints "Unknown protocol"
         // and returns -1 for anything other than tcp/udp. Reject
         // SO_REUSEPORT — it is not a valid token in C asyn.
         assert!(IpServerConfig::parse("0.0.0.0:9000 SO_REUSEPORT").is_err());
@@ -2070,8 +2048,8 @@ mod tests {
     /// DRV-18: the UDP server socket enables SO_REUSEPORT (datagram
     /// fanout) while the TCP listener does not. C calls
     /// `epicsSocketEnableAddressUseForDatagramFanout` (SO_REUSEPORT +
-    /// SO_REUSEADDR) for SOCK_DGRAM only (drvAsynIPServerPort.c:426-429);
-    /// the TCP path gets SO_REUSEADDR alone (:430). Read the option back
+    /// SO_REUSEADDR) for SOCK_DGRAM only (drvAsynIPServerPort.c:444-447);
+    /// the TCP path gets SO_REUSEADDR alone (:448). Read the option back
     /// off the bound socket so the assertion does not depend on the
     /// platform's permissive double-bind behaviour.
     #[cfg(unix)]
@@ -2106,11 +2084,12 @@ mod tests {
 
     /// DRV-20: a flush on the UDP server discards the cached datagram (C
     /// `flushIt` resets `UDPbufferPos`/`UDPbufferSize`,
-    /// drvAsynIPServerPort.c:244-245), so a flush-then-read waits for a
+    /// drvAsynIPServerPort.c:256-257), so a flush-then-read waits for a
     /// fresh datagram instead of re-returning the stale one.
     #[test]
     fn udp_server_flush_discards_cached_datagram() {
         let mut srv = DrvAsynIPServerPort::new("udp_flush", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
         // Seed a datagram directly so the assertion is deterministic.
         {
             let mut cache = srv.udp_cache.lock();
@@ -2139,8 +2118,8 @@ mod tests {
 
     /// DRV-20 (TCP sibling, found in adversarial review): a flush on a
     /// TCP server connection drains staged socket input, matching C's
-    /// child `drvAsynIPPort::flushIt` (drvAsynIPPort.c:846-861) — each
-    /// server child is a full `drvAsynIPPort` (drvAsynIPServerPort.c:690).
+    /// child `drvAsynIPPort::flushIt` (drvAsynIPPort.c:900-915) — each
+    /// server child is a full `drvAsynIPPort` (drvAsynIPServerPort.c:711-715).
     /// Pre-fix the TCP flush was a no-op and a flush-then-read returned
     /// the stale bytes. Exercises the parent's addr-routed flush path.
     #[test]
@@ -2184,10 +2163,10 @@ mod tests {
     ///
     /// C serves each accepted connection with a full `drvAsynIPPort` child
     /// (drvAsynIPServerPort.c:682-708), whose `readIt` calls `closeConnection` on
-    /// *any* errno outside `EWOULDBLOCK`/`EINTR` (drvAsynIPPort.c:798-806), not
+    /// *any* errno outside `EWOULDBLOCK`/`EINTR` (drvAsynIPPort.c:851-860), not
     /// just on EOF — and `closeConnection`'s `exceptionDisconnect` (:216) is
     /// exactly what makes the listener's `isConnected` scan hand the slot to the
-    /// next client (drvAsynIPServerPort.c:344-350).
+    /// next client (drvAsynIPServerPort.c:359-365).
     ///
     /// The port tore down on EOF only, so a peer that vanished with an RST
     /// (`ECONNRESET` — a crashed client, a NAT drop) kept its slot forever, and
@@ -2253,10 +2232,10 @@ mod tests {
     /// W10-D5: the child port honours `disconnectOnReadTimeout`.
     ///
     /// C serves each accepted connection with a full `drvAsynIPPort`
-    /// (drvAsynIPServerPort.c:690), so `asynSetOption("<parent>:<n>", 0,
+    /// (drvAsynIPServerPort.c:711-715), so `asynSetOption("<parent>:<n>", 0,
     /// "disconnectOnReadTimeout", "Y")` reaches `drvAsynIPPort::setOption`
     /// (:924-935) and arms the *first* disjunct of `readIt`'s `should_disconnect`
-    /// (:799-800): a read that merely times out closes the connection. The port
+    /// (:853-854): a read that merely times out closes the connection. The port
     /// modelled only the second (fatal-errno) disjunct, so a silent peer held its
     /// slot forever and the server could not reclaim it.
     ///
@@ -2288,7 +2267,7 @@ mod tests {
         );
         assert!(
             srv.slots[0].is_occupied(),
-            "with the option off a read timeout leaves the socket intact (C :810-811)"
+            "with the option off a read timeout leaves the socket intact (C :864-865)"
         );
 
         // asynSetOption("srv_drto:0", 0, "disconnectOnReadTimeout", "Y").
@@ -2304,11 +2283,11 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert!(
             srv.slots[0].is_occupied(),
-            "a zero-timeout poll is not a read timeout C tears down on (:799)"
+            "a zero-timeout poll is not a read timeout C tears down on (:853)"
         );
 
         // …but a real timed read now closes the connection, and C reports that
-        // branch as asynError, never as a retryable asynTimeout (:801-806).
+        // branch as asynError, never as a retryable asynTimeout (:855-860).
         let err = child.read_octet(&user, &mut buf).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
         // `"%s read error: %s"` (drvAsynIPPort.c:852-859).
@@ -2320,7 +2299,7 @@ mod tests {
         assert!(
             !srv.slots[0].is_occupied(),
             "disconnectOnReadTimeout=Y frees the slot on a read timeout \
-             (drvAsynIPPort.c:799-800, first disjunct)"
+             (drvAsynIPPort.c:853-854, first disjunct)"
         );
         assert!(!child.base().is_connected());
 
@@ -2341,7 +2320,7 @@ mod tests {
     /// `pasynCommonSyncIO->connectDevice(pl->pasynUser)` on the child port
     /// (drvAsynIPServerPort.c:358-360), which drives the child's `connectIt` and
     /// its `exceptionConnect`. It has to: the child's own `isConnected` is what
-    /// the *next* free-slot scan reads (:343-350), so C cannot leave a child
+    /// the *next* free-slot scan reads (:358-365), so C cannot leave a child
     /// disconnected while its slot holds a live socket.
     ///
     /// The port cached the child's `connected` in its own `PortDriverBase`, which
@@ -2362,7 +2341,7 @@ mod tests {
         let mut child = srv.make_subport(0).unwrap();
 
         // First client, killed with an RST so the read tears the slot down through
-        // the fatal-errno path (C drvAsynIPPort.c:798-806).
+        // the fatal-errno path (C drvAsynIPPort.c:851-860).
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let victim = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
         victim.connect(&addr.into()).unwrap();
@@ -2412,7 +2391,7 @@ mod tests {
         assert!(
             child.base().is_connected(),
             "a reused slot revives the child: C calls connectDevice on it \
-             (drvAsynIPServerPort.c:358-360)"
+             (drvAsynIPServerPort.c:372-375)"
         );
 
         // …and the revival is real I/O, not just a flag: the child must talk to the
@@ -2569,7 +2548,7 @@ mod tests {
     /// R19-121 boundary: a child port inherits the parent's trace masks at the
     /// accept, and only at the accept.
     ///
-    /// C `drvAsynIPServerPort.c:369-371` copies both masks onto the child when
+    /// C `drvAsynIPServerPort.c:384-386` copies both masks onto the child when
     /// the connection lands — *"Set the new port to initially have the same
     /// trace mask that we have"*. The two boundaries: a mask set on the parent
     /// BEFORE the client connects (the st.cmd case: `asynSetTraceMask SERVER -1
@@ -2770,9 +2749,9 @@ mod tests {
         srv.disconnect(&AsynUser::default()).unwrap();
     }
 
-    /// `read_octet` on empty UDP cache returns 0 (NOT an error) — the
-    /// C asyn semantics is "poll", not "block". Caller is expected to
-    /// retry or use the I/O Intr path.
+    /// An empty UDP cache is C readIt's 1 ms poll (drvAsynIPServerPort.c
+    /// :191-194): 0 bytes, no EOM, not an error, and not before the
+    /// millisecond has passed — on both read entries.
     #[test]
     fn udp_server_read_returns_zero_when_empty() {
         let mut srv = DrvAsynIPServerPort::new("udp_srv3", "127.0.0.1:0 UDP").unwrap();
@@ -2781,19 +2760,50 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 64];
+        let start = Instant::now();
         let n = srv.read_octet(&user, &mut buf).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(1), "read_octet");
         assert_eq!(n, 0, "empty UDP cache must return 0 bytes, not error");
+        let start = Instant::now();
+        let (n, eom) = srv.io_read_octet_eom(&user, &mut buf).unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(1),
+            "io_read_octet_eom"
+        );
+        assert_eq!((n, eom), (0, EomReason::empty()));
         srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// C readIt returns `asynDisconnected` on a closed socket before it
+    /// reads the datagram buffer (drvAsynIPServerPort.c:190), on both read
+    /// entries, and the buffered datagram stays.
+    #[test]
+    fn udp_server_read_on_a_closed_socket_is_disconnected() {
+        let mut srv = DrvAsynIPServerPort::new("udp_srv_closed", "127.0.0.1:0 UDP").unwrap();
+        {
+            let mut cache = srv.udp_cache.lock();
+            cache.data = b"held".to_vec();
+            cache.pos = 0;
+        }
+        let user = AsynUser::default().with_addr(0);
+        let mut buf = [0u8; 16];
+        let disconnected = |e: AsynError| e.status() == AsynStatus::Disconnected;
+        assert!(disconnected(srv.read_octet(&user, &mut buf).unwrap_err()));
+        assert!(disconnected(
+            srv.io_read_octet_eom(&user, &mut buf).unwrap_err()
+        ));
+        assert_eq!(srv.udp_cache_pending(), 4);
     }
 
     /// DRV-23 regression: a UDP datagram is a message boundary.
     /// `io_read_octet_eom` must report `ASYN_EOM_END` when the datagram
     /// is fully drained and `ASYN_EOM_CNT` when the caller buffer is too
     /// small and more of the datagram remains (C drvAsynIPServerPort.c
-    /// readIt:201-207). The default synthesis reports CNT-only, never END.
+    /// readIt:212-217). The default synthesis reports CNT-only, never END.
     #[test]
     fn udp_server_read_eom_reports_end_at_datagram_boundary() {
         let mut srv = DrvAsynIPServerPort::new("udp_srv_eom", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
         // Seed the cache directly so the assertion is deterministic (no
         // datagram-arrival race).
         {
@@ -2836,8 +2846,7 @@ mod tests {
 
         // Exact fit: a datagram that exactly fills the caller buffer is
         // both fully drained (END) and buffer-filled (CNT) — the two
-        // conditions are independent (C readIt:201-204 + :232-235,
-        // de-deadened off-by-one).
+        // conditions are independent (C readIt:212-215 + :243-246).
         {
             let mut cache = srv.udp_cache.lock();
             cache.data = b"abcd".to_vec();
@@ -2856,7 +2865,7 @@ mod tests {
         assert!(eom.is_empty());
     }
 
-    /// DRV-55 (UDP-server sibling): C readIt (drvAsynIPServerPort.c:180-184)
+    /// DRV-55 (UDP-server sibling): C readIt (drvAsynIPServerPort.c:181-185)
     /// rejects maxchars == 0 with asynError before draining the cache. The
     /// UDP read entries (`read_octet`/`io_read_octet_eom`) bypass
     /// `base_read_octet`, so they must carry the guard themselves — an empty
@@ -2865,6 +2874,7 @@ mod tests {
     #[test]
     fn udp_server_zero_length_read_rejected() {
         let mut srv = DrvAsynIPServerPort::new("udp_srv_maxchars", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
         {
             let mut cache = srv.udp_cache.lock();
             cache.data = b"keepme".to_vec();
@@ -3099,7 +3109,7 @@ mod tests {
     }
 
     /// Child port name matches C `epicsSnprintf(pl->portName, len,
-    /// "%s:%d", tty->portName, i)` at drvAsynIPServerPort.c:688.
+    /// "%s:%d", tty->portName, i)` at drvAsynIPServerPort.c:709.
     #[test]
     fn child_port_names_match_c_convention() {
         let cfg = IpServerConfig {
@@ -3125,14 +3135,14 @@ mod tests {
     }
 
     /// A child port IS a `drvAsynIPPortConfigure`d port (C creates it with
-    /// exactly that call, drvAsynIPServerPort.c:688-694), so it carries the same
+    /// exactly that call, drvAsynIPServerPort.c:709-715), so it carries the same
     /// configure-time shape as the client IP port the same command builds:
     ///
     /// - `octet_interrupt_process` — `pasynOctetBase->initialize(..., 1)`
-    ///   (drvAsynIPPort.c:1055): without it a `stringin` with SCAN="I/O Intr" on
+    ///   (drvAsynIPPort.c:1109): without it a `stringin` with SCAN="I/O Intr" on
     ///   `<parent>:<N>` never processes (R19-108).
     /// - one EOS interpose — `asynInterposeEosConfig` unless `noProcessEos`
-    ///   (drvAsynIPPort.c:1065-1066): without it an IEOS on the child terminates
+    ///   (drvAsynIPPort.c:1119-1120): without it an IEOS on the child terminates
     ///   nothing (R19-107).
     /// - `auto_connect == false` — C passes `noAutoConnect = 1` for the child;
     ///   the listener connects it by handing it the accepted fd.
@@ -3155,7 +3165,7 @@ mod tests {
 
         let srv = build("child_eos_on", false);
         let child = srv.make_subport(1).unwrap();
-        assert_eq!(child.base().port_name, "child_eos_on:1");
+        assert_eq!(&*child.base().port_name, "child_eos_on:1");
         assert!(
             child.base().octet_interrupt_process,
             "a child fans its reads out to interrupt users, like every drvAsynIPPort"
@@ -3182,7 +3192,7 @@ mod tests {
     /// The parent's own EOS state is not the child's: C's parent server port
     /// registers `pasynOctetBase->initialize(..., 0)` — no EOS processing, no
     /// interruptProcess flag on its own octet interface
-    /// (drvAsynIPServerPort.c:655-661) — and it is the CHILDREN that are real
+    /// (drvAsynIPServerPort.c:678-684) — and it is the CHILDREN that are real
     /// IP ports. Pins the asymmetry so a future "make them consistent" does not
     /// hand the parent an EOS layer C never gives it.
     #[test]
@@ -3225,7 +3235,7 @@ mod tests {
     /// Subport shares the slot with the parent: parent.accept_one
     /// fills slot 0, subport's connect() then succeeds and its
     /// read_octet/write_octet operate on the same TCP stream as the
-    /// parent's addr=0 path. Mirrors C drvAsynIPServerPort.c:358-360
+    /// parent's addr=0 path. Mirrors C drvAsynIPServerPort.c:372-375
     /// where the parent assigns the FD to the child port and triggers
     /// its connectDevice.
     #[test]
@@ -3482,7 +3492,7 @@ mod tests {
             "a stalled write is C's asynTimeout, not asynError: {}",
             failure.error
         );
-        // C keeps the socket on the branch it retries (drvAsynIPPort.c:661-672):
+        // C keeps the socket on the branch it retries (drvAsynIPPort.c:710-721):
         // the peer is alive, it is merely slow.
         assert!(
             !failure.closed,

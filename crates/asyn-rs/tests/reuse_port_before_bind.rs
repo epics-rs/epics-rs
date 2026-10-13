@@ -1,8 +1,8 @@
 //! R18-62: `SO_REUSEPORT` is set on the fresh socket, before bind/connect.
 //!
-//! C `connectIt` creates the socket (drvAsynIPPort.c:442), sets `SO_BROADCAST`
-//! (:451-459) and `SO_REUSEPORT` (:464-477) on it, and only then binds the local
-//! address (:499-506) and connects (:513-523). The kernel honours `SO_REUSEPORT`
+//! C `connectIt` creates the socket (drvAsynIPPort.c:443), sets `SO_BROADCAST`
+//! (:453-462) and `SO_REUSEPORT` (:467-481) on it, and only then binds the local
+//! address (:499-506) and connects (:533-577). The kernel honours `SO_REUSEPORT`
 //! only on an unbound socket, so the order is the feature: `udp&` exists so two
 //! ports can share one local port.
 //!
@@ -64,7 +64,7 @@ fn hold_reuseport_udp() -> (Socket, u16) {
 fn two_udp_reuseport_ports_share_one_local_port() {
     // `local` is what both ports re-bind, so hold it race-proof with a REUSEPORT
     // socket the driver's own REUSEPORT binds can share. `peer` is only a
-    // destination address (the driver never binds it, C :513 does not connect a
+    // destination address (the driver never binds it, C :533 does not connect a
     // datagram socket), so a plain held socket keeps its number ours too. Holding
     // both across the whole test closes the probe-then-rebind window without
     // changing the honest path — the ports still bind `local`, now alongside our

@@ -5,7 +5,7 @@
 //! `sscanf(val, "%d")` / `sscanf(val, "%u")` for the numeric keys, and
 //! `epicsStrCaseCmp(val, "Y"/"N")` for the boolean ones — and it reports the
 //! failure with a fixed string per key (`drvAsynSerialPort.c:261-616`,
-//! `drvAsynSerialPortWin32.c:192-345`, `drvAsynIPPort.c:924-935`). Those strings
+//! `drvAsynSerialPortWin32.c:192-345`, `drvAsynIPPort.c:978-989`). Those strings
 //! are the operator's diagnostic: they reach ERRS through
 //! `pasynUser->errorMessage` (asynRecord.c `reportError`), and an OPI or a
 //! script that keys off them sees the driver's own words.
@@ -128,7 +128,7 @@ pub fn bad_number() -> AsynError {
 
 /// C's diagnostic for a boolean/enumerated key whose value it does not
 /// recognise — `"Invalid <key> value."` (drvAsynSerialPort.c:419, :440, :464,
-/// :481, :502, :539, :558; drvAsynIPPort.c:933).
+/// :481, :502, :539, :558; drvAsynIPPort.c:987).
 ///
 /// The three keys whose C text is *not* of this shape have their own literal at
 /// the call site: `"Invalid parity."`, `"Invalid number of bits."`,

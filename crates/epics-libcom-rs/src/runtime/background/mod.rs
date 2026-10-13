@@ -47,8 +47,9 @@ pub mod timer_sleep;
 use std::time::Duration;
 
 pub use callback_executor::{
-    Callback, CallbackError, CallbackHandle, CallbackPool, CallbackPriority, CallbackQueueStats,
-    DEFAULT_QUEUE_SIZE, DEFAULT_THREADS_PER_PRIORITY, DedicatedExecutor, NUM_CALLBACK_PRIORITIES,
+    Callback, CallbackBody, CallbackCell, CallbackError, CallbackHandle, CallbackPool,
+    CallbackPriority, CallbackQueueStats, DEFAULT_QUEUE_SIZE, DEFAULT_THREADS_PER_PRIORITY,
+    DedicatedExecutor, NUM_CALLBACK_PRIORITIES,
 };
 pub use delayed_timer::{DelayedTimer, TimerHandle};
 pub use future_exec::{

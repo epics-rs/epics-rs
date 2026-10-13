@@ -238,16 +238,63 @@ impl AsyncToken {
     }
 
     /// Fire the continuation: if still current, re-enter the record's
-    /// `process()` via [`PvDatabase::process_record_continuation`]. A
-    /// stale (superseded / cancelled) token is a no-op. Consumes the
-    /// token so it cannot fire twice.
+    /// `process()`, through the re-entry `ProcessCallback` shares. A stale
+    /// (superseded / cancelled) token is a no-op. Consumes the token so it
+    /// cannot fire twice.
     pub async fn fire(self, db: &PvDatabase) -> CaResult<()> {
-        if self.generation.load(Ordering::Acquire) != self.epoch {
-            return Ok(());
-        }
-        let mut visited = ProcStack::new();
-        db.process_record_continuation(&self.name, &mut visited)
-            .await
+        db.reenter_if_current(
+            ProcessTarget::Name(&self.name),
+            &self.generation,
+            self.epoch,
+        )
+    }
+}
+
+/// A record's preallocated `epicsCallback` for C
+/// `callbackRequestProcessCallback` (`callback.c:397-402`): queuing it re-enters
+/// the record's `process()` on a callback band, under the record's lock set
+/// (`ProcessCallback`, `:379-387`), allocating nothing per request.
+///
+/// Owned by the record support that completes asynchronously, as C's lives in
+/// the record's private structure (`asynRecord.c:227`), and built once with
+/// [`AsyncDbHandle::process_callback`]. Each run supersedes the record's
+/// outstanding [`AsyncToken`]s, as minting one and firing it would.
+#[derive(Clone)]
+pub struct ProcessCallback(Arc<crate::runtime::background::CallbackCell<ProcessReentry>>);
+
+impl ProcessCallback {
+    /// C `callbackRequestProcessCallback(&cb, priority, prec)`. A request
+    /// while one is queued is taken by that one; `Err` is a full band.
+    pub fn request(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+    ) -> Result<(), crate::runtime::background::CallbackError> {
+        crate::runtime::task::request_cell(priority, &self.0)
+    }
+}
+
+/// The body of a [`ProcessCallback`].
+struct ProcessReentry {
+    db: std::sync::Weak<super::PvDatabaseInner>,
+    name: String,
+}
+
+impl crate::runtime::background::CallbackBody for ProcessReentry {
+    fn run(&self) {
+        let Some(inner) = self.db.upgrade() else {
+            return;
+        };
+        let db = PvDatabase { inner };
+        let Some(rec) = db.get_record_no_resolve(&self.name) else {
+            return;
+        };
+        let generation = rec.read().reprocess_generation.clone();
+        let epoch = PvDatabase::advance_generation(&generation);
+        let _ = db.reenter_if_current(
+            ProcessTarget::Resolved(&self.name, &rec),
+            &generation,
+            epoch,
+        );
     }
 }
 
@@ -514,6 +561,19 @@ impl AsyncDbHandle {
             Some(db) => db.mint_async_token(name),
             None => None,
         }
+    }
+
+    /// The [`ProcessCallback`] that re-enters `name`, built once by the
+    /// record support that owns it. `name` must be canonical. Holds the
+    /// database weakly, as this handle does: a run after the database or
+    /// the record is gone re-enters nothing.
+    pub fn process_callback(&self, name: &str) -> ProcessCallback {
+        ProcessCallback(crate::runtime::background::CallbackCell::new(
+            ProcessReentry {
+                db: self.inner.clone(),
+                name: name.to_string(),
+            },
+        ))
     }
 
     /// Cancel an outstanding async re-entry — see
@@ -2611,12 +2671,33 @@ impl PvDatabase {
         name: &str,
         generation: Arc<std::sync::atomic::AtomicU64>,
     ) -> AsyncToken {
-        let epoch = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let epoch = Self::advance_generation(&generation);
         AsyncToken {
             name: name.to_string(),
             generation,
             epoch,
         }
+    }
+
+    /// Supersede every outstanding token of the record that owns
+    /// `generation`, answering the epoch that is now current.
+    fn advance_generation(generation: &AtomicU64) -> u64 {
+        generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// The one re-entry of an async continuation: `target`'s `process()`
+    /// under its lock set, past the PACT guard, unless a newer token or a
+    /// cancel has advanced `generation` past `epoch`.
+    fn reenter_if_current(
+        &self,
+        target: ProcessTarget<'_>,
+        generation: &AtomicU64,
+        epoch: u64,
+    ) -> CaResult<()> {
+        if generation.load(Ordering::Acquire) != epoch {
+            return Ok(());
+        }
+        self.run_process_frame(target, &mut ProcStack::new(), true, true, false)
     }
 
     /// Cancel any outstanding async re-entry token for `name` (C

@@ -4,26 +4,45 @@ use std::time::Duration;
 use crate::services::PortServices;
 
 /// C `pasynBase->autoConnectTimeout` (asynManager.c:110), initialised to
-/// `DEFAULT_AUTOCONNECT_TIMEOUT` = 0.5 s (:49, :507) and rewritten by
-/// `asynSetAutoConnectTimeout` (:2370-2377).
+/// `DEFAULT_AUTOCONNECT_TIMEOUT` = 0.5 s (:49, :509) and rewritten by
+/// `asynSetAutoConnectTimeout` (:2375-2391).
 ///
-/// Process-global on purpose: C has exactly one `pasynBase`, and each port
-/// registration reads the value that is current *then* (:2135). Microseconds,
-/// so the shell's `double` seconds survives the round trip.
-static AUTO_CONNECT_TIMEOUT_US: AtomicU64 = AtomicU64::new(500_000);
+/// Process-global on purpose: C has exactly one `pasynBase`. Held as the raw
+/// `double`, sign included, because its two readers disagree on a negative
+/// value: the registration wait (:2137) does not wait, the connect poll
+/// (drvAsynIPPort.c:546-555) waits forever.
+static AUTO_CONNECT_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0.5f64.to_bits());
+
+fn auto_connect_timeout_secs() -> f64 {
+    f64::from_bits(AUTO_CONNECT_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
 
 /// The registration connect-wait every new port gets — C's
-/// `pasynBase->autoConnectTimeout` read at :2135.
+/// `waitConnect(..., pasynBase->autoConnectTimeout)` at :2137, whose
+/// `epicsEventWaitWithTimeout` does not wait on a negative or NaN value.
 pub fn auto_connect_timeout() -> Duration {
-    Duration::from_micros(AUTO_CONNECT_TIMEOUT_US.load(Ordering::Relaxed))
+    let secs = auto_connect_timeout_secs();
+    if secs.is_finite() && secs > 0.0 {
+        Duration::from_secs_f64(secs)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// The bound on an IP port's TCP connect — C `connectIt`'s
+/// `msConnectTimeout = (int)(1000 * connectTimeout)` handed to `poll`
+/// (drvAsynIPPort.c:546-555), read at every connect. A negative value is
+/// `poll`'s wait-forever, the longest wait an `int` of milliseconds spells.
+pub fn connect_poll_timeout() -> Duration {
+    let ms = (1000.0 * auto_connect_timeout_secs()) as i32;
+    Duration::from_millis(if ms < 0 { i32::MAX } else { ms } as u64)
 }
 
 /// C `pasynManager->setAutoConnectTimeout(double)` — the iocsh
-/// `asynSetAutoConnectTimeout`. Applies to ports registered after this call,
-/// exactly as in C. A negative or NaN value collapses to zero (no wait), which
-/// is what C's `epicsEventWaitWithTimeout` does with one.
-pub fn set_auto_connect_timeout(timeout: Duration) {
-    AUTO_CONNECT_TIMEOUT_US.store(timeout.as_micros() as u64, Ordering::Relaxed);
+/// `asynSetAutoConnectTimeout`. Stored as given; ports registered after this
+/// call and every later IP connect read the new value, exactly as in C.
+pub fn set_auto_connect_timeout(secs: f64) {
+    AUTO_CONNECT_TIMEOUT_SECS.store(secs.to_bits(), Ordering::Relaxed);
 }
 
 /// Configuration for a port runtime.
@@ -38,8 +57,8 @@ pub struct RuntimeConfig {
     /// How long port creation waits for an `auto_connect` port to come up
     /// before returning — C `waitConnect(pport->pconnectUser,
     /// pasynBase->autoConnectTimeout)` at the end of registration
-    /// (asynManager.c:2135), with `DEFAULT_AUTOCONNECT_TIMEOUT` = 0.5 s (:49,
-    /// :507). It bounds the wait; it does not decide the outcome — a port that
+    /// (asynManager.c:2137), with `DEFAULT_AUTOCONNECT_TIMEOUT` = 0.5 s (:49,
+    /// :509). It bounds the wait; it does not decide the outcome — a port that
     /// has not connected by then keeps retrying on its own timer, exactly as C's
     /// does, and registration still succeeds.
     pub auto_connect_timeout: Duration,
@@ -50,6 +69,9 @@ pub struct RuntimeConfig {
     /// [`crate::manager::PortManager`] carrying its own `TraceManager`
     /// substitutes its own here.
     pub services: PortServices,
+    /// C `registerPort`'s `priority`, the band of the port's thread; 0 is
+    /// `epicsThreadPriorityMedium` (asynManager.c:2077).
+    pub priority: u32,
 }
 
 impl Default for RuntimeConfig {
@@ -59,6 +81,7 @@ impl Default for RuntimeConfig {
             connect_backoff: BackoffConfig::default(),
             supervision: SupervisionPolicy::default(),
             auto_connect_timeout: auto_connect_timeout(),
+            priority: 0,
             services: PortServices::global(),
         }
     }
@@ -97,5 +120,29 @@ impl Default for SupervisionPolicy {
             max_restarts: 5,
             restart_window: Duration::from_secs(60),
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_connect_timeout_tests {
+    use super::*;
+
+    /// One C double, two readers that part on its sign: the registration
+    /// wait does not wait on a negative value (asynManager.c:2137), the
+    /// connect poll waits forever (drvAsynIPPort.c:547-555), and `(int)`
+    /// truncates both to whole milliseconds first.
+    #[test]
+    fn the_auto_connect_timeout_readers_part_on_the_sign() {
+        for (secs, wait, poll) in [
+            (0.5, Duration::from_millis(500), Duration::from_millis(500)),
+            (0.0004, Duration::from_micros(400), Duration::ZERO),
+            (0.0, Duration::ZERO, Duration::ZERO),
+            (-1.0, Duration::ZERO, Duration::from_millis(i32::MAX as u64)),
+        ] {
+            set_auto_connect_timeout(secs);
+            assert_eq!(auto_connect_timeout(), wait, "registration wait at {secs}");
+            assert_eq!(connect_poll_timeout(), poll, "connect poll at {secs}");
+        }
+        set_auto_connect_timeout(0.5);
     }
 }

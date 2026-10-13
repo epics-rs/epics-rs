@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+
 use tokio::sync::{broadcast, mpsc};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -156,13 +158,13 @@ fn stop_port_actor(
 }
 
 /// The one way to wait for a port's connect — C `waitConnect`
-/// (asynManager.c:3292-3336), which arms an exception handler and only then
+/// (asynManager.c:3323-3367), which arms an exception handler and only then
 /// blocks on the event.
 ///
 /// Arming first is the whole point: a connect that lands between "am I
 /// connected?" and "start waiting" would be missed by any caller that checked
 /// the flag first. C has that race — it reads `pport->dpc.connected` at
-/// :3308-3311 and only arms afterwards, at :3316 — so here [`Self::arm`]
+/// :3339-3342 and only arms afterwards, at :3347 — so here [`Self::arm`]
 /// registers the callback first, the caller may then short-circuit on an
 /// already-connected port, and [`Self::wait`] blocks for the rest. That
 /// ordering is a deliberate deviation. Both waiters in the crate — port
@@ -234,9 +236,9 @@ pub fn create_port_runtime<D: PortDriver>(
 /// survives anywhere in the process.
 ///
 /// C parity: `registerPort` → `registerDriver` creates the port thread at
-/// `asynManager.c:2079-2080`, and on failure (:2081-2091) prints, unwinds every
+/// `asynManager.c:2079-2080`, and on failure (:2083-2093) prints, unwinds every
 /// resource it had built for the port, and returns `asynError` **before**
-/// `ellAdd(&pasynBase->asynPortList, ...)` (:2094) — the port never enters the
+/// `ellAdd(&pasynBase->asynPortList, ...)` (:2096) — the port never enters the
 /// list. The unwind is this function's `Err` return: the `PortActor` (which
 /// owns the driver) is dropped along with the closure `Builder::spawn`
 /// rejected, and the one resource that is *not* local — the connect-exception
@@ -255,9 +257,9 @@ pub fn create_port_runtime_boxed(
 ) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
     // The one site that binds a port to its trace configuration and exception
     // list. C does it inside `registerPort` — the sole path into the port list
-    // — which calls `dpCommonInit` (asynManager.c:2066) before adding the port
-    // (:2094); `dpCommonInit` (:510-529) is what inits `exceptionUserList` (:524)
-    // and the port's own `tracePvt` (:528), so no port can exist without them. Every
+    // — which calls `dpCommonInit` (asynManager.c:2068) before adding the port
+    // (:2096); `dpCommonInit` (:512-531) is what inits `exceptionUserList` (:526)
+    // and the port's own `tracePvt` (:530), so no port can exist without them. Every
     // port creator in this crate (`PortManager::register_port`, the
     // `drvAsyn*PortConfigure` iocsh commands, driver-owned ports) funnels
     // through here, so binding here is what makes that true for the port too.
@@ -266,7 +268,7 @@ pub fn create_port_runtime_boxed(
     // C `registerInterface(asynCommonType)` — reached from `registerPort` for
     // every port — calls `initPortConnect` and then `portConnectTimerCallback`
     // (asynManager.c:2131-2136), which queues a connect at
-    // `asynQueuePriorityConnect` the moment the port exists (:3252-3266). An
+    // `asynQueuePriorityConnect` the moment the port exists (:3283-3297). An
     // auto-connect port is therefore brought up BY REGISTRATION, not by whichever
     // record first happens to do I/O: `CNCT` reads 1 straight after
     // `drvAsynIPPortConfigure`, and a port no record ever talks to still comes up.
@@ -274,14 +276,14 @@ pub fn create_port_runtime_boxed(
     // Arming the actor's connect deadline is that queued request: the actor runs
     // `service_connect_timer` ahead of anything in its queue, which is what C's
     // Connect priority buys. It re-arms itself at `secondsBetweenPortConnect` on
-    // failure (C :3281), so a port whose device is down keeps trying without a
+    // failure (C :3312), so a port whose device is down keeps trying without a
     // single request ever being submitted.
     let connect_at_registration = driver.base().is_auto_connect() && !driver.base().is_connected();
     if connect_at_registration {
         driver.base_mut().connect_retry_at = Some(std::time::Instant::now());
     }
 
-    let port_name = driver.base().port_name.clone();
+    let port_name = driver.base().port_name.to_string();
     let can_block = driver.base().flags.can_block;
     let multi_device = driver.base().flags.multi_device;
     let max_addr = driver.base().max_addr as i32;
@@ -312,7 +314,7 @@ pub fn create_port_runtime_boxed(
     let event_tx_clone = event_tx.clone();
     let name_clone = port_name.clone();
 
-    // C's `waitConnect` (asynManager.c:2135, :3292-3337): registration waits on
+    // C's `waitConnect` (asynManager.c:2137, :3323-3368): registration waits on
     // the port's *connect exception* for at most `autoConnectTimeout`, so the
     // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
     // The waiter is armed before the actor thread exists, so the connect it
@@ -320,36 +322,45 @@ pub fn create_port_runtime_boxed(
     let connect_wait =
         connect_at_registration.then(|| ConnectWaiter::arm(&config.services, &port_name));
 
-    let join_handle = match std::thread::Builder::new()
-        .name(format!("asyn-runtime-{port_name}"))
-        .spawn(move || {
-            let _ = event_tx_clone.send(RuntimeEvent::Started {
-                port_name: name_clone.clone(),
-            });
-            actor.run_with_shutdown(shutdown_rx);
-            let _ = event_tx_clone.send(RuntimeEvent::Stopped {
-                port_name: name_clone,
-            });
-            let _ = completion_tx.send(());
-        }) {
-        Ok(jh) => jh,
-        Err(e) => {
-            // Loud at the point of failure, as C is: `printf(
-            // "asynCommon:registerDriver %s epicsThreadCreate failed \n",
-            // portName)` (asynManager.c:2083-2084). `eprintln!` rather than
-            // `tracing`, because the targets where thread creation actually
-            // fails (RTEMS/VxWorks IOCs) install no subscriber and the console
-            // is all there is.
-            eprintln!("asyn: port '{port_name}' runtime thread could not be created: {e}");
-            // Everything this function built for the port is dropped on the way
-            // out — C's :2085-2091 unwind — and the port is never published.
-            return Err(port_thread_unavailable(&port_name, &e));
-        }
+    // C `epicsThreadCreate(portName, priority, stackSize, portThread, pport)`
+    // (asynManager.c:2077-2082), stackSize 0 → `epicsThreadStackMedium`. As an
+    // IOC thread its park state is built at entry, not in its first contended
+    // lock mid-cycle.
+    let priority = match config.priority {
+        0 => ThreadPriority::Medium,
+        p => ThreadPriority::Custom(p.min(99) as u8),
     };
+    let join_handle =
+        match MandatoryThread::new(port_name.clone(), priority, StackSizeClass::Medium).try_spawn(
+            move || {
+                let _ = event_tx_clone.send(RuntimeEvent::Started {
+                    port_name: name_clone.clone(),
+                });
+                actor.run_with_shutdown(shutdown_rx);
+                let _ = event_tx_clone.send(RuntimeEvent::Stopped {
+                    port_name: name_clone,
+                });
+                let _ = completion_tx.send(());
+            },
+        ) {
+            Ok(jh) => jh,
+            Err(e) => {
+                // Loud at the point of failure, as C is: `printf(
+                // "asynCommon:registerDriver %s epicsThreadCreate failed \n",
+                // portName)` (asynManager.c:2083-2084). `eprintln!` rather than
+                // `tracing`, because the targets where thread creation actually
+                // fails (RTEMS/VxWorks IOCs) install no subscriber and the console
+                // is all there is.
+                eprintln!("asyn: port '{port_name}' runtime thread could not be created: {e}");
+                // Everything this function built for the port is dropped on the way
+                // out — C's :2085-2091 unwind — and the port is never published.
+                return Err(port_thread_unavailable(&port_name, &e));
+            }
+        };
 
     if let Some(waiter) = connect_wait {
         // A timeout is not a failure: C ignores `waitConnect`'s status here and
-        // the port's own retry timer carries on (asynManager.c:2135, :3281).
+        // the port's own retry timer carries on (asynManager.c:2137, :3312).
         let _ = waiter.wait(config.auto_connect_timeout);
     }
 
@@ -396,7 +407,7 @@ pub fn create_port_runtime_boxed(
     // of the process — turning every port ever created into a leak, and
     // breaking the "last `PortHandle` dropped stops the port" contract above.
     // These ends keep nothing alive, exactly as C's callback holds only the
-    // port *name* and looks it up at exit time (asynManager.c:2026-2043).
+    // port *name* and looks it up at exit time (asynManager.c:2028-2045).
     let exit_shutdown_tx = handle.shutdown_tx.clone();
     let exit_completion_rx = handle.completion_rx.clone();
     let exit_port_name = handle.port_name.clone();

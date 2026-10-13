@@ -102,7 +102,7 @@ pub enum AsynError {
     /// The request waited in the port queue past the deadline its
     /// `queueRequest` was given, so it was removed and **never ran**.
     ///
-    /// C `queueTimeoutCallback` (asynManager.c:647-700): the timer
+    /// C `queueTimeoutCallback` (asynManager.c:649-703): the timer
     /// `queueRequest(pasynUser, priority, timeout)` armed at enqueue
     /// (asynManager.c:1617-1623) fires while `isQueued` is still true, the
     /// request is unlinked from the port's queue list, and the caller's
@@ -121,7 +121,7 @@ pub enum AsynError {
 
     /// The port's queue gate refused the request, so it was **never queued and
     /// never ran** — C's `queueRequest` returning `asynDisabled` /
-    /// `asynDisconnected` (asynManager.c:1541-1552).
+    /// `asynDisconnected` (asynManager.c:1543-1554).
     ///
     /// Distinct from an [`AsynError::Status`] carrying the same `AsynStatus`,
     /// and that distinction is the whole point: in C the two arrive by different
@@ -195,8 +195,8 @@ pub enum AsynError {
 
     /// An option key the port does not implement — C's trailing
     /// `else if (epicsStrCaseCmp(key, "") != 0)` arm, in `setOption` and
-    /// `getOption` alike (drvAsynSerialPort.c:594-597, :1171;
-    /// drvAsynSerialPortWin32.c:341-344; drvAsynIPPort.c:902-905). The text is
+    /// `getOption` alike (drvAsynSerialPort.c:594-597, :226-229;
+    /// drvAsynSerialPortWin32.c:341-344; drvAsynIPPort.c:995-998). The text is
     /// C's, verbatim: it is what reaches the operator through
     /// `pasynUser->errorMessage` and lands in the record's ERRS.
     #[error("Unsupported key \"{0}\"")]
@@ -269,8 +269,8 @@ impl AsynError {
     /// request must ask before doing anything a *completed* request implies.
     /// C draws the line structurally: both outcomes are decided before
     /// `processUser` is ever dispatched — `queueRequest` returns the refusal
-    /// (asynManager.c:1541-1552) and `queueTimeoutCallback` runs `timeoutUser`
-    /// *instead of* `processUser` (:647-700) — so no bytes moved, no option or
+    /// (asynManager.c:1543-1554) and `queueTimeoutCallback` runs `timeoutUser`
+    /// *instead of* `processUser` (:649-703) — so no bytes moved, no option or
     /// EOS was written, no connect was attempted, and none of the follow-up work
     /// a completed request implies (asynRecord's `setOption` → `getOptions`
     /// fall-through, its `monitorStatus` tail) may run.
@@ -315,7 +315,7 @@ impl AsynError {
     /// on the fd/socket, not a timeout and not a higher-layer complaint.
     ///
     /// C's drivers decide this at the errno itself, calling `closeConnection`
-    /// right where `read`/`write` failed (drvAsynIPPort.c:692-698,
+    /// right where `read`/`write` failed (drvAsynIPPort.c:741-748,
     /// drvAsynSerialPort.c:836-845) while returning `asynTimeout` with the link
     /// intact on a poll expiry. Rust re-derives the decision one layer up, in
     /// [`AsynError::is_fatal_transport`], so the errno has to survive the trip:
@@ -422,7 +422,7 @@ pub enum QueueRefusal<'a> {
     PortDisabled(&'a str),
     /// `port %s not connected` (:1549-1552).
     PortNotConnected(&'a str),
-    /// The user is already on a queue (:1574-1579).
+    /// The user is already on a queue (:1586-1591).
     AlreadyQueued,
     /// The port's queue is gone.
     ShutDown,

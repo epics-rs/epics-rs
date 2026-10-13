@@ -1,6 +1,6 @@
 //! Asyn iocsh shell-command registration.
 //!
-//! C parity: `asynRegister` (asynShellCommands.c:1347-1379) registers 27
+//! C parity: `asynRegister` (asynShellCommands.c:1349-1381) registers 27
 //! shell commands — the report/option/trace setters (`asynReport`,
 //! `asynSetOption`, `asynShowOption`, the five `asynSetTrace*`), the ten
 //! octet I/O and EOS commands, `asynEnable`/`asynAutoConnect`/
@@ -216,7 +216,7 @@ const SHELL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// — the 2 s I/O deadline ([`SHELL_IO_TIMEOUT`]), and
 /// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, which is what lets an `st.cmd`
 /// set a line's EOS before the device is powered on. No queue-wait deadline: C
-/// passes `queueRequest(..., 0.0)` (:244).
+/// passes `queueRequest(..., 0.0)` (:245).
 fn shell_eos_user(addr: i32) -> AsynUser {
     AsynUser::default()
         .with_addr(addr)
@@ -598,7 +598,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     // The `addr` names the DEVICE the layer lands on: C hands it to
     // `interposeInterface` (:176), which puts the layer on that device's
     // `dpCommon.interposeInterfaceList` (asynManager.c:2202-2206), and
-    // `findInterface` resolves a request device-first (:1493-1501). On a port that
+    // `findInterface` resolves a request device-first (:1495-1503). On a port that
     // is not multi-device every addr resolves to the port itself.
     {
         let mgr_r = mgr.clone();
@@ -876,9 +876,42 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         },
     ));
 
+    // asynSetQueueLockPortTimeout portName timeout ------------------------
+    // C asynShellCommands.c:1277-1307 → `setQueueLockPortTimeout`
+    // (asynManager.c:2393-2406): the port's floor for every SyncIO call's
+    // queue deadline.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynSetQueueLockPortTimeout",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                },
+                ArgDesc {
+                    name: "timeout",
+                    arg_type: ArgType::Double,
+                },
+            ],
+            "asynSetQueueLockPortTimeout portName timeout - least seconds a SyncIO call \
+             waits in the port's queue (C default 2.0)",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0).unwrap_or_default();
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => handle.set_queue_lock_port_timeout(duration_from_secs(
+                        arg_f64(args, 1).unwrap_or(0.0),
+                    )),
+                    Err(e) => ctx.println(&e.to_string()),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
     // asynWaitConnect portName timeout ------------------------------------
     // C asynShellCommands.c (asynWaitConnect) → pasynManager->waitConnect
-    // (asynManager.c:3292-3336). The st.cmd line that follows a
+    // (asynManager.c:3323-3367). The st.cmd line that follows a
     // drvAsynIPPortConfigure for a slow device: block here until the port is up
     // rather than let the next line's I/O fail on a still-connecting port.
     {
@@ -910,7 +943,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     }
                 };
                 // Arm before the check: a connect landing between the two would
-                // be lost the other way round (C :3313-3316 registers the
+                // be lost the other way round (C :3344-3347 registers the
                 // exception handler before it waits).
                 let waiter = crate::runtime::port::ConnectWaiter::arm(&services_wait, &port);
                 // `-1`, the PORT's own slot, even on a multi-device port: C's
@@ -939,19 +972,18 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         "asynSetAutoConnectTimeout timeout - seconds a new port waits for its first connect \
          (C default 0.5)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            // C `setAutoConnectTimeout` (asynManager.c:2370-2377) writes the
+            // C `setAutoConnectTimeout` (asynManager.c:2375-2391) writes the
             // process-global `pasynBase->autoConnectTimeout`; every port
-            // registered after this line reads the new value (:2135).
-            crate::runtime::config::set_auto_connect_timeout(duration_from_secs(
-                arg_f64(args, 0).unwrap_or(0.0),
-            ));
+            // registered after this line (:2137) and every IP connect
+            // (drvAsynIPPort.c:546) reads the new value.
+            crate::runtime::config::set_auto_connect_timeout(arg_f64(args, 0).unwrap_or(0.0));
             Ok(CommandOutcome::Continue)
         },
     ));
 
     // asynInterposeEosConfig portName addr processIn processOut ------------
     // C asynInterposeEos.c:393-410. The layer `drvAsynIPPortConfigure`
-    // installs by default (:1065) is the same one, with both halves on; this
+    // installs by default (:1119) is the same one, with both halves on; this
     // command is how a port created WITHOUT it (noProcessEos=1, or a serial
     // port) gets EOS processing back, and how a port gets one half only.
     {
@@ -1263,7 +1295,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 };
                 // C parity: asynShellCommands.c:858-892 routes through
                 // `connectDevice(pasynUser, portName, addr)`. The
-                // `setTraceFile` resolver (asynManager.c:2898-2926)
+                // `setTraceFile` resolver (asynManager.c:2912-2940)
                 // walks `findTracePvt(puserPvt)` which picks the
                 // device-specific `dpCommon` when `pdevice != NULL`.
                 if let Some(p) = port.as_deref() {
@@ -1298,7 +1330,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // `pasynManager->enable` (asynShellCommands.c:949-968);
                 // `findDpCommon` inside that call is what makes the addr select
                 // a device or the port. The shell itself does not choose.
-                let r = handle.set_enable_blocking(addr, yes);
+                let r = handle.set_enable(addr, yes);
                 if let Err(e) = r {
                     ctx.println(&format!("asynEnable: {e}"));
                 }
@@ -1323,7 +1355,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     };
                 // Same shape as `asynEnable` above — C `asynAutoConnect`
                 // (asynShellCommands.c:983-1002): one call, addr on the user.
-                let r = handle.set_auto_connect_blocking(addr, yes);
+                let r = handle.set_auto_connect(addr, yes);
                 if let Err(e) = r {
                     ctx.println(&format!("asynAutoConnect: {e}"));
                 }
@@ -1360,15 +1392,13 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
 /// registry so `asynRecord` device support resolves it by name. The
 /// runtime handle is parked in a process-lifetime static.
 ///
-/// `priority` is accepted for startup-script compatibility but has no
-/// effect: the Rust runtime schedules every port actor uniformly
-/// (priority is advisory in C too). `noAutoConnect` and `noProcessEos`
-/// are honored — by default the command installs an EOS interpose (C
-/// `drvAsynIPPort.c:1065-1066` `asynInterposeEosConfig`), and a nonzero
+/// `priority` is the port thread's band, as C's `registerPort` takes it.
+/// `noAutoConnect` and `noProcessEos` are honored — by default the command installs an EOS interpose (C
+/// `drvAsynIPPort.c:1119-1120` `asynInterposeEosConfig`), and a nonzero
 /// `noProcessEos` suppresses it.
 /// Build a configured IP port driver: parse host info, honor
 /// `noAutoConnect`, and install the default EOS interpose unless
-/// `noProcessEos` (C `drvAsynIPPort.c:1065-1066`). Shared by the iocsh
+/// `noProcessEos` (C `drvAsynIPPort.c:1119-1120`). Shared by the iocsh
 /// command and its tests so the install decision has a single owner.
 pub(crate) fn build_configured_ip_port(
     port: &str,
@@ -1425,8 +1455,15 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
                     }
                 };
 
-            if publish_configured_port("drvAsynIPPortConfigure", &port, driver, &services, ctx)
-                .is_none()
+            if publish_configured_port(
+                "drvAsynIPPortConfigure",
+                &port,
+                driver,
+                arg_int(args, 2).unwrap_or(0) as u32,
+                &services,
+                ctx,
+            )
+            .is_none()
             {
                 return Ok(CommandOutcome::Continue);
             }
@@ -1441,15 +1478,14 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
 /// Build the `drvAsynIPServerPortConfigure` iocsh command.
 ///
 /// C parity: `drvAsynIPServerPort.c::drvAsynIPServerPortConfigure(portName,
-/// serverInfo, maxClients, priority, noAutoConnect, noProcessEos)` (:523-722),
-/// registered as a 6-argument iocsh command (:727-739). Configure binds the
+/// serverInfo, maxClients, priority, noAutoConnect, noProcessEos)` (:544-743),
+/// registered as a 6-argument iocsh command (:748-760). Configure binds the
 /// listening socket, pre-creates one child port per client slot named
-/// `<parent>:<N>` (:682-708), and starts the `connectionListener` thread
-/// (:711-714) — so by the time `st.cmd` returns from this line, the server is
+/// `<parent>:<N>` (:703-729), and starts the `connectionListener` thread
+/// (:732-735) — so by the time `st.cmd` returns from this line, the server is
 /// accepting and every child port an IOC could bind device support to exists.
 ///
-/// `priority` is accepted for startup-script compatibility but has no effect
-/// (the Rust runtime schedules port actors uniformly).
+/// `priority` is the band of the server's thread and of every child's.
 pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynIPServerPortConfigure",
@@ -1503,7 +1539,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
             // ("No clients.", drvAsynIPServerPort.c:545-548).
             config.max_clients = max_clients.max(0) as usize;
             // C stores noProcessEos on the server and hands it to every child's
-            // `drvAsynIPPortConfigure` (:688-694) — that is its only use. The
+            // `drvAsynIPPortConfigure` (:709-715) — that is its only use. The
             // argument was parsed into the command's arg list and then never
             // read, so a `\n`-terminated client of an IP server never had an EOS
             // layer to terminate on (R19-107).
@@ -1520,7 +1556,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 driver.base_mut().init_auto_connect(false);
             }
 
-            // The child ports C pre-creates at configure (:682-708) — device
+            // The child ports C pre-creates at configure (:703-729) — device
             // support binds to `<parent>:<N>` before any client has connected.
             let n_children = driver.child_port_names().len();
             let children = (0..n_children)
@@ -1534,21 +1570,24 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             };
 
+            // C hands the server's priority to every child (:711-713).
+            let priority = arg_int(args, 3).unwrap_or(0) as u32;
             let Some(handle) = publish_configured_port(
                 "drvAsynIPServerPortConfigure",
                 &port,
                 driver,
+                priority,
                 &services,
                 ctx,
             ) else {
                 return Ok(CommandOutcome::Continue);
             };
             // C binds the listening socket inside configure — `createServerSocket`
-            // at drvAsynIPServerPort.c:605, before `registerPort` and regardless
+            // at drvAsynIPServerPort.c:626, before `registerPort` and regardless
             // of `noAutoConnect`, which governs only the *server* port's own
-            // autoConnect (:627); the child ports are created with
-            // `noAutoConnect = 1` unconditionally (:693, and the comment saying
-            // why at :689). So the server is listening when st.cmd moves to
+            // autoConnect (:648); the child ports are created with
+            // `noAutoConnect = 1` unconditionally (:714, and the comment saying
+            // why at :710). So the server is listening when st.cmd moves to
             // the next line, not when some record first pokes it.
             if let Err(e) = handle.port_handle().connect_blocking() {
                 ctx.println(&format!(
@@ -1563,12 +1602,13 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
             for child in children {
                 let name = child.base().port_name.clone();
                 // C traces and keeps going: a child that cannot be created costs
-                // that slot, not the server (:694-697). The helper has already
+                // that slot, not the server (:715-718). The helper has already
                 // printed and cleaned up whichever way it failed.
                 publish_configured_port(
                     &format!("drvAsynIPServerPortConfigure: {name}"),
                     &name,
                     child,
+                    priority,
                     &services,
                     ctx,
                 );
@@ -1590,9 +1630,8 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
 ///
 /// The created port is registered in the [`crate::asyn_record`] port
 /// registry so `asynRecord` device support resolves it by name. As with
-/// the IP command, `priority` is accepted for startup-script
-/// compatibility but has no effect (the Rust runtime schedules port
-/// actors uniformly); `noAutoConnect` and `noProcessEos` are honored —
+/// the IP command, `priority` is the port thread's band; `noAutoConnect`
+/// and `noProcessEos` are honored —
 /// by default an EOS interpose is installed (C
 /// `drvAsynSerialPort.c:1126` enables EOS processing in octetBase),
 /// suppressed by a nonzero `noProcessEos`.
@@ -1643,8 +1682,15 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                     }
                 };
 
-            if publish_configured_port("drvAsynSerialPortConfigure", &port, driver, &services, ctx)
-                .is_none()
+            if publish_configured_port(
+                "drvAsynSerialPortConfigure",
+                &port,
+                driver,
+                arg_int(args, 2).unwrap_or(0) as u32,
+                &services,
+                ctx,
+            )
+            .is_none()
             {
                 return Ok(CommandOutcome::Continue);
             }
@@ -1665,9 +1711,8 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
 /// [`crate::asyn_record`] port registry so `asynRecord` device support
 /// resolves it by name.
 ///
-/// As with the IP/serial commands, `priority` is accepted for startup-script
-/// compatibility but has no effect (the Rust runtime schedules port actors
-/// uniformly); `noAutoConnect` is honored. There is no `noProcessEos` arg —
+/// As with the IP/serial commands, `priority` is the port thread's band;
+/// `noAutoConnect` is honored. There is no `noProcessEos` arg —
 /// the prologix driver owns EOS itself (it passes `noProcessEos=1` to its
 /// inner `_TCP` IP port, mirroring C's `drvAsynIPPortConfigure(... 1)` at
 /// drvPrologixGPIB.c:575).
@@ -1711,8 +1756,15 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
                 }
             };
 
-            if publish_configured_port("prologixGPIBConfigure", &port, driver, &services, ctx)
-                .is_none()
+            if publish_configured_port(
+                "prologixGPIBConfigure",
+                &port,
+                driver,
+                arg_int(args, 2).unwrap_or(0) as u32,
+                &services,
+                ctx,
+            )
+            .is_none()
             {
                 return Ok(CommandOutcome::Continue);
             }
@@ -1726,14 +1778,14 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
 
 /// The single path a `*Configure` shell command uses to turn a freshly built
 /// driver into a live, named, traceable port — C's `registerPort`, which is the
-/// sole entry into the port list (asynManager.c:2045, adding the port at
-/// :2094). Binding the
+/// sole entry into the port list (asynManager.c:2047, adding the port at
+/// :2096). Binding the
 /// port to its trace configuration and exception list happens inside
 /// [`create_port_runtime`], driven by the services passed here, so a port an
 /// st.cmd builds is traceable from the moment it exists.
 ///
 /// `None` means **no port was published**, for either reason C has: the runtime
-/// thread could not be created (asynManager.c:2082-2092), or the name is
+/// thread could not be created (asynManager.c:2083-2093), or the name is
 /// already taken. Both have already printed the diagnostic and torn down
 /// whatever was half-built, so the caller has nothing to clean up and only has
 /// to stop — C's `drvAsynIPPortConfigure: Can't register myself.` / `ttyCleanup`
@@ -1747,11 +1799,13 @@ fn publish_configured_port<D: PortDriver>(
     command: &str,
     port: &str,
     driver: D,
+    priority: u32,
     services: &PortServices,
     ctx: &CommandContext,
 ) -> Option<PortRuntimeHandle> {
     let config = RuntimeConfig {
         services: services.clone(),
+        priority,
         ..RuntimeConfig::default()
     };
     let (handle, _jh) = match create_port_runtime(driver, config) {
@@ -1774,8 +1828,8 @@ fn publish_configured_port<D: PortDriver>(
 /// C parity: `drvAsynFTDIPort.cpp:641-660` — nine positional args
 /// (`portName`, `vendorID`, `productID`, `baudrate`, `latency`, `priority`,
 /// `noAutoConnect`, `noProcessEos`, `mode`), all but the name integers.
-/// `priority` is accepted for startup-script compatibility but has no effect
-/// (the Rust runtime schedules port actors uniformly).
+/// `priority` is the port thread's band. C's 500000-byte `stackSize`
+/// (drvAsynFTDIPort.cpp:590) is not carried: the thread takes Medium.
 pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDef {
     let int_args = [
         "vendorID",
@@ -1821,8 +1875,15 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("drvAsynFTDIPortConfigure", &port, driver, &services, ctx)
-                .is_some()
+            if publish_configured_port(
+                "drvAsynFTDIPortConfigure",
+                &port,
+                driver,
+                arg_int(args, 5).unwrap_or(0) as u32,
+                &services,
+                ctx,
+            )
+            .is_some()
             {
                 ctx.println(&format!(
                     "drvAsynFTDIPortConfigure: FTDI port '{port}' created"
@@ -1838,8 +1899,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
 /// C parity: `drvVxi11.c:1789-1802` — seven positional args (`portName`,
 /// `host name`, `flags`, `default timeout`, `vxiName`, `priority`,
 /// `disable auto-connect`). `default timeout` is a *string* in C, parsed by the
-/// driver, so it is a string here too. `priority` has no effect in the Rust
-/// runtime.
+/// driver, so it is a string here too. `priority` is the port thread's band.
 pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "vxi11Configure",
@@ -1897,7 +1957,16 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("vxi11Configure", &port, driver, &services, ctx).is_some() {
+            if publish_configured_port(
+                "vxi11Configure",
+                &port,
+                driver,
+                arg_int(args, 5).unwrap_or(0) as u32,
+                &services,
+                ctx,
+            )
+            .is_some()
+            {
                 ctx.println(&format!("vxi11Configure: VXI-11 port '{port}' -> {host}"));
             }
             Ok(CommandOutcome::Continue)
@@ -1910,8 +1979,8 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
 /// C parity: `drvAsynUSBTMC.c:1332-1345` — six positional args (`port name`,
 /// `vendor ID number`, `product ID number`, `serial string`, `priority`,
 /// `flags`). A vendor/product of 0 is C's "take the first USBTMC device found",
-/// and an empty serial string is "any serial number". `priority` has no effect
-/// in the Rust runtime.
+/// and an empty serial string is "any serial number". `priority` is the port
+/// thread's band.
 pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "usbtmcConfigure",
@@ -1961,7 +2030,16 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("usbtmcConfigure", &port, driver, &services, ctx).is_some() {
+            if publish_configured_port(
+                "usbtmcConfigure",
+                &port,
+                driver,
+                arg_int(args, 4).unwrap_or(0) as u32,
+                &services,
+                ctx,
+            )
+            .is_some()
+            {
                 ctx.println(&format!("usbtmcConfigure: USBTMC port '{port}' created"));
             }
             Ok(CommandOutcome::Continue)
@@ -2088,7 +2166,7 @@ mod tests {
         let mgr = fresh_mgr_with_port("trace_mask_port");
 
         // Subscribe to exception events so we can verify the per-set
-        // announce fires (asynManager.c:2790).
+        // announce fires (asynManager.c:2804).
         let observed: Arc<Mutex<Vec<AsynException>>> = Arc::new(Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
         mgr.exception_manager().add_callback(move |ev| {
@@ -2142,7 +2220,7 @@ mod tests {
         // command means adding it here; a C command still missing is a gap this
         // list names by its absence.
         let mut expected = vec![
-            // asynShellCommands.c:1352-1378
+            // asynShellCommands.c:1354-1380
             "asynReport",
             "asynSetOption",
             "asynSetTraceMask",
@@ -2158,6 +2236,7 @@ mod tests {
             "asynRegisterTimeStampSource",
             "asynUnregisterTimeStampSource",
             "asynSetMinTimerPeriod",
+            "asynSetQueueLockPortTimeout",
             "asynOctetSetInputEos",
             "asynOctetGetInputEos",
             "asynOctetSetOutputEos",
@@ -2221,6 +2300,37 @@ mod tests {
             trace.snapshot(Some("trunc_port"), None).io_truncate_size,
             40
         );
+    }
+
+    /// C `queueLockPort` queues with `max(queueLockPortTimeout, timeout)`
+    /// (asynManager.c:1894-1896); `asynSetQueueLockPortTimeout` sets the
+    /// port's half (asynShellCommands.c:1284-1307, asynManager.c:2393-2406).
+    #[test]
+    fn iocsh_set_queue_lock_port_timeout_floors_the_syncio_deadline() {
+        use crate::sync_io::SyncIOHandle;
+        use std::time::Duration;
+
+        let mgr = fresh_mgr_with_port("qlp_port");
+        let handle = mgr.find_port_handle("qlp_port").unwrap();
+        let deadline = |timeout_ms| {
+            SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(timeout_ms))
+                .user(0)
+                .queue_timeout()
+        };
+        assert_eq!(deadline(200), Some(Duration::from_secs(2)), "C default");
+
+        let cmds = build_asyn_commands(mgr);
+        cmds.iter()
+            .find(|c| c.name == "asynSetQueueLockPortTimeout")
+            .expect("asynSetQueueLockPortTimeout must be registered")
+            .handler
+            .call(
+                &[ArgValue::String("qlp_port".into()), ArgValue::Double(0.5)],
+                &make_ctx(),
+            )
+            .unwrap();
+        assert_eq!(deadline(200), Some(Duration::from_millis(500)));
+        assert_eq!(deadline(1000), Some(Duration::from_millis(1000)));
     }
 
     /// R19-120: `asynShowOption` prints `key=value` for a driver option
@@ -2324,7 +2434,7 @@ mod tests {
     /// connected — whether it was connected before the call or connects during
     /// it — and gives up after the timeout otherwise.
     ///
-    /// C `waitConnect` (asynManager.c:3292-3336) arms the connect exception
+    /// C `waitConnect` (asynManager.c:3323-3367) arms the connect exception
     /// handler and only then reads the connected flag, so the connect that
     /// lands in between is not lost. The three boundaries here are exactly
     /// that: already-connected, connects-during-the-wait, never-connects.
@@ -2402,7 +2512,7 @@ mod tests {
     /// R19-117: `asynSetAutoConnectTimeout` rewrites the value a newly
     /// registered port waits for its first connect — C's process-global
     /// `pasynBase->autoConnectTimeout` (asynManager.c:2370-2377), read at every
-    /// port registration (:2135). It was hard-coded at 0.5 s, which is too
+    /// port registration (:2137). It was hard-coded at 0.5 s, which is too
     /// short for a slow device and was the reason C exposes the knob.
     #[test]
     fn iocsh_set_auto_connect_timeout_rewrites_the_registration_wait() {
@@ -2483,7 +2593,7 @@ mod tests {
             .set_input_eos_blocking(shell_eos_user(0), b"\n")
             .unwrap();
         // processOut = 0 gates C's `writeIt` alone (asynInterposeEos.c:161-163):
-        // `setOutputEos` (:344-363) and `getOutputEos` (:365-390) carry no
+        // `setOutputEos` (:345-364) and `getOutputEos` (:366-391) carry no
         // `processEosOut` test at all, so the terminator is stored, answered
         // asynSuccess and read back — it is simply never appended. A startup
         // script that sets OEOS and reads it back therefore succeeds, which is
@@ -2592,7 +2702,7 @@ mod tests {
 
     /// R19-116: `asynEnable` / `asynAutoConnect` exist on the shell, and they
     /// pick port-level vs device-level state by C's `findDpCommon` rule
-    /// (asynManager.c:536-544) — a device only when the port is multi-device
+    /// (asynManager.c:538-546) — a device only when the port is multi-device
     /// AND the caller named one.
     #[test]
     fn iocsh_enable_and_autoconnect_follow_c_find_dp_common() {
@@ -3009,7 +3119,7 @@ mod tests {
 
         /// The raw device below the port's interpose chain — the driver's own
         /// `asynOctet`, which the manager's layers sit on top of
-        /// (asynManager.c:2190-2220). It does not run the chain: the port does.
+        /// (asynManager.c:2192-2222). It does not run the chain: the port does.
         struct InterposedDriver {
             base: PortDriverBase,
             link: EchoingLink,
@@ -3355,7 +3465,7 @@ mod tests {
     /// (`let _addr = arg_int(args, 1)`), so an `asynSetTraceIOMask
     /// MYPORT 3 "ESCAPE"` invocation degraded into a port-wide write
     /// rather than the device-specific dpCommon write C performs
-    /// (asynManager.c:2830-2833 / 2872-2875 / 2898-2926 via
+    /// (asynManager.c:2844-2847 / 2886-2889 / 2912-2940 via
     /// `findTracePvt` over `pdevice`). This test invokes all three
     /// handlers with `addr >= 0` and confirms each fires a per-device
     /// announce (addr propagated through to the device setter).
@@ -3457,7 +3567,7 @@ mod tests {
         );
     }
 
-    /// C drvAsynIPPort.c:1065-1066: an IP port gets an EOS interpose by
+    /// C drvAsynIPPort.c:1119-1120: an IP port gets an EOS interpose by
     /// default, suppressed by `noProcessEos`.
     #[test]
     fn build_configured_ip_port_installs_eos_unless_suppressed() {

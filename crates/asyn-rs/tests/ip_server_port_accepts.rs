@@ -2,7 +2,7 @@
 //!
 //! C `drvAsynIPServerPortConfigure` binds the socket, pre-creates one child port
 //! per client slot (`<parent>:<N>`, drvAsynIPServerPort.c:682-708) and starts
-//! `connectionListener` (:711-714), which loops on `epicsSocketAccept` (:326).
+//! `connectionListener` (:732-735), which loops on `epicsSocketAccept` (:340).
 //! Before the fix, nothing in the port ever accepted — `accept_one` had no
 //! caller outside `mod tests` — and `drvAsynIPServerPortConfigure` was not an
 //! iocsh command at all. A TCP client sat in the backlog until it timed out
@@ -94,7 +94,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
         assert!(
             asyn_rs::asyn_record::get_port(&child).is_some(),
             "child port {child} must exist after configure \
-             (drvAsynIPServerPort.c:682-708)"
+             (drvAsynIPServerPort.c:703-729)"
         );
     }
 
@@ -129,8 +129,8 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
              (C: connectionListener, drvAsynIPServerPort.c:326)"
         );
         // C parity: a child port is built by `drvAsynIPPortConfigure`
-        // (drvAsynIPServerPort.c:688-694), so it carries the EOS interpose
-        // (drvAsynIPPort.c:1065). `asynInterposeEos.c::readIt` keeps reading
+        // (drvAsynIPServerPort.c:709-715), so it carries the EOS interpose
+        // (drvAsynIPPort.c:1119-1120). `asynInterposeEos.c::readIt` keeps reading
         // until a terminator arrives; an un-terminated payload therefore comes
         // back as asynTimeout WITH the bytes already transferred attached
         // (readIt:242-253 runs the same tail on error as on success). The
@@ -160,7 +160,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
 /// port, no child ports.
 ///
 /// C rejects it before it parses the protocol: *"No clients."*, return -1
-/// (drvAsynIPServerPort.c:545-548). A server with zero slots would bind the
+/// (drvAsynIPServerPort.c:566-569). A server with zero slots would bind the
 /// socket and destroy every connection it accepted.
 #[test]
 fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {

@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     /// R7-50: C-Win32 guards getOption AND setOption on the closed handle
-    /// (`drvAsynSerialPortWin32.c:96-101,180-185`) *before* the key is
+    /// (`drvAsynSerialPortWin32.c:96-101,178-182`) *before* the key is
     /// inspected, so every key — not just the flow-control subset — reports
     /// asynError "<device> disconnected:" while the port is closed, and no key
     /// may be stored to the cached config.

@@ -3,7 +3,7 @@
 //! converter).
 //!
 //! Wire-faithful port of C `asynInterposeCom.c` (856 lines). C installs it from
-//! `drvAsynIPPort.c:1061` when the configure string's protocol token is `COM`;
+//! `drvAsynIPPort.c:1115` when the configure string's protocol token is `COM`;
 //! [`crate::drivers::ip_port::DrvAsynIPPort`] does the same.
 //!
 //! The C file interposes **two** interfaces on the port, and this module keeps
@@ -15,12 +15,12 @@
 //!   transformation: C's only per-port state here is the `xBuf` scratch buffer.
 //! * the `asynOption` interface — the telnet negotiation and the serial-line
 //!   settings it carries ([`ComPortOptions`], C `willdo` / `sbComPortOption` /
-//!   `setOption` / `getOption` / `restoreSettings`, :327-758).
+//!   `setOption` / `getOption` / `restoreSettings`, :327-772).
 //!
 //! # The negotiation bypasses the octet interpose
 //!
 //! Every negotiation byte C sends goes to `pinterposePvt->pasynOctetDrv->write`
-//! — the driver *below* the interpose (:339, :430) — and every byte it reads
+//! — the driver *below* the interpose (:339, :443) — and every byte it reads
 //! comes from `pasynOctetDrv->read` (`nextChar`, :103). So the IAC framing of
 //! the negotiation is **not** IAC-stuffed by `writeIt`, and the replies are
 //! **not** unstuffed by `readIt`. [`ComPortOptions`] therefore takes the lower
@@ -90,32 +90,32 @@ const CPO_SET_MODEMSTATE_MASK: u8 = 11;
 const CPO_SERVER_NOTIFY_LINESTATE: u8 = 106;
 const CPO_SERVER_NOTIFY_MODEMSTATE: u8 = 107;
 
-/// A server's reply to COM-PORT-OPTION subcommand `n` is `n + 100` — C :450.
+/// A server's reply to COM-PORT-OPTION subcommand `n` is `n + 100` — C :463.
 const CPO_REPLY_OFFSET: i32 = 100;
 
 /// C `nextChar`'s `EOF` (:105). `int` in C, so a failing read is distinguishable
 /// from the byte 0xFF, which is why this type is `i32` and not `u8`.
 const EOF: i32 = -1;
 
-/// The timeout on the interpose's *own* `asynUser` (`asynInterposeCom.c:836`).
+/// The timeout on the interpose's *own* `asynUser` (`asynInterposeCom.c:850`).
 ///
 /// It bounds the two negotiations the interpose runs for itself — `restoreSettings`
 /// at configure time and from the reconnect `exceptionHandler` — and nothing else.
 /// A negotiation driven by a *caller* (an asynRecord option put, an iocsh
 /// `asynSetOption`) runs under that caller's `asynUser`, whose timeout C threads
-/// all the way down through `setOption` → `sbComPortOption` → `nextChar` (:475,
-/// :417-431, :95-106).
+/// all the way down through `setOption` → `sbComPortOption` → `nextChar` (:488,
+/// :417-444, :95-106).
 const INTERPOSE_USER_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The interpose's own `asynUser` — C `asynInterposeCom.c:833-836`.
+/// The interpose's own `asynUser` — C `asynInterposeCom.c:847-850`.
 fn interpose_user() -> AsynUser {
     AsynUser::new(0).with_timeout(INTERPOSE_USER_TIMEOUT)
 }
 
-/// The option keys C's COM interpose claims — `setOption` (:481-643) and
-/// `getOption` (:664-708) test the same seven with `epicsStrCaseCmp`. Anything
-/// else falls through to the option interface of the driver below (:645-652,
-/// :710-717).
+/// The option keys C's COM interpose claims — `setOption` (:494-657) and
+/// `getOption` (:678-722) test the same seven with `epicsStrCaseCmp`. Anything
+/// else falls through to the option interface of the driver below (:659-666,
+/// :724-731).
 const COM_OPTION_KEYS: [&str; 7] = ["baud", "bits", "parity", "stop", "crtscts", "ixon", "break"];
 
 /// C `%#x` — lowercase hex with an `0x` prefix. printf's `#` flag adds the
@@ -129,7 +129,7 @@ fn hash_hex_lower(v: i32) -> String {
 }
 
 /// C `%#X` — the uppercase form, used by `expectChar` (:121) and `getOption`'s
-/// unknown-flow-code diagnostic (:689).
+/// unknown-flow-code diagnostic (:703).
 fn hash_hex_upper(v: i32) -> String {
     if v == 0 {
         "0".to_string()
@@ -417,7 +417,7 @@ impl OctetInterpose for ComInterpose {
 /// The slot is [`AsynUser::error_message`] — C's `pasynUser->errorMessage`
 /// itself, not a copy: `nextChar` leaves the lower read's message there on EOF
 /// (:103-106), `expectChar` overwrites it on a mismatch (:120-122), `setOption`
-/// leaves a *non-failing* advisory there (:571-573, :587-589), and each `return
+/// leaves a *non-failing* advisory there (:584-586, :600-602), and each `return
 /// asynError` carries out whatever it currently holds. Keeping the negotiation's
 /// messages in the caller's user is what lets a failing read surface the *lower
 /// driver's* message with C's `asynError` status, and what gives the advisories
@@ -450,7 +450,7 @@ impl<'a> TelnetLink<'a> {
     }
 
     /// C's `epicsSnprintf(pasynUser->errorMessage, …)` on a path that does *not*
-    /// return an error (:571-573, :587-589): the message is left for the caller
+    /// return an error (:571-573, :600-602): the message is left for the caller
     /// to find and the call carries on.
     fn advise(&mut self, msg: &str) {
         self.user.error_message = msg.to_string();
@@ -665,10 +665,10 @@ impl<'a> TelnetLink<'a> {
         }
     }
 
-    /// C `sbComPortOption` (:416-469) — send `IAC SB 44 <x…> IAC SE` and collect
+    /// C `sbComPortOption` (:416-482) — send `IAC SB 44 <x…> IAC SE` and collect
     /// the server's `x.len() - 1` reply bytes into `r`.
     ///
-    /// The server acknowledges subcommand `n` with `n + 100` (:450), echoing the
+    /// The server acknowledges subcommand `n` with `n + 100` (:463), echoing the
     /// value it actually applied — which may differ from the one requested, and
     /// which the callers below then check. An `IAC SB 44 <NOTIFY-…> <state> IAC
     /// SE` arriving instead is consumed and the wait resumes; any other reply
@@ -680,11 +680,11 @@ impl<'a> TelnetLink<'a> {
     /// [`Self::write_subnegotiation`] and [`Self::next_payload_char`].
     fn sb_com_port_option(&mut self, x: &[u8], r: &mut [u8]) -> AsynResult<()> {
         debug_assert!(!x.is_empty() && r.len() >= x.len() - 1);
-        // :424-431
+        // :425-444
         self.write_subnegotiation(x)?;
 
         loop {
-            // :435-438
+            // :448-451
             loop {
                 let c = self.next_char();
                 if c == EOF {
@@ -694,7 +694,7 @@ impl<'a> TelnetLink<'a> {
                     break;
                 }
             }
-            // :439-441
+            // :452-454
             if !self.expect_char(SB) || !self.expect_char(SB_COM_PORT_OPTION) {
                 return Err(self.error());
             }
@@ -702,7 +702,7 @@ impl<'a> TelnetLink<'a> {
             if c == i32::from(CPO_SERVER_NOTIFY_LINESTATE)
                 || c == i32::from(CPO_SERVER_NOTIFY_MODEMSTATE)
             {
-                // :443-449 — an unsolicited line/modem-state notification:
+                // :456-462 — an unsolicited line/modem-state notification:
                 // <state> IAC SE, discarded, and we keep waiting for our reply.
                 // The state is payload, so it carries the IAC escape (CBUG-B8).
                 if self.next_payload_char() == EOF
@@ -712,7 +712,7 @@ impl<'a> TelnetLink<'a> {
                     return Err(self.error());
                 }
             } else if c == i32::from(x[0]) + CPO_REPLY_OFFSET {
-                // :450-459 — `while (--xLen > 0)`: one reply byte per payload
+                // :463-472 — `while (--xLen > 0)`: one reply byte per payload
                 // byte after the subcommand. These are DATA, so they carry the
                 // IAC escape (CBUG-B8) — C still reads them raw (:464-468).
                 for slot in r.iter_mut().take(x.len() - 1) {
@@ -727,7 +727,7 @@ impl<'a> TelnetLink<'a> {
                 }
                 return Ok(());
             } else {
-                // :461-465 — C prints `c` with %d, so an EOF here reports -1.
+                // :474-478 — C prints `c` with %d, so an EOF here reports -1.
                 self.user.error_message =
                     format!("Sent COM-PORT-OPTION {} but got reply {}", x[0], c);
                 return Err(self.error());
@@ -755,7 +755,7 @@ pub struct ComPortOptions {
 }
 
 impl Default for ComPortOptions {
-    /// C :837-841 — the defaults `asynInterposeCOM` installs before its first
+    /// C :851-855 — the defaults `asynInterposeCOM` installs before its first
     /// `restoreSettings`.
     fn default() -> Self {
         Self {
@@ -776,12 +776,12 @@ impl ComPortOptions {
 
     /// Whether this layer answers `key` itself. A key outside the set falls
     /// through to the option interface of the driver below, which is what C does
-    /// at :645-652 (`setOption`) and :710-717 (`getOption`).
+    /// at :659-666 (`setOption`) and :724-731 (`getOption`).
     pub fn owns_key(key: &str) -> bool {
         COM_OPTION_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
     }
 
-    /// C `getOption` (:657-725). Reads back cached state only — no wire traffic,
+    /// C `getOption` (:671-739). Reads back cached state only — no wire traffic,
     /// so this needs no link.
     ///
     /// Caller must have checked [`Self::owns_key`]; a key outside the set is C's
@@ -792,7 +792,7 @@ impl ComPortOptions {
         } else if key.eq_ignore_ascii_case("bits") {
             Ok(self.bits.to_string())
         } else if key.eq_ignore_ascii_case("parity") {
-            // :671-677 — C's switch has no default: a parity code outside the
+            // :685-691 — C's switch has no default: a parity code outside the
             // five leaves `val` untouched (`l` stays 0) and still returns
             // asynSuccess, handing the caller back an unwritten buffer. "Nothing
             // written" is the empty string here. It is reachable — `parity` holds
@@ -810,7 +810,7 @@ impl ComPortOptions {
         } else if key.eq_ignore_ascii_case("stop") {
             Ok(self.stop.to_string())
         } else if key.eq_ignore_ascii_case("crtscts") {
-            // :682-691 — XON/XOFF reports as "no hardware flow control".
+            // :696-705 — XON/XOFF reports as "no hardware flow control".
             match self.flow {
                 CPO_CONTROL_NOFLOW | CPO_CONTROL_IXON => Ok("N".to_string()),
                 CPO_CONTROL_HWFLOW => Ok("Y".to_string()),
@@ -820,7 +820,7 @@ impl ComPortOptions {
                 ))),
             }
         } else if key.eq_ignore_ascii_case("ixon") {
-            // :693-703 — and hardware flow control reports as "no XON/XOFF".
+            // :707-717 — and hardware flow control reports as "no XON/XOFF".
             match self.flow {
                 CPO_CONTROL_NOFLOW | CPO_CONTROL_HWFLOW => Ok("N".to_string()),
                 CPO_CONTROL_IXON => Ok("Y".to_string()),
@@ -830,7 +830,7 @@ impl ComPortOptions {
                 ))),
             }
         } else if key.eq_ignore_ascii_case("break") {
-            // :704-708
+            // :718-722
             Ok(if self.break_active { "on" } else { "off" }.to_string())
         } else {
             Err(AsynError::OptionNotFound(key.to_string()))
@@ -842,10 +842,10 @@ impl ComPortOptions {
     /// **CBUG-B6 — the defect is fixed upstream; only the SCOPE of "off" still
     /// differs.** At the `R4-45-19-ge2a281e2` pin, C's `crtscts` and `ixon`
     /// branches both implemented "n" as `xBuf[1] = pinterposePvt->flow`
-    /// (`asynInterposeCom.c:575`, `:591`) — the value transmitted for "turn this
+    /// (`asynInterposeCom.c:575`, `:604`) — the value transmitted for "turn this
     /// off" was the port's **current** flow-control mode. So with RTS/CTS on,
     /// `crtscts N` re-transmitted SET-CONTROL HWFLOW, the server confirmed
-    /// HWFLOW, `:583` wrote it back into `flow`, and `getOption` still answered
+    /// HWFLOW, `:596` wrote it back into `flow`, and `getOption` still answered
     /// "Y": flow control could be turned on and never off. `CPO_CONTROL_NOFLOW`
     /// ("No flow control", `:53`) was defined and decoded in `getOption` but
     /// assigned to `xBuf[1]` nowhere in the file.
@@ -877,13 +877,13 @@ impl ComPortOptions {
         }
     }
 
-    /// C `setOption` (:474-655) — negotiate `key`/`val` with the server over
+    /// C `setOption` (:487-669) — negotiate `key`/`val` with the server over
     /// `next`, the octet driver *below* the interpose, bounded by `user`'s
     /// timeout.
     ///
     /// `user` is the caller's `asynUser`, as in C: `setOption(drvPvt, pasynUser,
-    /// key, val)` hands it to `sbComPortOption` (:495), which writes and reads the
-    /// wire with it (:431, :435-457). An asynRecord option put therefore
+    /// key, val)` hands it to `sbComPortOption` (:508), which writes and reads the
+    /// wire with it (:444, :448-470). An asynRecord option put therefore
     /// negotiates under TMOT and an iocsh `asynSetOption` under its own 2 s
     /// (`asynShellCommands.c:119`) — the layer has no timeout of its own.
     ///
@@ -899,8 +899,8 @@ impl ComPortOptions {
         self.set_option_on(&mut link, key, val)
     }
 
-    /// C `restoreSettings` (:729-758) — the full handshake, run at connect and on
-    /// every reconnect (C wires it to `asynExceptionConnect`, :763-774).
+    /// C `restoreSettings` (:743-772) — the full handshake, run at connect and on
+    /// every reconnect (C wires it to `asynExceptionConnect`, :777-788).
     ///
     /// `IAC DO BINARY`, `IAC WILL BINARY`, `IAC WILL COM-PORT-OPTION`, then a
     /// SET-MODEMSTATE-MASK of 0 (asking the server not to volunteer modem-state
@@ -908,9 +908,9 @@ impl ComPortOptions {
     /// pushed to the server — which is how the line comes up configured after a
     /// terminal server reboots. `break` is deliberately not in C's key list: a
     /// break is a momentary line condition, not a setting to restore.
-    /// Runs on the interpose's own `asynUser` (C creates it at :833-836 and hands
-    /// it to `restoreSettings` from both the configure path (:851) and the
-    /// reconnect `exceptionHandler` (:770)), so this is the one negotiation with a
+    /// Runs on the interpose's own `asynUser` (C creates it at :847-850 and hands
+    /// it to `restoreSettings` from both the configure path (:865) and the
+    /// reconnect `exceptionHandler` (:784)), so this is the one negotiation with a
     /// timeout of its own — 2 s — and no caller to inherit one from.
     pub fn restore_settings(&mut self, next: &mut dyn OctetNext) -> AsynResult<()> {
         let mut user = interpose_user();
@@ -919,14 +919,14 @@ impl ComPortOptions {
     }
 
     fn restore_settings_on(&mut self, link: &mut TelnetLink) -> AsynResult<()> {
-        // :740-747
+        // :754-761
         link.willdo(DO, WD_TRANSMIT_BINARY)?;
         link.willdo(WILL, WD_TRANSMIT_BINARY)?;
         link.willdo(WILL, SB_COM_PORT_OPTION)?;
         let mut r = [0u8; 1];
         link.sb_com_port_option(&[CPO_SET_MODEMSTATE_MASK, 0], &mut r)?;
 
-        // :749-756 — note `break` is absent from C's list.
+        // :763-770 — note `break` is absent from C's list.
         for key in ["baud", "bits", "parity", "stop", "crtscts", "ixon"] {
             let val = self.get_option(key)?;
             self.set_option_on(link, key, &val)?;
@@ -936,7 +936,7 @@ impl ComPortOptions {
 
     fn set_option_on(&mut self, link: &mut TelnetLink, key: &str, val: &str) -> AsynResult<()> {
         if key.eq_ignore_ascii_case("baud") {
-            // :481-508 — the rate goes out big-endian in four bytes, and the
+            // :494-521 — the rate goes out big-endian in four bytes, and the
             // server echoes the rate it actually applied. C fails the call when
             // they differ rather than silently running at the wrong speed.
             let Some(b) = scan_int(val) else {
@@ -961,7 +961,7 @@ impl ComPortOptions {
             }
             Ok(())
         } else if key.eq_ignore_ascii_case("bits") {
-            // :509-528
+            // :522-541
             let Some(b) = scan_int(val) else {
                 return Err(asyn_error("Bad number"));
             };
@@ -976,7 +976,7 @@ impl ComPortOptions {
             }
             Ok(())
         } else if key.eq_ignore_ascii_case("parity") {
-            // :529-543 — and note C does *not* check the echo here, unlike baud,
+            // :542-556 — and note C does *not* check the echo here, unlike baud,
             // bits and stop: whatever the server answers becomes the cached
             // parity, even if it is not what was asked for.
             let code = if val.eq_ignore_ascii_case("none") {
@@ -997,7 +997,7 @@ impl ComPortOptions {
             self.parity = r[0];
             Ok(())
         } else if key.eq_ignore_ascii_case("stop") {
-            // :544-568 — parsed as a float (so "1.5" is *read*), then required to
+            // :557-581 — parsed as a float (so "1.5" is *read*), then required to
             // be exactly 1 or 2, then truncated to a byte.
             let Some(b) = scan_float(val) else {
                 return Err(asyn_error("Bad number"));
@@ -1017,12 +1017,12 @@ impl ComPortOptions {
             }
             Ok(())
         } else if key.eq_ignore_ascii_case("crtscts") {
-            // :569-584 — "y" turns hardware flow control on. Since asyn #236
+            // :582-597 — "y" turns hardware flow control on. Since asyn #236
             // C's "n" sends NOFLOW as this does (`9a4c3185:588`); see
             // `flow_mode_off` for the cross-key scope that still differs
             // — CBUG-B6.
             //
-            // :571-573 — switching to RTS/CTS over a live XON/XOFF setting is
+            // :584-586 — switching to RTS/CTS over a live XON/XOFF setting is
             // announced in the message slot and does *not* fail the call.
             if self.flow == CPO_CONTROL_IXON {
                 link.advise("XON/XOFF already set. Now using RTS/CTS.");
@@ -1039,7 +1039,7 @@ impl ComPortOptions {
             self.flow = r[0];
             Ok(())
         } else if key.eq_ignore_ascii_case("ixon") {
-            // :585-604 — mirror of crtscts, advisory (:587-589) included.
+            // :598-618 — mirror of crtscts, advisory (:600-602) included.
             if self.flow == CPO_CONTROL_HWFLOW {
                 link.advise("RTS/CTS already set. Now using XON/XOFF.");
             }
@@ -1065,7 +1065,7 @@ impl ComPortOptions {
                     Ok(())
                 }
                 Err(e) => {
-                    // :601-603 — and only on this key does C print the failure to
+                    // :615-617 — and only on this key does C print the failure to
                     // stdout as well as returning it.
                     println!("XON/XOFF not set.");
                     Err(e)
@@ -1078,7 +1078,7 @@ impl ComPortOptions {
         }
     }
 
-    /// C `setOption`'s `break` arm (:605-643) — assert / release the line break.
+    /// C `setOption`'s `break` arm (:619-657) — assert / release the line break.
     ///
     /// `"on"` and `"off"` are edge-triggered against the cached state (asserting
     /// an already-asserted break sends nothing). Anything else is read as a
@@ -1102,7 +1102,7 @@ impl ComPortOptions {
                 };
                 n
             };
-            // :632 — a zero/absent length is 250 ms.
+            // :646 — a zero/absent length is 250 ms.
             let ms = if break_len == 0 { 250 } else { break_len };
             (!self.break_active, true, Some(ms))
         };
@@ -1118,7 +1118,7 @@ impl ComPortOptions {
         if off {
             let mut r = [0u8; 1];
             link.sb_com_port_option(&[CPO_SET_CONTROL, CPO_CONTROL_BREAK_OFF], &mut r)?;
-            // :640 — yes, C tests the reply against BREAK_ON here too, so a
+            // :654 — yes, C tests the reply against BREAK_ON here too, so a
             // server that echoes BREAK_OFF leaves the flag clear and one that
             // echoes BREAK_ON leaves it set. Same predicate as the assert arm.
             self.break_active = r[0] == CPO_CONTROL_BREAK_ON;
@@ -1390,7 +1390,7 @@ mod tests {
 
     // -- asynOption: negotiation bytes ------------------------------------
 
-    /// The exact bytes C's `restoreSettings` (:729-758) puts on the wire for a
+    /// The exact bytes C's `restoreSettings` (:743-772) puts on the wire for a
     /// freshly-configured port at its defaults (9600 8N1, no flow control).
     /// This is the byte contract of the whole subsystem.
     #[test]
@@ -1417,16 +1417,16 @@ mod tests {
 
         #[rustfmt::skip]
         let expected: Vec<u8> = vec![
-            IAC, DO,   WD_TRANSMIT_BINARY,                                  // :740
-            IAC, WILL, WD_TRANSMIT_BINARY,                                  // :742
-            IAC, WILL, SB_COM_PORT_OPTION,                                  // :744
-            IAC, SB, SB_COM_PORT_OPTION, CPO_SET_MODEMSTATE_MASK, 0, IAC, SE, // :738-746
-            // 9600 == 0x2580, big-endian in four bytes (:490-494).
+            IAC, DO,   WD_TRANSMIT_BINARY,                                  // :754
+            IAC, WILL, WD_TRANSMIT_BINARY,                                  // :756
+            IAC, WILL, SB_COM_PORT_OPTION,                                  // :758
+            IAC, SB, SB_COM_PORT_OPTION, CPO_SET_MODEMSTATE_MASK, 0, IAC, SE, // :752-760
+            // 9600 == 0x2580, big-endian in four bytes (:503-507).
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_BAUDRATE, 0x00, 0x00, 0x25, 0x80, IAC, SE,
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_DATASIZE, 8, IAC, SE,
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_PARITY, CPO_PARITY_NONE, IAC, SE,
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_STOPSIZE, 1, IAC, SE,
-            // crtscts "N" re-sends the *current* flow mode (:575), not NOFLOW by
+            // crtscts "N" re-sends the *current* flow mode (:588), not NOFLOW by
             // name — they coincide at the default, and the ixon "N" that follows
             // sends the same byte for the same reason.
             IAC, SB, SB_COM_PORT_OPTION, CPO_SET_CONTROL, CPO_CONTROL_NOFLOW, IAC, SE,
@@ -1465,11 +1465,11 @@ mod tests {
     /// CBUG-B8 — a payload byte of 0xFF is IAC-escaped, in both directions.
     ///
     /// At the `R4-45-19-ge2a281e2` pin C wrote the subnegotiation straight to the
-    /// driver below the interpose (:430), skipping the `writeIt` that doubles
+    /// driver below the interpose (:443), skipping the `writeIt` that doubles
     /// IACs, so `baud=255` (0x000000FF) put a raw IAC into the payload and a
     /// compliant RFC-2217 server mis-framed the rest of the negotiation. asyn
     /// #236 merged the write half (`9a4c3185:435-442`); the read half is still
-    /// raw there (:458, :464-468), so the un-escape this asserts on the way in
+    /// raw there (:471, :477-481), so the un-escape this asserts on the way in
     /// remains a deviation while the escape on the way out no longer is.
     #[test]
     fn b8_a_payload_byte_of_0xff_is_escaped_both_ways() {
@@ -1541,7 +1541,7 @@ mod tests {
         );
     }
 
-    /// C :501-506 — the server echoes the rate it *actually* applied, and C fails
+    /// C :514-519 — the server echoes the rate it *actually* applied, and C fails
     /// the call when it is not the one asked for.
     #[test]
     fn set_baud_fails_when_the_server_applies_a_different_rate() {
@@ -1556,7 +1556,7 @@ mod tests {
             err.message(),
             "Tried to set 115200 baud, actually set 9600 baud."
         );
-        // C still commits the echoed value before erroring (:497-500).
+        // C still commits the echoed value before erroring (:510-513).
         assert_eq!(com.get_option("baud").unwrap(), "9600");
     }
 
@@ -1580,7 +1580,7 @@ mod tests {
         );
     }
 
-    /// Negative control for the asymmetry at C :529-543: parity is the one
+    /// Negative control for the asymmetry at C :542-556: parity is the one
     /// setting with **no** echo check. Ask for "even", get "odd" back, and C
     /// reports success while caching odd. If someone "fixes" that into a
     /// consistency check, this fails.
@@ -1667,8 +1667,8 @@ mod tests {
     /// transmitting `CPO_CONTROL_NOFLOW`.
     ///
     /// At the `R4-45-19-ge2a281e2` pin, `xBuf[1] = pinterposePvt->flow` on both
-    /// "n" branches (:575, :591), so `crtscts N` with RTS/CTS on re-transmitted
-    /// HWFLOW, the server confirmed it, `:583`/`:599` cached it back, and `getOption`
+    /// "n" branches (:588, :604), so `crtscts N` with RTS/CTS on re-transmitted
+    /// HWFLOW, the server confirmed it, `:596`/`:613` cached it back, and `getOption`
     /// still answered "Y" — flow control could be enabled and never disabled.
     /// asyn #236 merged: at `9a4c3185` both branches send `CPO_CONTROL_NOFLOW`
     /// (:588, :604), so this case is now parity, not deviation. The sequences
@@ -1739,7 +1739,7 @@ mod tests {
         assert_eq!(com.get_option("ixon").unwrap(), "N");
     }
 
-    /// C :605-643 — "on" then "off", edge-triggered, and the cached flag comes
+    /// C :619-657 — "on" then "off", edge-triggered, and the cached flag comes
     /// from the server's reply byte, not the request.
     #[test]
     fn break_on_and_off_emit_set_control_break() {
@@ -1779,7 +1779,7 @@ mod tests {
         assert_eq!(com.get_option("break").unwrap(), "off");
     }
 
-    /// C :609-612 — asserting an already-asserted break sends nothing at all, and
+    /// C :623-626 — asserting an already-asserted break sends nothing at all, and
     /// releasing an already-released one likewise.
     #[test]
     fn break_is_edge_triggered_against_the_cached_state() {
@@ -1792,7 +1792,7 @@ mod tests {
         assert!(server.written.is_empty());
     }
 
-    /// C :614-641 — a numeric value runs assert / sleep / release in one call.
+    /// C :628-655 — a numeric value runs assert / sleep / release in one call.
     #[test]
     fn break_with_a_duration_asserts_then_releases() {
         let mut reply = ack(CPO_SET_CONTROL, &[CPO_CONTROL_BREAK_ON]);
@@ -1813,7 +1813,7 @@ mod tests {
 
     // -- asynOption: negotiation state machine ----------------------------
 
-    /// C `sbComPortOption` :443-449 — a server may volunteer a modem/line-state
+    /// C `sbComPortOption` :456-462 — a server may volunteer a modem/line-state
     /// notification at any point; it is consumed and the wait for our own reply
     /// resumes.
     #[test]
@@ -1854,7 +1854,7 @@ mod tests {
         assert_eq!(com.get_option("bits").unwrap(), "8");
     }
 
-    /// C :461-465 — a reply for the wrong subcommand ends the negotiation.
+    /// C :474-478 — a reply for the wrong subcommand ends the negotiation.
     #[test]
     fn a_reply_for_the_wrong_subcommand_is_an_error() {
         // Asked SET-DATASIZE (2, reply 102); server answers for SET-PARITY (103).
@@ -1968,15 +1968,15 @@ mod tests {
         for key in ["baud", "BITS", "Parity", "stop", "CRTSCTS", "ixon", "Break"] {
             assert!(ComPortOptions::owns_key(key), "{key}");
         }
-        // Handled by the driver below, not here — C :645-652 / :710-717.
+        // Handled by the driver below, not here — C :659-666 / :724-731.
         for key in ["hostInfo", "disconnectOnReadTimeout", "clocal", "ixoff"] {
             assert!(!ComPortOptions::owns_key(key), "{key}");
         }
     }
 
     /// R9-55. C threads the *caller's* `pasynUser` through the whole
-    /// negotiation: `setOption(drvPvt, pasynUser, key, val)` (:475) hands it to
-    /// `sbComPortOption` (:495), which writes (:431) and reads (:435-457) the wire
+    /// negotiation: `setOption(drvPvt, pasynUser, key, val)` (:488) hands it to
+    /// `sbComPortOption` (:508), which writes (:444) and reads (:448-470) the wire
     /// with it — so an asynRecord option put negotiates under TMOT and an iocsh
     /// `asynSetOption` under its own 2 s (`asynShellCommands.c:119`). The port
     /// pinned every negotiation to a private 2 s instead, so a record with
@@ -1984,7 +1984,7 @@ mod tests {
     /// TMOT=0.05 sat waiting for 2 s.
     ///
     /// The 2 s is C's only where C's own asynUser drives — `restoreSettings`,
-    /// from the configure path and the reconnect exceptionHandler (:836).
+    /// from the configure path and the reconnect exceptionHandler (:850).
     #[test]
     fn the_negotiation_runs_under_the_callers_timeout() {
         /// Records the timeout on the asynUser every wire operation is given.
@@ -2028,7 +2028,7 @@ mod tests {
         );
 
         // restoreSettings is the interpose's own negotiation, and only that one
-        // carries C's 2 s (:836).
+        // carries C's 2 s (:850).
         let mut replies = Vec::new();
         replies.extend(vec![IAC, WILL, WD_TRANSMIT_BINARY]);
         replies.extend(vec![IAC, DO, WD_TRANSMIT_BINARY]);
@@ -2098,7 +2098,7 @@ mod tests {
             "C :238 label, got {contents:?}"
         );
         // The line carries C's `[port,addr,reason]` prefix and no mask
-        // label — C prints no severity token (asynManager.c:3005-3023).
+        // label — C prints no severity token (asynManager.c:3030-3048).
         assert!(
             contents.contains("[comtrace,-1,0] "),
             "C printPort triple, got {contents:?}"
@@ -2120,8 +2120,8 @@ mod tests {
 
     /// R9-57, second half. C's `setOption` leaves an advisory in
     /// `pasynUser->errorMessage` when the operator switches flow control over a
-    /// live setting of the other kind, and does *not* fail the call (:571-573,
-    /// :587-589). A `Result` cannot carry a message that does not fail, so the
+    /// live setting of the other kind, and does *not* fail the call (:584-586,
+    /// :600-602). A `Result` cannot carry a message that does not fail, so the
     /// port dropped both; they now land in the user's message slot, which is
     /// where C's caller finds them.
     #[test]
@@ -2191,7 +2191,7 @@ mod tests {
                 .message(),
             "Invalid parity selection"
         );
-        // C's message really does have two spaces (:553).
+        // C's message really does have two spaces (:566).
         assert_eq!(
             com.set_option(&mut AsynUser::default(), &mut server, "stop", "1.5")
                 .unwrap_err()

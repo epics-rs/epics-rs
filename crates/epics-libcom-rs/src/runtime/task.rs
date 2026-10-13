@@ -508,6 +508,19 @@ where
     spawn_blocking_on(&background().callbacks().handle(), priority, f)
 }
 
+/// Queue a requester-owned [`CallbackCell`] on the process-global pool's
+/// `priority` band — C `callbackRequest` (`callback.c:341`). Unlike
+/// [`spawn_background`] this allocates nothing per request; a cell already
+/// queued is taken by its pending run.
+///
+/// [`CallbackCell`]: crate::runtime::background::CallbackCell
+pub fn request_cell<B: crate::runtime::background::CallbackBody>(
+    priority: CallbackPriority,
+    cell: &Arc<crate::runtime::background::CallbackCell<B>>,
+) -> Result<(), crate::runtime::background::CallbackError> {
+    background().callbacks().request_cell(priority, cell)
+}
+
 /// Sleep on the process-global delayed-callback timer — C
 /// `callbackRequestDelayed` (callback.c:410) — measured on `std::time`.
 ///

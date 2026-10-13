@@ -47,10 +47,11 @@ impl SyncIOHandle {
         })
     }
 
-    fn user(&self, reason: usize) -> AsynUser {
+    pub(crate) fn user(&self, reason: usize) -> AsynUser {
         AsynUser::new(reason)
             .with_addr(self.addr)
             .with_timeout(self.timeout)
+            .locking_port(self.handle.queue_lock_port_timeout())
     }
 
     /// Read the configured per-call timeout. The handle is `&self`-only

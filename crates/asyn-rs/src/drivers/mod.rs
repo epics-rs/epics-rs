@@ -49,7 +49,7 @@ pub mod serial_port;
 ///
 /// C reaches the same place from the other side: `readIt`/`writeIt` compute
 /// `pollmsec = (int)(timeout * 1000.0)` and then `if (pollmsec == 0) pollmsec =
-/// 1` (`drvAsynIPPort.c:741-743`, `:615-617`). Rounding every positive budget
+/// 1` (`drvAsynIPPort.c:741-743`, `:662-664`). Rounding every positive budget
 /// up is that floor generalised — C only ever sees the caller's timeout here,
 /// whereas the deadline loops also feed this a remainder. Each of those C
 /// triples ends `if (pollmsec < 0) pollmsec = -1`, the wait-forever case a
@@ -87,7 +87,7 @@ mod tests {
     /// No production C asyn driver passes `ASYN_DESTRUCTIBLE` to `registerPort`
     /// at pin `e2a281e2`. The flag occurs in exactly six places there — its
     /// definition (asynDriver.h:97), its two consumers (asynManager.c:2096 in
-    /// `registerPort`, :2271 in `shutdownPort`), the `asynPortDriver` base that
+    /// `registerPort`, :2273 in `shutdownPort`), the `asynPortDriver` base that
     /// forwards a caller's `asynFlags` (asynPortDriver.cpp:3996), and two *test*
     /// drivers (testAsynPortDriver.cpp:54, asynPortDriverTest.cpp:58) — plus
     /// documentation. Every real transport registers without it, so a port that
@@ -98,9 +98,9 @@ mod tests {
     /// | port | C original | attributes |
     /// |---|---|---|
     /// | FTDI | drvAsynFTDIPort.cpp:586-587 | `ASYN_CANBLOCK` |
-    /// | IP | drvAsynIPPort.c:1028-1029 | `ASYN_CANBLOCK` |
-    /// | IP server (listener) | drvAsynIPServerPort.c:625-626 | `ASYN_CANBLOCK` |
-    /// | IP server (child) | drvAsynIPServerPort.c:690 → drvAsynIPPortConfigure | `ASYN_CANBLOCK` |
+    /// | IP | drvAsynIPPort.c:1082-1083 | `ASYN_CANBLOCK` |
+    /// | IP server (listener) | drvAsynIPServerPort.c:646-647 | `ASYN_CANBLOCK` |
+    /// | IP server (child) | drvAsynIPServerPort.c:711 → drvAsynIPPortConfigure | `ASYN_CANBLOCK` |
     /// | serial | drvAsynSerialPort.c:1101-1102 | `ASYN_CANBLOCK` |
     /// | serial (win32) | drvAsynSerialPortWin32.c:774-775 | `ASYN_CANBLOCK` |
     /// | USBTMC | drvAsynUSBTMC.c:1273-1274 | `ASYN_CANBLOCK` |

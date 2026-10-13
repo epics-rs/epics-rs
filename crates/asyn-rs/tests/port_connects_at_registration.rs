@@ -4,8 +4,8 @@
 //! C `registerPort` → `registerInterface(asynCommonType)` → `initPortConnect` +
 //! `portConnectTimerCallback` + `waitConnect` (asynManager.c:2131-2136). The
 //! timer callback queues a connect at `asynQueuePriorityConnect` the moment the
-//! port exists (:3252-3266) and `waitConnect` blocks registration on the connect
-//! exception for up to `DEFAULT_AUTOCONNECT_TIMEOUT` (0.5 s, :49/:507).
+//! port exists (:3283-3297) and `waitConnect` blocks registration on the connect
+//! exception for up to `DEFAULT_AUTOCONNECT_TIMEOUT` (0.5 s, :49/:509).
 //!
 //! Before the fix the port sat disconnected until some record's I/O forced a
 //! lazy connect: `CNCT` read 0 straight after `drvAsynIPPortConfigure`, and a
@@ -55,7 +55,7 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
     // `is_connected` proves the server's kernel has already accepted the circuit.
     assert!(
         rt.port_handle().is_connected_blocking(-1).unwrap(),
-        "CNCT must read 1 straight after configure (asynRecord.c:1089-1093 reads \
+        "CNCT must read 1 straight after configure (asynRecord.c:1090-1094 reads \
          pasynManager->isConnected)"
     );
     // The server's `accept()` runs on its own thread, so it may not have returned
@@ -72,13 +72,13 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
         1,
         "registering an auto-connect port must connect it — C queues the connect \
          at asynQueuePriorityConnect from portConnectTimerCallback and waits for \
-         it (asynManager.c:2131-2136)"
+         it (asynManager.c:2133-2138)"
     );
 }
 
 /// The `noAutoConnect` port is the negative control: C's `waitConnect` is gated
-/// on `pport->dpc.autoConnect` (asynManager.c:2135) and its timer callback on
-/// the same flag (:3258), so registration must leave this port down and must not
+/// on `pport->dpc.autoConnect` (asynManager.c:2137) and its timer callback on
+/// the same flag (:3289), so registration must leave this port down and must not
 /// stall waiting for a connect that is never queued.
 #[test]
 fn a_no_auto_connect_port_stays_down_at_registration() {

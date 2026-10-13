@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
+use epics_libcom_rs::runtime::task::{in_test_ioc_thread, test_ioc_thread};
 
 use super::io_intr::NoInterface;
 use super::{AsynRecord, ERR_SIZE, Errs, IoOutcome, IoTrace, MessageOrEmpty};
@@ -20,8 +21,6 @@ thread_local! {
     /// Allocation calls made by this thread, so concurrently running tests
     /// cannot move each other's count.
     static ALLOCS: Cell<u64> = const { Cell::new(0) };
-    /// Set on the threads [`record_thread`] starts, the only ones counted.
-    static RECORD_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Counting;
@@ -45,37 +44,12 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// Allocation calls this thread has made so far — a record thread's only.
+/// Allocation calls this thread has made so far. Only a [`test_ioc_thread`]
+/// is counted: `enter_ioc_thread` builds its park state, which any other
+/// thread builds on its first contended lock, inside the count.
 pub(crate) fn thread_allocs() -> u64 {
-    assert!(
-        RECORD_THREAD.with(Cell::get),
-        "allocations are counted on a record thread: on_record_thread"
-    );
+    assert!(in_test_ioc_thread(), "counted off an IOC thread");
     ALLOCS.with(Cell::get)
-}
-
-/// Starts an IOC thread, the kind a record processes on. `enter_ioc_thread`
-/// builds its `parking_lot_core` park state; any other thread builds it on
-/// its first contended lock, inside the count, and grows the process table
-/// when live threads cross a threshold: two allocations no cycle owes.
-pub(crate) fn record_thread(
-    name: String,
-    body: impl FnOnce() + Send + 'static,
-) -> std::thread::JoinHandle<()> {
-    use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
-
-    MandatoryThread::new(name, ThreadPriority::ScanLow, StackSizeClass::Big).spawn(move || {
-        RECORD_THREAD.with(|c| c.set(true));
-        body();
-    })
-}
-
-/// Runs `body` on a [`record_thread`] and returns its panic, if any, as the
-/// caller's.
-pub(crate) fn on_record_thread(body: impl FnOnce() + Send + 'static) {
-    if let Err(panic) = record_thread("scan-1".into(), body).join() {
-        std::panic::resume_unwind(panic);
-    }
 }
 
 const LONG: &str = "Error in GPIB Serial Poll read, a driver diagnostic long enough \
@@ -83,7 +57,7 @@ const LONG: &str = "Error in GPIB Serial Poll read, a driver diagnostic long eno
 
 #[test]
 fn every_errs_report_formats_without_allocating() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         let mut rec = AsynRecord::default();
         let e = AsynError::Status {
             status: AsynStatus::Timeout,
@@ -235,7 +209,7 @@ fn blocking_cycle(rec: &mut AsynRecord) -> u64 {
 /// allocates nothing once the record has run one.
 #[test]
 fn a_blocking_port_cycle_queues_and_completes_without_allocating() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use super::{InterfaceType, TransferMode};
 
         let (mut rec, _db) = blocking_port_record();
@@ -255,9 +229,9 @@ fn a_blocking_port_cycle_queues_and_completes_without_allocating() {
     });
 }
 
-/// The first contended lock on a record thread allocates nothing.
+/// The first contended lock on an IOC thread allocates nothing.
 /// `parking_lot_core` grows its table when live threads cross 6, 11, 22, 43,
-/// 86, …, so one thread proves nothing: each of `THREADS` fresh record threads
+/// 86, …, so one thread proves nothing: each of `THREADS` fresh IOC threads
 /// queues the record once while the queue timer's lock is held, and all stay
 /// alive, so the live count climbs through those thresholds.
 #[test]
@@ -275,16 +249,18 @@ fn a_record_thread_s_first_contended_queue_allocates_nothing() {
         let mut r = rec.take().unwrap();
         let tx = tx.clone();
         let release = Arc::clone(&release);
-        threads.push(record_thread(format!("scan-{i}"), move || {
-            if i == 0 {
-                // What the record builds on its first cycle.
-                blocking_cycle(&mut r);
-            }
-            let holder = crate::request::hold_queue_timer_for_test(Duration::from_millis(5));
-            let allocs = blocking_cycle(&mut r);
-            holder.join().unwrap();
-            tx.send((r, allocs)).unwrap();
-            release.wait();
+        threads.push(std::thread::spawn(move || {
+            test_ioc_thread(move || {
+                if i == 0 {
+                    // What the record builds on its first cycle.
+                    blocking_cycle(&mut r);
+                }
+                let holder = crate::request::hold_queue_timer_for_test(Duration::from_millis(5));
+                let allocs = blocking_cycle(&mut r);
+                holder.join().unwrap();
+                tx.send((r, allocs)).unwrap();
+                release.wait();
+            })
         }));
         let (r, allocs) = rx.recv().unwrap();
         assert_eq!(allocs, 0, "record thread {i}'s first contended queue");
@@ -303,7 +279,7 @@ fn a_record_thread_s_first_contended_queue_allocates_nothing() {
 /// hold on a blocking port — allocates nothing after one round of each arm.
 #[test]
 fn a_special_put_on_a_blocking_port_queues_without_allocating() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
 
@@ -382,7 +358,7 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
 /// nor the report allocates.
 #[test]
 fn a_special_put_refused_by_its_port_reports_without_allocating() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use std::sync::Arc;
 
         use epics_base_rs::server::database::PvDatabase;
@@ -442,7 +418,7 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
 /// record's lock; neither the report nor the tail allocates.
 #[test]
 fn a_connect_to_a_shut_down_port_reports_without_allocating() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime};
 
@@ -497,7 +473,7 @@ fn a_connect_to_a_shut_down_port_reports_without_allocating() {
 /// leaving it from `special()` — the hold — allocates nothing.
 #[test]
 fn a_put_that_cancels_io_intr_leaves_its_scan_put_without_allocating() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use epics_base_rs::server::database::PvDatabase;
 
         let mut rec = AsynRecord::default();
@@ -526,7 +502,7 @@ fn a_put_that_cancels_io_intr_leaves_its_scan_put_without_allocating() {
 /// queued next; and neither queueing allocates.
 #[test]
 fn a_queued_cell_times_out_while_the_driver_blocks() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex, mpsc};
         use std::time::{Duration, Instant};
@@ -654,7 +630,7 @@ fn a_queued_cell_times_out_while_the_driver_blocks() {
 /// made on, the port's and a device's.
 #[test]
 fn enable_and_auto_connect_allocate_nothing_on_a_blocking_port() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_handle::PortHandle;
 
@@ -718,7 +694,7 @@ fn enable_and_auto_connect_allocate_nothing_on_a_blocking_port() {
 /// (`getPortName`, asynManager.c:2024), so the name is shared, not copied.
 #[test]
 fn a_dequeue_shares_the_port_name() {
-    on_record_thread(|| {
+    test_ioc_thread(|| {
         use crate::port::{PortDriverBase, PortFlags};
 
         let base = PortDriverBase::new("NAMESHARE", 1, PortFlags::default());

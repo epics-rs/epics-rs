@@ -72,6 +72,12 @@ fn ev(v: i32) -> MonitorEvent {
 
 #[test]
 fn a_steady_state_burst_allocates_and_frees_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(
+        a_steady_state_burst_allocates_and_frees_nothing_body,
+    );
+}
+
+fn a_steady_state_burst_allocates_and_frees_nothing_body() {
     let user = EventUser::new();
     let (a, _ra) = attach(&user, 1, LogKind::Val);
     let (b, _rb) = attach(&user, 2, LogKind::Val);
@@ -97,6 +103,10 @@ fn a_steady_state_burst_allocates_and_frees_nothing() {
             b.post_in(&mut burst, eb);
         }
         COUNTING.with(|c| c.set(false));
+        assert!(
+            epics_base_rs::runtime::task::in_test_ioc_thread(),
+            "counted off an IOC thread"
+        );
         // C's ring is allocated with the queue, so the first round is
         // steady state too.
         assert_eq!(CALLS.with(Cell::get), 0, "round {round}");
@@ -111,6 +121,12 @@ fn a_steady_state_burst_allocates_and_frees_nothing() {
 /// `poll_recv` as the QSRV group drain parks.
 #[test]
 fn a_parked_poll_recv_reader_costs_its_post_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(
+        a_parked_poll_recv_reader_costs_its_post_nothing_body,
+    );
+}
+
+fn a_parked_poll_recv_reader_costs_its_post_nothing_body() {
     let user = EventUser::new();
     let (sink, mut reader) = attach(&user, 1, LogKind::Val);
     let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
@@ -123,6 +139,10 @@ fn a_parked_poll_recv_reader_costs_its_post_nothing() {
         COUNTING.with(|c| c.set(true));
         sink.post(event);
         COUNTING.with(|c| c.set(false));
+        assert!(
+            epics_base_rs::runtime::task::in_test_ioc_thread(),
+            "counted off an IOC thread"
+        );
         assert_eq!(CALLS.with(Cell::get), 0, "round {round}");
         assert_eq!(wakes.0.load(Ordering::SeqCst), round as usize + 1);
         assert!(matches!(reader.poll_recv(&mut cx), Poll::Ready(Some(_))));
@@ -136,6 +156,10 @@ fn counted<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
     COUNTING.with(|c| c.set(true));
     let r = f();
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     (r, CALLS.with(Cell::get), FREES.with(Cell::get))
 }
 
@@ -144,6 +168,10 @@ fn counted<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 /// `rngSpace <= EVENTSPERQUE`, and replace under flow control.
 #[test]
 fn a_val_post_allocates_nothing_on_any_arm() {
+    epics_base_rs::runtime::task::test_ioc_thread(a_val_post_allocates_nothing_on_any_arm_body);
+}
+
+fn a_val_post_allocates_nothing_on_any_arm_body() {
     let user = EventUser::new();
     let (sink, mut reader) = attach(&user, 1, LogKind::Val);
     let mut appended = 0;
@@ -185,6 +213,12 @@ fn owned(v: f64) -> MonitorEvent {
 /// replace that displaces it, or by the consumer after delivery.
 #[test]
 fn a_filter_copy_is_freed_on_replace_or_by_the_consumer_only() {
+    epics_base_rs::runtime::task::test_ioc_thread(
+        a_filter_copy_is_freed_on_replace_or_by_the_consumer_only_body,
+    );
+}
+
+fn a_filter_copy_is_freed_on_replace_or_by_the_consumer_only_body() {
     let user = EventUser::new();
     let (sink, mut reader) = attach(&user, 1, LogKind::Ref);
     let first = owned(1.0);

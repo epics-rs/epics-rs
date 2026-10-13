@@ -697,6 +697,51 @@ pub fn osd_show_all_line() -> &'static str {
     }
 }
 
+/// A one-shot "this thread has started" latch, C's `startStopEvent`
+/// handshake (`callback.c:216`, `:333`; `dbCa.c:355-357`): the spawner
+/// [`wait`](StartWait::wait)s until the started thread drops its
+/// [`StartSignal`], which a panic in its startup does too.
+///
+/// A `Mutex` + `Condvar` rather than [`Event`] or a channel, because those
+/// sleep in `thread::park`, which swallows any unpark meant for the
+/// spawner's own future — a spawner inside a `park_on` poll would lose
+/// that wake and park for good.
+pub fn start_latch() -> (StartSignal, StartWait) {
+    let shared = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    (StartSignal(shared.clone()), StartWait(shared))
+}
+
+/// The started thread's half of [`start_latch`]; dropping it releases the
+/// spawner.
+pub struct StartSignal(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Drop for StartSignal {
+    fn drop(&mut self) {
+        let (started, cv) = &*self.0;
+        *started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cv.notify_one();
+    }
+}
+
+/// The spawner's half of [`start_latch`].
+pub struct StartWait(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl StartWait {
+    /// Block until the [`StartSignal`] is dropped.
+    pub fn wait(self) {
+        let (started, cv) = &*self.0;
+        let guard = started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            cv.wait_while(guard, |started| !*started)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+}
+
 /// C `epicsEventId` with one waiting thread — the wake-up half of a facility
 /// whose state is guarded by a [`PriorityInheritanceMutex`].
 ///
@@ -1449,5 +1494,49 @@ mod tests {
             polls > 1
         });
         assert_eq!(polls, 2, "the forced wake did not release the park");
+    }
+
+    /// A starter that panics before its prologue ends drops the signal while
+    /// unwinding, so the spawner is released rather than waiting forever.
+    #[test]
+    fn a_starter_that_panics_holding_the_signal_releases_the_wait() {
+        let (started, wait) = start_latch();
+        let child = std::thread::spawn(move || {
+            let _started = started;
+            panic!("prologue failed");
+        });
+        let (done, released) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            wait.wait();
+            let _ = done.send(());
+        });
+        assert!(
+            released
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "a panicking starter left its spawner waiting"
+        );
+        assert!(child.join().is_err());
+    }
+
+    /// A spawner waiting on its child's start keeps the unpark meant for the
+    /// future it is polling: with a channel's park-based wait, `scan-owner`
+    /// lost its stop wake and `ScanOwner::drop` joined it forever.
+    #[test]
+    fn a_start_wait_leaves_the_waiters_unpark_token() {
+        let (started, wait) = start_latch();
+        std::thread::current().unpark();
+        let child = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(started);
+        });
+        wait.wait();
+        child.join().unwrap();
+        let t0 = std::time::Instant::now();
+        std::thread::park_timeout(std::time::Duration::from_secs(5));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "the start wait consumed the thread's unpark"
+        );
     }
 }

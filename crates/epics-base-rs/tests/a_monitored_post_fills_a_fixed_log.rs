@@ -86,13 +86,25 @@ async fn per_put(db: &PvDatabase) -> (usize, usize) {
             .unwrap();
     }
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     (ALLOCS.with(Cell::get) / N, FREES.with(Cell::get) / N)
 }
 
 /// The post a `dbPut` makes to a monitored field costs it nothing over the
 /// same put with no monitor.
-#[epics_macros_rs::epics_test]
-async fn a_dbput_post_to_a_monitor_allocates_nothing() {
+#[test]
+fn a_dbput_post_to_a_monitor_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_dbput_post_to_a_monitor_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn a_dbput_post_to_a_monitor_allocates_nothing_body() {
     let db = ioc().await;
     let plain = per_put(&db).await;
     let rec = db.get_record("C").unwrap();
@@ -112,8 +124,14 @@ async fn a_dbput_post_to_a_monitor_allocates_nothing() {
 /// `strncpy(pLog->amsg, prec->amsg, DB_AMSG_SIZE-1)` with the last byte NUL
 /// (`dbEvent.c:708-709`): a message of 39 bytes or more arrives as its first
 /// 39.
-#[epics_macros_rs::epics_test]
-async fn an_amsg_reaches_a_monitor_cut_to_39_bytes() {
+#[test]
+fn an_amsg_reaches_a_monitor_cut_to_39_bytes() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(an_amsg_reaches_a_monitor_cut_to_39_bytes_body())
+    });
+}
+
+async fn an_amsg_reaches_a_monitor_cut_to_39_bytes_body() {
     let db = ioc().await;
     let rec = db.get_record("C").unwrap();
     let mut reader = rec
@@ -143,8 +161,16 @@ impl Wake for Wakes {
 /// A cycle that posts VAL and an alarm field reaches a parked circuit
 /// consumer as one wake, and each log carries `caEventMask & select`
 /// (`dbEvent.c:896-900`).
-#[epics_macros_rs::epics_test]
-async fn a_cycle_posting_val_and_sevr_wakes_once_with_narrowed_masks() {
+#[test]
+fn a_cycle_posting_val_and_sevr_wakes_once_with_narrowed_masks() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_cycle_posting_val_and_sevr_wakes_once_with_narrowed_masks_body(),
+        )
+    });
+}
+
+async fn a_cycle_posting_val_and_sevr_wakes_once_with_narrowed_masks_body() {
     let db = ioc().await;
     let rec = db.get_record("AI").unwrap();
     let user = EventUser::new();

@@ -12,6 +12,7 @@ use std::time::Duration;
 use epics_libcom_rs::runtime::log::{
     errlog_add_listener, errlog_flush, errlog_init, errlog_vprintf,
 };
+use epics_libcom_rs::runtime::task::{in_test_ioc_thread, test_ioc_thread};
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -65,15 +66,10 @@ fn a_flush_returns_after_the_pass_that_handled_what_came_before_it() {
     .unwrap();
 
     // A posting thread's flush waits for its own message.
-    std::thread::spawn(|| {
+    test_ioc_thread(|| {
         errlog_vprintf(format_args!("own 0\n"));
         errlog_flush();
         assert!(seen("own 0\n"), "the poster's own flush");
-        // parking_lot_core sizes its table on a thread's first park, which
-        // the queue lock reaches only under contention; park once here.
-        let lock = parking_lot::Mutex::new(());
-        let _ = parking_lot::Condvar::new().wait_for(&mut lock.lock(), Duration::from_millis(1));
-
         let n = {
             ALLOCS.with(|n| n.set(0));
             COUNTING.with(|c| c.set(true));
@@ -82,11 +78,10 @@ fn a_flush_returns_after_the_pass_that_handled_what_came_before_it() {
                 errlog_flush();
             }
             COUNTING.with(|c| c.set(false));
+            assert!(in_test_ioc_thread(), "counted off an IOC thread");
             ALLOCS.with(Cell::get)
         };
         assert!(seen("own 100\n"), "the poster's last flush");
         assert_eq!(n, 0, "allocations in 100 posts and flushes after the first");
-    })
-    .join()
-    .unwrap();
+    });
 }

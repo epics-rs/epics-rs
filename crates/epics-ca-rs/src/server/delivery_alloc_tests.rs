@@ -40,6 +40,12 @@ static ALLOC: Counting = Counting;
 
 #[test]
 fn a_gr_update_allocates_nothing_beyond_the_read() {
+    epics_base_rs::runtime::task::test_ioc_thread(
+        a_gr_update_allocates_nothing_beyond_the_read_body,
+    );
+}
+
+fn a_gr_update_allocates_nothing_beyond_the_read_body() {
     let mut read = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
     read.properties = PropertySupport::NUMERIC;
     read.display = Some(DisplayInfo {
@@ -57,6 +63,10 @@ fn a_gr_update_allocates_nothing_beyond_the_read() {
         .encode_dbr_into(&mut dst, DBR_GR_DOUBLE)
         .expect("encodes");
     let allocs = ALLOCS.with(Cell::get) - before;
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     drop(delivery);
     assert_eq!(allocs, 0);
     assert_eq!(&dst[..4], &[0, 3, 0, 1], "the log's status and severity");

@@ -92,6 +92,10 @@ async fn allocs(db: &PvDatabase, rec: &str) -> usize {
         .await
         .unwrap();
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     ALLOCS.with(Cell::get)
 }
 
@@ -104,8 +108,16 @@ record(fanout, "FPVA") { field(LNK1, "pva://T:C") }
 record(fanout, "FJSON") { field(LNK1, {pva:{pv:"T:D", Q:4}}) }
 "#;
 
-#[epics_macros_rs::epics_test]
-async fn an_external_flnk_cycle_allocates_nothing_for_its_forward() {
+#[test]
+fn an_external_flnk_cycle_allocates_nothing_for_its_forward() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            an_external_flnk_cycle_allocates_nothing_for_its_forward_body(),
+        )
+    });
+}
+
+async fn an_external_flnk_cycle_allocates_nothing_for_its_forward_body() {
     let (db, forwards) = ioc(DB).await;
     let bare = allocs(&db, "BARE").await;
     for rec in ["PVA", "JSON"] {
@@ -119,8 +131,14 @@ async fn an_external_flnk_cycle_allocates_nothing_for_its_forward() {
     }
 }
 
-#[epics_macros_rs::epics_test]
-async fn a_pva_lnkn_dispatch_allocates_nothing() {
+#[test]
+fn a_pva_lnkn_dispatch_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(a_pva_lnkn_dispatch_allocates_nothing_body())
+    });
+}
+
+async fn a_pva_lnkn_dispatch_allocates_nothing_body() {
     let (db, forwards) = ioc(DB).await;
     // An empty fanout: a baseline that dispatches nothing, so whatever the
     // forwarding branch allocates shows.

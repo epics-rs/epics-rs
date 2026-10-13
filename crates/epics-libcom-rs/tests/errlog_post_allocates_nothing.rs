@@ -1,7 +1,8 @@
 //! Posting an errlog message MUST NOT allocate: C `errlogVprintf` formats into
 //! the arena `errlogInitPvt` allocated once (`errlog.c:121-144`, `:592-593`),
-//! and the caller may hold a record lock. Counted on the posting thread only;
-//! the worker that drains the arena is not the poster.
+//! and the caller may hold a record lock. Counted on the posting thread only, an
+//! IOC thread as a record's is; the worker that drains the arena is not the
+//! poster.
 #![cfg(target_os = "linux")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -11,6 +12,7 @@ use epics_libcom_rs::runtime::log::{
     ErrlogSevEnum, errlog_init, errlog_messages_lost, errlog_set_console, errlog_sev_vprintf,
     errlog_vprintf,
 };
+use epics_libcom_rs::runtime::task::{in_test_ioc_thread, test_ioc_thread};
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -42,6 +44,7 @@ fn allocations_in(f: impl FnOnce()) -> usize {
     COUNTING.with(|c| c.set(true));
     f();
     COUNTING.with(|c| c.set(false));
+    assert!(in_test_ioc_thread(), "counted off an IOC thread");
     ALLOCS.with(Cell::get)
 }
 
@@ -61,12 +64,15 @@ fn stalled_console() -> (std::io::PipeReader, std::fs::File) {
 
 #[test]
 fn a_post_allocates_nothing_whether_taken_or_dropped() {
+    test_ioc_thread(posts_allocate_nothing);
+}
+
+fn posts_allocate_nothing() {
     errlog_init(0);
     let (reader, console) = stalled_console();
     errlog_set_console(console);
-    // Each call site registers with `tracing` on its first use, once, and
-    // parking_lot grows its table on each thread's first park; the worker
-    // contends only until it blocks in its write.
+    // Each call site registers with `tracing` on its first use, once; the
+    // worker contends only until it blocks in its write.
     errlog_vprintf(format_args!("warm\n"));
     errlog_sev_vprintf(ErrlogSevEnum::Major, format_args!("warm\n"));
     std::thread::sleep(std::time::Duration::from_millis(200));

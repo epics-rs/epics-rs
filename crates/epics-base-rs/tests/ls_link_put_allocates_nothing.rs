@@ -88,6 +88,10 @@ async fn per_cycle(src: &str, text: Option<&str>, target: &str, watch: bool) -> 
         db.process_record("S").await.unwrap();
     }
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     ALLOCS.with(Cell::get) / N
 }
 
@@ -101,29 +105,65 @@ async fn put_allocs(target: &str, text: &str) -> usize {
     with.saturating_sub(without)
 }
 
-#[epics_macros_rs::epics_test]
-async fn an_lso_put_into_ao_allocates_nothing() {
+#[test]
+fn an_lso_put_into_ao_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(an_lso_put_into_ao_allocates_nothing_body())
+    });
+}
+
+async fn an_lso_put_into_ao_allocates_nothing_body() {
     assert_eq!(put_allocs(r#"record(ao, "T") {}"#, "12.5").await, 0);
 }
 
-#[epics_macros_rs::epics_test]
-async fn an_lso_put_into_longout_allocates_nothing() {
+#[test]
+fn an_lso_put_into_longout_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(an_lso_put_into_longout_allocates_nothing_body())
+    });
+}
+
+async fn an_lso_put_into_longout_allocates_nothing_body() {
     assert_eq!(put_allocs(r#"record(longout, "T") {}"#, "42").await, 0);
 }
 
-#[epics_macros_rs::epics_test]
-async fn an_lso_put_into_a_char_waveform_allocates_nothing() {
+#[test]
+fn an_lso_put_into_a_char_waveform_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            an_lso_put_into_a_char_waveform_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn an_lso_put_into_a_char_waveform_allocates_nothing_body() {
     let wf = r#"record(waveform, "T") { field(FTVL, "CHAR") field(NELM, "16") }"#;
     assert_eq!(put_allocs(wf, "hello").await, 0);
 }
 
-#[epics_macros_rs::epics_test]
-async fn an_lso_put_into_a_long_waveform_allocates_nothing() {
+#[test]
+fn an_lso_put_into_a_long_waveform_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            an_lso_put_into_a_long_waveform_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn an_lso_put_into_a_long_waveform_allocates_nothing_body() {
     assert_eq!(put_allocs(WF_LONG, "7").await, 0);
 }
 
-#[epics_macros_rs::epics_test]
-async fn an_ao_put_into_a_long_waveform_allocates_nothing() {
+#[test]
+fn an_ao_put_into_a_long_waveform_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            an_ao_put_into_a_long_waveform_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn an_ao_put_into_a_long_waveform_allocates_nothing_body() {
     let ao = |out: &str| format!(r#"record(ao, "S") {{ field(VAL, "3.9") field(OUT, "{out}") }}"#);
     let with = per_cycle(&ao("T.VAL NPP"), None, WF_LONG, false).await;
     let without = per_cycle(&ao(""), None, WF_LONG, false).await;
@@ -132,8 +172,16 @@ async fn an_ao_put_into_a_long_waveform_allocates_nothing() {
 
 /// A caput of a scalar into `T.VAL` against one into `T.PROC`: both process
 /// T, so the difference is the VAL store.
-#[epics_macros_rs::epics_test]
-async fn a_scalar_caput_into_a_long_waveform_allocates_nothing() {
+#[test]
+fn a_scalar_caput_into_a_long_waveform_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_scalar_caput_into_a_long_waveform_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn a_scalar_caput_into_a_long_waveform_allocates_nothing_body() {
     let db = build(WF_LONG).await;
     let mut per = [0usize; 2];
     for (i, (field, value)) in [
@@ -156,6 +204,10 @@ async fn a_scalar_caput_into_a_long_waveform_allocates_nothing() {
             db.put_record_field_from_ca("T", field, v).await.unwrap();
         }
         COUNTING.with(|c| c.set(false));
+        assert!(
+            epics_base_rs::runtime::task::in_test_ioc_thread(),
+            "counted off an IOC thread"
+        );
         per[i] = ALLOCS.with(Cell::get) / N;
     }
     assert_eq!(
@@ -169,8 +221,16 @@ async fn a_scalar_caput_into_a_long_waveform_allocates_nothing() {
 
 /// A monitor on T: its post does not hold the buffer, so a PP put into VAL
 /// costs what one into PROC does.
-#[epics_macros_rs::epics_test]
-async fn an_lso_put_into_a_monitored_long_waveform_allocates_nothing() {
+#[test]
+fn an_lso_put_into_a_monitored_long_waveform_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            an_lso_put_into_a_monitored_long_waveform_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn an_lso_put_into_a_monitored_long_waveform_allocates_nothing_body() {
     let val = per_cycle(&lso("T.VAL PP"), Some("7"), WF_LONG, true).await;
     let proc = per_cycle(&lso("T.PROC PP"), Some("7"), WF_LONG, true).await;
     assert_eq!(val.saturating_sub(proc), 0, "VAL {val} PROC {proc}");
@@ -178,8 +238,16 @@ async fn an_lso_put_into_a_monitored_long_waveform_allocates_nothing() {
 
 /// A VAL snapshot held across the put shares T's buffer: the put copies it
 /// and the snapshot keeps the old element.
-#[epics_macros_rs::epics_test]
-async fn an_lso_put_into_a_shared_long_waveform_copies_the_buffer() {
+#[test]
+fn an_lso_put_into_a_shared_long_waveform_copies_the_buffer() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            an_lso_put_into_a_shared_long_waveform_copies_the_buffer_body(),
+        )
+    });
+}
+
+async fn an_lso_put_into_a_shared_long_waveform_copies_the_buffer_body() {
     let mut per = [0usize; 2];
     for (i, out) in ["T.VAL NPP", ""].into_iter().enumerate() {
         let db = build(&format!("{}\n{WF_LONG}", lso(out))).await;
@@ -197,6 +265,10 @@ async fn an_lso_put_into_a_shared_long_waveform_copies_the_buffer() {
             COUNTING.with(|c| c.set(true));
             db.process_record("S").await.unwrap();
             COUNTING.with(|c| c.set(false));
+            assert!(
+                epics_base_rs::runtime::task::in_test_ioc_thread(),
+                "counted off an IOC thread"
+            );
             allocs += ALLOCS.with(Cell::get);
             if i == 0 {
                 assert_eq!(snapshot, EpicsValue::LongArray(vec![1, 2].into()));

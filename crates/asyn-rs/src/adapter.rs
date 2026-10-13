@@ -6575,7 +6575,7 @@ mod tests {
     /// the one allocation left is the `Box` that `WriteStart::Pending` carries.
     #[test]
     fn a_put_on_a_blocking_port_queues_its_write_without_allocating() {
-        crate::asyn_record::errs_alloc_tests::on_record_thread(|| {
+        epics_libcom_rs::runtime::task::test_ioc_thread(|| {
             use crate::asyn_record::errs_alloc_tests::thread_allocs;
             use crate::param::ParamType;
             use crate::runtime::{RuntimeConfig, create_port_runtime};

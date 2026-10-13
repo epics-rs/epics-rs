@@ -49,7 +49,12 @@ static ALLOC: Counting = Counting;
 fn allocs<R>(f: impl FnOnce() -> R) -> (R, u64) {
     let before = ALLOCS.with(Cell::get);
     let r = f();
-    (r, ALLOCS.with(Cell::get) - before)
+    let n = ALLOCS.with(Cell::get) - before;
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
+    (r, n)
 }
 
 const LIMIT: u32 = 4;
@@ -150,11 +155,21 @@ fn assert_posts_fill_in_place(snap: impl Fn(u32) -> Snapshot) {
 
 #[test]
 fn an_ai_post_builds_no_descriptor_and_no_tree() {
+    epics_base_rs::runtime::task::test_ioc_thread(an_ai_post_builds_no_descriptor_and_no_tree_body);
+}
+
+fn an_ai_post_builds_no_descriptor_and_no_tree_body() {
     assert_posts_fill_in_place(|n| ai(f64::from(n)));
 }
 
 #[test]
 fn an_enum_post_builds_no_descriptor_and_no_tree() {
+    epics_base_rs::runtime::task::test_ioc_thread(
+        an_enum_post_builds_no_descriptor_and_no_tree_body,
+    );
+}
+
+fn an_enum_post_builds_no_descriptor_and_no_tree_body() {
     assert_posts_fill_in_place(|n| bo((n % 2) as u16));
 }
 
@@ -284,6 +299,10 @@ fn assert_encodes_by_reference(
 /// the structure leaf by leaf.
 #[test]
 fn an_nt_tree_encodes_by_reference() {
+    epics_base_rs::runtime::task::test_ioc_thread(an_nt_tree_encodes_by_reference_body);
+}
+
+fn an_nt_tree_encodes_by_reference_body() {
     let snap = ai(1.5);
     let desc = super::NtShape::of(&snap).desc();
     let v = snapshot_to_pv_field(&snap);
@@ -301,6 +320,10 @@ fn an_nt_tree_encodes_by_reference() {
 /// A structure array's elements encode in place, not as copies.
 #[test]
 fn a_structure_array_encodes_by_reference() {
+    epics_base_rs::runtime::task::test_ioc_thread(a_structure_array_encodes_by_reference_body);
+}
+
+fn a_structure_array_encodes_by_reference_body() {
     use crate::pvdata::{FieldDesc, PvStructure, ScalarType, ScalarValue};
     let fields = vec![("x".to_string(), FieldDesc::Scalar(ScalarType::Int))];
     let desc = FieldDesc::Structure {

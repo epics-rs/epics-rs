@@ -494,21 +494,33 @@ impl LinkPutQueue {
     /// whatever thread processed the record, so the loop itself goes to the
     /// background executor. The network work it dispatches goes to
     /// [`Self::reactor`] instead — see that field.
-    pub(crate) fn ensure_owner(self: &Arc<Self>, db: Weak<super::PvDatabaseInner>) {
+    ///
+    /// The call that starts it gets a latch that opens once the loop has
+    /// registered with the watchdog — C `dbCaLinkInit` waits for exactly
+    /// that (`dbCa.c:355-357`). Only `ca_link_init` waits. The lazy callers
+    /// (`stage_external_link_open`, `write_external_pv`) must not: they run in
+    /// record processing under the record hold, and they can run on the
+    /// Medium band, where the loop itself would have to start.
+    pub(crate) fn ensure_owner(
+        self: &Arc<Self>,
+        db: Weak<super::PvDatabaseInner>,
+    ) -> Option<crate::runtime::sync::StartWait> {
         if self
             .owner_started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            return;
+            return None;
         }
         let queue = Arc::downgrade(self);
         let work = self.work.clone();
+        let (started, wait) = crate::runtime::sync::start_latch();
         // Middle band: one owner loop drains the queued link puts of every
         // record, so there is no single record whose PRIO it could take.
         crate::runtime::task::spawn_background(
             crate::runtime::task::CallbackPriority::Medium,
-            owner_loop(queue, work, db),
+            owner_loop(queue, work, db, started),
         );
+        Some(wait)
     }
 }
 
@@ -524,6 +536,7 @@ async fn owner_loop(
     queue: Weak<LinkPutQueue>,
     work: Arc<tokio::sync::Notify>,
     db: Weak<super::PvDatabaseInner>,
+    started: crate::runtime::sync::StartSignal,
 ) {
     // C `dbCaTask` registers with the watchdog before its loop
     // (`dbCa.c:1096`) and removes when told to exit (`:1262`). Unbounded: the
@@ -534,6 +547,7 @@ async fn owner_loop(
         crate::runtime::taskwd::CheckIn::Unbounded,
         None,
     );
+    drop(started);
     loop {
         // Register on the wake signal BEFORE draining, so a put staged
         // during the drain cannot be missed.

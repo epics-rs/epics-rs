@@ -9238,7 +9238,7 @@ mod tests {
     /// nothing.
     #[test]
     fn enable_and_auto_connect_while_the_port_thread_is_busy_never_refuse() {
-        crate::asyn_record::errs_alloc_tests::on_record_thread(|| {
+        epics_libcom_rs::runtime::task::test_ioc_thread(|| {
             use crate::asyn_record::errs_alloc_tests::thread_allocs;
 
             let port = JammedPort::new("owed_busy");

@@ -70,11 +70,21 @@ record(lsi, "LSI") {{ field(SIZV, "64") field(INP, "C") }}
         db.process_record("C").await.unwrap();
     }
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     ALLOCS.with(Cell::get) / N
 }
 
-#[epics_macros_rs::epics_test]
-async fn a_val_length_change_allocates_nothing() {
+#[test]
+fn a_val_length_change_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(a_val_length_change_allocates_nothing_body())
+    });
+}
+
+async fn a_val_length_change_allocates_nothing_body() {
     let moving = per_cycle("VAL?0:10").await;
     let still = per_cycle("VAL?0:1").await;
     assert_eq!(moving, still, "length-alternating cycle vs same-length");

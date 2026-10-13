@@ -58,8 +58,14 @@ async fn cycle(db: &super::PvDatabase, name: &str) {
         .expect("process");
 }
 
-#[epics_macros_rs::epics_test]
-async fn input_stage_reads_are_freed_every_cycle() {
+#[test]
+fn input_stage_reads_are_freed_every_cycle() {
+    crate::runtime::task::test_ioc_thread(|| {
+        crate::runtime::task::test_block_on(input_stage_reads_are_freed_every_cycle_body())
+    });
+}
+
+async fn input_stage_reads_are_freed_every_cycle_body() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &HashMap::new())
         .expect("db")
@@ -80,6 +86,10 @@ async fn input_stage_reads_are_freed_every_cycle() {
             cycle(&db, name).await;
         }
         let grown = LIVE.with(Cell::get) - before;
+        assert!(
+            crate::runtime::task::in_test_ioc_thread(),
+            "counted off an IOC thread"
+        );
         assert_eq!(
             grown, 0,
             "{name}: {grown} B of heap grown over {CYCLES} cycles"

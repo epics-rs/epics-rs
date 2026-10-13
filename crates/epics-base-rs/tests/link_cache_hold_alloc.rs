@@ -73,6 +73,10 @@ fn start() {
 
 fn stop() -> [usize; 4] {
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     [&ALLOCS, &FREES, &HELD_ALLOCS, &HELD_FREES].map(|c| c.with(Cell::get))
 }
 
@@ -88,8 +92,16 @@ async fn ioc(db: &str) -> Arc<PvDatabase> {
 
 /// The counter tells a hold from the rest; without it the tests below would
 /// pass on nothing.
-#[epics_macros_rs::epics_test]
-async fn the_counter_sees_an_allocation_under_a_hold() {
+#[test]
+fn the_counter_sees_an_allocation_under_a_hold() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            the_counter_sees_an_allocation_under_a_hold_body(),
+        )
+    });
+}
+
+async fn the_counter_sees_an_allocation_under_a_hold_body() {
     let db = ioc(r#"record(ao, "AO") {}"#).await;
     let rec = db.get_record("AO").unwrap();
     let (_, [allocs, _, held, _]) = counted(|| {
@@ -99,8 +111,16 @@ async fn the_counter_sees_an_allocation_under_a_hold() {
     assert_eq!((allocs, held), (1, 1));
 }
 
-#[epics_macros_rs::epics_test]
-async fn install_link_cache_allocates_and_frees_nothing_under_the_hold() {
+#[test]
+fn install_link_cache_allocates_and_frees_nothing_under_the_hold() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            install_link_cache_allocates_and_frees_nothing_under_the_hold_body(),
+        )
+    });
+}
+
+async fn install_link_cache_allocates_and_frees_nothing_under_the_hold_body() {
     let db = ioc(r#"
 record(ao, "AO") { field(OUT, "OLD:TARGET.VAL PP") }
 record(ao, "OLD:TARGET") {}
@@ -136,8 +156,16 @@ record(ao, "NEW:TARGET") {}
 /// write hold that installs the external parse allocates and frees nothing,
 /// so the holds of a pass that rewrites one link cost what the same pass
 /// costs with nothing to rewrite.
-#[epics_macros_rs::epics_test]
-async fn iocinit_link_rewrite_allocates_and_frees_nothing_under_the_hold() {
+#[test]
+fn iocinit_link_rewrite_allocates_and_frees_nothing_under_the_hold() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            iocinit_link_rewrite_allocates_and_frees_nothing_under_the_hold_body(),
+        )
+    });
+}
+
+async fn iocinit_link_rewrite_allocates_and_frees_nothing_under_the_hold_body() {
     let rewrites = ioc(r#"
 record(ai, "AI") { field(INP, "ABSENT01") }
 record(ai, "OTHER001") {}

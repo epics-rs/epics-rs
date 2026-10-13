@@ -851,6 +851,7 @@ impl CallbackPool {
                 };
                 let pq = Arc::clone(pq);
                 let watched_name = name.clone();
+                let (started, wait) = crate::runtime::sync::start_latch();
                 // A band with no worker is a band whose queued callbacks never
                 // run again — deferred record processing, delayed callbacks,
                 // monitor tails. There is no error path out of a constructor
@@ -875,8 +876,12 @@ impl CallbackPool {
                         crate::runtime::taskwd::CheckIn::Unbounded,
                         None,
                     );
+                    drop(started);
                     run_facility_loop(FACILITY, || worker_loop(&pq, j), || pq.request_shutdown());
                 });
+                // callback.c:216, :333 — `callbackInit` waits on
+                // `startStopEvent` until the thread has registered.
+                wait.wait();
                 workers.push(handle);
             }
         }
@@ -1085,6 +1090,27 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    /// C `callbackInit` waits for each band thread's `taskwdInsert`
+    /// (`callback.c:216`, `:333`), so a pool that exists has every band
+    /// registered and none still starting up.
+    #[test]
+    fn every_band_is_registered_when_the_pool_is_built() {
+        let _pool = CallbackPool::with_config(4, 1);
+        let out = std::cell::RefCell::new(String::new());
+        crate::runtime::taskwd::taskwd_show(1, &|line| {
+            out.borrow_mut().push_str(line);
+            out.borrow_mut().push('\n');
+        });
+        let out = out.into_inner();
+        for prio in CallbackPriority::ALL {
+            assert!(
+                out.contains(prio.name_prefix()),
+                "{} was not registered when the pool was built:\n{out}",
+                prio.name_prefix()
+            );
+        }
+    }
 
     const T: Duration = Duration::from_secs(5);
 

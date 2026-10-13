@@ -2374,9 +2374,13 @@ impl PvDatabase {
         if self.inner.link_puts.network().is_none() {
             return false;
         }
-        self.inner
+        if let Some(started) = self
+            .inner
             .link_puts
-            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
+            .ensure_owner(std::sync::Arc::downgrade(&self.inner))
+        {
+            started.wait();
+        }
         true
     }
 
@@ -5713,6 +5717,26 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// C `dbCaLinkInit` waits for `dbCaTask` to start (`dbCa.c:355-357`):
+    /// the `dbCaLink` owner has registered by the time `ca_link_init`
+    /// returns, so its first poll is not left to land in record processing.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_link_init_returns_with_the_owner_registered() {
+        let db = PvDatabase::new();
+        assert!(db.ca_link_init(), "precondition: a captured reactor");
+        let out = std::cell::RefCell::new(String::new());
+        crate::runtime::taskwd::taskwd_show(1, &|line| {
+            out.borrow_mut().push_str(line);
+            out.borrow_mut().push('\n');
+        });
+        let out = out.into_inner();
+        assert!(
+            out.contains("dbCaLink"),
+            "the owner was not registered when ca_link_init returned:\n{out}"
+        );
     }
 
     /// The other boundary: a database that captured no reactor has nowhere to

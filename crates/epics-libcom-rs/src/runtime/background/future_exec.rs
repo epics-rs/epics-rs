@@ -1284,9 +1284,14 @@ mod tests {
 
     /// A wake runs under whatever lock its waker holds — a record's, when a
     /// post notifies a parked tail — so it must not allocate. Counted on the
-    /// waking thread only, over wakes that each re-queued a parked task.
+    /// waking thread only, an IOC thread as a record's is, over wakes that each
+    /// re-queued a parked task.
     #[test]
     fn a_wake_of_a_parked_task_allocates_nothing() {
+        crate::runtime::task::test_ioc_thread(wakes_allocate_nothing);
+    }
+
+    fn wakes_allocate_nothing() {
         let pool = CallbackPool::new();
         let notify = Arc::new(tokio::sync::Notify::new());
         let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1355,6 +1360,10 @@ mod tests {
 
         pub fn disarm() -> usize {
             ARMED.with(|a| a.set(false));
+            assert!(
+                crate::runtime::task::in_test_ioc_thread(),
+                "counted off an IOC thread"
+            );
             ALLOCS.with(Cell::get)
         }
 

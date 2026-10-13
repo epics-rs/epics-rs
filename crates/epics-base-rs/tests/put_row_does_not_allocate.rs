@@ -39,11 +39,19 @@ fn count<T>(f: impl FnOnce() -> T) -> (T, usize) {
     COUNTING.with(|c| c.set(true));
     let out = f();
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     (out, ALLOCS.with(Cell::get))
 }
 
 #[test]
 fn the_counter_sees_this_threads_allocations() {
+    epics_base_rs::runtime::task::test_ioc_thread(the_counter_sees_this_threads_allocations_body);
+}
+
+fn the_counter_sees_this_threads_allocations_body() {
     let (v, allocs) = count(|| Vec::<u8>::with_capacity(8));
     drop(v);
     assert_eq!(allocs, 1);
@@ -51,8 +59,16 @@ fn the_counter_sees_this_threads_allocations() {
 
 /// A string into a string field passes through unconverted; the old row test
 /// cloned the field's `PvString` to ask whether it was an array.
-#[epics_macros_rs::epics_test]
-async fn a_string_put_into_a_string_field_allocates_nothing() {
+#[test]
+fn a_string_put_into_a_string_field_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_string_put_into_a_string_field_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn a_string_put_into_a_string_field_allocates_nothing_body() {
     let (db, _) = IocBuilder::new()
         .db_string(
             r#"record(stringout, "SO") { field(VAL, "old") }"#,
@@ -73,8 +89,16 @@ async fn a_string_put_into_a_string_field_allocates_nothing() {
 
 /// A one-element string into a scalar-held `SPC_DBADDR` field is `putString*`
 /// on that one element; it used to be packed into a one-element array first.
-#[epics_macros_rs::epics_test]
-async fn a_string_put_into_a_scalar_dbaddr_field_allocates_nothing() {
+#[test]
+fn a_string_put_into_a_scalar_dbaddr_field_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_string_put_into_a_scalar_dbaddr_field_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn a_string_put_into_a_scalar_dbaddr_field_allocates_nothing_body() {
     let (db, _) = IocBuilder::new()
         .db_string(
             r#"
@@ -106,8 +130,16 @@ record(aSub, "AS") { field(FTA, "LONG") field(NOA, "1") }
 
 /// `putStringString` keeps `size - 1` bytes, cut from the request itself.
 /// softIoc: `caput A.EGU abcdefghijklmnopqrstuvwxyz` reads `abcdefghijklmno`.
-#[epics_macros_rs::epics_test]
-async fn a_string_over_the_field_size_is_cut_in_place() {
+#[test]
+fn a_string_over_the_field_size_is_cut_in_place() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_string_over_the_field_size_is_cut_in_place_body(),
+        )
+    });
+}
+
+async fn a_string_over_the_field_size_is_cut_in_place_body() {
     let (db, _) = IocBuilder::new()
         .db_string(r#"record(ai, "A") {}"#, &HashMap::new())
         .unwrap()
@@ -129,8 +161,16 @@ async fn a_string_over_the_field_size_is_cut_in_place() {
 /// own `MAX_STRING_SIZE` buffer, as C's `cvt_d_st` does into the field
 /// (`dbFastLinkConv.c:1333`), then copies it into the reserved slot; the
 /// field name resolves to its declared spelling. Neither allocates.
-#[epics_macros_rs::epics_test]
-async fn a_number_put_into_a_string_field_allocates_nothing() {
+#[test]
+fn a_number_put_into_a_string_field_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_number_put_into_a_string_field_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn a_number_put_into_a_string_field_allocates_nothing_body() {
     let (db, _) = IocBuilder::new()
         .db_string(
             r#"record(stringout, "SO") { field(VAL, "old") }"#,
@@ -160,8 +200,16 @@ async fn a_number_put_into_a_string_field_allocates_nothing() {
 /// A lean `Str` store copies into the slot `RecordCell::new` reserved to the
 /// field's cap, so no length up to the cap grows it; 40 bytes is cut to 39
 /// (`putStringString`, `dbConvert.c:916-926`).
-#[epics_macros_rs::epics_test]
-async fn a_lean_string_put_into_a_fresh_record_allocates_nothing() {
+#[test]
+fn a_lean_string_put_into_a_fresh_record_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_lean_string_put_into_a_fresh_record_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn a_lean_string_put_into_a_fresh_record_allocates_nothing_body() {
     let (db, _) = IocBuilder::new()
         .db_string(r#"record(stringout, "SO") {}"#, &HashMap::new())
         .unwrap()
@@ -186,8 +234,16 @@ async fn a_lean_string_put_into_a_fresh_record_allocates_nothing() {
 /// reading the field, as C `db_post_events` does at `mlis.count == 0`
 /// (`dbEvent.c:885`). Lean `Str` arm only: the general arm still clones
 /// the value it stores.
-#[epics_macros_rs::epics_test]
-async fn a_put_into_an_unsubscribed_string_field_allocates_nothing() {
+#[test]
+fn a_put_into_an_unsubscribed_string_field_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_put_into_an_unsubscribed_string_field_allocates_nothing_body(),
+        )
+    });
+}
+
+async fn a_put_into_an_unsubscribed_string_field_allocates_nothing_body() {
     let (db, _) = IocBuilder::new()
         .db_string(r#"record(stringout, "SO") {}"#, &HashMap::new())
         .unwrap()

@@ -54,11 +54,23 @@ async fn allocs_over_1000(db: &PvDatabase, rec: &str) -> usize {
         db.process_record_with_links(rec, &mut stack).await.unwrap();
     }
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     ALLOCS.with(Cell::get)
 }
 
-#[epics_macros_rs::epics_test]
-async fn a_numeric_dol_or_siol_read_builds_no_source_render() {
+#[test]
+fn a_numeric_dol_or_siol_read_builds_no_source_render() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_numeric_dol_or_siol_read_builds_no_source_render_body(),
+        )
+    });
+}
+
+async fn a_numeric_dol_or_siol_read_builds_no_source_render_body() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &HashMap::new())
         .unwrap()

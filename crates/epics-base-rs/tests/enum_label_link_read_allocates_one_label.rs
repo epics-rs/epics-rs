@@ -59,11 +59,23 @@ async fn allocs_over_1000(db: &PvDatabase, rec: &str) -> usize {
         db.process_record_with_links(rec, &mut stack).await.unwrap();
     }
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     ALLOCS.with(Cell::get)
 }
 
-#[epics_macros_rs::epics_test]
-async fn a_string_read_of_an_enum_val_allocates_as_a_string_source() {
+#[test]
+fn a_string_read_of_an_enum_val_allocates_as_a_string_source() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(
+            a_string_read_of_an_enum_val_allocates_as_a_string_source_body(),
+        )
+    });
+}
+
+async fn a_string_read_of_an_enum_val_allocates_as_a_string_source_body() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &HashMap::new())
         .unwrap()

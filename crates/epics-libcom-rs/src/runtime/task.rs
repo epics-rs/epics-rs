@@ -318,6 +318,38 @@ pub fn test_block_on<F: Future>(fut: F) -> F::Output {
     park_on(fut)
 }
 
+thread_local! {
+    static TEST_IOC_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` on a fresh IOC thread, the kind a record processes on, and hand
+/// back its result or its panic. A test that counts allocations counts here:
+/// [`enter_ioc_thread`] built this thread's park and drive state, which a
+/// libtest thread builds inside the count — on its first contended park
+/// `parking_lot_core` also grows its table at live-thread thresholds
+/// (6, 11, 22, 43, 86, …), so the count depends on how many tests run beside
+/// it.
+pub fn test_ioc_thread<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let joined = MandatoryThread::new("scan-test", ThreadPriority::ScanLow, StackSizeClass::Big)
+        .spawn(move || {
+            TEST_IOC_THREAD.with(|t| t.set(true));
+            let _ = tx.send(f());
+        })
+        .join();
+    match joined {
+        Ok(()) => rx.recv().expect("the IOC thread returned"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// `true` inside [`test_ioc_thread`]. A counting test asserts it where it
+/// reads its count, so a count taken on any other thread fails rather than
+/// flakes.
+pub fn in_test_ioc_thread() -> bool {
+    TEST_IOC_THREAD.with(std::cell::Cell::get)
+}
+
 // ---------------------------------------------------------------------------
 // Platform-selected task handle types (decision A2 / B)
 //
@@ -1596,6 +1628,7 @@ pub fn set_thread_ok_to_block(ok: bool) {
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     name_current_thread();
     build_park_state();
+    build_drive_state();
     #[cfg(target_os = "vxworks")]
     epics_rtems_boot::stats::register_task();
     band_and_register(priority)
@@ -1620,6 +1653,15 @@ fn build_park_state() {
             None,
         );
     }
+}
+
+/// A thread's first [`block_on_sync`] builds the thread-locals it reads: the
+/// [`current_thread_waker`] (an `Arc`) and tokio's runtime context, each with
+/// the node glibc callocs to drop it at thread exit — inside a scan thread's
+/// first pass. Building them at entry keeps all three here.
+fn build_drive_state() {
+    drop(current_thread_waker());
+    let _ = RuntimeHandle::try_current();
 }
 
 /// C `epicsThreadSetPriority(epicsThreadGetIdSelf(), prio)` on a thread that
@@ -3115,14 +3157,21 @@ impl MandatoryThread {
     {
         let priority = self.priority;
         let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
-        std::thread::Builder::new()
+        // Returns once the thread is through its prologue, so what std and
+        // `enter_ioc_thread` allocate there happens before the spawner goes
+        // on, not in whatever its caller does next.
+        let (started, wait) = crate::runtime::sync::start_latch();
+        let handle = std::thread::Builder::new()
             .name(self.name)
             .stack_size(stack.bytes())
             .spawn(move || {
                 let _charge = charge;
                 let _ = enter_ioc_thread(priority);
+                drop(started);
                 f()
-            })
+            })?;
+        wait.wait();
+        Ok(handle)
     }
 }
 
@@ -3179,6 +3228,28 @@ fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a thread allocates starting up — std's name copy, the registry
+    /// row, the first park's `ThreadData` — is done before `try_spawn` hands
+    /// back, so it cannot land in whatever the spawner does next.
+    #[test]
+    fn a_mandatory_thread_is_through_its_prologue_when_spawn_returns() {
+        for i in 0..50 {
+            let name = format!("prologue-pin-{i}");
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            let handle = MandatoryThread::new(&name, ThreadPriority::Low, StackSizeClass::Small)
+                .try_spawn(move || {
+                    let _ = gate.recv();
+                })
+                .unwrap();
+            assert!(
+                thread_by_name(&name).is_some(),
+                "{name} was not registered when try_spawn returned"
+            );
+            release.send(()).unwrap();
+            handle.join().unwrap();
+        }
+    }
 
     /// The band binding, end to end: a reactor with an executor bound puts its
     /// spawned future on that executor's worker, and one without still uses the

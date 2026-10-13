@@ -63,13 +63,23 @@ async fn per_cycle(calc: &str) -> usize {
         db.process_record("AC").await.unwrap();
     }
     COUNTING.with(|c| c.set(false));
+    assert!(
+        epics_base_rs::runtime::task::in_test_ioc_thread(),
+        "counted off an IOC thread"
+    );
     ALLOCS.with(Cell::get) / N
 }
 
 /// The store's own array temporary is the one allocation an AMASK cycle may
 /// add over a cycle that stores nothing; the post itself adds none.
-#[epics_macros_rs::epics_test]
-async fn an_unwatched_amask_post_allocates_nothing() {
+#[test]
+fn an_unwatched_amask_post_allocates_nothing() {
+    epics_base_rs::runtime::task::test_ioc_thread(|| {
+        epics_base_rs::runtime::task::test_block_on(an_unwatched_amask_post_allocates_nothing_body())
+    });
+}
+
+async fn an_unwatched_amask_post_allocates_nothing_body() {
     let stores = per_cycle("AA:=IX;VAL+1").await;
     let plain = per_cycle("VAL+1").await;
     assert!(

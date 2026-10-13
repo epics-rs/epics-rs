@@ -440,6 +440,10 @@ pub struct UpstreamManager {
     /// where a rights event must not be lost.
     #[cfg(test)]
     watch_gate: parking_lot::Mutex<Option<WatchGate>>,
+    /// Test-only hold on the next property task before it subscribes, so a
+    /// test can read the shadow before the first property event seeds it.
+    #[cfg(test)]
+    prop_gate: parking_lot::Mutex<Option<epics_base_rs::runtime::sync::oneshot::Receiver<()>>>,
     /// Detachable handle that re-pushes `CA_PROTO_ACCESS_RIGHTS` to
     /// already-connected downstream clients. Installed via
     /// [`Self::install_access_notifier`] once the downstream `CaServer`
@@ -514,6 +518,8 @@ impl UpstreamManager {
             event_mask: cfg.event_mask,
             #[cfg(test)]
             watch_gate: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            prop_gate: parking_lot::Mutex::new(None),
             access_notifier: Arc::new(ArcSwapOption::empty()),
         })
     }
@@ -1302,7 +1308,13 @@ impl UpstreamManager {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
         let name = served_name.to_string();
+        #[cfg(test)]
+        let gate = self.prop_gate.lock().take();
         self.reactor.spawn(async move {
+            #[cfg(test)]
+            if let Some(release) = gate {
+                let _ = release.await;
+            }
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // The very first event of the FIRST subscription is the
@@ -2885,13 +2897,15 @@ ASG(NewGroup) {
         // Force every connect-time CTRL seed to miss (private test seam) so
         // the recovery path — first property event seeds — is exercised.
         mgr.metadata_seed_timeout = Duration::ZERO;
+        let (release_prop, release) = epics_base_rs::runtime::sync::oneshot::channel();
+        *mgr.prop_gate.lock() = Some(release);
 
         mgr.ensure_subscribed(name, name, None, 0)
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
         // Precondition: the seed genuinely MISSED — the shadow's units must
-        // be empty right after ensure_subscribed, before the prop task runs.
+        // be empty while the prop task is held before it subscribes.
         // Without this guard the test would pass vacuously if the seed ever
         // silently succeeded (the units would already be present).
         {
@@ -2907,6 +2921,8 @@ ASG(NewGroup) {
                  the first-event recovery is what this test exercises"
             );
         }
+
+        release_prop.send(()).expect("the prop task is held");
 
         // The cached property task subscribes DBE_PROPERTY, receives its
         // initial-state event, and — because the seed missed — consumes it

@@ -49,7 +49,7 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
         },
         move |iv| {
             if let ParamValue::Octet(s) = &iv.value {
-                sink.lock().unwrap().push(s.clone());
+                sink.lock().unwrap().push(s.to_vec());
             }
         },
     );

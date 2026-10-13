@@ -1113,7 +1113,7 @@ impl SharedProcessorInner {
                     addr0.push(ParamSetValue::new(
                         self.ndarray_params.codec,
                         0,
-                        ParamValue::Octet(codec.name.as_str().as_bytes().to_vec()),
+                        ParamValue::Octet(codec.name.as_str().as_bytes().into()),
                     ));
                     addr0.push(ParamSetValue::new(
                         self.ndarray_params.compressed_size,
@@ -1125,7 +1125,7 @@ impl SharedProcessorInner {
                     addr0.push(ParamSetValue::new(
                         self.ndarray_params.codec,
                         0,
-                        ParamValue::Octet(Vec::new()),
+                        ParamValue::Octet(std::sync::Arc::from([])),
                     ));
                     addr0.push(ParamSetValue::new(
                         self.ndarray_params.compressed_size,
@@ -1180,7 +1180,7 @@ impl SharedProcessorInner {
                     let pv = ParamSetValue::new(
                         *reason,
                         *addr,
-                        ParamValue::Octet(value.clone().into_bytes()),
+                        ParamValue::Octet(value.as_bytes().into()),
                     );
                     if *addr == 0 {
                         addr0.push(pv);

@@ -144,6 +144,12 @@ pub enum AsynError {
     #[error("port already registered: {0}")]
     PortAlreadyRegistered(String),
 
+    /// The handle's interrupt manager already has an owner gate: it was
+    /// registered before, or built with [`crate::interrupt::InterruptManager::owned_by`]
+    /// for a driver driven by hand. A port has one owner, set once.
+    #[error("port already has an owner gate: {0}")]
+    PortAlreadyOwned(String),
+
     #[error("param not found: {0}")]
     ParamNotFound(String),
 

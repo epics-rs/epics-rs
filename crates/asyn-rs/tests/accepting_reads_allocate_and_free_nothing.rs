@@ -54,13 +54,11 @@ fn counted<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 #[test]
 fn an_owned_and_an_ownerless_port_read_without_allocating_or_freeing() {
     let ownerless = InterruptManager::new(4);
-    let open = InterruptManager::new(4);
-    let closed = InterruptManager::new(4);
     let live = InterruptGate::opened();
-    open.set_owner(live.clone());
+    let open = InterruptManager::owned_by(4, live.clone());
     // An owner that was open and is dropped before the reads.
     let gone = InterruptGate::opened();
-    closed.set_owner(gone.clone());
+    let closed = InterruptManager::owned_by(4, gone.clone());
     gone.set(false);
     drop(gone);
 

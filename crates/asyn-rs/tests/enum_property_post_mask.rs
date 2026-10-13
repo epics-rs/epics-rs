@@ -97,7 +97,10 @@ async fn enum_ioc(
         create_port_runtime(EnumPort::new(port, choices), RuntimeConfig::default())
             .expect("port runtime starts");
     let handle = runtime.port_handle().clone();
-    register_port(port, handle.clone(), &asyn_rs::registry::open_owner())
+    // The port belongs to the database its records load into, and the
+    // callbacks are dropped until that database's `iocRun`.
+    let owner = Arc::new(PvDatabase::new());
+    register_port(port, handle.clone(), owner.scan_control().interrupt_gate())
         .expect("port name is free");
     drop(runtime);
 
@@ -110,11 +113,16 @@ async fn enum_ioc(
     );
     let (database, _) =
         asyn_rs::adapter::register_asyn_device_support_for_builder(IocBuilder::new())
+            .with_database(owner)
             .db_string(&db_text, &HashMap::new())
             .unwrap()
             .build()
             .await
             .unwrap();
+    database.scan_control().run();
+    // `iocRun`'s boot flush posts the port's seeded table; let it land so a
+    // test's own subscription sees only what the test drives.
+    settle().await;
     (database, handle)
 }
 

@@ -4396,8 +4396,10 @@ mod tests {
                 ..PortFlags::default()
             },
         );
-        base.interrupts
-            .set_owner(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(
+            256,
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
@@ -4451,8 +4453,10 @@ mod tests {
         // Post-`iocInit` precondition: the scan facility has opened the
         // interruptAccept gate. See `TestDriver::new` in `port.rs`.
         let mut base = PortDriverBase::new("status_pub", 1, PortFlags::default());
-        base.interrupts
-            .set_owner(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(
+            256,
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
@@ -4894,15 +4898,15 @@ mod tests {
 
         // details >= 3: one line per interrupt client, and none below 3.
         let with_client = build(vec![Capability::Int32Read]);
-        let (_sub, _rx) = with_client
-            .0
-            .interrupts
-            .register_interrupt_user(InterruptFilter {
+        let (_sub, _rx) = with_client.0.interrupts.register_interrupt_user(
+            InterruptFilter {
                 reason: Some(0),
                 addr: Some(0),
                 iface: Some(InterfaceType::Int32),
                 ..InterruptFilter::default()
-            });
+            },
+            4096,
+        );
         let mut out2 = String::new();
         with_client.report(&mut out2, 2);
         assert!(

@@ -157,6 +157,14 @@ name = "enum_property_post_mask"
 required-features = ["epics"]
 
 [[test]]
+name = "enum_notify_allocates_nothing"
+required-features = ["epics"]
+
+[[test]]
+name = "notify_allocates_nothing"
+required-features = ["epics"]
+
+[[test]]
 name = "iocsh_port_is_traceable"
 required-features = ["epics"]
 

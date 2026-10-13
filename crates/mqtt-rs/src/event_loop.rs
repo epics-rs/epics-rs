@@ -361,7 +361,7 @@ fn decode_for_subscribers(
                 batch_updates.push(ParamSetValue::new(
                     *reason,
                     0,
-                    ParamValue::Octet(bytes.to_vec()),
+                    ParamValue::Octet(bytes.into()),
                 ));
                 continue;
             }
@@ -385,7 +385,7 @@ fn decode_for_subscribers(
                         batch_updates.push(ParamSetValue::new(
                             *reason,
                             0,
-                            ParamValue::Octet(octet_cstr(&v).as_bytes().to_vec()),
+                            ParamValue::Octet(octet_cstr(&v).as_bytes().into()),
                         ));
                     }
                     DecodedValue::Float64Array(v) => {
@@ -566,7 +566,7 @@ mod tests {
             ParamSetValue::Value { reason, value, .. } => {
                 assert_eq!(*reason, 1);
                 match value {
-                    ParamValue::Octet(v) => assert_eq!(v.as_slice(), b"hello"),
+                    ParamValue::Octet(v) => assert_eq!(&v[..], b"hello"),
                     other => panic!("expected Octet, got {other:?}"),
                 }
             }
@@ -591,7 +591,7 @@ mod tests {
             ParamSetValue::Value { reason, value, .. } => {
                 assert_eq!(*reason, 1);
                 match value {
-                    ParamValue::Octet(v) => assert_eq!(v.as_slice(), b"\xff\xfe"),
+                    ParamValue::Octet(v) => assert_eq!(&v[..], b"\xff\xfe"),
                     other => panic!("expected Octet, got {other:?}"),
                 }
             }
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(batch.len(), 1, "{batch:?}");
         match &batch[0] {
             ParamSetValue::Value { value, .. } => match value {
-                ParamValue::Octet(v) => assert_eq!(v.as_slice(), b"\xff\xfe"),
+                ParamValue::Octet(v) => assert_eq!(&v[..], b"\xff\xfe"),
                 other => panic!("expected Octet, got {other:?}"),
             },
             other => panic!("expected a value set, got {other:?}"),

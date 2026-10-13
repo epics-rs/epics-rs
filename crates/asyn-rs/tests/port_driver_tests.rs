@@ -282,13 +282,9 @@ fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
     let mgr = PortManager::new();
     let rt = mgr
-        .register_port(
-            TestScopeDriver::new(&unique_name("SCOPE")),
-            &asyn_rs::registry::open_owner(),
-        )
+        .register_port(TestScopeDriver::new(&unique_name("SCOPE")), &gate)
         .unwrap();
     let handle = rt.port_handle().clone();
-    handle.interrupts().set_owner(gate);
     (mgr, handle)
 }
 
@@ -519,11 +515,14 @@ async fn test_interrupt_on_param_change() {
         .drv_user_create(&DrvUserRequest::new("NoiseAmplitude", 0))
         .await
         .unwrap();
-    let (_sub, mut rx) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(reason),
-        addr: Some(0),
-        ..Default::default()
-    });
+    let (_sub, mut rx) = h.interrupts().register_interrupt_user(
+        InterruptFilter {
+            reason: Some(reason),
+            addr: Some(0),
+            ..Default::default()
+        },
+        4096,
+    );
     h.write_float64(reason, 0, 0.5).await.unwrap();
     let iv = tokio::time::timeout(Duration::from_millis(200), rx.recv())
         .await
@@ -554,11 +553,14 @@ async fn test_interrupt_filter_excludes_other_params() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Subscribe only to NoiseAmplitude
-    let (_sub, mut rx) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(noise_r),
-        addr: Some(0),
-        ..Default::default()
-    });
+    let (_sub, mut rx) = h.interrupts().register_interrupt_user(
+        InterruptFilter {
+            reason: Some(noise_r),
+            addr: Some(0),
+            ..Default::default()
+        },
+        4096,
+    );
 
     // Write only to UpdateTime — should NOT trigger NoiseAmplitude interrupt
     h.write_float64(update_r, 0, 1.0).await.unwrap();
@@ -577,16 +579,22 @@ async fn test_multiple_interrupt_subscribers() {
         .drv_user_create(&DrvUserRequest::new("Run", 0))
         .await
         .unwrap();
-    let (_sub1, mut rx1) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(reason),
-        addr: Some(0),
-        ..Default::default()
-    });
-    let (_sub2, mut rx2) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(reason),
-        addr: Some(0),
-        ..Default::default()
-    });
+    let (_sub1, mut rx1) = h.interrupts().register_interrupt_user(
+        InterruptFilter {
+            reason: Some(reason),
+            addr: Some(0),
+            ..Default::default()
+        },
+        4096,
+    );
+    let (_sub2, mut rx2) = h.interrupts().register_interrupt_user(
+        InterruptFilter {
+            reason: Some(reason),
+            addr: Some(0),
+            ..Default::default()
+        },
+        4096,
+    );
     h.write_int32(reason, 0, 1).await.unwrap();
     let iv1 = tokio::time::timeout(Duration::from_millis(200), rx1.recv())
         .await

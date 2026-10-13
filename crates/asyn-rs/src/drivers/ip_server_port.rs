@@ -751,7 +751,7 @@ impl Acceptor {
                     InterruptValue {
                         reason: 0,
                         addr: i as i32,
-                        value: ParamValue::Octet(child.into_bytes()),
+                        value: ParamValue::Octet(child.into_bytes().into()),
                         timestamp: SystemTime::now(),
                         iface: Some(InterfaceType::Octet),
                         ..Default::default()
@@ -1598,7 +1598,7 @@ fn udp_recv_loop(
                     InterruptValue {
                         reason: 0,
                         addr: 0,
-                        value: ParamValue::Octet(buf[..n].to_vec()),
+                        value: ParamValue::Octet(buf[..n].into()),
                         timestamp: SystemTime::now(),
                         iface: Some(InterfaceType::Octet),
                         ..Default::default()

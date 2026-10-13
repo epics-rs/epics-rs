@@ -14040,7 +14040,13 @@ A.OEOS
         let scan = rec.io_intr_scan();
         let _wakeups = scan.take_receiver().unwrap();
         rec.set_io_intr_scan(true);
-        fire_interrupt(&rt, 0, ParamValue::Octet("ab\n".into()), RegIface::Octet, 0);
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Octet(b"ab\n"[..].into()),
+            RegIface::Octet,
+            0,
+        );
         rec.process().unwrap();
         assert_eq!(rec.tinp, "ab\\n", "C `epicsStrSnPrintEscaped` into TINP");
 

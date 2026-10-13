@@ -1764,10 +1764,13 @@ impl PortDriverBase {
         if !self.interrupts.accepting() {
             return Ok(());
         }
-        let changed = self.params.take_changed(addr)?;
         let now = self.current_timestamp();
-        for reason in changed {
-            let value = self.params.get_value(reason, addr)?.clone();
+        let interrupts = &self.interrupts;
+        // C `callCallbacks` (asynPortDriver.cpp:833-873): every changed flag
+        // is walked and cleared at the end; only a bad index returns early,
+        // with the flags kept.
+        self.params.flush_changed(addr, |params, reason| {
+            let value = params.get_value(reason, addr)?.clone();
             // C asynPortDriver.cpp:845 — callCallbacks skips firing for an
             // undefined param even though its changed flag is consumed
             // (flags.clear() at :871). A status/alarm change or bare
@@ -1775,28 +1778,24 @@ impl PortDriverBase {
             // Array/generic-pointer params have no callCallbacks analog
             // (:846-865 switch is scalar-only) and Rust fires them as a
             // read-trigger regardless, so gate scalars only.
-            if !value.is_array() && !self.params.is_param_defined(reason, addr).unwrap_or(false) {
-                continue;
+            if !value.is_array() && !params.is_param_defined(reason, addr).unwrap_or(false) {
+                return Ok(false);
             }
-            let ts = self.params.get_timestamp(reason, addr)?.unwrap_or(now);
+            let ts = params.get_timestamp(reason, addr)?.unwrap_or(now);
             // C parity: read the accumulated callback mask and reset it
             // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
             // uInt32CallbackMask = 0). The flush is the single owner of
             // this consume, so accumulated bits never leak to the next.
-            let uint32_mask = self
-                .params
-                .take_uint32_interrupt_mask(reason, addr)
-                .unwrap_or(0);
+            let uint32_mask = params.take_uint32_interrupt_mask(reason, addr).unwrap_or(0);
             // C parity: asynPortDriver.cpp:633-637 sets
             // `pInterrupt->pasynUser->auxStatus/alarmStatus/alarmSeverity`
             // from the param's stored status before invoking each
             // subscriber callback. Pull those here so subscribers see
             // the same triplet C consumers do.
-            let (aux_status, alarm_status, alarm_severity) = self
-                .params
+            let (aux_status, alarm_status, alarm_severity) = params
                 .get_param_status(reason, addr)
                 .unwrap_or((AsynStatus::Success, 0, 0));
-            self.interrupts.notify(InterruptValue {
+            interrupts.notify(InterruptValue {
                 reason,
                 addr,
                 value,
@@ -1809,8 +1808,8 @@ impl PortDriverBase {
                 // every subscribing interface (the pre-per-interface path).
                 iface: None,
             });
-        }
-        Ok(())
+            Ok(true)
+        })
     }
 
     /// Flush a single parameter's changed flag and notify if dirty.
@@ -2855,7 +2854,7 @@ impl OctetNext for DriverOctetLink<'_> {
                 InterruptValue {
                     reason: user.reason,
                     addr: user.addr,
-                    value: ParamValue::Octet(raw.to_vec()),
+                    value: ParamValue::Octet(raw.into()),
                     timestamp: SystemTime::now(),
                     iface: Some(InterfaceType::Octet),
                     ..Default::default()
@@ -3025,7 +3024,7 @@ mod tests {
             InterruptFilter::default(),
             move |iv: &InterruptValue| {
                 if let ParamValue::Octet(s) = &iv.value {
-                    seen_cb.lock().unwrap().push(s.clone());
+                    seen_cb.lock().unwrap().push(s.to_vec());
                 }
             },
         );
@@ -3070,7 +3069,7 @@ mod tests {
             InterruptFilter::default(),
             move |iv: &InterruptValue| {
                 if let ParamValue::Octet(bytes) = &iv.value {
-                    seen_cb.lock().unwrap().push(bytes.clone());
+                    seen_cb.lock().unwrap().push(bytes.to_vec());
                 }
             },
         );
@@ -3109,7 +3108,7 @@ mod tests {
         // The record's database: its gate is closed until `scan_run`.
         let gate = InterruptGate::new();
         let mut base = PortDriverBase::new("gate", 1, PortFlags::default());
-        base.interrupts.set_owner(gate.clone());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(256, gate.clone());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
 
         let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3168,7 +3167,8 @@ mod tests {
             // preservation regression test builds its own `PortDriverBase` and
             // drives the gate itself, so it is unaffected.
             let mut base = PortDriverBase::new("test", 1, PortFlags::default());
-            base.interrupts.set_owner(InterruptGate::opened());
+            base.interrupts =
+                crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("TEMP", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -3511,7 +3511,8 @@ mod tests {
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
         let mut base = PortDriverBase::new("test_enum_cb", 1, PortFlags::default());
-        base.interrupts.set_owner(InterruptGate::opened());
+        base.interrupts =
+            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
         base.create_param("MODE", ParamType::Enum).unwrap();
         let mut rx = base.interrupts.subscribe_async();
 
@@ -3559,7 +3560,8 @@ mod tests {
         use crate::param::{EnumEntry, ParamValue};
 
         let mut base = PortDriverBase::new("test_cb_enum", 1, PortFlags::default());
-        base.interrupts.set_owner(InterruptGate::opened());
+        base.interrupts =
+            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
         let owner = base.create_param("MODE", ParamType::Enum).unwrap();
         let plain = base.create_param("GAIN", ParamType::Int32).unwrap();
         base.set_int32_param(plain, 0, 7).unwrap();
@@ -3615,7 +3617,8 @@ mod tests {
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
         let mut base = PortDriverBase::new("test_gp_cb", 1, PortFlags::default());
-        base.interrupts.set_owner(InterruptGate::opened());
+        base.interrupts =
+            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
         let mut rx = base.interrupts.subscribe_async();
 
@@ -4075,7 +4078,8 @@ mod tests {
     fn test_timestamp_source_in_callbacks() {
         // Post-`iocInit` precondition — see `TestDriver::new`.
         let mut base = PortDriverBase::new("ts_cb", 1, PortFlags::default());
-        base.interrupts.set_owner(InterruptGate::opened());
+        base.interrupts =
+            crate::interrupt::InterruptManager::owned_by(256, InterruptGate::opened());
         base.create_param("V", ParamType::Int32).unwrap();
         let mut rx = base.interrupts.subscribe_async();
 

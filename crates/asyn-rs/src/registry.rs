@@ -98,8 +98,10 @@ impl PortRegistry {
                 // never be asked about a port whose `ASYN_MULTIDEVICE` bit it
                 // does not know. This is the one site that claims a name in
                 // this process, so it is the one place that has to say so.
+                if !handle.interrupts().set_owner(owner.clone()) {
+                    return Err(AsynError::PortAlreadyOwned(name.to_string()));
+                }
                 handle.trace().register_port(name, handle.is_multi_device());
-                handle.interrupts().set_owner(owner.clone());
                 slot.insert(PortEntry { handle });
                 // By name, so the gate does not keep a withdrawn port's
                 // actor alive.
@@ -254,5 +256,31 @@ mod tests {
                 .is_ok(),
             "re-register after remove must succeed"
         );
+    }
+
+    /// A port has one owner, set once: a handle that already has one — it
+    /// was registered, or built owned for a hand-driven driver — is refused,
+    /// and nothing is claimed for it.
+    #[test]
+    fn registering_an_already_owned_handle_errors() {
+        let reg = PortRegistry::new();
+        let handle = dummy_handle("owned_once");
+        reg.register("owned_once", handle.clone(), &open_owner())
+            .unwrap();
+
+        match reg.register("owned_twice", handle, &InterruptGate::new()) {
+            Err(AsynError::PortAlreadyOwned(name)) => assert_eq!(name, "owned_twice"),
+            other => panic!("expected PortAlreadyOwned, got {other:?}"),
+        }
+        assert!(reg.get("owned_twice").is_none(), "no name was claimed");
+        assert!(
+            handle_owner_unchanged(&reg),
+            "the first owner is still the owner"
+        );
+    }
+
+    fn handle_owner_unchanged(reg: &PortRegistry) -> bool {
+        reg.get("owned_once")
+            .is_some_and(|e| e.handle.interrupts().accepting())
     }
 }

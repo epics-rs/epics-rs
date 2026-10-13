@@ -111,6 +111,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("ad-plugins-rs", "tests/plugin_configure_max_threads.rs"),
     ("asyn-rs", "tests/process_gate_tests.rs"),
     ("epics-base-rs", "tests/client_server.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/gw_upstream_unresponsive_window.rs",
+    ),
     ("epics-bridge-rs", "tests/pva_gateway.rs"),
     (
         "epics-bridge-rs",

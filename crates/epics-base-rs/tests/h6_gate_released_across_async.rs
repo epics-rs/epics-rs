@@ -18,9 +18,16 @@
 //!    the gate is free while the delay runs;
 //! 3. the completion re-entry RE-TAKES the gate, so it serialises against a
 //!    concurrent holder rather than racing it.
+//!
+//! The DLYn cases hold the seq's lock-set epoch across the process call. That
+//! is sound only because `process_record_with_links` never yields — a resumed
+//! future could release the blocking epoch from another worker — so those
+//! calls go through [`unyielding`], which fails the test if it ever does.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -123,6 +130,15 @@ async fn probe_gate_is_free(db: &PvDatabase, record: &'static str) -> Result<(),
     Ok(())
 }
 
+/// Run `fut` to completion in one poll, on whatever thread calls this — no
+/// executor needed. Panics if it is not ready at once.
+fn unyielding<T>(fut: impl Future<Output = T>) -> T {
+    match std::pin::pin!(fut).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(out) => out,
+        Poll::Pending => panic!("process_record_with_links yielded"),
+    }
+}
+
 /// Boundary 1b — the same property through a real put. A CA-route put to an
 /// async-pending record must reach its PACT/RPRO decision instead of blocking
 /// on a gate the async cycle never released.
@@ -201,9 +217,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
     // fire before `epoch` is dropped, however long this thread is held up.
     let epoch = db.lock_records(["H6:SEQ"]);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("H6:SEQ", &mut visited)
-        .await
-        .unwrap();
+    unyielding(db.process_record_with_links("H6:SEQ", &mut visited)).unwrap();
 
     // C `process` returns straight through `processNextLink`; the group has
     // NOT run yet.
@@ -263,6 +277,61 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
     );
 }
 
+/// Boundary 2, clock-free — `process` does not wait on DLY0 at all.
+///
+/// The timed case above cannot tell "returns at once" from "sleeps DLY0
+/// inline, then defers the rest": both look the same once 0.3 s has passed.
+/// With DLY0 = 1e6 s only the first returns, so the call runs on its own
+/// thread under a 30 s backstop, and the record must be PACT when it does.
+#[epics_macros_rs::epics_test]
+async fn seq_process_returns_without_waiting_out_dly0() {
+    let db = PvDatabase::new();
+    db.add_record("H6:SEQCF", Box::new(SeqRecord::new()))
+        .await
+        .unwrap();
+    db.add_record("H6:SEQCFTGT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.get_record("H6:SEQCF")
+        .unwrap()
+        .write()
+        .record
+        .put_field("DLY0", EpicsValue::Double(1e6))
+        .unwrap();
+    for (field, text) in [("DOL0", "7.0"), ("LNK0", "H6:SEQCFTGT")] {
+        db.put_record_field_from_ca("H6:SEQCF", field, EpicsValue::String(text.into()))
+            .await
+            .unwrap();
+    }
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let db2 = db.clone();
+    std::thread::spawn(move || {
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        let _ = done_tx.send(unyielding(
+            db2.process_record_with_links("H6:SEQCF", &mut visited),
+        ));
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("process must return without waiting out DLY0")
+        .unwrap();
+
+    assert!(
+        db.get_record("H6:SEQCF").unwrap().read().is_processing(),
+        "seq must be PACT while DLY0 is pending (seqRecord.c:143)"
+    );
+    assert_eq!(
+        db.get_record("H6:SEQCFTGT")
+            .unwrap()
+            .read()
+            .record
+            .get_field("VAL"),
+        Some(EpicsValue::Double(0.0)),
+        "LNK0 must not fire before DLY0 elapses"
+    );
+}
+
 /// Boundary 2b (UI-81) — a seq whose selected groups are ALL `DLYn == 0` is
 /// async too.
 ///
@@ -306,9 +375,7 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
 
     let epoch = db.lock_records(["UI81:SEQ"]);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("UI81:SEQ", &mut visited)
-        .await
-        .unwrap();
+    unyielding(db.process_record_with_links("UI81:SEQ", &mut visited)).unwrap();
 
     // C returns through `processNextLink` without running a single group:
     // whatever the chain did before `epoch` is dropped, it did inline.

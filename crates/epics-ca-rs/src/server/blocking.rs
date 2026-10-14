@@ -1110,13 +1110,38 @@ where
     /// buffered first. A frame larger than the whole buffer goes out on its
     /// own rather than growing it.
     fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
-        if self.buf.len() + frame.len() > self.buf.capacity() {
+        if self.buf.len() + frame.len() > crate::protocol::MAX_TCP {
             self.send()?;
         }
-        if frame.len() > self.buf.capacity() {
+        if frame.len() > crate::protocol::MAX_TCP {
             return crate::server::send::RetryTransient(&*self.sock).write_all(frame);
         }
         self.buf.extend_from_slice(frame);
+        Ok(())
+    }
+
+    /// [`stage`](Self::stage) with the frame built straight into the buffer:
+    /// what does not fit is sent first, as there, on the expected size. A
+    /// frame larger than the whole buffer is built apart and goes out on its
+    /// own; one that outgrows its estimate stays staged and the next frame
+    /// sends it.
+    fn stage_with(
+        &mut self,
+        len_hint: usize,
+        build: impl FnOnce(Vec<u8>) -> Vec<u8>,
+    ) -> std::io::Result<()> {
+        if len_hint > crate::protocol::MAX_TCP {
+            let frame = build(Vec::with_capacity(len_hint));
+            return if frame.is_empty() {
+                Ok(())
+            } else {
+                self.stage(&frame)
+            };
+        }
+        if self.buf.len() + len_hint > crate::protocol::MAX_TCP {
+            self.send()?;
+        }
+        self.buf = build(std::mem::take(&mut self.buf));
         Ok(())
     }
 
@@ -1144,6 +1169,17 @@ where
 {
     fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
         self.0.lock().expect("CA send-lock poisoned").stage(frame)
+    }
+
+    fn stage_with(
+        &mut self,
+        len_hint: usize,
+        build: impl FnOnce(Vec<u8>) -> Vec<u8>,
+    ) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .expect("CA send-lock poisoned")
+            .stage_with(len_hint, build)
     }
 
     fn send(&mut self) -> std::io::Result<()> {
@@ -1184,11 +1220,10 @@ pub(crate) struct BlockingSub {
     data_type: u16,
     data_count: u32,
     target: ChannelTarget,
-    /// This driver's copy of the subscription's delivery gate. The event
-    /// thread holds the other one; revoking here is what stops it before the
-    /// dispatch thread queues a cancel confirmation. See
-    /// [`MonitorGate`](crate::server::outbox::MonitorGate).
-    gate: crate::server::outbox::MonitorGate,
+    /// Shared with the event thread; revoking its gate here is what stops
+    /// that thread before the dispatch thread queues a cancel confirmation.
+    /// See [`MonitorGate`](crate::server::outbox::MonitorGate).
+    monitor: Arc<crate::server::tcp::CircuitMonitor>,
 }
 
 /// C `event_add_action` past its checks (`camessage.c:1863-1866`): the one
@@ -1209,15 +1244,14 @@ pub(crate) fn hand_off_subscription(
             data_type: r.data_type,
             data_count: r.data_count,
             target: r.target.clone(),
-            gate: r.gate.clone(),
+            monitor: r.monitor.clone(),
         },
     );
     state.link_subscription(
         r.channel_sid,
         crate::server::tcp::ChannelMonitor {
             sub_id: r.sub_id,
-            gate: r.gate,
-            denied: r.denied,
+            monitor: r.monitor,
             id: r.reader.id(),
         },
     );
@@ -1550,7 +1584,7 @@ fn handle_client_blocking(
                             channel_sid: s.channel_sid,
                             data_type: s.data_type,
                             data_count: s.data_count,
-                            gate: s.gate.clone(),
+                            monitor: s.monitor.clone(),
                         });
                     match cancel_subscription_reply(&hdr, &state, &outbox, sub_info) {
                         Ok(id) => {
@@ -4364,18 +4398,16 @@ mod tests {
                 .expect("blockable")
                 .expect("a queued entry");
             crate::server::monitor::send_event(
-                crate::server::tcp::RefusalChannel { cid: 0, pv: "" },
+                crate::server::tcp::RefusalChannel::UNNAMED,
                 r.data_type,
                 r.data_count,
                 r.sub_id,
-                crate::server::monitor::Delivery::log(event),
+                crate::server::monitor::Update::log(std::borrow::Cow::Owned(event)),
                 &outbox,
                 crate::server::outbox::Credit::none(),
                 &crate::server::DeliveryStage::plain(),
-                crate::server::tcp::ReplyContext {
-                    req_hdr: hdr,
-                    client_minor: state.client_minor_version(),
-                },
+                state.client_minor_version(),
+                &hdr,
             );
             drain_one_event_add(&mut drain)
         };
@@ -4478,6 +4510,42 @@ mod tests {
         let value = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
         assert_eq!(&value[6..12], &[0, 1, 0, 0, 0, 1]);
         assert_eq!(monitor_reply_value(&value), 1.5);
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// C `event_add_action` installs a read-denied monitor disabled, and
+    /// `read_reply` answers its initial update with `no_read_access_event`
+    /// (`camessage.c:516-535`): status ECA_NORDACCESS in `m_cid`, no value.
+    #[test]
+    fn a_read_denied_monitor_starts_with_nordaccess() {
+        const ACF: &str =
+            "UAG(nobody) { nosuchuser }\nASG(DEFAULT) {\n RULE(1, READ) { UAG(nobody) }\n}\n";
+        let db = seed_db(&[("BLK:NORD", EpicsValue::Double(42.0))]);
+        let acf = epics_base_rs::server::access_security::new_acf_cell(Some(
+            epics_base_rs::server::access_security::parse_acf(ACF).unwrap(),
+        ));
+        let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db, acf).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:NORD")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        c.write_all(&event_add_double_frame(sid, 9)).unwrap();
+
+        let initial = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(
+            u32::from_be_bytes(initial[8..12].try_into().unwrap()),
+            crate::protocol::ECA_NORDACCESS
+        );
+        assert_eq!(u32::from_be_bytes(initial[12..16].try_into().unwrap()), 9);
 
         server.shutdown();
         accept.join().unwrap();

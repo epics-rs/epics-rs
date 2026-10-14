@@ -61,9 +61,20 @@ fn a_gr_update_allocates_nothing_beyond_the_read_body() {
     });
     let mut posted = Snapshot::new(EpicsValue::Double(2.5), 3, 1, std::time::UNIX_EPOCH);
     let event = MonitorEvent::read_log(&mut posted, EventMask::VALUE);
+    let stage = super::DeliveryStage::plain();
     let mut dst = Vec::with_capacity(256);
+    let (mut slot, mut log) = (None, None);
     let before = ALLOCS.with(Cell::get);
-    let delivery = with_live_options(DBR_GR_DOUBLE, event, || Some(read)).expect("a read");
+    let update = with_live_options(
+        DBR_GR_DOUBLE,
+        std::borrow::Cow::Owned(event),
+        &mut slot,
+        || Some(read),
+    )
+    .expect("a read");
+    let delivery = update
+        .prepare(&stage, 0, &mut log)
+        .expect("an identity stage drops nothing");
     delivery
         .encode_dbr_into(&mut dst, DBR_GR_DOUBLE)
         .expect("encodes");

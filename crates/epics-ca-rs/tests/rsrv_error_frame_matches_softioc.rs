@@ -1175,3 +1175,31 @@ record(ao,\"SQOUT\"){}
         ]
     );
 }
+
+/// `read_reply` answers a read-denied monitor's initial update with
+/// `no_read_access_event` (`camessage.c:516-535`, `:473-475`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_read_denied_monitor_gets_nordaccess_not_the_value() {
+    const ACF: &str =
+        "UAG(nobody) { nosuchuser }\nASG(DEFAULT) {\n RULE(1, READ) { UAG(nobody) }\n}\n";
+    let acf = epics_base_rs::server::access_security::parse_acf(ACF).expect("acf");
+    let port = serve(CaServer::builder().acf(acf)).await;
+    let first = blocking(move || {
+        let mut c = Client::connect(port, 13);
+        let sid = c.create(1, "LO");
+        c.send(&event_add(sid, 9, 1));
+        loop {
+            let f = c.next().expect("frame");
+            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_EVENT_ADD {
+                break f;
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        u32::from_be_bytes(first[8..12].try_into().unwrap()),
+        epics_ca_rs::protocol::ECA_NORDACCESS,
+        "initial update of a read-denied monitor: {first:02x?}"
+    );
+}

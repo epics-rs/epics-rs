@@ -247,7 +247,7 @@ pub enum ServerConnectionEvent {
 
 use super::LongStringMode;
 use crate::protocol::*;
-use crate::server::outbox::Outbox;
+use crate::server::outbox::{FrameSink, Outbox};
 // The accumulator is shared with the blocking driver, but this file's only
 // user of it is the async `handle_client`; same gate as that fn, which is
 // `tokio_backend` and not the target. Every reactor-free build reaches the
@@ -285,7 +285,7 @@ impl ChannelTarget {
     /// C rsrv's `RECORD_NAME(pciu->dbch)` (`camessage.c:56`): the diagnostic
     /// every channel-scoped `send_err` carries, and what libca prints as the
     /// exception block's `ctx=`. It is the record's name, never `REC.FIELD`.
-    /// Read without the record's lock set, so a hot path may hold it eagerly.
+    /// Read without the record's lock set.
     pub(crate) fn rsrv_record_name(&self) -> &str {
         match self {
             ChannelTarget::SimplePv(pv) => &pv.name,
@@ -733,19 +733,14 @@ struct ChannelEntry {
 /// re-evaluation need, whichever driver holds the producer.
 pub(crate) struct ChannelMonitor {
     pub sub_id: u32,
-    pub gate: crate::server::outbox::MonitorGate,
-    /// C `asCheckGet` as `read_reply` sees it; flipped by
-    /// [`reeval_access_rights`].
-    pub denied: Arc<AtomicBool>,
+    /// Its gate and read-access flag.
+    pub monitor: Arc<CircuitMonitor>,
     pub id: epics_base_rs::server::event_queue::AttachId,
 }
 
 impl ChannelEntry {
     fn refusal_channel(&self) -> RefusalChannel<'_> {
-        RefusalChannel {
-            cid: self.cid,
-            pv: self.target.rsrv_record_name(),
-        }
+        RefusalChannel::new(&self.cid, &self.target)
     }
 
     /// parse a FRESH channel-filter chain from this channel's
@@ -787,11 +782,11 @@ struct SubscriptionEntry {
     /// `pevext->msg.m_count`; monitor delivery and the
     /// EVENT_CANCEL ack both echo it.
     data_count: u32,
-    /// Revoked before this subscription's cancel confirmation is queued, so
-    /// no monitor frame for it can follow that confirmation — C's
+    /// Its gate is revoked before this subscription's cancel confirmation is
+    /// queued, so no monitor frame for it can follow that confirmation — C's
     /// `db_cancel_event` barrier, minus the wait. See
     /// [`MonitorGate`](crate::server::outbox::MonitorGate).
-    gate: crate::server::outbox::MonitorGate,
+    monitor: Arc<CircuitMonitor>,
     /// The monitor's slot on the circuit's queue (C `evSubscrip`). Dropping
     /// it is C `db_cancel_event`: the slot and its queued entries go at once.
     reader: epics_base_rs::server::event_queue::EventReader,
@@ -1147,7 +1142,7 @@ impl ClientState {
             | CA_PROTO_WRITE_NOTIFY => self
                 .channels
                 .get(&hdr.cid)
-                .map_or(0xFFFF_FFFF, |entry| entry.refusal_channel().cid),
+                .map_or(0xFFFF_FFFF, |entry| entry.cid),
             CA_PROTO_SEARCH => hdr.cid,
             _ => 0xFFFF_FFFF,
         }
@@ -2467,7 +2462,7 @@ where
         state.subscriptions.drain().map(|(_, s)| s).collect();
     for sub in pending_subs {
         let sub_id = sub.sub_id;
-        sub.gate.revoke();
+        sub.monitor.gate.revoke();
         let id = sub.reader.id();
         drop(sub.reader);
         match &sub.target {
@@ -2582,7 +2577,7 @@ fn destroy_channel(
         // would be enqueued after the confirmation. C `clear_channel_reply`
         // calls `db_cancel_event` for every pevext on the channel before
         // SEND_LOCK (`camessage.c:1890-1903`).
-        monitor.gate.revoke();
+        monitor.monitor.gate.revoke();
     }
     for monitor in &entry.subscriptions {
         let Some(sub) = state.subscriptions.remove(&monitor.id) else {
@@ -3669,7 +3664,8 @@ pub(crate) async fn dispatch_message(
             if !stage.is_identity() {
                 // The post chain drops nothing (`arr`, `ts`), so `None` is
                 // unreachable; it keeps the value as read.
-                if let Some(read) = stage.prepare_snapshot(snapshot.clone(), requested_count, 0) {
+                let mut read = snapshot.clone();
+                if stage.prepare_snapshot(&mut read, requested_count, 0) {
                     snapshot = read;
                 }
             }
@@ -3886,8 +3882,7 @@ pub(crate) async fn dispatch_message(
                         s.channel_sid,
                         ChannelMonitor {
                             sub_id: s.sub_id,
-                            gate: s.gate.clone(),
-                            denied: s.denied,
+                            monitor: s.monitor.clone(),
                             id: s.reader.id(),
                         },
                     );
@@ -3899,7 +3894,7 @@ pub(crate) async fn dispatch_message(
                             channel_sid: s.channel_sid,
                             data_type: s.data_type,
                             data_count: s.data_count,
-                            gate: s.gate.clone(),
+                            monitor: s.monitor,
                             reader: s.reader,
                         },
                     );
@@ -3934,7 +3929,7 @@ pub(crate) async fn dispatch_message(
                     channel_sid: s.channel_sid,
                     data_type: s.data_type,
                     data_count: s.data_count,
-                    gate: s.gate.clone(),
+                    monitor: s.monitor.clone(),
                 });
             let id = cancel_subscription_reply(hdr, state, writer, sub_info)?;
             // C `event_cancel_reply` unlinks the `event_ext` from
@@ -5170,7 +5165,7 @@ pub(crate) fn finish_write_notify(
     trap_guard: &mut Option<epics_base_rs::server::access_security::TrapWriteGuard>,
     final_status: u32,
     reply: &WriteNotifyReply,
-    writer: &Outbox,
+    writer: &impl FrameSink,
 ) -> CaResult<()> {
     // AfterWrite at real device-side completion. `status` carries "ok" for
     // ECA_NORMAL or the ECA-code form otherwise so listeners can filter
@@ -5277,7 +5272,7 @@ impl PendingWriteNotify {
     pub(crate) fn settle(
         &mut self,
         chain: Result<(), tokio::sync::oneshot::error::RecvError>,
-        writer: &Outbox,
+        writer: &impl FrameSink,
         commit: impl FnOnce() -> bool,
     ) -> CaResult<bool> {
         // Losing the claim means a predecessor-timeout supersede already
@@ -5428,13 +5423,12 @@ pub(crate) enum SubscriptionOutcome {
 /// its `SubscriptionOpened` event.
 pub(crate) struct CircuitSubscription {
     pub reader: epics_base_rs::server::event_queue::EventReader,
-    pub gate: crate::server::outbox::MonitorGate,
+    pub monitor: Arc<CircuitMonitor>,
     pub target: ChannelTarget,
     pub channel_sid: u32,
     pub sub_id: u32,
     pub data_type: u16,
     pub data_count: u32,
-    pub denied: Arc<AtomicBool>,
     pub mask: u16,
 }
 
@@ -5452,8 +5446,7 @@ pub(crate) struct RegisteredSubscription {
     pub sub_id: u32,
     pub data_type: u16,
     pub data_count: u32,
-    pub gate: crate::server::outbox::MonitorGate,
-    pub denied: Arc<AtomicBool>,
+    pub monitor: Arc<CircuitMonitor>,
 }
 
 /// The subscription metadata [`cancel_subscription_reply`] needs, looked up by
@@ -5465,10 +5458,11 @@ pub(crate) struct CancelInfo {
     pub channel_sid: u32,
     pub data_type: u16,
     pub data_count: u32,
-    /// Revoked by [`cancel_subscription_reply`] immediately before it queues
-    /// the delete-confirmed echo, so the revoke-then-confirm order lives in
-    /// the shared helper and neither driver can get it wrong on its own.
-    pub gate: crate::server::outbox::MonitorGate,
+    /// Its gate is revoked by [`cancel_subscription_reply`] immediately
+    /// before it queues the delete-confirmed echo, so the revoke-then-confirm
+    /// order lives in the shared helper and neither driver can get it wrong
+    /// on its own.
+    pub monitor: Arc<CircuitMonitor>,
 }
 
 /// Validate and register a CA subscription (C `event_add_action`,
@@ -5643,30 +5637,26 @@ pub(crate) async fn register_subscription(
     let access_denied = state.lookup_access(sid).require_read().is_err();
 
     let target = entry.target.clone();
-    let denied = Arc::new(AtomicBool::new(access_denied));
-    // One gate per subscription, revoked by whichever teardown confirms its
-    // cancellation (C `db_cancel_event`).
-    let gate = crate::server::outbox::MonitorGate::open();
     // C `pevext`, handed to `db_add_event` as `user_arg`: every entry of this
     // monitor, the initial one included, is framed from it. C stores the
     // EVENT_ADD request (`pevext->msg`) with it, so each delivery is framed for
     // this client's negotiated version and echoes this header if unbuildable.
+    // Its gate is revoked by whichever teardown confirms the cancellation
+    // (C `db_cancel_event`).
     let monitor = Arc::new(CircuitMonitor {
-        target: target.clone(),
-        db: state.db.clone(),
-        cid: entry_cid,
-        sub_id,
-        data_type: requested_type,
-        data_count: requested_count,
-        denied: denied.clone(),
-        gate: gate.clone(),
-        stage,
-        reply: ReplyContext {
-            req_hdr: *hdr,
-            client_minor: state.client_minor_version,
-        },
-        stats: state.stats.clone(),
+        gate: crate::server::outbox::MonitorGate::open(),
+        denied: AtomicBool::new(access_denied),
         ended: AtomicBool::new(false),
+        data_type: requested_type,
+        client_minor: state.client_minor_version,
+        sub_id,
+        data_count: requested_count,
+        stats: state.stats.clone(),
+        stage,
+        target: target.clone(),
+        req_hdr: *hdr,
+        cid: entry_cid,
+        db: state.db.clone(),
     });
     let context: epics_base_rs::server::event_queue::DeliveryContext = monitor.clone();
     // C `event_add_action` queues the initial value with
@@ -5746,19 +5736,17 @@ pub(crate) async fn register_subscription(
             sub_id,
             data_type: requested_type,
             data_count: requested_count,
-            gate,
-            denied,
+            monitor,
         }));
     }
     Ok(SubscriptionOutcome::Circuit(CircuitSubscription {
         reader: rx,
-        gate,
+        monitor,
         target,
         channel_sid: sid,
         sub_id,
         data_type: requested_type,
         data_count: requested_count,
-        denied,
         mask,
     }))
 }
@@ -5822,7 +5810,7 @@ pub(crate) fn cancel_subscription_reply(
     // is in the shared helper so both drivers get it from the one place; the
     // caller's own teardown (abort the task, drop the subscriber) may then run
     // at its leisure, because nothing it races with can still emit.
-    info.gate.revoke();
+    info.monitor.gate.revoke();
     // C `event_cancel_reply` (`camessage.c:2089-2091`): echo the stored
     // EVENT_ADD request — m_dataType / m_count / m_cid (the SID) / m_available —
     // with a zero payload, in the extended form when the count needs it.
@@ -5870,11 +5858,7 @@ enum EventStep {
     /// The circuit's oldest entry, the monitor it is for, and C's
     /// `eventsRemaining`. Not boxed: a step lives on this task's stack for
     /// one turn, and a box is one allocation per delivered event.
-    Delivered(
-        epics_base_rs::server::event_queue::DeliveryContext,
-        epics_base_rs::server::pv::MonitorEvent,
-        bool,
-    ),
+    Delivered(bool),
     /// Subscription `idx`'s producer is gone and its entries are delivered.
     Ended(usize),
     /// A control message (`None` = the dispatch thread dropped the sender).
@@ -5925,6 +5909,7 @@ async fn next_event_step(
     subs: &mut [MonitorDelivery],
     pending_writes: &mut [PendingWriteNotify],
     control: &mut tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
+    slot: &mut Option<epics_base_rs::server::event_queue::CircuitEvent>,
 ) -> EventStep {
     use epics_base_rs::server::event_queue::CircuitEvent;
     use futures_util::future::{Either, select};
@@ -5935,20 +5920,19 @@ async fn next_event_step(
     // destroyed target itself.
     let readers = std::future::poll_fn(|cx| {
         loop {
-            match std::task::ready!(events.poll_next(cx)) {
-                CircuitEvent::Event {
-                    context,
-                    event,
-                    remaining,
-                    ..
-                } => {
-                    return std::task::Poll::Ready(EventStep::Delivered(context, event, remaining));
+            std::task::ready!(events.poll_next_into(cx, slot));
+            match slot {
+                Some(CircuitEvent::Event { remaining, .. }) => {
+                    return std::task::Poll::Ready(EventStep::Delivered(*remaining));
                 }
-                CircuitEvent::Ended(id) => {
+                Some(CircuitEvent::Ended(id)) => {
+                    let id = *id;
+                    *slot = None;
                     if let Some(idx) = subs.iter().position(|s| s.reader.id() == id) {
                         return std::task::Poll::Ready(EventStep::Ended(idx));
                     }
                 }
+                None => unreachable!("a ready poll fills the slot"),
             }
         }
     });
@@ -5973,8 +5957,78 @@ pub(crate) trait EventSink {
     /// C `cas_copy_in_header` + `cas_commit_msg`: append one complete frame,
     /// first sending what is buffered when the frame does not fit.
     fn stage(&mut self, frame: &[u8]) -> std::io::Result<()>;
+    /// C `cas_copy_in_header` … `cas_commit_msg` with the payload converted in
+    /// between: `build` appends one frame of about `len_hint` bytes to the
+    /// buffer it is given and returns it, unchanged to drop the frame. This
+    /// default builds it apart and stages the copy.
+    fn stage_with(
+        &mut self,
+        len_hint: usize,
+        build: impl FnOnce(Vec<u8>) -> Vec<u8>,
+    ) -> std::io::Result<()> {
+        let frame = build(Vec::with_capacity(len_hint));
+        if frame.is_empty() {
+            return Ok(());
+        }
+        self.stage(&frame)
+    }
     /// C `cas_send_bs_msg`: put everything staged on the wire.
     fn send(&mut self) -> std::io::Result<()>;
+}
+
+/// [`run_event_task`]'s [`FrameSink`]: a monitor update is built straight into
+/// the client's send buffer and any other frame staged as it is sealed, so
+/// the event thread's frames join the one ordered reply stream the dispatch
+/// thread stages into, in build order.
+struct StageNow<'a, S: EventSink> {
+    sink: std::cell::RefCell<&'a mut S>,
+    /// A stage failed: the peer is gone and later frames are dropped.
+    gone: std::cell::Cell<bool>,
+}
+
+impl<'a, S: EventSink> StageNow<'a, S> {
+    fn new(sink: &'a mut S) -> Self {
+        Self {
+            sink: std::cell::RefCell::new(sink),
+            gone: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl<S: EventSink> FrameSink for StageNow<'_, S> {
+    fn frame_with(
+        &self,
+        hdr_len: usize,
+        len_hint: usize,
+        _credit: crate::server::outbox::Credit,
+        build: impl FnOnce(&mut crate::server::frame::FrameBuf) -> Option<CaHeader>,
+    ) {
+        if self.gone.get() {
+            return;
+        }
+        let staged = self.sink.borrow_mut().stage_with(len_hint, |buf| {
+            let mut frame = crate::server::frame::FrameBuf::over(buf, hdr_len);
+            match build(&mut frame) {
+                Some(hdr) => frame.seal_in_place(&hdr),
+                None => frame.abandon(),
+            }
+        });
+        if staged.is_err() {
+            self.gone.set(true);
+        }
+    }
+
+    // The socket, not credit, bounds this thread.
+    fn push_with(
+        &self,
+        frame: impl Into<crate::server::frame::PooledFrame>,
+        _credit: crate::server::outbox::Credit,
+    ) {
+        let frame: crate::server::frame::PooledFrame = frame.into();
+        if !self.gone.get() && self.sink.borrow_mut().stage(&frame).is_err() {
+            self.gone.set(true);
+        }
+    }
 }
 
 /// [`run_event_task`]'s one exit path for staged frames: whatever ends the
@@ -6036,18 +6090,25 @@ pub(crate) async fn run_event_task(
     let mut retired: std::collections::HashSet<u32> = std::collections::HashSet::new();
     // WRITE_NOTIFYs whose record chain went async, awaiting completion.
     let mut pending_writes: Vec<PendingWriteNotify> = Vec::new();
-    // Frames are built into a private outbox (reusing the shared `send_event` /
-    // `send_put_notify_response` builders) then drained to the socket under the
-    // send lock.
-    let (ev_outbox, mut ev_drain) = crate::server::outbox::channel();
+    // The shared `send_event` / `send_put_notify_response` builders stage
+    // through a [`StageNow`].
     let mut sink = FlushOnExit(sink);
+    // The circuit's oldest entry, moved here from its ring slot once and
+    // framed in place; emptied before the next poll.
+    let mut slot = None;
     loop {
         // C `read_reply` sends a delivered frame only `if (!eventsRemaining)`
         // (`camessage.c:525`, `:536`, `:593`), below. The frames the other
         // arms stage go out when the task is about to wait, never per frame
         // and never on a timer.
         let step = {
-            let next = next_event_step(&events, &mut subs, &mut pending_writes, &mut control);
+            let next = next_event_step(
+                &events,
+                &mut subs,
+                &mut pending_writes,
+                &mut control,
+                &mut slot,
+            );
             let mut next = std::pin::pin!(next);
             std::future::poll_fn(|cx| match next.as_mut().poll(cx) {
                 std::task::Poll::Pending => match sink.0.send() {
@@ -6127,79 +6188,31 @@ pub(crate) async fn run_event_task(
                     break;
                 }
             }
-            EventStep::Delivered(context, event, remaining) => {
-                let Some(m) = context.downcast_ref::<CircuitMonitor>() else {
-                    continue;
+            EventStep::Delivered(remaining) => {
+                use epics_base_rs::server::event_queue::CircuitEvent;
+                use std::borrow::Cow;
+                // The update is framed from the slot it was polled into; only a
+                // post chain, which rewrites the log, takes it out.
+                let Some(CircuitEvent::Event { context, event, .. }) = &slot else {
+                    unreachable!("a delivered step leaves its event in the slot")
                 };
-                // Read before the gate, which a cancel can hold this thread
-                // in; `None` is a failed get, framed inside it.
-                let source =
-                    super::monitor::with_live_options(m.data_type, event, || m.live_options());
-                // The gate spans BUILD AND STAGING here, not just the enqueue
-                // as on the async path: this driver's frames reach the wire
-                // through the client's send buffer, shared with the dispatch
-                // thread, so that — not the private `ev_outbox` — is where the
-                // cancel confirmation could overtake them. Holding it across
-                // the stage can park the dispatch thread inside `revoke`, which
-                // is what C does too: `db_cancel_event` blocks in
-                // `db_sync_event` while the event task is inside a callback
-                // that is itself writing under SEND_LOCK.
-                //
-                // `None` from `deliver` means EVENT_CANCEL confirmed this
-                // subscription while the update was in flight; C discards
-                // every log still queued for a cancelled subscription
-                // (`user_sub == NULL` under LOCKEVQUE), so dropping it is the
-                // C answer, not an approximation of one.
-                let step = m.gate.deliver(|| {
-                    // C `db_event_get_field`: one subscription update committed
-                    // this cycle (PCAS `subscriptionEventsPosted`), counted
-                    // before the read-access gate.
-                    if let Some(ref s) = m.stats {
-                        s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+                let step = match context.downcast_ref::<CircuitMonitor>() {
+                    Some(m) if m.stage.is_identity() => {
+                        Some(deliver_update(m, Cow::Borrowed(event), &mut sink.0))
                     }
-                    let denied = m.denied.load(Ordering::Acquire);
-                    if denied {
-                        send_denied_event(m, &ev_outbox);
-                    } else if let Some(delivery) = source {
-                        super::monitor::send_event(
-                            m.refusal_channel(),
-                            m.data_type,
-                            m.data_count,
-                            m.sub_id,
-                            delivery,
-                            &ev_outbox,
-                            // `ev_outbox` is this task's private one-delivery
-                            // scratch buffer, drained to the socket under the
-                            // send lock immediately below, so the socket — not
-                            // credit — is already this producer's bound.
-                            crate::server::outbox::Credit::none(),
-                            &m.stage,
-                            m.reply,
-                        );
-                    } else {
-                        send_get_fail_event(
-                            &ev_outbox,
-                            m.refusal_channel(),
-                            m.data_type,
-                            m.data_count,
-                            m.sub_id,
-                            m.reply,
-                        );
+                    Some(_) => {
+                        let Some(CircuitEvent::Event { context, event, .. }) = slot.take() else {
+                            unreachable!()
+                        };
+                        let m = context
+                            .downcast_ref::<CircuitMonitor>()
+                            .expect("downcast above");
+                        Some(deliver_update(m, Cow::Owned(event), &mut sink.0))
                     }
-                    while let Some(frame) = ev_drain.try_next() {
-                        if sink.0.stage(&frame).is_err() {
-                            return DeliverStep::PeerGone;
-                        }
-                    }
-                    // Frame written (PCAS `subscriptionEventsProcessed`).
-                    if !denied {
-                        if let Some(ref s) = m.stats {
-                            s.subscription_events_processed
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    DeliverStep::Delivered
-                });
+                    None => None,
+                };
+                slot = None;
+                let Some(step) = step else { continue };
                 match step {
                     // Cancelled mid-flight: the frame is dropped and the
                     // reader stays in `subs` until the `Cancel` control
@@ -6223,19 +6236,12 @@ pub(crate) async fn run_event_task(
                 // not two.
                 let mut p = pending_writes.remove(idx);
                 // Staging INSIDE `settle` is what keeps this driver's two
-                // writers in order. Each builds into its own outbox and they
-                // meet only in the shared send buffer, so a push is not a
-                // commit here: the dispatch thread, released by this reply,
-                // would otherwise be free to stage its own put-callback's
-                // reply ahead of it.
-                let committed = p.settle(res, &ev_outbox, || {
-                    while let Some(frame) = ev_drain.try_next() {
-                        if sink.0.stage(&frame).is_err() {
-                            return false;
-                        }
-                    }
-                    true
-                });
+                // writers in order: they meet only in the shared send buffer,
+                // and the dispatch thread, released by this reply, would
+                // otherwise be free to stage its own put-callback's reply
+                // ahead of it.
+                let to = StageNow::new(&mut sink.0);
+                let committed = p.settle(res, &to, || !to.gone.get());
                 match committed {
                     // Encoding the reply failed (16k-array boundary): the reply
                     // is unshippable, drop this completion and keep serving.
@@ -6291,16 +6297,18 @@ fn send_monitor_snapshot(
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
     reply: ReplyContext,
 ) -> CaResult<()> {
+    let mut read = snapshot.clone();
     super::monitor::send_event(
-        RefusalChannel { cid: 0, pv: "" },
+        RefusalChannel::UNNAMED,
         data_type,
         requested_count,
         sub_id,
-        super::monitor::Delivery::of_read(snapshot.clone()),
+        super::monitor::Update::of_read(&mut read),
         writer,
         crate::server::outbox::Credit::none(),
         &super::DeliveryStage::plain(),
-        reply,
+        reply.client_minor,
+        &reply.req_hdr,
     );
     Ok(())
 }
@@ -6401,7 +6409,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         // enabled and then posts the current value. Both posts take the
         // monitor's pre-chain and ring like any update.
         for monitor in &entry.subscriptions {
-            monitor.denied.store(!new_read, Ordering::Release);
+            monitor.monitor.denied.store(!new_read, Ordering::Release);
             let id = monitor.id;
             match &entry.target {
                 ChannelTarget::SimplePv(pv) => {
@@ -6469,7 +6477,7 @@ impl NotifyReplyKind {
 /// with `count = 0` (the extended marker) where rsrv preserves
 /// the count with an extended header.
 fn send_put_notify_response(
-    writer: &Outbox,
+    writer: &impl FrameSink,
     kind: NotifyReplyKind,
     data_type: u16,
     count: u32,
@@ -6593,14 +6601,15 @@ pub(crate) fn print_forcing_disconnect(peer: SocketAddr) {
 /// subscription's own count, so an autosize request is denied with count 0
 /// (`event_add_action` `camessage.c:1853-1858`, `no_read_access_event`
 /// `:473-475`), not read_reply's `no_elements`.
-pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &Outbox) {
+pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &impl FrameSink) {
     if refuse_unframeable_update(
         outbox,
         m.refusal_channel(),
         m.data_type,
         m.data_count,
         &m.stage,
-        m.reply,
+        m.client_minor,
+        &m.req_hdr,
     ) {
         return;
     }
@@ -6614,7 +6623,7 @@ pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &Outbox) {
             available: m.sub_id,
             eca_status: ECA_NORDACCESS,
         },
-        m.reply,
+        m.reply(),
     );
 }
 
@@ -6630,7 +6639,7 @@ pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &Outbox) {
 /// (`camessage.c:545-561`): a zeroed update, count 0 when autosized, with
 /// `m_cid = ECA_GETFAIL`. The subscription stays.
 pub(crate) fn send_get_fail_event(
-    writer: &Outbox,
+    writer: &impl FrameSink,
     chan: RefusalChannel<'_>,
     data_type: u16,
     data_count: u32,
@@ -6663,7 +6672,7 @@ pub(crate) struct StatusEvent {
 }
 
 fn send_no_read_access_event(
-    writer: &Outbox,
+    writer: &impl FrameSink,
     chan: RefusalChannel<'_>,
     ev: StatusEvent,
     reply: ReplyContext,
@@ -6961,23 +6970,36 @@ pub(crate) struct ReplyContext {
 /// One async monitor's delivery context — C `user_sub`/`user_arg` — handed
 /// to the circuit's event task with each queued entry
 /// ([`EventReader::enable`](epics_base_rs::server::event_queue::EventReader::enable)).
+///
+/// The one owner of the subscription's gate and access flag: the channel, the
+/// circuit's registry and the cancel path hold this `Arc`, not copies of them.
+/// Every field an update reads comes first, on one 64-byte line (C's
+/// `event_ext` is freelist-allocated and walked in order instead); see the
+/// `circuit_monitor_layout` test.
+#[repr(C, align(64))]
 pub(crate) struct CircuitMonitor {
-    pub(crate) target: ChannelTarget,
-    /// The database a record-field delivery reads its options from.
-    pub(crate) db: Arc<PvDatabase>,
-    /// The client's id for the channel, which a refusal carries.
-    pub(crate) cid: u32,
-    pub(crate) sub_id: u32,
-    pub(crate) data_type: u16,
-    pub(crate) data_count: u32,
-    pub(crate) denied: Arc<AtomicBool>,
     pub(crate) gate: crate::server::outbox::MonitorGate,
-    pub(crate) stage: super::DeliveryStage,
-    pub(crate) reply: ReplyContext,
-    pub(crate) stats: Option<Arc<super::stats::ServerStats>>,
+    /// C `asCheckGet` as `read_reply` sees it; flipped by
+    /// [`reeval_access_rights`].
+    pub(crate) denied: AtomicBool,
     /// The monitor's frame could not be built; its later entries are dropped.
     /// Only the event task touches it.
     pub(crate) ended: AtomicBool,
+    pub(crate) data_type: u16,
+    /// The client's negotiated minor version, which frames every update.
+    pub(crate) client_minor: u16,
+    pub(crate) sub_id: u32,
+    pub(crate) data_count: u32,
+    pub(crate) stats: Option<Arc<super::stats::ServerStats>>,
+    pub(crate) stage: super::DeliveryStage,
+    pub(crate) target: ChannelTarget,
+    // Cold: read only to refuse an update or by an option read.
+    /// The EVENT_ADD request, echoed by a refusal.
+    pub(crate) req_hdr: CaHeader,
+    /// The client's id for the channel, which a refusal carries.
+    pub(crate) cid: u32,
+    /// The database a record-field delivery reads its options from.
+    pub(crate) db: Arc<PvDatabase>,
 }
 
 /// A `DBR_STSACK_STRING`'s ACKS and ACKT, which `getOptions` reads from the
@@ -7018,9 +7040,53 @@ impl CircuitMonitor {
     }
 
     pub(crate) fn refusal_channel(&self) -> RefusalChannel<'_> {
-        RefusalChannel {
-            cid: self.cid,
-            pv: self.target.rsrv_record_name(),
+        RefusalChannel::new(&self.cid, &self.target)
+    }
+
+    /// The reply context a refusal frames, assembled only on that path.
+    pub(crate) fn reply(&self) -> ReplyContext {
+        ReplyContext {
+            req_hdr: self.req_hdr,
+            client_minor: self.client_minor,
+        }
+    }
+}
+
+#[cfg(test)]
+mod circuit_monitor_layout {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn every_field_an_update_reads_is_on_the_first_line() {
+        assert_eq!(align_of::<CircuitMonitor>(), 64);
+        let ends = [
+            (
+                "gate",
+                offset_of!(CircuitMonitor, gate) + size_of::<crate::server::outbox::MonitorGate>(),
+            ),
+            ("denied", offset_of!(CircuitMonitor, denied) + 1),
+            ("ended", offset_of!(CircuitMonitor, ended) + 1),
+            ("data_type", offset_of!(CircuitMonitor, data_type) + 2),
+            ("client_minor", offset_of!(CircuitMonitor, client_minor) + 2),
+            ("sub_id", offset_of!(CircuitMonitor, sub_id) + 4),
+            ("data_count", offset_of!(CircuitMonitor, data_count) + 4),
+            (
+                "stats",
+                offset_of!(CircuitMonitor, stats)
+                    + size_of::<Option<Arc<super::super::stats::ServerStats>>>(),
+            ),
+            (
+                "stage",
+                offset_of!(CircuitMonitor, stage) + size_of::<super::super::DeliveryStage>(),
+            ),
+            (
+                "target",
+                offset_of!(CircuitMonitor, target) + size_of::<ChannelTarget>(),
+            ),
+        ];
+        for (field, end) in ends {
+            assert!(end <= 64, "{field} ends at byte {end}");
         }
     }
 }
@@ -7084,19 +7150,25 @@ async fn deliver_record_field_event(
         m.data_type,
         m.data_count,
         &m.stage,
-        m.reply,
+        m.client_minor,
+        &m.req_hdr,
     ) {
         return;
     }
-    let Some(delivery) = super::monitor::with_live_options(m.data_type, event, || m.live_options())
-    else {
+    let mut read = None;
+    let Some(update) = super::monitor::with_live_options(
+        m.data_type,
+        std::borrow::Cow::Owned(event),
+        &mut read,
+        || m.live_options(),
+    ) else {
         send_get_fail_event(
             outbox,
             m.refusal_channel(),
             m.data_type,
             m.data_count,
             m.sub_id,
-            m.reply,
+            m.reply(),
         );
         return;
     };
@@ -7104,7 +7176,8 @@ async fn deliver_record_field_event(
     // rewrite of a snapshot every other subscriber shares, so it takes the
     // copy-on-write path — and only when it has something to write, so an
     // identity stage (the common case) never copies.
-    let Some(delivery) = delivery.prepare(&m.stage, m.data_count) else {
+    let mut log = None;
+    let Some(delivery) = update.prepare(&m.stage, m.data_count, &mut log) else {
         return;
     };
     // Header space reserved up front, payload encoded straight into
@@ -7118,7 +7191,7 @@ async fn deliver_record_field_event(
             m.data_type,
             m.data_count,
             m.sub_id,
-            m.reply,
+            m.reply(),
         );
         return;
     }
@@ -7134,16 +7207,16 @@ async fn deliver_record_field_event(
     // cannot parse the extended header gets ECA_16KARRAYCLIENT
     // instead of a de-syncing frame.
     if ev
-        .set_payload_size(frame.payload_len(), element_count, m.reply.client_minor)
+        .set_payload_size(frame.payload_len(), element_count, m.client_minor)
         .is_err()
     {
         let _ = send_16k_array_client_err(
             outbox,
-            &m.reply.req_hdr,
+            &m.req_hdr,
             m.refusal_channel(),
             UnloadedReply::ReadReply,
             element_count,
-            m.reply.client_minor,
+            m.client_minor,
         );
         return;
     }
@@ -7272,13 +7345,11 @@ mod delivery_reads_options {
             sub_id: 1,
             data_type,
             data_count: 0,
-            denied: Arc::new(AtomicBool::new(false)),
+            denied: AtomicBool::new(false),
             gate: crate::server::outbox::MonitorGate::open(),
             stage: super::super::DeliveryStage::plain(),
-            reply: ReplyContext {
-                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
-                client_minor: CA_MINOR_VERSION,
-            },
+            client_minor: CA_MINOR_VERSION,
+            req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
             stats: None,
             ended: AtomicBool::new(false),
         }
@@ -7480,12 +7551,15 @@ record(stringin, "SI") { field(SIMM, "YES") field(SIOL, "abc") field(SIMS, "MAJO
         }
         // utag rides no CA DBR, so it is held at the source.
         let m = monitor(&db, field(&db), DBR_CTRL_DOUBLE);
-        let source =
-            crate::server::monitor::with_live_options(m.data_type, event, || m.live_options())
-                .unwrap();
-        let read = source
-            .read()
-            .expect("a CTRL update encodes the channel read");
+        let mut read = None;
+        crate::server::monitor::with_live_options(
+            m.data_type,
+            std::borrow::Cow::Owned(event),
+            &mut read,
+            || m.live_options(),
+        )
+        .unwrap();
+        let read = read.expect("a CTRL update encodes the channel read");
         assert_eq!(read.user_tag, 5);
     }
 }
@@ -7549,6 +7623,81 @@ impl Drop for WriteNotifyQueue {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// One queued update of `m`, framed into the send buffer under its gate:
+/// `None` when EVENT_CANCEL confirmed it while in flight.
+fn deliver_update(
+    m: &CircuitMonitor,
+    event: std::borrow::Cow<'_, epics_base_rs::server::pv::MonitorEvent>,
+    sink: &mut impl EventSink,
+) -> Option<DeliverStep> {
+    // Read before the gate, which a cancel can hold this thread
+    // in; `None` is a failed get, framed inside it.
+    let mut read = None;
+    let source =
+        super::monitor::with_live_options(m.data_type, event, &mut read, || m.live_options());
+    // The gate spans BUILD AND STAGING here, not just the enqueue
+    // as on the async path: this driver's frames reach the wire
+    // through the client's send buffer, shared with the dispatch
+    // thread, so that is where the cancel confirmation could
+    // overtake them. Holding it across
+    // the stage can park the dispatch thread inside `revoke`, which
+    // is what C does too: `db_cancel_event` blocks in
+    // `db_sync_event` while the event task is inside a callback
+    // that is itself writing under SEND_LOCK.
+    //
+    // `None` from `deliver` means EVENT_CANCEL confirmed this
+    // subscription while the update was in flight; C discards
+    // every log still queued for a cancelled subscription
+    // (`user_sub == NULL` under LOCKEVQUE), so dropping it is the
+    // C answer, not an approximation of one.
+    m.gate.deliver(|| {
+        // C `db_event_get_field`: one subscription update committed
+        // this cycle (PCAS `subscriptionEventsPosted`), counted
+        // before the read-access gate.
+        if let Some(ref s) = m.stats {
+            s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+        }
+        let to = StageNow::new(sink);
+        let denied = m.denied.load(Ordering::Acquire);
+        if denied {
+            send_denied_event(m, &to);
+        } else if let Some(update) = source {
+            super::monitor::send_event(
+                m.refusal_channel(),
+                m.data_type,
+                m.data_count,
+                m.sub_id,
+                update,
+                &to,
+                crate::server::outbox::Credit::none(),
+                &m.stage,
+                m.client_minor,
+                &m.req_hdr,
+            );
+        } else {
+            send_get_fail_event(
+                &to,
+                m.refusal_channel(),
+                m.data_type,
+                m.data_count,
+                m.sub_id,
+                m.reply(),
+            );
+        }
+        if to.gone.get() {
+            return DeliverStep::PeerGone;
+        }
+        // Frame written (PCAS `subscriptionEventsProcessed`).
+        if !denied {
+            if let Some(ref s) = m.stats {
+                s.subscription_events_processed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        DeliverStep::Delivered
+    })
 }
 
 /// What one gated monitor delivery decided, so the decision can leave the
@@ -7658,34 +7807,58 @@ fn truncate_diag(message: &str) -> &str {
 /// every element of the field whatever the value holds. `true` when that
 /// header is refused and the refusal has been queued in the update's place.
 pub(crate) fn refuse_unframeable_update(
-    outbox: &Outbox,
+    outbox: &impl FrameSink,
     chan: RefusalChannel<'_>,
     data_type: u16,
     data_count: u32,
     stage: &super::DeliveryStage,
-    reply: ReplyContext,
+    client_minor: u16,
+    // Read only when the update is refused.
+    req_hdr: &CaHeader,
 ) -> bool {
     let count = stage.item_count(data_count);
-    if !crate::server::frame::header_refused(data_type, count, reply.client_minor) {
+    if !crate::server::frame::header_refused(data_type, count, client_minor) {
         return false;
     }
     let _ = send_16k_array_client_err(
         outbox,
-        &reply.req_hdr,
+        req_hdr,
         chan,
         UnloadedReply::ReadReply,
         count,
-        reply.client_minor,
+        client_minor,
     );
     true
 }
 
 /// The channel a refusal names, as C `send_err` does: `pciu->cid` in `m_cid`
-/// and `RECORD_NAME` in the context.
+/// and `RECORD_NAME` in the context. Both are read only when a refusal is
+/// reported, as C reads them only inside `send_err`: a monitor update builds
+/// one of these per post, and an eager read cost the event thread a line.
 #[derive(Clone, Copy)]
 pub(crate) struct RefusalChannel<'a> {
-    pub(crate) cid: u32,
-    pub(crate) pv: &'a str,
+    cid: &'a u32,
+    target: Option<&'a ChannelTarget>,
+}
+
+impl<'a> RefusalChannel<'a> {
+    pub(crate) fn new(cid: &'a u32, target: &'a ChannelTarget) -> Self {
+        Self {
+            cid,
+            target: Some(target),
+        }
+    }
+
+    /// No channel: cid 0 and an empty name.
+    #[cfg(test)]
+    pub(crate) const UNNAMED: RefusalChannel<'static> = RefusalChannel {
+        cid: &0,
+        target: None,
+    };
+
+    fn pv(&self) -> &'a str {
+        self.target.map_or("", ChannelTarget::rsrv_record_name)
+    }
 }
 
 /// Which C reply a refused frame was: the two `send_err` texts differ.
@@ -7706,7 +7879,7 @@ pub(crate) enum UnloadedReply {
 /// answers CA_PROTO_ERROR with that status, echoing the request header, and
 /// keeps the circuit. `count` is the element count the refused header carried.
 pub(crate) fn send_16k_array_client_err(
-    writer: &Outbox,
+    writer: &impl FrameSink,
     request_hdr: &CaHeader,
     chan: RefusalChannel<'_>,
     reply: UnloadedReply,
@@ -7721,11 +7894,11 @@ pub(crate) fn send_16k_array_client_err(
         writer,
         request_hdr,
         ECA_16KARRAYCLIENT,
-        chan.cid,
+        *chan.cid,
         format_args!(
             "server unable to load {what} response into protocol buffer PV=\"{}\" \
              dbf={} count={count} avail={} max bytes={}",
-            chan.pv,
+            chan.pv(),
             request_hdr.data_type,
             request_hdr.available,
             crate::protocol::max_array_bytes_buffer(),
@@ -7821,7 +7994,7 @@ fn refuse_install(
 /// [`build_ca_error_frame`]. Synchronous: enqueueing is a pure buffer
 /// push with no I/O, so callers do not `.await` it.
 pub(crate) fn send_ca_error(
-    writer: &Outbox,
+    writer: &impl FrameSink,
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,
@@ -8127,6 +8300,119 @@ mod write_notify_queue_tests {
         drop(tx);
         owner.await.expect("owner ends when its sender is dropped");
         assert!(completions(&mut drain).is_empty());
+    }
+
+    /// What the event task asked of its sink, with each staged frame's
+    /// command and `available` and whether the put-callback behind it was
+    /// still held then; stages fail once `refuse` is set.
+    #[derive(Clone, Default)]
+    struct Staged {
+        log: std::sync::Arc<std::sync::Mutex<Vec<(u16, u32, bool)>>>,
+        successor: Option<std::sync::Arc<std::sync::Mutex<tokio::sync::oneshot::Receiver<()>>>>,
+        refuse: bool,
+    }
+
+    impl super::EventSink for Staged {
+        fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+            let held = self.successor.as_ref().is_some_and(|s| {
+                matches!(
+                    s.lock().unwrap().try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                )
+            });
+            self.log.lock().unwrap().push((
+                u16::from_be_bytes([frame[0], frame[1]]),
+                u32::from_be_bytes(frame[12..16].try_into().unwrap()),
+                held,
+            ));
+            if self.refuse {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            Ok(())
+        }
+        fn send(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `p`, already reported, through the blocking driver's event task.
+    fn settle_on_event_task(p: PendingWriteNotify, sink: Staged) -> bool {
+        use std::future::Future;
+        let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        ctl_tx
+            .send(super::EventTaskControl::WriteComplete(Box::new(p)))
+            .unwrap();
+        let user = std::sync::Arc::new(epics_base_rs::server::event_queue::EventUser::new());
+        let mut task = std::pin::pin!(super::run_event_task(user, ctl_rx, sink));
+        let ended = task
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_ready();
+        drop(ctl_tx);
+        ended
+    }
+
+    /// A completion whose stage is refused ends the event task: `settle`'s
+    /// commit reports the peer gone, though the sink's sends still succeed.
+    #[test]
+    fn a_refused_completion_stage_ends_the_event_task() {
+        let (p, tx) = pending(1, 0x1111);
+        tx.send(()).unwrap();
+        let sink = Staged {
+            refuse: true,
+            ..Staged::default()
+        };
+        assert!(
+            settle_on_event_task(p, sink.clone()),
+            "the control sender is still held, so only the refused stage can end it"
+        );
+        assert_eq!(
+            *sink.log.lock().unwrap(),
+            [(CA_PROTO_WRITE_NOTIFY, 0x1111, false)]
+        );
+    }
+
+    /// The event task stages a completion before the channel's next
+    /// put-callback is released, so the dispatch thread's reply to that one
+    /// cannot be staged ahead of it (C signals `blockSem` after
+    /// `cas_commit_msg`, `camessage.c:1452-1460`).
+    #[test]
+    fn a_completion_is_staged_before_its_successor_is_released() {
+        let (completion, settled) = PutNotifyCompletion::new(None);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(()).unwrap();
+        let p = PendingWriteNotify {
+            rx,
+            eca_status: crate::protocol::ECA_NORMAL,
+            reply: WriteNotifyReply {
+                write_type: 6,
+                write_count: 1,
+                ioid: 0x1111,
+                req_hdr: CaHeader::new(CA_PROTO_WRITE_NOTIFY),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+            completion,
+            sid: 1,
+            cancel: None,
+        };
+        let successor = std::sync::Arc::new(std::sync::Mutex::new(settled));
+        let sink = Staged {
+            successor: Some(successor.clone()),
+            ..Staged::default()
+        };
+        assert!(!settle_on_event_task(p, sink.clone()));
+        assert_eq!(
+            *sink.log.lock().unwrap(),
+            [(CA_PROTO_WRITE_NOTIFY, 0x1111, true)],
+            "staged while the successor was held"
+        );
+        assert!(
+            matches!(
+                successor.lock().unwrap().try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "and released after"
+        );
     }
 }
 
@@ -10955,7 +11241,7 @@ mod single_write_all_framing_tests {
         // exactly where `count=0`/empty diverged from C.
         send_no_read_access_event(
             &outbox,
-            RefusalChannel { cid: 0, pv: "" },
+            RefusalChannel::UNNAMED,
             StatusEvent {
                 cmd: CA_PROTO_READ_NOTIFY,
                 data_type: epics_base_rs::types::DBR_TIME_DOUBLE,
@@ -14195,6 +14481,103 @@ mod unrouted_command_tests {
                 "invalid (damaged?) request code from TCP",
                 13
             )]
+        );
+    }
+}
+
+#[cfg(test)]
+mod clear_channel_revoke_tests {
+    //! C `clear_channel_reply` runs `db_cancel_event` for every monitor on
+    //! the channel before it writes the delete-confirmed echo
+    //! (`camessage.c:1890-1903`), so no update can follow the confirmation.
+    use super::*;
+    use crate::protocol::{CA_MINOR_VERSION, CA_PROTO_VERSION, pad_string};
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): measured — passes under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`; nothing it awaits needs a reactor.
+    #[tokio::test]
+    async fn clear_channel_closes_its_monitors_gate_before_the_echo() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("CC:VAL", EpicsValue::Double(1.5)).await.unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let mut state = ClientState::new(acf, 5064, db.clone());
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        let peer: SocketAddr = "127.0.0.1:55991".parse().unwrap();
+
+        let mut version = CaHeader::new(CA_PROTO_VERSION);
+        version.count = CA_MINOR_VERSION;
+        let name = pad_string("CC:VAL");
+        let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+        create.cid = 0x1234;
+        create.available = CA_MINOR_VERSION as u32;
+        create.postsize = name.len() as u16;
+        for (hdr, payload) in [(version, Vec::new()), (create, name)] {
+            dispatch_message(
+                &hdr,
+                &payload,
+                &mut state,
+                &db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
+            )
+            .await
+            .unwrap();
+        }
+        let sid = *state.channels.keys().next().unwrap();
+
+        let mut add = CaHeader::new(CA_PROTO_EVENT_ADD);
+        add.data_type = epics_base_rs::types::DBR_DOUBLE;
+        add.count = 1;
+        add.cid = sid;
+        add.available = 0xAB;
+        let mut mon_info = vec![0u8; 16];
+        mon_info[12..14].copy_from_slice(&5u16.to_be_bytes());
+        let Ok(SubscriptionOutcome::HandedOff(r)) = register_subscription(
+            &add,
+            &mon_info,
+            &state,
+            &outbox,
+            SubscriptionDelivery::HandOff,
+            || 0,
+        )
+        .await
+        else {
+            panic!("EVENT_ADD refused");
+        };
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut blk_subs = std::collections::HashMap::new();
+        crate::server::blocking::hand_off_subscription(&mut state, &mut blk_subs, &ev_tx, r);
+        let monitor = state.channels[&sid].subscriptions[0].monitor.clone();
+        assert!(monitor.gate.deliver(|| ()).is_some(), "a live monitor");
+        while drain.try_next().is_some() {}
+
+        let mut clear = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
+        clear.cid = sid;
+        clear.available = 0x1234;
+        dispatch_message(
+            &clear,
+            &[],
+            &mut state,
+            &db,
+            &outbox,
+            peer,
+            None,
+            SubscriptionDelivery::HandOff,
+        )
+        .await
+        .unwrap();
+        let echo = drain.try_next().expect("the delete-confirmed echo");
+        assert_eq!(
+            u16::from_be_bytes([echo[0], echo[1]]),
+            CA_PROTO_CLEAR_CHANNEL
+        );
+        assert!(
+            monitor.gate.deliver(|| ()).is_none(),
+            "a delivery after the echo was queued must not emit"
         );
     }
 }

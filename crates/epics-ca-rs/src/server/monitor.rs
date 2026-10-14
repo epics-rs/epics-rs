@@ -1,109 +1,166 @@
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
-use super::frame::{FrameBuf, size_dbr_reply};
-use super::outbox::{Credit, Outbox};
+use super::frame::size_dbr_reply;
+use super::outbox::{Credit, FrameSink, Outbox};
 use crate::protocol::*;
-use epics_base_rs::server::pv::MonitorEvent;
+use epics_base_rs::server::pv::{LogValue, MonitorEvent};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
 
-/// What one update encodes, as `dbGet` encodes it (`dbAccess.c:909`): the
-/// log alone, or — once `read` is set — the channel read at delivery with
+/// One queued update as `dbGet` encodes it (`dbAccess.c:909`): its log,
+/// and where the encode reads an option, the channel read at delivery with
 /// the log written over it, whose status, severity, amsg, time and utag are
 /// the log's and every other option the channel's (`getOptions`,
-/// `dbAccess.c:336-414`).
-pub(crate) struct Delivery {
-    log: MonitorEvent,
-    read: Option<Snapshot>,
+/// `dbAccess.c:336-414`). The read lives in the caller's slot; the update
+/// points at it, so neither is moved on the way to the encode.
+pub(crate) struct Update<'a> {
+    /// Borrowed from the consumer's queue slot unless a post chain rewrites it.
+    log: Cow<'a, MonitorEvent>,
+    body: Body<'a>,
 }
 
-impl Delivery {
+/// An [`Update`] after its channel's stage, as the encode reads it.
+pub(crate) struct Delivery<'a> {
+    log: &'a MonitorEvent,
+    body: Body<'a>,
+}
+
+enum Body<'a> {
+    /// The log alone, with its scalar made into an `EpicsValue` once for
+    /// the count and the encode; `None` when the log's value is boxed.
+    Log(Option<EpicsValue>),
+    Read(&'a mut Snapshot),
+}
+
+/// The scalar a log carries by value.
+fn scalar(value: LogValue<'_>) -> Option<EpicsValue> {
+    match value {
+        LogValue::Val(v) => Some(v),
+        _ => None,
+    }
+}
+
+impl<'a> Update<'a> {
     /// The log alone: the encode reads value, alarm and time only.
-    pub(crate) fn log(log: MonitorEvent) -> Self {
-        Self { log, read: None }
-    }
-
-    /// The update after this channel's post chain and long-string
-    /// conversion, `None` where the chain drops it.
-    pub(crate) fn prepare(
-        self,
-        stage: &super::DeliveryStage,
-        requested_count: u32,
-    ) -> Option<Self> {
-        if stage.is_identity() {
-            return Some(self);
-        }
-        let Self { log, read } = self;
-        match read {
-            None => stage.prepare(log, requested_count).map(Self::log),
-            Some(read) => {
-                let read = stage.prepare_snapshot(read, requested_count, log.mask().bits())?;
-                Some(Self {
-                    log,
-                    read: Some(read),
-                })
-            }
-        }
-    }
-
-    pub(crate) fn encode_dbr_into(
-        &self,
-        dst: &mut Vec<u8>,
-        data_type: u16,
-    ) -> epics_base_rs::error::CaResult<()> {
-        match &self.read {
-            None => self.log.encode_dbr_into(dst, data_type),
-            Some(read) => epics_base_rs::types::encode_dbr_into(dst, data_type, read),
-        }
-    }
-
-    /// The element count the encode carries.
-    pub(crate) fn count(&self) -> u32 {
-        match &self.read {
-            None => self.log.value().as_value().map_or(0, |v| v.count()),
-            Some(read) => read.value.count(),
-        }
+    #[cfg(test)]
+    pub(crate) fn log(log: Cow<'a, MonitorEvent>) -> Self {
+        let body = Body::Log(scalar(log.value()));
+        Self { log, body }
     }
 
     /// An update of `read` written over by its own log.
     #[cfg(test)]
-    pub(crate) fn of_read(read: Snapshot) -> Self {
+    pub(crate) fn of_read(read: &'a mut Snapshot) -> Self {
         let log = MonitorEvent::read_log(
             &mut read.clone(),
             epics_base_rs::server::recgbl::EventMask::VALUE,
         );
         Self {
-            log,
-            read: Some(read),
+            log: Cow::Owned(log),
+            body: Body::Read(read),
+        }
+    }
+
+    /// The update after this channel's post chain and long-string
+    /// conversion, `None` where the chain drops it. The chain takes the log
+    /// by value, so the delivery borrows it from `log` rather than `self`.
+    pub(crate) fn prepare<'s>(
+        self,
+        stage: &super::DeliveryStage,
+        requested_count: u32,
+        log: &'s mut Option<Cow<'a, MonitorEvent>>,
+    ) -> Option<Delivery<'s>> {
+        let Self { log: posted, body } = self;
+        if stage.is_identity() {
+            return Some(Delivery {
+                log: log.insert(posted),
+                body,
+            });
+        }
+        match body {
+            Body::Read(read) => {
+                if !stage.prepare_snapshot(read, requested_count, posted.mask().bits()) {
+                    return None;
+                }
+                Some(Delivery {
+                    log: log.insert(posted),
+                    body: Body::Read(read),
+                })
+            }
+            Body::Log(_) => {
+                let log = log.insert(Cow::Owned(
+                    stage.prepare(posted.into_owned(), requested_count)?,
+                ));
+                let body = Body::Log(scalar(log.value()));
+                Some(Delivery { log, body })
+            }
+        }
+    }
+}
+
+impl Delivery<'_> {
+    pub(crate) fn encode_dbr_into(
+        &self,
+        dst: &mut Vec<u8>,
+        data_type: u16,
+    ) -> epics_base_rs::error::CaResult<()> {
+        let log = self.log;
+        match &self.body {
+            Body::Log(Some(v)) => epics_base_rs::types::encode_log_dbr_into(
+                dst,
+                data_type,
+                v,
+                log.stat(),
+                log.sevr(),
+                log.time(),
+            ),
+            Body::Log(None) => log.encode_dbr_into(dst, data_type),
+            Body::Read(read) => epics_base_rs::types::encode_dbr_into(dst, data_type, read),
+        }
+    }
+
+    /// The element count the encode carries.
+    pub(crate) fn count(&self) -> u32 {
+        match &self.body {
+            Body::Log(Some(v)) => v.count(),
+            Body::Log(None) => self.log.value().as_value().map_or(0, |v| v.count()),
+            Body::Read(read) => read.value.count(),
         }
     }
 
     /// The channel read this update encodes, if it reads one.
     #[cfg(test)]
     pub(crate) fn read(&self) -> Option<&Snapshot> {
-        self.read.as_ref()
+        match &self.body {
+            Body::Read(read) => Some(read),
+            Body::Log(_) => None,
+        }
     }
 }
 
 /// `event` as `dbGet` encodes it for `data_type`. `live` is the channel
 /// read; it runs only when the encode consults an option — GR/CTRL, STSACK,
 /// CLASS_NAME, or a conversion through precision, enum strings or
-/// `put_enum_str` — or the log holds no value, and `None` from it is a
-/// failed get.
-pub(crate) fn with_live_options(
+/// `put_enum_str` — or the log holds no value, and lands in `read`; `None`
+/// from it is a failed get.
+pub(crate) fn with_live_options<'a>(
     data_type: u16,
-    event: MonitorEvent,
+    event: Cow<'a, MonitorEvent>,
+    read: &'a mut Option<Snapshot>,
     live: impl FnOnce() -> Option<Snapshot>,
-) -> Option<Delivery> {
-    let reads = (event.value().as_value()).is_none_or(|v| reads_options(data_type, v));
-    if !reads {
-        return Some(Delivery::log(event));
+) -> Option<Update<'a>> {
+    let value = event.value();
+    if (value.as_value()).is_some_and(|v| !reads_options(data_type, v)) {
+        let body = Body::Log(scalar(value));
+        return Some(Update { log: event, body });
     }
-    let mut read = live()?;
-    event.write_log_over(&mut read);
-    Some(Delivery {
+    drop(value);
+    let read = read.insert(live()?);
+    event.write_log_over(read);
+    Some(Update {
         log: event,
-        read: Some(read),
+        body: Body::Read(read),
     })
 }
 
@@ -153,14 +210,17 @@ pub(crate) async fn deliver_monitor_event(
     // reading from growing the server without limit. C's `event_task`
     // blocks in the socket send the same way.
     let credit = outbox.reserve().await;
-    let Some(delivery) = with_live_options(m.data_type, event, || m.live_options()) else {
+    let mut read = None;
+    let Some(update) = with_live_options(m.data_type, Cow::Owned(event), &mut read, || {
+        m.live_options()
+    }) else {
         super::tcp::send_get_fail_event(
             outbox,
             m.refusal_channel(),
             m.data_type,
             m.data_count,
             m.sub_id,
-            m.reply,
+            m.reply(),
         );
         return;
     };
@@ -176,11 +236,12 @@ pub(crate) async fn deliver_monitor_event(
             m.data_type,
             m.data_count,
             m.sub_id,
-            delivery,
+            update,
             outbox,
             credit,
             &m.stage,
-            m.reply,
+            m.client_minor,
+            &m.req_hdr,
         )
     });
     if delivered.is_none() {
@@ -201,76 +262,105 @@ pub(crate) fn send_event(
     data_type: u16,
     data_count: u32,
     sub_id: u32,
-    delivery: Delivery,
-    outbox: &Outbox,
+    update: Update<'_>,
+    outbox: &impl FrameSink,
     // Spent on the delivery below. `Credit::none()` from callers that already
     // run under the connection loop's own bound — see `super::outbox`.
     credit: Credit,
     stage: &super::DeliveryStage,
-    reply: super::tcp::ReplyContext,
+    client_minor: u16,
+    // Read only when the update is refused.
+    req_hdr: &CaHeader,
 ) {
-    if super::tcp::refuse_unframeable_update(outbox, chan, data_type, data_count, stage, reply) {
+    if super::tcp::refuse_unframeable_update(
+        outbox,
+        chan,
+        data_type,
+        data_count,
+        stage,
+        client_minor,
+        req_hdr,
+    ) {
         return;
     }
-    let (req_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     // The channel's post chain and long-string boundary conversion
     // (`$` → CHAR[40]+NUL, or a long-string record field → scalar
     // DBR_STRING).
-    let Some(delivery) = delivery.prepare(stage, data_count) else {
+    let mut log = None;
+    let Some(delivery) = update.prepare(stage, data_count, &mut log) else {
         return;
     };
-    // One buffer with the header space reserved at the front, and the payload
-    // encoded straight into it — C `cas_copy_in_header` reserving inside the
-    // client's send buffer and `dbGet` converting into that space
-    // (`camessage.c:511` → `dbAccess.c:1017-1018`). See `server::frame`.
-    let mut frame = FrameBuf::acquire(outbox.pool(), 0);
-    if delivery.encode_dbr_into(frame.dst(), data_type).is_err() {
-        super::tcp::send_get_fail_event(outbox, chan, data_type, data_count, sub_id, reply);
-        return;
-    }
-    // Size the payload and pick the header count — `size_dbr_reply` owns the
-    // rule (autosize, request-count pad/truncate, and the DBR_CLASS_NAME
-    // fixed single element). A SimplePv channel carries no record_type, so
-    // its CLASS_NAME body is 40 zero bytes, matching an IOC's synthetic
-    // channels.
-    let element_count = size_dbr_reply(&mut frame, data_type, delivery.count(), data_count);
-    frame.align_payload();
+    // The header space reserved and the payload encoded straight into it,
+    // in the client's send buffer where the sink has one — C
+    // `cas_copy_in_header` reserving inside it and `dbGet` converting into
+    // that space (`camessage.c:511` → `dbAccess.c:1017-1018`). See
+    // `server::frame`.
+    let count = super::frame::reply_count(data_type, delivery.count(), data_count);
+    let payload = super::frame::payload_size(data_type, count);
+    let hdr_len = super::frame::header_len(payload, count);
+    let len_hint = hdr_len + payload;
+    // Why the frame was dropped, answered once it is out of the buffer.
+    let mut unsent = None;
+    outbox.frame_with(hdr_len, len_hint, credit, |frame| {
+        if delivery.encode_dbr_into(frame.dst(), data_type).is_err() {
+            unsent = Some(Unsent::GetFail);
+            return None;
+        }
+        // Size the payload and pick the header count — `size_dbr_reply` owns
+        // the rule (autosize, request-count pad/truncate, and the
+        // DBR_CLASS_NAME fixed single element). A SimplePv channel carries no
+        // record_type, so its CLASS_NAME body is 40 zero bytes, matching an
+        // IOC's synthetic channels.
+        let element_count = size_dbr_reply(frame, data_type, delivery.count(), data_count);
+        frame.align_payload();
 
-    let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-    // C client TCP parser requires 8-byte aligned postsize. C `read_reply`
-    // (`camessage.c:515-524`): when `cas_copy_in_header` refuses the frame
-    // because this client is pre-CA_V49, the update is answered with
-    // CA_PROTO_ERROR / ECA_16KARRAYCLIENT and the circuit is kept.
-    if hdr
-        .set_payload_size(frame.payload_len(), element_count, client_minor)
-        .is_err()
-    {
-        let _ = super::tcp::send_16k_array_client_err(
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        // C client TCP parser requires 8-byte aligned postsize. C `read_reply`
+        // (`camessage.c:515-524`): when `cas_copy_in_header` refuses the frame
+        // because this client is pre-CA_V49, the update is answered with
+        // CA_PROTO_ERROR / ECA_16KARRAYCLIENT and the circuit is kept.
+        if hdr
+            .set_payload_size(frame.payload_len(), element_count, client_minor)
+            .is_err()
+        {
+            unsent = Some(Unsent::Refused(element_count));
+            return None;
+        }
+        hdr.data_type = data_type;
+        hdr.cid = 1; // ECA_NORMAL status
+        hdr.available = sub_id;
+        Some(hdr)
+    });
+    match unsent {
+        None => {}
+        Some(Unsent::GetFail) => super::tcp::send_get_fail_event(
             outbox,
-            req_hdr,
             chan,
-            super::tcp::UnloadedReply::ReadReply,
-            element_count,
-            client_minor,
-        );
-        return;
+            data_type,
+            data_count,
+            sub_id,
+            super::tcp::ReplyContext {
+                req_hdr: *req_hdr,
+                client_minor,
+            },
+        ),
+        Some(Unsent::Refused(element_count)) => {
+            let _ = super::tcp::send_16k_array_client_err(
+                outbox,
+                req_hdr,
+                chan,
+                super::tcp::UnloadedReply::ReadReply,
+                element_count,
+                client_minor,
+            );
+        }
     }
-    hdr.data_type = data_type;
-    hdr.cid = 1; // ECA_NORMAL status
-    hdr.available = sub_id;
+}
 
-    // Abort-safety: this runs inside the circuit's event task, which
-    // `handle_client` aborts at disconnect cleanup. `seal` yields the whole CA_PROTO_EVENT_ADD frame as ONE
-    // contiguous buffer, handed to the outbox with a single synchronous
-    // `push_with`. Because that is a synchronous channel send with no await
-    // between building the frame and enqueuing it, an abort can only land
-    // at a frame boundary — never between the header and the payload — so
-    // the connection loop can never observe a partial frame. (Under the
-    // former shared `Arc<Mutex<BufWriter>>` this required a two-await
-    // split to be avoided; routing through the outbox removes the hazard
-    // structurally.) The caller's `reserve().await` is likewise outside
-    // this function, so an abort there strands neither a frame nor credit.
-    outbox.push_with(frame.seal(&hdr), credit);
+/// Why [`send_event`] built no frame.
+enum Unsent {
+    GetFail,
+    Refused(u32),
 }
 
 #[cfg(test)]
@@ -319,18 +409,16 @@ mod tests {
         // data_count = 0 means autosize (use snapshot's actual count);
         // matches every producer caller.
         send_event(
-            crate::server::tcp::RefusalChannel { cid: 0, pv: "" },
+            crate::server::tcp::RefusalChannel::UNNAMED,
             DBR_LONG,
             0,
             7,
-            Delivery::log(event),
+            Update::log(Cow::Owned(event)),
             &outbox,
             Credit::none(),
             &crate::server::DeliveryStage::plain(),
-            crate::server::tcp::ReplyContext {
-                req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
-                client_minor: crate::protocol::CA_MINOR_VERSION,
-            },
+            crate::protocol::CA_MINOR_VERSION,
+            &crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
         );
 
         let batches = drain_frames(&mut drain);
@@ -369,6 +457,59 @@ mod tests {
         );
         // Payload is 8-byte aligned (C client TCP parser requirement).
         assert_eq!(payload_size % 8, 0, "payload not 8-byte aligned");
+    }
+
+    /// A GR/CTRL update encodes the channel read, which the post chain runs
+    /// on in place of the log (`prepare_snapshot`); a post filter that drops
+    /// it sends nothing, as C's `dbChannelRunPostChain` returning NULL does.
+    #[epics_macros_rs::epics_test]
+    async fn a_read_update_the_post_chain_drops_sends_no_frame() {
+        use epics_base_rs::server::database::filters::{
+            FilterChain, FilteredMonitorEvent, SubscriptionFilter,
+        };
+        use epics_base_rs::types::{DBR_CTRL_DOUBLE, EpicsValue};
+        struct Post(bool);
+        impl SubscriptionFilter for Post {
+            fn name(&self) -> &'static str {
+                "post"
+            }
+            fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
+                self.0.then_some(event)
+            }
+            fn post_chain(&self) -> bool {
+                true
+            }
+        }
+        for pass in [true, false] {
+            let mut chain = FilterChain::new();
+            chain.push(std::sync::Arc::new(Post(pass)));
+            let stage =
+                crate::server::DeliveryStage::new(chain, crate::server::LongStringMode::Plain, 1);
+            let (outbox, mut drain): (Outbox, OutboxDrain) = crate::server::outbox::channel();
+            let mut read = Snapshot::new(
+                EpicsValue::Double(1.5),
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+            );
+            send_event(
+                crate::server::tcp::RefusalChannel::UNNAMED,
+                DBR_CTRL_DOUBLE,
+                0,
+                7,
+                Update::of_read(&mut read),
+                &outbox,
+                Credit::none(),
+                &stage,
+                crate::protocol::CA_MINOR_VERSION,
+                &crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
+            );
+            assert_eq!(
+                drain_frames(&mut drain).len(),
+                usize::from(pass),
+                "pass {pass}"
+            );
+        }
     }
 
     /// Server-wide subscription-event counters (PCAS
@@ -420,15 +561,11 @@ mod tests {
                     sub_id: 1,
                     data_type: DBR_DOUBLE,
                     data_count: 0,
-                    denied: Arc::new(AtomicBool::new(denied)),
+                    denied: AtomicBool::new(denied),
                     gate: crate::server::outbox::MonitorGate::open(),
                     stage: crate::server::DeliveryStage::plain(),
-                    reply: crate::server::tcp::ReplyContext {
-                        req_hdr: crate::protocol::CaHeader::new(
-                            crate::protocol::CA_PROTO_EVENT_ADD,
-                        ),
-                        client_minor: crate::protocol::CA_MINOR_VERSION,
-                    },
+                    client_minor: crate::protocol::CA_MINOR_VERSION,
+                    req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
                     stats: Some(stats.clone()),
                     ended: AtomicBool::new(false),
                 });
@@ -518,6 +655,40 @@ mod tests {
                 0,
                 "a denied event is suppressed before the wire — never processed"
             );
+        }
+    }
+
+    /// A log delivered alone counts and encodes as the log itself does,
+    /// whether its value is a scalar copied in or a boxed array.
+    #[test]
+    fn a_log_alone_encodes_as_the_log_does() {
+        use epics_base_rs::server::recgbl::EventMask;
+        for value in [
+            EpicsValue::Double(2.5),
+            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
+        ] {
+            let posted = Snapshot::new(value, 3, 1, std::time::UNIX_EPOCH);
+            for data_type in 0..=20u16 {
+                let event = || MonitorEvent::post_log(&posted, 0, EventMask::VALUE);
+                let mut want = Vec::new();
+                let want_res = event().encode_dbr_into(&mut want, data_type);
+                let want_count = event().value().as_value().map_or(0, |v| v.count());
+                // A class that reads an option has no log-alone delivery.
+                let mut read = None;
+                let alone = with_live_options(data_type, Cow::Owned(event()), &mut read, || None);
+                for update in std::iter::once(Update::log(Cow::Owned(event()))).chain(alone) {
+                    let mut log = None;
+                    let delivery = update
+                        .prepare(&crate::server::DeliveryStage::plain(), 0, &mut log)
+                        .expect("an identity stage drops nothing");
+                    assert!(delivery.read().is_none(), "type {data_type}");
+                    let mut got = Vec::new();
+                    let got_res = delivery.encode_dbr_into(&mut got, data_type);
+                    assert_eq!(got_res.is_ok(), want_res.is_ok(), "type {data_type}");
+                    assert_eq!(got, want, "type {data_type}");
+                    assert_eq!(delivery.count(), want_count, "type {data_type}");
+                }
+            }
         }
     }
 }

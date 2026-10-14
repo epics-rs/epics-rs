@@ -105,6 +105,99 @@ fn a_stage_whose_flush_fails_reports_it_and_stages_nothing() {
     assert!(wire.writes().is_empty());
 }
 
+/// `stage_with` keeps `stage`'s boundaries: a frame expected not to fit
+/// sends what is staged first, and one larger than the buffer goes out on
+/// its own.
+#[test]
+fn a_frame_built_in_place_keeps_the_staging_boundaries() {
+    let (wire, mut sb) = send_buf();
+    sb.stage(&frame(1, MAX_TCP - 10)).unwrap();
+    sb.stage_with(11, |mut b| {
+        b.extend(frame(2, 11));
+        b
+    })
+    .unwrap();
+    assert_eq!(wire.writes(), [frame(1, MAX_TCP - 10)]);
+    sb.stage_with(MAX_TCP + 1, |mut b| {
+        b.extend(frame(3, MAX_TCP + 1));
+        b
+    })
+    .unwrap();
+    assert_eq!(
+        wire.writes(),
+        [frame(1, MAX_TCP - 10), frame(2, 11), frame(3, MAX_TCP + 1)]
+    );
+    sb.stage_with(16, |b| b).unwrap();
+    sb.send().unwrap();
+    assert_eq!(wire.writes().len(), 3, "a dropped frame stages nothing");
+}
+
+/// A sink that builds every frame apart and records it — the copy path
+/// `stage_with`'s default takes.
+#[derive(Clone, Default)]
+struct Copies(Arc<Mutex<Vec<u8>>>);
+
+impl crate::server::tcp::EventSink for Copies {
+    fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().extend_from_slice(frame);
+        Ok(())
+    }
+    fn send(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Monitor updates built straight into the send buffer reach the wire as
+/// the same bytes, in the same order, as frames built apart and copied in.
+#[test]
+fn updates_built_in_place_are_the_frames_built_apart() {
+    const N: u32 = 5;
+    let run = |sink: &mut dyn FnMut(
+        Arc<EventUser>,
+        mpsc::UnboundedReceiver<EventTaskControl>,
+        &[Arc<epics_base_rs::server::pv::ProcessVariable>],
+    )| {
+        let user = Arc::new(EventUser::new());
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let pvs = circuit_monitored_pvs(N, &user, &ctl_tx);
+        sink(user, ctl_rx, &pvs);
+        drop(ctl_tx);
+    };
+    let post = |pvs: &[Arc<epics_base_rs::server::pv::ProcessVariable>]| {
+        for (i, pv) in pvs.iter().enumerate().rev() {
+            pv.set(EpicsValue::Double(i as f64 + 0.5));
+        }
+    };
+    let wire = Arc::new(Wire::default());
+    run(&mut |user, ctl_rx, pvs| {
+        let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
+        let mut task = pin!(run_event_task(user, ctl_rx, sink));
+        assert!(poll_once(task.as_mut()).is_pending());
+        post(pvs);
+        assert!(poll_once(task.as_mut()).is_pending());
+    });
+    let copies = Copies::default();
+    run(&mut |user, ctl_rx, pvs| {
+        let mut task = pin!(run_event_task(user, ctl_rx, copies.clone()));
+        assert!(poll_once(task.as_mut()).is_pending());
+        post(pvs);
+        assert!(poll_once(task.as_mut()).is_pending());
+    });
+    let in_place = wire.writes().concat();
+    let apart = copies.0.lock().unwrap().clone();
+    assert_eq!(in_place, apart);
+    // Post order, each frame whole: sub_id N..1, value N-0.5..0.5.
+    let frames: Vec<&[u8]> = in_place.chunks(in_place.len() / N as usize).collect();
+    assert_eq!(frames.len(), N as usize);
+    for (k, f) in frames.iter().enumerate() {
+        let sub = N - k as u32;
+        assert_eq!(u16::from_be_bytes([f[0], f[1]]), CA_PROTO_EVENT_ADD);
+        assert_eq!(u32::from_be_bytes(f[12..16].try_into().unwrap()), sub);
+        let v = f64::from_be_bytes(f[16..24].try_into().unwrap());
+        assert_eq!(v, (sub - 1) as f64 + 0.5);
+    }
+}
+
 fn poll_once<F: Future>(fut: std::pin::Pin<&mut F>) -> Poll<F::Output> {
     fut.poll(&mut Context::from_waker(Waker::noop()))
 }
@@ -226,14 +319,14 @@ fn circuit_monitored_pvs(
         .collect()
 }
 
-/// [`circuit_monitored_pvs`] with each monitor's gate, for cancelling one.
+/// [`circuit_monitored_pvs`] with each monitor, for cancelling one.
 fn gated_circuit_monitored_pvs(
     n: u32,
     user: &Arc<EventUser>,
     ctl_tx: &mpsc::UnboundedSender<EventTaskControl>,
 ) -> Vec<(
     Arc<epics_base_rs::server::pv::ProcessVariable>,
-    crate::server::outbox::MonitorGate,
+    Arc<crate::server::tcp::CircuitMonitor>,
 )> {
     use epics_base_rs::server::pv::ProcessVariable;
     use epics_base_rs::types::DBR_DOUBLE;
@@ -245,25 +338,22 @@ fn gated_circuit_monitored_pvs(
                 format!("CIRCUIT:{cid}"),
                 EpicsValue::Double(0.0),
             ));
-            let gate = crate::server::outbox::MonitorGate::open();
-            let context: epics_base_rs::server::event_queue::DeliveryContext =
-                Arc::new(crate::server::tcp::CircuitMonitor {
-                    target: ChannelTarget::SimplePv(pv.clone()),
-                    db: db.clone(),
-                    cid,
-                    sub_id: cid + 1,
-                    data_type: DBR_DOUBLE,
-                    data_count: 0,
-                    denied: Arc::new(AtomicBool::new(false)),
-                    gate: gate.clone(),
-                    stage: crate::server::DeliveryStage::plain(),
-                    reply: crate::server::tcp::ReplyContext {
-                        req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
-                        client_minor: CA_MINOR_VERSION,
-                    },
-                    stats: None,
-                    ended: AtomicBool::new(false),
-                });
+            let monitor = Arc::new(crate::server::tcp::CircuitMonitor {
+                gate: crate::server::outbox::MonitorGate::open(),
+                denied: AtomicBool::new(false),
+                ended: AtomicBool::new(false),
+                data_type: DBR_DOUBLE,
+                client_minor: CA_MINOR_VERSION,
+                sub_id: cid + 1,
+                data_count: 0,
+                stats: None,
+                stage: crate::server::DeliveryStage::plain(),
+                target: ChannelTarget::SimplePv(pv.clone()),
+                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
+                cid,
+                db: db.clone(),
+            });
+            let context: epics_base_rs::server::event_queue::DeliveryContext = monitor.clone();
             let reader = pv
                 .add_subscriber_on(
                     user,
@@ -280,7 +370,7 @@ fn gated_circuit_monitored_pvs(
                     cid,
                 })))
                 .unwrap();
-            (pv, gate)
+            (pv, monitor)
         })
         .collect()
 }
@@ -360,7 +450,7 @@ fn a_cancelled_last_event_sends_nothing() {
     for (pv, _) in &pvs {
         pv.set(EpicsValue::Double(1.0));
     }
-    pvs[1].1.revoke();
+    pvs[1].1.gate.revoke();
     assert!(poll_once(task.as_mut()).is_pending());
     assert_eq!(
         *calls.0.lock().unwrap(),
@@ -421,6 +511,47 @@ fn a_failed_send_at_a_drained_queue_ends_the_task() {
         ["stage", "send", "send"],
         "update staged, drained-queue send failed, exit flush"
     );
+}
+
+/// A [`Calls`] whose stages fail and whose sends do not, so only the stage
+/// error can tell the task the peer is gone.
+#[derive(Clone, Default)]
+struct RefusedStages(Calls);
+
+impl crate::server::tcp::EventSink for RefusedStages {
+    fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        self.0.stage(frame)?;
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+    fn send(&mut self) -> std::io::Result<()> {
+        self.0.send()
+    }
+}
+
+/// A failed stage ends the task at that update: the next update queued
+/// behind it is never built for the gone peer.
+#[test]
+fn a_failed_update_stage_ends_the_task() {
+    let user = Arc::new(EventUser::new());
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let pvs = circuit_monitored_pvs(2, &user, &ctl_tx);
+    let sink = RefusedStages::default();
+    let mut task = pin!(run_event_task(user, ctl_rx, sink.clone()));
+    assert!(poll_once(task.as_mut()).is_pending());
+    sink.0.0.lock().unwrap().clear();
+    for pv in &pvs {
+        pv.set(EpicsValue::Double(1.0));
+    }
+    assert!(
+        poll_once(task.as_mut()).is_ready(),
+        "the control sender is still held, so only the stage error can end it"
+    );
+    assert_eq!(
+        *sink.0.0.lock().unwrap(),
+        ["stage", "send"],
+        "one refused stage, then the exit flush"
+    );
+    drop(ctl_tx);
 }
 
 /// Frames no queue drain sends, such as a retirement, go out at the send

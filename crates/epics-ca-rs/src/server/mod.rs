@@ -147,10 +147,17 @@ pub(super) fn apply_long_string_mode(
 /// `event_read` (`dbEvent.c:984-985`).
 #[derive(Clone)]
 pub(crate) struct DeliveryStage {
-    post: Option<std::sync::Arc<epics_base_rs::server::database::db_access::PostStage>>,
-    long_string_mode: LongStringMode,
     /// What an autosize request reads, C `paddr->no_elements`.
     autosize: u32,
+    /// `None` when every event goes out exactly as posted, the common case:
+    /// the stage is read on every update, so it stays one pointer wide there.
+    transform: Option<Box<StageTransform>>,
+}
+
+#[derive(Clone)]
+struct StageTransform {
+    post: Option<std::sync::Arc<epics_base_rs::server::database::db_access::PostStage>>,
+    long_string_mode: LongStringMode,
 }
 
 impl DeliveryStage {
@@ -165,11 +172,17 @@ impl DeliveryStage {
             LongStringMode::DollarChar { view, .. } if !post.is_empty() => Some(view),
             _ => None,
         };
+        let post = epics_base_rs::server::database::db_access::PostStage::new(post, dollar)
+            .map(std::sync::Arc::new);
+        let transform = (post.is_some() || long_string_mode != LongStringMode::Plain).then(|| {
+            Box::new(StageTransform {
+                post,
+                long_string_mode,
+            })
+        });
         Self {
-            post: epics_base_rs::server::database::db_access::PostStage::new(post, dollar)
-                .map(std::sync::Arc::new),
-            long_string_mode,
             autosize,
+            transform,
         }
     }
 
@@ -177,9 +190,8 @@ impl DeliveryStage {
     #[cfg(test)]
     pub(crate) fn plain() -> Self {
         Self {
-            post: None,
-            long_string_mode: LongStringMode::Plain,
             autosize: 0,
+            transform: None,
         }
     }
 
@@ -194,7 +206,7 @@ impl DeliveryStage {
 
     /// Whether every event goes out exactly as posted.
     pub(crate) fn is_identity(&self) -> bool {
-        self.post.is_none() && self.long_string_mode == LongStringMode::Plain
+        self.transform.is_none()
     }
 
     /// `event` as sent for a `requested_count` request, `None` where the post
@@ -204,10 +216,13 @@ impl DeliveryStage {
         event: epics_base_rs::server::pv::MonitorEvent,
         requested_count: u32,
     ) -> Option<epics_base_rs::server::pv::MonitorEvent> {
+        let Some(transform) = &self.transform else {
+            return Some(event);
+        };
         // An autosize request reads the field's own count, which a log the
         // filters grew (`ts`) is cut to.
         let n_request = self.item_count(requested_count) as usize;
-        let mut event = match &self.post {
+        let mut event = match &transform.post {
             // A `$` view's read is already `dbGet`'s chars for this count.
             Some(post) if post.reads_chars() => return post.read_request(event, n_request),
             Some(post) => {
@@ -221,11 +236,11 @@ impl DeliveryStage {
             }
             None => event,
         };
-        if self.long_string_mode != LongStringMode::Plain {
+        if transform.long_string_mode != LongStringMode::Plain {
             let value = event.replace_value(epics_base_rs::types::EpicsValue::Long(0));
             event.replace_value(apply_long_string_mode(
                 value,
-                self.long_string_mode,
+                transform.long_string_mode,
                 requested_count,
             ));
         }
@@ -233,24 +248,26 @@ impl DeliveryStage {
     }
 
     /// [`Self::prepare`] for a snapshot no queue carried: a read, or a single
-    /// event posted under subscriber mask `mask`.
+    /// event posted under subscriber mask `mask`, rewritten in place; `false`
+    /// where the chain drops it, which leaves `snapshot` without its value.
     pub(crate) fn prepare_snapshot(
         &self,
-        snapshot: epics_base_rs::server::snapshot::Snapshot,
+        snapshot: &mut epics_base_rs::server::snapshot::Snapshot,
         requested_count: u32,
         mask: u16,
-    ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
+    ) -> bool {
         if self.is_identity() {
-            return Some(snapshot);
+            return true;
         }
-        let mut snapshot = snapshot;
         let log = epics_base_rs::server::pv::MonitorEvent::read_log(
-            &mut snapshot,
+            snapshot,
             epics_base_rs::server::recgbl::EventMask::from_bits(mask),
         );
-        self.prepare(log, requested_count)?
-            .write_log_over(&mut snapshot);
-        Some(snapshot)
+        let Some(log) = self.prepare(log, requested_count) else {
+            return false;
+        };
+        log.write_log_over(snapshot);
+        true
     }
 }
 

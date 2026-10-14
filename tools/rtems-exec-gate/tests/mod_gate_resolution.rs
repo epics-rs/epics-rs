@@ -6,12 +6,20 @@
 //! finds nothing reports a cost of zero and looks exactly like a gate that cost
 //! nothing.
 
-use rtems_exec_gate::audit_crate;
+use rtems_exec_gate::{GateCost, audit_crate};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 fn tokio_test() -> &'static str {
     concat!("#[tokio", "::test]\nasync fn t() {}\n")
+}
+
+/// A reactor-free test whose body builds a runtime.
+fn builds_runtime() -> &'static str {
+    concat!(
+        "\n#[test]\nfn builds() {\n    let _ = tokio::runtime::Runtime",
+        "::new();\n}\n"
+    )
 }
 
 /// A file holding one reactor-dependent site and `plain` reactor-free tests.
@@ -144,6 +152,72 @@ fn a_path_override_is_followed_from_the_declaring_files_directory() {
         ],
     );
     assert_eq!(shape(&dir), [("x".to_owned(), 1, 1, 6)]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The crate root can arrive spelled with `..` — a relative CARGO_TARGET_DIR
+/// puts one in CARGO_TARGET_TMPDIR — and the resolved `#[path]` must still
+/// match the scanned file it names.
+#[test]
+fn a_path_override_resolves_under_a_root_spelled_with_dot_dot() {
+    let dir = crate_at(
+        "modgate_path_dotdot",
+        &[
+            (
+                "src/lib.rs",
+                format!(
+                    "{}\n#[path = \"../shared/helper.rs\"]\nmod x;\n",
+                    rtems_exec_gate::GATE_ATTR
+                ),
+            ),
+            ("shared/helper.rs", source(6)),
+        ],
+    );
+    assert_eq!(
+        shape(&dir.join("src").join("..")),
+        [("x".to_owned(), 1, 1, 6)]
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Under the same `..` root, every label and the `tests/` classification come
+/// from the one spelling the scan used. The classification shows in a test
+/// that builds a runtime: a site in an integration file, collateral elsewhere.
+#[test]
+fn a_root_spelled_with_dot_dot_still_names_and_classifies_integration_files() {
+    let dir = crate_at(
+        "modgate_tests_dotdot",
+        &[
+            ("src/lib.rs", String::new()),
+            (
+                "tests/a.rs",
+                format!(
+                    "{}\n{}{}",
+                    rtems_exec_gate::FILE_GATE_ATTR,
+                    source(3),
+                    builds_runtime()
+                ),
+            ),
+            (
+                "tests/b.rs",
+                format!("{}\nmod helper;\n", rtems_exec_gate::GATE_ATTR),
+            ),
+            ("tests/b/helper.rs", source(2) + builds_runtime()),
+        ],
+    );
+    let census = audit_crate(dir.join("src").join("..").to_str().expect("utf-8"));
+    let cost = |file: &str, sites, collateral| GateCost {
+        file: file.to_owned(),
+        sites,
+        collateral,
+    };
+    assert_eq!(census.scope_gated, [cost("tests/a.rs", 2, 3)]);
+    assert_eq!(census.mod_gated.len(), 1, "{:?}", census.mod_gated);
+    assert_eq!(census.mod_gated[0].declared_in, "tests/b.rs");
+    assert_eq!(
+        census.mod_gated[0].removes,
+        [cost("tests/b/helper.rs", 2, 2)]
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

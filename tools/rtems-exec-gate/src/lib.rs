@@ -1104,7 +1104,13 @@ pub struct GateCost {
 /// reports a compliant crate, which is the failure this whole crate exists to
 /// prevent.
 pub fn audit_crate(manifest_dir: &str) -> CrateCensus {
-    let root = Path::new(manifest_dir);
+    // One spelling for the whole scan: a `#[path]` is resolved by `normalise`,
+    // so the root is too. `canonicalize` would hand Windows a `\\?\` path, in
+    // which `components` never splits out a `..`.
+    let root = &normalise(
+        &std::path::absolute(manifest_dir)
+            .unwrap_or_else(|e| panic!("rtems-exec-gate: cannot resolve {manifest_dir}: {e}")),
+    );
     let mut files = Vec::new();
     crate_rust_files(root, &mut files);
     assert!(

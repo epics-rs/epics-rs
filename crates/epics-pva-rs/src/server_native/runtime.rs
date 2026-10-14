@@ -484,6 +484,7 @@ impl PvaServer {
         config.udp_port = bound.port;
         let udp_handle = tokio::spawn(run_udp_responder_on_socket(
             bound.v4,
+            bound.lo_mcast,
             bound.port,
             dyn_source.clone(),
             advertised_tcp_port,

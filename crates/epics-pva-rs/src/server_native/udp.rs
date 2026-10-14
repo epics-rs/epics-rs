@@ -4,7 +4,7 @@
 //! SEARCH_RESPONSE messages naming our TCP endpoint. Beacons are emitted
 //! periodically to advertise our presence.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the exec-backend
 // suite.
 use std::collections::HashSet;
 use std::io::Cursor;
@@ -115,11 +115,13 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
 /// a start either holds both families or fails — pvxs binds its `[::]`
 /// listener on the number the v4 one read back and throws out of the
 /// `Server` constructor when it cannot (`server.cpp:421-426`,
-/// `udp_collector.cpp:151`). v4 goes first: its ephemeral pick must come from
+/// `udp_collector.cpp:151`). So is the ORIGIN_TAG socket, which in pvxs is
+/// the v4 collector itself. v4 goes first: its ephemeral pick must come from
 /// the kernel, since a guessed number under the reuse flags would co-bind
-/// silently. A v6 holder without reuse flags is still `EADDRINUSE`; on that
-/// error the pair is dropped and the kernel asked again, which pvxs does not
-/// do.
+/// silently. On a chosen number the v6 socket binds before its fanout flags,
+/// so any v6 holder there is `EADDRINUSE`; on that error from either
+/// companion the set is dropped and the kernel asked again, which pvxs does
+/// not do.
 pub(crate) fn bind_udp(
     port: u16,
     interfaces: &[Ipv4Addr],
@@ -127,27 +129,34 @@ pub(crate) fn bind_udp(
     v6: bool,
 ) -> PvaResult<UdpBind> {
     const EPHEMERAL_TRIES: usize = 32;
+    let origin = if port == 0 {
+        PortOrigin::Chosen
+    } else {
+        PortOrigin::Configured
+    };
     let mut tries = 1;
-    let (mut sock, port, v6) = loop {
+    let (mut sock, port, v6, lo_mcast) = loop {
         let (sock, bound) = bind_udp_v4(port, interfaces)?;
-        if !v6 {
-            break (sock, bound, None);
-        }
-        #[cfg(test)]
-        tests::BEFORE_V6_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bound)));
-        let origin = if port == 0 {
-            PortOrigin::Chosen
-        } else {
-            PortOrigin::Configured
+        let companions = || -> std::io::Result<_> {
+            let v6 = if v6 {
+                #[cfg(test)]
+                tests::BEFORE_V6_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bound)));
+                Some(bind_search_v6(bound, origin)?)
+            } else {
+                None
+            };
+            // Fanout flags before the bind even on a chosen number: this
+            // wildcard socket co-binds the bundle's own sockets there.
+            Ok((v6, bind_loopback_mcast(bound)?))
         };
-        match bind_search_v6(bound, origin) {
-            Ok(v6) => break (sock, bound, Some(v6)),
+        match companions() {
+            Ok((v6, lo_mcast)) => break (sock, bound, v6, lo_mcast),
             Err(e)
                 if port == 0
                     && e.kind() == std::io::ErrorKind::AddrInUse
                     && tries < EPHEMERAL_TRIES =>
             {
-                debug!("UDP6 port {bound} is held; choosing another search port");
+                debug!("UDP port {bound} is held; choosing another search port");
                 tries += 1;
             }
             Err(e) => return Err(PvaError::Io(e)),
@@ -177,7 +186,17 @@ pub(crate) fn bind_udp(
     // outside the configured interface list — and `&mut sock` lets
     // `ensure_iface_socket` add those listener sockets to the bundle.
     join_beacon_multicast_groups(&mut sock, beacon_dests, port, &external_nics);
-    Ok(UdpBind { v4: sock, v6, port })
+    // pvxs `UDPCollector::UDPCollector` (commit a064677e3625) enables
+    // SO_RXQ_OVFL on the collector socket. No-op on non-Linux.
+    if let Err(e) = enable_so_rxq_ovfl_for_socket(&lo_mcast) {
+        debug!("loopback SO_RXQ_OVFL enable failed (non-fatal): {e}");
+    }
+    Ok(UdpBind {
+        v4: sock,
+        v6,
+        lo_mcast,
+        port,
+    })
 }
 
 /// A server start's search sockets, all on [`Self::port`].
@@ -185,6 +204,8 @@ pub(crate) struct UdpBind {
     pub v4: AsyncUdpV4,
     /// The v6 SEARCH socket, when the v6 responder is on.
     pub v6: Option<std::net::UdpSocket>,
+    /// The ORIGIN_TAG channel: wildcard, joined to 224.0.0.128 on loopback.
+    pub lo_mcast: tokio::net::UdpSocket,
     pub port: u16,
 }
 
@@ -425,6 +446,7 @@ pub async fn run_udp_responder_with_config(
     let bound = bind_udp(udp_port, &interfaces, &destinations, false)?;
     run_udp_responder_on_socket(
         bound.v4,
+        bound.lo_mcast,
         bound.port,
         source,
         tcp_port,
@@ -454,6 +476,8 @@ pub async fn run_udp_responder_with_config(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_udp_responder_on_socket(
     socket: AsyncUdpV4,
+    // The ORIGIN_TAG channel on the same port — see [`bind_udp`].
+    lo_mcast: tokio::net::UdpSocket,
     // The port `socket` is actually bound to — see [`bind_udp`].
     udp_port: u16,
     source: DynSource,
@@ -692,32 +716,11 @@ pub async fn run_udp_responder_on_socket(
     });
     let _beacon_guard = AbortOnDrop(beacon_join.abort_handle());
 
-    // pvxs `udp_collector.cpp:127, :140-167`: a dedicated socket
-    // bound wildcard, joined to 224.0.0.128 via 127.0.0.1, sits
-    // alongside the per-NIC SEARCH responder so other PVA peers on
-    // this host can forward SEARCHes (CMD_ORIGIN_TAG-prefixed) into
-    // every local listener. Optional — if the bind fails (most
-    // commonly a sandboxed test environment that prohibits multicast
-    // joins, or a kernel without IP_ADD_MEMBERSHIP for the
-    // requested group), we log at debug and run without ORIGIN_TAG
-    // delivery rather than aborting startup.
-    let lo_mcast = match bind_loopback_mcast(udp_port) {
-        Ok(s) => {
-            // pvxs `udp_collector.cpp::UDPCollector::UDPCollector`
-            // (commit a064677e3625) enables SO_RXQ_OVFL on the
-            // collector socket so the kernel's per-socket dropped-
-            // datagram counter is delivered as a cmsg on each
-            // recvmsg. No-op on non-Linux.
-            if let Err(e) = enable_so_rxq_ovfl_for_socket(&s) {
-                debug!("loopback SO_RXQ_OVFL enable failed (non-fatal): {e}");
-            }
-            Some(Arc::new(s))
-        }
-        Err(e) => {
-            debug!("loopback ORIGIN_TAG socket bind failed, running without: {e}");
-            None
-        }
-    };
+    // pvxs `udp_collector.cpp:127, :140-167`: a dedicated socket bound
+    // wildcard, joined to 224.0.0.128 via 127.0.0.1, sits alongside the
+    // per-NIC SEARCH responder so other PVA peers on this host can forward
+    // SEARCHes (CMD_ORIGIN_TAG-prefixed) into every local listener.
+    let lo_mcast = Arc::new(lo_mcast);
     // pvxs parity for the per-NIC SEARCH responder bundle. Each NIC
     // socket gets its own kernel counter; we track the previous
     // observed value per iface IP and log only on transitions.
@@ -744,22 +747,11 @@ pub async fn run_udp_responder_on_socket(
     loop {
         // Receive on whichever path is ready first. The per-NIC bundle
         // handles regular SEARCH/beacon traffic; the loopback mcast
-        // socket (if bound) catches CMD_ORIGIN_TAG forwards from local
+        // socket catches CMD_ORIGIN_TAG forwards from local
         // PVA peers. Both paths feed `process_search_datagram` with a
         // tagged origin so anti-loop and reply-routing rules apply.
         let recv_direct = socket.recv_with_meta_with_drops(&mut buf);
-        let recv_lo = async {
-            match lo_mcast.as_ref() {
-                Some(s) => recv_from_with_drop_count_socket(s, &mut lo_buf)
-                    .await
-                    .map(Some),
-                // No loopback socket: never resolve.
-                None => {
-                    std::future::pending::<std::io::Result<Option<(usize, SocketAddr, u32)>>>()
-                        .await
-                }
-            }
-        };
+        let recv_lo = recv_from_with_drop_count_socket(&lo_mcast, &mut lo_buf);
         // No `biased;` ordering — under SEARCH bursts on the wire the
         // per-NIC path can dominate the loopback path arbitrarily long
         // and we want fair round-robin between the two so a co-resident
@@ -788,7 +780,7 @@ pub async fn run_udp_responder_on_socket(
                 }
                 let outputs = process_search_datagram(
                     &source,
-                    lo_mcast.is_some(),
+                    true,
                     udp_port,
                     &buf[..frame_len],
                     meta.src,
@@ -799,12 +791,11 @@ pub async fn run_udp_responder_on_socket(
                     protocol,
                 )
                 .await;
-                dispatch_search_outputs(&socket, lo_mcast.as_ref(), outputs).await;
+                dispatch_search_outputs(&socket, Some(&lo_mcast), outputs).await;
             }
             r = recv_lo => {
                 let r = match r {
-                    Ok(Some(v)) => v,
-                    Ok(None) => continue,
+                    Ok(v) => v,
                     Err(e) => { debug!("loopback udp recv error: {e}"); continue; }
                 };
                 let (n, src, drops) = r;
@@ -845,7 +836,7 @@ pub async fn run_udp_responder_on_socket(
                     };
                 let outputs = process_search_datagram(
                     &source,
-                    lo_mcast.is_some(),
+                    true,
                     udp_port,
                     inner,
                     src,
@@ -856,7 +847,7 @@ pub async fn run_udp_responder_on_socket(
                     protocol,
                 )
                 .await;
-                dispatch_search_outputs(&socket, lo_mcast.as_ref(), outputs).await;
+                dispatch_search_outputs(&socket, Some(&lo_mcast), outputs).await;
             }
         }
     }
@@ -1466,6 +1457,101 @@ mod tests {
         /// Called with each number `bind_udp` is about to bind on v6.
         pub(super) static BEFORE_V6_BIND: std::cell::RefCell<Option<Box<dyn FnMut(u16)>>> =
             const { std::cell::RefCell::new(None) };
+    }
+
+    /// Loopback only: on a port holding ten sockets or fewer the kernel
+    /// checks a wildcard bind against each specific address, so the bundle's
+    /// own 127.0.0.1 socket refuses an ORIGIN_TAG bind made before its flags.
+    fn lo_mcast_server() -> crate::server_native::PvaServerConfig {
+        crate::server_native::PvaServerConfig {
+            interfaces: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    /// The ORIGIN_TAG socket is bound and joined before `start` returns, as
+    /// pvxs's `UDPCollector` is in the `Server` constructor: a SEARCH sent to
+    /// the group before the responder task first runs is still answered.
+    #[tokio::test]
+    async fn the_origin_tag_socket_is_joined_when_start_returns() {
+        use crate::nt::typed::TypedNT;
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
+        let pv = SharedPV::new();
+        pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();
+        let source = Arc::new(SharedSource::new());
+        source.add("LO:MCAST:PV", pv);
+        let server = PvaServer::start(source, lo_mcast_server()).expect("start");
+        let port = server.report().udp_port;
+
+        // This runtime is current-thread, so the responder has not run yet.
+        #[cfg(target_os = "linux")]
+        {
+            let wildcard = format!("00000000:{port:04X}");
+            let ours: std::collections::HashSet<String> = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+                .map(|l| l.to_string_lossy().into_owned())
+                .collect();
+            let held = std::fs::read_to_string("/proc/net/udp")
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(|l| l.split_whitespace().collect::<Vec<_>>())
+                .any(|f| f[1] == wildcard && ours.contains(&format!("socket:[{}]", f[9])));
+            assert!(held, "no wildcard socket of ours on {port} at start");
+        }
+
+        let client = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket2::SockRef::from(&client)
+            .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+            .unwrap();
+        let reply_port = client.local_addr().unwrap().port();
+        let frame = PvaCodec { big_endian: false }.build_search(
+            1,
+            0x1234,
+            "LO:MCAST:PV",
+            [127, 0, 0, 1],
+            reply_port,
+            false,
+        );
+        client
+            .send_to(&frame, (epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, port))
+            .unwrap();
+        client.set_nonblocking(true).unwrap();
+        let client = tokio::net::UdpSocket::from_std(client).unwrap();
+        let mut buf = [0u8; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("no SEARCH_RESPONSE: the group SEARCH sent at start was lost")
+            .unwrap();
+        let hdr = PvaHeader::decode(&mut Cursor::new(&buf[..n])).unwrap();
+        assert_eq!(hdr.command, Command::SearchResponse.code());
+    }
+
+    /// pvxs throws out of the `Server` constructor when the collector cannot
+    /// bind (`udp_collector.cpp:151`, `evhelper.cpp:498-505`). A stranger on
+    /// 127.0.0.2:P without reuse flags leaves the 127.0.0.1:P search bind free
+    /// but refuses the wildcard ORIGIN_TAG bind on P.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_failed_origin_tag_bind_fails_the_start() {
+        use crate::server_native::{PvaServer, SharedSource};
+        let holder = std::net::UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+        let config = crate::server_native::PvaServerConfig {
+            udp_port: holder.local_addr().unwrap().port(),
+            ..lo_mcast_server()
+        };
+        let err = PvaServer::start(Arc::new(SharedSource::new()), config).err();
+        assert!(
+            matches!(&err, Some(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse),
+            "{:?}",
+            err.map(|e| e.to_string())
+        );
     }
 
     /// Holds each number `bind_udp` tries on v6, as a stranger with no reuse

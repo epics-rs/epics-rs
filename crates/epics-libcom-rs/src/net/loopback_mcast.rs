@@ -61,6 +61,11 @@ pub use super::ORIGIN_TAG_MCAST_GROUP;
 ///
 /// Returns the tokio-wrapped socket. Caller still drives `recv_from`/
 /// `send_to` on it; this helper does no I/O.
+///
+/// Only a failed socket or bind is an error, as pvxs's `evsocket::bind`
+/// throws; a failed join or multicast option is logged and the socket kept,
+/// as `evsocket::mcast_join`/`mcast_loop` do (`evhelper.cpp:536-545`,
+/// `:611-620` at 1.5.3).
 pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -97,7 +102,9 @@ pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
 
     // Receive side: join 224.0.0.128 on the loopback interface so the
     // kernel delivers forwarded packets to us.
-    sock.join_multicast_v4(&ORIGIN_TAG_MCAST_GROUP, &Ipv4Addr::LOCALHOST)?;
+    if let Err(e) = sock.join_multicast_v4(&ORIGIN_TAG_MCAST_GROUP, &Ipv4Addr::LOCALHOST) {
+        tracing::error!("Unable to join mcast4 group {ORIGIN_TAG_MCAST_GROUP}: {e}");
+    }
 
     // Send side: any send to 224.0.0.128 from this socket goes out
     // via loopback (TTL=1 so it stays on this host) and loops back
@@ -109,9 +116,15 @@ pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
     // which is TTL=1 by design. `EPICS_CA_MCAST_TTL` governs routed
     // CA multicast only and must not leak this loopback channel onto
     // the wire.
-    sock.set_multicast_loop_v4(true)?;
-    sock.set_multicast_ttl_v4(1)?;
-    sock.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
+    for (what, set) in [
+        ("loopback", sock.set_multicast_loop_v4(true)),
+        ("TTL", sock.set_multicast_ttl_v4(1)),
+        ("interface", sock.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)),
+    ] {
+        if let Err(e) = set {
+            tracing::error!("Unable to set mcast {what}4: {e}");
+        }
+    }
 
     let std_sock: std::net::UdpSocket = sock.into();
     UdpSocket::from_std(std_sock)

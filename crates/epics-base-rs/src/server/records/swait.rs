@@ -1,7 +1,7 @@
 use super::calc_compile;
 use super::link_status::{LinkStatusGen, SWAIT_NO_PV, SWAIT_PV_STATUS_CHOICES, classify_swait_pv};
 use crate::calc::NumericInputs;
-use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
+use crate::calc::{Rpcl, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
@@ -22,6 +22,9 @@ const SWAIT_PV_STATUS_FIELDS: [&str; 14] = [
     "DOLV", "OUTV",
 ];
 
+/// `swaitRecord.dbd:431` `char rpcl[184]`.
+const SWAIT_RPCL_SIZE: usize = 184;
+
 // swait (string wait) record from synApps calc module.
 // Functionally equivalent to scalcout, but uses INxN/INxP naming for input links
 // (INxN = link name, INxP = process passive flag) instead of INPx.
@@ -33,7 +36,7 @@ pub struct SwaitRecord {
     /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     /// empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run, so
     /// the record alarms on every process. See [`calc_compile`].
-    compiled_calc: CompiledExpr,
+    rpcl: Rpcl<SWAIT_RPCL_SIZE>,
     /// CLCV ("CALC Valid", `swaitRecord.dbd:433`, `DBF_LONG`) — `postfix()`'s
     /// return status, stored on every compile (`swaitRecord.c:304` at init,
     /// `:561` in `special(SPC_CALC)`) and posted `DBE_VALUE` (`:309`, `:566`).
@@ -203,7 +206,7 @@ impl Default for SwaitRecord {
         Self {
             val: 0.0,
             calc: String::new(),
-            compiled_calc: CompiledExpr::empty(ExprKind::Numeric),
+            rpcl: Rpcl::empty(),
             clcv: 0,
             initialized: false,
             calc_alarm: false,
@@ -270,9 +273,8 @@ impl SwaitRecord {
         // returns 0 from `special()`, so the put SUCCEEDS and the client reads
         // the verdict back from CLCV (the calcout/scalcout/acalcout disposition,
         // not calcRecord's S_db_badField rejection).
-        let compiled = calc_compile::postfix(&self.calc);
+        let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
         self.clcv = compiled.status;
-        self.compiled_calc = compiled.program;
     }
 
     /// C `recGblRecordError(S_db_badField, pwait, pmessage)` on a CALC
@@ -820,7 +822,7 @@ impl Record for SwaitRecord {
             // alone. An empty or uncompilable CALC is the empty program and
             // fails here every cycle.
             let mut inputs = self.build_inputs(self.val);
-            let outcome = calc_eval(&self.compiled_calc, &mut inputs);
+            let outcome = calc_eval(&self.rpcl, &mut inputs);
             // C writes the stores through `&pwait->a` as the expression runs, so
             // they stand whether or not a later operator failed the perform.
             self.apply_stores(&inputs);

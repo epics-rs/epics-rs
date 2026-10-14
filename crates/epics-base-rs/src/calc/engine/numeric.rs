@@ -1,411 +1,375 @@
+use super::bytecode::{self, BASE, base::*};
 use super::cast::{d2i, d2ui, imod, nint};
 use super::error::CalcError;
-use super::opcodes::{CoreOp, Opcode};
 use super::random::calc_random;
-use super::{CompiledExpr, NumericInputs, NumericVars};
+use super::{NumericInputs, NumericVars};
 
-pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, CalcError> {
-    eval_vars(expr, inputs.view())
+pub fn eval(code: &[u8], inputs: &mut NumericInputs) -> Result<f64, CalcError> {
+    eval_vars(code, inputs.view())
 }
 
 /// `eval` on a borrowed arg block — the record's own `A..U`, as C's
 /// `calcPerform(&prec->a, ...)` is handed a pointer into the record.
-pub(crate) fn eval_vars(
-    expr: &CompiledExpr,
-    mut inputs: NumericVars<'_>,
-) -> Result<f64, CalcError> {
+pub(crate) fn eval_vars(code: &[u8], mut inputs: NumericVars<'_>) -> Result<f64, CalcError> {
     // C `calcPerform` runs the empty program's loop zero times and leaves the
     // stack empty, so its closing `if (ptop != stack + 1) return -1`
     // (`calcPerform.c:419-420`) fails it — and `*presult` is never written, so
     // the record keeps the previous VAL and goes to CALC_ALARM/INVALID. A
     // failed compile leaves exactly this program behind, which is how C makes a
     // broken CALC alarm on EVERY process rather than once at compile time.
-    if expr.is_empty() {
+    if bytecode::is_empty(code) {
         return Err(CalcError::EmptyProgram);
     }
 
     let mut stack = Stack::new();
-    let code = &expr.code;
     let mut pc = 0;
 
-    while pc < code.len() {
-        let op = &code[pc];
+    // C's `switch (*post++)` (`calcPerform.c:58`): one dispatch on the byte.
+    // Running off the end of the slice reads `END_EXPRESSION`.
+    while let Some(&b) = code.get(pc) {
         pc += 1;
 
-        match op {
-            Opcode::Core(core) => match core {
-                CoreOp::End => break,
+        match b {
+            END => break,
 
-                // Push operations
-                CoreOp::PushConst(v) => stack.push(*v),
-                // An arg the caller did not supply fetches 0 — the same rule
-                // `sCalcPerform.c:421-427` and `aCalcPerform.c:432` state for
-                // theirs. Base's C omits the bound and walks off the end of a
-                // short caller's field block (CBUG-G3); see `NumericInputs::num_args`.
-                CoreOp::PushVar(idx) => stack.push(inputs.num_arg(*idx as usize).unwrap_or(0.0)),
-                CoreOp::PushDoubleVar(idx) => {
-                    stack.push(inputs.num_arg(*idx as usize).unwrap_or(0.0));
-                }
+            // Push operations
+            LITERAL_DOUBLE => {
+                let p = code.get(pc..pc + 8).ok_or(CalcError::Internal)?;
+                stack.push(f64::from_ne_bytes(p.try_into().unwrap()));
+                pc += 8;
+            }
+            LITERAL_INT => {
+                let p = code.get(pc..pc + 4).ok_or(CalcError::Internal)?;
+                stack.push(f64::from(i32::from_ne_bytes(p.try_into().unwrap())));
+                pc += 4;
+            }
+            // An arg the caller did not supply fetches 0 — the same rule
+            // `sCalcPerform.c:421-427` and `aCalcPerform.c:432` state for
+            // theirs. Base's C omits the bound and walks off the end of a
+            // short caller's field block (CBUG-G3); see `NumericInputs::num_args`.
+            FETCH_A..=FETCH_U => {
+                stack.push(inputs.num_arg(usize::from(b - FETCH_A)).unwrap_or(0.0));
+            }
 
-                // Constants
-                CoreOp::Pi => stack.push(std::f64::consts::PI),
-                CoreOp::D2R => stack.push(std::f64::consts::PI / 180.0),
-                CoreOp::R2D => stack.push(180.0 / std::f64::consts::PI),
-                CoreOp::S2R | CoreOp::R2S => {
-                    // The arcsecond constants are synApps-only (`sCalcPostfix.c:136,173`,
-                    // `aCalcPostfix.c:186,195`); base's element table has no S2R/R2S,
-                    // so `calcPerform` can never see them. Same shared-tokenizer
-                    // reachability as `FetchSval` below.
-                    return Err(CalcError::Internal);
-                }
+            // Constants
+            CONST_PI => stack.push(std::f64::consts::PI),
+            CONST_D2R => stack.push(std::f64::consts::PI / 180.0),
+            CONST_R2D => stack.push(180.0 / std::f64::consts::PI),
 
-                // Random. BASE's generator, not synApps' — `calcRandom`
-                // (`calcPerform.c:518-523`) maps the shared Knuth LCG with
-                // `seed / 65535.0`, where sCalc/aCalc use `(seed+1) / 65536.0`.
-                // Every draw differs, from the first one on.
-                CoreOp::Random => {
-                    stack.push(calc_random());
-                }
-                CoreOp::FetchVal => {
-                    // C calcPerform.c:74-76 — FETCH_VAL pushes *presult, the
-                    // record's previous calculation result (the VAL field).
-                    stack.push(inputs.prev_val);
-                }
-                CoreOp::FetchSval => {
-                    // C's numeric `postfix()` element table has no SVAL token,
-                    // so `calcPerform` can never see FETCH_SVAL. It reaches this
-                    // evaluator only because the port shares one tokenizer with
-                    // sCalc, and is rejected like every other string-only opcode
-                    // (the `Opcode::String(_)` catch-all below).
-                    return Err(CalcError::Internal);
-                }
-                CoreOp::NormalRandom => {
-                    // `NRNDM` is synApps-only (`sCalcPostfix.c:169`,
-                    // `aCalcPostfix.c:133`); base's element table has RNDM and
-                    // nothing else (`postfix.c:133`), so `calcPerform` has no
-                    // NORMAL_RNDM case to run. Unreachable here for the same
-                    // shared-tokenizer reason as `FetchSval` and S2R/R2S — and
-                    // it must NOT draw, since base's generator is `calcRandom`
-                    // and its `[0, 1]` range would let `log(0)` through.
-                    return Err(CalcError::Internal);
-                }
+            // Random. BASE's generator, not synApps' — `calcRandom`
+            // (`calcPerform.c:518-523`) maps the shared Knuth LCG with
+            // `seed / 65535.0`, where sCalc/aCalc use `(seed+1) / 65536.0`.
+            // Every draw differs, from the first one on.
+            RANDOM => {
+                stack.push(calc_random());
+            }
+            FETCH_VAL => {
+                // C calcPerform.c:74-76 — FETCH_VAL pushes *presult, the
+                // record's previous calculation result (the VAL field).
+                stack.push(inputs.prev_val);
+            }
+            // Arithmetic
+            ADD => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(a + b);
+            }
+            SUB => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(a - b);
+            }
+            MULT => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(a * b);
+            }
+            DIV => {
+                let (a, b) = pop2(&mut stack)?;
+                // C uses IEEE 754: 1.0/0.0 = Inf, 0.0/0.0 = NaN
+                stack.push(a / b);
+            }
+            MODULO => {
+                let (a, b) = pop2(&mut stack)?;
+                // C `calcPerform.c:176-190` (unmerged PR #925):
+                //   itop = d2i(top);
+                //   if (itop == 0)       *ptop = epicsNAN;
+                //   else if (itop == -1) *ptop = 0;
+                //   else                 *ptop = d2i(*ptop) % itop;
+                // base's dialect narrowing is `d2i`; `cast::imod` owns the
+                // -1 guard; base's zero-divisor rule is NaN. See CBUG-A2.
+                stack.push(imod(a, b, |x| i64::from(d2i(x))).unwrap_or(f64::NAN));
+            }
+            UNARY_NEG => {
+                let a = pop1(&mut stack)?;
+                stack.push(-a);
+            }
+            POWER => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(a.powf(b));
+            }
 
-                // Arithmetic
-                CoreOp::Add => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(a + b);
-                }
-                CoreOp::Sub => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(a - b);
-                }
-                CoreOp::Mul => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(a * b);
-                }
-                CoreOp::Div => {
-                    let (a, b) = pop2(&mut stack)?;
-                    // C uses IEEE 754: 1.0/0.0 = Inf, 0.0/0.0 = NaN
-                    stack.push(a / b);
-                }
-                CoreOp::Mod => {
-                    let (a, b) = pop2(&mut stack)?;
-                    // C `calcPerform.c:176-190` (unmerged PR #925):
-                    //   itop = d2i(top);
-                    //   if (itop == 0)       *ptop = epicsNAN;
-                    //   else if (itop == -1) *ptop = 0;
-                    //   else                 *ptop = d2i(*ptop) % itop;
-                    // base's dialect narrowing is `d2i`; `cast::imod` owns the
-                    // -1 guard; base's zero-divisor rule is NaN. See CBUG-A2.
-                    stack.push(imod(a, b, |x| i64::from(d2i(x))).unwrap_or(f64::NAN));
-                }
-                CoreOp::Neg => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(-a);
-                }
-                CoreOp::Power => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(a.powf(b));
-                }
+            // Comparison - exact comparison like C (no epsilon)
+            EQUAL => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a == b { 1.0 } else { 0.0 });
+            }
+            NOT_EQ => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a != b { 1.0 } else { 0.0 });
+            }
+            LESS_THAN => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a < b { 1.0 } else { 0.0 });
+            }
+            LESS_OR_EQ => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a <= b { 1.0 } else { 0.0 });
+            }
+            GR_THAN => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a > b { 1.0 } else { 0.0 });
+            }
+            GR_OR_EQ => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a >= b { 1.0 } else { 0.0 });
+            }
 
-                // Comparison - exact comparison like C (no epsilon)
-                CoreOp::Eq => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a == b { 1.0 } else { 0.0 });
-                }
-                CoreOp::Ne => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a != b { 1.0 } else { 0.0 });
-                }
-                CoreOp::Lt => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a < b { 1.0 } else { 0.0 });
-                }
-                CoreOp::Le => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a <= b { 1.0 } else { 0.0 });
-                }
-                CoreOp::Gt => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a > b { 1.0 } else { 0.0 });
-                }
-                CoreOp::Ge => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a >= b { 1.0 } else { 0.0 });
-                }
+            // Logical
+            REL_AND => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 });
+            }
+            REL_OR => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 });
+            }
+            REL_NOT => {
+                let a = pop1(&mut stack)?;
+                stack.push(if a == 0.0 { 1.0 } else { 0.0 });
+            }
 
-                // Logical
-                CoreOp::And => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 });
-                }
-                CoreOp::Or => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 });
-                }
-                CoreOp::Not => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(if a == 0.0 { 1.0 } else { 0.0 });
-                }
+            // Bitwise - use C's d2i/d2ui conversion (wrap-on-overflow 32-bit)
+            BIT_AND => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push((d2i(a) & d2i(b)) as f64);
+            }
+            BIT_OR => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push((d2i(a) | d2i(b)) as f64);
+            }
+            BIT_EXCL_OR => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push((d2i(a) ^ d2i(b)) as f64);
+            }
+            BIT_NOT => {
+                let a = pop1(&mut stack)?;
+                stack.push(!d2i(a) as f64);
+            }
+            LEFT_SHIFT_ARITH => {
+                let (a, b) = pop2(&mut stack)?;
+                // C: d2i(*ptop) << (d2i(top) & 31)
+                stack.push((d2i(a) << (d2i(b) & 31)) as f64);
+            }
+            RIGHT_SHIFT_ARITH => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push((d2i(a) >> (d2i(b) & 31)) as f64);
+            }
+            RIGHT_SHIFT_LOGIC => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push((d2ui(a) >> (d2ui(b) & 31)) as f64);
+            }
 
-                // Bitwise - use C's d2i/d2ui conversion (wrap-on-overflow 32-bit)
-                CoreOp::BitAnd => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push((d2i(a) & d2i(b)) as f64);
+            // Conditional
+            COND_IF => {
+                let cond = pop1(&mut stack)?;
+                if cond == 0.0 {
+                    pc = bytecode::cond_search(&BASE, code, pc, true)?;
                 }
-                CoreOp::BitOr => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push((d2i(a) | d2i(b)) as f64);
-                }
-                CoreOp::BitXor => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push((d2i(a) ^ d2i(b)) as f64);
-                }
-                CoreOp::BitNot => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(!d2i(a) as f64);
-                }
-                CoreOp::Shl => {
-                    let (a, b) = pop2(&mut stack)?;
-                    // C: d2i(*ptop) << (d2i(top) & 31)
-                    stack.push((d2i(a) << (d2i(b) & 31)) as f64);
-                }
-                CoreOp::Shr => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push((d2i(a) >> (d2i(b) & 31)) as f64);
-                }
-                CoreOp::ShrLogical => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push((d2ui(a) >> (d2ui(b) & 31)) as f64);
-                }
+            }
+            COND_ELSE => {
+                pc = bytecode::cond_search(&BASE, code, pc, false)?;
+            }
+            COND_END => {
+                // No-op, just a marker
+            }
 
-                // Conditional
-                CoreOp::CondIf => {
-                    let cond = pop1(&mut stack)?;
-                    if cond == 0.0 {
-                        pc = cond_search(code, pc, true)?;
-                    }
-                }
-                CoreOp::CondElse => {
-                    pc = cond_search(code, pc, false)?;
-                }
-                CoreOp::CondEnd => {
-                    // No-op, just a marker
-                }
+            // Math functions (1 arg)
+            //
+            // BASE's ABS is `fabs` (`calcPerform.c:174-176`) and stays that
+            // way: `ABS(-0.0)` is `+0.0` here. The synApps engines use a
+            // conditional negate and answer `-0.0` — a real dialect
+            // difference, not an oversight to unify (see [`super::abs_val`],
+            // which they, and only they, call).
+            ABS_VAL => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.abs());
+            }
+            SQU_RT => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.sqrt());
+            }
+            EXP => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.exp());
+            }
+            LOG_10 => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.log10());
+            }
+            LOG_E => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.ln());
+            }
+            SIN => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.sin());
+            }
+            COS => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.cos());
+            }
+            TAN => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.tan());
+            }
+            ASIN => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.asin());
+            }
+            ACOS => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.acos());
+            }
+            ATAN => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.atan());
+            }
+            SINH => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.sinh());
+            }
+            COSH => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.cosh());
+            }
+            TANH => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.tanh());
+            }
+            CEIL => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.ceil());
+            }
+            FLOOR => {
+                let a = pop1(&mut stack)?;
+                stack.push(a.floor());
+            }
+            NINT => {
+                let a = pop1(&mut stack)?;
+                // C `calcPerform.c:313-317` (unmerged PR #925):
+                //   top = top >= 0 ? top+0.5 : top-0.5;
+                //   *ptop = d2i(top);
+                // base's dialect narrowing is `d2i`. See CBUG-A2.
+                stack.push(nint(a, |x| i64::from(d2i(x))));
+            }
 
-                // Math functions (1 arg)
-                //
-                // BASE's ABS is `fabs` (`calcPerform.c:174-176`) and stays that
-                // way: `ABS(-0.0)` is `+0.0` here. The synApps engines use a
-                // conditional negate and answer `-0.0` — a real dialect
-                // difference, not an oversight to unify (see [`super::abs_val`],
-                // which they, and only they, call).
-                CoreOp::Abs => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.abs());
+            // Test functions
+            ISNAN => {
+                let n = usize::from(*code.get(pc).ok_or(CalcError::Internal)?);
+                pc += 1;
+                if stack.len() < n {
+                    return Err(CalcError::Underflow);
                 }
-                CoreOp::Sqrt => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.sqrt());
+                let mut result = false;
+                for _ in 0..n {
+                    let v = stack.pop().unwrap();
+                    result = result || v.is_nan();
                 }
-                CoreOp::Exp => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.exp());
+                stack.push(if result { 1.0 } else { 0.0 });
+            }
+            ISINF => {
+                let a = pop1(&mut stack)?;
+                stack.push(super::isinf(a));
+            }
+            FINITE => {
+                let n = usize::from(*code.get(pc).ok_or(CalcError::Internal)?);
+                pc += 1;
+                if stack.len() < n {
+                    return Err(CalcError::Underflow);
                 }
-                CoreOp::Log10 => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.log10());
+                let mut result = true;
+                for _ in 0..n {
+                    let v = stack.pop().unwrap();
+                    result = result && v.is_finite();
                 }
-                CoreOp::LogE => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.ln());
-                }
-                CoreOp::Sin => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.sin());
-                }
-                CoreOp::Cos => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.cos());
-                }
-                CoreOp::Tan => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.tan());
-                }
-                CoreOp::Asin => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.asin());
-                }
-                CoreOp::Acos => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.acos());
-                }
-                CoreOp::Atan => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.atan());
-                }
-                CoreOp::Sinh => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.sinh());
-                }
-                CoreOp::Cosh => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.cosh());
-                }
-                CoreOp::Tanh => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.tanh());
-                }
-                CoreOp::Ceil => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.ceil());
-                }
-                CoreOp::Floor => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.floor());
-                }
-                CoreOp::Nint => {
-                    let a = pop1(&mut stack)?;
-                    // C `calcPerform.c:313-317` (unmerged PR #925):
-                    //   top = top >= 0 ? top+0.5 : top-0.5;
-                    //   *ptop = d2i(top);
-                    // base's dialect narrowing is `d2i`. See CBUG-A2.
-                    stack.push(nint(a, |x| i64::from(d2i(x))));
-                }
+                stack.push(if result { 1.0 } else { 0.0 });
+            }
 
-                // Test functions
-                CoreOp::IsNan(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = false;
-                    for _ in 0..n {
-                        let v = stack.pop().unwrap();
-                        result = result || v.is_nan();
-                    }
-                    stack.push(if result { 1.0 } else { 0.0 });
-                }
-                CoreOp::IsInf => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(super::isinf(a));
-                }
-                CoreOp::Finite(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = true;
-                    for _ in 0..n {
-                        let v = stack.pop().unwrap();
-                        result = result && v.is_finite();
-                    }
-                    stack.push(if result { 1.0 } else { 0.0 });
-                }
+            // 2-arg functions
+            ATAN2 => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(b.atan2(a));
+            }
+            FMOD => {
+                let (a, b) = pop2(&mut stack)?;
+                stack.push(a % b);
+            }
 
-                // 2-arg functions
-                CoreOp::Atan2 => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(b.atan2(a));
+            // Vararg min/max
+            MAX => {
+                let n = usize::from(*code.get(pc).ok_or(CalcError::Internal)?);
+                pc += 1;
+                if stack.len() < n {
+                    return Err(CalcError::Underflow);
                 }
-                CoreOp::Fmod => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(a % b);
+                // C: top = *ptop--; if (*ptop < top || isnan(top)) *ptop = top;
+                // The running value (`acc`) flows from the shallowest operand
+                // toward the deepest; at each step `acc` is C's `top` and the
+                // next-deeper operand is C's accumulator `*ptop`.
+                let base = stack.len() - n;
+                let mut acc = stack[stack.len() - 1];
+                for i in (base..stack.len() - 1).rev() {
+                    let deeper = stack[i];
+                    // Keep `acc` when `deeper < acc` or `acc` is NaN, else `deeper`.
+                    acc = if deeper < acc || acc.is_nan() {
+                        acc
+                    } else {
+                        deeper
+                    };
                 }
+                stack.truncate(base);
+                stack.push(acc);
+            }
+            MIN => {
+                let n = usize::from(*code.get(pc).ok_or(CalcError::Internal)?);
+                pc += 1;
+                if stack.len() < n {
+                    return Err(CalcError::Underflow);
+                }
+                // C: top = *ptop--; if (*ptop > top || isnan(top)) *ptop = top;
+                let base = stack.len() - n;
+                let mut acc = stack[stack.len() - 1];
+                for i in (base..stack.len() - 1).rev() {
+                    let deeper = stack[i];
+                    acc = if deeper > acc || acc.is_nan() {
+                        acc
+                    } else {
+                        deeper
+                    };
+                }
+                stack.truncate(base);
+                stack.push(acc);
+            }
 
-                // Vararg min/max
-                CoreOp::Max(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    // C: top = *ptop--; if (*ptop < top || isnan(top)) *ptop = top;
-                    // The running value (`acc`) flows from the shallowest operand
-                    // toward the deepest; at each step `acc` is C's `top` and the
-                    // next-deeper operand is C's accumulator `*ptop`.
-                    let base = stack.len() - n;
-                    let mut acc = stack[stack.len() - 1];
-                    for i in (base..stack.len() - 1).rev() {
-                        let deeper = stack[i];
-                        // Keep `acc` when `deeper < acc` or `acc` is NaN, else `deeper`.
-                        acc = if deeper < acc || acc.is_nan() {
-                            acc
-                        } else {
-                            deeper
-                        };
-                    }
-                    stack.truncate(base);
-                    stack.push(acc);
+            // Store. The stack is popped whether or not the arg exists — C's
+            // guarded store (`sCalcPerform.c:432-438`) pops in both arms too;
+            // only the assignment is conditional.
+            STORE_A..=STORE_U => {
+                let v = pop1(&mut stack)?;
+                if let Some(slot) = inputs.num_arg_mut(usize::from(b - STORE_A)) {
+                    *slot = v;
                 }
-                CoreOp::Min(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    // C: top = *ptop--; if (*ptop > top || isnan(top)) *ptop = top;
-                    let base = stack.len() - n;
-                    let mut acc = stack[stack.len() - 1];
-                    for i in (base..stack.len() - 1).rev() {
-                        let deeper = stack[i];
-                        acc = if deeper > acc || acc.is_nan() {
-                            acc
-                        } else {
-                            deeper
-                        };
-                    }
-                    stack.truncate(base);
-                    stack.push(acc);
-                }
+            }
 
-                // Binary max/min operators
-                CoreOp::MaxVal => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a > b { a } else { b });
-                }
-                CoreOp::MinVal => {
-                    let (a, b) = pop2(&mut stack)?;
-                    stack.push(if a < b { a } else { b });
-                }
-
-                // Store. The stack is popped whether or not the arg exists — C's
-                // guarded store (`sCalcPerform.c:432-438`) pops in both arms too;
-                // only the assignment is conditional.
-                CoreOp::StoreVar(idx) => {
-                    let v = pop1(&mut stack)?;
-                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
-                        *slot = v;
-                    }
-                }
-                CoreOp::StoreDoubleVar(idx) => {
-                    let v = pop1(&mut stack)?;
-                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
-                        *slot = v;
-                    }
-                }
-            },
-
-            // Non-core opcodes are not supported by the numeric evaluator
-            #[allow(unreachable_patterns)]
+            // A byte outside base's enum: no compiler writes one.
             _ => return Err(CalcError::Internal),
         }
     }
@@ -443,42 +407,10 @@ fn pop2(stack: &mut Stack) -> Result<(f64, f64), CalcError> {
     Ok((a, b))
 }
 
-/// Forward-scan for a matching conditional opcode, mirroring C `cond_search`
-/// (calcPerform.c:520-557): `count` starts at 1, every occurrence of the target
-/// opcode decrements it (return when 0), and every `COND_IF` increments it.
-/// `COND_ELSE`/`COND_END` are not specially tracked for nesting.
-fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, CalcError> {
-    let mut count: i32 = 1;
-    let mut pc = start;
-
-    while pc < code.len() {
-        let op = &code[pc];
-        if matches!(op, Opcode::Core(CoreOp::End)) {
-            break;
-        }
-        let is_match = match op {
-            Opcode::Core(CoreOp::CondElse) => find_else,
-            Opcode::Core(CoreOp::CondEnd) => !find_else,
-            _ => false,
-        };
-        if is_match {
-            count -= 1;
-            if count == 0 {
-                return Ok(pc + 1);
-            }
-        }
-        if matches!(op, Opcode::Core(CoreOp::CondIf)) {
-            count += 1;
-        }
-        pc += 1;
-    }
-
-    Err(CalcError::Conditional)
-}
-
 #[cfg(test)]
 mod parity_tests {
     //! C-parity regression tests for calc engine fixes.
+    use crate::calc::engine::bytecode::base::*;
     use crate::calc::engine::cast::{d2i, d2ui};
     use crate::calc::engine::error::calc_error_str;
     use crate::calc::{
@@ -493,17 +425,8 @@ mod parity_tests {
     // malformed postfix leaving multiple residual values must error.
     #[test]
     fn c1_runtime_depth_multi_value_errors() {
-        // Hand-built postfix: two PushConst, no operator, then End.
-        use crate::calc::engine::opcodes::{CoreOp, Opcode};
-        use crate::calc::{CompiledExpr, ExprKind};
-        let prog = CompiledExpr {
-            code: vec![
-                Opcode::Core(CoreOp::PushConst(1.0)),
-                Opcode::Core(CoreOp::PushConst(2.0)),
-                Opcode::Core(CoreOp::End),
-            ],
-            ..CompiledExpr::empty(ExprKind::Numeric)
-        };
+        // Hand-built postfix: two literals, no operator, then END.
+        let prog = [LITERAL_INT, 1, 0, 0, 0, LITERAL_INT, 2, 0, 0, 0, END];
         let mut inp = NumericInputs::new();
         assert_eq!(eval(&prog, &mut inp), Err(CalcError::Internal));
     }
@@ -740,10 +663,12 @@ mod parity_tests {
         }
     }
 
-    // hex literal must fit in 32 bits.
+    // hex literal must fit in 32 bits, and runs as the int32 C's LITERAL_INT is.
     #[test]
     fn m3_hex_literal_32bit() {
-        assert_eq!(run("0xFFFFFFFF"), 4294967295.0);
+        assert_eq!(run("0xFFFFFFFF"), -1.0);
+        assert_eq!(run("0x80000000"), -2147483648.0);
+        assert_eq!(run("0x7FFFFFFF"), 2147483647.0);
         assert!(matches!(compile("0x1FFFFFFFF"), Err(CalcError::BadLiteral)));
     }
 
@@ -804,21 +729,15 @@ mod parity_tests {
         assert_eq!(got[0], 49156.0 / 65535.0);
     }
 
-    /// NRNDM is not in base's element table, so it cannot compile — and if one
-    /// were hand-assembled, the evaluator refuses it rather than drawing from
-    /// base's `[0, 1]` generator (`log(0)`).
+    /// NRNDM is not in base's element table, so it cannot compile, and base's
+    /// enum has no code for it; a byte past the enum (`NOT_GENERATED`) is
+    /// refused rather than run.
     #[test]
     fn l4_normal_random_is_not_a_base_operator() {
-        use crate::calc::engine::opcodes::{CoreOp, Opcode};
-        use crate::calc::{CompiledExpr, ExprKind};
         assert_eq!(compile("NRNDM").unwrap_err(), CalcError::Syntax);
-        let mut hand_built = CompiledExpr::empty(ExprKind::Numeric);
-        hand_built.code = vec![
-            Opcode::Core(CoreOp::NormalRandom),
-            Opcode::Core(CoreOp::End),
-        ];
+        let not_generated = COND_END + 1;
         assert_eq!(
-            eval(&hand_built, &mut NumericInputs::new()).unwrap_err(),
+            eval(&[not_generated, END], &mut NumericInputs::new()).unwrap_err(),
             CalcError::Internal
         );
     }
@@ -830,17 +749,14 @@ mod parity_tests {
     /// expression can reach this.
     #[test]
     fn a_push_past_the_frame_array_fails_the_evaluation() {
-        use crate::calc::engine::opcodes::{CoreOp, Opcode};
-        use crate::calc::{CompiledExpr, ExprKind};
         for (pushes, expected) in [
             (super::CALCPERFORM_STACK, CalcError::Internal),
             (super::CALCPERFORM_STACK + 1, CalcError::Overflow),
         ] {
-            let mut hand_built = CompiledExpr::empty(ExprKind::Numeric);
-            hand_built.code = (0..pushes)
-                .map(|i| Opcode::Core(CoreOp::PushConst(i as f64)))
-                .chain(std::iter::once(Opcode::Core(CoreOp::End)))
+            let mut hand_built: Vec<u8> = (0..pushes as i32)
+                .flat_map(|i| std::iter::once(LITERAL_INT).chain(i.to_ne_bytes()))
                 .collect();
+            hand_built.push(END);
             assert_eq!(
                 eval(&hand_built, &mut NumericInputs::new()).unwrap_err(),
                 expected,

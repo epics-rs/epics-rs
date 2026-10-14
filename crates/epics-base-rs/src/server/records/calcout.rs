@@ -217,8 +217,8 @@ pub struct CalcoutRecord {
     // C `RPCL` / `ORPC`. Always a program: an empty or uncompilable CALC/OCAL
     // carries C's empty `END_EXPRESSION` postfix, which `calcPerform` refuses to
     // run, so the record alarms on every process. See [`calc_compile`].
-    rpcl: crate::calc::CompiledExpr,
-    orpc: crate::calc::CompiledExpr,
+    rpcl: crate::calc::Rpcl<CALCOUT_RPCL_SIZE>,
+    orpc: crate::calc::Rpcl<CALCOUT_RPCL_SIZE>,
     // CLCV/OCLV — `DBF_LONG` expression-validity fields
     // (calcoutRecord.dbd.pod:729,1049). C stores `postfix()`'s RETURN VALUE
     // here (`prec->clcv = postfix(...)`, calcoutRecord.c:327,338), i.e. 0 when
@@ -351,8 +351,8 @@ impl Default for CalcoutRecord {
             calc_alarm: None,
             fetch_gate_failed: false,
             value_computed: false,
-            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
-            orpc: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            rpcl: crate::calc::Rpcl::empty(),
+            orpc: crate::calc::Rpcl::empty(),
             clcv: 0,
             oclv: 0,
             // C `init_record` leaves an empty/unconfigured link CON
@@ -369,6 +369,9 @@ impl Default for CalcoutRecord {
     }
 }
 
+/// `calcoutRecord.dbd` `rpcl`/`orpc[INFIX_TO_POSTFIX_SIZE(160)]`.
+const CALCOUT_RPCL_SIZE: usize = crate::calc::infix_to_postfix_size(160);
+
 impl CalcoutRecord {
     /// C's CALC compile, the same in `init_record` (calcoutRecord.c:191-197)
     /// and `special()` (`:325-333`): a refused `postfix()` writes
@@ -376,22 +379,20 @@ impl CalcoutRecord {
     /// `calcErrorStr` line, both naming the record. Returned, not printed:
     /// `special()` runs under the put's hold.
     fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
-        let compiled = calc_compile::postfix(&self.calc);
+        let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
         let report = compiled.put_report_in_expression(pmessage, "CALC", &self.calc);
         self.clcv = compiled.status;
-        self.rpcl = compiled.program;
         report
     }
 
     /// The OCAL half (`:199-205`, `:336-342`): reported only under DOPT
     /// "Use OCAL"; OCLV is -1 either way.
     fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
-        let compiled = calc_compile::postfix(&self.ocal);
+        let compiled = calc_compile::postfix_into(&self.ocal, &mut self.orpc);
         let report = compiled
             .put_report_in_expression(pmessage, "OCAL", &self.ocal)
             .filter(|_| self.dopt == 1);
         self.oclv = compiled.status;
-        self.orpc = compiled.program;
         report
     }
 

@@ -102,7 +102,7 @@ use crate::server::record::{
 use crate::types::{EpicsValue, PvString};
 
 use super::calc_compile;
-use crate::calc::{ArrayInputs, CompiledExpr, ExprKind, acalc_eval};
+use crate::calc::{ArrayInputs, Rpcl, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::{LINK_CON, LinkStatusGen, LinkStatusPosts, post_link_status};
@@ -391,6 +391,9 @@ mod array_mem {
 
 use array_mem::{ArrayBuf, ArrayMem};
 
+/// `aCalcoutRecord.dbd:805,811` `unsigned char rpcl[282]`, `orpc[282]`.
+const ACALCOUT_RPCL_SIZE: usize = 282;
+
 /// aCalcout record state. Field comments cite the `aCalcoutRecord.dbd`
 /// declaration; behaviour cites `aCalcoutRecord.c`.
 pub struct AcalcoutRecord {
@@ -424,13 +427,13 @@ pub struct AcalcoutRecord {
     /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     /// empty `END_EXPRESSION` postfix, which `aCalcPerform` refuses to run
     /// (`aCalcPerform.c:312-314`), so the record alarms on every process.
-    compiled_calc: CompiledExpr,
+    rpcl: Rpcl<ACALCOUT_RPCL_SIZE>,
     clcv: i32,
 
     // --- OCAL / output-data option ---
     pub ocal: String,
-    /// C `ORPC`. Same contract as [`Self::compiled_calc`].
-    compiled_ocal: CompiledExpr,
+    /// C `ORPC`. Same contract as [`Self::rpcl`].
+    orpc: Rpcl<ACALCOUT_RPCL_SIZE>,
     oclv: i32,
     dopt: i16, // 0=Use CALC, 1=Use OCAL
     oval: f64,
@@ -545,10 +548,10 @@ impl Default for AcalcoutRecord {
             nuse: 0, // dbd initial("0")
             nuse_post_pending: None,
             calc: String::new(),
-            compiled_calc: CompiledExpr::empty(ExprKind::Array),
+            rpcl: Rpcl::empty(),
             clcv: 0,
             ocal: String::new(),
-            compiled_ocal: CompiledExpr::empty(ExprKind::Array),
+            orpc: Rpcl::empty(),
             oclv: 0,
             dopt: 0,
             oval: 0.0,
@@ -925,7 +928,7 @@ impl AcalcoutRecord {
     ///   straight into the record's fields on the way there.
     fn eval(
         &self,
-        compiled: &CompiledExpr,
+        compiled: &Rpcl<ACALCOUT_RPCL_SIZE>,
         n: usize,
         prev_val: f64,
         prev_aval: &[f64],
@@ -1015,17 +1018,15 @@ impl AcalcoutRecord {
     /// `aCalcoutRecordDebug >= 10`. The report is returned, not printed:
     /// `special()` runs under the put's hold.
     fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
-        let compiled = calc_compile::acalc_postfix(&self.calc);
+        let compiled = calc_compile::acalc_postfix_into(&self.calc, &mut self.rpcl);
         self.clcv = compiled.status;
-        self.compiled_calc = compiled.program;
         Self::bad_expr_report(self.clcv, pmessage)
     }
 
     /// C `aCalcoutRecord.c::special:483-490` — same, into ORPC/OCLV.
     fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
-        let compiled = calc_compile::acalc_postfix(&self.ocal);
+        let compiled = calc_compile::acalc_postfix_into(&self.ocal, &mut self.orpc);
         self.oclv = compiled.status;
-        self.compiled_ocal = compiled.program;
         Self::bad_expr_report(self.oclv, pmessage)
     }
 
@@ -1359,7 +1360,7 @@ impl Record for AcalcoutRecord {
         let mut calc_failed = false;
         // CALC pass: the `VAL` token reads `prec->val` (this pass's result
         // field) before it is overwritten.
-        let pass = self.eval(&self.compiled_calc, n, self.val, &self.aval);
+        let pass = self.eval(&self.rpcl, n, self.val, &self.aval);
         // C passes `&pcalc->amask` straight into aCalcPerform, which zeroes it at
         // entry (`aCalcPerform.c:326`) — so the CALC pass REPLACES the record's mask
         // and nothing carries over from the previous process.
@@ -1386,7 +1387,7 @@ impl Record for AcalcoutRecord {
             // It sees the CALC pass's stores, because C's two calls share the same
             // record fields — which is why `apply_stores` above must land before this
             // `eval` rebuilds its inputs from them.
-            let pass = self.eval(&self.compiled_ocal, n, self.oval, &self.oav);
+            let pass = self.eval(&self.orpc, n, self.oval, &self.oav);
             // C `aCalcoutRecord.c:1288-1291` — the OCAL pass gets a LOCAL mask that is
             // then OR'd in, so a CALC-pass store stays flagged.
             self.amask |= pass.inputs.amask;
@@ -2906,7 +2907,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         // Non-empty CALC that fails to compile.
         rec.calc = "???bad".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
+        rec.rpcl = Rpcl::empty();
         rec.process().unwrap();
         assert!(rec.calc_alarm);
         assert_eq!(rec.cstat, -1);
@@ -3032,7 +3033,7 @@ mod tests {
     fn test_acalcout_ivoa_dont_drive_on_failure() {
         let mut rec = AcalcoutRecord::new();
         rec.calc = "???bad".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
+        rec.rpcl = Rpcl::empty();
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
         rec.process().unwrap();
         assert!(!rec.cached_should_output);
@@ -3044,7 +3045,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(2)).unwrap();
         rec.calc = "???bad".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
+        rec.rpcl = Rpcl::empty();
         rec.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set to IVOV
         rec.put_field("IVOV", EpicsValue::Double(9.0)).unwrap();
         rec.process().unwrap();

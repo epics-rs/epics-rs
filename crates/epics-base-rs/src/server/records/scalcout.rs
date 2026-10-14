@@ -12,12 +12,15 @@ use super::link_status::{
 };
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
-use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
+use crate::calc::{Rpcl, ScalcResult, scalc_perform};
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::{PutReport, ReportTail};
 
 /// Code version reported by `VERS` (C `sCalcoutRecord.c:55 #define VERSION 4.1`).
 const VERSION: f64 = 4.1;
+
+/// `sCalcoutRecord.dbd:877,883` `unsigned char rpcl[282]`, `orpc[282]`.
+const SCALCOUT_RPCL_SIZE: usize = 282;
 
 /// Scalcout record — string calc with output.
 ///
@@ -32,7 +35,7 @@ pub struct ScalcoutRecord {
     /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     /// empty `END_EXPRESSION` postfix, which `sCalcPerform` refuses to run
     /// (`sCalcPerform.c:396`), so the record alarms on every process.
-    compiled_calc: CompiledExpr,
+    rpcl: Rpcl<SCALCOUT_RPCL_SIZE>,
     /// CLCV/OCLV — `DBF_LONG` expression-validity fields
     /// (sCalcoutRecord.dbd:75,438). C stores `sCalcPostfix()`'s RETURN VALUE
     /// (`pcalc->clcv = sCalcPostfix(...)`, sCalcoutRecord.c:464,475): 0 when the
@@ -42,8 +45,8 @@ pub struct ScalcoutRecord {
     pub oopt: i16, // 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
     pub dopt: i16, // 0=Use CALC, 1=Use OCAL
     pub ocal: String,
-    /// C `ORPC`. Same contract as [`Self::compiled_calc`].
-    compiled_ocal: CompiledExpr,
+    /// C `ORPC`. Same contract as [`Self::rpcl`].
+    orpc: Rpcl<SCALCOUT_RPCL_SIZE>,
     pub oval: f64,
     pub osv: PvString,
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
@@ -215,13 +218,13 @@ impl Default for ScalcoutRecord {
             val: 0.0,
             sval: PvString::new(),
             calc: String::new(),
-            compiled_calc: CompiledExpr::empty(ExprKind::String),
+            rpcl: Rpcl::empty(),
             clcv: 0,
             oclv: 0,
             oopt: 0,
             dopt: 0,
             ocal: String::new(),
-            compiled_ocal: CompiledExpr::empty(ExprKind::String),
+            orpc: Rpcl::empty(),
             oval: 0.0,
             osv: PvString::new(),
             ivoa: 0,
@@ -395,7 +398,7 @@ impl ScalcoutRecord {
         // RESULT cells differ between the passes, the arg set is the record's
         // own A..L / AA..LL that CALC stored into.
         let mut inputs = self.build_inputs(self.oval, &self.osv);
-        match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
+        match scalc_perform(&self.orpc, &mut inputs, self.prec) {
             // As on the CALC side: a non-finite OCAL result is C's -1 with the
             // cells written, and `execOutput` reads only the status — so it
             // takes the OVAL=-1 sentinel branch too.
@@ -482,19 +485,17 @@ impl ScalcoutRecord {
     /// (sCalcPostfix.c:432-434) — unlike base `postfix()`, which calls it
     /// CALC_ERR_NULL_ARG.
     fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
-        let compiled = calc_compile::scalc_postfix(&self.calc);
+        let compiled = calc_compile::scalc_postfix_into(&self.calc, &mut self.rpcl);
         let report = Self::bad_expr_report(compiled.error_number(), pmessage);
         self.clcv = compiled.status;
-        self.compiled_calc = compiled.program;
         report
     }
 
     /// C `sCalcoutRecord.c::special:474-481` — same, into ORPC/OCLV.
     fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
-        let compiled = calc_compile::scalc_postfix(&self.ocal);
+        let compiled = calc_compile::scalc_postfix_into(&self.ocal, &mut self.orpc);
         let report = Self::bad_expr_report(compiled.error_number(), pmessage);
         self.oclv = compiled.status;
-        self.compiled_ocal = compiled.program;
         report
     }
 
@@ -1017,7 +1018,7 @@ impl Record for ScalcoutRecord {
             // psresult = pcalc->sval: the VAL/SVAL tokens read this cycle's
             // pre-evaluation VAL/SVAL, i.e. the cells the results are about to
             // overwrite. (PVAL/PSVL are a different pair — see their docs.)
-            match scalc_perform(&self.compiled_calc, &mut inputs, self.prec) {
+            match scalc_perform(&self.rpcl, &mut inputs, self.prec) {
                 // C's two `-1`s are ONE failure to this record: `:357-364` tests
                 // the return code alone, so a non-finite result (cells written,
                 // status -1) and an operator refusal (nothing written) both take
@@ -2135,7 +2136,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         // Use an expression that will fail to compile
         rec.calc = "???invalid".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::String);
+        rec.rpcl = Rpcl::empty();
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap();
         rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
             .unwrap();
@@ -2165,7 +2166,7 @@ mod tests {
         // must NOT complete immediately as the old IVOA==1 early-return did.
         let mut rec = ScalcoutRecord::new();
         rec.calc = "???invalid".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::String); // calc fails
+        rec.rpcl = Rpcl::empty(); // calc fails
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
         rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
             .unwrap();

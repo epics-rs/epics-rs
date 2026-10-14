@@ -82,7 +82,6 @@ pub enum FuncName {
     IxZ,
     IxNz,
     Arr,
-    Ix,
     AToD,
     // Array functions (Phase 3B)
     Smoo,
@@ -95,7 +94,6 @@ pub enum FuncName {
     FitMQ,
     Cum,
     Cat,
-    ARndm,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +131,10 @@ pub enum Token {
     Minus,
     /// aCalc `AVAL` — the array-valued `VAL` (`aCalcPostfix.c:118`, OPERAND).
     FetchAval,
+    /// aCalc `IX` / `ARNDM` — OPERANDs in C (`aCalcPostfix.c:157,114`), so they
+    /// emit where they are read, not as nullary functions after their operator.
+    ConstIx,
+    ARndm,
     Star,
     Slash,
     Percent,
@@ -209,7 +211,9 @@ pub enum Token {
 /// symbol below compiles in that engine; every symbol omitted answers
 /// `CALC_ERR_SYNTAX` (11).
 struct ElementTable {
-    /// The table's named symbols, `name -> token`. Matched case-insensitively
+    /// The table's named elements, `name -> token`, in C's two lists: the
+    /// `operands[]` searched while an operand is needed and the `operators[]`
+    /// searched after one (`get_element(opnd, ...)`). `-` is in both. Matched case-insensitively
     /// (C `epicsStrnCaseCmp`), longest match wins, with NO identifier boundary:
     /// C lexes `LOG2` as `LOG` then the literal `2`, and `AANDB` as `AA AND B`.
     ///
@@ -217,7 +221,8 @@ struct ElementTable {
     /// can map to different tokens per engine: `DBL` is `TO_DOUBLE` in both
     /// sCalc (string->double) and aCalc (array->double), and those are
     /// different opcodes.
-    symbols: &'static [(&'static str, Token)],
+    operands: &'static [(&'static str, Token)],
+    operators: &'static [(&'static str, Token)],
     /// Highest single-letter operand: `U` (base, `FETCH_A`..`FETCH_U`,
     /// CALCPERFORM_NARGS = 21) or `P` (sCalc/aCalc, `FETCH_A`..`FETCH_P`).
     last_var: u8,
@@ -255,6 +260,43 @@ struct ElementTable {
     /// database-load failure on the port, `VAL=35` in C) and accepted aCalc
     /// expressions C rejects.
     stack_size: i32,
+    terminator: Terminator,
+    store: StoreRule,
+}
+
+/// Where C's `STORE_OPERATOR` case accepts a `:=`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum StoreRule {
+    /// base `postfix.c:296-300`: only with an empty operator stack, so
+    /// `A:=B:=C` and `(A:=1)` are CALC_ERR_BAD_ASSIGNMENT.
+    TopLevel,
+    /// `sCalcPostfix.c:515-567`, `aCalcPostfix.c:483-531`: wherever the
+    /// fetch it rewrites is.
+    Anywhere,
+}
+
+impl StoreRule {
+    /// The `:=` row's in-stack priority: 0 in `postfix.c:162`, 1 in
+    /// `sCalcPostfix.c:226` / `aCalcPostfix.c:223`. It decides whether a
+    /// later `?` or `:`, which pops only strictly higher entries, flushes it.
+    pub(crate) fn in_stack_pri(self) -> u8 {
+        match self {
+            StoreRule::TopLevel => 0,
+            StoreRule::Anywhere => 1,
+        }
+    }
+}
+
+/// What C's `EXPR_TERMINATOR` case does at a `;`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Terminator {
+    /// base `postfix.c:439-456`: the `;` ends a whole statement — an open `(`
+    /// is CALC_ERR_PAREN_OPEN, an open `?` CALC_ERR_CONDITIONAL, and more than
+    /// one value left CALC_ERR_TOOMANY.
+    Statement,
+    /// `sCalcPostfix.c:786-800`, `aCalcPostfix.c:730-741`: flush down to the
+    /// innermost `(` and check nothing, so `A?(0;C:=3.3):B` compiles.
+    Flush,
 }
 
 /// The `LITERAL_OPERAND` words shared by base and sCalc. aCalc's table has no
@@ -290,7 +332,7 @@ enum LiteralReader {
 
 /// base `postfix.c:73-179`.
 static BASE_TABLE: ElementTable = ElementTable {
-    symbols: &[
+    operands: &[
         ("ABS", Token::Func(FuncName::Abs)),
         ("ACOS", Token::Func(FuncName::Acos)),
         ("ASIN", Token::Func(FuncName::Asin)),
@@ -323,6 +365,12 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("TAN", Token::Func(FuncName::Tan)),
         ("TANH", Token::Func(FuncName::Tanh)),
         ("VAL", Token::FetchVal),
+        ("(", Token::LParen),
+        ("-", Token::Minus),
+        ("!", Token::Bang),
+        ("~", Token::Tilde),
+    ],
+    operators: &[
         // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
         // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
         // carry. They are not `&&`/`||`.
@@ -335,7 +383,6 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("%", Token::Percent),
         ("&", Token::BitAnd),
         ("&&", Token::AndAnd),
-        ("(", Token::LParen),
         (")", Token::RParen),
         ("*", Token::Star),
         ("**", Token::DoubleStar),
@@ -359,8 +406,6 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("^", Token::Caret),
         ("|", Token::BitOr),
         ("||", Token::OrOr),
-        ("!", Token::Bang),
-        ("~", Token::Tilde),
     ],
     last_var: b'U' - b'A',
     last_double_var: None,
@@ -369,11 +414,13 @@ static BASE_TABLE: ElementTable = ElementTable {
     literals: LiteralReader::ParseDouble,
     // `postfix.h:31` — `#define CALCPERFORM_STACK 80`.
     stack_size: 80,
+    terminator: Terminator::Statement,
+    store: StoreRule::TopLevel,
 };
 
 /// synApps `sCalcPostfix.c:97-215`.
 static SCALC_TABLE: ElementTable = ElementTable {
-    symbols: &[
+    operands: &[
         ("ABS", Token::Func(FuncName::Abs)),
         ("ACOS", Token::Func(FuncName::Acos)),
         ("ADD_XOR8", Token::Func(FuncName::AddXor8)),
@@ -443,6 +490,12 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("VAL", Token::FetchVal),
         ("WRITE", Token::Func(FuncName::BinWrite)),
         ("XOR8", Token::Func(FuncName::Xor8)),
+        ("(", Token::LParen),
+        ("-", Token::Minus),
+        ("!", Token::Bang),
+        ("~", Token::Tilde),
+    ],
+    operators: &[
         // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
         // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
         // carry. They are not `&&`/`||`.
@@ -455,7 +508,6 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("%", Token::Percent),
         ("&", Token::BitAnd),
         ("&&", Token::AndAnd),
-        ("(", Token::LParen),
         (")", Token::RParen),
         ("[", Token::LBracket),
         ("]", Token::RBracket),
@@ -491,8 +543,6 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("-|", Token::Minus),
         (">?", Token::MaxOp),
         ("<?", Token::MinOp),
-        ("!", Token::Bang),
-        ("~", Token::Tilde),
     ],
     last_var: b'P' - b'A',
     last_double_var: Some(b'L' - b'A'),
@@ -501,16 +551,18 @@ static SCALC_TABLE: ElementTable = ElementTable {
     literals: LiteralReader::Strtod,
     // `sCalcPostfixPvt.h:21` — `#define SCALC_STACKSIZE 30`.
     stack_size: 30,
+    terminator: Terminator::Flush,
+    store: StoreRule::Anywhere,
 };
 
 /// synApps `aCalcPostfix.c:99-224`.
 static ACALC_TABLE: ElementTable = ElementTable {
-    symbols: &[
+    operands: &[
         ("ABS", Token::Func(FuncName::Abs)),
         ("ACOS", Token::Func(FuncName::Acos)),
         ("AMAX", Token::Func(FuncName::AMax)),
         ("AMIN", Token::Func(FuncName::AMin)),
-        ("ARNDM", Token::Func(FuncName::ARndm)),
+        ("ARNDM", Token::ARndm),
         ("ARR", Token::Func(FuncName::Arr)),
         ("ASIN", Token::Func(FuncName::Asin)),
         ("ATAN", Token::Func(FuncName::Atan)),
@@ -546,7 +598,7 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("INT", Token::Func(FuncName::Int)),
         ("ISINF", Token::Func(FuncName::IsInf)),
         ("ISNAN", Token::Func(FuncName::IsNan)),
-        ("IX", Token::Func(FuncName::Ix)),
+        ("IX", Token::ConstIx),
         ("IXMAX", Token::Func(FuncName::IxMax)),
         ("IXMIN", Token::Func(FuncName::IxMin)),
         ("IXNZ", Token::Func(FuncName::IxNz)),
@@ -577,6 +629,12 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("TANH", Token::Func(FuncName::Tanh)),
         ("UNTIL", Token::UntilKeyword),
         ("VAL", Token::FetchVal),
+        ("(", Token::LParen),
+        ("-", Token::Minus),
+        ("!", Token::Bang),
+        ("~", Token::Tilde),
+    ],
+    operators: &[
         // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
         // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
         // carry. They are not `&&`/`||`.
@@ -590,7 +648,6 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("%", Token::Percent),
         ("&", Token::BitAnd),
         ("&&", Token::AndAnd),
-        ("(", Token::LParen),
         (")", Token::RParen),
         ("[", Token::LBracket),
         ("]", Token::RBracket),
@@ -619,8 +676,6 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("||", Token::OrOr),
         (">?", Token::MaxOp),
         ("<?", Token::MinOp),
-        ("!", Token::Bang),
-        ("~", Token::Tilde),
     ],
     last_var: b'P' - b'A',
     last_double_var: Some(b'L' - b'A'),
@@ -631,6 +686,8 @@ static ACALC_TABLE: ElementTable = ElementTable {
     literals: LiteralReader::Strtod,
     // `aCalcPostfixPvt.h:22` — `#define ACALC_STACKSIZE 20`.
     stack_size: 20,
+    terminator: Terminator::Flush,
+    store: StoreRule::Anywhere,
 };
 
 fn table_for(kind: &ExprKind) -> &'static ElementTable {
@@ -651,6 +708,18 @@ fn table_for(kind: &ExprKind) -> &'static ElementTable {
 pub(crate) fn runtime_stack_size(kind: ExprKind) -> i32 {
     table_for(&kind).stack_size
 }
+
+pub(crate) fn expr_terminator(kind: ExprKind) -> Terminator {
+    table_for(&kind).terminator
+}
+
+pub(crate) fn store_rule(kind: ExprKind) -> StoreRule {
+    table_for(&kind).store
+}
+
+/// The element reader `postfix::compile` pulls from, one element at a time,
+/// because which C list an element comes from depends on the parser's state.
+pub(crate) struct Lexer<'a>(Tokenizer<'a>);
 
 struct Tokenizer<'a> {
     input: &'a [u8],
@@ -735,10 +804,10 @@ impl<'a> Tokenizer<'a> {
     /// longest-prefix match — with NO identifier boundary. Calc has no
     /// identifiers, so there is nothing for a boundary to protect: C lexes
     /// `LOG2` as `LOG` then the literal `2`.
-    fn match_symbol(&mut self) -> Option<Token> {
+    fn match_symbol(&mut self, symbols: &[(&'static str, Token)]) -> Option<Token> {
         let rem = &self.input[self.pos..];
         let mut best: Option<(usize, &Token)> = None;
-        for (name, tok) in self.table.symbols {
+        for (name, tok) in symbols {
             if !starts_with_ci(rem, name) {
                 continue;
             }
@@ -821,8 +890,11 @@ impl<'a> Tokenizer<'a> {
                 .count();
             self.pos = start + end;
             let digits = std::str::from_utf8(&rem[2..end]).unwrap();
+            // C stores the `epicsUInt32` bits as `LITERAL_INT` (`postfix.c:283-289`)
+            // and `calcPerform` reads them back as `epicsInt32`
+            // (`calcPerform.c:68-71`): `0xFFFFFFFF` is -1.
             return u32::from_str_radix(digits, 16)
-                .map(f64::from)
+                .map(|v| f64::from(v as i32))
                 .map_err(|_| CalcError::BadLiteral);
         }
 
@@ -850,69 +922,80 @@ fn starts_with_ci(text: &[u8], name: &str) -> bool {
     strtod::starts_with_ci(text, name.as_bytes())
 }
 
-/// Lex `input` with the `ELEMENT` table of the C compiler `kind` names.
-///
-/// A symbol outside that table is `CalcError::Syntax` — C's `CALC_ERR_SYNTAX`,
-/// raised at compile time, because C's `get_element` simply cannot produce it.
-pub fn tokenize(input: &str, kind: ExprKind) -> Result<Vec<Token>, CalcError> {
-    let table = table_for(&kind);
-    let mut tokenizer = Tokenizer::new(input, table);
-    let mut tokens = Vec::new();
+impl<'a> Lexer<'a> {
+    pub(crate) fn new(input: &'a str, kind: ExprKind) -> Self {
+        Lexer(Tokenizer::new(input, table_for(&kind)))
+    }
 
-    loop {
-        tokenizer.skip_whitespace();
-        let Some(b) = tokenizer.peek() else { break };
+    /// C `get_element(opnd, ...)`: the next element from the `operands[]` list
+    /// when `operand` is set, else from `operators[]`; `None` at the end of the
+    /// text. Text that matches no element of THAT list is `CalcError::Syntax`,
+    /// at this position — C's loop stops there and finds `*psrc != '\0'`.
+    pub(crate) fn next(&mut self, operand: bool) -> Result<Option<Token>, CalcError> {
+        let t = &mut self.0;
+        t.skip_whitespace();
+        let Some(b) = t.peek() else {
+            return Ok(None);
+        };
+        if !operand {
+            return t
+                .match_symbol(t.table.operators)
+                .map(Some)
+                .ok_or(CalcError::Syntax);
+        }
 
         // LITERAL_OPERAND. Checked before the other elements because C's
         // longest-match `get_element` cannot prefer one: no table has a
         // non-literal element that starts with a digit, a `.`, `INF` or `NAN`.
-        if tokenizer.at_literal() {
-            let n = tokenizer.read_literal()?;
-            tokens.push(Token::Number(n));
-            continue;
+        if t.at_literal() {
+            return t.read_literal().map(|n| Some(Token::Number(n)));
         }
 
         // LITERAL_STRING: sCalcPostfix.c:97-98 only.
-        if (b == b'"' || b == b'\'') && table.string_literals {
-            tokenizer.advance();
-            let s = tokenizer.read_string_literal(b);
-            tokens.push(Token::StringLiteral(s));
-            continue;
+        if (b == b'"' || b == b'\'') && t.table.string_literals {
+            t.advance();
+            return Ok(Some(Token::StringLiteral(t.read_string_literal(b))));
         }
 
-        if let Some(tok) = tokenizer.match_symbol() {
-            tokens.push(tok);
-            continue;
+        if let Some(tok) = t.match_symbol(t.table.operands) {
+            return Ok(Some(tok));
         }
-        if let Some(tok) = tokenizer.match_var() {
-            tokens.push(tok);
-            continue;
-        }
-
-        return Err(CalcError::Syntax);
+        t.match_var().map(Some).ok_or(CalcError::Syntax)
     }
-
-    Ok(tokens)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn base(expr: &str) -> Result<Vec<Token>, CalcError> {
-        tokenize(expr, ExprKind::Numeric)
+    /// Pull one element per flag: `o` reads from `operands[]`, `x` from
+    /// `operators[]`. Stops at the first error.
+    fn lex(kind: ExprKind, expr: &str, lists: &str) -> Result<Vec<Token>, CalcError> {
+        let mut lexer = Lexer::new(expr, kind);
+        let mut out = Vec::new();
+        for list in lists.chars() {
+            match lexer.next(list == 'o')? {
+                Some(t) => out.push(t),
+                None => break,
+            }
+        }
+        assert_eq!(lexer.next(true), Ok(None), "{expr:?} not fully read");
+        Ok(out)
     }
-    fn scalc(expr: &str) -> Result<Vec<Token>, CalcError> {
-        tokenize(expr, ExprKind::String)
+    fn base(expr: &str, lists: &str) -> Result<Vec<Token>, CalcError> {
+        lex(ExprKind::Numeric, expr, lists)
     }
-    fn acalc(expr: &str) -> Result<Vec<Token>, CalcError> {
-        tokenize(expr, ExprKind::Array)
+    fn scalc(expr: &str, lists: &str) -> Result<Vec<Token>, CalcError> {
+        lex(ExprKind::String, expr, lists)
+    }
+    fn acalc(expr: &str, lists: &str) -> Result<Vec<Token>, CalcError> {
+        lex(ExprKind::Array, expr, lists)
     }
 
     #[test]
     fn test_basic_tokens() {
         assert_eq!(
-            base("A+B*3").unwrap(),
+            base("A+B*3", "oxoxo").unwrap(),
             vec![
                 Token::Var(0),
                 Token::Plus,
@@ -926,7 +1009,7 @@ mod tests {
     #[test]
     fn test_functions() {
         assert_eq!(
-            base("SIN(A)").unwrap(),
+            base("SIN(A)", "ooox").unwrap(),
             vec![
                 Token::Func(FuncName::Sin),
                 Token::LParen,
@@ -939,17 +1022,18 @@ mod tests {
     #[test]
     fn test_double_vars() {
         assert_eq!(
-            scalc("AA+BB").unwrap(),
+            scalc("AA+BB", "oxo").unwrap(),
             vec![Token::DoubleVar(0), Token::Plus, Token::DoubleVar(1)]
         );
-        // base postfix.c has no double-letter operand: `AA` is `A` then `A`.
-        assert_eq!(base("AA").unwrap(), vec![Token::Var(0), Token::Var(0)]);
+        // base postfix.c has no double-letter operand: `AA` is `A`, and the
+        // second `A` is in no `operators[]` entry.
+        assert_eq!(base("AA", "ox"), Err(CalcError::Syntax));
     }
 
     #[test]
     fn test_constants() {
         assert_eq!(
-            base("PI+D2R").unwrap(),
+            base("PI+D2R", "oxo").unwrap(),
             vec![
                 Token::Const(ConstName::Pi),
                 Token::Plus,
@@ -961,7 +1045,7 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         assert_eq!(
-            base("sin(a)+Cos(b)").unwrap(),
+            base("sin(a)+Cos(b)", "oooxxooox").unwrap(),
             vec![
                 Token::Func(FuncName::Sin),
                 Token::LParen,
@@ -979,7 +1063,7 @@ mod tests {
     #[test]
     fn test_assign() {
         assert_eq!(
-            base("A:=5").unwrap(),
+            base("A:=5", "oxo").unwrap(),
             vec![Token::Var(0), Token::Assign, Token::Number(5.0)]
         );
     }
@@ -987,7 +1071,7 @@ mod tests {
     #[test]
     fn test_ternary() {
         assert_eq!(
-            base("A?B:C").unwrap(),
+            base("A?B:C", "oxoxo").unwrap(),
             vec![
                 Token::Var(0),
                 Token::Question,
@@ -1000,61 +1084,75 @@ mod tests {
 
     #[test]
     fn test_hex() {
-        assert_eq!(base("0xFF").unwrap(), vec![Token::Number(255.0)]);
-        assert_eq!(scalc("0xFF").unwrap(), vec![Token::Number(255.0)]);
+        assert_eq!(base("0xFF", "o").unwrap(), vec![Token::Number(255.0)]);
+        assert_eq!(scalc("0xFF", "o").unwrap(), vec![Token::Number(255.0)]);
     }
 
     #[test]
     fn test_float_literal() {
-        assert_eq!(base("3.14e2").unwrap(), vec![Token::Number(314.0)]);
+        assert_eq!(base("3.14e2", "o").unwrap(), vec![Token::Number(314.0)]);
+    }
+
+    /// The two lists are disjoint except for `-`: `(` and `!` are operands
+    /// only, `)` and the binary operators operators only, and sCalc's `-|` is
+    /// in `operators[]` alone, so in operand position it is the unary `-`
+    /// followed by a `|` that no operand spells.
+    #[test]
+    fn test_each_position_reads_its_own_list() {
+        assert_eq!(base(")", "o"), Err(CalcError::Syntax));
+        assert_eq!(base("A(", "ox"), Err(CalcError::Syntax));
+        assert_eq!(base("-", "o").unwrap(), vec![Token::Minus]);
+        assert_eq!(base("A-", "ox").unwrap(), vec![Token::Var(0), Token::Minus]);
+        assert_eq!(scalc("A-|B", "oxo").unwrap()[1], Token::Minus);
+        assert_eq!(scalc("-|A", "oo"), Err(CalcError::Syntax));
     }
 
     #[test]
     fn test_operand_range_per_table() {
         // base: A..U, and no double-letter operand at all.
-        assert_eq!(base("U").unwrap(), vec![Token::Var(20)]);
-        // sCalc/aCalc: A..P, AA..LL. `Q` is in no operand table and in no
-        // symbol table, so the lexer itself stops — C `get_element` returns
-        // FALSE and `sCalcPostfix` answers CALC_ERR_SYNTAX.
-        assert_eq!(scalc("P").unwrap(), vec![Token::Var(15)]);
-        assert_eq!(scalc("Q"), Err(CalcError::Syntax));
-        assert_eq!(acalc("U"), Err(CalcError::Syntax));
-        assert_eq!(scalc("LL").unwrap(), vec![Token::DoubleVar(11)]);
+        assert_eq!(base("U", "o").unwrap(), vec![Token::Var(20)]);
+        // sCalc/aCalc: A..P, AA..LL. `Q` is in no operand table, so C
+        // `get_element` returns FALSE and `sCalcPostfix` answers
+        // CALC_ERR_SYNTAX.
+        assert_eq!(scalc("P", "o").unwrap(), vec![Token::Var(15)]);
+        assert_eq!(scalc("Q", "o"), Err(CalcError::Syntax));
+        assert_eq!(acalc("U", "o"), Err(CalcError::Syntax));
+        assert_eq!(scalc("LL", "o").unwrap(), vec![Token::DoubleVar(11)]);
         // `MM` is not a double operand: C lexes `M` and then fails on the
-        // second `M` in operator position. The port reaches the same
-        // CALC_ERR_SYNTAX one stage later, in `postfix::compile`.
-        assert_eq!(scalc("MM").unwrap(), vec![Token::Var(12), Token::Var(12)]);
+        // second `M` in operator position.
+        assert_eq!(scalc("MM", "ox"), Err(CalcError::Syntax));
     }
 
     #[test]
     fn test_symbols_outside_a_table() {
         // FMOD and `>>>` are base-only symbols. In sCalc/aCalc no entry spells
-        // them, so the text lexes as other elements (`F`,`M`,`O`,`D` operands;
-        // `>>` then `>`) and `postfix::compile` is where CALC_ERR_SYNTAX lands
-        // — exactly as C, whose `get_element` does the same and then finds no
-        // operand for `>`. The engine-level assertions live in
+        // them: `>>>` reads as `>>`, and the `>` left over is in no
+        // `operands[]`. The engine-level assertions live in
         // tests/calc_element_tables.rs.
-        assert_eq!(base("FMOD(A,B)").unwrap()[0], Token::Func(FuncName::Fmod));
-        assert_eq!(base("A>>>1").unwrap()[1], Token::ShrLogical);
-        assert_eq!(scalc("A>>>1").unwrap()[1], Token::Shr);
+        assert_eq!(base("FMOD", "o").unwrap()[0], Token::Func(FuncName::Fmod));
+        assert_eq!(base("A>>>1", "oxo").unwrap()[1], Token::ShrLogical);
+        assert_eq!(scalc("A>>>1", "oxo"), Err(CalcError::Syntax));
         // INF/NAN are LITERAL_OPERANDs of base and sCalc; aCalc has neither, so
-        // `INF` lexes there as the operands I, N, F (C does the same and then
-        // fails at `N` in operator position).
-        assert_eq!(base("INF").unwrap(), vec![Token::Number(f64::INFINITY)]);
-        assert_eq!(scalc("INF").unwrap(), vec![Token::Number(f64::INFINITY)]);
+        // `INF` reads there as the operand I and then fails at `N` in operator
+        // position.
         assert_eq!(
-            acalc("INF").unwrap(),
-            vec![Token::Var(8), Token::Var(13), Token::Var(5)]
+            base("INF", "o").unwrap(),
+            vec![Token::Number(f64::INFINITY)]
         );
+        assert_eq!(
+            scalc("INF", "o").unwrap(),
+            vec![Token::Number(f64::INFINITY)]
+        );
+        assert_eq!(acalc("INF", "ox"), Err(CalcError::Syntax));
         // `DBL` is TO_DOUBLE in both synApps tables, but a different opcode in
         // each; base has no such symbol.
         assert_eq!(
-            scalc("DBL(AA)").unwrap()[0],
+            scalc("DBL", "o").unwrap()[0],
             Token::Func(FuncName::Dbl),
             "sCalc DBL is the string->double op"
         );
         assert_eq!(
-            acalc("DBL(AA)").unwrap()[0],
+            acalc("DBL", "o").unwrap()[0],
             Token::Func(FuncName::AToD),
             "aCalc DBL is the array->double op"
         );

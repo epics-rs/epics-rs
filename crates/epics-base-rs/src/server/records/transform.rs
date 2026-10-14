@@ -5,8 +5,9 @@ use crate::server::record::{
 };
 use crate::types::EpicsValue;
 
-use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_perform};
+use crate::calc::{Rpcl, StringInputs, scalc_perform};
 
+use super::calc_compile;
 use super::link_status::{
     LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
@@ -14,6 +15,9 @@ use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
 
 const NUM_CHANNELS: usize = 16; // A-P
+
+/// `transformRecord.c:208` `POSTFIX_SIZE`, `SCALC_INFIX_TO_POSTFIX_SIZE(120)`.
+const TRANSFORM_RPC_SIZE: usize = 2 + 120 * 21 / 6;
 
 /// The sixteen channel value fields, in `A..P` order — the set C's `monitor()`
 /// walks (`transformRecord.c:797-806`) and the only fields it posts.
@@ -78,7 +82,8 @@ pub struct TransformRecord {
     /// nowhere else derived.
     lvals: [f64; NUM_CHANNELS],
     pub calcs: [String; NUM_CHANNELS],
-    compiled: [Option<CompiledExpr>; NUM_CHANNELS],
+    /// C `RPCA..RPCP`.
+    rpc: [Rpcl<TRANSFORM_RPC_SIZE>; NUM_CHANNELS],
     /// `CMTA..CMTP` — "Comment A".."Comment P" (`transformRecord.dbd:681-741`,
     /// DBF_STRING `size(39)`, and note NO `special`).
     ///
@@ -169,7 +174,7 @@ impl Default for TransformRecord {
             vals: [0.0; NUM_CHANNELS],
             lvals: [0.0; NUM_CHANNELS],
             calcs: Default::default(),
-            compiled: Default::default(),
+            rpc: Default::default(),
             cmts: Default::default(),
             inp_links: Default::default(),
             out_links: Default::default(),
@@ -207,9 +212,8 @@ impl TransformRecord {
     /// reason this matters here, different failure rules (see the eval site in
     /// `process`).
     ///
-    /// C's `postfix_ok = *pclcbuf && (*prpcbuf != BAD_EXPRESSION)` (`:585`): an
-    /// EMPTY CLCx is not compiled and not evaluated — which is why the empty
-    /// case is `None` rather than sCalc's empty-but-valid program.
+    /// An EMPTY CLCx is not compiled (`:477`, `:677`): its RPCx keeps whatever
+    /// it held, and `process` does not evaluate it.
     ///
     /// Both callers, `init_record` (`:481-487`) and `special()` (`:684-689`),
     /// follow a refused non-empty CLCx with `recGblRecordError(S_db_badField,
@@ -219,12 +223,11 @@ impl TransformRecord {
     /// `special()` posts.
     fn recompile(&mut self, idx: usize, pmessage: &'static str) -> bool {
         let status = if self.calcs[idx].is_empty() {
-            self.compiled[idx] = None;
             0
         } else {
             let converted = self.convert_expression(&self.calcs[idx]);
-            self.compiled[idx] = scalc_compile(&converted).ok();
-            if self.compiled[idx].is_some() {
+            let compiled = calc_compile::scalc_postfix_into(&converted, &mut self.rpc[idx]);
+            if compiled.status == 0 {
                 0
             } else {
                 self.put_report = Some(PutReport::RecordError {
@@ -705,16 +708,14 @@ impl Record for TransformRecord {
         //     A channel holding such a value keeps it for one cycle instead of
         //     being overwritten by its own CLCx.
         //   Always (COPT=1): compute whenever CLCx is valid, regardless.
-        // `postfix_ok` is the `if let Some(compiled)` below: `recompile` leaves
-        // `None` for both of C's failing halves — an empty CLCx (never compiled)
-        // and one `sCalcPostfix` rejected (BAD_EXPRESSION).
+        // `BAD_EXPRESSION` is `END_EXPRESSION`, what a refused compile leaves.
         for i in 0..NUM_CHANNELS {
             let new_value = !Self::value_is_same(self.vals[i], self.lvals[i]) || map[i];
             let do_calc = (self.no_inlink(i) && !new_value) || self.copt == 1;
             if !do_calc {
                 continue;
             }
-            if let Some(ref compiled) = self.compiled[i] {
+            if !self.calcs[i].is_empty() && !self.rpc[i].is_empty() {
                 // C `transformRecord.c:593`:
                 //
                 //   sCalcPerform(&ptran->a, 16, NULL, 0, pval, NULL, 0, prpcbuf, ptran->prec)
@@ -753,7 +754,7 @@ impl Record for TransformRecord {
                 // the `VAL` token (`FETCH_VAL`) pushes `*presult` — *this
                 // channel's* current value, not a record-wide previous VAL.
                 inputs.prev_val = self.vals[i];
-                let outcome = scalc_perform(compiled, &mut inputs, self.prec);
+                let outcome = scalc_perform(&self.rpc[i], &mut inputs, self.prec);
                 // C's store opcodes write through `&ptran->a`
                 // (`sCalcPerform.c:429-433`), so `CLCB="A:=A+1"` mutates the
                 // record's A — before channel C's expression fetches it, and
@@ -1579,9 +1580,9 @@ mod tests {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("IVLA", EpicsValue::Short(1)).unwrap();
-        // Use invalid expression that fails to compile — compiled[0] stays None
+        // Use invalid expression that fails to compile — RPCA stays END
         rec.calcs[0] = "???invalid".into();
-        rec.compiled[0] = None;
+        rec.rpc[0] = Rpcl::empty();
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 10.0); // Unchanged — no valid calc
     }

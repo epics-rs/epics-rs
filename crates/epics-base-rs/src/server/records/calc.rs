@@ -90,7 +90,7 @@ pub struct CalcRecord {
     // C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     // empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run — the
     // record then alarms on every process. See [`calc_compile`].
-    rpcl: crate::calc::CompiledExpr,
+    rpcl: crate::calc::Rpcl<CALC_RPCL_SIZE>,
     // C `prec->name`, handed over at creation by `set_async_context`. Only the
     // record knows it, which is why C prints its bad-CALC report from
     // `init_record`/`special` and not from `postfix()`.
@@ -99,6 +99,9 @@ pub struct CalcRecord {
     // and taken by the put's owner through `take_put_report`.
     put_report: Option<crate::server::recgbl::PutReport>,
 }
+
+/// `calcRecord.dbd` `rpcl[INFIX_TO_POSTFIX_SIZE(160)]`.
+const CALC_RPCL_SIZE: usize = crate::calc::infix_to_postfix_size(160);
 
 impl Default for CalcRecord {
     fn default() -> Self {
@@ -145,7 +148,7 @@ impl Default for CalcRecord {
             value_computed: false,
             aftc: 0.0,
             afvl: 0.0,
-            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            rpcl: crate::calc::Rpcl::empty(),
             name: None,
             put_report: None,
         }
@@ -163,7 +166,7 @@ impl CalcRecord {
             calc: calc.to_string(),
             ..Default::default()
         };
-        rec.rpcl = calc_compile::postfix(&rec.calc).program;
+        calc_compile::postfix_into(&rec.calc, &mut rec.rpcl);
         rec
     }
 
@@ -418,9 +421,8 @@ impl Record for CalcRecord {
             // there, and the empty program it leaves in RPCL is what makes the
             // record alarm on every process. Skipping the compile for an empty
             // CALC left the port with no program and no alarm.
-            let compiled = calc_compile::postfix(&self.calc);
+            let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
             self.report_bad_calc(&compiled, "calc: init_record: Illegal CALC field");
-            self.rpcl = compiled.program;
             if !self.calc.is_empty() {
                 self.mlst = self.val;
                 self.alst = self.val;
@@ -440,11 +442,10 @@ impl Record for CalcRecord {
         if !after || !field.eq_ignore_ascii_case("CALC") {
             return Ok(());
         }
-        let compiled = calc_compile::postfix(&self.calc);
+        let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
         self.put_report =
             compiled.put_report_in_expression("calc: Illegal CALC field", "CALC", &self.calc);
         let failed = compiled.error_str().is_some();
-        self.rpcl = compiled.program;
         if failed {
             return Err(CaError::BadField("calc: Illegal CALC field".into()));
         }
@@ -977,5 +978,27 @@ mod tests {
         assert_eq!(rec.val, 2.0);
         rec.process().unwrap();
         assert_eq!(rec.val, 3.0);
+    }
+
+    /// RPCL holds `postfix()`'s bytes: FETCH_VAL, LITERAL_INT 1, ADD, END.
+    #[test]
+    fn rpcl_is_the_c_postfix() {
+        let rec = CalcRecord::new("VAL+1");
+        assert_eq!(rec.rpcl.as_ref()[..8], [3, 2, 1, 0, 0, 0, 50, 0]);
+    }
+
+    /// A program longer than C's 560-byte RPCL is a failed compile, not a
+    /// longer buffer.
+    #[test]
+    fn a_program_past_the_rpcl_size_fails_to_compile() {
+        let long = vec!["1.5"; 60].join("+");
+        let mut rpcl = crate::calc::Rpcl::<CALC_RPCL_SIZE>::empty();
+        let compiled = calc_compile::postfix_into(&long, &mut rpcl);
+        assert_eq!(compiled.status, calc_compile::POSTFIX_ERR);
+        assert!(rpcl.is_empty());
+        let fits = vec!["1.5"; 56].join("+");
+        let compiled = calc_compile::postfix_into(&fits, &mut rpcl);
+        assert_eq!(compiled.status, calc_compile::POSTFIX_OK);
+        assert!(!rpcl.is_empty());
     }
 }

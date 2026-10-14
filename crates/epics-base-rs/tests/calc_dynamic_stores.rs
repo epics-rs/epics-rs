@@ -114,10 +114,10 @@ fn scalc_dynamic_string_store_writes_the_indexed_string() {
 /// with a `case A_SSTORE`.
 #[test]
 fn a_dynamic_string_store_latches_uses_string() {
-    assert!(scalc_compile(r#"@@1:="x";1"#).unwrap().uses_string);
+    assert!(scalc_compile(r#"@@1:="x";1"#).unwrap().uses_string());
     // The scalar `@` does not — and does not need to: A_STORE has a case on
     // BOTH of C's evaluator paths (sCalcPerform.c:440 and :897).
-    assert!(!scalc_compile("@1:=5;1").unwrap().uses_string);
+    assert!(!scalc_compile("@1:=5;1").unwrap().uses_string());
 }
 
 // ---- aCalc `@n := v` (A_STORE) and `@@n := v` (A_ASTORE) ----------------
@@ -166,4 +166,23 @@ fn base_has_no_dynamic_store() {
     assert_eq!(compile("@1:=5;1").unwrap_err(), CalcError::Syntax);
     let mut inputs = epics_base_rs::calc::NumericInputs::new();
     assert!(calc("A:=5;A", &mut inputs).is_ok()); // the static store still works
+}
+
+/// A dynamic `:=` flushes every entry above its `@`, a still-open `(` included:
+/// C writes that paren's `NOT_GENERATED` byte and adds its comma count, and
+/// both performs run the byte as a no-op. Compiled sCalc: `A;@(1:=2` with
+/// A=1.5, B=-2 returns 1.5 and leaves B=2.
+#[test]
+fn a_dynamic_store_flushes_an_open_paren_as_c_does() {
+    let (inputs, top) = s("A;@(1:=5");
+    assert_eq!(top, StackValue::Double(1.0));
+    assert_eq!(inputs.num_vars[1], 5.0);
+    let (inputs, _) = a("A;@(1:=5");
+    assert_eq!(inputs.num_vars[1], 5.0);
+    // The `,` charged -1 to the paren, so the flush ends one value short —
+    // C's CALC_ERR_INCOMPLETE.
+    assert_eq!(
+        scalc_compile("@(1,2:=3").unwrap_err(),
+        CalcError::Incomplete
+    );
 }

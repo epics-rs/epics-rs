@@ -7,7 +7,9 @@
 //! The port exempted depth 0 when the last opcode was a store, so every one of
 //! these compiled and then evaluated to a stale value. Compiled base `postfix`
 //! and synApps `sCalcPostfix` on this host both answer err=8 for `A:=5`,
-//! `AA:="x"`, `A:=5;B:=6`, `A:=B:=5`, and 0 for `A:=5;A`.
+//! `AA:="x"`, `A:=5;B:=6`, and 0 for `A:=5;A`. `A:=B:=5` is err=8 in sCalc
+//! and aCalc but err=3 in base, whose `:=` needs an empty operator stack
+//! (`postfix.c:297`).
 
 use epics_base_rs::calc::{CalcError, acalc_compile, compile, scalc_compile};
 
@@ -15,10 +17,12 @@ use epics_base_rs::calc::{CalcError, acalc_compile, compile, scalc_compile};
 #[test]
 fn a_store_terminated_source_is_incomplete() {
     for expr in ["A:=5", "A:=5;B:=6", "A:=B:=5"] {
-        assert!(
-            matches!(compile(expr), Err(CalcError::Incomplete)),
-            "calc {expr}"
-        );
+        if expr != "A:=B:=5" {
+            assert!(
+                matches!(compile(expr), Err(CalcError::Incomplete)),
+                "calc {expr}"
+            );
+        }
         assert!(
             matches!(scalc_compile(expr), Err(CalcError::Incomplete)),
             "scalc {expr}"
@@ -28,6 +32,7 @@ fn a_store_terminated_source_is_incomplete() {
             "acalc {expr}"
         );
     }
+    assert!(matches!(compile("A:=B:=5"), Err(CalcError::BadAssignment)));
     // sCalc's string store is the same shape and the same answer.
     assert!(matches!(
         scalc_compile("AA:=\"x\""),

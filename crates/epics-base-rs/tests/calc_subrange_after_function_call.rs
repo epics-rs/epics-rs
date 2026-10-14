@@ -91,11 +91,11 @@ fn acalc_amax_applies_to_the_array_subrange() {
 /// used to emit `1, ABS, 0, 1, SUBRANGE`.
 #[test]
 fn the_function_is_emitted_after_the_subrange() {
-    let code = format!("{:?}", scalc_compile("ABS(1)[0,1]").unwrap().code);
+    let code = format!("{:?}", scalc_compile("ABS(1)[0,1]").unwrap().ops());
     assert_eq!(
         code,
         "[Core(PushConst(1.0)), Core(PushConst(0.0)), Core(PushConst(1.0)), \
-         String(Subrange), Core(Abs), Core(End)]",
+         String(Subrange), Core(Abs)]",
         "C dumps `1, 0, 1, SUBRANGE, ABS_VAL` for ABS(1)[0,1]"
     );
 }
@@ -114,7 +114,7 @@ fn the_function_is_emitted_after_the_subrange() {
 /// R13-2 owns and is what this pins.)
 #[test]
 fn a_bracket_comma_is_not_charged_to_the_vararg() {
-    let code = format!("{:?}", scalc_compile("MAX(4,7)[0,0]").unwrap().code);
+    let code = format!("{:?}", scalc_compile("MAX(4,7)[0,0]").unwrap().ops());
     assert!(
         code.contains("Max(2)"),
         "MAX still takes exactly 2 arguments; the bracket's `,` is the SUBRANGE's. \

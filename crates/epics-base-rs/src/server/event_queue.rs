@@ -192,16 +192,6 @@ impl FlowCtrl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-
-    /// Park `cx` as the consumer. Taken under the polled queue's lock, so a
-    /// post landing after the consumer's check finds it parked. The waker it
-    /// displaces goes to `retired`: the last waker of a task drops its future.
-    fn park(&self, cx: &std::task::Context<'_>, retired: &mut Retired) {
-        let mut parked = self.ppendsem();
-        if !parked.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-            retired.waker = parked.replace(cx.waker().clone());
-        }
-    }
 }
 
 /// One producer's run of posts — C's `db_post_events` calls made under one
@@ -551,7 +541,7 @@ impl QueInner {
     /// `evSubscrip` under `LOCKEVQUE`, but it runs no destructor).
     fn free_slot(&mut self, id: AttachId, retired: &mut Retired) {
         let sub = self.subs[usize::from(id.slot())].take();
-        retired.subs.extend(sub);
+        retired.retire_sub(sub);
         self.free.push(id.slot());
         self.quota -= EVENT_ENTRIES;
     }
@@ -683,41 +673,84 @@ pub struct EvQue {
     inner: Mutex<QueInner>,
 }
 
-/// What a holder of a queue's lock displaced: subscriptions freed from their
-/// slots and a parked waker replaced. Either can own user state whose drop
-/// takes this lock again, so it is dropped only by [`QueGuard`], after the
-/// lock. No constructor outside [`EvQue::lock_retiring`], so nothing else can hold one.
-struct Retired {
-    subs: Vec<SubQ>,
-    waker: Option<std::task::Waker>,
-}
+/// The only way to a [`Retired`]: its fields and its guard's are private to
+/// this module, so nothing but [`EvQue::lock_retiring`] can build one, and
+/// every one drops after the lock it was filled under.
+mod retiring {
+    use super::{EvQue, FlowCtrl, QueInner, SubQ};
 
-/// [`EvQue`]'s lock, carrying the [`Retired`] its holder displaced.
-struct QueGuard<'a> {
-    // Fields drop in declaration order: the lock is released before
-    // `retired` drops.
-    q: std::sync::MutexGuard<'a, QueInner>,
-    retired: Retired,
-}
+    /// What a holder of a queue's lock displaced: subscriptions freed from
+    /// their slots and a parked waker replaced. Either can own user state
+    /// whose drop takes this lock again, so it is dropped only by
+    /// [`QueGuard`], after the lock.
+    pub(super) struct Retired {
+        subs: Vec<SubQ>,
+        waker: Option<std::task::Waker>,
+    }
 
-impl QueGuard<'_> {
-    fn parts(&mut self) -> (&mut QueInner, &mut Retired) {
-        (&mut self.q, &mut self.retired)
+    impl Retired {
+        pub(super) fn retire_sub(&mut self, sub: Option<SubQ>) {
+            self.subs.extend(sub);
+        }
+    }
+
+    /// [`EvQue`]'s lock, carrying the [`Retired`] its holder displaced.
+    pub(super) struct QueGuard<'a> {
+        // Fields drop in declaration order: the lock is released before
+        // `retired` drops.
+        q: std::sync::MutexGuard<'a, QueInner>,
+        retired: Retired,
+        flow: &'a FlowCtrl,
+    }
+
+    impl QueGuard<'_> {
+        pub(super) fn parts(&mut self) -> (&mut QueInner, &mut Retired) {
+            (&mut self.q, &mut self.retired)
+        }
+
+        /// Park `cx` as the consumer. Taken under the polled queue's lock, so
+        /// a post landing after the consumer's check finds it parked. The
+        /// waker it displaces goes to `retired`: the last waker of a task
+        /// drops its future. Consuming the guard makes this the one
+        /// displacement it carries, so none is overwritten under the lock.
+        pub(super) fn park(mut self, cx: &std::task::Context<'_>) {
+            let mut parked = self.flow.ppendsem();
+            if !parked.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                self.retired.waker = parked.replace(cx.waker().clone());
+            }
+        }
+    }
+
+    impl std::ops::Deref for QueGuard<'_> {
+        type Target = QueInner;
+        fn deref(&self) -> &QueInner {
+            &self.q
+        }
+    }
+
+    impl std::ops::DerefMut for QueGuard<'_> {
+        fn deref_mut(&mut self) -> &mut QueInner {
+            &mut self.q
+        }
+    }
+
+    impl EvQue {
+        /// [`Self::lock`] for a holder that may free a slot or displace a
+        /// parked waker; the post path takes the plain lock and pays nothing
+        /// for it.
+        pub(super) fn lock_retiring(&self) -> QueGuard<'_> {
+            QueGuard {
+                q: self.lock(),
+                retired: Retired {
+                    subs: Vec::new(),
+                    waker: None,
+                },
+                flow: &self.flow,
+            }
+        }
     }
 }
-
-impl std::ops::Deref for QueGuard<'_> {
-    type Target = QueInner;
-    fn deref(&self) -> &QueInner {
-        &self.q
-    }
-}
-
-impl std::ops::DerefMut for QueGuard<'_> {
-    fn deref_mut(&mut self) -> &mut QueInner {
-        &mut self.q
-    }
-}
+use retiring::Retired;
 
 impl EvQue {
     fn new(flow: Arc<FlowCtrl>) -> Self {
@@ -749,18 +782,6 @@ impl EvQue {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// [`Self::lock`] for a holder that may free a slot or displace a parked
-    /// waker; the post path takes the plain lock and pays nothing for it.
-    fn lock_retiring(&self) -> QueGuard<'_> {
-        QueGuard {
-            q: self.lock(),
-            retired: Retired {
-                subs: Vec::new(),
-                waker: None,
-            },
-        }
     }
 
     /// C `epicsEventSignal(ppendsem)`: wake the consumer parked on this
@@ -896,7 +917,7 @@ impl EvQue {
         } else if producer_gone {
             return Poll::Ready(None);
         }
-        self.flow.park(cx, retired);
+        guard.park(cx);
         Poll::Pending
     }
 
@@ -911,7 +932,7 @@ impl EvQue {
         if let Some(step) = q.take_oldest(flow_on, retired).or_else(|| q.take_ended()) {
             return Poll::Ready(step);
         }
-        self.flow.park(cx, retired);
+        guard.park(cx);
         Poll::Pending
     }
 
@@ -2766,8 +2787,7 @@ mod tests {
         let (sink, _reader) = attach(&user, 1, LogKind::Val);
         let (counter, waker) = count_waker();
         let cx = std::task::Context::from_waker(&waker);
-        let flow = sink.que.flow.clone();
-        flow.park(&cx, &mut sink.que.lock_retiring().retired);
+        sink.que.lock_retiring().park(&cx);
         sink.post(ev(1));
         assert_eq!(
             counter.0.load(Ordering::SeqCst),
@@ -2775,7 +2795,7 @@ mod tests {
             "empty ring: first post wakes"
         );
         for v in 2..10 {
-            flow.park(&cx, &mut sink.que.lock_retiring().retired);
+            sink.que.lock_retiring().park(&cx);
             sink.post(ev(v));
         }
         assert_eq!(

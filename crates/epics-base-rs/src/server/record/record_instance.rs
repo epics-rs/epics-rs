@@ -3197,14 +3197,11 @@ mod posted {
     }
 
     /// The [`Record::process_posted_fields`] answer every entry's `posted` was
-    /// settled against, and the deadband field's membership in it, which
-    /// [`RecordInstance::deadband_post`] reads; that field keeps no
-    /// published entry. And the [`Lists`] every entry's roles were settled
+    /// settled against, and the [`Lists`] every entry's roles were settled
     /// against.
     #[derive(Debug)]
     pub(super) struct PostedSet {
         list: Option<DeclaredFields>,
-        deadband: bool,
         lists: Lists,
     }
 
@@ -3212,7 +3209,6 @@ mod posted {
         pub(super) const fn new() -> Self {
             Self {
                 list: None,
-                deadband: true,
                 lists: Lists::NONE,
             }
         }
@@ -3253,18 +3249,12 @@ mod posted {
             }
         }
 
-        /// Settle `log` and the deadband membership against `list`.
-        pub(super) fn resettle(
-            &mut self,
-            list: Option<DeclaredFields>,
-            deadband: Option<FieldIx>,
-            log: &mut PostedLog,
-        ) {
+        /// Settle `log` against `list`.
+        pub(super) fn resettle(&mut self, list: Option<DeclaredFields>, log: &mut PostedLog) {
             self.list = list;
             for (member, published) in log.iter_mut() {
                 published.posted = self.contains(member);
             }
-            self.deadband = list.is_none_or(|list| holds(list, deadband));
         }
 
         /// Whether every entry's roles are settled against `lists`.
@@ -3299,11 +3289,6 @@ mod posted {
         /// last settle.
         pub(super) fn contains(&self, member: Option<FieldIx>) -> bool {
             self.list.is_some_and(|list| holds(list, member))
-        }
-
-        /// The deadband field's membership in the list of the last settle.
-        pub(super) fn deadband(&self) -> bool {
-            self.deadband
         }
     }
 }
@@ -4816,6 +4801,9 @@ pub struct RecordInstance {
     pub parsed_out: OutLinkCache,
     pub parsed_tsel: LinkCache,
     pub parsed_flnk: LinkCache,
+    /// See [`MonitorHot`]. Last of the unmonitored run: past it, only a
+    /// watched cycle reads on.
+    monitor_hot: MonitorHot,
     /// The value of each subscribed field as ALREADY PUBLISHED to that
     /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
     /// change-detection loop in every snapshot builder posts a field only
@@ -5137,6 +5125,97 @@ pub(crate) struct MonitorPlan {
     /// Whether the type is `sub` or `aSub` — a property of the type, so not
     /// matched by name every cycle.
     subroutine_kind: Option<SubroutineKind>,
+}
+
+/// What a cycle's monitor state half asks before it knows anyone listens: the
+/// [`MonitorPlan`] answers it reads, whether a monitor is attached and whether
+/// a field was ever published. One word on the tail line the cycle already
+/// holds, so a record nobody watches reads none of the plan's lines, the
+/// subscriber list's or `last_posted`'s — C's `monitor()` reads its record
+/// and nothing else.
+///
+/// The plan bits are copied once from the plan, which never changes. The two
+/// others have one writer each: [`RecordInstance::set_subscribers_watched`],
+/// after every change to the list, and [`RecordInstance::record_value_post_as`],
+/// the only insert into `last_posted`, which never shrinks.
+#[derive(Clone, Copy)]
+struct MonitorHot {
+    bits: u16,
+    /// [`MonitorPlan::deadband_member`]'s index, read under [`Self::DEADBAND_DECLARED`].
+    deadband_ix: FieldIx,
+    /// [`MonitorPlan::value_gate`], kept whole: it is handed on as two bools.
+    gate: crate::server::record::MonitorValueGate,
+}
+
+impl MonitorHot {
+    /// [`MonitorPlan::posts_value_monitor`].
+    const POSTS_VALUE: u16 = 1 << 0;
+    /// [`MonitorPlan::log_suppressed`].
+    const LOG_SUPPRESSED: u16 = 1 << 3;
+    /// [`MonitorPlan::alarm_alone_posts_value`].
+    const ALARM_ALONE: u16 = 1 << 4;
+    /// [`MonitorPlan::hooks`] has [`CycleHooks::CYCLE_POSTED`](crate::server::record::CycleHooks::CYCLE_POSTED).
+    const CYCLE_POSTED: u16 = 1 << 5;
+    /// [`MonitorPlan::forced_secondary`].
+    const FORCED_SECONDARY: u16 = 1 << 6;
+    /// [`MonitorPlan::value_masked`] is not empty.
+    const VALUE_MASKED: u16 = 1 << 7;
+    /// [`MonitorPlan::answers_own_posts`].
+    const ANSWERS_OWN: u16 = 1 << 8;
+    /// [`MonitorPlan::deadband_member`] is `Some`.
+    const DEADBAND_DECLARED: u16 = 1 << 9;
+    /// A monitor is attached.
+    const WATCHED: u16 = 1 << 10;
+    /// `last_posted` holds an entry.
+    const PUBLISHED: u16 = 1 << 11;
+    /// Any set, the cycle may owe a mark TAKE or the walk a field to reach.
+    const WALK_OWED: u16 = Self::CYCLE_POSTED | Self::WATCHED | Self::PUBLISHED;
+
+    fn of(plan: &MonitorPlan) -> Self {
+        let bit = |on: bool, bit: u16| if on { bit } else { 0 };
+        let deadband = plan.deadband_member();
+        Self {
+            bits: bit(plan.posts_value_monitor, Self::POSTS_VALUE)
+                | bit(plan.log_suppressed, Self::LOG_SUPPRESSED)
+                | bit(plan.alarm_alone_posts_value, Self::ALARM_ALONE)
+                | bit(
+                    plan.hooks
+                        .has(crate::server::record::CycleHooks::CYCLE_POSTED),
+                    Self::CYCLE_POSTED,
+                )
+                | bit(plan.forced_secondary, Self::FORCED_SECONDARY)
+                | bit(!plan.value_masked.is_empty(), Self::VALUE_MASKED)
+                | bit(plan.answers_own_posts, Self::ANSWERS_OWN)
+                | bit(deadband.is_some(), Self::DEADBAND_DECLARED),
+            deadband_ix: deadband.unwrap_or(FieldIx::UNDECLARED),
+            gate: plan.value_gate,
+        }
+    }
+
+    #[inline(always)]
+    fn has(self, bit: u16) -> bool {
+        self.bits & bit != 0
+    }
+
+    #[inline(always)]
+    fn set(&mut self, bit: u16, on: bool) {
+        if on {
+            self.bits |= bit;
+        } else {
+            self.bits &= !bit;
+        }
+    }
+
+    #[inline(always)]
+    fn value_gate(self) -> crate::server::record::MonitorValueGate {
+        self.gate
+    }
+
+    #[inline(always)]
+    fn deadband_member(self) -> Option<FieldIx> {
+        self.has(Self::DEADBAND_DECLARED)
+            .then_some(self.deadband_ix)
+    }
 }
 
 impl MonitorPlan {
@@ -6430,6 +6509,7 @@ impl RecordInstance {
             message: record.udf_alarm_message(),
         });
         let monitor_plan = MonitorPlan::of(record.as_ref());
+        let monitor_hot = MonitorHot::of(&monitor_plan);
         let analog_alarm = match rtype {
             // C parity: every record type whose dbd carries
             // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV gets an analog-alarm
@@ -6505,6 +6585,7 @@ impl RecordInstance {
             udf_alarm,
             monitor_plan,
             array_hash_changed: false,
+            monitor_hot,
             simpvt: false,
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6915,8 +6996,7 @@ impl RecordInstance {
     }
 
     /// The record's [`Record::process_posted_fields`], with every
-    /// `last_posted` entry's `posted` and the deadband membership settled
-    /// against it.
+    /// `last_posted` entry's `posted` settled against it.
     #[inline]
     fn settle_posted(&mut self) -> Option<DeclaredFields> {
         let list = match self.monitor_plan.posts_closed {
@@ -6942,11 +7022,7 @@ impl RecordInstance {
             !self.monitor_plan.answers_own_posts || self.monitor_plan.own_posts_hold(&*self.record),
             "a turned-over post set broke answers_own_posts"
         );
-        self.posted.resettle(
-            list,
-            self.monitor_plan.deadband_member(),
-            &mut self.last_posted,
-        );
+        self.posted.resettle(list, &mut self.last_posted);
         self.settle_sub_walk();
     }
 
@@ -7002,6 +7078,7 @@ impl RecordInstance {
             self.monitor_plan.fixed_roles(key),
         );
         self.last_posted.insert(key, published);
+        self.monitor_hot.set(MonitorHot::PUBLISHED, true);
         if !self.unwatched() {
             self.settle_sub_walk();
         }
@@ -10291,51 +10368,36 @@ impl RecordInstance {
         include_val: bool,
         marked: bool,
     ) {
-        use crate::server::record::{
-            CycleHooks, CycleMarks, CyclePostMask, SecondaryTake, ValuePostGate,
-        };
+        use crate::server::record::{CycleMarks, CyclePostMask, SecondaryTake, ValuePostGate};
 
-        let hooks = self.monitor_plan.hooks;
-        // C's `if (monitor_mask)` is shut and the type holds no one-shot post
-        // state, so there is nothing to take, no old copy to advance and no
-        // field for the walk to reach.
-        let idle = deadband_mask.is_empty()
-            && !marked
-            && !hooks.has(CycleHooks::CYCLE_POSTED)
-            && self.walk_unreached();
-        // C's secondary block, TAKEn once per cycle and ahead of the idle exit,
-        // so an idle bo leaves here instead of at the walk. It decides each
-        // field from the record's own old copy and advances it (C aoRecord.c:
-        // 535-549), whether or not anyone is subscribed, before the walk reads
-        // the record; the posts land after the walk, in the order C emits
-        // them. Idle, VAL's mask is shut, so only a forced block can open, and
-        // a cycle it leaves shut ends here.
-        let forced_secondary = self.monitor_plan.forced_secondary;
-        let secondary = if idle {
-            if !forced_secondary {
-                return;
-            }
-            let secondary = self.take_secondary(deadband_mask);
-            if secondary.is_none() {
-                return;
-            }
-            secondary
-        } else if forced_secondary
-            || !deadband_mask.is_empty() && !self.monitor_plan.value_masked.is_empty()
+        let hot = self.monitor_hot;
+        let cycle_posted = hot.has(MonitorHot::CYCLE_POSTED);
+        // C's secondary block, TAKEn once per cycle ahead of the mark TAKE. It
+        // decides each field from the record's own old copy and advances it (C
+        // aoRecord.c:535-549), whether or not anyone is subscribed, before the
+        // walk reads the record; the posts land after the walk, in the order C
+        // emits them. With VAL's mask shut only a forced block can open.
+        let secondary = if hot.has(MonitorHot::FORCED_SECONDARY)
+            || !deadband_mask.is_empty() && hot.has(MonitorHot::VALUE_MASKED)
         {
             self.take_secondary(deadband_mask)
         } else {
             SecondaryTake::NONE
         };
-        let secondary_fired = secondary.fired();
-
+        // One mask for the cycle nobody watches: no block fired, no mark to
+        // TAKE, no field for the walk. An own-posts type falls through to the
+        // exact test below.
+        if secondary.is_none() && !marked && !hot.has(MonitorHot::WALK_OWED) {
+            return;
+        }
         // TAKE — this also clears the state it answers from (C's
-        // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
-        let cycle_marks = if marked || hooks.has(CycleHooks::CYCLE_POSTED) {
+        // `pcalc->newm = 0`), which is why it may run only once per cycle.
+        let cycle_marks = if marked || cycle_posted {
             self.record.take_cycle_posted_fields()
         } else {
             CycleMarks::NONE
         };
+        let secondary_fired = secondary.fired();
         let any_marks = !cycle_marks.is_empty();
         let value_masked = self.monitor_plan.value_masked;
         // The walk has no field to reach — nothing subscribed and none it can
@@ -10350,7 +10412,7 @@ impl RecordInstance {
         // advance — has already run.
         if secondary_fired == 0
             && self.walk_unreached()
-            && !(self.monitor_plan.answers_own_posts && any_marks)
+            && !(hot.has(MonitorHot::ANSWERS_OWN) && any_marks)
         {
             return;
         }
@@ -11102,7 +11164,7 @@ impl RecordInstance {
         // `Record::process_posts_value_monitor`. The alarm bits still reach VAL
         // via `deadband_post`'s `alarm_bits`, so an alarm transition still posts
         // it; only the value/archive classes are suppressed.
-        if !self.monitor_plan.posts_value_monitor {
+        if !self.monitor_hot.has(MonitorHot::POSTS_VALUE) {
             return (false, false, false);
         }
         // lsi/lso and the binary records gate on their own change test (C
@@ -11112,7 +11174,7 @@ impl RecordInstance {
         let mut last_posted = [self.common.mlst, self.common.alst];
         let classes = self
             .record
-            .monitor_value_classes(self.monitor_plan.value_gate, &mut last_posted);
+            .monitor_value_classes(self.monitor_hot.value_gate(), &mut last_posted);
         [self.common.mlst, self.common.alst] = last_posted;
         self.array_hash_changed = classes.hash_changed;
         (classes.value, classes.archive, classes.marked)
@@ -11129,19 +11191,12 @@ impl RecordInstance {
         include_val: bool,
         include_archive: bool,
     ) -> EventMask {
-        let MonitorPlan {
-            deadband_field: field,
-            deadband_is_val,
-            log_suppressed,
-            alarm_alone_posts_value,
-            ..
-        } = self.monitor_plan;
-
+        let hot = self.monitor_hot;
         let mut mask = alarm_bits;
         if include_val {
             mask |= EventMask::VALUE;
         }
-        if include_archive && !log_suppressed {
+        if include_archive && !hot.has(MonitorHot::LOG_SUPPRESSED) {
             mask |= EventMask::LOG;
         }
 
@@ -11154,19 +11209,24 @@ impl RecordInstance {
         // `alarm_bits` alone make `mask` non-empty, was firing a `.VAL` monitor
         // C never sends. Gating here rather than at each builder keeps the
         // single owner of the deadband post the single enforcer of the set.
-        if mask.is_empty() || !(alarm_alone_posts_value || include_val || include_archive) || {
-            self.settle_posted();
-            !self.posted.deadband()
-        } {
+        if mask.is_empty()
+            || !(hot.has(MonitorHot::ALARM_ALONE) || include_val || include_archive)
+            || !self.deadband_posted()
+        {
             return mask;
         }
-        if self.subscribers.is_empty() {
+        if self.unwatched() {
             // `notify_from_snapshot`'s gate, taken before the read: the post
             // has no one to deliver to, and the value is a copy (an
             // allocation for compress, waveform and the string records).
             snapshot.push_unwatched(mask);
             return mask;
         }
+        let MonitorPlan {
+            deadband_field: field,
+            deadband_is_val,
+            ..
+        } = self.monitor_plan;
         // A reference-log field's post carries no value: it is read at
         // delivery, as C's `dbfl_type_ref` log is.
         let value = if self.monitor_plan.deadband_ref {
@@ -11185,6 +11245,17 @@ impl RecordInstance {
             ));
         }
         mask
+    }
+
+    /// Whether the deadband field is in the record's
+    /// [`Record::process_posted_fields`] now, asked of the record's own list
+    /// and the plan's index in [`MonitorHot`].
+    #[inline(always)]
+    fn deadband_posted(&self) -> bool {
+        let member = self.monitor_hot.deadband_member();
+        self.record
+            .process_posted_fields()
+            .is_none_or(|list| holds(list, member))
     }
 
     #[inline(always)]
@@ -11946,6 +12017,7 @@ impl RecordInstance {
         let before = self.subscribers.len();
         self.subscribers.retain(|sub| keep(sub));
         if self.subscribers.len() != before {
+            self.set_subscribers_watched();
             self.settle_sub_walk();
         }
     }
@@ -11993,18 +12065,28 @@ impl RecordInstance {
     /// subscribed and published fields.
     #[inline(always)]
     fn walk_unreached(&self) -> bool {
-        self.monitor_plan.answers_own_posts || self.unwatched() && self.last_posted.is_empty()
+        let hot = self.monitor_hot;
+        debug_assert_eq!(hot.has(MonitorHot::PUBLISHED), !self.last_posted.is_empty());
+        hot.has(MonitorHot::ANSWERS_OWN) || self.unwatched() && !hot.has(MonitorHot::PUBLISHED)
     }
 
-    /// No monitor is attached, tested on the inline length alone: a spilled
-    /// list emptied by detaches still reads as watched and its post finds no
-    /// one, so the gate is one load where `SmallVec::len` branches on the
-    /// spill.
+    /// No monitor is attached, read from [`MonitorHot`] rather than the list.
     #[inline(always)]
     fn unwatched(&self) -> bool {
         #[cfg(test)]
         SUBSCRIBER_TESTS.with(|n| n.set(n.get() + 1));
-        !self.subscribers.spilled() && self.subscribers.is_empty()
+        debug_assert_eq!(
+            self.monitor_hot.has(MonitorHot::WATCHED),
+            !self.subscribers.is_empty()
+        );
+        !self.monitor_hot.has(MonitorHot::WATCHED)
+    }
+
+    /// The one writer of [`MonitorHot::WATCHED`], run after every change to
+    /// the list.
+    fn set_subscribers_watched(&mut self) {
+        self.monitor_hot
+            .set(MonitorHot::WATCHED, !self.subscribers.is_empty());
     }
 
     #[inline(never)]
@@ -12417,6 +12499,7 @@ impl RecordInstance {
                 .unwrap_or(self.subscribers.len()),
         };
         self.subscribers.insert(at, entry);
+        self.set_subscribers_watched();
         // A field with no `last_posted` entry has never been published: seed it
         // with the value the client is handed in the EVENT_ADD response, so the
         // first process cycle does not treat it as changed. An existing entry
@@ -12523,6 +12606,7 @@ impl RecordInstance {
         let first = !self.destroyed;
         self.destroyed = true;
         self.subscribers.clear();
+        self.set_subscribers_watched();
         self.notify_restart_list.clear();
         for entry in self.parsed_inputs.iter_mut().flatten() {
             entry.release_target();
@@ -12781,6 +12865,7 @@ mod record_cell_layout_tests {
             parsed_out,
             parsed_tsel,
             parsed_flnk,
+            monitor_hot,
             last_posted,
             posted,
             monitor_plan,
@@ -15988,8 +16073,8 @@ mod mlis_tests {
         assert_eq!(drained(&mut kept).len(), 2);
     }
 
-    /// A list detached empty after spilling reads as watched: its posts find
-    /// no one, and the next monitor attached receives them.
+    /// A list detached empty after spilling reads as unwatched, and the next
+    /// monitor attached receives its posts.
     #[test]
     fn a_list_emptied_after_spilling_posts_to_its_next_monitor() {
         let mut inst = ao();
@@ -15999,12 +16084,36 @@ mod mlis_tests {
         for reader in &gone {
             inst.remove_subscriber(reader.id());
         }
-        assert!(inst.subscribers.spilled() && inst.subscribers.is_empty());
+        assert!(inst.subscribers.spilled() && inst.unwatched());
         post(&inst, "VAL", EventMask::VALUE);
         inst.notify_field("VAL", EventMask::VALUE);
         let mut next = attach(&mut inst, "VAL", EventMask::VALUE);
         post(&inst, "VAL", EventMask::VALUE);
         assert_eq!(drained(&mut next), [EventMask::VALUE.bits()]);
+    }
+
+    /// [`MonitorHot::WATCHED`] follows the list through each change: the first
+    /// attach, a detach that leaves one, the last detach of a spilled list, a
+    /// re-attach and destroy. `unwatched` asserts it against the list.
+    #[test]
+    fn the_watched_bit_follows_every_change_to_the_list() {
+        let mut inst = ao();
+        assert!(inst.unwatched());
+        let first = attach(&mut inst, "VAL", EventMask::VALUE);
+        assert!(!inst.unwatched());
+        let rest: Vec<_> = (0..2)
+            .map(|_| attach(&mut inst, "VAL", EventMask::VALUE))
+            .collect();
+        inst.remove_subscriber(first.id());
+        assert!(!inst.unwatched());
+        for reader in &rest {
+            inst.remove_subscriber(reader.id());
+        }
+        assert!(inst.subscribers.spilled() && inst.unwatched());
+        let _again = attach(&mut inst, "VAL", EventMask::VALUE);
+        assert!(!inst.unwatched());
+        inst.destroy();
+        assert!(inst.unwatched());
     }
 
     /// With no monitor the post stops at the list's length.
@@ -16795,10 +16904,10 @@ mod posted_settle_tests {
         }
     }
 
-    /// The deadband post reads its field's membership from the same settle:
-    /// transform's closed list leaves VAL out, aSub's keeps it.
+    /// The deadband post reads its field's membership from the record's list
+    /// now: transform's closed list leaves VAL out, aSub's keeps it.
     #[test]
-    fn the_deadband_post_reads_the_settled_membership() {
+    fn the_deadband_post_reads_the_listed_membership() {
         use crate::server::records::transform::TransformRecord;
         let mut transform = RecordInstance::new("T".to_string(), TransformRecord::default());
         let mut asub = RecordInstance::new("AS".to_string(), ASubRecord::default());
@@ -16808,10 +16917,67 @@ mod posted_settle_tests {
                 .expect("VAL subscriber");
             let mut snapshot = ProcessSnapshot::new();
             inst.deadband_post(&mut snapshot, EventMask::ALARM, true, true);
-            inst.settle_posted();
-            assert_eq!(inst.posted.deadband(), member, "{}", inst.name);
+            assert_eq!(inst.deadband_posted(), member, "{}", inst.name);
             assert_eq!(snapshot.len(), usize::from(member), "{}", inst.name);
         }
+    }
+
+    /// A list that drops and readmits the deadband field, as aSub's EFLG does.
+    struct DropsVal {
+        closed: bool,
+    }
+
+    impl Record for DropsVal {
+        fn record_type(&self) -> &'static str {
+            "dropsval"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            matches!(name, "VAL" | "X").then_some(EpicsValue::Double(0.0))
+        }
+        fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
+            Err(CaError::FieldNotFound(name.to_string()))
+        }
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
+            TOGGLES_FIELDS
+        }
+        fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+            Some(if self.closed {
+                &const { crate::server::record::declared_set(TOGGLES_FIELDS, ["X"]) }
+            } else {
+                &const { crate::server::record::declared_set(TOGGLES_FIELDS, ["VAL", "X"]) }
+            })
+        }
+    }
+
+    /// With no monitor and nothing published, the deadband post's CP mask
+    /// follows the list the record answers each cycle, though no walk runs to
+    /// settle `posted` against it.
+    #[test]
+    fn an_unwatched_deadband_post_follows_a_turned_over_list() {
+        let mut inst = RecordInstance::new("D".to_string(), DropsVal { closed: false });
+        for closed in [false, true, false, true] {
+            inst.record = Box::new(DropsVal { closed });
+            let mut snapshot = ProcessSnapshot::new();
+            let mask = inst.deadband_post(&mut snapshot, EventMask::ALARM, true, false);
+            assert!(inst.unwatched() && inst.walk_unreached());
+            assert_eq!(mask, EventMask::ALARM | EventMask::VALUE);
+            let published = if closed { EventMask::NONE } else { mask };
+            assert_eq!(snapshot.published_mask(), published, "closed {closed}");
+        }
+    }
+
+    /// The first publish of a field with no monitor sets
+    /// [`MonitorHot::PUBLISHED`], and the walk then has a field to reach;
+    /// `walk_unreached` asserts the bit against `last_posted`.
+    #[test]
+    fn a_first_unwatched_publish_opens_the_walk() {
+        let mut inst = RecordInstance::new("T".to_string(), Toggles { closed: false });
+        assert!(inst.walk_unreached());
+        inst.record_value_post("X", PostedValue::Val(EpicsValue::Double(1.0)));
+        assert!(inst.unwatched() && !inst.walk_unreached());
     }
 
     /// A field first published while the instance still holds the old list

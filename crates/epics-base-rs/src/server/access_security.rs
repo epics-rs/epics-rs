@@ -214,6 +214,8 @@ struct AcfShared {
     /// What the `INP*` watcher has attached, for [`AcfCell::wait_served`].
     served: parking_lot::Mutex<Served>,
     served_cv: parking_lot::Condvar,
+    /// [`AcfCell::install_async`]'s wake, fired beside `served_cv`.
+    served_notify: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -250,6 +252,28 @@ impl AcfCell {
         notify_asg_field_changed();
     }
 
+    /// Publish `derived`, computed from `from`, only while `from` is still the
+    /// published policy: a reload that landed meanwhile is newer than anything
+    /// derived from the policy it replaced, so the derived one is dropped.
+    /// True if it was published.
+    fn replace_derived(
+        &self,
+        from: &std::sync::Arc<AccessSecurityConfig>,
+        derived: AccessSecurityConfig,
+    ) -> bool {
+        let prev = self
+            .0
+            .policy
+            .compare_and_swap(from, Some(std::sync::Arc::new(derived)));
+        let replaced = prev
+            .as_ref()
+            .is_some_and(|p| std::sync::Arc::ptr_eq(p, from));
+        if replaced {
+            notify_asg_field_changed();
+        }
+        replaced
+    }
+
     /// Block until the `INP*` watcher has added the current policy's inputs,
     /// each one present taking its first reading — C `asCaStart` waiting on
     /// `asCaTaskWait`. That wait puts an `asInit`'s initial events before
@@ -257,23 +281,51 @@ impl AcfCell {
     /// processed last decides. Returns at once for a cell no watcher serves.
     pub fn wait_served(&self) {
         let mut served = self.0.served.lock();
-        while served.watching && served.load != load_ident(self.load().as_ref()) {
+        while !self.is_served(&served) {
             self.0.served_cv.wait(&mut served);
         }
     }
 
+    fn is_served(&self, served: &Served) -> bool {
+        !served.watching || served.load == load_ident(self.load().as_ref())
+    }
+
     /// C `asInit` for a parsed file: publish it as a new load, then
     /// [`Self::wait_served`]. Every path that loads a file comes through here
-    /// so none returns with the new inputs still unread. Blocks; an async
-    /// caller runs it under `spawn_blocking`.
+    /// or [`Self::install_async`], so none returns with the new inputs still
+    /// unread. Blocks the calling thread, so it is for a thread of its own
+    /// (iocsh's): the watcher it waits for runs on cbMedium, and a band worker
+    /// parked here can starve it. Async callers use [`Self::install_async`].
     pub fn install(&self, config: AccessSecurityConfig) {
         self.store(Some(std::sync::Arc::new(config)));
         self.wait_served();
     }
 
+    /// [`Self::install`] that awaits the first readings instead of parking a
+    /// thread, so it is safe on any executor, the watcher's band included.
+    pub async fn install_async(&self, config: AccessSecurityConfig) {
+        self.store(Some(std::sync::Arc::new(config)));
+        self.wait_served_async().await;
+    }
+
+    /// [`Self::wait_served`] for async callers: parks no thread.
+    pub async fn wait_served_async(&self) {
+        loop {
+            let notified = self.0.served_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            // Registered before the check, so a mark between them still wakes.
+            notified.as_mut().enable();
+            if self.is_served(&self.0.served.lock()) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn mark_served(&self, watching: bool, load: usize) {
         *self.0.served.lock() = Served { watching, load };
         self.0.served_cv.notify_all();
+        self.0.served_notify.notify_waiters();
     }
 }
 
@@ -284,6 +336,7 @@ pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
         policy: arc_swap::ArcSwapOption::new(initial.map(std::sync::Arc::new)),
         served: Default::default(),
         served_cv: Default::default(),
+        served_notify: tokio::sync::Notify::new(),
     }))
 }
 
@@ -350,10 +403,10 @@ const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 /// rights automatically. C recovers stale HAG IPs only on a manual
 /// `asInit`; this is the sibling of the CA-side `refresh_dns` deviation.
 ///
-/// Resolution runs inline in the task (the established `refresh_dns`
-/// pattern): a wedged resolver delays this refresher, nothing else. The
-/// task holds only a `Weak` to the cell and ends when the owning IOC
-/// drops it.
+/// Resolution runs on [`AS_OFFLOAD`], not on the band: a wedged resolver
+/// holds one of its workers and delays this refresher, while cbMedium, which
+/// the INP watcher shares, keeps running. The task holds only a `Weak` to
+/// the cell and ends when the owning IOC drops it.
 fn spawn_hag_refresh(cell: &AcfCell) {
     let weak = std::sync::Arc::downgrade(&cell.0);
     // Middle band: an IOC-wide HAG re-resolution owns no record and so has no
@@ -365,23 +418,55 @@ fn spawn_hag_refresh(cell: &AcfCell) {
         async move {
             loop {
                 crate::runtime::task::sleep_background(HAG_DNS_REFRESH).await;
-                let Some(inner) = weak.upgrade() else { break };
-                if !as_check_client_ip() {
-                    continue;
-                }
-                let Some(config) = inner.policy.load_full() else {
-                    continue;
-                };
-                if let Some(refreshed) = config.with_refreshed_hags() {
-                    tracing::info!(
-                        target: "epics_base_rs::access_security",
-                        "HAG DNS refresh: re-resolved members changed; republishing policy"
-                    );
-                    AcfCell(inner).store(Some(std::sync::Arc::new(refreshed)));
+                if !refresh_hags_once(&weak, AccessSecurityConfig::with_refreshed_hags).await {
+                    break;
                 }
             }
         },
     );
+}
+
+/// One [`spawn_hag_refresh`] tick, `resolve` run on [`AS_OFFLOAD`]. False once
+/// the cell is gone.
+async fn refresh_hags_once<F>(weak: &std::sync::Weak<AcfShared>, resolve: F) -> bool
+where
+    F: FnOnce(&AccessSecurityConfig) -> Option<AccessSecurityConfig> + Send + 'static,
+{
+    let Some(inner) = weak.upgrade() else {
+        return false;
+    };
+    if !as_check_client_ip() {
+        return true;
+    }
+    let Some(config) = inner.policy.load_full() else {
+        return true;
+    };
+    drop(inner);
+    let from = config.clone();
+    let refreshed = match AS_OFFLOAD.run(move || resolve(&config)) {
+        Ok(job) => job.await,
+        Err(e) => {
+            tracing::warn!(
+                target: "epics_base_rs::access_security",
+                error = %e,
+                "HAG DNS refresh: no offload thread; skipping this tick"
+            );
+            return true;
+        }
+    };
+    let Some(refreshed) = refreshed else {
+        return true;
+    };
+    let Some(inner) = weak.upgrade() else {
+        return false;
+    };
+    if AcfCell(inner).replace_derived(&from, refreshed) {
+        tracing::info!(
+            target: "epics_base_rs::access_security",
+            "HAG DNS refresh: re-resolved members changed; republishing policy"
+        );
+    }
+    true
 }
 
 /// Retry cadence for an ASG `INP*` link whose record is not in the database
@@ -2517,6 +2602,25 @@ fn invalid_character(c: u8) -> String {
     }
 }
 
+/// The threads access security blocks on: an ACF file read, and the host
+/// lookups a HAG parse or refresh makes. Not a callback band, because the
+/// INP watcher shares cbMedium and C does this work on the iocsh thread.
+pub static AS_OFFLOAD: crate::runtime::offload::OffloadPool =
+    crate::runtime::offload::OffloadPool::new(
+        "asOffload",
+        crate::runtime::task::ThreadPriority::Low,
+    );
+
+/// [`parse_acf`] of a file, for async callers, on [`AS_OFFLOAD`]: the read can
+/// stall on a slow mount and a HAG parse resolves its hosts.
+pub async fn read_acf(path: impl AsRef<std::path::Path>) -> CaResult<AccessSecurityConfig> {
+    let path = path.as_ref().to_path_buf();
+    AS_OFFLOAD
+        .run(move || parse_acf(std::fs::read(path).map_err(CaError::Io)?))
+        .map_err(CaError::Io)?
+        .await
+}
+
 pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
@@ -3541,6 +3645,82 @@ ASG(DEFAULT) {
         assert!(
             idempotent.is_none(),
             "a freshly parsed config re-resolves to itself"
+        );
+    }
+
+    /// A HAG refresh tick awaited on cbMedium leaves cbMedium free while its
+    /// lookups block, and publishes what they return.
+    #[test]
+    fn a_hag_refresh_tick_leaves_cb_medium_free() {
+        use crate::runtime::task::{CallbackPriority, spawn_background};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(true);
+        let cell = new_acf_cell(Some(parse_acf("ASG(DEFAULT) { RULE(1, READ) }\n").unwrap()));
+        let weak = std::sync::Arc::downgrade(&cell.0);
+        let (release, held) = channel::<()>();
+        let (ticked, tick) = channel();
+        spawn_background(CallbackPriority::Medium, async move {
+            let alive = refresh_hags_once(&weak, move |c| {
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                let mut moved = c.clone();
+                moved.hag.insert(b"h".to_vec(), bs(&["127.0.0.1"]));
+                Some(moved)
+            })
+            .await;
+            let _ = ticked.send(alive);
+        });
+        // Queued only once the tick is blocked in its lookup.
+        std::thread::sleep(Duration::from_millis(200));
+        let (ran, beside) = channel();
+        spawn_background(CallbackPriority::Medium, async move {
+            let _ = ran.send(());
+        });
+        let free = beside.recv_timeout(Duration::from_secs(3)).is_ok();
+        release.send(()).unwrap();
+        let alive = tick.recv_timeout(Duration::from_secs(10)).unwrap();
+        set_as_check_client_ip(false);
+        assert!(free, "the HAG lookup parked cbMedium");
+        assert!(alive);
+        assert!(cell.load_full().unwrap().hag.contains_key(b"h".as_slice()));
+    }
+
+    /// A reload that lands while a HAG lookup is blocked wins: the refresh,
+    /// derived from the policy the reload replaced, is dropped.
+    #[test]
+    fn a_reload_during_a_hag_lookup_is_not_overwritten() {
+        use crate::runtime::task::{CallbackPriority, spawn_background};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(true);
+        let cell = new_acf_cell(Some(parse_acf("ASG(DEFAULT) { RULE(1, READ) }\n").unwrap()));
+        let weak = std::sync::Arc::downgrade(&cell.0);
+        let (looking, in_lookup) = channel::<()>();
+        let (release, held) = channel::<()>();
+        let (ticked, tick) = channel();
+        spawn_background(CallbackPriority::Medium, async move {
+            let alive = refresh_hags_once(&weak, move |c| {
+                let _ = looking.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                let mut moved = c.clone();
+                moved.hag.insert(b"h".to_vec(), bs(&["127.0.0.1"]));
+                Some(moved)
+            })
+            .await;
+            let _ = ticked.send(alive);
+        });
+        in_lookup.recv_timeout(Duration::from_secs(5)).unwrap();
+        let reload = std::sync::Arc::new(parse_acf("ASG(RELOADED) { RULE(1, READ) }\n").unwrap());
+        cell.store(Some(reload.clone()));
+        release.send(()).unwrap();
+        let alive = tick.recv_timeout(Duration::from_secs(10)).unwrap();
+        set_as_check_client_ip(false);
+        assert!(alive);
+        assert!(
+            std::sync::Arc::ptr_eq(&cell.load_full().unwrap(), &reload),
+            "a refresh derived from the replaced policy overwrote the reload"
         );
     }
 
@@ -5587,6 +5767,70 @@ mod as_ca_task_tests {
         }
     }
 
+    /// `read_acf` awaited from cbMedium leaves cbMedium free while the file is
+    /// read: the fifo's writer waits for a second cbMedium future, which a read
+    /// on the band never lets run. Under tokio the seam it replaced panicked
+    /// here instead, a band future having no runtime.
+    #[cfg(unix)]
+    #[epics_macros_rs::epics_test]
+    async fn read_acf_from_cb_medium_leaves_the_band_free() {
+        use crate::runtime::task::{CallbackPriority, spawn_background};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("acf");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let waited = wait.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            std::fs::write(path, "ASG(DEFAULT) { RULE(1, READ) }\n").unwrap();
+            waited
+        });
+        let read = spawn_background(CallbackPriority::Medium, read_acf(fifo));
+        // Queued only once the read is parked on the fifo, wherever it runs.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        spawn_background(CallbackPriority::Medium, async move {
+            let _ = go.send(());
+        });
+        let cfg = read.await.unwrap();
+        assert!(writer.join().unwrap(), "read_acf parked cbMedium");
+        assert!(cfg.unwrap().asg.contains_key(b"DEFAULT".as_slice()));
+    }
+
+    /// `install_async` awaits the first readings without parking a thread,
+    /// so it completes on cbMedium beside the watcher it waits for, where a
+    /// blocking `install` starves it.
+    #[epics_macros_rs::epics_test]
+    async fn install_async_completes_on_the_watchers_band() {
+        let db = rv_db(5.0).await;
+        let cell = new_acf_cell_watching(None, &db);
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        // Hold `rv`'s lock so the first reading lands only after the install
+        // is waiting for it.
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        let installing = cell.clone();
+        let installed = crate::runtime::task::spawn_background(
+            crate::runtime::task::CallbackPriority::Medium,
+            async move { installing.install_async(cfg).await },
+        );
+        crate::runtime::task::timeout(std::time::Duration::from_secs(5), installed)
+            .await
+            .expect("install_async never returned")
+            .unwrap();
+        assert_eq!(
+            cell.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
+    }
+
     /// U11: two inputs on one letter that both deliver. C keeps whichever
     /// event arrives last (`asCa.c:146-161`), so the record processed last
     /// decides, whichever the ACF lists last. softIoc R7.0.10 with `g` an ai
@@ -5613,7 +5857,7 @@ mod as_ca_task_tests {
                 }
                 let cell = new_acf_cell_watching(None, &db);
                 cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
-                cell.wait_served();
+                cell.wait_served_async().await;
                 let order = if last == "g" {
                     ["bi", "g"]
                 } else {
@@ -5662,7 +5906,7 @@ mod as_ca_task_tests {
             ASG(DEFAULT) { INPA(g) INPA(bi) RULE(1,READ) { CALC("A>1") } }"#;
         let cell = new_acf_cell_watching(None, &db);
         cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
-        cell.wait_served();
+        cell.wait_served_async().await;
         for (name, value) in [("bi", 20.0), ("g", 5.0)] {
             db.put_record_field_from_ca(name, "VAL", EpicsValue::Double(value))
                 .await
@@ -5677,7 +5921,7 @@ mod as_ca_task_tests {
             .insert(b"local".to_vec(), vec![b"192.0.2.1".to_vec()]);
         let refreshed = moved.with_refreshed_hags().expect("the HAG moved");
         cell.store(Some(Arc::new(refreshed)));
-        cell.wait_served();
+        cell.wait_served_async().await;
         // Let the watcher take the republish's wake.
         crate::runtime::task::sleep_background(std::time::Duration::from_millis(200)).await;
         let cfg = cell.load_full().unwrap();
@@ -5695,7 +5939,7 @@ mod as_ca_task_tests {
         let db = rv_db(0.0).await;
         let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
         let cell = new_acf_cell_watching(Some(cfg), &db);
-        cell.wait_served();
+        cell.wait_served_async().await;
         for k in 1..=50 {
             let before = asg_change_generation();
             let spinning = Arc::new(std::sync::Barrier::new(2));

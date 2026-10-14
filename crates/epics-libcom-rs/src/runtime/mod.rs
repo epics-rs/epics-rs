@@ -38,6 +38,7 @@ pub mod log;
 pub mod log_client;
 pub mod mac_lib;
 pub mod net;
+pub mod offload;
 // `select(2)` over raw fds, and `libc` for the calls: nothing in it exists
 // on Windows, whose hosted server keeps the tokio reactor.
 #[cfg(unix)]

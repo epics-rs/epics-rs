@@ -728,19 +728,8 @@ impl CaServer {
         // would stall clients on a slow NFS / FUSE mount — the offload is what
         // preserves C's property, not a departure from it.
         //
-        // Through the seam, not `tokio::task::spawn_blocking`: the file read is
-        // reactor-free by nature, which is the case `runtime::task::
-        // spawn_blocking` documents itself as being for, and it is the half
-        // that needs no runtime under `exec_backend`. Naming tokio's directly
-        // made this panic for any caller reaching `reload_acf_from` off a
-        // runtime — an iocsh `asInit` on the blocking driver.
-        let path_owned = path.to_string();
-        let content =
-            epics_base_rs::runtime::task::spawn_blocking(move || std::fs::read(path_owned))
-                .await
-                .map_err(|e| CaError::Io(std::io::Error::other(e)))?
-                .map_err(CaError::Io)?;
-        let parsed = access_security::parse_acf(&content)?;
+        // `read_acf` offloads the parse too, which resolves HAG hosts.
+        let parsed = access_security::read_acf(path).await?;
         Self::publish_acf(path, parsed, acf, reload_tx).await
     }
 
@@ -752,10 +741,7 @@ impl CaServer {
         acf: &epics_base_rs::server::access_security::AcfCell,
         reload_tx: &tokio::sync::broadcast::Sender<()>,
     ) -> CaResult<()> {
-        let cell = acf.clone();
-        epics_base_rs::runtime::task::spawn_blocking(move || cell.install(parsed))
-            .await
-            .map_err(|e| CaError::Io(std::io::Error::other(e)))?;
+        acf.install_async(parsed).await;
         // Notify every active TCP client to recompute and push fresh
         // CA_PROTO_ACCESS_RIGHTS for its open channels. Send-error
         // (no live subscribers) is a normal transient state.
@@ -1717,6 +1703,51 @@ mod reload_acf_hook_tests {
         );
         holder.join().unwrap();
     }
+
+    /// A reload awaited on cbMedium, the INP watcher's band, returns with the
+    /// first readings in place: the install's wait parks no thread there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_from_cb_medium_returns_with_the_first_readings_in_place() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("rv", Box::new(AiRecord::new(5.0)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.acf");
+        std::fs::write(
+            &path,
+            r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
+        )
+        .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(None, &db);
+        let (reload_tx, _refreshed) = tokio::sync::broadcast::channel(4);
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        let cell = acf.clone();
+        let reload = epics_base_rs::runtime::task::spawn_background(
+            epics_base_rs::runtime::task::CallbackPriority::Medium,
+            async move { CaServer::reload_acf_inner(&path.to_string_lossy(), &cell, &reload_tx).await },
+        );
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), reload)
+            .await
+            .expect("the reload parked cbMedium")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1769,18 +1800,12 @@ mod access_notifier_tests {
     }
 }
 
-#[cfg(all(test, exec_backend))]
+#[cfg(test)]
 mod acf_reload_needs_no_runtime {
-    //! The measurement behind `reload_acf_inner`'s seam routing.
-    //!
     //! `reload_acf_from` is public and `reload_acf_inner` is reached from
     //! iocsh as well as from `run`, so it has to work on a thread that is not
-    //! inside any runtime — which on the RTEMS execution model is every thread
-    //! the blocking driver and the shell own. `tokio::task::spawn_blocking`
-    //! panics there; the seam's `spawn_blocking` is the callback pool and does
-    //! not. This test is `exec_backend`-only because that is the backend where
-    //! the difference exists: under `tokio_backend` both spellings are the same
-    //! call and neither works off a runtime.
+    //! inside any runtime. `tokio::task::spawn_blocking`, which the read went
+    //! through before `read_acf`, panics there.
 
     #[test]
     fn reload_acf_inner_completes_on_a_thread_with_no_runtime() {

@@ -20,8 +20,9 @@
 //! you've cleared the network policy explicitly. There is no auth —
 //! treat this like `/proc`.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): end_to_end_healthz binds a tokio::net TCP
-// listener for a real GET, which needs the reactor. These run and pass in the
+// RTEMS-EXEC-MODEL-ALLOW(2): end_to_end_healthz and
+// reload_acf_runs_on_the_access_security_offload bind a tokio::net TCP
+// listener for a real request, which needs the reactor. These run and pass in the
 // exec-backend suite on the tokio driver.
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -348,20 +349,19 @@ async fn handle_request(stream: TcpStream, state: Arc<IntrospectionState>) -> st
                     }
                     "/reload-acf" => match state.reload_acf.clone() {
                         Some(f) => {
-                            // closure does blocking std::fs reads; run on the
-                            // pool so a slow NFS mount doesn't freeze the
-                            // worker. Through the seam because the work is
-                            // reactor-free — see `blocking_work_goes_through_
-                            // the_seam`.
-                            match epics_base_rs::runtime::task::spawn_blocking(move || f()).await {
-                                Ok(Ok(())) => (200, "{\"reload_acf\":\"ok\"}".to_string()),
-                                Ok(Err(e)) => {
-                                    (500, format!("{{\"error\":\"{}\"}}", escape_json(&e)))
-                                }
-                                Err(e) => (
-                                    500,
-                                    format!("{{\"error\":\"{}\"}}", escape_json(&e.to_string())),
-                                ),
+                            // The hook reads and parses the file, HAG lookups
+                            // included: access security's blocking work, so
+                            // it runs where the rest of it does.
+                            let reloaded = epics_base_rs::server::access_security::AS_OFFLOAD
+                                .run(move || f())
+                                .map_err(|e| e.to_string());
+                            let reloaded = match reloaded {
+                                Ok(job) => job.await,
+                                Err(e) => Err(e),
+                            };
+                            match reloaded {
+                                Ok(()) => (200, "{\"reload_acf\":\"ok\"}".to_string()),
+                                Err(e) => (500, format!("{{\"error\":\"{}\"}}", escape_json(&e))),
                             }
                         }
                         None => (501, "{\"error\":\"reload_acf not configured\"}".to_string()),
@@ -540,6 +540,40 @@ mod tests {
         assert!(s.contains("\"status\":\"ok\""));
         server.abort();
     }
+
+    /// POST /reload-acf runs its hook on `AS_OFFLOAD`, where the rest of access
+    /// security's blocking work runs.
+    #[tokio::test]
+    async fn reload_acf_runs_on_the_access_security_offload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let ran_on = Arc::new(std::sync::Mutex::new(None));
+        let seen = ran_on.clone();
+        let state = IntrospectionState::new(5064).with_reload_acf(Arc::new(move || {
+            *seen.lock().unwrap() = std::thread::current().name().map(str::to_owned);
+            Ok(())
+        }));
+        let st = state.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_introspection(addr, st).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"POST /reload-acf HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("200 OK"));
+        let name = ran_on.lock().unwrap().clone().unwrap_or_default();
+        assert!(name.starts_with("asOffload"), "the hook ran on {name:?}");
+        server.abort();
+    }
 }
 
 #[cfg(test)]
@@ -592,7 +626,7 @@ mod ambient_spawn_exemption {
     /// The blocking pool is a different requirement from the reactor, and the
     /// seam says so: a caller whose work is reactor-free by nature takes
     /// `runtime::task::spawn_blocking`, which needs no runtime at all under
-    /// `exec_backend`. The reload hooks do `std::fs` reads, so they qualify;
+    /// `exec_backend`. The TLS reload hook does `std::fs` reads, so it qualifies;
     /// naming tokio's directly re-introduces the ambient read this file is
     /// only narrowly exempt from, in a spelling the exemption's own counter
     /// does not see.

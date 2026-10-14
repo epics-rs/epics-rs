@@ -166,12 +166,8 @@ impl PvaServer {
     /// subsequent checks see the new one. Unlike the `RwLock` this replaced,
     /// the reload does not wait for in-flight checks to finish.
     pub async fn reload_acf_from(&self, path: &std::path::Path) -> CaResult<()> {
-        let content = std::fs::read(path).map_err(epics_base_rs::error::CaError::Io)?;
-        let cfg = access_security::parse_acf(&content)?;
-        let acf = self.acf.clone();
-        epics_base_rs::runtime::task::spawn_blocking(move || acf.install(cfg))
-            .await
-            .map_err(|e| CaError::Io(std::io::Error::other(e)))?;
+        let cfg = access_security::read_acf(path).await?;
+        self.acf.install_async(cfg).await;
         // Bump the shared ACL generation so monitor tasks
         // spawned on the default `PvDatabaseSource` (which captured
         // this counter at spawn time) detect the change on their
@@ -681,7 +677,8 @@ mod tests {
     }
 
     /// C `asInit` returns only once `asCaStart` has the inputs' first readings
-    /// (`asCaTaskWait`), so a check right after a reload sees them.
+    /// (`asCaTaskWait`), so a check right after a reload sees them, and the
+    /// wait parks no thread, so it completes on the watcher's own band.
     #[epics_macros_rs::epics_test]
     async fn reload_acf_from_returns_with_the_first_readings_in_place() {
         let db = Arc::new(PvDatabase::new());
@@ -713,7 +710,17 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
         });
         held.recv().unwrap();
-        server.reload_acf_from(&path).await.unwrap();
+        // From cbMedium, the INP watcher's band: an install that parks its
+        // thread there waits on a watcher that cannot run.
+        let reload = epics_base_rs::runtime::task::spawn_background(
+            epics_base_rs::runtime::task::CallbackPriority::Medium,
+            async move { server.reload_acf_from(&path).await },
+        );
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), reload)
+            .await
+            .expect("the reload parked cbMedium")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
             0

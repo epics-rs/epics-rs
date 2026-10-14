@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::char_view::PvaDollar;
-use epics_base_rs::types::{DbFieldType, DbfLinkClass, EpicsValue};
+use epics_base_rs::types::{DbFieldType, DbfLinkClass, EpicsValue, RecordName};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, convert};
 use epics_pva_rs::server_native::source::RemoteLog;
 
@@ -101,18 +101,19 @@ pub(super) async fn resolve_db_channel(
     db: &PvDatabase,
     member: &MemberChannel,
 ) -> Result<(), String> {
-    let name = member.def.channel.as_str();
+    let name = &member.def.channel[..];
+    let invalid = || format!("Invalid PV: {}", String::from_utf8_lossy(name));
     if epics_base_rs::server::database::filters::db_channel_create(db, name).is_err() {
-        return Err(format!("Invalid PV: {name}"));
+        return Err(invalid());
     }
     let Some(rec) = db.get_record(&member.record) else {
-        return Err(format!("Invalid PV: {name}"));
+        return Err(invalid());
     };
     let instance = rec.read();
     if member.value_in(&instance).is_some() {
         Ok(())
     } else {
-        Err(format!("Invalid PV: {name}"))
+        Err(invalid())
     }
 }
 
@@ -169,7 +170,7 @@ pub struct MemberChannel {
     /// Record name from the member's `+channel`, filter suffix and `$`
     /// modifier already peeled (`dbChannel.c:448-532`). Empty for a
     /// channel-less (Structure / Const) member.
-    pub record: String,
+    pub record: RecordName,
     /// Uppercased field name from the same split.
     pub field: String,
     /// `record[.FIELD]` with the `{json}` suffix and the `$` modifier
@@ -178,7 +179,7 @@ pub struct MemberChannel {
     /// does not peel and would take the suffix for part of the field name;
     /// binding the peeled form here is what lets the member subscription
     /// address `REC.VAL` while its chain carries the `{"dbnd":…}`.
-    pub pv_name: String,
+    pub pv_name: RecordName,
     /// The `+channel` asked for the `$` view.
     pub string_view: bool,
     /// [`Self::put_field`].
@@ -202,9 +203,9 @@ impl MemberChannel {
         if def.channel.is_empty() {
             return Self {
                 def,
-                record: String::new(),
+                record: RecordName::from(&b""[..]),
                 field: String::new(),
-                pv_name: String::new(),
+                pv_name: RecordName::from(&b""[..]),
                 string_view: false,
                 put_field: String::new(),
                 value_filters: Arc::new(f::FilterChain::new()),
@@ -233,7 +234,7 @@ impl MemberChannel {
             def,
             record: cn.record,
             field: cn.field,
-            pv_name: cn.record_path,
+            pv_name: RecordName::from(cn.record_path),
             string_view: cn.string_view,
             put_field,
             value_filters,
@@ -247,8 +248,8 @@ impl MemberChannel {
     }
 
     /// `(record, FIELD)` as the group paths need them.
-    pub fn names(&self) -> (&str, &str) {
-        (self.record.as_str(), self.field.as_str())
+    pub fn names(&self) -> (&[u8], &str) {
+        (&self.record, &self.field)
     }
 
     /// The field a put to this member names: `field`, `$` kept, so the
@@ -420,8 +421,8 @@ pub struct BridgeChannel {
     db: Arc<PvDatabase>,
     /// Full client-facing PV name (`record.FIELD`, or `record` when
     /// no suffix was requested). Used for `channel_name()` and ACF.
-    pv_name: String,
-    record_name: String,
+    pv_name: RecordName,
+    record_name: RecordName,
     /// Uppercased field name. Defaults to `"VAL"`.
     field: String,
     /// The `$` char-array re-view this channel was created with
@@ -453,8 +454,8 @@ impl BridgeChannel {
     /// Create from cached metadata (no DB introspection needed).
     pub fn from_cached(
         db: Arc<PvDatabase>,
-        pv_name: String,
-        record_name: String,
+        pv_name: RecordName,
+        record_name: RecordName,
         field: String,
         nt_type: NtType,
         value_dbf: DbFieldType,
@@ -492,7 +493,7 @@ impl BridgeChannel {
     /// suffix (e.g. `test:ai.VAL{"dbnd":{"d":0.0}}`) via
     /// `split_channel_name` before record/field resolution, and
     /// stashes the parsed filter chain on the channel for GET.
-    pub async fn new(db: Arc<PvDatabase>, name: &str) -> BridgeResult<Self> {
+    pub async fn new(db: Arc<PvDatabase>, name: &[u8]) -> BridgeResult<Self> {
         use epics_base_rs::server::database::filters::{ChannelCreateError, db_channel_create};
         // A NULL channel refuses the create (`dbChannel.c:513-529`).
         let value = {
@@ -501,9 +502,9 @@ impl BridgeChannel {
                 ChannelCreateError::NotFound => {
                     let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
                     match db.get_record(&cn.record) {
-                        None => BridgeError::RecordNotFound(cn.record),
+                        None => BridgeError::RecordNotFound(cn.record.to_string()),
                         Some(_) => BridgeError::FieldNotFound {
-                            record: cn.record,
+                            record: cn.record.to_string(),
                             field: if cn.string_view {
                                 format!("{}$", cn.field)
                             } else {
@@ -519,15 +520,12 @@ impl BridgeChannel {
         // The `$` modifier (C `dbChannel.c:486-505`) is innermost in the
         // channel name (`REC.FIELD$[range]{json}`); `split_channel_name` has
         // already peeled `{json}` and `[range]`, and the parse peels the `$`.
-        let (record_name, field_upper, string_view) = (
-            parsed.record.as_str(),
-            parsed.field.clone(),
-            parsed.string_view,
-        );
+        let (record_name, field_upper, string_view) =
+            (&parsed.record[..], parsed.field.clone(), parsed.string_view);
 
-        let rec = db
-            .get_record(record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        let rec = db.get_record(record_name).ok_or_else(|| {
+            BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
+        })?;
 
         let instance = rec.read();
         // One resolution for both views, [`served_value`]: without `$` it is
@@ -546,7 +544,7 @@ impl BridgeChannel {
         let (view, value) = View::of(&instance, &field_upper, string_view, &channel_filters)
             .and_then(|view| Some((view, served_value(&instance, &field_upper, view)?)))
             .ok_or_else(|| BridgeError::FieldNotFound {
-                record: record_name.to_string(),
+                record: String::from_utf8_lossy(record_name).into_owned(),
                 field: if string_view {
                     format!("{field_upper}$")
                 } else {
@@ -595,8 +593,8 @@ impl BridgeChannel {
 
         Ok(Self {
             db,
-            pv_name: name.to_string(),
-            record_name: record_name.to_string(),
+            pv_name: RecordName::from(name),
+            record_name: parsed.record.clone(),
             field: field_upper,
             string_view,
             nt_type,
@@ -615,7 +613,7 @@ impl BridgeChannel {
             &self.channel_filters,
         )
         .ok_or_else(|| BridgeError::FieldNotFound {
-            record: self.record_name.clone(),
+            record: self.record_name.to_string(),
             field: self.field.clone(),
         })
     }
@@ -631,7 +629,7 @@ impl BridgeChannel {
     }
 
     /// Resolved canonical record name (no field suffix).
-    pub fn record_name(&self) -> &str {
+    pub fn record_name(&self) -> &[u8] {
         &self.record_name
     }
 
@@ -708,7 +706,7 @@ impl BridgeChannel {
             let rec = self
                 .db
                 .get_record(&self.record_name)
-                .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+                .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.to_string()))?;
             // `putLongString`'s `dbPut(DBR_CHAR, str, strlen+1)` through the
             // char address — `$`, or the plain one pvxs re-views.
             char_address = self.string_view
@@ -818,7 +816,7 @@ impl BridgeChannel {
 }
 
 impl Channel for BridgeChannel {
-    fn channel_name(&self) -> &str {
+    fn channel_name(&self) -> &[u8] {
         // report the full PV identity (`record.FIELD`) so ACF
         // checks and error messages distinguish field PVs from the
         // record PV.
@@ -836,7 +834,7 @@ impl Channel for BridgeChannel {
         let rec = self
             .db
             .get_record(&self.record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+            .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.to_string()))?;
 
         // Through the database, which resolves a link-backed field's metadata
         // from the LINK TARGET's record — a second lock this holds none of.
@@ -844,7 +842,7 @@ impl Channel for BridgeChannel {
             .db
             .channel_snapshot_for_field(&rec, &self.field, false)
             .ok_or_else(|| BridgeError::FieldNotFound {
-                record: self.record_name.clone(),
+                record: self.record_name.to_string(),
                 field: self.field.clone(),
             })?;
         // pvxs's `Q:time:tag` split (`iocsource.cpp:239-248`).
@@ -987,7 +985,7 @@ mod tests {
     #[tokio::test]
     async fn channel_filter_accepts_documented_json5_arr() {
         let db = db_with_rec().await;
-        let ch = BridgeChannel::new(db, r#"REC.{"arr":{s:2,i:2,e:8}}"#)
+        let ch = BridgeChannel::new(db, br#"REC.{"arr":{s:2,i:2,e:8}}"#)
             .await
             .expect("documented JSON5 arr filter must create the channel");
         assert_eq!(ch.channel_filters.len(), 1);
@@ -1000,7 +998,7 @@ mod tests {
         // `BridgeChannel` is not `Debug`, so match the `Result` rather
         // than `expect_err` (which would require `Ok: Debug`).
         let db = db_with_rec().await;
-        let res = BridgeChannel::new(db, r#"REC.{"no_such":{}}"#).await;
+        let res = BridgeChannel::new(db, br#"REC.{"no_such":{}}"#).await;
         assert!(matches!(res, Err(BridgeError::ChannelFilterError(_))));
     }
 
@@ -1017,7 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn a_deadband_filter_never_fails_a_get() {
         let db = db_with_rec().await;
-        let ch = BridgeChannel::new(db.clone(), r#"REC.VAL{"dbnd":{"d":10.0}}"#)
+        let ch = BridgeChannel::new(db.clone(), br#"REC.VAL{"dbnd":{"d":10.0}}"#)
             .await
             .expect("a dbnd channel is created");
         let request = PvStructure::new("");
@@ -1042,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn channel_filter_rejects_malformed_json() {
         let db = db_with_rec().await;
-        let res = BridgeChannel::new(db, r#"REC.{not json}"#).await;
+        let res = BridgeChannel::new(db, br#"REC.{not json}"#).await;
         assert!(matches!(res, Err(BridgeError::ChannelFilterError(_))));
     }
 
@@ -1051,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn channel_filter_rejects_invalid_dec_body() {
         let db = db_with_rec().await;
-        let res = BridgeChannel::new(db, r#"REC.{"dec":{}}"#).await;
+        let res = BridgeChannel::new(db, br#"REC.{"dec":{}}"#).await;
         assert!(matches!(res, Err(BridgeError::ChannelFilterError(_))));
     }
 
@@ -1060,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn channel_without_filter_suffix_still_creates() {
         let db = db_with_rec().await;
-        let ch = BridgeChannel::new(db, "REC")
+        let ch = BridgeChannel::new(db, b"REC")
             .await
             .expect("unfiltered channel must create");
         assert!(ch.channel_filters.is_empty());
@@ -1073,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn a_field_the_record_does_not_have_refuses_the_channel() {
         let db = db_with_rec().await;
-        let res = BridgeChannel::new(db, "REC.NOSUCH").await;
+        let res = BridgeChannel::new(db, b"REC.NOSUCH").await;
         assert!(matches!(res, Err(BridgeError::FieldNotFound { .. })));
     }
 
@@ -1109,7 +1107,7 @@ mod tests {
             .unwrap();
         db.add_record("SC0", Box::new(sc)).await.unwrap();
 
-        let ch = BridgeChannel::new(db.clone(), "SC0")
+        let ch = BridgeChannel::new(db.clone(), b"SC0")
             .await
             .expect("channel over scalcout VAL must create");
         let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -1167,7 +1165,7 @@ mod tests {
             .unwrap();
         db.add_record("SC1", Box::new(sc)).await.unwrap();
 
-        let ch = BridgeChannel::new(db.clone(), "SC1")
+        let ch = BridgeChannel::new(db.clone(), b"SC1")
             .await
             .expect("channel over scalcout VAL must create");
         let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -1238,7 +1236,7 @@ mod tests {
             .unwrap();
         db.add_record("SC2", Box::new(sc)).await.unwrap();
 
-        let ch = BridgeChannel::new(db.clone(), "SC2")
+        let ch = BridgeChannel::new(db.clone(), b"SC2")
             .await
             .expect("channel over scalcout VAL must create");
         let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -1286,7 +1284,7 @@ mod tests {
         struct DenyWrites;
         #[async_trait::async_trait]
         impl AccessControl for DenyWrites {
-            async fn can_write(&self, _: &str, _: &[u8], _: &str) -> bool {
+            async fn can_write(&self, _: &[u8], _: &[u8], _: &str) -> bool {
                 false
             }
         }
@@ -1301,7 +1299,7 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.0))));
 
         // write-ACF denial → "Put not permitted"
-        let denied = BridgeChannel::new(db.clone(), "PS:ai")
+        let denied = BridgeChannel::new(db.clone(), b"PS:ai")
             .await
             .unwrap()
             .with_access(AccessContext::with_identity(
@@ -1318,7 +1316,7 @@ mod tests {
 
         // DISP=1 → "Unable to put value: Field Disabled: S_db_putDisabled"
         db.get_record("PS:ai").unwrap().write().common.disp = 1;
-        let ch = BridgeChannel::new(db.clone(), "PS:ai").await.unwrap();
+        let ch = BridgeChannel::new(db.clone(), b"PS:ai").await.unwrap();
         let err = ch.put(&put).await.expect_err("DISP=1 must reject the put");
         assert_eq!(
             super::super::put_status::wire_message(&err),
@@ -1327,7 +1325,7 @@ mod tests {
 
         // Read-only (SPC_NOMOD) field on the SAME DISP=1 record → noMod wins,
         // because C tests `special == SPC_ATTRIBUTE` first.
-        let ro = BridgeChannel::new(db.clone(), "PS:ai.AFVL").await.unwrap();
+        let ro = BridgeChannel::new(db.clone(), b"PS:ai.AFVL").await.unwrap();
         let err = ro
             .put(&put)
             .await
@@ -1365,7 +1363,11 @@ mod tests {
             .unwrap();
 
         let m = member(r#"GRP:AI.{"arr":{"s":0}}"#);
-        assert_eq!(m.names(), ("GRP:AI", "VAL"), "the suffix is peeled first");
+        assert_eq!(
+            m.names(),
+            (&b"GRP:AI"[..], "VAL"),
+            "the suffix is peeled first"
+        );
         assert_eq!(m.value_filters.len(), 1);
         assert_eq!(m.property_filters.len(), 1);
         resolve_db_channel(&db, &m)
@@ -1402,7 +1404,7 @@ mod tests {
             .unwrap();
         let lines = errlog_of(async {
             assert!(
-                BridgeChannel::new(db.clone(), r#"Y.VAL{"bad":{}}"#)
+                BridgeChannel::new(db.clone(), br#"Y.VAL{"bad":{}}"#)
                     .await
                     .is_err()
             );
@@ -1450,14 +1452,14 @@ mod tests {
     fn member_channel_peels_the_suffix_before_splitting() {
         assert_eq!(
             member(r#"REC.VAL{"dbnd":{"d":0.5}}"#).names(),
-            ("REC", "VAL")
+            (&b"REC"[..], "VAL")
         );
-        assert_eq!(member("REC.VAL[1:3]").names(), ("REC", "VAL"));
-        assert_eq!(member("REC.VAL$").names(), ("REC", "VAL"));
+        assert_eq!(member("REC.VAL[1:3]").names(), (&b"REC"[..], "VAL"));
+        assert_eq!(member("REC.VAL$").names(), (&b"REC"[..], "VAL"));
         assert!(member("REC.VAL$").string_view);
         // the ordinary cases the old split already got right
-        assert_eq!(member("REC.egu").names(), ("REC", "EGU"));
-        assert_eq!(member("REC").names(), ("REC", "VAL"));
+        assert_eq!(member("REC.egu").names(), (&b"REC"[..], "EGU"));
+        assert_eq!(member("REC").names(), (&b"REC"[..], "VAL"));
     }
 
     /// The two chains are independent parses, not one shared instance:

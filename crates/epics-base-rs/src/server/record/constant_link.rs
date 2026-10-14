@@ -37,7 +37,7 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
     };
     #[cfg(test)]
     super::record_instance::put_gate_probe::parsed();
-    let parsed = parse_link_v2(link_str.as_str_lossy().as_ref());
+    let parsed = parse_link_v2(link_str.as_bytes());
     load_constant_link(record, seed, &parsed)
 }
 

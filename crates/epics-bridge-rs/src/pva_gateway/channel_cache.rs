@@ -40,6 +40,7 @@ use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use epics_base_rs::runtime::task::Reactor;
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorUpdate;
@@ -1488,7 +1489,7 @@ impl ChannelCache {
         let Some(inv) = self.invalidator.get() else {
             return;
         };
-        let batch: Arc<[String]> = names.into_iter().collect();
+        let batch: Arc<[RecordName]> = names.into_iter().map(RecordName::from).collect();
         inv.publish(batch);
     }
 

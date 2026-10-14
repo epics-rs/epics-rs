@@ -331,9 +331,9 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `&'static [&'static str]` choice table and is emitted through
 ///   `Record::menu_field_choices` (the framework promotes the stored menu
 ///   index to `EpicsValue::Enum` and attaches these labels).
-/// - `#[field(type = "String", link)]` — a `DBF_INLINK`/`DBF_OUTLINK`/
+/// - `#[field(type = "PvStr", link)]` — a `DBF_INLINK`/`DBF_OUTLINK`/
 ///   `DBF_FWDLINK` field, lent through `Record::link_text_ref`. The `type`
-///   cannot say this: link fields and `DBF_STRING` fields share `"String"`
+///   cannot say this: link fields and `DBF_STRING` fields share `"PvStr"`
 ///   storage, and the `.dbd` class is not visible to the derive.
 ///
 /// Field names are converted from snake_case to UPPER_CASE for EPICS field names.
@@ -550,10 +550,12 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     // store of the declared kind is mapped (`slot_mut` must store exactly what
     // `put_field` stores); a read-only one gets a `slot_ref` only. A `menu()`
     // member is stored `Short` but declared `DBF_MENU`, so it is not mapped
-    // ([`slot_kind`]).
+    // ([`slot_kind`]). A link is `PvStr` too, but its text is never a slot
+    // value.
     // A mapped name the `.dbd` does not declare has no `slots::` constant and
     // does not compile.
-    let slotted = |fi: &&FieldInfo| fi.menu_choices.is_none() && slot_kind(&fi.dbf_type);
+    let slotted =
+        |fi: &&FieldInfo| fi.menu_choices.is_none() && !fi.link && slot_kind(&fi.dbf_type);
     let slot_arm = |fi: &FieldInfo| {
         let field = proc_macro2::Ident::new(&fi.epics_name, fi.ident.span());
         let ident = &fi.ident;
@@ -616,14 +618,14 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         .map(|fi| {
             let epics_name = &fi.epics_name;
             let ident = &fi.ident;
-            quote! { #epics_name => Some(&self.#ident), }
+            quote! { #epics_name => Some(self.#ident.as_bytes()), }
         })
         .collect();
     let link_text_method = if link_arms.is_empty() {
         quote! {}
     } else {
         quote! {
-            fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+            fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
                 match link_field {
                     #(#link_arms)*
                     _ => None,
@@ -1161,10 +1163,10 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
 
     let dbf_type = dbf_type
         .ok_or_else(|| syn::Error::new_spanned(field, "missing #[field(type = \"...\")]"))?;
-    if link && dbf_type != "String" {
+    if link && dbf_type != "PvStr" {
         return Err(syn::Error::new_spanned(
             field,
-            "`link` lends a `&str`, so it needs #[field(type = \"String\")]",
+            "`link` lends the field's bytes, so it needs #[field(type = \"PvStr\")]",
         ));
     }
 

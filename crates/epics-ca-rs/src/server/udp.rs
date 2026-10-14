@@ -773,7 +773,8 @@ pub(crate) async fn parse_search_datagram(
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(scan_end);
-            if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
+            {
+                let pv_name = &payload[..pv_name_end];
                 // thread the datagram source address
                 // into the search resolver so the CA gateway can
                 // apply host-scoped `.pvlist` `DENY FROM host`

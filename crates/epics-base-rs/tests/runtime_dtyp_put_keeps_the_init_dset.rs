@@ -25,7 +25,7 @@ async fn a_runtime_dtyp_put_keeps_the_init_dset_iocinit_529() {
         .build()
         .await
         .unwrap();
-    let field = |rec: &str, f: &str| db.get_pv(&format!("{rec}.{f}")).ok();
+    let field = |rec: &str, f: &str| db.get_pv(format!("{rec}.{f}")).ok();
 
     for rec in ["M", "MO", "A", "B"] {
         db.put_record_field_from_ca_no_notify(rec, "DTYP", EpicsValue::Enum(1))

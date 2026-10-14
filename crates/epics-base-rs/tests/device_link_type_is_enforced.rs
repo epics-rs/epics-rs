@@ -87,9 +87,9 @@ fn link_text(db: &PvDatabase, field: &str) -> String {
         .unwrap_or_else(|| panic!("{REC} must survive a refused link, as it does in C"));
     let inst = rec.read();
     match field {
-        "INP" => inst.common.text.inp.clone(),
-        "SDIS" => inst.common.text.sdis.clone(),
-        "FLNK" => inst.common.text.flnk.clone(),
+        "INP" => inst.common.text.inp.to_string(),
+        "SDIS" => inst.common.text.sdis.to_string(),
+        "FLNK" => inst.common.text.flnk.to_string(),
         other => panic!("no accessor for {other}"),
     }
 }

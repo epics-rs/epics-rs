@@ -66,7 +66,7 @@ async fn a_number_into_a_string_takes_the_targets_precision() {
             .unwrap();
         assert_eq!(text(&db, target), want, "{src}");
         assert_eq!(
-            db.get_pv(&format!("{src}.SEVR")).unwrap().to_f64(),
+            db.get_pv(format!("{src}.SEVR")).unwrap().to_f64(),
             Some(0.0)
         );
     }

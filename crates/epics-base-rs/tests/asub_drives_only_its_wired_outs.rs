@@ -26,7 +26,7 @@ async fn asub_drives_only_its_wired_outs() {
     let vals = async |names: &[&str]| {
         let mut out = Vec::new();
         for n in names {
-            out.push(db.get_pv(&format!("{n}.VAL")).unwrap());
+            out.push(db.get_pv(format!("{n}.VAL")).unwrap());
         }
         out
     };

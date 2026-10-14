@@ -29,7 +29,7 @@ pub fn ca_caxr_command(resolver: CaLinkResolver) -> CommandDef {
         "caxr <pv_name>",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("caxr: missing pv_name".into()),
             };
             let resolver = resolver.clone();
@@ -100,12 +100,14 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                             let r = resolver.clone();
                             let n = name.clone();
                             let b = ctx.bridge().clone();
-                            let connected = <CaLinkResolver as LinkSet>::is_connected(&r, &n);
-                            let alarm = <CaLinkResolver as LinkSet>::alarm_severity(&r, &n);
-                            let ts = <CaLinkResolver as LinkSet>::time_stamp(&r, &n);
+                            let connected =
+                                <CaLinkResolver as LinkSet>::is_connected(&r, n.as_bytes());
+                            let alarm =
+                                <CaLinkResolver as LinkSet>::alarm_severity(&r, n.as_bytes());
+                            let ts = <CaLinkResolver as LinkSet>::time_stamp(&r, n.as_bytes());
                             let value = std::thread::spawn(move || {
                                 b.block_on(async move {
-                                    <CaLinkResolver as LinkSet>::get_value(&r, &n).await
+                                    <CaLinkResolver as LinkSet>::get_value(&r, n.as_bytes()).await
                                 })
                             })
                             .join()

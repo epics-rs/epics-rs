@@ -1152,7 +1152,7 @@ mod pbuf_tests {
             "1/4 samples → accumulating (CompleteNoEmit), not emitting"
         );
 
-        let mut inst = RecordInstance::new("CMP".into(), cmp);
+        let mut inst = RecordInstance::new("CMP", cmp);
         let (snap, actions) = inst.process_local().unwrap();
 
         assert!(

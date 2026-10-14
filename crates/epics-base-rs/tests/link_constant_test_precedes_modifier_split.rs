@@ -31,7 +31,7 @@ fn db_target(link: &str) -> String {
             let t = l.target();
             format!("{}.{}", t.record, t.field)
         }
-        ParsedLink::Ca(l) => l.pv,
+        ParsedLink::Ca(l) => l.pv.to_string(),
         other => panic!("{link:?} classified as {other:?}, expected a PV link"),
     }
 }

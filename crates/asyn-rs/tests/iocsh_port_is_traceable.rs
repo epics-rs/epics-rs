@@ -100,7 +100,7 @@ fn iocsh_created_port_traces_and_announces_exceptions() {
         .call(
             &[
                 ArgValue::String("R1857".into()),
-                ArgValue::String(host.clone()),
+                ArgValue::String((&host).into()),
                 ArgValue::Int(0),
                 ArgValue::Int(1),
             ],

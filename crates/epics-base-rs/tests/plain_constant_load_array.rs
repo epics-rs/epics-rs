@@ -60,7 +60,7 @@ async fn plain_constant_waveform_matches_softioc_dbconstloadarray_dbconstlink_c_
     ];
 
     let mut wrong = Vec::new();
-    let f = |rec: &str, field: &str| db.get_pv(&format!("{rec}.{field}")).ok();
+    let f = |rec: &str, field: &str| db.get_pv(format!("{rec}.{field}")).ok();
     for (p, elems, ai_val, ai_udf) in expect {
         let vals = wf(elems.as_deref().unwrap_or(&[]));
         let (nord, udf) = match &elems {

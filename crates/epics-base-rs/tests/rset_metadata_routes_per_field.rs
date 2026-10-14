@@ -45,7 +45,7 @@ fn snap(inst: &RecordInstance, field: &str) -> Snapshot {
 }
 
 fn calc() -> RecordInstance {
-    RecordInstance::new("T:CALC".to_string(), CalcRecord::new("0"))
+    RecordInstance::new("T:CALC", CalcRecord::new("0"))
 }
 
 /// The `default:` arm, keyed on the field's own STATIC dbd type. `recGbl.c`
@@ -144,7 +144,7 @@ fn an_unlisted_field_serves_nan_alarm_limits_not_the_records_bands() {
 /// `biRecord.c:57-76` NULLs every numeric slot.
 #[test]
 fn a_record_with_no_control_slot_mints_no_control_limits() {
-    let inst = RecordInstance::new("T:BI".to_string(), BiRecord::new(0));
+    let inst = RecordInstance::new("T:BI", BiRecord::new(0));
 
     assert_eq!(
         snap(&inst, "PHAS").control_limits(),
@@ -163,7 +163,7 @@ fn a_record_with_no_control_slot_mints_no_control_limits() {
 /// the type range regressed 42 oracle cases from agreed to defect.
 #[test]
 fn a_record_whose_slot_falls_through_without_delegating_serves_the_seed() {
-    let inst = RecordInstance::new("T:ACALCOUT".to_string(), AcalcoutRecord::new());
+    let inst = RecordInstance::new("T:ACALCOUT", AcalcoutRecord::new());
 
     // PHAS is DBF_SHORT: a delegating record would serve -32768/32767 here.
     assert_eq!(
@@ -181,7 +181,7 @@ fn a_record_whose_slot_falls_through_without_delegating_serves_the_seed() {
 /// has no arm in `populate_control_info`, so pre-fix it served nothing here.
 #[test]
 fn a_record_the_legacy_cache_never_covered_still_routes_its_type_range() {
-    let inst = RecordInstance::new("T:BO".to_string(), BoRecord::new(0));
+    let inst = RecordInstance::new("T:BO", BoRecord::new(0));
 
     assert_eq!(
         snap(&inst, "PHAS").control_limits(),
@@ -201,7 +201,7 @@ fn a_record_the_legacy_cache_never_covered_still_routes_its_type_range() {
 /// 0/0 (HOPR/LOPR) and valueAlarm all-NaN in the same read.
 #[test]
 fn the_alarm_arm_lists_val_alone_where_the_control_arm_lists_the_bands() {
-    let inst = RecordInstance::new("T:CALC".to_string(), CalcRecord::new("A"));
+    let inst = RecordInstance::new("T:CALC", CalcRecord::new("A"));
 
     // Same field, same read, two different answers — that is the whole point.
     assert_eq!(
@@ -239,7 +239,7 @@ fn the_alarm_arm_lists_val_alone_where_the_control_arm_lists_the_bands() {
 /// the gated NaN that masked the bug on `ai`.
 #[test]
 fn int64ins_unconditional_val_case_does_not_leak_to_its_alarm_bands() {
-    let inst = RecordInstance::new("T:I64".to_string(), Int64inRecord::default());
+    let inst = RecordInstance::new("T:I64", Int64inRecord::default());
 
     assert_eq!(
         snap(&inst, "VAL").alarm_limits(),
@@ -272,7 +272,7 @@ fn int64ins_unconditional_val_case_does_not_leak_to_its_alarm_bands() {
 #[test]
 fn the_graphic_slot_routes_recgbl_seed_and_link_arms_apart() {
     // RecGblRange: calc delegates, PHAS is DBF_SHORT and backs no link.
-    let calc = RecordInstance::new("T:CALC".to_string(), CalcRecord::new("A"));
+    let calc = RecordInstance::new("T:CALC", CalcRecord::new("A"));
     assert_eq!(
         snap(&calc, "PHAS").display_limits(),
         Some((-32768.0, 32767.0)),
@@ -284,7 +284,7 @@ fn the_graphic_slot_routes_recgbl_seed_and_link_arms_apart() {
     // unlisted field is written by nothing and the dbAccess.c:216 seed stands.
     // Its OWN get_control_double is a bare recGblGetControlDouble (:372-376) —
     // the two slots disagree on the same record, same field.
-    let asub = RecordInstance::new("T:ASUB".to_string(), ASubRecord::default());
+    let asub = RecordInstance::new("T:ASUB", ASubRecord::default());
     assert_eq!(
         snap(&asub, "PHAS").display_limits(),
         Some((0.0, 0.0)),
@@ -317,7 +317,7 @@ fn the_graphic_slot_routes_recgbl_seed_and_link_arms_apart() {
 /// wrong — it would serve the DBF_DOUBLE range for a link-backed field.
 #[test]
 fn the_calc_arg_link_range_runs_to_u_not_to_l() {
-    let calc = RecordInstance::new("T:CALC".to_string(), CalcRecord::new("A"));
+    let calc = RecordInstance::new("T:CALC", CalcRecord::new("A"));
     for arg in ["A", "L", "M", "U", "LA", "LL", "LU"] {
         assert_eq!(
             snap(&calc, arg).display_limits(),
@@ -334,7 +334,7 @@ fn the_calc_arg_link_range_runs_to_u_not_to_l() {
 /// predicate must be per-type, not keyed on the field name.
 #[test]
 fn sels_args_are_explicit_limits_not_link_backed_like_calcs() {
-    let sel = RecordInstance::new("T:SEL".to_string(), SelRecord::default());
+    let sel = RecordInstance::new("T:SEL", SelRecord::default());
     assert_eq!(
         snap(&sel, "A").display_limits(),
         Some((0.0, 0.0)),
@@ -354,7 +354,7 @@ fn sels_args_are_explicit_limits_not_link_backed_like_calcs() {
 /// recGbl and then overwrites the lower with 0 (`calcoutRecord.c:490-493`).
 #[test]
 fn the_graphic_literal_arms_are_not_the_control_ones() {
-    let seq = RecordInstance::new("T:SEQ".to_string(), SeqRecord::default());
+    let seq = RecordInstance::new("T:SEQ", SeqRecord::default());
     assert_eq!(
         snap(&seq, "DLY0").display_limits(),
         Some((0.0, 10.0)),
@@ -366,7 +366,7 @@ fn the_graphic_literal_arms_are_not_the_control_ones() {
         "seqRecord.c:331 routes DOn through its DOLn link"
     );
 
-    let co = RecordInstance::new("T:CO".to_string(), CalcoutRecord::default());
+    let co = RecordInstance::new("T:CO", CalcoutRecord::default());
     assert_eq!(
         snap(&co, "ODLY").display_limits(),
         Some((0.0, 1e300)),

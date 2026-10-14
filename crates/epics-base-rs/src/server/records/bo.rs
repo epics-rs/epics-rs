@@ -30,16 +30,16 @@ pub struct BoRecord {
     // Monitor
     pub mlst: u16, // last monitored value
     // Output control
-    pub omsl: i16,   // 0=supervisory, 1=closed_loop
-    pub dol: String, // desired output location link
-    pub high: f64,   // seconds to hold output high (toggle delay)
+    pub omsl: i16,     // 0=supervisory, 1=closed_loop
+    pub dol: PvString, // desired output location link
+    pub high: f64,     // seconds to hold output high (toggle delay)
     // Invalid output
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: u16, // invalid output value
     // Simulation
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Set by `set_device_did_compute(true)` when a device readback has
@@ -68,13 +68,13 @@ impl Default for BoRecord {
             lalm: 0,
             mlst: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             high: 0.0,
             ivoa: 0,
             ivov: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -472,11 +472,11 @@ impl Record for BoRecord {
         }
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -656,7 +656,7 @@ impl Record for BoRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(v) => {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -696,14 +696,14 @@ impl Record for BoRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

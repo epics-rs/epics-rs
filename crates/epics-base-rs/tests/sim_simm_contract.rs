@@ -290,7 +290,7 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
     // A DB link to a record that does not exist: `dbTryGetLink` fails.
-    li.siml = "NO:SUCH:RECORD".to_string();
+    li.siml = "NO:SUCH:RECORD".into();
     db.add_record("SIMLFAIL", Box::new(li)).await.unwrap();
     // VAL written so the record's own UDF alarm (INVALID) cannot mask the
     // severity-less LINK_ALARM we are asserting on.
@@ -321,7 +321,7 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
 async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
     let db = PvDatabase::new();
     let mut b = BusyRecord::new();
-    b.siml = "NO:SUCH:RECORD".to_string();
+    b.siml = "NO:SUCH:RECORD".into();
     db.add_record("BUSYFAIL", Box::new(b)).await.unwrap();
     db.put_pv("BUSYFAIL", EpicsValue::Short(0)).await.unwrap();
 
@@ -372,7 +372,7 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
     li.simm = 1; // YES — simulate
-    li.siol = "NO:SUCH:RECORD".to_string(); // dbGetLink fails
+    li.siol = "NO:SUCH:RECORD".into(); // dbGetLink fails
     li.sims = 0; // NO_ALARM — the dbd default
     db.add_record("SIOLFAIL", Box::new(li)).await.unwrap();
 
@@ -408,7 +408,7 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
     li.simm = 1;
-    li.siol = "NO:SUCH:RECORD".to_string();
+    li.siol = "NO:SUCH:RECORD".into();
     li.sims = 3; // INVALID — same severity as the LINK_ALARM
     db.add_record("SIOLTIE", Box::new(li)).await.unwrap();
 
@@ -498,7 +498,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
         .await
         .unwrap();
     let mut lo = LongoutRecord::new(0);
-    lo.siol = "SINK".to_string();
+    lo.siol = "SINK".into();
     db.add_record("RAWOUT", Box::new(lo)).await.unwrap();
     db.put_pv("RAWOUT.SIMM", EpicsValue::Short(2))
         .await
@@ -530,7 +530,7 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
         .await
         .unwrap();
     let mut b = BusyRecord::new();
-    b.siol = "BSINK".to_string();
+    b.siol = "BSINK".into();
     db.add_record("BRAW", Box::new(b)).await.unwrap();
     db.put_pv("BRAW.SIMM", EpicsValue::Short(2)).await.unwrap();
     db.put_pv("BRAW", EpicsValue::Short(1)).await.unwrap();
@@ -604,7 +604,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
         .unwrap();
 
     let mut b = BusyRecord::new();
-    b.siml = "NO:SUCH:RECORD".to_string();
+    b.siml = "NO:SUCH:RECORD".into();
     db.add_record("E5BUSY", Box::new(b)).await.unwrap();
     db.put_record_field_from_ca_no_notify("E5BUSY", "OUT", EpicsValue::String("E5TGT".into()))
         .await
@@ -644,8 +644,8 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
         .unwrap();
 
     let mut b = BusyRecord::new();
-    b.siml = "NO:SUCH:RECORD".to_string();
-    b.siol = "E5STGT".to_string();
+    b.siml = "NO:SUCH:RECORD".into();
+    b.siol = "E5STGT".into();
     b.simm = 1; // YES — but the SIML read overwrites SIMM before it is tested,
     // and in C the failed read returns before that test is ever reached.
     db.add_record("E5SBUSY", Box::new(b)).await.unwrap();

@@ -85,6 +85,6 @@ async fn alias_refusals_are_create_alias_s() {
     assert_eq!(err, want);
 
     // softIoc: `dbgf A3.NAME` is "A".
-    assert_eq!(db.resolve_alias("A3").as_deref(), Some("A"));
-    assert_eq!(db.resolve_alias("A2").as_deref(), Some("A"));
+    assert_eq!(db.resolve_alias("A3").as_deref(), Some(&b"A"[..]));
+    assert_eq!(db.resolve_alias("A2").as_deref(), Some(&b"A"[..]));
 }

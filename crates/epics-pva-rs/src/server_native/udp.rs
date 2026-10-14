@@ -1320,7 +1320,7 @@ fn rebuild_search_forward(req: &SearchRequest, dest_unicast: bool, source: Socke
     p.put_u16(req.queries.len() as u16, order);
     for (cid, name) in &req.queries {
         p.put_u32(*cid, order);
-        encode_string_into(name, order, &mut p);
+        crate::proto::encode_string_bytes_into(name, order, &mut p);
     }
     let header = PvaHeader::application(false, order, Command::Search.code(), p.len() as u32);
     let mut out = Vec::new();
@@ -1581,6 +1581,7 @@ mod tests {
     // import in a non-test build.
     use crate::server_native::search_engine::try_build_forward_frame;
     use crate::server_native::source::OpError;
+    use epics_base_rs::types::RecordName;
     use std::net::SocketAddrV4;
 
     /// Decode + dispatch in one call, with the argument list
@@ -1671,40 +1672,43 @@ mod tests {
         struct OneSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for OneSource {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(
+                &self,
+            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
+            {
                 async { vec!["MY:PV".into()] }
             }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let m = name == "MY:PV";
+            fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == b"MY:PV";
                 async move { m }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<crate::pvdata::FieldDesc>> + Send
             {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<crate::pvdata::PvField>> + Send
             {
                 async { None }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: crate::pvdata::PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only".into()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<crate::pvdata::PvField>>> + Send
             {
                 async { None }
@@ -1795,37 +1799,40 @@ mod tests {
         struct EmptySource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for EmptySource {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(
+                &self,
+            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
+            {
                 async { Vec::new() }
             }
-            fn has_pv(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn has_pv(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn get_introspection(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _value: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only test source".into()) }
             }
-            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -1914,37 +1921,40 @@ mod tests {
         struct EmptySource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for EmptySource {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(
+                &self,
+            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
+            {
                 async { Vec::new() }
             }
-            fn has_pv(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn has_pv(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn get_introspection(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _value: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only test source".into()) }
             }
-            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -2007,38 +2017,41 @@ mod tests {
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for PresentSource {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(
+                &self,
+            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
+            {
                 async { vec!["MY:PV".into()] }
             }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let m = name == "MY:PV";
+            fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == b"MY:PV";
                 async move { m }
             }
             fn get_introspection(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { Some(FieldDesc::Scalar(ScalarType::Double)) }
             }
             fn get_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _value: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only".into()) }
             }
-            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -2102,38 +2115,41 @@ mod tests {
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for PresentSource {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(
+                &self,
+            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
+            {
                 async { vec!["MY:PV".into()] }
             }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let m = name == "MY:PV";
+            fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == b"MY:PV";
                 async move { m }
             }
             fn get_introspection(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { Some(FieldDesc::Scalar(ScalarType::Double)) }
             }
             fn get_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _value: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only".into()) }
             }
-            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -2213,21 +2229,25 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        let server_src = ServerInfoSource::new(|| async { Vec::<String>::new() });
+        let server_src =
+            ServerInfoSource::new(|| async { Vec::<epics_base_rs::types::RecordName>::new() });
 
         // Direct-connect path still resolves `server`.
         assert!(
-            server_src.has_pv(SERVER_PV_NAME).await,
+            server_src.has_pv(SERVER_PV_NAME.as_bytes()).await,
             "has_pv must still resolve `server` for direct TCP connect"
         );
         assert!(
-            !server_src.searchable(SERVER_PV_NAME).await,
+            !server_src.searchable(SERVER_PV_NAME.as_bytes()).await,
             "`server` must NOT be UDP-search-advertised"
         );
         // pvxs `server` has no GET surface (onRPC only); the direct
         // path reaches it via RPC, and a GET returns no prototype/value.
         assert!(
-            server_src.get_value(SERVER_PV_NAME).await.is_none(),
+            server_src
+                .get_value(SERVER_PV_NAME.as_bytes())
+                .await
+                .is_none(),
             "`server` has no GET surface (pvxs onRPC-only)"
         );
 
@@ -2291,47 +2311,50 @@ mod tests {
         struct ScopedSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for ScopedSource {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(
+                &self,
+            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
+            {
                 async { vec!["MY:PV".into()] }
             }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let m = name == "MY:PV";
+            fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == b"MY:PV";
                 async move { m }
             }
             fn searchable_from(
                 &self,
-                name: &str,
+                name: &[u8],
                 requester: SocketAddr,
             ) -> impl std::future::Future<Output = bool> + Send {
                 let ok =
-                    name == "MY:PV" && requester.ip() == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+                    name == b"MY:PV" && requester.ip() == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
                 async move { ok }
             }
             fn get_introspection(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _value: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only".into()) }
             }
-            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -2383,38 +2406,41 @@ mod tests {
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for PresentSource {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(
+                &self,
+            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
+            {
                 async { vec!["MY:PV".into()] }
             }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let m = name == "MY:PV";
+            fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == b"MY:PV";
                 async move { m }
             }
             fn get_introspection(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { Some(FieldDesc::Scalar(ScalarType::Double)) }
             }
             fn get_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _value: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only".into()) }
             }
-            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -2844,7 +2870,7 @@ mod tests {
         SearchRequest {
             seq: 42,
             byte_order: ByteOrder::Little,
-            queries: vec![(7, "PV:A".to_string()), (8, "PV:B".to_string())],
+            queries: vec![(7, RecordName::from("PV:A")), (8, RecordName::from("PV:B"))],
             reply_addr: reply,
             reply_port: 5566,
             unicast,
@@ -2869,7 +2895,7 @@ mod tests {
         assert_eq!(out.reply_port, 5566);
         assert_eq!(
             out.queries,
-            vec![(7, "PV:A".to_string()), (8, "PV:B".to_string())]
+            vec![(7, RecordName::from("PV:A")), (8, RecordName::from("PV:B"))]
         );
     }
 
@@ -2915,6 +2941,18 @@ mod tests {
         assert_eq!(out.protocols, vec![b"tls".to_vec(), b"tcp".to_vec()]);
     }
 
+    /// A SEARCH name is wire bytes in pvxs: a Latin-1 query survives the
+    /// parse and the forward rebuild unchanged.
+    #[test]
+    fn mshim_search_keeps_a_latin1_query_byte_for_byte() {
+        let mut req = req_with(false, false, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        req.queries = vec![(9, RecordName::from(&b"TEMP:\xb0C"[..]))];
+        let source = "192.168.9.9:1111".parse().unwrap();
+        let frame = rebuild_search_forward(&req, true, source);
+        let out = parse_search_request(&frame).expect("rebuilt SEARCH parses");
+        assert_eq!(out.queries, vec![(9, RecordName::from(&b"TEMP:\xb0C"[..]))]);
+    }
+
     /// End-to-end decode: a real SEARCH datagram built by the codec is
     /// recognized by `decode_all` and rebuilt for a multicast dest with
     /// the Unicast bit cleared.
@@ -2929,7 +2967,7 @@ mod tests {
         let rebuilt = msgs[0].rebuild_for(/*dest_unicast=*/ false, source);
         let out = parse_search_request(&rebuilt).expect("rebuilt parses");
         assert!(!out.unicast);
-        assert_eq!(out.queries, vec![(7, "MY:PV".to_string())]);
+        assert_eq!(out.queries, vec![(7, RecordName::from("MY:PV"))]);
     }
 
     /// A BEACON is rebuilt as a valid CMD_BEACON (NOT mislabeled as
@@ -3001,7 +3039,7 @@ mod tests {
         let out = parse_search_request(&first.rebuild_for(false, source)).expect("rebuilt parses");
         assert_eq!(
             out.queries,
-            vec![(7, "PV:A".to_string())],
+            vec![(7, RecordName::from("PV:A"))],
             "only the first SEARCH is forwarded, not the chained PV:B"
         );
 

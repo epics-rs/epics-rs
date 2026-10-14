@@ -12,7 +12,7 @@ use epics_ca_rs::calink::CaLinkResolver;
 async fn get_value_of_an_unconnected_link_on_current_thread_runtime() {
     let resolver = CaLinkResolver::new();
     assert!(
-        resolver.get_value("NO:SUCH:PV:CALINK").await.is_none(),
+        resolver.get_value(b"NO:SUCH:PV:CALINK").await.is_none(),
         "an unconnected link reads as no value"
     );
 }
@@ -21,7 +21,7 @@ async fn get_value_of_an_unconnected_link_on_current_thread_runtime() {
 async fn get_value_of_an_unconnected_link_on_multi_thread_runtime() {
     let resolver = CaLinkResolver::new();
     assert!(
-        resolver.get_value("NO:SUCH:PV:CALINK").await.is_none(),
+        resolver.get_value(b"NO:SUCH:PV:CALINK").await.is_none(),
         "an unconnected link reads as no value"
     );
 }

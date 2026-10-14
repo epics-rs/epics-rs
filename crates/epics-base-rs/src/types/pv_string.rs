@@ -177,6 +177,18 @@ impl PartialEq<String> for PvString {
     }
 }
 
+impl PartialEq<[u8]> for PvString {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&[u8]> for PvString {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.0 == *other
+    }
+}
+
 impl PartialEq<PvString> for str {
     fn eq(&self, other: &PvString) -> bool {
         self.as_bytes() == other.0

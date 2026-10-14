@@ -1,6 +1,6 @@
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{rec_gbl_get_alarm_double, rec_gbl_get_graphic_double};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::coordinate;
 use crate::fields::*;
@@ -132,17 +132,17 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
         "NTMF" => Some(EpicsValue::UShort(rec.timing.ntmf)),
         // Public C motorRecord.dbd link / menu / string surface.
-        "OUT" => Some(EpicsValue::String(rec.links.out.clone().into())),
+        "OUT" => Some(EpicsValue::String(rec.links.out.clone())),
         // `motorRecord.cc:653-670` — derived from OUT at init by
         // `motor_derive_card`, SPC_NOMOD so no client can write it.
         "CARD" => Some(EpicsValue::Short(rec.links.card)),
-        "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone().into())),
-        "DOL" => Some(EpicsValue::String(rec.links.dol.clone().into())),
-        "RLNK" => Some(EpicsValue::String(rec.links.rlnk.clone().into())),
-        "STOO" => Some(EpicsValue::String(rec.links.stoo.clone().into())),
-        "DINP" => Some(EpicsValue::String(rec.links.dinp.clone().into())),
-        "RINP" => Some(EpicsValue::String(rec.links.rinp.clone().into())),
-        "POST" => Some(EpicsValue::String(rec.links.post.clone().into())),
+        "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone())),
+        "DOL" => Some(EpicsValue::String(rec.links.dol.clone())),
+        "RLNK" => Some(EpicsValue::String(rec.links.rlnk.clone())),
+        "STOO" => Some(EpicsValue::String(rec.links.stoo.clone())),
+        "DINP" => Some(EpicsValue::String(rec.links.dinp.clone())),
+        "RINP" => Some(EpicsValue::String(rec.links.rinp.clone())),
+        "POST" => Some(EpicsValue::String(rec.links.post.clone())),
         "OMSL" => Some(EpicsValue::Short(rec.links.omsl)),
         // Alarm-limit / operator-range surface.
         "HIHI" => Some(EpicsValue::Double(rec.alarm.hihi)),
@@ -1517,10 +1517,10 @@ pub(crate) fn motor_put_field(
 
 /// Store a DBF_INLINK/DBF_OUTLINK specification string verbatim, mirroring how
 /// C `dbPutString` records the link before `recGblInitConstantLink`/resolution.
-fn put_link_string(value: EpicsValue, slot: &mut String, name: &str) -> CaResult<()> {
+fn put_link_string(value: EpicsValue, slot: &mut PvString, name: &str) -> CaResult<()> {
     match value {
         EpicsValue::String(v) => {
-            *slot = v.as_str_lossy().into_owned();
+            *slot = v;
             Ok(())
         }
         _ => Err(CaError::TypeMismatch(name.into())),

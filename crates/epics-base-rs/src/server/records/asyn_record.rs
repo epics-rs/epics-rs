@@ -115,7 +115,7 @@ mod tests {
     use crate::types::{DbFieldType, EpicsValue};
 
     fn instance() -> RecordInstance {
-        RecordInstance::new("ASYN:TEST".to_string(), AsynRecord::default())
+        RecordInstance::new("ASYN:TEST", AsynRecord::default())
     }
 
     /// A `DBF_MENU` config field (`TMOD`, `menu(asynTMOD)`) the struct does not

@@ -80,12 +80,12 @@ async fn constant_loads_at_the_readers_type() {
         db.process_record_with_links(rec, &mut ProcStack::new())
             .await
             .unwrap();
-        let got = match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+        let got = match db.get_pv(format!("{rec}.VAL")).unwrap() {
             EpicsValue::CharArray(b) => b.to_vec(),
             other => panic!("{rec}.VAL {other:?}"),
         };
-        let len = db.get_pv(&format!("{rec}.LEN")).unwrap();
-        let sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap();
+        let len = db.get_pv(format!("{rec}.LEN")).unwrap();
+        let sevr = db.get_pv(format!("{rec}.SEVR")).unwrap();
         if got != [want.as_bytes(), b"\0"].concat()
             || len != EpicsValue::ULong(want.len() as u32 + 1)
             || sevr != EpicsValue::Short(0)
@@ -97,13 +97,13 @@ async fn constant_loads_at_the_readers_type() {
         }
     }
     for (rec, want) in HISTOGRAM {
-        let sgnl = db.get_pv(&format!("{rec}.SGNL")).unwrap();
+        let sgnl = db.get_pv(format!("{rec}.SGNL")).unwrap();
         if sgnl != EpicsValue::Double(want) {
             diverging.push(format!("{rec}.SGNL {sgnl:?}"));
         }
     }
     for (rec, want) in SOFT_INPUT {
-        let val = db.get_pv(&format!("{rec}.VAL")).unwrap();
+        let val = db.get_pv(format!("{rec}.VAL")).unwrap();
         if val != want {
             diverging.push(format!("{rec}.VAL {val:?}"));
         }

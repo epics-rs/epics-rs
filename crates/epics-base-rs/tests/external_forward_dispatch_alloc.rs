@@ -51,13 +51,13 @@ struct Forwards(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl LinkSet for Forwards {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    fn scan_forward(&self, _: &str) -> Result<(), String> {
+    fn scan_forward(&self, _: &[u8]) -> Result<(), String> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

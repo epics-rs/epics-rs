@@ -863,7 +863,7 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
             while let Ok(ev) = rx.try_recv() {
                 // A wide field's log is read at delivery, as a client reads it.
                 let value = ev.value().as_value().cloned().or_else(|| {
-                    let cell = db.get_record(rec).unwrap();
+                    let cell = db.get_record(&**rec).unwrap();
                     let inst = cell.read();
                     inst.channel_field_value(field, false)
                 });

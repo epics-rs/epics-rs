@@ -13,7 +13,7 @@
 
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::record::{FieldDeclaration, Record};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 use epics_macros_rs::EpicsRecord;
 
 // ---------------------------------------------------------------------------
@@ -553,8 +553,8 @@ fn put_get_roundtrip_multiple_fields() {
 #[derive(EpicsRecord)]
 #[record(type = "longin", crate_path = "epics_base_rs")]
 struct LinkFieldRecord {
-    #[field(type = "String", link)]
-    siol: String,
+    #[field(type = "PvStr", link)]
+    siol: PvString,
     #[field(type = "String")]
     egu: String,
 }
@@ -562,13 +562,13 @@ struct LinkFieldRecord {
 #[test]
 fn link_fields_are_lent_and_others_are_not() {
     let mut rec = LinkFieldRecord {
-        siol: String::new(),
+        siol: PvString::new(),
         egu: String::new(),
     };
-    assert_eq!(rec.link_text_ref("SIOL"), Some(""));
+    assert_eq!(rec.link_text_ref("SIOL"), Some(&b""[..]));
     rec.put_field("SIOL", EpicsValue::String("OTHER.VAL".into()))
         .unwrap();
-    assert_eq!(rec.link_text_ref("SIOL"), Some("OTHER.VAL"));
+    assert_eq!(rec.link_text_ref("SIOL"), Some(&b"OTHER.VAL"[..]));
     assert_eq!(rec.link_text_ref("EGU"), None);
     assert_eq!(rec.link_text_ref("VAL"), None);
 }

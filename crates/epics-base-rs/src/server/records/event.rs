@@ -34,8 +34,8 @@ pub struct EventRecord {
     /// SIMM is `DBF_MENU menu(menuYesNo)` (eventRecord.dbd.pod:152-156):
     /// the two-choice NO/YES simulation menu, served as DBR_ENUM.
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     /// SVAL is `DBF_STRING` (eventRecord.dbd.pod:143-145) — the BUFFER C's
     /// `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_STRING,
     /// &prec->sval)`, eventRecord.c:185) before publishing `val = sval`.
@@ -57,8 +57,8 @@ impl Default for EventRecord {
             val: PvString::new(),
             epvt: None,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: PvString::new(),
             sims: 0,
             // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
@@ -87,16 +87,16 @@ impl EventRecord {
 /// C `EVENTPVT` (`eventNameToHandle`, `dbScan.c:469`): the event a name
 /// posts, `None` for the names C maps to no event (empty, `"0"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventHandle(Arc<str>);
+pub struct EventHandle(Arc<[u8]>);
 
 impl EventHandle {
     fn of(name: &PvString) -> Option<Self> {
-        crate::server::database::scan_index::EventName::of(&name.as_str_lossy())
-            .map(|event| Self(event.to_string().into()))
+        crate::server::database::scan_index::EventName::of(name.as_bytes())
+            .map(|event| Self(event.to_bytes().into()))
     }
 
     /// The normalised name `post_event_named` routes by.
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &[u8] {
         &self.0
     }
 }
@@ -111,10 +111,10 @@ fn put_pv_string(slot: &mut PvString, value: EpicsValue, field: &str) -> CaResul
     }
 }
 
-fn put_string(slot: &mut String, value: EpicsValue, field: &str) -> CaResult<()> {
+fn put_string(slot: &mut PvString, value: EpicsValue, field: &str) -> CaResult<()> {
     match value {
         EpicsValue::String(v) => {
-            *slot = v.as_str_lossy().into_owned();
+            *slot = v;
             Ok(())
         }
         _ => Err(CaError::TypeMismatch(field.to_string())),
@@ -247,10 +247,10 @@ impl Record for EventRecord {
         }
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -360,7 +360,7 @@ mod tests {
         let mut rec = EventRecord::default();
         rec.put_field("SIMM", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.menu_field_choices("SIMM"), Some(&["NO", "YES"][..]));
-        let inst = RecordInstance::new("EV:SIMM".into(), rec);
+        let inst = RecordInstance::new("EV:SIMM", rec);
         let snap = inst.snapshot_for_field("SIMM").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
@@ -372,10 +372,10 @@ mod tests {
     fn every_val_write_settles_software_event() {
         let name = |r: &EventRecord| r.software_event().map(|e| e.name().to_owned());
         let mut rec = EventRecord::new(" 5.0 ");
-        assert_eq!(name(&rec).as_deref(), Some("5"));
+        assert_eq!(name(&rec).as_deref(), Some(&b"5"[..]));
         rec.put_field("VAL", EpicsValue::String("shutter".into()))
             .unwrap();
-        assert_eq!(name(&rec).as_deref(), Some("shutter"));
+        assert_eq!(name(&rec).as_deref(), Some(&b"shutter"[..]));
         rec.soft_input_read(
             Some(EpicsValue::String("0".into())),
             &mut Default::default(),
@@ -387,7 +387,7 @@ mod tests {
             &mut Default::default(),
         )
         .unwrap();
-        assert_eq!(name(&rec).as_deref(), Some("7"));
+        assert_eq!(name(&rec).as_deref(), Some(&b"7"[..]));
         rec.put_field("VAL", EpicsValue::String("".into())).unwrap();
         assert_eq!(name(&rec), None);
     }

@@ -41,6 +41,9 @@ async fn order(db: &str) -> Vec<String> {
         .0
         .records_for_scan(ScanType::SEC1)
         .await
+        .iter()
+        .map(|n| n.to_string())
+        .collect()
 }
 
 /// BOUNDARY: same PHAS, declaration order contradicts DBD order. The brief's

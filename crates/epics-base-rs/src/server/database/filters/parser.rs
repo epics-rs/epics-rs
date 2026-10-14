@@ -29,6 +29,8 @@
 
 use std::sync::Arc;
 
+use crate::types::RecordName;
+
 use super::{
     ArrayFilter, ArrayFilterConfig, DeadbandFilter, DeadbandMode, DecimateFilter, FilterChain,
     SubscriptionFilter,
@@ -41,8 +43,9 @@ pub struct ParsedChannelName {
     /// Record + optional `.FIELD` portion (everything before the
     /// JSON suffix), with the `$` modifier still attached when
     /// [`Self::string_view`] is set. Caller routes this through the
-    /// existing `parse_pv_name` to get the (base, field) split.
-    pub record_path: String,
+    /// existing `parse_pv_name` to get the (base, field) split. Bytes, as
+    /// `dbChannelCreate` reads them: a record name need not be UTF-8.
+    pub record_path: Vec<u8>,
     /// The `$` long-string modifier was present *where C accepts one* —
     /// directly after the field part. Read this instead of looking for a
     /// trailing `$` on [`Self::record_path`]: a record whose own name ends
@@ -95,17 +98,22 @@ pub struct ParsedChannelName {
 /// emitting the range as `arr` here gives the legacy syntax full support
 /// with no consumer changes — `split_channel_name` is the single owner of
 /// "channel name → record_path + filters".
-pub fn split_channel_name(raw: &str) -> ParsedChannelName {
+///
+/// The JSON suffix must be UTF-8: `chf_parse` hands it to yajl, which
+/// validates strings, so a suffix that is not fails the channel; here it
+/// stays on the record path, which then names nothing.
+pub fn split_channel_name(raw: impl AsRef<[u8]>) -> ParsedChannelName {
+    let raw = raw.as_ref();
     // Anything the grammar does not accept stays whole on the record path,
     // so the record/field lookup downstream fails the channel exactly as C
     // reaches `finish:` with a status and returns no `dbChannel`.
     let whole = || ParsedChannelName {
-        record_path: raw.to_string(),
+        record_path: raw.to_vec(),
         string_view: false,
         json_suffix: None,
     };
 
-    let Some(dot) = raw.find('.') else {
+    let Some(dot) = raw.iter().position(|&b| b == b'.') else {
         // No field part, so no `[range]` and no `{json}` either. The one
         // modifier the port still reads off an undotted name is a trailing
         // `$`: C refuses `REC$` (`caget 'LS:REC$'` reports not found on a
@@ -114,9 +122,9 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
         // for `REC$` since it gained `$` support, and unlike `{` a `$` cannot
         // occur in a real record name — `.db` files spell macros `$(P)`, so a
         // loaded name never carries one.
-        return match raw.strip_suffix('$') {
+        return match raw.strip_suffix(b"$") {
             Some(core) if !core.is_empty() => ParsedChannelName {
-                record_path: raw.to_string(),
+                record_path: raw.to_vec(),
                 string_view: true,
                 json_suffix: None,
             },
@@ -136,16 +144,16 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
     // `$` long-string modifier, innermost of the three. Left ON the record
     // path because `parse_channel_name` and the CA server both expect to
     // find it there; `string_view` is what says it is a modifier.
-    let string_view = rest.starts_with('$');
+    let string_view = rest.starts_with(b"$");
     if string_view {
         rest = &rest[1..];
     }
 
     // `[range]` folded into a leading `arr` entry.
     let mut arr_inner = None;
-    if let Some(body) = rest.strip_prefix('[') {
-        let Some((inner, after)) = body.find(']').and_then(|close| {
-            let (start, incr, end) = parse_array_range(&body[..close])?;
+    if let Some(body) = rest.strip_prefix(b"[") {
+        let Some((inner, after)) = body.iter().position(|&b| b == b']').and_then(|close| {
+            let (start, incr, end) = parse_array_range(std::str::from_utf8(&body[..close]).ok()?)?;
             Some((build_arr_inner(start, incr, end), &body[close + 1..]))
         }) else {
             return whole();
@@ -156,8 +164,11 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
 
     let json_suffix = if rest.is_empty() {
         None
-    } else if rest.starts_with('{') {
-        Some(rest.to_string())
+    } else if rest.starts_with(b"{") {
+        match std::str::from_utf8(rest) {
+            Ok(json) => Some(json.to_string()),
+            Err(_) => return whole(),
+        }
     } else {
         return whole();
     };
@@ -169,12 +180,12 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
     // nowhere — `src.[2]` then fails every existence and locality test in
     // the port while C answers all of them.
     let mut record_path = if field_len == 0 {
-        raw[..dot].to_string()
+        raw[..dot].to_vec()
     } else {
-        raw[..dot + 1 + field_len].to_string()
+        raw[..dot + 1 + field_len].to_vec()
     };
     if string_view {
-        record_path.push('$');
+        record_path.push(b'$');
     }
 
     let json_suffix = match (arr_inner, json_suffix) {
@@ -193,8 +204,7 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
 /// Length of the field-name token at the head of `s` — a C identifier, or
 /// zero when none is present, as C `dbFindFieldPart` measures it
 /// (`dbStaticLib.c:1565-1571`).
-fn field_name_len(s: &str) -> usize {
-    let b = s.as_bytes();
+fn field_name_len(b: &[u8]) -> usize {
     match b.first() {
         Some(&c) if c == b'_' || c.is_ascii_alphabetic() => {}
         _ => return 0,
@@ -213,10 +223,10 @@ pub struct ChannelName {
     /// `record[.FIELD]` with the filter suffix and the `$` modifier
     /// removed — the key [`PvDatabase::find_entry`](crate::server::database::PvDatabase::find_entry)
     /// and the CA CREATE_CHANNEL lookup use.
-    pub record_path: String,
+    pub record_path: Vec<u8>,
     /// The record (or alias) [`Self::record_path`] names, without the
     /// field.
-    pub record: String,
+    pub record: RecordName,
     /// The addressed field, uppercased, defaulting to `VAL` when the
     /// client named none (`parse_pv_name`).
     pub field: String,
@@ -257,7 +267,7 @@ pub fn spells_a_field(field: &str) -> bool {
 /// `dbChannelDelete(chan); chan = NULL` at `finish:`
 /// (`dbChannel.c:514-527`), so base never connects a channel whose filter
 /// it could not build.
-pub fn parse_channel_name(raw: &str) -> ChannelName {
+pub fn parse_channel_name(raw: impl AsRef<[u8]>) -> ChannelName {
     let parsed = split_channel_name(raw);
     // `split_channel_name` decided whether the trailing `$` is a modifier;
     // re-deriving it here with `strip_suffix` would strip the last character
@@ -265,16 +275,16 @@ pub fn parse_channel_name(raw: &str) -> ChannelName {
     let core = if parsed.string_view {
         parsed
             .record_path
-            .strip_suffix('$')
+            .strip_suffix(b"$")
             .unwrap_or(&parsed.record_path)
     } else {
-        parsed.record_path.as_str()
+        parsed.record_path.as_slice()
     };
     let (record, field) = crate::server::database::parse_pv_name(core);
     ChannelName {
-        record: record.to_string(),
+        record: RecordName::from(record),
         field: field.to_ascii_uppercase(),
-        record_path: core.to_string(),
+        record_path: core.to_vec(),
         string_view: parsed.string_view,
         json_suffix: parsed.json_suffix,
     }
@@ -1048,21 +1058,21 @@ mod tests {
     #[test]
     fn split_plain_record_name() {
         let p = split_channel_name("TEMP");
-        assert_eq!(p.record_path, "TEMP");
+        assert_eq!(p.record_path, b"TEMP");
         assert!(p.json_suffix.is_none());
     }
 
     #[test]
     fn split_record_dot_field() {
         let p = split_channel_name("TEMP.VAL");
-        assert_eq!(p.record_path, "TEMP.VAL");
+        assert_eq!(p.record_path, b"TEMP.VAL");
         assert!(p.json_suffix.is_none());
     }
 
     #[test]
     fn split_filter_only_no_field() {
         let p = split_channel_name(r#"TEMP.{"dbnd":{"d":0.5}}"#);
-        assert_eq!(p.record_path, "TEMP");
+        assert_eq!(p.record_path, b"TEMP");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.5}}"#));
     }
 
@@ -1075,7 +1085,7 @@ mod tests {
     fn split_refuses_a_separator_after_the_field() {
         let raw = r#"TEMP.VAL.{"dbnd":{"d":0.5}}"#;
         let p = split_channel_name(raw);
-        assert_eq!(p.record_path, raw);
+        assert_eq!(p.record_path, raw.as_bytes());
         assert!(p.json_suffix.is_none());
     }
 
@@ -1083,7 +1093,7 @@ mod tests {
     #[test]
     fn split_pvxs_field_directly_followed_by_filter() {
         let p = split_channel_name(r#"test:ai.VAL{"dbnd":{"d":0.0}}"#);
-        assert_eq!(p.record_path, "test:ai.VAL");
+        assert_eq!(p.record_path, b"test:ai.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.0}}"#));
     }
 
@@ -1096,7 +1106,7 @@ mod tests {
     fn split_refuses_a_filter_with_no_field_separator() {
         let raw = r#"TEMP{"arr":{"s":0,"i":1,"e":4}}"#;
         let p = split_channel_name(raw);
-        assert_eq!(p.record_path, raw);
+        assert_eq!(p.record_path, raw.as_bytes());
         assert!(p.json_suffix.is_none());
     }
 
@@ -1108,21 +1118,21 @@ mod tests {
     fn split_keeps_braces_that_belong_to_the_record_name() {
         let bare = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
         let p = split_channel_name(bare);
-        assert_eq!(p.record_path, bare);
+        assert_eq!(p.record_path, bare.as_bytes());
         assert!(p.json_suffix.is_none());
 
         let p = split_channel_name("XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
-        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
+        assert_eq!(p.record_path, b"XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
         assert!(p.json_suffix.is_none());
 
         let p = split_channel_name(r#"XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL{"dbnd":{"d":0.1}}"#);
-        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL");
+        assert_eq!(p.record_path, b"XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.1}}"#));
 
         // A record name may even END in `}` — the closing brace carries no
         // more meaning than the opening one.
         let p = split_channel_name("XF:31IDA-OP{Tbl}.VAL");
-        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl}.VAL");
+        assert_eq!(p.record_path, b"XF:31IDA-OP{Tbl}.VAL");
         assert!(p.json_suffix.is_none());
     }
 
@@ -1131,7 +1141,7 @@ mod tests {
     #[test]
     fn split_array_range_single_element() {
         let p = split_channel_name("WF.VAL[3]");
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":3,"e":3}}"#));
     }
 
@@ -1139,7 +1149,7 @@ mod tests {
     #[test]
     fn split_array_range_start_end() {
         let p = split_channel_name("WF.VAL[2:5]");
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":2,"e":5}}"#));
     }
 
@@ -1147,7 +1157,7 @@ mod tests {
     #[test]
     fn split_array_range_start_incr_end() {
         let p = split_channel_name("WF.VAL[0:2:10]");
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"i":2,"e":10}}"#));
     }
 
@@ -1158,11 +1168,11 @@ mod tests {
     #[test]
     fn split_array_range_needs_the_separator() {
         let p = split_channel_name("WF.[1:4]");
-        assert_eq!(p.record_path, "WF");
+        assert_eq!(p.record_path, b"WF");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":1,"e":4}}"#));
 
         let p = split_channel_name("WF[1:4]");
-        assert_eq!(p.record_path, "WF[1:4]");
+        assert_eq!(p.record_path, b"WF[1:4]");
         assert!(p.json_suffix.is_none());
     }
 
@@ -1191,7 +1201,7 @@ mod tests {
     #[test]
     fn split_array_range_with_json_filter() {
         let p = split_channel_name(r#"WF.VAL[2:5]{"dbnd":{"d":0.5}}"#);
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(
             p.json_suffix.as_deref(),
             Some(r#"{"arr":{"s":2,"e":5},"dbnd":{"d":0.5}}"#)
@@ -1209,7 +1219,11 @@ mod tests {
     fn split_array_range_invalid_left_intact() {
         for raw in ["WF.VAL[]", "WF.VAL[a:b]", "WF.VAL[1:2:3:4]"] {
             let p = split_channel_name(raw);
-            assert_eq!(p.record_path, raw, "invalid range must stay in the name");
+            assert_eq!(
+                p.record_path,
+                raw.as_bytes(),
+                "invalid range must stay in the name"
+            );
             assert!(p.json_suffix.is_none());
         }
     }
@@ -1640,8 +1654,8 @@ mod tests {
     fn cn(raw: &str) -> (String, String, String, bool, Option<String>) {
         let c = parse_channel_name(raw);
         (
-            c.record_path,
-            c.record,
+            String::from_utf8(c.record_path).unwrap(),
+            c.record.to_string(),
             c.field,
             c.string_view,
             c.json_suffix,
@@ -1722,8 +1736,8 @@ mod tests {
     fn channel_name_folds_a_range_into_an_arr_filter() {
         let c = parse_channel_name("REC.VAL[0:2]");
         assert_eq!(
-            (c.record_path.as_str(), c.field.as_str()),
-            ("REC.VAL", "VAL")
+            (&c.record_path[..], c.field.as_str()),
+            (&b"REC.VAL"[..], "VAL")
         );
         assert_eq!(c.json_suffix.as_deref(), Some(r#"{"arr":{"e":2}}"#));
     }
@@ -1744,8 +1758,8 @@ mod tests {
         ] {
             let c = parse_channel_name(raw);
             assert_eq!(
-                (c.record.as_str(), c.field.as_str(), c.record_path.as_str()),
-                ("src", "VAL", "src"),
+                (&c.record[..], c.field.as_str(), &c.record_path[..]),
+                (&b"src"[..], "VAL", &b"src"[..]),
                 "{raw}"
             );
             assert_eq!(c.json_suffix.as_deref(), Some(expect_json), "{raw}");

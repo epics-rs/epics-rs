@@ -110,9 +110,9 @@ pub struct ScalerRecord {
     pub vers: f32,
     pub prec: i16,
     pub egu: PvString,
-    pub out: String,
-    pub cout: String,
-    pub coutp: String,
+    pub out: PvString,
+    pub cout: PvString,
+    pub coutp: PvString,
 
     // --- Per-channel arrays (64 channels) ---
     pub d: [i16; MAX_SCALER_CHANNELS],
@@ -263,9 +263,9 @@ impl Default for ScalerRecord {
             vers: VERSION,
             prec: 0,
             egu: PvString::new(),
-            out: String::new(),
-            cout: String::new(),
-            coutp: String::new(),
+            out: PvString::new(),
+            cout: PvString::new(),
+            coutp: PvString::new(),
             d: {
                 // D1: scalerRecord.dbd `initial("1")` (Dn). D2..D64 default 0.
                 let mut d = [0i16; MAX_SCALER_CHANNELS];
@@ -1218,9 +1218,9 @@ impl Record for ScalerRecord {
             "VERS" => return Some(EpicsValue::Float(self.vers)),
             "PREC" => return Some(EpicsValue::Short(self.prec)),
             "EGU" => return Some(EpicsValue::String(self.egu.clone())),
-            "OUT" => return Some(EpicsValue::String(self.out.clone().into())),
-            "COUT" => return Some(EpicsValue::String(self.cout.clone().into())),
-            "COUTP" => return Some(EpicsValue::String(self.coutp.clone().into())),
+            "OUT" => return Some(EpicsValue::String(self.out.clone())),
+            "COUT" => return Some(EpicsValue::String(self.cout.clone())),
+            "COUTP" => return Some(EpicsValue::String(self.coutp.clone())),
             _ => {}
         }
         if let Some(i) = parse_indexed_field(name, "NM") {
@@ -1331,21 +1331,21 @@ impl Record for ScalerRecord {
             },
             "OUT" => match value {
                 EpicsValue::String(v) => {
-                    self.out = v.as_str_lossy().into_owned();
+                    self.out = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "COUT" => match value {
                 EpicsValue::String(v) => {
-                    self.cout = v.as_str_lossy().into_owned();
+                    self.cout = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "COUTP" => match value {
                 EpicsValue::String(v) => {
-                    self.coutp = v.as_str_lossy().into_owned();
+                    self.coutp = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -1561,7 +1561,7 @@ mod menu_choice_tests {
     fn scaler_cont_snapshot_is_enum_with_labels() {
         let mut rec = ScalerRecord::default();
         rec.put_field("CONT", EpicsValue::Short(1)).unwrap();
-        let inst = RecordInstance::new("SC:CONT".into(), rec);
+        let inst = RecordInstance::new("SC:CONT", rec);
 
         let snap = inst.snapshot_for_field("CONT").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
@@ -1634,7 +1634,7 @@ mod menu_choice_tests {
     fn scaler_gate_snapshot_is_enum_with_labels() {
         let mut rec = ScalerRecord::default();
         rec.put_field("G3", EpicsValue::Short(1)).unwrap();
-        let inst = RecordInstance::new("SC:G3".into(), rec);
+        let inst = RecordInstance::new("SC:G3", rec);
         let snap = inst.snapshot_for_field("G3").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["N", "Y"]);

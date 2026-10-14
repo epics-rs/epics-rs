@@ -58,7 +58,7 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
 /// behaviour, and the rule is defined by `iocsh.cpp`, not by either caller.
 fn check_pdbbase(arg: &ArgValue) -> Result<(), String> {
     if let ArgValue::String(pdbbase) = arg
-        && !(pdbbase.is_empty() || pdbbase.starts_with('0') || pdbbase == "pdbbase")
+        && !(pdbbase.is_empty() || pdbbase.starts_with(b"0") || pdbbase == "pdbbase")
     {
         return Err(format!("Expecting 'pdbbase' got '{pdbbase}'."));
     }
@@ -110,10 +110,10 @@ fn print_escaped(s: &str) -> String {
 /// [`super::commands`] holds the same walk for its own commands. It is six
 /// lines and it is C's iteration order, not a shared policy, so it is stated
 /// where it is used rather than exported.
-fn record_names_by_type(ctx: &CommandContext) -> Vec<String> {
+fn record_names_by_type(ctx: &CommandContext) -> Vec<crate::types::RecordName> {
     let mut names = ctx.block_on(ctx.db().all_record_names());
     let record_types = crate::server::record::record_types();
-    let rank = |name: &String| {
+    let rank = |name: &crate::types::RecordName| {
         let record_type = ctx
             .db()
             .get_record(name)
@@ -131,9 +131,10 @@ fn record_names_by_type(ctx: &CommandContext) -> Vec<String> {
 /// C's `*`/empty sentinel for a record-type argument: both mean "every type"
 /// (`dbWriteRecordFP`, `dbStaticLib.c:801-804`; `dbDumpDevice`,
 /// `dbStaticLib.c:3434-3437`).
-fn type_filter(arg: &ArgValue) -> Option<&str> {
+fn type_filter(arg: &ArgValue) -> Option<std::borrow::Cow<'_, str>> {
     match arg {
-        ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.as_str()),
+        // Matched against the record-type names, all text.
+        ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.to_str_lossy()),
         _ => None,
     }
 }
@@ -182,13 +183,14 @@ fn cmd_db_dump_record() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             check_pdbbase(&args[0])?;
             let wanted = type_filter(&args[1]);
+            let wanted = wanted.as_deref();
             let level = match args[2] {
                 ArgValue::Int(n) => n,
                 _ => 0,
             };
 
             let names = record_names_by_type(ctx);
-            let record_type_of = |name: &String| {
+            let record_type_of = |name: &crate::types::RecordName| {
                 ctx.db()
                     .get_record(name)
                     .map(|rec| rec.read().record.record_type().to_string())
@@ -372,7 +374,7 @@ fn cmd_db_dump_menu() -> CommandDef {
             };
             for (name, idents, values) in crate::server::record::menus() {
                 if let Some(w) = wanted.as_deref()
-                    && name != w
+                    && name.as_bytes() != w
                 {
                     continue;
                 }
@@ -446,7 +448,7 @@ fn cmd_db_dump_record_type() -> CommandDef {
             };
             for record_type in crate::server::record::record_types() {
                 if let Some(w) = wanted.as_deref()
-                    && record_type != w
+                    && record_type.as_bytes() != w
                 {
                     continue;
                 }
@@ -614,7 +616,7 @@ fn cmd_db_dump_field() -> CommandDef {
 
             for record_type in crate::server::record::record_types() {
                 if let Some(wanted) = wanted_type.as_deref()
-                    && record_type != wanted
+                    && record_type.as_bytes() != wanted
                 {
                     continue;
                 }
@@ -626,7 +628,7 @@ fn cmd_db_dump_field() -> CommandDef {
                     crate::server::record::record_declaration_order(record_type).unwrap_or(&[]);
                 for desc in common.iter().chain(own.iter()) {
                     if let Some(wanted) = wanted_field.as_deref()
-                        && desc.name != wanted
+                        && desc.name.as_bytes() != wanted
                     {
                         continue;
                     }
@@ -685,7 +687,7 @@ fn cmd_db_dump_device() -> CommandDef {
             check_pdbbase(&args[0])?;
             let wanted = type_filter(&args[1]);
             for record_type in crate::server::record::record_types() {
-                if let Some(wanted) = wanted
+                if let Some(wanted) = wanted.as_deref()
                     && record_type != wanted
                 {
                     continue;
@@ -1212,7 +1214,11 @@ fn cmd_db_pvd_dump() -> CommandDef {
 
             let mut names = ctx.block_on(ctx.db().all_record_names());
             names.extend(ctx.db().all_alias_names());
-            names.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
+            names.extend(
+                ctx.block_on(ctx.db().all_simple_pv_names())
+                    .into_iter()
+                    .map(crate::types::RecordName::from),
+            );
             names.sort();
 
             ctx.println(&format!(
@@ -1226,7 +1232,7 @@ fn cmd_db_pvd_dump() -> CommandDef {
                     let mut line = String::from("         ");
                     for name in row {
                         line.push_str("  ");
-                        line.push_str(name);
+                        line.push_str(&name.to_str_lossy());
                     }
                     ctx.println(&line);
                 }
@@ -1362,8 +1368,13 @@ fn device_config_lines(ctx: &CommandContext) -> Vec<String> {
         // read go through. Both answer `Soft Timestamp` for `DTYP` and
         // `LINEAR` for `LINR`, but only this one renders `EGUF` the way C's
         // `cvt(` column does.
-        let field_string =
-            |field: &str| super::commands::db_get_string_field(&inst, field).unwrap_or_default();
+        // Display only: a menu choice and two numbers.
+        let field_string = |field: &str| {
+            String::from_utf8_lossy(
+                &super::commands::db_get_string_field(&inst, field).unwrap_or_default(),
+            )
+            .into_owned()
+        };
 
         // C `cvt(<EGUL>,<EGUF>)`, and only when `LINR` reads exactly `LINEAR`
         // (`dbStaticLib.c:3632-3647`). A record type with no `LINR` field gets
@@ -1434,11 +1445,19 @@ fn cmd_dbhcr() -> CommandDef {
 /// One `record(...) { ... }` block — the body of C's inner `dbFirstRecord`
 /// loop (`dbStaticLib.c:826-866`), returned as lines so the walk is testable
 /// without an output capture.
-fn dump_one_record(ctx: &CommandContext, name: &str, record_type: &str, level: i64) -> Vec<String> {
+fn dump_one_record(
+    ctx: &CommandContext,
+    name: &[u8],
+    record_type: &str,
+    level: i64,
+) -> Vec<String> {
     let Some(rec) = ctx.db().get_record(name) else {
         return Vec::new();
     };
-    let mut lines = vec![format!("record({record_type},\"{name}\") {{")];
+    let mut lines = vec![format!(
+        "record({record_type},\"{}\") {{",
+        String::from_utf8_lossy(name)
+    )];
     let inst = rec.read();
 
     let mut descs: Vec<&crate::server::record::FieldDesc> =
@@ -1797,7 +1816,7 @@ variable(seqDLYprecision,int)
     fn run(ctx: &CommandContext, name: &str, tokens: &[&str]) -> Result<String, String> {
         let reg = registry();
         let cmd = reg.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = super::super::registry::parse_args(&tokens, &cmd.args).unwrap();
         let mut outcome = Ok(());
         let printed = capture(ctx, || {
@@ -1990,11 +2009,9 @@ variable(seqDLYprecision,int)
         write!(tmp.as_file(), "{body}").unwrap();
         let reg = registry();
         let cmd = reg.get("dbLoadRecords").unwrap();
-        let args = super::super::registry::parse_args(
-            &[tmp.path().to_string_lossy().to_string()],
-            &cmd.args,
-        )
-        .unwrap();
+        let args =
+            super::super::registry::parse_args(&[tmp.path().to_string_lossy().into()], &cmd.args)
+                .unwrap();
         cmd.handler.call(&args, ctx).unwrap();
     }
 
@@ -2306,7 +2323,7 @@ variable(seqDLYprecision,int)
         let cmd = reg.get("dbPvdTableSize").unwrap();
 
         let outcome = |tokens: &[&str]| {
-            let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
             let args = super::super::registry::parse_args(&tokens, &cmd.args).unwrap();
             let mut failed = false;
             let printed = capture(&ctx, || {
@@ -2623,9 +2640,9 @@ variable(seqDLYprecision,int)
         let (_db, ctx) = make_ctx();
         let reg = registry();
         let cmd = reg.get("dbPutAttribute").unwrap();
-        let tokens: Vec<String> = ["ai", "MYATTR", "hello"]
+        let tokens: Vec<IocshString> = ["ai", "MYATTR", "hello"]
             .iter()
-            .map(|t| t.to_string())
+            .map(|t| t.to_string().into())
             .collect();
         let args = super::super::registry::parse_args(&tokens, &cmd.args).unwrap();
         capture(&ctx, || {
@@ -2848,7 +2865,7 @@ variable(seqDLYprecision,int)
     #[test]
     fn pdbbase_argument_refuses_anything_else() {
         assert!(check_pdbbase(&ArgValue::String("pdbbase".into())).is_ok());
-        assert!(check_pdbbase(&ArgValue::String(String::new())).is_ok());
+        assert!(check_pdbbase(&ArgValue::String(Default::default())).is_ok());
         assert!(check_pdbbase(&ArgValue::String("0".into())).is_ok());
         assert!(check_pdbbase(&ArgValue::Missing).is_ok());
         assert_eq!(

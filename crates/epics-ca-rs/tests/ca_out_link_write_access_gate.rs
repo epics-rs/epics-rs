@@ -131,7 +131,7 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
 async fn admission_settling_to(resolver: &CaLinkResolver, want: PutAdmission) -> PutAdmission {
     let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        let got = LinkSet::put_admission(resolver, PV);
+        let got = LinkSet::put_admission(resolver, PV.as_bytes());
         if got == want || Instant::now() >= deadline {
             return got;
         }
@@ -212,12 +212,12 @@ async fn a_connected_but_write_denied_link_is_refused() {
         "C refuses on `!pca->hasWriteAccess` alone (dbCa.c:529-532)"
     );
     assert!(
-        LinkSet::is_connected(&resolver, PV),
+        LinkSet::is_connected(&resolver, PV.as_bytes()),
         "and it is refused while CONNECTED — the read half is untouched, \
          which is why testing `is_connected` alone admitted it"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV)
+        LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),
@@ -294,13 +294,18 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
     );
 
     use epics_base_rs::server::database::LinkPutOp;
-    LinkSet::put_value(&resolver, PV, EpicsValue::Double(42.0), LinkPutOp::Plain)
-        .await
-        .expect("an admitted write must reach the wire");
+    LinkSet::put_value(
+        &resolver,
+        PV.as_bytes(),
+        EpicsValue::Double(42.0),
+        LinkPutOp::Plain,
+    )
+    .await
+    .expect("an admitted write must reach the wire");
 
     let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        if LinkSet::get_value(&resolver, PV)
+        if LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64())
             == Some(42.0)
@@ -338,7 +343,7 @@ async fn a_plain_out_write_to_a_write_denied_link_alarms_the_record() {
         "C refuses BEFORE addAction, so nothing is staged at all"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV)
+        LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),
@@ -373,7 +378,7 @@ async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
         "nothing staged, so no completion was ever owed"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV)
+        LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),

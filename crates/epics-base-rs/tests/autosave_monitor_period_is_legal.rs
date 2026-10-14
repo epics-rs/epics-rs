@@ -70,7 +70,7 @@ fn monitor_interval(period: i64) -> Duration {
         .handler
         .call(
             &[
-                ArgValue::String("settings.req".to_string()),
+                ArgValue::String("settings.req".into()),
                 ArgValue::Int(period),
             ],
             &ctx,
@@ -120,10 +120,7 @@ fn the_triggered_loop_takes_no_period() {
     find(&cmds, "create_monitor_set")
         .handler
         .call(
-            &[
-                ArgValue::String("settings.req".to_string()),
-                ArgValue::Int(30),
-            ],
+            &[ArgValue::String("settings.req".into()), ArgValue::Int(30)],
             &ctx,
         )
         .unwrap();
@@ -131,8 +128,8 @@ fn the_triggered_loop_takes_no_period() {
         .handler
         .call(
             &[
-                ArgValue::String("settings.req".to_string()),
-                ArgValue::String("IOC:saveTrigger".to_string()),
+                ArgValue::String("settings.req".into()),
+                ArgValue::String("IOC:saveTrigger".into()),
             ],
             &ctx,
         )

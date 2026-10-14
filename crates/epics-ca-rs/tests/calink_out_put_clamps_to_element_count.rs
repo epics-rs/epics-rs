@@ -112,7 +112,7 @@ async fn an_oversized_array_put_truncates_instead_of_failing() {
 
     LinkSet::put_value(
         &resolver,
-        "CALINK:CLAMP:WF",
+        b"CALINK:CLAMP:WF",
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
         LinkPutOp::Async,
     )
@@ -138,7 +138,7 @@ async fn a_plain_put_takes_the_same_clamp() {
 
     LinkSet::put_value(
         &resolver,
-        "CALINK:CLAMP:WFP",
+        b"CALINK:CLAMP:WFP",
         EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
         LinkPutOp::Plain,
     )
@@ -182,7 +182,7 @@ async fn an_oversized_put_to_a_scalar_target_keeps_the_first_element() {
 
     LinkSet::put_value(
         &resolver,
-        "CALINK:CLAMP:AI",
+        b"CALINK:CLAMP:AI",
         EpicsValue::DoubleArray(vec![7.5, 8.5, 9.5].into()),
         LinkPutOp::Async,
     )

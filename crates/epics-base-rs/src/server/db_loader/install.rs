@@ -274,7 +274,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                     apply_fields_one_at_a_time(
                         &host.db().link_list(),
                         &mut *inst,
-                        &def.name,
+                        &def.name.to_str_lossy(),
                         &def.fields,
                         &mut common_fields,
                         faults,
@@ -309,7 +309,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                 apply_fields_one_at_a_time(
                     &host.db().link_list(),
                     &mut record,
-                    &def.name,
+                    &def.name.to_str_lossy(),
                     &def.fields,
                     &mut common_fields,
                     faults,
@@ -405,7 +405,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                     // mechanism, so the per-field release is a bounded,
                     // `.await`-free window.
                     let mut link =
-                        crate::server::record::PreparedCommonLink::for_put(&def.name, &name, &value);
+                        crate::server::record::PreparedCommonLink::for_put(def.name.as_bytes(), &name, &value);
                     let put = rec_arc
                         .write()
                         .put_common_field_db_load_prepared(&name, value, &mut link);
@@ -417,7 +417,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                             phas,
                         }) => {
                             host.db()
-                                .update_scan_index(&def.name, old_scan, new_scan, phas, phas);
+                                .update_scan_index(def.name.as_bytes(), old_scan, new_scan, phas, phas);
                         }
                         Ok(CommonFieldPutResult::PhasChanged {
                             scan,
@@ -425,7 +425,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                             new_phas,
                         }) => {
                             host.db()
-                                .update_scan_index(&def.name, scan, scan, old_phas, new_phas);
+                                .update_scan_index(def.name.as_bytes(), scan, scan, old_phas, new_phas);
                         }
                         Ok(CommonFieldPutResult::NoChange) => {}
                         Err(e) => {
@@ -453,7 +453,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                         None,
                     );
                     let mut inst = rec_arc.write();
-                    inst.run_init_passes(&def.name, input);
+                    inst.run_init_passes(&def.name.to_str_lossy(), input);
                     rec_arc.settle_string_typed(&inst);
                 }
             }
@@ -478,7 +478,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                     // here — `arm_watchdog` would spawn a second task and
                     // supersede the first for nothing.
                     host.db().rec_gbl_init_simm(&rec_arc);
-                    host.db().arm_watchdog(&def.name);
+                    host.db().arm_watchdog(def.name.as_bytes());
                 }
             }
             Ok(())

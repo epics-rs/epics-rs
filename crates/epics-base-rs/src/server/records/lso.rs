@@ -21,10 +21,10 @@ pub struct LsoRecord {
     pub ivoa: i16,
     pub ivov: PvString,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// `menuPost` Post Value Monitors: `menuPost_OnChange` (0, default)
@@ -55,10 +55,10 @@ impl Default for LsoRecord {
             ivoa: 0,
             ivov: PvString::new(),
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             mpst: 0,
@@ -366,11 +366,11 @@ impl Record for LsoRecord {
         Some(crate::server::record::ValueView::Char(self.val.elements()))
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -464,7 +464,7 @@ impl Record for LsoRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -478,14 +478,14 @@ impl Record for LsoRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

@@ -60,7 +60,7 @@ async fn narrow_double_casts_match_softioc() {
                 db.process_record_with_links(&rec, &mut visited)
                     .await
                     .unwrap();
-                let got = match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+                let got = match db.get_pv(format!("{rec}.VAL")).unwrap() {
                     EpicsValue::CharArray(b) if rec.starts_with('P') => {
                         String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default())
                             .parse::<i64>()

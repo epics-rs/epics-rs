@@ -93,6 +93,6 @@ async fn each_input_reads_at_its_ftx_like_softiocpvx() {
     ];
     for (rec, want) in rows {
         process(&db, rec).await;
-        assert_eq!(db.get_pv(&format!("{rec}.A")).unwrap(), want, "{rec}");
+        assert_eq!(db.get_pv(format!("{rec}.A")).unwrap(), want, "{rec}");
     }
 }

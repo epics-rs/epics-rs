@@ -77,13 +77,13 @@ pub struct EpidRecord {
     /// Setpoint mode: 0=supervisory, 1=closed_loop (SMSL)
     pub smsl: i16,
     /// Setpoint input link (STPL) — resolved by framework
-    pub stpl: String,
+    pub stpl: PvString,
     /// Controlled value input link (INP) — resolved by framework
-    pub inp: String,
+    pub inp: PvString,
     /// Output link (OUTL) — resolved by framework
-    pub outl: String,
+    pub outl: PvString,
     /// Readback trigger link (TRIG)
-    pub trig: String,
+    pub trig: PvString,
     /// Trigger value (TVAL)
     pub tval: f64,
     /// Controlled value (CVAL), read-only
@@ -274,10 +274,10 @@ impl Default for EpidRecord {
         Self {
             val: 0.0,
             smsl: 0,
-            stpl: String::new(),
-            inp: String::new(),
-            outl: String::new(),
-            trig: String::new(),
+            stpl: PvString::new(),
+            inp: PvString::new(),
+            outl: PvString::new(),
+            trig: PvString::new(),
             tval: 0.0,
             cval: 0.0,
             cvlp: 0.0,
@@ -722,10 +722,10 @@ impl Record for EpidRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SMSL" => Some(EpicsValue::Short(self.smsl)),
-            "STPL" => Some(EpicsValue::String(self.stpl.clone().into())),
-            "INP" => Some(EpicsValue::String(self.inp.clone().into())),
-            "OUTL" => Some(EpicsValue::String(self.outl.clone().into())),
-            "TRIG" => Some(EpicsValue::String(self.trig.clone().into())),
+            "STPL" => Some(EpicsValue::String(self.stpl.clone())),
+            "INP" => Some(EpicsValue::String(self.inp.clone())),
+            "OUTL" => Some(EpicsValue::String(self.outl.clone())),
+            "TRIG" => Some(EpicsValue::String(self.trig.clone())),
             "TVAL" => Some(EpicsValue::Double(self.tval)),
             "CVAL" => Some(EpicsValue::Double(self.cval)),
             "CVLP" => Some(EpicsValue::Double(self.cvlp)),
@@ -791,28 +791,28 @@ impl Record for EpidRecord {
             },
             "STPL" => match value {
                 EpicsValue::String(v) => {
-                    self.stpl = v.as_str_lossy().into_owned();
+                    self.stpl = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "INP" => match value {
                 EpicsValue::String(v) => {
-                    self.inp = v.as_str_lossy().into_owned();
+                    self.inp = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "OUTL" => match value {
                 EpicsValue::String(v) => {
-                    self.outl = v.as_str_lossy().into_owned();
+                    self.outl = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "TRIG" => match value {
                 EpicsValue::String(v) => {
-                    self.trig = v.as_str_lossy().into_owned();
+                    self.trig = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -1351,7 +1351,7 @@ mod menu_choice_tests {
     fn epid_smsl_snapshot_is_enum_with_labels() {
         let mut rec = EpidRecord::default();
         rec.put_field("SMSL", EpicsValue::Short(1)).unwrap(); // closed_loop
-        let inst = RecordInstance::new("PID:SMSL".into(), rec);
+        let inst = RecordInstance::new("PID:SMSL", rec);
 
         let snap = inst.snapshot_for_field("SMSL").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));

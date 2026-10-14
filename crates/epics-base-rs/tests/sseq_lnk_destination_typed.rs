@@ -89,25 +89,25 @@ struct ExtLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for ExtLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &[u8]) -> bool {
         self.metadata.is_some()
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
     async fn put_value(
         &self,
-        _name: &str,
+        _name: &[u8],
         value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &[u8]) -> Option<LinkMetadata> {
         self.metadata.clone()
     }
 }

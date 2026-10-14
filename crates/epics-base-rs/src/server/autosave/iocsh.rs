@@ -23,7 +23,7 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             "Restore PVs from a save set",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let set_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("expected string argument".to_string()),
                 };
                 let mgr = mgr.clone();
@@ -69,7 +69,7 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             "Save PVs for a save set",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let set_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("expected string argument".to_string()),
                 };
                 let mgr = mgr.clone();
@@ -122,7 +122,7 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             "Verify saved vs live values",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let set_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("expected string argument".to_string()),
                 };
                 let mgr = mgr.clone();
@@ -161,7 +161,7 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             "Show save set configuration",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let set_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("expected string argument".to_string()),
                 };
                 if let Some((set, _)) = mgr.sets().iter().find(|(s, _)| s.config().name == set_name)

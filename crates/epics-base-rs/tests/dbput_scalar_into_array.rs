@@ -66,7 +66,7 @@ fn first(db: &PvDatabase, pv: &str) -> (f64, f64) {
         EpicsValue::LongArray(a) => a[0].into(),
         other => panic!("{pv} = {other:?}"),
     };
-    let nord = db.get_pv(&format!("{pv}.NORD")).unwrap().to_f64().unwrap();
+    let nord = db.get_pv(format!("{pv}.NORD")).unwrap().to_f64().unwrap();
     (v, nord)
 }
 

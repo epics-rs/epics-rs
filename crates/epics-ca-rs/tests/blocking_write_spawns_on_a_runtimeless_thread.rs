@@ -143,9 +143,9 @@ impl Record for ReprocessRecord {
 
     /// `OEVT` set: the framework posts the named event from a spawned tail on
     /// the OUT stage of this very put.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<epics_base_rs::types::PvString> {
         match self.deferral {
-            Deferral::OutputEvent => Some(OEVT.to_string()),
+            Deferral::OutputEvent => Some(OEVT.into()),
             Deferral::After => None,
         }
     }

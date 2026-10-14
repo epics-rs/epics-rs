@@ -5,7 +5,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonLexFault {
     /// `Invalid character '%c'`; carries the character.
-    Invalid(char),
+    Invalid(u8),
     /// `Bad character in JSON string`; carries the whole string, quotes included.
     BadString(String),
     /// `Newline in string, closing quote missing` (`dbLex.l:131-133`), the

@@ -60,8 +60,11 @@ impl ChannelCreateError {
 /// reaches the filter parse and prints nothing; a failure is reported as C's
 /// parse reports it, once per call. Takes record locks one at a time; a
 /// caller must hold none.
-pub fn db_channel_create(db: &PvDatabase, raw: &str) -> Result<DbChannel, ChannelCreateError> {
-    let channel = db_channel_create_unreported(db, raw);
+pub fn db_channel_create(
+    db: &PvDatabase,
+    raw: impl AsRef<[u8]>,
+) -> Result<DbChannel, ChannelCreateError> {
+    let channel = db_channel_create_unreported(db, raw.as_ref());
     if let Err(e) = &channel {
         e.report();
     }
@@ -72,13 +75,13 @@ pub fn db_channel_create(db: &PvDatabase, raw: &str) -> Result<DbChannel, Channe
 /// [`ChannelCreateError::report`] exactly where C would have printed.
 pub(crate) fn db_channel_create_unreported(
     db: &PvDatabase,
-    raw: &str,
+    raw: &[u8],
 ) -> Result<DbChannel, ChannelCreateError> {
     let name = parse_channel_name(raw);
     // An undotted `REC$` is the port's record-level long string, which C
     // refuses (see `split_channel_name`); its `$` is the caller's to judge.
-    let probe = if name.string_view && !raw.contains('.') {
-        name.record_path.as_str()
+    let probe = if name.string_view && !raw.contains(&b'.') {
+        name.record_path.as_slice()
     } else {
         raw
     };

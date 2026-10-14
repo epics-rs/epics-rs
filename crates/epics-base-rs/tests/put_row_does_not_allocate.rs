@@ -261,7 +261,7 @@ async fn a_put_into_an_unsubscribed_string_field_allocates_nothing_body() {
             }
         }
         assert_eq!(
-            db.get_pv(&format!("{rec}.{field}")).unwrap(),
+            db.get_pv(format!("{rec}.{field}")).unwrap(),
             EpicsValue::String(PvString::from("next"))
         );
     }

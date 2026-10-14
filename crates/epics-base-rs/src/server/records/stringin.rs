@@ -25,8 +25,8 @@ pub struct StringinRecord {
     pub val: PvString,
     pub oval: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     /// The SIOL read's buffer (`dbGetLink(&prec->siol, DBR_STRING,
     /// prec->sval)`, stringinRecord.c:208), copied to VAL on success.
     pub sval: PvString,
@@ -47,8 +47,8 @@ impl Default for StringinRecord {
             val: PvString::new(),
             oval: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: PvString::new(),
             sims: 0,
             sdly: -1.0,
@@ -208,10 +208,10 @@ impl Record for StringinRecord {
         Ok(ProcessOutcome::complete())
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -302,14 +302,14 @@ impl Record for StringinRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s.as_str_lossy().into_owned();
+                    self.siml = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s.as_str_lossy().into_owned();
+                    self.siol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -409,7 +409,7 @@ mod tests {
         rec.put_field("MPST", EpicsValue::Short(1)).unwrap();
         rec.put_field("APST", EpicsValue::Short(0)).unwrap();
         assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(1)));
-        let inst = RecordInstance::new("SI:MPST".into(), rec);
+        let inst = RecordInstance::new("SI:MPST", rec);
         let snap = inst.snapshot_for_field("MPST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(

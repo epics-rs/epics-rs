@@ -70,11 +70,11 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
         "dbLoadGroup <jsonFilename> [<macros>]",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let filename = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("dbLoadGroup: missing filename".into()),
             };
             let macros_str = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => String::new(),
             };
 
@@ -378,7 +378,7 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
             let groups = provider.groups();
             match args.first() {
                 Some(ArgValue::String(name)) if !name.is_empty() => {
-                    if let Some(def) = groups.get(name) {
+                    if let Some(def) = name.to_str().ok().and_then(|name| groups.get(name)) {
                         ctx.println(&format!(
                             "Group '{}' (atomic={}, struct_id={:?}): {} member(s)",
                             def.name,
@@ -390,7 +390,7 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
                             ctx.println(&format!(
                                 "  {} <- {} (mapping={:?}, put_order={}, triggers={:?})",
                                 m.field_name,
-                                m.channel,
+                                String::from_utf8_lossy(&m.channel),
                                 m.mapping,
                                 m.put_order
                                     .map(|p| p.to_string())
@@ -458,7 +458,7 @@ pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
             let mut names = ctx.block_on(async {
                 let mut n = db.all_record_names().await;
                 n.extend(db.all_alias_names());
-                n
+                n.iter().map(|n| n.to_string()).collect::<Vec<_>>()
             });
             names.sort();
             names.dedup();
@@ -526,11 +526,11 @@ pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 _ => 0,
             };
             let pattern = match args.get(1) {
-                Some(ArgValue::String(s)) => s.as_str(),
-                _ => "",
+                Some(ArgValue::String(s)) => s.to_str_lossy(),
+                _ => "".into(),
             };
             let groups = provider.groups();
-            for line in pvxgl_lines(&groups, level, pattern) {
+            for line in pvxgl_lines(&groups, level, &pattern) {
                 ctx.println(&line);
             }
             Ok(CommandOutcome::Continue)
@@ -562,7 +562,7 @@ fn pvxgl_lines(
     let mut names: Vec<&String> = groups.keys().collect();
     names.sort();
     for name in names {
-        if !pattern.is_empty() && !glob_match(name, pattern) {
+        if !pattern.is_empty() && !glob_match(name.as_bytes(), pattern.as_bytes()) {
             continue;
         }
         out.push(name.clone());
@@ -583,7 +583,7 @@ fn pvxgl_lines(
                     let chan = if m.channel.is_empty() {
                         String::new()
                     } else {
-                        format!(" chan={}", m.channel)
+                        format!(" chan={}", String::from_utf8_lossy(&m.channel))
                     };
                     let targets = def.resolved_trigger_targets(idx);
                     let trig = if targets.is_empty() {
@@ -609,33 +609,31 @@ fn pvxgl_lines(
 }
 
 /// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`):
-/// `*` matches any run of characters, `?` matches exactly one, all
-/// other characters are literal. Used by `pvxgl` to filter group names,
+/// `*` matches any run of bytes, `?` exactly one byte (C walks `char`s),
+/// all other bytes are literal. Used by `pvxgl` to filter group names,
 /// matching pvxs `epicsStrGlobMatch(groupName, pattern)`.
-fn glob_match(s: &str, pattern: &str) -> bool {
-    let text: Vec<char> = s.chars().collect();
-    let pat: Vec<char> = pattern.chars().collect();
+fn glob_match(text: &[u8], pat: &[u8]) -> bool {
     let mut i = 0usize; // index into text
     let mut p = 0usize; // index into pattern
-    let mut mp: Option<usize> = None; // pattern resume pos after a '*'
-    let mut cp = 0usize; // text resume pos for that '*'
+    let mut mp: Option<usize> = None; // pattern resume pos after a b'*'
+    let mut cp = 0usize; // text resume pos for that b'*'
 
-    while i < text.len() && p < pat.len() && pat[p] != '*' {
-        if pat[p] != text[i] && pat[p] != '?' {
+    while i < text.len() && p < pat.len() && pat[p] != b'*' {
+        if pat[p] != text[i] && pat[p] != b'?' {
             return false;
         }
         p += 1;
         i += 1;
     }
     while i < text.len() {
-        if p < pat.len() && pat[p] == '*' {
+        if p < pat.len() && pat[p] == b'*' {
             p += 1;
             if p >= pat.len() {
                 return true;
             }
             mp = Some(p);
             cp = i + 1;
-        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == '?') {
+        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == b'?') {
             p += 1;
             i += 1;
         } else if let Some(m) = mp {
@@ -646,7 +644,7 @@ fn glob_match(s: &str, pattern: &str) -> bool {
             return false;
         }
     }
-    while p < pat.len() && pat[p] == '*' {
+    while p < pat.len() && pat[p] == b'*' {
         p += 1;
     }
     p >= pat.len()
@@ -785,7 +783,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let missing = tmpdir.path().join("nosuch.json");
         let err = tmpdir.path().join("err");
-        let outcome = shell.execute_line(&format!(
+        let outcome = shell.execute_line(format!(
             "dbLoadGroup(\"{}\") 2> {}",
             missing.display(),
             err.display()
@@ -818,8 +816,7 @@ mod tests {
             "-*".into(),
         ] {
             let out = tmpdir.path().join("out");
-            let outcome =
-                shell.execute_line(&format!("dbLoadGroup(\"{arg}\") > {}", out.display()));
+            let outcome = shell.execute_line(format!("dbLoadGroup(\"{arg}\") > {}", out.display()));
             assert!(matches!(outcome, Ok(CommandOutcome::Continue)), "{arg}");
             assert_eq!(std::fs::read_to_string(&out).unwrap(), "", "{arg}");
         }
@@ -870,15 +867,19 @@ mod tests {
     #[test]
     fn glob_match_star_question_literal() {
         // EPICS `epicsStrGlobMatch` semantics.
-        assert!(glob_match("TEST:grp", "TEST:*"));
-        assert!(glob_match("TEST:grp", "*grp"));
-        assert!(glob_match("TEST:grp", "TEST:gr?"));
-        assert!(glob_match("TEST:grp", "*"));
-        assert!(glob_match("abc", "a*c"));
-        assert!(!glob_match("TEST:grp", "OTHER:*"));
-        assert!(!glob_match("TEST:grp", "TEST:gr"));
-        assert!(!glob_match("abc", "a?"));
-        assert!(glob_match("", "*"));
+        assert!(glob_match(b"TEST:grp", b"TEST:*"));
+        assert!(glob_match(b"TEST:grp", b"*grp"));
+        assert!(glob_match(b"TEST:grp", b"TEST:gr?"));
+        assert!(glob_match(b"TEST:grp", b"*"));
+        assert!(glob_match(b"abc", b"a*c"));
+        assert!(!glob_match(b"TEST:grp", b"OTHER:*"));
+        assert!(!glob_match(b"TEST:grp", b"TEST:gr"));
+        // `?` is one byte, as C `epicsStrGlobMatch` walks `char`s: a
+        // two-byte UTF-8 character needs two.
+        assert!(!glob_match("G:\u{b5}".as_bytes(), b"G:?"));
+        assert!(glob_match("G:\u{b5}".as_bytes(), b"G:??"));
+        assert!(!glob_match(b"abc", b"a?"));
+        assert!(glob_match(b"", b"*"));
     }
 
     /// Borrow a `Vec<String>` as `Vec<&str>` for exact-output assertions

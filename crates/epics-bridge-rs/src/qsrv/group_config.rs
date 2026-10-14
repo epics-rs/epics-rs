@@ -101,8 +101,9 @@ pub struct GroupMember {
     /// Field path within the group structure (e.g., "temperature").
     pub field_name: String,
     /// Source record and field (e.g., "TEMP:ai.VAL").
-    /// Empty for Structure and Const mappings (no backing channel).
-    pub channel: String,
+    /// Empty for Structure and Const mappings (no backing channel). Bytes:
+    /// an info(Q:group) prefixes it with the record's own name.
+    pub channel: Vec<u8>,
     /// How to map the record field to PVA structure.
     pub mapping: FieldMapping,
     /// Which fields to update when this member changes.
@@ -306,7 +307,7 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
         // A semantic error in one group must not hide valid siblings in
         // the same file; the JSON *syntax* error above still rejects the
         // whole file (matching the strict-parse boundary).
-        match raw_to_group_def(name.clone(), raw, "") {
+        match raw_to_group_def(name.clone(), raw, b"") {
             Ok(def) => groups.push(def),
             Err(e) => tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV group"),
         }
@@ -327,7 +328,7 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 ///     })
 /// }
 /// ```
-pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<GroupPvDef>> {
+pub fn parse_info_group(record_name: &[u8], json: &str) -> BridgeResult<Vec<GroupPvDef>> {
     let normalized = relaxed_group_json(json)?;
     let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
         .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
@@ -339,7 +340,7 @@ pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<Group
         // (pvxs groupconfigprocessor.cpp:128-163). pvxs prefixes EVERY `+channel` in a record's info(Q:group) with
         // `"{record}."`, including ones that already hold ':' or '.'
         // (groupprocessorcontext.cpp:65-66, groupconfigprocessor.cpp:810-818).
-        let def = match raw_to_group_def(name.clone(), raw, &format!("{record_name}.")) {
+        let def = match raw_to_group_def(name.clone(), raw, &[record_name, b"."].concat()) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV info(Q:group) group");
@@ -604,7 +605,7 @@ fn json_value_as_i64(v: &serde_json::Value) -> Option<i64> {
 fn raw_to_group_def(
     name: String,
     raw: RawGroupDef,
-    channel_prefix: &str,
+    channel_prefix: &[u8],
 ) -> BridgeResult<GroupPvDef> {
     let mut members = Vec::new();
 
@@ -772,7 +773,7 @@ fn validate_field_name(field_name: &str) -> BridgeResult<()> {
 fn parse_member(
     field_name: &str,
     value: &serde_json::Value,
-    channel_prefix: &str,
+    channel_prefix: &[u8],
 ) -> BridgeResult<GroupMember> {
     // pvxs constructs `FieldName(def.name)` before anything else in the field
     // definition; a malformed path throws and aborts this group's build.
@@ -833,7 +834,7 @@ fn parse_member(
                     }
                 );
             }
-            String::new()
+            Vec::new()
         }
         _ => {
             // pvxs reads `+channel` via `value.as<std::string>()`
@@ -850,7 +851,7 @@ fn parse_member(
                     "field '{field_name}': +channel value {v} is not a string, number, or bool"
                 ))
             })?;
-            format!("{channel_prefix}{channel}")
+            [channel_prefix, channel.as_bytes()].concat()
         }
     };
 
@@ -1153,14 +1154,14 @@ mod tests {
 
         let temp = &g.members[0];
         assert_eq!(temp.field_name, "temperature");
-        assert_eq!(temp.channel, "TEMP:ai");
+        assert_eq!(temp.channel, b"TEMP:ai");
         assert_eq!(temp.mapping, FieldMapping::Scalar);
         assert!(matches!(temp.triggers, TriggerDef::All));
         assert_eq!(temp.put_order, Some(0));
 
         let press = &g.members[1];
         assert_eq!(press.field_name, "pressure");
-        assert_eq!(press.channel, "PRESS:ai");
+        assert_eq!(press.channel, b"PRESS:ai");
         if let TriggerDef::Fields(ref fields) = press.triggers {
             assert_eq!(fields, &["temperature", "pressure"]);
         } else {
@@ -1228,10 +1229,10 @@ mod tests {
         assert_eq!(g.struct_id.as_deref(), Some("epics:nt/NTGroup:1.0"));
         assert!(g.atomic);
         let f1 = g.members.iter().find(|m| m.field_name == "fld1").unwrap();
-        assert_eq!(f1.channel, "VAL");
+        assert_eq!(f1.channel, b"VAL");
         assert_eq!(f1.put_order, Some(0));
         let f2 = g.members.iter().find(|m| m.field_name == "fld2").unwrap();
-        assert_eq!(f2.channel, "RVAL");
+        assert_eq!(f2.channel, b"RVAL");
         match &f2.triggers {
             TriggerDef::Fields(t) => assert_eq!(t, &vec!["fld1".to_string(), "fld2".to_string()]),
             other => panic!("expected named trigger fields, got {other:?}"),
@@ -1305,7 +1306,7 @@ mod tests {
         let defs = parse_group_config(json).expect("bare identifier keys are JSON5");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "grp");
-        assert_eq!(defs[0].members[0].channel, "X.VAL");
+        assert_eq!(defs[0].members[0].channel, b"X.VAL");
     }
 
     /// pva2pva enables YAJL `allow_comments` (pva2pva
@@ -1323,7 +1324,7 @@ mod tests {
         }"#;
         let defs = parse_group_config(json).expect("comments must be stripped");
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].members[0].channel, "X.VAL");
+        assert_eq!(defs[0].members[0].channel, b"X.VAL");
     }
 
     /// The normalizer is string-literal aware: comment markers and a
@@ -1337,7 +1338,7 @@ mod tests {
             }
         }"#;
         let defs = parse_group_config(json).expect("strings with markers must parse");
-        assert_eq!(defs[0].members[0].channel, "A/*not a comment*/B//x");
+        assert_eq!(defs[0].members[0].channel, b"A/*not a comment*/B//x");
     }
 
     /// YAJL treats a
@@ -1351,13 +1352,13 @@ mod tests {
     fn group_json_block_comment_separates_tokens() {
         let json = r#"{ "g": { "f": {+channel:"VAL", +putorder:1/*typo*/2} } }"#;
         assert!(
-            parse_info_group("rec", json).is_err(),
+            parse_info_group(b"rec", json).is_err(),
             "block comment must separate 1 and 2, leaving invalid JSON (not splice into 12)"
         );
         // The same comment placed where a separator is legal still parses, and
         // the number before it keeps its value (`1`, not `12`).
         let json = r#"{ "g": { "f": {+channel:"VAL", +putorder:1/*typo*/, +type:"plain"} } }"#;
-        let groups = parse_info_group("rec", json).expect("comment before ',' is valid");
+        let groups = parse_info_group(b"rec", json).expect("comment before ',' is valid");
         assert_eq!(
             groups[0].members[0].put_order,
             Some(1),
@@ -1373,12 +1374,12 @@ mod tests {
     fn group_json_unterminated_block_comment_is_rejected() {
         let json = r#"{ "g": { "f": {+channel:"VAL"} } } /* never closed"#;
         assert!(
-            parse_info_group("rec", json).is_err(),
+            parse_info_group(b"rec", json).is_err(),
             "unterminated block comment must be rejected, matching YAJL"
         );
         // Also rejected mid-document, before any otherwise-valid close.
         let json = r#"{ "g": { "f": {+channel:"VAL" /* unterminated } } }"#;
-        assert!(parse_info_group("rec", json).is_err());
+        assert!(parse_info_group(b"rec", json).is_err());
     }
 
     /// The relaxed normalizer applies to the record `info(Q:group, ...)`
@@ -1392,10 +1393,21 @@ mod tests {
                 "fld1": {+channel:"VAL", +putorder:0}
             }
         }"#;
-        let groups = parse_info_group("rec3", json).expect("unquoted +keys must parse");
+        let groups = parse_info_group(b"rec3", json).expect("unquoted +keys must parse");
         assert_eq!(groups.len(), 1);
         // bare field-name channel gets the record-name prefix applied.
-        assert_eq!(groups[0].members[0].channel, "rec3.VAL");
+        assert_eq!(groups[0].members[0].channel, b"rec3.VAL");
+    }
+
+    /// pvxs prefixes `+channel` with the record's name as dbStatic stores it,
+    /// so a Latin-1 record's member channel keeps its byte.
+    #[test]
+    fn an_info_group_member_channel_keeps_a_latin1_record_name() {
+        let json = r#"{"g": {"f": {"+channel": "VAL"}}}"#;
+        let groups = parse_info_group(b"R\xb5", json).unwrap();
+        assert_eq!(groups[0].members[0].channel, b"R\xb5.VAL");
+        let m = super::super::channel::MemberChannel::new(groups[0].members[0].clone());
+        assert_eq!(m.names(), (&b"R\xb5"[..], "VAL"));
     }
 
     #[test]
@@ -2037,9 +2049,9 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
         // Bare field "VAL" should become "TEMP:sensor.VAL"
-        assert_eq!(groups[0].members[0].channel, "TEMP:sensor.VAL");
+        assert_eq!(groups[0].members[0].channel, b"TEMP:sensor.VAL");
     }
 
     /// pvxs prefixes the owning record name onto EVERY info(Q:group)
@@ -2057,9 +2069,9 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
         assert_eq!(
-            groups[0].members[0].channel, "TEMP:sensor.PRESS:ai",
+            groups[0].members[0].channel, b"TEMP:sensor.PRESS:ai",
             "info(Q:group) channel must be record-relative even when it contains ':'"
         );
     }
@@ -2077,8 +2089,8 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
-        assert_eq!(groups[0].members[0].channel, "TEMP:sensor.A.B");
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
+        assert_eq!(groups[0].members[0].channel, b"TEMP:sensor.A.B");
     }
 
     #[test]
@@ -2090,7 +2102,7 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
         let container = groups[0]
             .members
             .iter()
@@ -2104,7 +2116,7 @@ mod tests {
             .iter()
             .find(|m| m.field_name == "val")
             .unwrap();
-        assert_eq!(val.channel, "TEMP:sensor.VAL");
+        assert_eq!(val.channel, b"TEMP:sensor.VAL");
     }
 
     #[test]
@@ -2160,7 +2172,7 @@ mod tests {
         assert_eq!(grp.members.len(), 1, "duplicate field must collapse");
         assert_eq!(grp.members[0].field_name, "x");
         assert_eq!(
-            grp.members[0].channel, "R1:x",
+            grp.members[0].channel, b"R1:x",
             "first definition must win (pvxs ignores the duplicate)"
         );
     }
@@ -2637,7 +2649,7 @@ mod tests {
         let groups = parse_group_config(json).unwrap();
         assert_eq!(groups[0].members.len(), 1);
         assert_eq!(groups[0].members[0].field_name, "val");
-        assert_eq!(groups[0].members[0].channel, "R:val");
+        assert_eq!(groups[0].members[0].channel, b"R:val");
     }
 
     #[test]
@@ -2744,7 +2756,7 @@ mod tests {
         }"#;
         let groups = parse_group_config(json).unwrap();
         let a = &groups[0].members[0];
-        assert_eq!(a.channel, "5", "numeric +channel coerces to \"5\"");
+        assert_eq!(a.channel, b"5", "numeric +channel coerces to \"5\"");
         assert_eq!(
             a.struct_id.as_deref(),
             Some("7"),

@@ -38,8 +38,8 @@ async fn add_simulated_ao(db: &PvDatabase, name: &str, siol: &str, val: f64) {
         .await
         .ok();
     let mut ao = AoRecord::new(val);
-    ao.siml = "SIM_ON".to_string();
-    ao.siol = siol.to_string();
+    ao.siml = "SIM_ON".into();
+    ao.siol = siol.into();
     db.add_record(name, Box::new(ao)).await.unwrap();
     let rec = db.get_record(name).unwrap();
     let mut inst = rec.write();

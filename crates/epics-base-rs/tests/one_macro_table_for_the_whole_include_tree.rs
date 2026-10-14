@@ -63,7 +63,8 @@ fn expand_and_notices(path: &Path, macros: impl Into<MacroDefs>) -> (String, Str
     assert!(unsafe { libc::dup2(saved, 2) } >= 0, "restore fd 2 failed");
     unsafe { libc::close(saved) };
 
-    let text = ran.expect("the expansion").expect("the flattened text");
+    let text =
+        String::from_utf8(ran.expect("the expansion").expect("the flattened text")).expect("ASCII");
     let notices = strip_ansi(&std::fs::read_to_string(sink.path()).expect("read the capture"));
     (text, notices)
 }

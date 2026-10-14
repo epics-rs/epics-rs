@@ -32,7 +32,7 @@ const C: [(&str, bool); 7] = [
 fn run(shell: &IocShell, line: &str) -> String {
     let out = std::env::temp_dir().join(format!("dbpr-dpvt-{}", std::process::id()));
     shell
-        .execute_line(&format!("{line} > {}", out.display()))
+        .execute_line(format!("{line} > {}", out.display()))
         .unwrap();
     let text = std::fs::read_to_string(&out).unwrap();
     std::fs::remove_file(&out).unwrap();

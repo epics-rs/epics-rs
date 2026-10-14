@@ -68,8 +68,8 @@ async fn constant_inp_loads_at_the_dsets_type() {
         .unwrap();
     for (i, (rtype, dtyp, inp, field, value, udf)) in cases.iter().enumerate() {
         let got = (
-            db.get_pv(&format!("R{i}.{field}")).unwrap(),
-            db.get_pv(&format!("R{i}.UDF")).unwrap(),
+            db.get_pv(format!("R{i}.{field}")).unwrap(),
+            db.get_pv(format!("R{i}.UDF")).unwrap(),
         );
         assert_eq!(
             got,

@@ -22,8 +22,8 @@ async fn proc(db: &PvDatabase, r: &str) {
 }
 
 async fn state(db: &PvDatabase, r: &str) -> (f64, i32, String, String) {
-    let num = |f: &str| db.get_pv(&format!("{r}.{f}")).unwrap().to_f64().unwrap();
-    let s = |f: &str| db.get_pv(&format!("{r}.{f}")).unwrap().to_string();
+    let num = |f: &str| db.get_pv(format!("{r}.{f}")).unwrap().to_f64().unwrap();
+    let s = |f: &str| db.get_pv(format!("{r}.{f}")).unwrap().to_string();
     (num("VAL"), num("RVAL") as i32, s("SEVR"), s("STAT"))
 }
 

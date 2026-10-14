@@ -415,7 +415,7 @@ impl QxbpmHolder {
             "simQxbpmCreate(port, [xPos], [yPos], [pollMs]) - Create a simulated QXBPM",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("port must be a string".into()),
                 };
                 let x_pos = match &args[1] {

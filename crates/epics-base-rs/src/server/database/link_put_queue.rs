@@ -87,7 +87,7 @@ pub(crate) enum LinkTarget {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct LinkKey {
     pub(crate) target: LinkTarget,
-    pub(crate) name: String,
+    pub(crate) name: crate::types::RecordName,
 }
 
 /// The completion half of a staged put — the `pca->putCallback` slot
@@ -704,7 +704,7 @@ mod tests {
     fn key(name: &str) -> LinkKey {
         LinkKey {
             target: LinkTarget::Scheme("ca".to_string()),
-            name: name.to_string(),
+            name: name.into(),
         }
     }
 

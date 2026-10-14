@@ -596,7 +596,7 @@ mod tests {
     fn ev(pv: &str, cid: u32) -> ServerConnectionEvent {
         ServerConnectionEvent::ChannelCreated {
             peer: "127.0.0.1:5064".parse().unwrap(),
-            pv_name: pv.into(),
+            pv_name: pv.as_bytes().into(),
             cid,
         }
     }
@@ -770,7 +770,7 @@ mod tests {
                     ..
                 }) => {
                     assert_eq!(
-                        &*pv_name, "NEW",
+                        &*pv_name, b"NEW",
                         "must not replay pre-subscription `OLD` events"
                     );
                     seen.push(cid);

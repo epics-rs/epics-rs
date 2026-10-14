@@ -65,7 +65,7 @@ async fn a_dtyp_with_no_device_menu_refuses_every_string() {
             .await
             .unwrap();
         assert_eq!(heard(), [LINE], "link {put}");
-        let num = |f: &str| db.get_pv(&format!("SO.{f}")).unwrap().to_f64();
+        let num = |f: &str| db.get_pv(format!("SO.{f}")).unwrap().to_f64();
         assert_eq!(
             [num("STAT"), num("SEVR")],
             [Some(14.0), Some(3.0)],

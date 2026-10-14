@@ -64,25 +64,31 @@ impl SpyLset {
 
 #[async_trait::async_trait]
 impl LinkSet for SpyLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &[u8]) -> bool {
         true
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.asked
-            .lock()
-            .push(format!("{}:get:{name}", self.scheme));
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        self.asked.lock().push(format!(
+            "{}:get:{}",
+            self.scheme,
+            String::from_utf8_lossy(name)
+        ));
         Some(EpicsValue::Long(3))
     }
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        self.asked
-            .lock()
-            .push(format!("{}:read:{name}", self.scheme));
+    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        self.asked.lock().push(format!(
+            "{}:read:{}",
+            self.scheme,
+            String::from_utf8_lossy(name)
+        ));
         Some(EpicsValue::Long(3))
     }
-    async fn connect_link(&self, name: &str) {
-        self.asked
-            .lock()
-            .push(format!("{}:open:{name}", self.scheme));
+    async fn connect_link(&self, name: &[u8]) {
+        self.asked.lock().push(format!(
+            "{}:open:{}",
+            self.scheme,
+            String::from_utf8_lossy(name)
+        ));
     }
 }
 

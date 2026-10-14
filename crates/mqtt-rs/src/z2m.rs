@@ -126,19 +126,19 @@ fn add_topic_opts(port: &str, drv_info: &str, normalize: bool) -> String {
 
 fn extract_args(args: &[ArgValue]) -> Result<(String, String, String, String), String> {
     let port = match &args[0] {
-        ArgValue::String(s) => s.clone(),
+        ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
     };
     let prefix = match &args[1] {
-        ArgValue::String(s) => s.clone(),
+        ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("prefix required".into()),
     };
     let dev = match &args[2] {
-        ArgValue::String(s) => s.clone(),
+        ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("devName required".into()),
     };
     let topic = match &args[3] {
-        ArgValue::String(s) => s.clone(),
+        ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("mqttTopic required".into()),
     };
     Ok((port, prefix, dev, topic))

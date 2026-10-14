@@ -44,7 +44,7 @@ async fn event_names_fold_as_soft_ioc_folds_them() {
             let rec = db.get_record(name).unwrap();
             let mut w = rec.write();
             w.common.scan = ScanType::Event;
-            w.common.text.evnt = evnt.to_string();
+            w.common.text.evnt = evnt.into();
         }
         db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
     }
@@ -97,7 +97,7 @@ async fn a_hexadecimal_event_name_is_its_event_number() {
             let rec = db.get_record(name).unwrap();
             let mut w = rec.write();
             w.common.scan = ScanType::Event;
-            w.common.text.evnt = evnt.to_string();
+            w.common.text.evnt = evnt.into();
         }
         db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
     }

@@ -62,7 +62,7 @@ async fn process(db: &PvDatabase, name: &str) {
 
 async fn rval(db: &PvDatabase, rec: &str) -> EpicsValue {
     process(db, rec).await;
-    db.get_pv(&format!("{rec}.RVAL")).unwrap()
+    db.get_pv(format!("{rec}.RVAL")).unwrap()
 }
 
 /// An INTEGER source into a SIGNED RVAL. `3735928559` (0xdeadbeef) does not fit

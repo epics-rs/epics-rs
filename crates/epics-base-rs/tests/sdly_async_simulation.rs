@@ -46,8 +46,8 @@ async fn sdly_async_defers_input_sim_read_to_continuation() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SDLY_SW".to_string();
-    ai.siol = "SDLY_SRC".to_string();
+    ai.siml = "SDLY_SW".into();
+    ai.siol = "SDLY_SRC".into();
     ai.sims = 1; // SIMM severity = MINOR
     ai.sdly = 100.0; // async; the real timer is unfireable in this test
     db.add_record("SDLY_AI", Box::new(ai)).await.unwrap();
@@ -115,8 +115,8 @@ async fn sdly_negative_reads_input_synchronously() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SDLYN_SW".to_string();
-    ai.siol = "SDLYN_SRC".to_string();
+    ai.siml = "SDLYN_SW".into();
+    ai.siol = "SDLYN_SRC".into();
     ai.sims = 1;
     // sdly left at the default -1.0 (synchronous).
     db.add_record("SDLYN_AI", Box::new(ai)).await.unwrap();
@@ -158,8 +158,8 @@ async fn sdly_continuation_keeps_simm_latched_from_fresh_cycle() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SDLYL_SW".to_string();
-    ai.siol = "SDLYL_SRC".to_string();
+    ai.siml = "SDLYL_SW".into();
+    ai.siol = "SDLYL_SRC".into();
     ai.sims = 1;
     ai.sdly = 100.0;
     db.add_record("SDLYL_AI", Box::new(ai)).await.unwrap();
@@ -235,8 +235,8 @@ async fn pact_false_retrigger_reresolves_simm_from_siml() {
         .unwrap();
 
     let mut bo = BoRecord::new(1); // VAL=1 + HIGH>0 arms the one-shot reset
-    bo.siml = "BOH_SW".to_string();
-    bo.siol = "BOH_TGT".to_string();
+    bo.siml = "BOH_SW".into();
+    bo.siol = "BOH_TGT".into();
     bo.high = 100.0;
     // sdly left at the default -1.0; the HIGH timer is the pact=FALSE re-trigger.
     db.add_record("BOH", Box::new(bo)).await.unwrap();
@@ -290,8 +290,8 @@ async fn sdly_async_defers_output_sim_write_to_continuation() {
 
     // ao output: VAL=77 is written to SIOL when simulated.
     let mut ao = AoRecord::new(77.0);
-    ao.siml = "SDLYO_SW".to_string();
-    ao.siol = "SDLYO_TGT".to_string();
+    ao.siml = "SDLYO_SW".into();
+    ao.siol = "SDLYO_TGT".into();
     ao.sdly = 100.0;
     db.add_record("SDLYO_AO", Box::new(ao)).await.unwrap();
 

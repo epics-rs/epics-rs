@@ -51,12 +51,12 @@ async fn directive_shapes_match_softioc() {
         db.process_record_with_links(rec, &mut ProcStack::new())
             .await
             .unwrap();
-        let got = match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+        let got = match db.get_pv(format!("{rec}.VAL")).unwrap() {
             EpicsValue::CharArray(b) => b.to_vec(),
             other => panic!("{rec}.VAL {other:?}"),
         };
-        let len = db.get_pv(&format!("{rec}.LEN")).unwrap();
-        let sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap();
+        let len = db.get_pv(format!("{rec}.LEN")).unwrap();
+        let sevr = db.get_pv(format!("{rec}.SEVR")).unwrap();
         let want_sevr = EpicsValue::Short(if invalid { 3 } else { 0 });
         if got != [want.as_bytes(), b"\0"].concat()
             || len != EpicsValue::ULong(want.len() as u32 + 1)

@@ -42,7 +42,7 @@ async fn val_rval(db: &PvDatabase, rec: &str) -> (f64, f64) {
         .await
         .unwrap();
     let f = |field: &str| {
-        db.get_pv(&format!("{rec}.{field}"))
+        db.get_pv(format!("{rec}.{field}"))
             .unwrap()
             .to_f64()
             .unwrap()

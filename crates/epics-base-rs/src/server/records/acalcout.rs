@@ -442,12 +442,12 @@ pub struct AcalcoutRecord {
 
     // --- scalar inputs A..L ---
     num_vals: [f64; 12],
-    inp_links: [String; 12],
+    inp_links: [PvString; 12],
     pa: [f64; 12], // PA..PL
 
     // --- array inputs AA..LL ---
     arr_vals: [Vec<f64>; 12],
-    ina_links: [String; 12],
+    ina_links: [PvString; 12],
 
     // --- link status, derived from the links by `refresh_link_status` ---
     inav: [i16; 12], // INAV..INLV
@@ -455,14 +455,14 @@ pub struct AcalcoutRecord {
     outv: i16,
     /// Async surface + generation gate for `refresh_link_status`, the shape
     /// calcout/scalcout/transform use (see `link_status::post_link_status`).
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
     // A refused CALC/OCAL put's report, made by `special()` under the put's
     // hold and printed by the put's owner after it.
     put_report: Option<PutReport>,
 
     // --- output link + options ---
-    out: String,
+    out: PvString,
     oopt: i16, // 0..6, see acalcoutOOPT
     odly: f64,
     wait: i16,
@@ -574,7 +574,7 @@ impl Default for AcalcoutRecord {
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
             put_report: None,
-            out: String::new(),
+            out: PvString::new(),
             oopt: 0,
             odly: 0.0,
             wait: 0,
@@ -1041,8 +1041,11 @@ impl AcalcoutRecord {
     /// `init_record` is not under a put's hold, so it prints at once.
     fn init_report(&self, report: Option<PutReport>) {
         if let Some(report) = report {
-            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-            report.emit(name, "");
+            let name = self
+                .async_ctx
+                .as_ref()
+                .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+            report.emit(&name, "");
         }
     }
 
@@ -1087,7 +1090,7 @@ impl AcalcoutRecord {
     /// mirroring C `aCalcoutRecord.c::init_record` (209-243) and the
     /// `special()` re-classification (528-569). No-op without an async context.
     fn refresh_link_status(&self, posts: LinkStatusPosts) {
-        let mut links: Vec<(&'static str, String)> = Vec::with_capacity(25);
+        let mut links: Vec<(&'static str, PvString)> = Vec::with_capacity(25);
         for i in 0..12 {
             links.push((INAV_NAMES[i], self.inp_links[i].clone()));
             links.push((IAAV_NAMES[i], self.ina_links[i].clone()));
@@ -1285,7 +1288,7 @@ impl Record for AcalcoutRecord {
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (aCalcoutRecord.c:209-243) classifies all 25 links
         // before any process. Every one of them is an acalcout-owned field
@@ -1704,16 +1707,16 @@ impl Record for AcalcoutRecord {
     /// C reads `prec->inpa..inpl / inaa..inll` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 24 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match *link_field.as_bytes() {
             [b'I', b'N', b'P', slot] => {
                 let slot = usize::from(slot.checked_sub(b'A')?);
-                self.inp_links.get(slot).map(String::as_str)
+                self.inp_links.get(slot).map(PvString::as_bytes)
             }
             // INAA..INLL, the doubled-letter array/string inputs.
             [b'I', b'N', slot, tail] if slot == tail => {
                 let slot = usize::from(slot.checked_sub(b'A')?);
-                self.ina_links.get(slot).map(String::as_str)
+                self.ina_links.get(slot).map(PvString::as_bytes)
             }
             _ => None,
         }
@@ -1989,7 +1992,7 @@ impl Record for AcalcoutRecord {
             }
             "OUT" => match value {
                 EpicsValue::String(s) => {
-                    self.out = s.as_str_lossy().into_owned();
+                    self.out = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OUT".into())),
@@ -2246,7 +2249,7 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::inp_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.inp_links[idx] = s.as_str_lossy().into_owned();
+                            self.inp_links[idx] = s;
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
@@ -2255,7 +2258,7 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::ina_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.ina_links[idx] = s.as_str_lossy().into_owned();
+                            self.ina_links[idx] = s;
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
@@ -2331,12 +2334,12 @@ impl Record for AcalcoutRecord {
     /// body's one name match per link.
     /// See [`Record::set_input_link_slots`].
     fn set_input_link_slots(&self) -> Option<(u64, u64)> {
-        let mut texts: [&str; 24] = [""; 24];
+        let mut texts: [&[u8]; 24] = [b""; 24];
         for (dst, src) in texts[..12].iter_mut().zip(&self.inp_links) {
-            *dst = src.as_str();
+            *dst = src.as_bytes();
         }
         for (dst, src) in texts[12..].iter_mut().zip(&self.ina_links) {
-            *dst = src.as_str();
+            *dst = src.as_bytes();
         }
         crate::server::record::input_link_slots_of(&texts)
     }
@@ -2432,9 +2435,9 @@ impl Record for AcalcoutRecord {
     /// same OOPT/calc-fail/ODLY decision as the OUT write (`cached_should_output`)
     /// — the framework adds the IVOA `Don't_drive` veto. Stringified so the
     /// numeric event matches a `SCAN="Event"` record's `EVNT`.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<crate::types::PvString> {
         if self.cached_should_output && self.oevt > 0 {
-            Some(self.oevt.to_string())
+            Some(self.oevt.to_string().into())
         } else {
             None
         }
@@ -2744,7 +2747,7 @@ mod tests {
         // A default record has all-constant links → every field = 3
         // (`acalcoutINAV_CON`). This is the C-parity case the oracle measured:
         // `caput ACALCOUT.INAV 0` then caget → C returns 3, not the put value.
-        let inst = RecordInstance::new("A:LS".into(), AcalcoutRecord::new());
+        let inst = RecordInstance::new("A:LS", AcalcoutRecord::new());
         for name in ["INAV", "INLV", "IAAV", "ILLV", "OUTV"] {
             assert_eq!(
                 inst.resolve_field(name),

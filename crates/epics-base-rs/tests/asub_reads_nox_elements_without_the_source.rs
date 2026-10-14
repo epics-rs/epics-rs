@@ -78,7 +78,7 @@ async fn each_ftx_converts_the_requested_elements() {
         ] {
             let rec = format!("A_{ft}_{name}");
             process(&db, &rec).await;
-            let got = db.get_pv(&format!("{rec}.A")).unwrap();
+            let got = db.get_pv(format!("{rec}.A")).unwrap();
             assert_eq!(elements(&got), want, "{rec}: {got:?}");
         }
     }

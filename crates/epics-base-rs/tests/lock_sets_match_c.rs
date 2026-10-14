@@ -60,7 +60,11 @@ async fn dbpf(db: &PvDatabase, record: &str, field: &str, text: &str) {
 fn partition(db: &PvDatabase) -> (Vec<Vec<String>>, usize) {
     let report = db.lock_set_report();
     (
-        report.active.iter().map(|s| s.members.clone()).collect(),
+        report
+            .active
+            .iter()
+            .map(|s| s.members.iter().map(|m| m.to_string()).collect())
+            .collect(),
         report.free,
     )
 }
@@ -87,7 +91,11 @@ async fn linked_records_share_one_lock_set_and_free_the_spare() {
     let db = ioc(ORACLE_DB).await;
     let report = db.lock_set_report();
 
-    let members: Vec<Vec<String>> = report.active.iter().map(|s| s.members.clone()).collect();
+    let members: Vec<Vec<String>> = report
+        .active
+        .iter()
+        .map(|s| s.members.iter().map(|m| m.to_string()).collect())
+        .collect();
     assert_eq!(
         members,
         vec![

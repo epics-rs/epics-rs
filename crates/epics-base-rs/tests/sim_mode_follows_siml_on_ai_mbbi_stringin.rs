@@ -35,7 +35,7 @@ async fn proc(db: &PvDatabase, rec: &str) {
 
 /// `(VAL, SIMM, STAT, SEVR, PACT)` as text.
 async fn state(db: &PvDatabase, rec: &str) -> String {
-    let val = match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+    let val = match db.get_pv(format!("{rec}.VAL")).unwrap() {
         EpicsValue::Double(d) => d.to_string(),
         EpicsValue::Enum(e) => e.to_string(),
         other => other.to_string(),

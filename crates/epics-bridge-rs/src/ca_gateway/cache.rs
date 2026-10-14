@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_base_rs::server::snapshot::Snapshot;
+use epics_base_rs::types::RecordName;
 use tokio::sync::RwLock;
 
 /// State of a cached PV in the gateway.
@@ -70,7 +71,7 @@ impl PvState {
 #[derive(Debug)]
 pub struct GwPvEntry {
     /// Upstream PV name (after alias resolution).
-    pub name: String,
+    pub name: RecordName,
     /// Current state in the lifecycle FSM.
     pub state: PvState,
     /// Most recent value + metadata received from upstream.
@@ -117,7 +118,7 @@ pub struct GwPvEntry {
 
 impl GwPvEntry {
     /// Create a new entry in the `Connecting` state.
-    pub fn new_connecting(name: impl Into<String>) -> Self {
+    pub fn new_connecting(name: impl Into<RecordName>) -> Self {
         Self {
             name: name.into(),
             state: PvState::Connecting,
@@ -282,7 +283,7 @@ impl Default for CacheTimeouts {
 /// Corresponds to C++ `gateServer::pv_list` (HashMap of `gatePvData`).
 #[derive(Debug, Default)]
 pub struct PvCache {
-    entries: HashMap<String, Arc<RwLock<GwPvEntry>>>,
+    entries: HashMap<RecordName, Arc<RwLock<GwPvEntry>>>,
 }
 
 impl PvCache {
@@ -300,8 +301,8 @@ impl PvCache {
     }
 
     /// Look up an entry by upstream name.
-    pub fn get(&self, name: &str) -> Option<Arc<RwLock<GwPvEntry>>> {
-        self.entries.get(name).cloned()
+    pub fn get(&self, name: impl AsRef<[u8]>) -> Option<Arc<RwLock<GwPvEntry>>> {
+        self.entries.get(name.as_ref()).cloned()
     }
 
     /// Insert a new entry, replacing any existing one with the same name.
@@ -314,20 +315,21 @@ impl PvCache {
     }
 
     /// Get an existing entry or create a new one in the `Connecting` state.
-    pub fn get_or_create(&mut self, name: &str) -> Arc<RwLock<GwPvEntry>> {
+    pub fn get_or_create(&mut self, name: impl AsRef<[u8]>) -> Arc<RwLock<GwPvEntry>> {
+        let name = name.as_ref();
         if let Some(arc) = self.entries.get(name) {
             return arc.clone();
         }
-        self.insert(GwPvEntry::new_connecting(name.to_string()))
+        self.insert(GwPvEntry::new_connecting(name))
     }
 
     /// Remove an entry by name.
-    pub fn remove(&mut self, name: &str) -> Option<Arc<RwLock<GwPvEntry>>> {
-        self.entries.remove(name)
+    pub fn remove(&mut self, name: impl AsRef<[u8]>) -> Option<Arc<RwLock<GwPvEntry>>> {
+        self.entries.remove(name.as_ref())
     }
 
     /// All entry names (for stats / introspection).
-    pub fn names(&self) -> Vec<String> {
+    pub fn names(&self) -> Vec<RecordName> {
         self.entries.keys().cloned().collect()
     }
 
@@ -398,9 +400,9 @@ impl PvCache {
     /// once the IOC reappears) and only evicted after `dead_timeout`
     /// further elapses. Same for `Disconnect` → kept as-is and only
     /// evicted after `disconnect_timeout`.
-    pub async fn cleanup(&mut self, timeouts: &CacheTimeouts) -> Vec<String> {
+    pub async fn cleanup(&mut self, timeouts: &CacheTimeouts) -> Vec<RecordName> {
         let mut to_remove = Vec::new();
-        let mut to_demote: Vec<String> = Vec::new();
+        let mut to_demote: Vec<RecordName> = Vec::new();
 
         for (name, entry) in &self.entries {
             let entry_guard = entry.read().await;

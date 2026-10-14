@@ -96,20 +96,20 @@ struct MqttConfigHandler {
 impl CommandHandler for MqttConfigHandler {
     fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let port_name = match &args[0] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("portName required".into()),
         };
         let broker_url = match &args[1] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("brokerUrl required".into()),
         };
         let client_id = match &args[2] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("clientId required".into()),
         };
         let qos = resolve_iocsh_qos(&args[3]);
         let conn_pv_name = match &args[4] {
-            ArgValue::String(s) if !s.is_empty() => Some(s.clone()),
+            ArgValue::String(s) if !s.is_empty() => Some(s.to_str()?.to_owned()),
             _ => None,
         };
 

@@ -84,7 +84,7 @@ fn callback_dset(record_type: &str) -> Option<(&'static str, &'static str)> {
 /// across two variants, but both are the same `PV_LINK` here. Everything
 /// else — a constant, an empty field, a JSON link (`{const:9}` included), a
 /// `#C0 S0` hardware address — is one of C's other link types.
-fn pv_link_name(inp: &str) -> Option<String> {
+fn pv_link_name(inp: &[u8]) -> Option<crate::types::RecordName> {
     match parse_link_v2(inp) {
         ParsedLink::Db(link) => Some(link.pvname()),
         ParsedLink::Ca(link) => Some(link.pv),
@@ -107,7 +107,7 @@ pub(crate) fn add_record_input(
     db: &PvDatabase,
     record_type: &str,
     dtyp: &str,
-    inp: &str,
+    inp: &[u8],
 ) -> Option<AddRecordInput> {
     callback_dset(record_type)?;
     if served_soft(record_type, dtyp) != Some(SoftDtyp::Async) {
@@ -116,10 +116,12 @@ pub(crate) fn add_record_input(
     Some(match pv_link_name(inp) {
         // An undotted name is all record name to `dbFindRecordPart`
         // (`dbStaticLib.c:1557-1566`), so `REC$` names no record.
-        Some(name) if !name.contains('.') && name.contains('$') => {
+        Some(name) if !name.contains(&b'.') && name.contains(&b'$') => {
             AddRecordInput::Channel(Err(ChannelCreateError::NotFound))
         }
-        Some(name) => AddRecordInput::Channel(db_channel_create_unreported(db, &name).map(|_| ())),
+        Some(name) => {
+            AddRecordInput::Channel(db_channel_create_unreported(db, name.as_bytes()).map(|_| ()))
+        }
         None => AddRecordInput::NotPvLink,
     })
 }
@@ -130,7 +132,7 @@ pub(crate) fn add_record_input(
 pub(crate) fn add_record_input_of(
     db: &PvDatabase,
     rec: &crate::server::record::RecordCell,
-    inp: Option<&str>,
+    inp: Option<&[u8]>,
 ) -> Option<AddRecordInput> {
     let (record_type, dtyp, own_inp) = {
         let instance = rec.read();
@@ -141,7 +143,12 @@ pub(crate) fn add_record_input_of(
             inp.is_none().then(|| instance.common.text.inp.clone()),
         )
     };
-    add_record_input(db, record_type, &dtyp, inp.or(own_inp.as_deref())?)
+    add_record_input(
+        db,
+        record_type,
+        &dtyp,
+        inp.or(own_inp.as_ref().map(|t| t.as_bytes()))?,
+    )
 }
 
 /// An `add_record` refusal, printed by the caller once it holds no lock.
@@ -193,7 +200,7 @@ pub(crate) fn add_record(
     if served_soft(instance.record.record_type(), dtyp) != Some(SoftDtyp::Async) {
         return None;
     }
-    let input = input.unwrap_or_else(|| match pv_link_name(&instance.common.text.inp) {
+    let input = input.unwrap_or_else(|| match pv_link_name(instance.common.text.inp.as_bytes()) {
         Some(_) => AddRecordInput::Channel(Ok(())),
         None => AddRecordInput::NotPvLink,
     });
@@ -236,7 +243,7 @@ pub(crate) fn put_add_record(
     db: &PvDatabase,
     record_type: &str,
     dtyp: &str,
-    inp: &str,
+    inp: &[u8],
 ) -> Result<Dpvt, AddRecordRefusal> {
     match add_record_input(db, record_type, dtyp, inp) {
         Some(input) => answer(record_type, input),

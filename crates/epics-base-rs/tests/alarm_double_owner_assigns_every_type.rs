@@ -49,7 +49,7 @@ fn limits(inst: &RecordInstance, field: &str) -> (f64, f64, f64, f64) {
 }
 
 fn inst<R: Record + 'static>(rec: R) -> RecordInstance {
-    RecordInstance::new("T:REC".to_string(), rec)
+    RecordInstance::new("T:REC", rec)
 }
 
 /// Set HIHI/LOLO and enable their severities, through whichever store the type

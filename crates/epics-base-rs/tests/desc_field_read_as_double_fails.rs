@@ -30,7 +30,7 @@ const DBR_TIME_DOUBLE: u16 = 20;
 const DBR_TIME_SHORT: u16 = 15;
 
 fn ai_with_desc(desc: &str) -> RecordInstance {
-    let mut inst = RecordInstance::new("A".to_string(), AiRecord::new(0.0));
+    let mut inst = RecordInstance::new("A", AiRecord::new(0.0));
     inst.put_common_field("DESC", EpicsValue::String(PvString::from(desc.to_string())))
         .expect("DESC accepts a string");
     inst

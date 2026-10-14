@@ -45,7 +45,7 @@ fn dump(record_type: &str) -> String {
     let shell = IocShell::new(Arc::new(PvDatabase::new()), bridge);
     let out = tempfile::NamedTempFile::new().unwrap();
     shell
-        .execute_line(&format!(
+        .execute_line(format!(
             "dbDumpDevice pdbbase {record_type} > {}",
             out.path().display()
         ))
@@ -76,7 +76,7 @@ async fn dtyp_index_of_each_choice_is_its_oracle_ioc_position() {
                 .await
                 .unwrap();
             assert_eq!(
-                db.get_pv(&format!("{rec}.DTYP")).ok(),
+                db.get_pv(format!("{rec}.DTYP")).ok(),
                 Some(EpicsValue::Enum(index as u16)),
                 "{rec} DTYP {choice}"
             );

@@ -256,14 +256,12 @@ impl AutosaveStartupConfig {
                 "set_requestfile_path(path, pathsub) - Add request file search path",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let path = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_path()?.to_path_buf(),
                         _ => return Err("path argument required".into()),
                     };
                     let full_path = match args.get(1) {
-                        Some(ArgValue::String(sub)) if !sub.is_empty() => {
-                            PathBuf::from(&path).join(sub)
-                        }
-                        _ => PathBuf::from(&path),
+                        Some(ArgValue::String(sub)) if !sub.is_empty() => path.join(sub.to_path()?),
+                        _ => path,
                     };
                     eprintln!("set_requestfile_path: {}", full_path.display());
                     h.lock().unwrap().request_file_paths.push(full_path);
@@ -290,14 +288,12 @@ impl AutosaveStartupConfig {
                 "set_savefile_path(path, pathsub) - Set save file directory",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let path = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_path()?.to_path_buf(),
                         _ => return Err("path argument required".into()),
                     };
                     let full_path = match args.get(1) {
-                        Some(ArgValue::String(sub)) if !sub.is_empty() => {
-                            PathBuf::from(&path).join(sub)
-                        }
-                        _ => PathBuf::from(&path),
+                        Some(ArgValue::String(sub)) if !sub.is_empty() => path.join(sub.to_path()?),
+                        _ => path,
                     };
                     eprintln!("set_savefile_path: {}", full_path.display());
                     if let Err(e) = std::fs::create_dir_all(&full_path) {
@@ -331,7 +327,7 @@ impl AutosaveStartupConfig {
                 "create_monitor_set(filename, period, macrostring) - Create periodic save set",
                 move |args: &[ArgValue], ctx: &CommandContext| {
                     let filename = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("filename argument required".into()),
                     };
                     let period = match &args[1] {
@@ -339,7 +335,7 @@ impl AutosaveStartupConfig {
                         _ => return Err("period argument required".into()),
                     };
                     let macros = match args.get(2) {
-                        Some(ArgValue::String(s)) => s.clone(),
+                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
                     eprintln!(
@@ -387,11 +383,13 @@ impl AutosaveStartupConfig {
                  Create triggered save set (saves when trigger_channel changes)",
                 move |args: &[ArgValue], ctx: &CommandContext| {
                     let filename = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("filename argument required".into()),
                     };
                     let trigger_channel = match &args[1] {
-                        ArgValue::String(s) if is_valid_first_pv_char(s) => s.clone(),
+                        ArgValue::String(s) if s.to_str().is_ok_and(is_valid_first_pv_char) => {
+                            s.to_str()?.to_owned()
+                        }
                         // C's wording, and C's refusal: no set is created
                         // at all rather than one that saves on something
                         // else (`save_restore.c:2296-2303`).
@@ -404,7 +402,7 @@ impl AutosaveStartupConfig {
                         }
                     };
                     let macros = match args.get(2) {
-                        Some(ArgValue::String(s)) => s.clone(),
+                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
                     eprintln!("create_triggered_set: {filename}, trigger={trigger_channel}");
@@ -439,11 +437,11 @@ impl AutosaveStartupConfig {
                 "set_pass0_restoreFile(filename, macrostring) - Restore before device support init",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let filename = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("filename argument required".into()),
                     };
                     let macros = match args.get(1) {
-                        Some(ArgValue::String(s)) => s.clone(),
+                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
                     eprintln!("set_pass0_restoreFile: {filename}");
@@ -474,11 +472,11 @@ impl AutosaveStartupConfig {
                 "set_pass1_restoreFile(filename, macrostring) - Restore after device support init",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let filename = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("filename argument required".into()),
                     };
                     let macros = match args.get(1) {
-                        Some(ArgValue::String(s)) => s.clone(),
+                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
                     eprintln!("set_pass1_restoreFile: {filename}");
@@ -509,7 +507,7 @@ impl AutosaveStartupConfig {
                  else native",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let mode = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("mode argument required".into()),
                     };
                     let compat =
@@ -537,7 +535,7 @@ impl AutosaveStartupConfig {
                 "save_restoreSet_status_prefix(prefix) - Set status PV prefix",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let prefix = match &args[0] {
-                        ArgValue::String(s) => s.clone(),
+                        ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("prefix argument required".into()),
                     };
                     eprintln!("save_restoreSet_status_prefix: {prefix}");
@@ -634,8 +632,8 @@ mod tests {
                 .handler
                 .call(
                     &[
-                        ArgValue::String("settings.req".to_string()),
-                        ArgValue::String(bad.to_string()),
+                        ArgValue::String("settings.req".into()),
+                        ArgValue::String(bad.into()),
                     ],
                     &ctx,
                 )

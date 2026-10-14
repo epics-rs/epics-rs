@@ -27,7 +27,7 @@ pub enum AccessLevel {
 /// `AccessGate::check`.
 #[derive(Debug, Clone)]
 pub struct AccessChecked {
-    pv_name: String,
+    pv_name: crate::types::RecordName,
     level: AccessLevel,
     /// Write-trap mask of the rule that resolved `level`. C
     /// `asComputePvt` stores this as `pasgclient->trapMask`
@@ -45,7 +45,7 @@ struct AccessSeal;
 
 impl AccessChecked {
     /// The PV name the check was performed against.
-    pub fn pv_name(&self) -> &str {
+    pub fn pv_name(&self) -> &crate::types::RecordName {
         &self.pv_name
     }
 
@@ -146,7 +146,7 @@ pub struct AccessGate {
 /// part of the key — a re-auth that only changes role claims must miss.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CheckKey {
-    pv_name: String,
+    pv_name: crate::types::RecordName,
     host: String,
     user: Vec<u8>,
     method: String,
@@ -178,7 +178,9 @@ enum AclVersionSource {
 /// source. Sources install one when constructing an
 /// [`AccessGate::required`].
 pub type AsgAslResolver = std::sync::Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = (String, u8)> + Send>>
+    dyn Fn(
+            crate::types::RecordName,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (String, u8)> + Send>>
         + Send
         + Sync,
 >;
@@ -967,7 +969,7 @@ impl AccessGate {
     /// kind of value the source's op methods will accept.
     pub async fn check(
         &self,
-        pv_name: impl Into<String>,
+        pv_name: impl Into<crate::types::RecordName>,
         host: &str,
         user: impl AsRef<[u8]>,
         method: &str,
@@ -982,7 +984,7 @@ impl AccessGate {
     /// UAG member can match.
     pub async fn check_with_roles(
         &self,
-        pv_name: impl Into<String>,
+        pv_name: impl Into<crate::types::RecordName>,
         host: &str,
         user: impl AsRef<[u8]>,
         roles: &[crate::types::PvString],
@@ -1075,7 +1077,7 @@ mod access_checked_tests {
         assert_eq!(checked.level(), AccessLevel::ReadWrite);
         assert!(checked.allows_read());
         assert!(checked.allows_write());
-        assert_eq!(checked.pv_name(), "any:pv");
+        assert_eq!(&checked.pv_name()[..], b"any:pv");
     }
 
     #[epics_macros_rs::epics_test]
@@ -1443,6 +1445,8 @@ impl AsgInp {
 /// fires no re-evaluation.
 pub fn inp_link_target(link: &str) -> (&str, &str) {
     let (record, field) = crate::server::database::parse_pv_name(link);
+    // A prefix of `link` cut at an ASCII `.`, so still UTF-8.
+    let record = &link[..record.len()];
     (record, if field.is_empty() { "VAL" } else { field })
 }
 
@@ -1926,7 +1930,8 @@ pub enum TrapWriteOp {
 #[derive(Debug, Clone, Copy)]
 pub struct TrapWriteMessage<'a> {
     pub op: TrapWriteOp,
-    pub pv_name: &'a str,
+    /// C `asTrapWriteMessage::serverSpecific` channel name: bytes, never decoded.
+    pub pv_name: &'a [u8],
     /// C `asTrapWriteMessage::userid`: the client's bytes, never decoded.
     pub user: &'a [u8],
     pub host: &'a [u8],
@@ -2073,7 +2078,7 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
             };
             tracing::error!(
                 target: "epics_base_rs::server::access_security",
-                pv = msg.pv_name,
+                pv = %String::from_utf8_lossy(msg.pv_name),
                 event_id = msg.event_id,
                 op = ?msg.op,
                 panic = %descr,
@@ -2093,7 +2098,7 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
 /// `.await` points until the put really finishes, is superseded, or the
 /// connection tears down.
 pub struct TrapWriteFields {
-    pub pv_name: String,
+    pub pv_name: Vec<u8>,
     pub user: Vec<u8>,
     pub host: Vec<u8>,
     pub peer: String,
@@ -2211,7 +2216,7 @@ impl Drop for TrapWriteGuard {
 pub struct TrapWriteMeta<'a> {
     /// The channel (`record.FIELD`) being written — pvxs passes
     /// `dbChannelName(pChan)`.
-    pub pv_name: &'a str,
+    pub pv_name: &'a [u8],
     /// Authenticated account name (pvxs `cred->account`), as bytes.
     pub user: &'a [u8],
     /// Client host (pvxs `cred->host`).
@@ -2306,7 +2311,7 @@ where
 
 fn trap_fields(meta: &TrapWriteMeta<'_>, value: &crate::types::EpicsValue) -> TrapWriteFields {
     TrapWriteFields {
-        pv_name: meta.pv_name.to_string(),
+        pv_name: meta.pv_name.to_vec(),
         user: meta.user.to_vec(),
         host: meta.host.as_bytes().to_vec(),
         peer: meta.peer.to_string(),
@@ -5546,7 +5551,7 @@ ASG(G) {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = events.clone();
         let handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
-            if msg.pv_name == pv {
+            if msg.pv_name == pv.as_bytes() {
                 sink.lock()
                     .unwrap()
                     .push((msg.op, msg.status.map(str::to_owned)));
@@ -5557,7 +5562,7 @@ ASG(G) {
 
     fn trap_fields(pv: &'static str) -> TrapWriteFields {
         TrapWriteFields {
-            pv_name: pv.to_string(),
+            pv_name: pv.as_bytes().to_vec(),
             user: b"u".to_vec(),
             host: b"h".to_vec(),
             peer: "h:5064".to_string(),
@@ -5617,12 +5622,12 @@ ASG(G) {
         let users = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = users.clone();
         let _handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
-            if msg.pv_name == "trap:nonutf8" {
+            if msg.pv_name == b"trap:nonutf8" {
                 sink.lock().unwrap().push(msg.user.to_vec());
             }
         }));
         let meta = TrapWriteMeta {
-            pv_name: "trap:nonutf8",
+            pv_name: b"trap:nonutf8",
             user: b"op\xff",
             host: "h",
             peer: "h:5064",
@@ -5633,6 +5638,31 @@ ASG(G) {
         })
         .unwrap();
         assert_eq!(*users.lock().unwrap(), vec![b"op\xff".to_vec(); 2]);
+    }
+
+    /// C `asTrapWriteMessage` hands listeners the channel name as stored;
+    /// a Latin-1 name must not be decoded on the way.
+    #[test]
+    fn a_non_utf8_pv_name_reaches_the_trap_listener_byte_for_byte() {
+        let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = names.clone();
+        let _handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
+            if msg.pv_name.starts_with(b"trap:latin1") {
+                sink.lock().unwrap().push(msg.pv_name.to_vec());
+            }
+        }));
+        let meta = TrapWriteMeta {
+            pv_name: b"trap:latin1\xb5",
+            user: b"op",
+            host: "h",
+            peer: "h:5064",
+            dbr_type: 5,
+        };
+        put_with_trap_blocking(true, meta, crate::types::EpicsValue::Long(1), |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(*names.lock().unwrap(), vec![b"trap:latin1\xb5".to_vec(); 2]);
     }
 }
 

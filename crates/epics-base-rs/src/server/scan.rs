@@ -2991,7 +2991,7 @@ mod tests {
             let rec = db.get_record("SCAN:THREAD").unwrap();
             rec.write().common.scan = ScanType::SEC01;
         }
-        db.update_scan_index("SCAN:THREAD", ScanType::Passive, ScanType::SEC01, 0, 0);
+        db.update_scan_index(b"SCAN:THREAD", ScanType::Passive, ScanType::SEC01, 0, 0);
 
         let owner = ScanOwner::start(Arc::clone(&db));
 

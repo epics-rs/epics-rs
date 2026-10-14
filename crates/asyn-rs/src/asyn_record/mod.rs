@@ -501,7 +501,10 @@ pub struct AsynRecord {
     // `dbDefineRecord`). Lets `process()` run port I/O off the scan thread
     // and re-enter on completion, and lets the exception callback take the
     // record's hold from the port's side (`with_record`).
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(epics_base_rs::types::RecordName, AsyncDbHandle)>,
+    /// The name as the asyn trace prints it, made once here so the cycle
+    /// that copies it into its I/O plan never re-validates the bytes.
+    trace_name: String,
     /// The callback band this record's `PRIO` selects, refreshed from
     /// `ProcessContext` before every `process()`. C asyn device support
     /// completes through
@@ -866,6 +869,7 @@ impl Default for AsynRecord {
             device_user: crate::manager::DeviceUser::default(),
             resolved_reason: 0,
             async_ctx: None,
+            trace_name: String::new(),
             callback_priority: epics_libcom_rs::runtime::task::CallbackPriority::Low,
             special_lane: Arc::default(),
             special_cells: Vec::new(),
@@ -2444,7 +2448,7 @@ fn read_eos(port: &mut dyn PortCalls, user: SpecialUser) -> Result<(String, Stri
 struct SpecialLane {
     done: Mutex<SpecialQueue>,
     /// The record the drainer applies results to, set at `add_record`.
-    record: Mutex<Option<(String, AsyncDbHandle)>>,
+    record: Mutex<Option<(epics_base_rs::types::RecordName, AsyncDbHandle)>>,
     /// Held by a test to stop the drainer before it takes the next result.
     #[cfg(test)]
     gate: Mutex<()>,
@@ -4080,7 +4084,7 @@ impl AsynRecord {
 
     /// `pasynRec->name`: the name the record was added under.
     fn record_name(&self) -> &str {
-        self.async_ctx.as_ref().map_or("", |(name, _)| name)
+        &self.trace_name
     }
 
     /// [`Self::build_io_plan_for`] into `plan`, reusing its output buffer.
@@ -4450,7 +4454,7 @@ impl Record for AsynRecord {
     /// `process()` completion re-entry and the exception refresh; a
     /// record never built into a database keeps `None` and stays fully
     /// synchronous.
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {
         let target = name.clone();
         self.cancel_scan = Some(Arc::new(move |db| {
             let passive = EpicsValue::Enum(ScanType::Passive.to_u16());
@@ -4459,6 +4463,7 @@ impl Record for AsynRecord {
         }));
         *self.process_job.reentry.lock().unwrap() = Some(db.process_callback(&name));
         *self.special_lane.record.lock().unwrap() = Some((name.clone(), db.clone()));
+        self.trace_name = name.to_string();
         self.async_ctx = Some((name, db));
     }
 
@@ -10560,7 +10565,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         let db = PvDatabase::new();
-        rec.async_ctx = Some(("AS".to_string(), db.async_handle()));
+        rec.async_ctx = Some(("AS".into(), db.async_handle()));
         rec.process().unwrap();
         assert!(
             named(rec.take_process_posted_fields())
@@ -10596,7 +10601,7 @@ mod tests {
         // the completion's re-entry token resolves to nothing, so the test
         // drives the completion re-entry itself, isolating the apply path.
         let db = PvDatabase::new();
-        rec.async_ctx = Some(("ASYNIO_REC".to_string(), db.async_handle()));
+        rec.async_ctx = Some(("ASYNIO_REC".into(), db.async_handle()));
 
         // Pass 1: submitted off-thread, parked — no inline I/O result.
         let out = rec.process().unwrap();
@@ -10811,7 +10816,7 @@ mod tests {
         rec.iface = InterfaceType::Int32 as i32;
         rec.resolved_reason = 0;
         let db = PvDatabase::new();
-        rec.async_ctx = Some(("ASYNAQR_REC".to_string(), db.async_handle()));
+        rec.async_ctx = Some(("ASYNAQR_REC".into(), db.async_handle()));
 
         // No request in flight yet: AQR is the C `wasQueued==false` no-op.
         rec.special("AQR", true).unwrap();
@@ -10925,7 +10930,7 @@ mod tests {
         let rec_name = "TRACE_IMM_REC";
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.set_async_context(rec_name.to_string(), db.async_handle());
+        rec.set_async_context(rec_name.into(), db.async_handle());
         let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1, "record must connect to the registered port");
         assert_eq!(rec.tmsk, 0, "baseline trace mask is empty");
@@ -12289,7 +12294,7 @@ A.OEOS
         let rec_name = "EXCEPT_CNCT_REC";
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.set_async_context(rec_name.to_string(), db.async_handle());
+        rec.set_async_context(rec_name.into(), db.async_handle());
         let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1, "the port starts connected");
         assert_eq!(rec.enbl, 1, "the port starts enabled");
@@ -12388,7 +12393,7 @@ A.OEOS
         let rec_name = "EXCEPT_CONVERGES_REC";
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.set_async_context(rec_name.to_string(), db.async_handle());
+        rec.set_async_context(rec_name.into(), db.async_handle());
         let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1, "the port starts connected");
         db.add_record(rec_name, Box::new(rec)).await.unwrap();

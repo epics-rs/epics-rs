@@ -30,7 +30,7 @@ async fn a_json_const_scalar_converts_by_its_own_type() {
         .unwrap();
     let got: Vec<_> = ["LI", "QI", "LB", "LS"]
         .iter()
-        .map(|r| (db.get_pv(r).ok(), db.get_pv(&format!("{r}.UDF")).ok()))
+        .map(|r| (db.get_pv(r).ok(), db.get_pv(format!("{r}.UDF")).ok()))
         .collect();
     let udf0 = Some(EpicsValue::UChar(0));
     assert_eq!(

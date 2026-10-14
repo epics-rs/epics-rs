@@ -94,10 +94,10 @@ pub struct LonginRecord {
     // the two-choice NO/YES simulation menu, served as DBR_ENUM.
     #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
-    #[field(type = "String", link)]
-    pub siml: String,
-    #[field(type = "String", link)]
-    pub siol: String,
+    #[field(type = "PvStr", link)]
+    pub siml: PvString,
+    #[field(type = "PvStr", link)]
+    pub siol: PvString,
     // SVAL is `DBF_LONG` (longinRecord.dbd.pod:466-468) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,
     // &prec->sval)`, longinRecord.c:416) before publishing `val = sval`. An
@@ -132,8 +132,8 @@ impl Default for LonginRecord {
             alst: 0,
             mlst: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: 0,
             sims: 0,
             // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means

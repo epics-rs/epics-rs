@@ -34,12 +34,12 @@ async fn the_record_type_declares_which_alarm_wins_the_tie() {
             .await
             .unwrap();
         assert_eq!(
-            db.get_pv(&format!("{rec}.SEVR")).unwrap(),
+            db.get_pv(format!("{rec}.SEVR")).unwrap(),
             EpicsValue::Short(3),
             "{rec}"
         );
         assert_eq!(
-            db.get_pv(&format!("{rec}.STAT")).unwrap(),
+            db.get_pv(format!("{rec}.STAT")).unwrap(),
             EpicsValue::Short(stat as i16),
             "{rec}"
         );

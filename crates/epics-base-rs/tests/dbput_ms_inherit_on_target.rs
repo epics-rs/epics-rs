@@ -38,12 +38,12 @@ const LINK_MAJOR: (u16, u16) = (14, 2);
 const LINK_INVALID: (u16, u16) = (14, 3);
 
 fn alarm(db: &PvDatabase, rec: &str) -> (u16, u16) {
-    let f = |f: &str| db.get_pv(&format!("{rec}.{f}")).unwrap().to_f64().unwrap() as u16;
+    let f = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().to_f64().unwrap() as u16;
     (f("STAT"), f("SEVR"))
 }
 
 fn amsg(db: &PvDatabase, rec: &str) -> String {
-    match db.get_pv(&format!("{rec}.AMSG")).unwrap() {
+    match db.get_pv(format!("{rec}.AMSG")).unwrap() {
         EpicsValue::String(s) => s.as_str_lossy().into_owned(),
         other => panic!("{rec}.AMSG = {other:?}"),
     }

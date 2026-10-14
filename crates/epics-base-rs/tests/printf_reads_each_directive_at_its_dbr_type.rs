@@ -78,10 +78,10 @@ async fn check(rows: &[(&str, &str, &[u8], f64)]) {
         db.process_record_with_links(&rec, &mut visited)
             .await
             .unwrap();
-        let EpicsValue::CharArray(got) = db.get_pv(&format!("{rec}.VAL")).unwrap() else {
+        let EpicsValue::CharArray(got) = db.get_pv(format!("{rec}.VAL")).unwrap() else {
             panic!("{rec}.VAL is not a char array");
         };
-        let got_sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap().to_f64().unwrap();
+        let got_sevr = db.get_pv(format!("{rec}.SEVR")).unwrap().to_f64().unwrap();
         let mut want_val = b"[".to_vec();
         want_val.extend_from_slice(want);
         want_val.extend_from_slice(b"]\0");

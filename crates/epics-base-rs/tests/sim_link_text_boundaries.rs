@@ -34,8 +34,8 @@ async fn put_link(db: &PvDatabase, pv: &str, text: &str) {
 /// the cycle reads SIOL into VAL, raising SIMM_ALARM at SIMS=MINOR.
 async fn add_simulated_ai(db: &PvDatabase, name: &str, siml: &str, siol: &str) {
     let mut ai = AiRecord::new(0.0);
-    ai.siml = siml.to_string();
-    ai.siol = siol.to_string();
+    ai.siml = siml.into();
+    ai.siol = siol.into();
     ai.sims = MINOR;
     db.add_record(name, Box::new(ai)).await.unwrap();
 }
@@ -233,8 +233,8 @@ async fn siol_put_redirects_an_output_write() {
         .await
         .unwrap();
     let mut ao = AoRecord::new(5.0);
-    ao.siml = "SIM_ON".to_string();
-    ao.siol = "TGT_A".to_string();
+    ao.siml = "SIM_ON".into();
+    ao.siol = "TGT_A".into();
     db.add_record("AO_SIM", Box::new(ao)).await.unwrap();
     db.get_record("AO_SIM").unwrap().write().common.udf = 0;
 

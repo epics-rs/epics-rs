@@ -23,7 +23,7 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 fn alarm(db: &PvDatabase, rec: &str) -> (f64, f64, String) {
-    let amsg = match db.get_pv(&format!("{rec}.AMSG")).unwrap() {
+    let amsg = match db.get_pv(format!("{rec}.AMSG")).unwrap() {
         EpicsValue::String(s) => s.as_str_lossy().into_owned(),
         other => panic!("{rec}.AMSG = {other:?}"),
     };

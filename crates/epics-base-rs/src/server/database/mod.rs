@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use crate::server::pv::ProcessVariable;
 use crate::server::record::{Record, RecordCell, RecordInstance};
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, PvString, RecordName};
 
 /// What a `.db` definition carries into the creation sink alongside the record
 /// itself: the `dbCommon` fields `db_loader::apply_fields` could not route to
@@ -97,9 +97,17 @@ impl RecordLoad {
 /// This is the channel-name half of the rule. Link text is split by
 /// [`crate::server::record::DbLink`], which follows C exactly and cuts at the
 /// first `.` before requiring the remainder to be a field identifier.
-pub fn parse_pv_name(name: &str) -> (&str, &str) {
-    match name.rsplit_once('.') {
-        Some((base, field)) => (base, field),
+///
+/// The record half is bytes, as `dbNameToAddr` hashes it. Every field name is
+/// an ASCII identifier, so a field part that is not UTF-8 names none and is
+/// given back as U+FFFD, which no field lookup matches.
+pub fn parse_pv_name<N: AsRef<[u8]> + ?Sized>(name: &N) -> (&[u8], &str) {
+    let name = name.as_ref();
+    match name.iter().rposition(|&b| b == b'.') {
+        Some(dot) => (
+            &name[..dot],
+            std::str::from_utf8(&name[dot + 1..]).unwrap_or("\u{fffd}"),
+        ),
         None => (name, "VAL"),
     }
 }
@@ -171,7 +179,7 @@ mod tsel_stamp {
         #[inline(always)]
         pub(crate) fn stamp(
             self,
-            name: &str,
+            name: &[u8],
             common: &mut CommonFields,
             simm_set: impl FnOnce() -> bool,
         ) {
@@ -186,7 +194,7 @@ mod tsel_stamp {
         pub(crate) fn stamp_begun(
             self,
             _begun: crate::server::record::StampBegun,
-            name: &str,
+            name: &[u8],
             common: &mut CommonFields,
             simm_set: impl FnOnce() -> bool,
         ) {
@@ -234,7 +242,7 @@ mod tsel_stamp {
     /// into `precord->time` and errlogs, so a misconfigured record holds its
     /// stale stamp rather than timestamping as if healthy.
     #[inline]
-    fn apply_timestamp(name: &str, common: &mut CommonFields) {
+    fn apply_timestamp(name: &[u8], common: &mut CommonFields) {
         // `stamp` has taken `TSE == -2` already, so this is `get_time_stamp`'s
         // other arm; the two share `recgbl::event_time` and cannot drift.
         match crate::server::recgbl::event_time(common.tse) {
@@ -254,9 +262,10 @@ mod tsel_stamp {
     }
 
     #[cold]
-    fn tse_failed(name: &str, tse: i16) {
+    fn tse_failed(name: &[u8], tse: i16) {
         crate::runtime::log::errlog_vprintf(format_args!(
-            "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {name}.TSE = {tse}\n"
+            "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {}.TSE = {tse}\n",
+            String::from_utf8_lossy(name)
         ));
     }
 }
@@ -276,7 +285,7 @@ pub enum PvEntry {
 /// it never waits for the wire (`dbCa.c:419-506`). A resolver that cannot
 /// answer from cache must stage the open on its own executor and return
 /// `None` (C's `!pca->isConnected` arm, `dbCa.c:430-435`).
-pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sync>;
+pub type ExternalPvResolver = Arc<dyn Fn(&[u8]) -> Option<EpicsValue> + Send + Sync>;
 
 /// Async hook invoked by [`PvDatabase::has_name`] when a name is not yet
 /// in the database. Used by the CA gateway and similar proxy components
@@ -302,7 +311,7 @@ pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sy
 /// `gateAs::findEntry`.
 pub type SearchResolver = Arc<
     dyn Fn(
-            String,
+            RecordName,
             Option<std::net::SocketAddr>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
@@ -331,7 +340,7 @@ pub type SearchResolver = Arc<
 /// gateway-managed and bypass it.
 pub type ExistenceGate = Arc<
     dyn Fn(
-            String,
+            RecordName,
             Option<std::net::SocketAddr>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
@@ -376,7 +385,7 @@ pub type ExistenceGate = Arc<
 /// honours it.
 #[derive(Clone, Debug)]
 pub struct CpTarget {
-    pub record: String,
+    pub record: RecordName,
     pub passive_only: bool,
 }
 
@@ -400,7 +409,7 @@ pub(crate) fn put_posted_field(field: &str) -> Option<&'static str> {
 /// field it reads if it reads one ([`put_posted_field`]), and CPP's gate.
 #[derive(Clone, Debug)]
 pub(crate) struct CpSource {
-    pub(crate) record: String,
+    pub(crate) record: RecordName,
     pub(crate) put_field: Option<&'static str>,
     pub(crate) passive_only: bool,
 }
@@ -412,24 +421,24 @@ pub(crate) struct CpSource {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CpRegistry {
     /// Edges fired when the source processes.
-    by_source: HashMap<String, Vec<CpTarget>>,
+    by_source: HashMap<RecordName, Vec<CpTarget>>,
     /// Edges fired by a put of their source field.
-    by_put: HashMap<String, Vec<(&'static str, CpTarget)>>,
+    by_put: HashMap<RecordName, Vec<(&'static str, CpTarget)>>,
     /// (holder, link field) → that link's edge.
-    by_link: HashMap<(String, String), CpSource>,
+    by_link: HashMap<(RecordName, String), CpSource>,
     /// The connect pass has run: from here a relink connects its own link.
     connected: bool,
 }
 
 impl CpRegistry {
-    pub(crate) fn targets(&self, source: &str) -> Option<&Vec<CpTarget>> {
+    pub(crate) fn targets(&self, source: &[u8]) -> Option<&Vec<CpTarget>> {
         self.by_source.get(source)
     }
 
     /// The edges a put of `source.field` fires.
     pub(crate) fn put_targets<'a>(
         &'a self,
-        source: &str,
+        source: &[u8],
         field: &'static str,
     ) -> impl Iterator<Item = &'a CpTarget> {
         self.by_put
@@ -440,7 +449,7 @@ impl CpRegistry {
             .map(|(_, t)| t)
     }
 
-    pub(crate) fn sources(&self) -> impl Iterator<Item = &String> {
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &RecordName> {
         self.by_source.keys()
     }
 
@@ -454,10 +463,10 @@ impl CpRegistry {
 
     /// The one writer: the link `field` of `holder` now carries `edge`, or
     /// none.
-    pub(crate) fn set_link(&mut self, holder: &str, field: &str, edge: Option<CpSource>) {
-        let key = (holder.to_string(), field.to_string());
+    pub(crate) fn set_link(&mut self, holder: &[u8], field: &str, edge: Option<CpSource>) {
+        let key = (RecordName::from(holder), field.to_string());
         if let Some(old) = self.by_link.remove(&key) {
-            let is_old = |t: &CpTarget| t.record == holder && t.passive_only == old.passive_only;
+            let is_old = |t: &CpTarget| *t.record == *holder && t.passive_only == old.passive_only;
             match old.put_field {
                 None => {
                     if let Some(edges) = self.by_source.get_mut(&old.record) {
@@ -485,7 +494,7 @@ impl CpRegistry {
         }
         if let Some(edge) = edge {
             let target = CpTarget {
-                record: holder.to_string(),
+                record: key.0.clone(),
                 passive_only: edge.passive_only,
             };
             match edge.put_field {
@@ -505,19 +514,19 @@ impl CpRegistry {
     }
 
     /// Every edge `name` holds or sources.
-    pub(crate) fn remove_record(&mut self, name: &str) {
+    pub(crate) fn remove_record(&mut self, name: &[u8]) {
         self.by_source.remove(name);
         self.by_put.remove(name);
         for edges in self.by_source.values_mut() {
-            edges.retain(|e| e.record != name);
+            edges.retain(|e| *e.record != *name);
         }
         for edges in self.by_put.values_mut() {
-            edges.retain(|(_, e)| e.record != name);
+            edges.retain(|(_, e)| *e.record != *name);
         }
         self.by_source.retain(|_, edges| !edges.is_empty());
         self.by_put.retain(|_, edges| !edges.is_empty());
         self.by_link
-            .retain(|(holder, _), edge| holder != name && edge.record != name);
+            .retain(|(holder, _), edge| **holder != *name && *edge.record != *name);
     }
 }
 
@@ -575,15 +584,16 @@ struct ScanKey {
     /// An `Arc` and not a `String` because the cursor hands this name out once
     /// per record per scan cycle, and a `String` there made every sweep
     /// allocate — twice, since the cursor step clones the key as well.
-    /// `Ord` on `Arc<str>` is `str`'s, so the sort rule above is unchanged.
-    name: Arc<str>,
+    /// `Ord` on the bytes is `str`'s on a UTF-8 name, so the sort rule above
+    /// is unchanged.
+    name: RecordName,
     /// The instance `name` resolves to — see the type doc. `None` only for a
     /// key built before its record was registered, or for a lookup key.
     handle: Option<Arc<RecordCell>>,
 }
 
 impl ScanKey {
-    fn sort_fields(&self) -> (i16, &'static str, u64, &str) {
+    fn sort_fields(&self) -> (i16, &'static str, u64, &[u8]) {
         (self.phas, self.record_type, self.load_order, &self.name)
     }
 }
@@ -627,14 +637,14 @@ impl ScanKey {
         phas: i16,
         record_type: &'static str,
         load_order: u64,
-        name: &str,
+        name: impl Into<RecordName>,
         handle: Option<Arc<RecordCell>>,
     ) -> Self {
         Self {
             phas,
             record_type,
             load_order,
-            name: Arc::from(name),
+            name: name.into(),
             handle,
         }
     }
@@ -665,7 +675,7 @@ impl ScanKey {
 /// two facts — what it points at, where it was declared — are this struct.
 struct AliasNode {
     /// The canonical record name the alias resolves to.
-    target: String,
+    target: RecordName,
     /// Load sequence, from the same counter as [`RecordCell::load_order`].
     order: u64,
 }
@@ -674,9 +684,9 @@ struct AliasNode {
 pub struct DbNode {
     /// The name this node is reached by — an alias node carries the ALIAS
     /// name, which is what C prints from `dbGetRecordName`.
-    pub name: String,
+    pub name: RecordName,
     /// The record an alias node stands for, or `None` for a record node.
-    pub alias_of: Option<String>,
+    pub alias_of: Option<RecordName>,
 }
 
 struct PvDatabaseInner {
@@ -697,7 +707,7 @@ struct PvDatabaseInner {
     /// the ones that await today, so a new `.await` in an existing body cannot
     /// re-open it.
     simple_pvs:
-        crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
+        crate::runtime::sync::PriorityInheritanceMutex<HashMap<RecordName, Arc<ProcessVariable>>>,
     /// Moved by every `simple_pvs` insert and remove, after it, through
     /// [`PvDatabase::insert_simple_pv`] / [`PvDatabase::take_simple_pv`]: a
     /// simple PV spelled `REC.FLD` shadows that field, so a cached link
@@ -718,7 +728,7 @@ struct PvDatabaseInner {
     /// chain — the cycle guard, the scan key, the lock-set lookup — carries a
     /// share of it rather than a copy. A name-keyed map that owned `String`s
     /// made a scan step allocate the name of every record it touched.
-    records: RecursiveReadLock<HashMap<Arc<str>, Arc<RecordCell>>>,
+    records: RecursiveReadLock<HashMap<RecordName, Arc<RecordCell>>>,
     /// Every record registered, by [`RecordIdx`]: where a resolved forward
     /// link finds its target without the name map or a count.
     record_table: record_table::RecordTable,
@@ -782,7 +792,7 @@ struct PvDatabaseInner {
     /// epics-base PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
-    aliases: RecursiveReadLock<HashMap<String, AliasNode>>,
+    aliases: RecursiveReadLock<HashMap<RecordName, AliasNode>>,
     /// Single gate that serializes
     /// every `add_pv` / `add_pv_with_hook` / `add_record` /
     /// `add_alias` / `remove_record` / `remove_simple_pv` /
@@ -829,7 +839,7 @@ struct PvDatabaseInner {
     /// released by [`PvDatabase::add_loaded_record`] the moment that name lands
     /// in `records`, which is what makes "the init observes a registered
     /// record" hold by construction rather than by scheduler timing.
-    record_init_waiting: std::sync::Mutex<HashMap<String, Vec<RecordInit>>>,
+    record_init_waiting: std::sync::Mutex<HashMap<RecordName, Vec<RecordInit>>>,
     /// Records whose device-support binding and `init_record` passes are OWED
     /// to [`PvDatabase::ioc_init`] because they were created during the LOAD
     /// phase — C's `dbLoadRecords` links a record into `pdbbase` at once but
@@ -849,12 +859,12 @@ struct PvDatabaseInner {
     /// empty assignments here makes the distinction exact rather than
     /// approximate. Consumed and cleared by
     /// [`PvDatabase::db_init_record_links`], the way C frees the text.
-    empty_link_assignments: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    empty_link_assignments: std::sync::Mutex<HashMap<RecordName, Vec<String>>>,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
     /// commands run with the database in its post-init state.
-    after_ioc_running: std::sync::Mutex<Vec<String>>,
+    after_ioc_running: std::sync::Mutex<Vec<Vec<u8>>>,
     /// Optional resolver for external PVs (ca://, pva:// links).
     ///
     /// Whole-value replace: the only writer stores a complete new value
@@ -1879,7 +1889,7 @@ impl PvDatabase {
     /// [`Self::find_entry_from`] and [`Self::has_name_from`] so the
     /// "cached simple PV ⇒ exists" short-circuit is closed uniformly on
     /// both the create and search paths.
-    async fn simple_pv_gate_denies(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
+    async fn simple_pv_gate_denies(&self, name: &[u8], peer: Option<std::net::SocketAddr>) -> bool {
         let Some(gate) = self.inner.existence_gate.load_full() else {
             return false;
         };
@@ -1887,14 +1897,10 @@ impl PvDatabase {
         // Strip the channel-filter suffix exactly as the lookups do
         // (CA-FR-8) so the gate sees the same record-path key the
         // simple-PV map and the gateway cache are keyed on.
-        let record_path = filters::split_channel_name(name).record_path;
+        let record_path = RecordName::from(filters::split_channel_name(name).record_path);
         // Own statement: the `!Send` guard must be down before the gate's
         // `.await` below (see the `simple_pvs` field doc).
-        let known = self
-            .inner
-            .simple_pvs
-            .lock()
-            .contains_key(record_path.as_str());
+        let known = self.inner.simple_pvs.lock().contains_key(&record_path);
         if !known {
             return false;
         }
@@ -2093,14 +2099,14 @@ impl PvDatabase {
     /// (e.g. areaDetector's `ShutterStatusEPICS_RBV.INP = "test CP MS"`
     /// placeholder) and every `pva://` link connect asynchronously and are
     /// never held by iocInit, like C.
-    async fn external_link_targets(&self) -> Vec<(link_set::DynLinkSet, String)> {
+    async fn external_link_targets(&self) -> Vec<(link_set::DynLinkSet, RecordName)> {
         // Only the CA facility participates — look it up directly rather
         // than iterating every registered scheme. `has_name_no_resolve`
         // is the `dbChannelTest` twin (target is a local record).
         let Some(ca_lset) = self.inner.link_sets.load().get("ca") else {
             return Vec::new();
         };
-        let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
+        let mut targets: Vec<(link_set::DynLinkSet, RecordName)> = Vec::new();
         for n in ca_lset.link_names() {
             if self.has_name_no_resolve(&n) {
                 targets.push((ca_lset.clone(), n));
@@ -2116,7 +2122,7 @@ impl PvDatabase {
     /// "M/N connected" diagnostic can name the `N-M` it proceeded
     /// without, instead of leaving the operator to run `dbcar`.
     /// `pva://` links are not in this set — they never block iocInit.
-    pub async fn unconnected_external_links(&self) -> Vec<String> {
+    pub async fn unconnected_external_links(&self) -> Vec<RecordName> {
         let mut names = Vec::new();
         for (lset, name) in self.external_link_targets().await {
             // Same predicate as the wait loop, so the M/N accounting and
@@ -2153,11 +2159,11 @@ impl PvDatabase {
     /// `.db` spelled it or not (`dbStaticLib.c:2185-2212`).
     fn link_field_texts(
         inst: &RecordInstance,
-    ) -> Vec<(String, String, crate::server::record::LinkFieldType)> {
+    ) -> Vec<(String, PvString, crate::server::record::LinkFieldType)> {
         use crate::server::record::LinkFieldType;
         use crate::types::DbfLinkClass;
         let record_type = inst.record.record_type();
-        let mut out: Vec<(String, String, LinkFieldType)> = Vec::new();
+        let mut out: Vec<(String, PvString, LinkFieldType)> = Vec::new();
         // `dbCommon` first, then the record's own, which is C's `papFldDes`
         // order; a record type that redeclares a `dbCommon` field keeps the
         // first entry, since that is the one `declared_field` resolves.
@@ -2177,10 +2183,10 @@ impl PvDatabase {
             // A link the type leaves to the framework (mca's SIML/SIOL) keeps
             // its text on the instance, not the rset: `link_text` reads both.
             let raw = match inst.common_link_text(desc.name) {
-                Some(raw) => raw.to_string(),
+                Some(raw) => raw.into(),
                 None => match inst.link_text(desc.name) {
                     Some(text) => text,
-                    None if inst.record.get_field(desc.name).is_some() => String::new(),
+                    None if inst.record.get_field(desc.name).is_some() => PvString::new(),
                     // Declared but held by no owner — a downstream type whose
                     // generated table outruns its `get_field`. C would have
                     // the `dbFldDes` and an empty link; the port has no text
@@ -2221,8 +2227,9 @@ impl PvDatabase {
     /// Returns an empty Vec when the record doesn't exist.
     pub fn record_link_fields(
         &self,
-        record_name: &str,
-    ) -> Vec<(String, String, crate::server::record::ParsedLink)> {
+        record_name: impl AsRef<[u8]>,
+    ) -> Vec<(String, PvString, crate::server::record::ParsedLink)> {
+        let record_name = record_name.as_ref();
         let rec = match self.get_record(record_name) {
             Some(r) => r,
             None => return Vec::new(),
@@ -2230,7 +2237,7 @@ impl PvDatabase {
         // The texts leave the hold before any is parsed.
         let texts = Self::link_field_texts(&rec.read());
         let (mut out, ftypes): (
-            Vec<(String, String, crate::server::record::ParsedLink)>,
+            Vec<(String, PvString, crate::server::record::ParsedLink)>,
             Vec<_>,
         ) = texts
             .into_iter()
@@ -2280,7 +2287,7 @@ impl PvDatabase {
     /// C's open happens at record init rather than at
     /// first read, but in both designs the connect runs on the link task and
     /// the reading record takes LINK/INVALID until the cache is warm.
-    pub(crate) fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
+    pub(crate) fn resolve_external_pv(&self, name: &[u8]) -> Option<EpicsValue> {
         // Try lsets first. We accept both "scheme://body" and the
         // bare body (stored in ParsedLink::Pva/Ca after the
         // dispatch in record/link.rs). `Any` tries every registered
@@ -2314,10 +2321,10 @@ impl PvDatabase {
     /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
     /// the same [`link_put_queue::LinkKey`] from the same link, or the
     /// queue's once-per-link open would fire twice under two spellings.
-    fn split_external_link_name(name: &str) -> (link_put_queue::LinkTarget, &str) {
-        if let Some(rest) = name.strip_prefix("pva://") {
+    fn split_external_link_name(name: &[u8]) -> (link_put_queue::LinkTarget, &[u8]) {
+        if let Some(rest) = name.strip_prefix(b"pva://") {
             (link_put_queue::LinkTarget::Scheme("pva".to_string()), rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
+        } else if let Some(rest) = name.strip_prefix(b"ca://") {
             (link_put_queue::LinkTarget::Scheme("ca".to_string()), rest)
         } else {
             (link_put_queue::LinkTarget::Any, name)
@@ -2333,7 +2340,7 @@ impl PvDatabase {
     /// an empty lset list and marked `Done`, burning the link's one and
     /// only connect. Returns true when this call is the one that staged
     /// it (false when already staged, or when no lset addresses it).
-    pub(crate) fn stage_external_link_open_by_name(&self, name: &str) -> bool {
+    pub(crate) fn stage_external_link_open_by_name(&self, name: &[u8]) -> bool {
         let (target, body) = Self::split_external_link_name(name);
         if link_put_queue::resolve_lsets(&self.inner, &target).is_empty() {
             return false;
@@ -2357,13 +2364,13 @@ impl PvDatabase {
     /// one queue entry per `(scheme, PV name)`, so both fields report the
     /// shared count — the same aliasing `LinkSet` already applies to the
     /// link's cache and connection state.
-    pub fn external_link_puts_coalesced_for(&self, link_name: &str) -> u64 {
-        let (target, body) = Self::split_external_link_name(link_name);
+    pub fn external_link_puts_coalesced_for(&self, link_name: impl AsRef<[u8]>) -> u64 {
+        let (target, body) = Self::split_external_link_name(link_name.as_ref());
         self.inner
             .link_puts
             .coalesced_for(&link_put_queue::LinkKey {
                 target,
-                name: body.to_string(),
+                name: body.into(),
             })
     }
 
@@ -2404,7 +2411,7 @@ impl PvDatabase {
     /// Private to the `database` module, and reached only through
     /// [`Self::stage_external_link_open_by_name`], so no caller can skip the
     /// scheme split or the lset gate and mint a `LinkKey` of its own shape.
-    fn stage_external_link_open(&self, target: link_put_queue::LinkTarget, name: &str) -> bool {
+    fn stage_external_link_open(&self, target: link_put_queue::LinkTarget, name: &[u8]) -> bool {
         // Nothing is staged that no owner can perform. A database built with
         // no tokio runtime captured no reactor, and `connect_link` has nowhere
         // to run (see `LinkPutQueue::network`) — so refuse here rather than
@@ -2420,7 +2427,7 @@ impl PvDatabase {
             .ensure_owner(std::sync::Arc::downgrade(&self.inner));
         self.inner.link_puts.stage_open(link_put_queue::LinkKey {
             target,
-            name: name.to_string(),
+            name: name.into(),
         })
     }
 
@@ -2442,14 +2449,14 @@ impl PvDatabase {
     /// cross-namespace check is atomic with the insert and the lock
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
-    fn insert_simple_pv(&self, name: String, pv: Arc<ProcessVariable>) {
+    fn insert_simple_pv(&self, name: RecordName, pv: Arc<ProcessVariable>) {
         self.inner.simple_pvs.lock().insert(name, pv);
         self.inner
             .simple_pvs_revision
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    fn take_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
+    fn take_simple_pv(&self, name: &[u8]) -> Option<Arc<ProcessVariable>> {
         let removed = self.inner.simple_pvs.lock().remove(name);
         self.inner
             .simple_pvs_revision
@@ -2463,11 +2470,12 @@ impl PvDatabase {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
+    pub async fn add_pv(&self, name: impl AsRef<[u8]>, initial: EpicsValue) -> CaResult<()> {
         let _gate = self.lock_registration("add_pv");
-        self.check_name_free(name)?;
-        let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.insert_simple_pv(name.to_string(), pv);
+        let name = RecordName::from(name.as_ref());
+        self.check_name_free(&name)?;
+        let pv = Arc::new(ProcessVariable::new(name.clone(), initial));
+        self.insert_simple_pv(name, pv);
         Ok(())
     }
 
@@ -2484,7 +2492,7 @@ impl PvDatabase {
     /// Returns `Err` on duplicate name (see [`Self::add_pv`]).
     pub async fn add_pv_with_hook(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         initial: EpicsValue,
         hook: crate::server::pv::WriteHook,
     ) -> CaResult<()> {
@@ -2499,7 +2507,7 @@ impl PvDatabase {
     /// cannot observe the PV without its access hook bound.
     pub async fn add_pv_with_hooks(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         initial: EpicsValue,
         write_hook: crate::server::pv::WriteHook,
         access_hook: Option<crate::server::pv::AccessHook>,
@@ -2519,15 +2527,16 @@ impl PvDatabase {
     /// None` is identical to [`Self::add_pv_with_hooks`].
     pub async fn add_pv_with_hooks_full(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         initial: EpicsValue,
         write_hook: crate::server::pv::WriteHook,
         access_hook: Option<crate::server::pv::AccessHook>,
         read_hook: Option<crate::server::pv::ReadHook>,
     ) -> CaResult<()> {
         let _gate = self.lock_registration("add_pv_with_hooks_full");
-        self.check_name_free(name)?;
-        let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
+        let name = RecordName::from(name.as_ref());
+        self.check_name_free(&name)?;
+        let pv = Arc::new(ProcessVariable::new(name.clone(), initial));
         pv.set_write_hook(write_hook);
         if let Some(access) = access_hook {
             pv.set_access_hook(access);
@@ -2535,7 +2544,7 @@ impl PvDatabase {
         if let Some(read) = read_hook {
             pv.set_read_hook(read);
         }
-        self.insert_simple_pv(name.to_string(), pv);
+        self.insert_simple_pv(name, pv);
         Ok(())
     }
 
@@ -2548,7 +2557,8 @@ impl PvDatabase {
     /// (otherwise a re-add of the same alias name would fail with
     /// "already registered as an alias" even though its target is
     /// gone).
-    pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
+    pub async fn remove_simple_pv(&self, name: impl AsRef<[u8]>) -> Option<Arc<ProcessVariable>> {
+        let name = name.as_ref();
         let _gate = self.lock_registration("remove_simple_pv");
         // Simple PVs cannot be alias targets (aliases point at
         // records), but a stale alias whose name MATCHES this PV
@@ -2576,7 +2586,7 @@ impl PvDatabase {
     /// every call site.
     pub async fn add_simple_pv(&self, pv: ProcessVariable) -> CaResult<()> {
         let _gate = self.lock_registration("add_simple_pv");
-        self.check_name_free(&pv.name)?;
+        self.check_name_free(pv.name.as_bytes())?;
         let name = pv.name.clone();
         self.insert_simple_pv(name, Arc::new(pv));
         Ok(())
@@ -2687,7 +2697,7 @@ impl PvDatabase {
     /// same code path on every backend.
     pub(crate) fn schedule_record_init(
         &self,
-        record: &str,
+        record: &[u8],
         init: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
         if !self.inner.records.read().contains_key(record) {
@@ -2695,7 +2705,7 @@ impl PvDatabase {
                 .record_init_waiting
                 .lock()
                 .unwrap()
-                .entry(record.to_string())
+                .entry(RecordName::from(record))
                 .or_default()
                 .push(Box::pin(init));
             return;
@@ -2724,7 +2734,7 @@ impl PvDatabase {
 
     /// Release every init parked for `record` — called by the one site that
     /// registers the name, immediately after the insert that makes it real.
-    fn release_record_inits(&self, record: &str) {
+    fn release_record_inits(&self, record: &[u8]) {
         let parked = self
             .inner
             .record_init_waiting
@@ -2893,9 +2903,13 @@ impl PvDatabase {
                     || assigned_empty.is_some_and(|fields| fields.iter().any(|f| f == &field));
                 let mut refused = false;
                 if assigned {
-                    if let Some(line) =
-                        link_type_refusal(&name, &record_type, Some(&dtyp), &field, &text)
-                    {
+                    if let Some(line) = link_type_refusal(
+                        &name.to_str_lossy(),
+                        &record_type,
+                        Some(&dtyp),
+                        &field,
+                        &text,
+                    ) {
                         eprintln!("{ERL_ERROR}: {line}");
                         refused = true;
                     }
@@ -2935,7 +2949,7 @@ impl PvDatabase {
     ///
     /// Returns the work the field's `special()` left for after the hold.
     fn set_link_text(
-        name: &str,
+        name: &[u8],
         rec: &RecordCell,
         field: &str,
         text: &str,
@@ -3043,7 +3057,7 @@ impl PvDatabase {
         record: &Arc<RecordCell>,
         field: &str,
         string_view: bool,
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<RecordName>,
     ) -> Option<crate::server::snapshot::Snapshot> {
         // 1. Under a short read lock: is this field link-backed at all, and if
         //    so what does its link field currently say. Nothing is resolved
@@ -3173,7 +3187,11 @@ impl PvDatabase {
     /// under the same `registration_mutex` hold, eliminating the
     /// TOCTOU window where `remove_record` could land between them
     /// and leave a phantom scan entry.
-    pub async fn add_record(&self, name: &str, record: Box<dyn Record>) -> CaResult<()> {
+    pub async fn add_record(
+        &self,
+        name: impl AsRef<[u8]>,
+        record: Box<dyn Record>,
+    ) -> CaResult<()> {
         self.add_loaded_record(name, record, RecordLoad::default())
             .await
     }
@@ -3199,20 +3217,21 @@ impl PvDatabase {
     /// crate-private for the same reason — the sink is the only caller.
     pub async fn add_loaded_record(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
+        let name = RecordName::from(name.as_ref());
         // A record created after `iocInit` needs a lock set, and its links —
         // in both directions — may merge it into existing ones. `None` while
         // the database is still loading, which is every ordinary
         // `dbLoadRecords`: `build_lock_sets` builds the whole graph at
         // `iocInit` instead. Declared ABOVE the gate: the relink takes lock
         // sets, which sit above L46, so it must run once the gate is down.
-        let _relink = self.lock_set_membership_change(name);
+        let _relink = self.lock_set_membership_change(&name);
         let gate = self.lock_registration("add_loaded_record");
-        self.check_name_free(name)?;
-        let mut instance = RecordInstance::new_boxed(name.to_string(), record);
+        self.check_name_free(&name)?;
+        let mut instance = RecordInstance::new_boxed(name.clone(), record);
         links::check_record_links(&instance)?;
         // Hand the record a cycle-free handle to its own database so it can
         // post out-of-band field updates / wire completion-driven re-entry
@@ -3223,7 +3242,7 @@ impl PvDatabase {
         // do not need it.
         instance
             .record
-            .set_async_context(name.to_string(), self.async_handle());
+            .set_async_context(name.clone(), self.async_handle());
 
         // Hand the record the current breakpoint-table registry snapshot so a
         // LINR>=3 ai/ao record can resolve its table lazily at convert time.
@@ -3272,16 +3291,14 @@ impl PvDatabase {
         let mut entry = crate::server::db_loader::EntryMessage::default();
         for (field, value) in load.common_fields {
             if let crate::types::EpicsValue::String(text) = &value {
-                if text.as_str_lossy().is_empty()
-                    && instance.common_link_text(&field.to_uppercase()).is_some()
-                {
+                if text.is_empty() && instance.common_link_text(&field.to_uppercase()).is_some() {
                     empty_links.push(field.to_uppercase());
                 }
             }
             if let crate::types::EpicsValue::String(text) = &value {
                 if let Some(refusal) = crate::server::db_loader::menu_value_refusal(
                     instance.record.record_type(),
-                    name,
+                    &name.to_str_lossy(),
                     &field,
                     &text.as_str_lossy(),
                 ) {
@@ -3332,7 +3349,7 @@ impl PvDatabase {
                 .empty_link_assignments
                 .lock()
                 .unwrap()
-                .insert(name.to_string(), empty_links);
+                .insert(name.clone(), empty_links);
         }
 
         // C `doInitRecord0` (`iocInit.c:530-536`) binds the dset and only then
@@ -3358,7 +3375,7 @@ impl PvDatabase {
         if !defer {
             crate::server::ioc_app::attach_device_support(
                 &mut instance,
-                name,
+                &name.to_str_lossy(),
                 self.inner.device_support_resolver.load().as_deref(),
             );
             // C `registryFunctionFind` reads a process-global registry from
@@ -3369,7 +3386,7 @@ impl PvDatabase {
             instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
             // No `add_record` channel: resolving INP's target here would take
             // a record lock under L46.
-            instance.run_init_passes(name, None);
+            instance.run_init_passes(&name.to_str_lossy(), None);
 
             // The init-seed owner: every CONSTANT link the record declares
             // (`Record::constant_init_links`) is loaded into its value field
@@ -3401,15 +3418,15 @@ impl PvDatabase {
         // C `createLockRecord` allocates the `lockRecord` INTO the record:
         // the registry's answer for this name is this record's own cell,
         // adopted before the record is reachable by anyone.
-        self.inner.record_locks.adopt(name, rec_arc.lock_record());
+        self.inner.record_locks.adopt(&name, rec_arc.lock_record());
         self.inner
             .records
             .write()
-            .insert(Arc::from(name), rec_arc.clone());
+            .insert(name.clone(), rec_arc.clone());
         // The record is reachable from this line on, so anything its
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
-        self.release_record_inits(name);
+        self.release_record_inits(&name);
 
         if defer {
             // The dset binding, init passes, scan-index insert and the
@@ -3420,7 +3437,7 @@ impl PvDatabase {
             return Ok(());
         }
 
-        self.add_to_scan_list(scan, phas, record_type, seq, name);
+        self.add_to_scan_list(scan, phas, record_type, seq, &name);
 
         // Registration is complete and the name is published, so the gate has
         // nothing left to serialize. It is released HERE, before the tail
@@ -3445,7 +3462,7 @@ impl PvDatabase {
         // the gate is also what C does: `iterateRecords` is a separate pass
         // over an already-built database, holding no registration lock.
         self.rec_gbl_init_simm(&rec_arc);
-        self.arm_watchdog(name);
+        self.arm_watchdog(&name);
         // A record added after `iocInit` initialises its own forward links;
         // one added before is swept by the barrier.
         if self.ioc_is_running() {
@@ -3484,9 +3501,13 @@ impl PvDatabase {
             .map(|(name, rec_arc)| {
                 let mut guard = rec_arc.write();
                 let instance = &mut *guard;
-                crate::server::ioc_app::attach_device_support(instance, &name, resolver.as_deref());
+                crate::server::ioc_app::attach_device_support(
+                    instance,
+                    &name.to_str_lossy(),
+                    resolver.as_deref(),
+                );
                 instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-                let reached = instance.run_init_pass0(&name);
+                let reached = instance.run_init_pass0(&name.to_str_lossy());
                 // The load has moved the type selectors since the cell was
                 // built, and an `add_record` below may ask this record's `$`.
                 rec_arc.settle_string_typed(instance);
@@ -3500,7 +3521,9 @@ impl PvDatabase {
                     crate::server::builtin_devices::soft_callback::add_record_input_of(
                         self, rec_arc, None,
                     );
-                rec_arc.write().run_add_record(name, add_record_input);
+                rec_arc
+                    .write()
+                    .run_add_record(&name.to_str_lossy(), add_record_input);
             }
         }
         for (name, rec_arc, reached) in &owed {
@@ -3513,7 +3536,7 @@ impl PvDatabase {
     /// merge arm of the iocsh loader uses this to tell a record it must init in
     /// place (created before the load, already live) from one the barrier will
     /// init against the final merged fields.
-    pub(crate) fn record_init_deferred(&self, name: &str) -> bool {
+    pub(crate) fn record_init_deferred(&self, name: &[u8]) -> bool {
         self.get_record(name).is_some_and(|rec| rec.init_owed())
     }
 
@@ -3535,7 +3558,7 @@ impl PvDatabase {
     /// `recGblInitSimm` reaches `update_scan_index`, which takes the gate
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
-    fn init_deferred_record(&self, name: &str, rec_arc: &Arc<RecordCell>, reached: bool) {
+    fn init_deferred_record(&self, name: &RecordName, rec_arc: &Arc<RecordCell>, reached: bool) {
         let init_reads = if reached {
             self.read_init_links(rec_arc)
         } else {
@@ -3550,7 +3573,7 @@ impl PvDatabase {
                         eprintln!("init link read into {name}.{field} failed: {e}");
                     }
                 }
-                instance.run_init_pass1(name);
+                instance.run_init_pass1(&name.to_str_lossy());
             }
             super::database::processing::seed_constant_links(instance);
             rec_arc.settle_string_typed(instance);
@@ -3608,8 +3631,8 @@ impl PvDatabase {
     /// makes no suspension point inside the `registration_mutex` hold — which
     /// is what lets that gate become a `PriorityInheritanceMutex` whose `!Send`
     /// guard may not cross an `.await`.
-    fn check_name_free(&self, name: &str) -> CaResult<()> {
-        let kind = if self.inner.simple_pvs.lock().contains_key(name) {
+    fn check_name_free(&self, name: &[u8]) -> CaResult<()> {
+        let kind = if self.simple_pv_named(name) {
             Some("simple PV")
         } else if self.inner.records.read().contains_key(name) {
             Some("record")
@@ -3622,7 +3645,10 @@ impl PvDatabase {
             return Err(CaError::DbParseError {
                 line: 0,
                 token: String::new(),
-                message: format!("name '{name}' is already registered as a {kind}"),
+                message: format!(
+                    "name '{}' is already registered as a {kind}",
+                    String::from_utf8_lossy(name)
+                ),
             });
         }
         Ok(())
@@ -3638,7 +3664,8 @@ impl PvDatabase {
     /// Live subscribers on the removed record drop their `Sender` clone
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
-    pub async fn remove_record(&self, name: &str) -> bool {
+    pub async fn remove_record(&self, name: impl AsRef<[u8]>) -> bool {
+        let name = name.as_ref();
         // C `dbDeleteRecord` frees the record's `lockRecord`, so the set it
         // was in loses a member and may fall apart into several. Declared
         // first so it drops last: the relink runs once the record is out of
@@ -3662,7 +3689,7 @@ impl PvDatabase {
     /// [`Self::remove_record`] under its gates: the entry out of every map
     /// and index, the record destroyed. The removed cell, for the sweep the
     /// caller runs once the gates are down.
-    fn remove_record_entry(&self, name: &str) -> Option<Arc<RecordCell>> {
+    fn remove_record_entry(&self, name: &[u8]) -> Option<Arc<RecordCell>> {
         // The record's data — its SCAN for the index sweep, `destroy()` at
         // the end — is behind its lock set, which is taken ABOVE L46 in the
         // acquisition order. So the set is taken first, off the handle, and
@@ -3701,7 +3728,7 @@ impl PvDatabase {
         self.inner
             .aliases
             .write()
-            .retain(|_alias, node| node.target != name);
+            .retain(|_alias, node| *node.target != *name);
 
         self.destroy_record(&rec_arc, name);
         Some(rec_arc)
@@ -3715,7 +3742,7 @@ impl PvDatabase {
     /// Same rule as `remove_simple_pv`: removal IS destruction. The cell
     /// outlives the map entry, so without the mark a downstream monitor or a
     /// bound forward would keep serving a record the database no longer has.
-    fn destroy_record(&self, rec: &RecordCell, name: &str) {
+    fn destroy_record(&self, rec: &RecordCell, name: &[u8]) {
         let scan = rec.read().common.scan;
         self.delete_from_scan_list(scan, name);
         rec.write().destroy();
@@ -3723,7 +3750,7 @@ impl PvDatabase {
     }
 
     /// Internal: synchronous lookup without invoking the search resolver.
-    async fn find_entry_no_resolve(&self, name: &str) -> Option<PvEntry> {
+    async fn find_entry_no_resolve(&self, name: &[u8]) -> Option<PvEntry> {
         // a channel name may carry a `.{"arr":...}` filter
         // suffix. Strip it before lookup — the suffix is a per-channel
         // filter spec, not part of the PV identity. `split_channel_name`
@@ -3741,7 +3768,7 @@ impl PvDatabase {
             .inner
             .simple_pvs
             .lock()
-            .get(record_path.as_str())
+            .get(record_path.as_slice())
             .cloned();
         if let Some(pv) = simple {
             return Some(PvEntry::Simple(pv));
@@ -3753,7 +3780,7 @@ impl PvDatabase {
         // to a canonical record name. Look up the real record after
         // translating the base.
         if let Some(target) = self.alias_target(base) {
-            if let Some(rec) = self.inner.records.read().get(target.as_str()) {
+            if let Some(rec) = self.inner.records.read().get(&*target) {
                 return Some(PvEntry::Record(rec.clone()));
             }
         }
@@ -3772,7 +3799,12 @@ impl PvDatabase {
     /// simple PV or the alias-mapped record depending on lookup
     /// order. Now we run the same cross-namespace `check_name_free`
     /// guard the other add_* paths use.
-    pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
+    pub async fn add_alias(
+        &self,
+        alias: impl AsRef<[u8]>,
+        target: impl AsRef<[u8]>,
+    ) -> CaResult<()> {
+        let (alias, target) = (alias.as_ref(), target.as_ref());
         // A link naming `alias` resolved to nothing until now, so the alias
         // can turn a dangling link into a real edge and merge two sets.
         // Declared above the gate so the relink, which takes lock sets, runs
@@ -3781,7 +3813,8 @@ impl PvDatabase {
         let _gate = self.lock_registration("add_alias");
         if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
-                "alias target '{target}' is not a registered record"
+                "alias target '{}' is not a registered record",
+                String::from_utf8_lossy(target)
             )));
         }
         self.check_name_free(alias)?;
@@ -3795,9 +3828,9 @@ impl PvDatabase {
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.aliases.write().insert(
-            alias.to_string(),
+            RecordName::from(alias),
             AliasNode {
-                target: target.to_string(),
+                target: RecordName::from(target),
                 order,
             },
         );
@@ -3854,13 +3887,13 @@ impl PvDatabase {
 
     /// Resolve an alias to its target record name, or `None` when the
     /// name is not an alias.
-    pub fn resolve_alias(&self, name: &str) -> Option<String> {
-        self.alias_target(name)
+    pub fn resolve_alias(&self, name: impl AsRef<[u8]>) -> Option<RecordName> {
+        self.alias_target(name.as_ref())
     }
 
     /// The record name the alias node `name` points at, or `None` when the
     /// name is not an alias. The one reader of an alias node's target.
-    fn alias_target(&self, name: &str) -> Option<String> {
+    fn alias_target(&self, name: &[u8]) -> Option<RecordName> {
         self.inner
             .aliases
             .read()
@@ -3872,7 +3905,7 @@ impl PvDatabase {
     /// Mirrors epics-base PR #558 — `afterIocRunning <command>` lets
     /// the startup script schedule actions that run after iocInit
     /// completes (when the record set is fully wired up).
-    pub fn queue_after_ioc_running(&self, line: impl Into<String>) {
+    pub fn queue_after_ioc_running(&self, line: impl Into<Vec<u8>>) {
         self.inner
             .after_ioc_running
             .lock()
@@ -3882,7 +3915,7 @@ impl PvDatabase {
 
     /// Drain the post-PINI iocsh command queue. Called by
     /// `IocApplication::run` after PINI processing.
-    pub fn take_after_ioc_running(&self) -> Vec<String> {
+    pub fn take_after_ioc_running(&self) -> Vec<Vec<u8>> {
         std::mem::take(&mut *self.inner.after_ioc_running.lock().unwrap())
     }
 
@@ -3890,15 +3923,12 @@ impl PvDatabase {
     /// local record that names `field`. Otherwise `dbInitLink` falls through
     /// to CA (`dbLink.c:128`), `SRC.desc` and `SRC.NOSUCH` alike. Registry
     /// facts only, as the holder may be held while this is asked.
-    pub(crate) fn has_db_link_target(&self, record: &str, field: &str) -> bool {
-        if self.inner.simple_pvs.lock().contains_key(record) {
+    pub(crate) fn has_db_link_target(&self, record: &[u8], field: &str) -> bool {
+        if self.simple_pv_named(record) {
             return true;
         }
-        let rec = self.inner.records.read().get(record).cloned().or_else(|| {
-            let target = self.alias_target(record);
-            target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
-        });
-        rec.is_some_and(|rec| self.names_field(&rec, field))
+        self.record_or_alias(record)
+            .is_some_and(|rec| self.names_field(&rec, field))
     }
 
     /// `dbChannelCreate`'s field half for `rec`: `pvNameLookup` finds `field`
@@ -3937,57 +3967,59 @@ impl PvDatabase {
     /// first `.`, then the field name's identifier prefix
     /// (`dbStaticLib.c:1800-1802`); what follows is not read, so
     /// `R.VAL$garbage` is found and refused at create.
-    fn has_name_no_resolve(&self, name: &str) -> bool {
+    fn has_name_no_resolve(&self, name: &[u8]) -> bool {
         // A filtered simple PV (`SP.{"arr":...}`) answers by its base name.
-        let record_path = filters::split_channel_name(name).record_path;
-        if self
-            .inner
-            .simple_pvs
-            .lock()
-            .contains_key(record_path.as_str())
-        {
+        if self.simple_pv_named(&filters::split_channel_name(name).record_path) {
             return true;
         }
-        let (base, rest) = name.split_once('.').unwrap_or((name, ""));
+        let (base, rest) = match name.iter().position(|&b| b == b'.') {
+            Some(dot) => (&name[..dot], &name[dot + 1..]),
+            None => (name, &b""[..]),
+        };
         let Some(rec) = self.record_or_alias(base) else {
             return false;
         };
-        let len = match rest.as_bytes().first() {
+        let len = match rest.first() {
             Some(c) if c.is_ascii_alphabetic() || *c == b'_' => rest
-                .bytes()
-                .position(|c| !(c.is_ascii_alphanumeric() || c == b'_'))
+                .iter()
+                .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
                 .unwrap_or(rest.len()),
             // An absent field name binds `VAL`.
             _ => return true,
         };
-        self.names_field(&rec, &rest[..len])
+        // The identifier prefix is ASCII by construction.
+        self.names_field(&rec, std::str::from_utf8(&rest[..len]).unwrap_or_default())
     }
 
-    fn record_or_alias(&self, name: &str) -> Option<Arc<RecordCell>> {
+    fn record_or_alias(&self, name: &[u8]) -> Option<Arc<RecordCell>> {
         self.inner.records.read().get(name).cloned().or_else(|| {
             let target = self.alias_target(name);
-            target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
+            target.and_then(|t| self.inner.records.read().get(&*t).cloned())
         })
+    }
+
+    fn simple_pv_named(&self, name: &[u8]) -> bool {
+        self.inner.simple_pvs.lock().contains_key(name)
+    }
+
+    /// The simple PV registered as `name`.
+    pub(crate) fn simple_pv_bytes(&self, name: &[u8]) -> Option<Arc<ProcessVariable>> {
+        self.inner.simple_pvs.lock().get(name).cloned()
     }
 
     /// `dbChannelCreate`'s existence half, which also judges the `$`
     /// modifier against the field (`dbChannel.c:486-503`); the search side,
     /// `dbChannelTest`, does not.
-    pub(crate) fn channel_create_found(&self, name: &str) -> bool {
+    pub(crate) fn channel_create_found(&self, name: &[u8]) -> bool {
         // A filtered channel (`REC.{"dbnd":{"d":0.5}}`) resolves to its
         // underlying PV, as in `find_entry_no_resolve`.
         let record_path = filters::split_channel_name(name).record_path;
-        if self
-            .inner
-            .simple_pvs
-            .lock()
-            .contains_key(record_path.as_str())
-        {
+        if self.simple_pv_named(&record_path) {
             return true;
         }
-        let (base, explicit_field) = match record_path.rsplit_once('.') {
-            Some((base, field)) => (base, Some(field)),
-            None => (record_path.as_str(), None),
+        let (base, explicit_field) = match record_path.iter().rposition(|&b| b == b'.') {
+            Some(dot) => (&record_path[..dot], Some(parse_pv_name(&record_path).1)),
+            None => (record_path.as_slice(), None),
         };
         let Some(rec) = self.record_or_alias(base) else {
             return false;
@@ -4006,7 +4038,7 @@ impl PvDatabase {
     /// If the name is not found and a search resolver is installed,
     /// the resolver is invoked once. If the resolver returns true, the
     /// database is re-checked.
-    pub async fn find_entry(&self, name: &str) -> Option<PvEntry> {
+    pub async fn find_entry(&self, name: impl AsRef<[u8]>) -> Option<PvEntry> {
         self.find_entry_from(name, None).await
     }
 
@@ -4016,9 +4048,10 @@ impl PvDatabase {
     /// host-scoped `.pvlist` admission.
     pub async fn find_entry_from(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         peer: Option<std::net::SocketAddr>,
     ) -> Option<PvEntry> {
+        let name = name.as_ref();
         if let Some(entry) = self.find_entry_no_resolve(name).await {
             // A cached simple PV must still pass the per-request
             // existence gate (CA gateway host/state admission). When the
@@ -4033,11 +4066,8 @@ impl PvDatabase {
             return Some(entry);
         }
         // Try the search resolver
-        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
-        if let Some(r) = resolver {
-            if r(name.to_string(), peer).await {
-                return self.find_entry_no_resolve(name).await;
-            }
+        if self.search_resolver_admits(name, peer).await {
+            return self.find_entry_no_resolve(name).await;
         }
         None
     }
@@ -4048,7 +4078,7 @@ impl PvDatabase {
     /// the resolver is invoked. The resolver may populate the database
     /// (e.g., subscribe to an upstream IOC and add a placeholder PV) and
     /// return true; this method then re-checks.
-    pub async fn has_name(&self, name: &str) -> bool {
+    pub async fn has_name(&self, name: impl AsRef<[u8]>) -> bool {
         self.has_name_from(name, None).await
     }
 
@@ -4056,7 +4086,12 @@ impl PvDatabase {
     /// socket address into the search resolver. The CA UDP search
     /// responder passes the datagram source address so the gateway can
     /// apply host-scoped `.pvlist` admission.
-    pub async fn has_name_from(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
+    pub async fn has_name_from(
+        &self,
+        name: impl AsRef<[u8]>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> bool {
+        let name = name.as_ref();
         if self.has_name_no_resolve(name) {
             // Same per-request gate as `find_entry_from`: a cached simple
             // PV the gateway's host/state admission denies must answer
@@ -4066,18 +4101,27 @@ impl PvDatabase {
             }
             return true;
         }
-        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
-        if let Some(r) = resolver {
-            if r(name.to_string(), peer).await {
-                return self.has_name_no_resolve(name);
-            }
+        if self.search_resolver_admits(name, peer).await {
+            return self.has_name_no_resolve(name);
         }
         false
     }
 
+    /// Ask the installed [`SearchResolver`] to make `name` resolvable.
+    async fn search_resolver_admits(
+        &self,
+        name: &[u8],
+        peer: Option<std::net::SocketAddr>,
+    ) -> bool {
+        let Some(resolver) = self.inner.search_resolver.load_full().map(|r| (*r).clone()) else {
+            return false;
+        };
+        resolver(name.into(), peer).await
+    }
+
     /// Look up a simple PV by name (backward-compatible).
-    pub async fn find_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        self.inner.simple_pvs.lock().get(name).cloned()
+    pub async fn find_pv(&self, name: impl AsRef<[u8]>) -> Option<Arc<ProcessVariable>> {
+        self.inner.simple_pvs.lock().get(name.as_ref()).cloned()
     }
 
     /// Get a record Arc by name. Alias-aware (epics-base PR #336):
@@ -4090,16 +4134,17 @@ impl PvDatabase {
     /// Use [`Self::get_record_no_resolve`] when the caller already
     /// holds a canonical name and wants to suppress the alias path
     /// (e.g. to detect alias collisions during builder wiring).
-    pub fn get_record(&self, name: &str) -> Option<Arc<RecordCell>> {
+    pub fn get_record(&self, name: impl AsRef<[u8]>) -> Option<Arc<RecordCell>> {
+        let name = name.as_ref();
         if let Some(rec) = self.inner.records.read().get(name).cloned() {
             return Some(rec);
         }
         let target = self.alias_target(name)?;
-        self.inner.records.read().get(target.as_str()).cloned()
+        self.inner.records.read().get(&*target).cloned()
     }
 
     /// The record behind `name` AND the canonical name it is registered
-    /// under — the one place a caller's `&str` becomes the shared `Arc<str>`
+    /// under — the one place a caller's name becomes the shared [`RecordName`]
     /// that a process chain then carries from hop to hop.
     ///
     /// The records map is asked first and the alias table only on a miss. A
@@ -4115,7 +4160,11 @@ impl PvDatabase {
     /// [`Self::get_record`] is (epics-base PR #336) — and the name it returns
     /// for an alias is the TARGET's, which is what `visited` must key on if
     /// alias and canonical are not to count as two different records.
-    pub(crate) fn lookup_record(&self, name: &str) -> Option<(Arc<str>, Arc<RecordCell>)> {
+    pub(crate) fn lookup_record(
+        &self,
+        name: impl AsRef<[u8]>,
+    ) -> Option<(RecordName, Arc<RecordCell>)> {
+        let name = name.as_ref();
         {
             let records = self.inner.records.read();
             if let Some((canonical, rec)) = records.get_key_value(name) {
@@ -4124,7 +4173,7 @@ impl PvDatabase {
         }
         let target = self.alias_target(name)?;
         let records = self.inner.records.read();
-        let (canonical, rec) = records.get_key_value(target.as_str())?;
+        let (canonical, rec) = records.get_key_value(&*target)?;
         Some((canonical.clone(), rec.clone()))
     }
 
@@ -4138,8 +4187,8 @@ impl PvDatabase {
     /// Strict variant of [`Self::get_record`] — does NOT consult the
     /// alias table. Returns `Some` only when a canonical record with
     /// that exact name exists.
-    pub fn get_record_no_resolve(&self, name: &str) -> Option<Arc<RecordCell>> {
-        self.inner.records.read().get(name).cloned()
+    pub fn get_record_no_resolve(&self, name: impl AsRef<[u8]>) -> Option<Arc<RecordCell>> {
+        self.inner.records.read().get(name.as_ref()).cloned()
     }
 
     /// Every record name, in **database load order** — the single owner of
@@ -4167,15 +4216,15 @@ impl PvDatabase {
     /// scan-index's secondary sort key), so this ordering and the scan lists'
     /// ordering are the same fact, not two. A record cannot be missing one: it
     /// is a field of its cell, set where the cell is built.
-    pub async fn all_record_names(&self) -> Vec<String> {
+    pub async fn all_record_names(&self) -> Vec<RecordName> {
         // One map, one guard: the sequence travels with the record, so the
         // snapshot and the sort key come from the same read and there is no
         // second structure to order a lock against.
-        let mut names: Vec<(u64, String)> = {
+        let mut names: Vec<(u64, RecordName)> = {
             let records = self.inner.records.read();
             records
                 .iter()
-                .map(|(name, rec)| (rec.load_order(), name.to_string()))
+                .map(|(name, rec)| (rec.load_order(), name.clone()))
                 .collect()
         };
         names.sort_unstable();
@@ -4205,7 +4254,7 @@ impl PvDatabase {
                     (
                         rec.load_order(),
                         DbNode {
-                            name: name.to_string(),
+                            name: name.clone(),
                             alias_of: None,
                         },
                     )
@@ -4235,7 +4284,7 @@ impl PvDatabase {
     /// Mirrors the alias-half of base's `dbFirstRecord` iteration —
     /// `dbgrep` / `dbglob` / `dbsr` walk both record names and
     /// aliases when matching a glob.
-    pub fn all_alias_names(&self) -> Vec<String> {
+    pub fn all_alias_names(&self) -> Vec<RecordName> {
         self.inner.aliases.read().keys().cloned().collect()
     }
 
@@ -4243,12 +4292,13 @@ impl PvDatabase {
     /// stable output; empty when the record has no aliases. Used by
     /// `dbpr` to surface alias-form names so admins can see how
     /// clients may reach the record.
-    pub fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
+    pub fn aliases_for_record(&self, canonical: impl AsRef<[u8]>) -> Vec<RecordName> {
+        let canonical = canonical.as_ref();
         let aliases = self.inner.aliases.read();
-        let mut hits: Vec<String> = aliases
+        let mut hits: Vec<RecordName> = aliases
             .iter()
             .filter_map(|(alias, node)| {
-                if node.target == canonical {
+                if *node.target == *canonical {
                     Some(alias.clone())
                 } else {
                     None
@@ -4260,7 +4310,7 @@ impl PvDatabase {
     }
 
     /// Get all simple PV names.
-    pub async fn all_simple_pv_names(&self) -> Vec<String> {
+    pub async fn all_simple_pv_names(&self) -> Vec<RecordName> {
         self.inner.simple_pvs.lock().keys().cloned().collect()
     }
 }
@@ -4364,7 +4414,7 @@ mod tests {
         common.tse = -1;
         common.time = stale;
 
-        TselStamp::None.stamp("REC", &mut common, || false);
+        TselStamp::None.stamp(b"REC", &mut common, || false);
 
         // BestTime must have run unconditionally — `common.time` is
         // no longer the stale sentinel.
@@ -4389,7 +4439,7 @@ mod tests {
         common.tse = -2;
         common.time = device_time;
 
-        TselStamp::None.stamp("REC", &mut common, || false);
+        TselStamp::None.stamp(b"REC", &mut common, || false);
 
         assert_eq!(
             common.time, device_time,
@@ -4443,7 +4493,7 @@ mod tests {
         common.tse = -3;
         common.time = stale;
 
-        TselStamp::None.stamp("X", &mut common, || false);
+        TselStamp::None.stamp(b"X", &mut common, || false);
 
         assert_eq!(
             common.time, stale,
@@ -4578,17 +4628,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             crate::runtime::task::Instant::now() >= self.connect_at
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn link_names(&self) -> Vec<String> {
-            self.names.clone()
+        fn link_names(&self) -> Vec<crate::types::RecordName> {
+            self.names.iter().map(|n| n.as_str().into()).collect()
         }
     }
 
@@ -4690,20 +4740,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for ConnectedMetaPendingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn init_ready(&self, _: &str) -> bool {
+        fn init_ready(&self, _: &[u8]) -> bool {
             false
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn link_names(&self) -> Vec<String> {
-            self.names.clone()
+        fn link_names(&self) -> Vec<crate::types::RecordName> {
+            self.names.iter().map(|n| n.as_str().into()).collect()
         }
     }
 
@@ -4852,7 +4902,7 @@ mod tests {
                 let answers: Vec<bool> =
                     ["TARGET.VAL", "TARGET.MLOK", "TARGET.EGU$", "TARGET.NOSUCH"]
                         .iter()
-                        .map(|name| db.has_name_no_resolve(name))
+                        .map(|name| db.has_name_no_resolve(name.as_bytes()))
                         .collect();
                 answer_tx.send(answers).unwrap();
             })
@@ -5140,7 +5190,7 @@ mod tests {
         aliases.sort();
         assert_eq!(aliases, vec!["ALIAS_A".to_string(), "ALIAS_B".to_string()]);
         // Canonical names are NOT returned here.
-        assert!(!aliases.contains(&"TARGET".to_string()));
+        assert!(!aliases.iter().any(|a| a == "TARGET"));
     }
 
     #[epics_macros_rs::epics_test]
@@ -5322,7 +5372,7 @@ mod tests {
         db.add_pv("ALT1", EpicsValue::Double(0.0)).await.unwrap();
         db.add_pv("ALT2", EpicsValue::Double(0.0)).await.unwrap();
         // The unrelated alias must survive.
-        assert_eq!(db.resolve_alias("KEEPER"), Some("OTHER".to_string()));
+        assert_eq!(db.resolve_alias("KEEPER"), Some("OTHER".into()));
     }
 
     /// The node list is C's `recList`: records and aliases in ONE sequence,
@@ -5421,25 +5471,25 @@ mod tests {
         db.add_record("EAGER", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        assert!(!db.record_init_deferred("EAGER"));
+        assert!(!db.record_init_deferred(b"EAGER"));
 
         db.begin_load().unwrap();
         db.add_record("OWED", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        assert!(db.record_init_deferred("OWED"));
-        assert!(!db.record_init_deferred("EAGER"));
+        assert!(db.record_init_deferred(b"OWED"));
+        assert!(!db.record_init_deferred(b"EAGER"));
 
         let owed = db.get_record("OWED").expect("the record is published");
         db.drain_deferred_record_inits();
-        assert!(!db.record_init_deferred("OWED"));
+        assert!(!db.record_init_deferred(b"OWED"));
         assert!(
             !owed.claim_owed_init(),
             "the barrier's claim was not the only one"
         );
 
         db.drain_deferred_record_inits();
-        assert!(!db.record_init_deferred("OWED"));
+        assert!(!db.record_init_deferred(b"OWED"));
     }
 
     /// `add_alias` must reject collisions with
@@ -5688,7 +5738,7 @@ mod tests {
         // exact storage a `field_list()` String scan cannot reach.
         {
             let rec = db.get_record("AI").unwrap();
-            rec.write().common.text.inp = "pva://mini:current?proc=CP".to_string();
+            rec.write().common.text.inp = "pva://mini:current?proc=CP".into();
         }
 
         let links = db.record_link_fields("AI");

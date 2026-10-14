@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::client::PvaClient;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
@@ -87,7 +88,7 @@ pub struct ChannelDiag {
     /// of owning records. Backs `dbpvar`'s record-name glob filter
     /// (`pvxs/ioc/pvalink.cpp:216-231`). Empty for channels opened
     /// manually (e.g. `pvxr`) with no owning record.
-    pub records: Vec<String>,
+    pub records: Vec<RecordName>,
 }
 
 /// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
@@ -123,7 +124,7 @@ pub struct PvaLinkRegistry {
     /// to each cached channel. Populated at open time via
     /// [`Self::attach_record`]; backs the `dbpvar` record-name glob
     /// filter (`pvxs/ioc/pvalink.cpp:216-231`).
-    channel_records: RwLock<HashMap<RegistryKey, BTreeSet<String>>>,
+    channel_records: RwLock<HashMap<RegistryKey, BTreeSet<RecordName>>>,
 }
 
 /// Build the `RegistryKey` for a config — the shared
@@ -179,12 +180,12 @@ impl PvaLinkRegistry {
     /// fold of field/sevr-only variants still accumulates every owning
     /// record. Mirrors pvxs appending a `pvaLink` to
     /// `pvaLinkChannel::links` (`pvxs/ioc/pvalink_channel.cpp` link attach).
-    pub fn attach_record(&self, config: &PvaLinkConfig, record: &str) {
+    pub fn attach_record(&self, config: &PvaLinkConfig, record: &[u8]) {
         self.channel_records
             .write()
             .entry(key_of(config))
             .or_default()
-            .insert(record.to_string());
+            .insert(RecordName::from(record));
     }
 
     /// Exact lookup for the full config's `RegistryKey`. Returns
@@ -636,9 +637,12 @@ mod tests {
 
         // Two records share the folded channel; one of them registers
         // twice (idempotent set insert).
-        reg.attach_record(&inp, "REC:A");
-        reg.attach_record(&inp_field, "REC:B");
-        reg.attach_record(&inp, "REC:A");
+        reg.attach_record(&inp, b"REC:A");
+        reg.attach_record(&inp_field, b"REC:B");
+        reg.attach_record(&inp, b"REC:A");
+        // Two names that are not UTF-8 stay two records.
+        reg.attach_record(&inp, b"caf\xe9");
+        reg.attach_record(&inp, b"caf\xe8");
 
         let diags = reg.channel_diagnostics();
         let row = diags
@@ -647,8 +651,8 @@ mod tests {
             .expect("INP channel present");
         assert_eq!(
             row.records,
-            vec!["REC:A".to_string(), "REC:B".to_string()],
-            "both owning records surface, de-duplicated and sorted"
+            [&b"REC:A"[..], b"REC:B", b"caf\xe8", b"caf\xe9"].map(RecordName::from),
+            "every owning record surfaces, de-duplicated and sorted"
         );
 
         // close_all clears the back-index too.

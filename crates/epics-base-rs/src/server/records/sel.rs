@@ -2,6 +2,7 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
 /// Number of input signals A..L (C `selRecord.c::SEL_MAX`).
 const SEL_MAX: usize = 12;
@@ -53,20 +54,20 @@ pub struct SelRecord {
     /// (selRecord.dbd.pod:295): an unsigned 0..65535 index — `do_sel`
     /// rejects values ≥ SEL_MAX.
     pub seln: u16,
-    pub nvl: String, // NVL link (for SELN)
+    pub nvl: PvString, // NVL link (for SELN)
     // Input links
-    pub inpa: String,
-    pub inpb: String,
-    pub inpc: String,
-    pub inpd: String,
-    pub inpe: String,
-    pub inpf: String,
-    pub inpg: String,
-    pub inph: String,
-    pub inpi: String,
-    pub inpj: String,
-    pub inpk: String,
-    pub inpl: String,
+    pub inpa: PvString,
+    pub inpb: PvString,
+    pub inpc: PvString,
+    pub inpd: PvString,
+    pub inpe: PvString,
+    pub inpf: PvString,
+    pub inpg: PvString,
+    pub inph: PvString,
+    pub inpi: PvString,
+    pub inpj: PvString,
+    pub inpk: PvString,
+    pub inpl: PvString,
     // Input values
     pub a: f64,
     pub b: f64,
@@ -133,19 +134,19 @@ impl Default for SelRecord {
             val: 0.0,
             selm: 0,
             seln: 0,
-            nvl: String::new(),
-            inpa: String::new(),
-            inpb: String::new(),
-            inpc: String::new(),
-            inpd: String::new(),
-            inpe: String::new(),
-            inpf: String::new(),
-            inpg: String::new(),
-            inph: String::new(),
-            inpi: String::new(),
-            inpj: String::new(),
-            inpk: String::new(),
-            inpl: String::new(),
+            nvl: PvString::new(),
+            inpa: PvString::new(),
+            inpb: PvString::new(),
+            inpc: PvString::new(),
+            inpd: PvString::new(),
+            inpe: PvString::new(),
+            inpf: PvString::new(),
+            inpg: PvString::new(),
+            inph: PvString::new(),
+            inpi: PvString::new(),
+            inpj: PvString::new(),
+            inpk: PvString::new(),
+            inpl: PvString::new(),
             // C initializes inputs to epicsNAN; NaN values are skipped by algorithms
             a: f64::NAN,
             b: f64::NAN,
@@ -537,23 +538,23 @@ impl Record for SelRecord {
     /// C reads `prec->inpa..inpl` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 12 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         Some(match slot {
-            b'A' => &self.inpa,
-            b'B' => &self.inpb,
-            b'C' => &self.inpc,
-            b'D' => &self.inpd,
-            b'E' => &self.inpe,
-            b'F' => &self.inpf,
-            b'G' => &self.inpg,
-            b'H' => &self.inph,
-            b'I' => &self.inpi,
-            b'J' => &self.inpj,
-            b'K' => &self.inpk,
-            b'L' => &self.inpl,
+            b'A' => self.inpa.as_bytes(),
+            b'B' => self.inpb.as_bytes(),
+            b'C' => self.inpc.as_bytes(),
+            b'D' => self.inpd.as_bytes(),
+            b'E' => self.inpe.as_bytes(),
+            b'F' => self.inpf.as_bytes(),
+            b'G' => self.inpg.as_bytes(),
+            b'H' => self.inph.as_bytes(),
+            b'I' => self.inpi.as_bytes(),
+            b'J' => self.inpj.as_bytes(),
+            b'K' => self.inpk.as_bytes(),
+            b'L' => self.inpl.as_bytes(),
             _ => return None,
         })
     }
@@ -675,7 +676,7 @@ impl Record for SelRecord {
             },
             "NVL" => match value {
                 EpicsValue::String(s) => {
-                    self.nvl = s.as_str_lossy().into_owned();
+                    self.nvl = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("NVL".into())),
@@ -683,7 +684,6 @@ impl Record for SelRecord {
             "INPA" | "INPB" | "INPC" | "INPD" | "INPE" | "INPF" | "INPG" | "INPH" | "INPI"
             | "INPJ" | "INPK" | "INPL" => match value {
                 EpicsValue::String(s) => {
-                    let s = s.as_str_lossy().into_owned();
                     match name {
                         "INPA" => self.inpa = s,
                         "INPB" => self.inpb = s,
@@ -785,18 +785,18 @@ impl Record for SelRecord {
     /// See [`Record::set_input_link_slots`].
     fn set_input_link_slots(&self) -> Option<(u64, u64)> {
         crate::server::record::input_link_slots_of(&[
-            self.inpa.as_str(),
-            self.inpb.as_str(),
-            self.inpc.as_str(),
-            self.inpd.as_str(),
-            self.inpe.as_str(),
-            self.inpf.as_str(),
-            self.inpg.as_str(),
-            self.inph.as_str(),
-            self.inpi.as_str(),
-            self.inpj.as_str(),
-            self.inpk.as_str(),
-            self.inpl.as_str(),
+            self.inpa.as_bytes(),
+            self.inpb.as_bytes(),
+            self.inpc.as_bytes(),
+            self.inpd.as_bytes(),
+            self.inpe.as_bytes(),
+            self.inpf.as_bytes(),
+            self.inpg.as_bytes(),
+            self.inph.as_bytes(),
+            self.inpi.as_bytes(),
+            self.inpj.as_bytes(),
+            self.inpk.as_bytes(),
+            self.inpl.as_bytes(),
         ])
     }
 

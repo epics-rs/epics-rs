@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::server::record::{
     AlarmSeverity, NotifyWaitSet, OutTarget, RecordCell, RecordInstance, ScanType,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
 use super::filters::ChannelName;
 use super::link_set::LinkDbfType;
@@ -21,22 +21,27 @@ use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select
 /// that splits it, and this is the one place that puts the halves back
 /// together for a local lookup. The external name stays `pvname`, which keeps
 /// the filter because C hands it to `dbCaAddLink` unchanged.
-fn local_pv_name(target: &ChannelName) -> String {
+fn local_pv_name(target: &ChannelName) -> Vec<u8> {
+    let mut name = local_name(&target.record, &target.field);
     // A `$` address the record refused keeps its `$`, so the put is refused
     // too rather than storing through the field's own type.
     if target.string_view {
-        return format!("{}.{}$", target.record, target.field);
+        if target.field == "VAL" {
+            name.extend_from_slice(b".VAL");
+        }
+        name.push(b'$');
     }
-    local_name(&target.record, &target.field)
+    name
 }
 
 /// [`local_pv_name`] from the halves, for a caller that holds them apart.
-pub(super) fn local_name(record: &str, field: &str) -> String {
-    if field == "VAL" {
-        record.to_string()
-    } else {
-        format!("{record}.{field}")
+pub(super) fn local_name(record: &[u8], field: &str) -> Vec<u8> {
+    let mut name = record.to_vec();
+    if field != "VAL" {
+        name.push(b'.');
+        name.extend_from_slice(field.as_bytes());
     }
+    name
 }
 
 /// **The one classifier of a process-time read that delivered no value.**
@@ -671,8 +676,9 @@ fn selected_links(instance: &RecordInstance, sel: SelmResult) -> SelectedLinks {
 
 /// `dbInitLink`'s warning for a CA forward link that will never forward
 /// (`dbLink.c:137-142`); the runtime `dbAddLink` sets the flag silently.
-fn warn_ca_forward_without_proc(name: &str, field: &str, ca: &crate::server::record::CaLink) {
+fn warn_ca_forward_without_proc(name: &[u8], field: &str, ca: &crate::server::record::CaLink) {
     if !ca.fwd {
+        let name = String::from_utf8_lossy(name);
         crate::runtime::log::errlog_vprintf(format_args!(
             "{}: Forward-link uses Channel Access without pointing to PROC field\n    {name}.{field} => {}\n",
             crate::runtime::log::erl_warning(),
@@ -844,10 +850,11 @@ impl PvDatabase {
     /// See [`LinkTarget`]. The records map is asked FIRST — a link target is
     /// overwhelmingly a record, and only the miss then pays the `simple_pvs`
     /// mutex `has_name_no_resolve` takes on every call.
-    pub(super) fn link_target(&self, record: &str) -> LinkTarget {
+    pub(super) fn link_target(&self, record: &[u8]) -> LinkTarget {
         if let Some(rec) = self.get_record(record) {
             return LinkTarget::Local(rec);
         }
+        // A record was answered above.
         if self.has_name_no_resolve(record) {
             return LinkTarget::LocalNotRecord;
         }
@@ -937,7 +944,7 @@ impl PvDatabase {
     fn db_link_target(&self, db: &crate::server::record::DbLink) -> LinkTarget {
         match self.db_link_addr(db) {
             Some(at) => LinkTarget::Local(at.rec),
-            None => self.link_target(&db.target().record),
+            None => self.link_target(db.target().record.as_bytes()),
         }
     }
 
@@ -974,7 +981,7 @@ impl PvDatabase {
     fn read_db_target_by_name(&self, db: &crate::server::record::DbLink) -> TargetValue {
         use crate::server::record::DbLinkAnswer;
         let target = db.target();
-        match self.link_target(&target.record) {
+        match self.link_target(target.record.as_bytes()) {
             // The record was added after the answer settled `Absent`, so the
             // revision moved: read through the re-resolved answer, once. A
             // target gone again by then has nothing readable this cycle.
@@ -986,7 +993,7 @@ impl PvDatabase {
             // A simple PV under the target's own name — the value `get_pv`
             // answers with before it ever reaches a record.
             LinkTarget::LocalNotRecord => {
-                TargetValue::NoRecord(self.get_pv(&local_name(&target.record, &target.field)).ok())
+                TargetValue::NoRecord(self.get_pv(local_name(&target.record, &target.field)).ok())
             }
             LinkTarget::External => TargetValue::External,
         }
@@ -1100,8 +1107,7 @@ impl PvDatabase {
             return None;
         }
         let target = db.target();
-        let pv_name = local_name(&target.record, &target.field);
-        self.inner.simple_pvs.lock().get(&pv_name).cloned()
+        self.simple_pv_bytes(&local_name(&target.record, &target.field))
     }
 
     /// Read a `Db`-variant link's value honoring C `dbInitLink`'s
@@ -1148,7 +1154,7 @@ impl PvDatabase {
         // chain. Applying it here as well would filter twice.
         let value = match self.read_db_target(db) {
             TargetValue::Record(value, ..) | TargetValue::NoRecord(value) => value,
-            TargetValue::External => return self.resolve_external_pv(&db.pvname()),
+            TargetValue::External => return self.resolve_external_pv(db.pvname().as_bytes()),
         };
         let Some(suffix) = target.json_suffix.as_deref() else {
             return value;
@@ -1561,7 +1567,9 @@ impl PvDatabase {
 
     /// The record name a `time` argument's timestamp comes from, or `None`
     /// when that slot holds a numeric literal (nothing to read a time from).
-    pub(super) fn calc_time_source_record(arg: &crate::server::record::CalcArg) -> Option<String> {
+    pub(super) fn calc_time_source_record(
+        arg: &crate::server::record::CalcArg,
+    ) -> Option<RecordName> {
         use crate::server::record::{CalcArg, ParsedLink};
         let CalcArg::Link(link) = arg else {
             return None;
@@ -1569,10 +1577,10 @@ impl PvDatabase {
         let name = match link.as_ref() {
             // Strip the `.FIELD` suffix — and any channel filter — to land
             // on the record name.
-            ParsedLink::Db(db) => db.target().record.clone(),
-            ParsedLink::Ca(ca) => ca.pv.clone(),
-            ParsedLink::Pva(pv) => pv.clone(),
-            ParsedLink::PvaJson(j) => j.pv.clone(),
+            ParsedLink::Db(db) => return Some(db.target().record.clone()),
+            ParsedLink::Ca(ca) => ca.pv.as_bytes(),
+            ParsedLink::Pva(pv) => pv.as_bytes(),
+            ParsedLink::PvaJson(j) => j.pv.as_bytes(),
             // A state link names no record, so it has no timestamp to adopt
             // — its lset implements no `getTimestampTag`.
             ParsedLink::None
@@ -1582,11 +1590,9 @@ impl PvDatabase {
             | ParsedLink::State(_)
             | ParsedLink::Removed(_) => return None,
         };
-        Some(
-            name.rsplit_once('.')
-                .map(|(r, _)| r.to_string())
-                .unwrap_or(name),
-        )
+        Some(RecordName::from(
+            name.rsplitn(2, |&b| b == b'.').last().unwrap_or(name),
+        ))
     }
 
     /// lnkCalc evaluation: resolve each input, bind the calc engine's
@@ -1944,8 +1950,8 @@ impl PvDatabase {
                     TargetValue::External => {
                         let external = db.pvname();
                         return (
-                            self.resolve_external_pv(&external),
-                            self.external_link_alarm(&external)
+                            self.resolve_external_pv(external.as_bytes()),
+                            self.external_link_alarm(external.as_bytes())
                                 .map(SourceAlarm::external),
                         );
                     }
@@ -2038,10 +2044,10 @@ impl PvDatabase {
     /// adopts the `userTag` into `common.utag`. The `userTag` is the
     /// remote `timeStamp.userTag` widened without sign extension, or `0`
     /// when the source carries none.
-    pub(crate) fn external_link_time(&self, name: &str) -> Option<(i64, i32, u64)> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+    pub(crate) fn external_link_time(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix(b"pva://") {
             ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
+        } else if let Some(rest) = name.strip_prefix(b"ca://") {
             ("ca", rest)
         } else {
             // Bare name — try every registered lset.
@@ -2064,10 +2070,10 @@ impl PvDatabase {
     /// [`crate::server::database::LinkSet::alarm_severity`]); when it
     /// is `Some`, the `stat` is `LINK_ALARM` and the message comes
     /// from `alarm_message`.
-    fn external_link_alarm(&self, name: &str) -> Option<LinkAlarm> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+    fn external_link_alarm(&self, name: &[u8]) -> Option<LinkAlarm> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix(b"pva://") {
             ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
+        } else if let Some(rest) = name.strip_prefix(b"ca://") {
             ("ca", rest)
         } else {
             // Bare name — try every registered lset until one reports
@@ -2121,11 +2127,11 @@ impl PvDatabase {
     /// dispatch mirrors `Self::external_link_alarm`.
     pub fn external_link_alarm_snapshot(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Option<crate::server::database::RemoteAlarm> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix(b"pva://") {
             ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
+        } else if let Some(rest) = name.strip_prefix(b"ca://") {
             ("ca", rest)
         } else {
             for lset in self.registered_link_sets() {
@@ -2157,11 +2163,11 @@ impl PvDatabase {
     /// has no cached value for the link (not yet connected).
     pub fn external_link_metadata(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Option<crate::server::database::LinkMetadata> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix(b"pva://") {
             ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
+        } else if let Some(rest) = name.strip_prefix(b"ca://") {
             ("ca", rest)
         } else {
             for lset in self.registered_link_sets() {
@@ -2262,7 +2268,7 @@ impl PvDatabase {
     pub fn link_metadata(
         &self,
         link: &crate::server::record::ParsedLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<RecordName>,
     ) -> Option<crate::server::database::LinkMetadata> {
         use crate::server::record::ParsedLink;
         match link {
@@ -2342,7 +2348,7 @@ impl PvDatabase {
     fn db_link_metadata(
         &self,
         db: &crate::server::record::DbLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<RecordName>,
     ) -> Option<crate::server::database::LinkMetadata> {
         let key = db.pvname();
         // C `if (!(mutable_plink->flags & DBLINK_FLAG_VISITED))`
@@ -2367,7 +2373,7 @@ impl PvDatabase {
     fn db_target_metadata(
         &self,
         db: &crate::server::record::DbLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<RecordName>,
     ) -> Option<crate::server::database::LinkMetadata> {
         let target = db.target();
         let record = match self.db_link_target(db) {
@@ -2375,7 +2381,7 @@ impl PvDatabase {
             // Local but not a record: no field to carry metadata, and C would
             // not have made this a CA link either.
             LinkTarget::LocalNotRecord => return None,
-            LinkTarget::External => return self.external_link_metadata(&db.pvname()),
+            LinkTarget::External => return self.external_link_metadata(db.pvname().as_bytes()),
         };
         // C `dbGet(paddr, DBR_DOUBLE, &buffer, &option, ...)` under the
         // target's lock (`dbDbLink.c:252-256` between `dbScanLock` /
@@ -2711,12 +2717,12 @@ impl PvDatabase {
         }
         if !self.has_name_no_resolve(&target.record) {
             let external = db.pvname();
-            let failed = match self.external_put_value(&external, src, ls) {
+            let failed = match self.external_put_value(external.as_bytes(), src, ls) {
                 None => false,
-                Some(value) => match self.write_external_pv(&external, value, notify) {
+                Some(value) => match self.write_external_pv(external.as_bytes(), value, notify) {
                     Ok(()) => false,
                     Err(refusal) => {
-                        refusal.report(&external);
+                        refusal.report(external.as_bytes());
                         true
                     }
                 },
@@ -2738,7 +2744,7 @@ impl PvDatabase {
             }
         };
         if tail.has_report() {
-            self.emit_cycle_report(&target.record, &target.field, tail);
+            self.emit_cycle_report(target.record.as_bytes(), &target.field, tail);
         }
         // No local target: no inherit and no `processTarget` to run.
         DbLinkWrite::untargeted(failed)
@@ -2901,22 +2907,23 @@ impl PvDatabase {
     /// and the answer the write obeys cannot differ.
     fn external_put_gate<'a>(
         &self,
-        name: &'a str,
-    ) -> Result<(super::link_put_queue::LinkTarget, &'a str), ExternalPutRefusal> {
+        name: &'a [u8],
+    ) -> Result<(super::link_put_queue::LinkTarget, &'a [u8]), ExternalPutRefusal> {
         use super::link_put_queue::LinkTarget;
         use super::link_set::PutAdmission;
+        let shown = String::from_utf8_lossy(name);
 
-        let (target, body, lsets) = if let Some(rest) = name.strip_prefix("pva://") {
+        let (target, body, lsets) = if let Some(rest) = name.strip_prefix(b"pva://") {
             let lset = self.inner.link_sets.load().get("pva").ok_or_else(|| {
                 ExternalPutRefusal::Unserviceable(format!(
-                    "no 'pva' link set registered for '{name}'"
+                    "no 'pva' link set registered for '{shown}'"
                 ))
             })?;
             (LinkTarget::Scheme("pva".to_string()), rest, vec![lset])
-        } else if let Some(rest) = name.strip_prefix("ca://") {
+        } else if let Some(rest) = name.strip_prefix(b"ca://") {
             let lset = self.inner.link_sets.load().get("ca").ok_or_else(|| {
                 ExternalPutRefusal::Unserviceable(format!(
-                    "no 'ca' link set registered for '{name}'"
+                    "no 'ca' link set registered for '{shown}'"
                 ))
             })?;
             (LinkTarget::Scheme("ca".to_string()), rest, vec![lset])
@@ -2927,7 +2934,7 @@ impl PvDatabase {
             let lsets = self.registered_link_sets();
             if lsets.is_empty() {
                 return Err(ExternalPutRefusal::Unserviceable(format!(
-                    "no link set registered for external link '{name}'"
+                    "no link set registered for external link '{shown}'"
                 )));
             }
             (LinkTarget::Any, name, lsets)
@@ -2945,7 +2952,7 @@ impl PvDatabase {
         // (`db/dbCa.c:322` (`dbCaLinkInitImpl`), `:342`, `:344`; R7.0.10).
         if self.inner.link_puts.network().is_none() {
             return Err(ExternalPutRefusal::Unserviceable(format!(
-                "external link '{name}' refused the write: this database was \
+                "external link '{shown}' refused the write: this database was \
                  built with no tokio runtime, so no link set can reach the \
                  network"
             )));
@@ -2976,7 +2983,7 @@ impl PvDatabase {
 
     /// Ask [`Self::external_put_gate`] on its own, staging nothing: `Ok` iff a
     /// put to `name` would be issued right now.
-    pub(crate) fn external_put_admitted(&self, name: &str) -> Result<(), ExternalPutRefusal> {
+    pub(crate) fn external_put_admitted(&self, name: &[u8]) -> Result<(), ExternalPutRefusal> {
         self.external_put_gate(name).map(|_| ())
     }
 
@@ -2988,7 +2995,7 @@ impl PvDatabase {
     /// `DBR_STRING`.
     fn external_put_value(
         &self,
-        name: &str,
+        name: &[u8],
         src: super::field_io::PutSrc<'_>,
         ls: bool,
     ) -> Option<EpicsValue> {
@@ -3064,7 +3071,7 @@ impl PvDatabase {
     /// reported through, so the two cannot disagree.
     pub(crate) fn write_external_pv(
         &self,
-        name: &str,
+        name: &[u8],
         value: EpicsValue,
         src_notify: Option<&Arc<NotifyWaitSet>>,
     ) -> Result<(), ExternalPutRefusal> {
@@ -3078,7 +3085,7 @@ impl PvDatabase {
             .ensure_owner(std::sync::Arc::downgrade(&self.inner));
         let key = LinkKey {
             target,
-            name: body.to_string(),
+            name: body.into(),
         };
         match self.inner.link_puts.stage_put(key, value, op) {
             // `dbCaPutLink`: staged, signalled, returned (`dbCa.c:593-595`).
@@ -3166,7 +3173,7 @@ impl PvDatabase {
                 let lset = lsets
                     .get("pva")
                     .ok_or_else(|| format!("no 'pva' link set registered for '{name}'"))?;
-                lset.scan_forward(name)
+                lset.scan_forward(name.as_bytes())
             }
         }
     }
@@ -3209,7 +3216,7 @@ impl PvDatabase {
     /// field: an array field reports its record's `NELM` when it has one and
     /// its current length otherwise; a scalar field reports 1.
     pub(crate) fn resolve_out_target(&self, link: &crate::server::record::ParsedLink) -> OutTarget {
-        let external = |name: String| {
+        let external = |name: crate::types::RecordName| {
             match self.external_link_metadata(&name) {
                 Some(m) => {
                     let field_type = m.dbf_type.map(link_dbf_to_field_type);
@@ -3248,7 +3255,7 @@ impl PvDatabase {
                     LinkTarget::Local(rec) => rec,
                     LinkTarget::LocalNotRecord => return UNADDRESSED,
                     // Non-local ⇒ CA link in C (`dbInitLink` locality).
-                    LinkTarget::External => return external(db.pvname()),
+                    LinkTarget::External => return external(db.pvname().into()),
                 };
                 let guard = target.read();
                 // `dbGetLinkDBFtype` / `dbGetNelements` of a `$` address: the
@@ -3302,7 +3309,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                external(name.to_string())
+                external(name.as_ref().into())
             }
             // C `lnkState_getDBFtype`/`lnkState_getElements`
             // (`lnkState.c:126-135`): one `DBF_SHORT` element, and never a
@@ -3754,7 +3761,7 @@ impl PvDatabase {
     /// `name` is the record's canonical name, the frame's.
     pub(crate) fn dispatch_multi_output(
         &self,
-        name: &str,
+        name: &[u8],
         rec: InFrame<'_>,
         skip_out: bool,
         visited: &mut ProcStack,
@@ -4238,8 +4245,8 @@ impl PvDatabase {
     /// again replaces it.
     pub async fn register_cp_link(
         &self,
-        source_record: &str,
-        target_record: &str,
+        source_record: impl AsRef<[u8]>,
+        target_record: impl AsRef<[u8]>,
         field: &str,
         passive_only: bool,
     ) {
@@ -4258,8 +4265,10 @@ impl PvDatabase {
         });
     }
 
-    fn canonical_name(&self, name: &str) -> String {
-        self.resolve_alias(name).unwrap_or_else(|| name.to_string())
+    fn canonical_name(&self, name: impl AsRef<[u8]>) -> RecordName {
+        let name = name.as_ref();
+        self.resolve_alias(name)
+            .unwrap_or_else(|| RecordName::from(name))
     }
 
     /// Whether any CP/CPP edge names this record as its source — the gate
@@ -4273,7 +4282,7 @@ impl PvDatabase {
     /// which moves that revision, so no cached `false` can outlive the
     /// registration that makes it wrong.
     #[inline(always)]
-    pub(crate) fn sources_cp_edges(&self, source_record: &str, rec: InFrame<'_>) -> bool {
+    pub(crate) fn sources_cp_edges(&self, source_record: &[u8], rec: InFrame<'_>) -> bool {
         // The cache is atomics on the cell, outside the data the frame guards.
         let rec = rec.unframed();
         // Revision first, map second — see `SnapshotCell::revision`.
@@ -4288,7 +4297,7 @@ impl PvDatabase {
     /// every steady cycle takes pays a branch and not this frame.
     fn sources_cp_edges_uncached(
         &self,
-        source_record: &str,
+        source_record: &[u8],
         rec: &Arc<super::RecordCell>,
         revision: u64,
     ) -> bool {
@@ -4307,7 +4316,8 @@ impl PvDatabase {
     }
 
     /// Get target edges to process when `source_record` changes (CP/CPP links).
-    pub fn get_cp_targets(&self, source_record: &str) -> Vec<super::CpTarget> {
+    pub fn get_cp_targets(&self, source_record: impl AsRef<[u8]>) -> Vec<super::CpTarget> {
+        let source_record = source_record.as_ref();
         self.inner
             .cp_links
             .load()
@@ -4333,12 +4343,12 @@ impl PvDatabase {
     /// keyed by the holder's link `field`, identical to the local path.
     pub async fn register_external_cp_link(
         &self,
-        external_pv: &str,
-        target_record: &str,
+        external_pv: impl AsRef<[u8]>,
+        target_record: impl AsRef<[u8]>,
         field: &str,
         passive_only: bool,
     ) {
-        let key = external_cp_key(external_pv).to_string();
+        let key = RecordName::from(external_cp_key(external_pv.as_ref()));
         let holder = self.canonical_name(target_record);
         self.inner.external_cp_links.update(|cp| {
             cp.set_link(
@@ -4355,7 +4365,7 @@ impl PvDatabase {
 
     /// Get holder edges to process when the remote PV `external_pv` changes
     /// (external CA/PVA CP/CPP links).
-    pub fn get_external_cp_targets(&self, external_pv: &str) -> Vec<super::CpTarget> {
+    pub fn get_external_cp_targets(&self, external_pv: &[u8]) -> Vec<super::CpTarget> {
         self.inner
             .external_cp_links
             .load()
@@ -4369,7 +4379,7 @@ impl PvDatabase {
     /// these at iocInit so the remote source has a live subscription whose
     /// callback can drive an [`super::ExternalCpProcess`] — a Passive
     /// CP holder is otherwise never read and its monitor never opens.
-    pub async fn external_cp_pv_names(&self) -> Vec<String> {
+    pub async fn external_cp_pv_names(&self) -> Vec<RecordName> {
         self.inner
             .external_cp_links
             .load()
@@ -4395,15 +4405,15 @@ impl PvDatabase {
     /// link and counting it.
     ///
     /// Sorted, so a caller can print it as a stable operator-facing list.
-    pub async fn external_link_pv_names(&self) -> Vec<String> {
-        let mut seen: Vec<String> = Vec::new();
+    pub async fn external_link_pv_names(&self) -> Vec<RecordName> {
+        let mut seen: Vec<RecordName> = Vec::new();
         for record_name in &self.all_record_names().await {
             for (_field, _raw, parsed) in self.record_link_fields(record_name) {
                 let Some(pv) = parsed.external_pv_name() else {
                     continue;
                 };
-                if !seen.iter().any(|s| s == pv.as_ref()) {
-                    seen.push(pv.into_owned());
+                if !seen.iter().any(|s| *s == *pv) {
+                    seen.push(pv.as_ref().into());
                 }
             }
         }
@@ -4497,7 +4507,7 @@ impl PvDatabase {
         let crate::server::record::ParsedLink::Db(db) = parsed else {
             return None;
         };
-        if self.has_db_link_target(&db.target().record, db.field_as_written()) {
+        if self.has_db_link_target(db.target().record.as_bytes(), db.field_as_written()) {
             return None;
         }
         Some(crate::server::record::ParsedLink::Ca(
@@ -4716,16 +4726,14 @@ impl PvDatabase {
         match parsed {
             crate::server::record::ParsedLink::Db(db) => {
                 db.policy.cp_passive_only().map(|passive_only| CpEdge {
-                    external: false,
-                    source: db.target().record.clone(),
+                    source: CpEdgeSource::Local(db.target().record.clone()),
                     put_field: super::put_posted_field(&db.target().field),
                     passive_only,
                 })
             }
             crate::server::record::ParsedLink::Ca(ca) => {
                 ca.policy.cp_passive_only().map(|passive_only| CpEdge {
-                    external: true,
-                    source: ca.pv,
+                    source: CpEdgeSource::External(ca.pv.into()),
                     put_field: None,
                     passive_only,
                 })
@@ -4737,8 +4745,8 @@ impl PvDatabase {
     /// Every CP/CPP link in the database, as `(holder, field, edge)`.
     fn cp_links_of(
         &self,
-        holders: impl IntoIterator<Item = String>,
-    ) -> Vec<(String, String, CpEdge)> {
+        holders: impl IntoIterator<Item = RecordName>,
+    ) -> Vec<(RecordName, String, CpEdge)> {
         let mut out = Vec::new();
         for holder in holders {
             // Enumerated through the single shared owner (`record_link_fields`)
@@ -4761,11 +4769,11 @@ impl PvDatabase {
     fn set_cp_links<'a>(
         &self,
         external: bool,
-        links: impl IntoIterator<Item = &'a (String, String, CpEdge)>,
+        links: impl IntoIterator<Item = &'a (RecordName, String, CpEdge)>,
     ) {
-        let edges: Vec<(String, &str, super::CpSource)> = links
+        let edges: Vec<(RecordName, &str, super::CpSource)> = links
             .into_iter()
-            .filter(|(_, _, edge)| edge.external == external)
+            .filter(|(_, _, edge)| edge.external() == external)
             .map(|(holder, field, edge)| {
                 (
                     self.canonical_name(holder),
@@ -4790,10 +4798,9 @@ impl PvDatabase {
     /// monitor dispatches under, a local one by its canonical record.
     fn cp_source(&self, edge: &CpEdge) -> super::CpSource {
         super::CpSource {
-            record: if edge.external {
-                external_cp_key(&edge.source).to_string()
-            } else {
-                self.canonical_name(&edge.source)
+            record: match &edge.source {
+                CpEdgeSource::External(pv) => RecordName::from(external_cp_key(pv)),
+                CpEdgeSource::Local(record) => self.canonical_name(record),
             },
             put_field: edge.put_field,
             passive_only: edge.passive_only,
@@ -4808,7 +4815,7 @@ impl PvDatabase {
         let links = self.cp_links_of(self.all_record_names().await);
         // The local edges are registered by `process_cp_links_on_connect`,
         // C's connect: a source processed before it (PINI) reaches no holder.
-        let ext_count = links.iter().filter(|(_, _, e)| e.external).count();
+        let ext_count = links.iter().filter(|(_, _, e)| e.external()).count();
         let db_count = links.len() - ext_count;
         self.set_cp_links(true, &links);
         if db_count > 0 {
@@ -4847,14 +4854,14 @@ impl PvDatabase {
         let links = self.cp_links_of(self.iterate_records().into_iter().map(|(h, _)| h));
         self.set_cp_links(false, &links);
         self.inner.cp_links.update(|cp| cp.mark_connected());
-        for (holder, _, edge) in links.iter().filter(|(_, _, e)| !e.external) {
+        for (holder, _, edge) in links.iter().filter(|(_, _, e)| !e.external()) {
             self.cp_event(holder, edge.passive_only);
         }
     }
 
     /// A put of `record.field` posted that field: every local CP/CPP link
     /// reading it gets its monitor event. Called once the put's gate is down.
-    pub(crate) fn dispatch_put_cp_targets(&self, record: &str, field: &'static str) {
+    pub(crate) fn dispatch_put_cp_targets(&self, record: &[u8], field: &'static str) {
         let source = self.canonical_name(record);
         let holders: Vec<super::CpTarget> = self
             .inner
@@ -4870,7 +4877,7 @@ impl PvDatabase {
 
     /// One local CP/CPP link's monitor event (its connect is the first),
     /// which processes the holder, a CPP holder only while Passive.
-    fn cp_event(&self, holder: &str, passive_only: bool) {
+    fn cp_event(&self, holder: &[u8], passive_only: bool) {
         let Some((name, rec)) = self.lookup_record(holder) else {
             return;
         };
@@ -4887,7 +4894,7 @@ impl PvDatabase {
     /// [`Self::setup_external_link_opens`] does at iocInit — whose connect
     /// processes a CP holder like the connect pass. A link the put removed
     /// and never added opens nothing. Called once the put's gate is down.
-    pub(crate) fn relink_cp_link(&self, holder: &str, field: &str) {
+    pub(crate) fn relink_cp_link(&self, holder: &[u8], field: &str) {
         if !self.inner.cp_links.load().connected() {
             return;
         }
@@ -4912,7 +4919,7 @@ impl PvDatabase {
         for external in [false, true] {
             let keyed = edge
                 .as_ref()
-                .filter(|e| e.external == external)
+                .filter(|e| e.external() == external)
                 .map(|e| self.cp_source(e));
             let registry = if external {
                 &self.inner.external_cp_links
@@ -4922,8 +4929,11 @@ impl PvDatabase {
             registry.update(|cp| cp.set_link(&holder, &field, keyed));
         }
         match edge {
-            Some(e) if e.external => {
-                let _ = self.resolve_external_pv(external_cp_key(&e.source));
+            Some(CpEdge {
+                source: CpEdgeSource::External(pv),
+                ..
+            }) => {
+                let _ = self.resolve_external_pv(external_cp_key(&pv));
             }
             Some(e) => self.cp_event(&holder, e.passive_only),
             None => {}
@@ -5227,22 +5237,25 @@ mod nonlocal_db_link_write_tests {
     }
     #[async_trait::async_trait]
     impl LinkSet for RecordingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
         async fn put_value(
             &self,
-            name: &str,
+            name: &[u8],
             value: EpicsValue,
             _op: LinkPutOp,
         ) -> Result<(), String> {
-            self.puts.lock().unwrap().push((name.to_string(), value));
+            self.puts
+                .lock()
+                .unwrap()
+                .push((String::from_utf8_lossy(name).into_owned(), value));
             Ok(())
         }
     }
@@ -5333,17 +5346,20 @@ mod nonlocal_db_link_write_tests {
     }
     #[async_trait::async_trait]
     impl LinkSet for ForwardingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             self.connected
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn scan_forward(&self, name: &str) -> Result<(), String> {
-            self.forwards.lock().unwrap().push(name.to_string());
+        fn scan_forward(&self, name: &[u8]) -> Result<(), String> {
+            self.forwards
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(name).into_owned());
             if self.connected {
                 Ok(())
             } else {
@@ -5500,7 +5516,7 @@ mod cp_link_locality_tests {
             .unwrap();
         {
             let rec = db.get_record("HOLDER").unwrap();
-            rec.write().common.text.inp = "OTHER:PV CP".to_string();
+            rec.write().common.text.inp = "OTHER:PV CP".into();
         }
 
         db.initialize_link_locality().await;
@@ -5518,7 +5534,8 @@ mod cp_link_locality_tests {
         assert!(
             db.external_cp_pv_names()
                 .await
-                .contains(&"OTHER:PV".to_string()),
+                .iter()
+                .any(|n| n == "OTHER:PV"),
             "non-local CP link must be registered as an external CP trigger"
         );
     }
@@ -5556,7 +5573,7 @@ mod cp_link_locality_tests {
         {
             let rec = db.get_record("HOLDER").unwrap();
             let mut inst = rec.write();
-            inst.common.text.inp = "SRC CP".to_string();
+            inst.common.text.inp = "SRC CP".into();
             // Seed the parse cache as load would, so the assertion proves
             // setup_cp_links leaves a local CP link untouched.
             inst.install_link_cache(
@@ -5577,7 +5594,7 @@ mod cp_link_locality_tests {
              CA link); got {inp:?}"
         );
         assert!(
-            !db.external_cp_pv_names().await.contains(&"SRC".to_string()),
+            !db.external_cp_pv_names().await.iter().any(|n| n == "SRC"),
             "a local CP target must not be registered as an external CP link"
         );
         assert!(
@@ -5606,24 +5623,24 @@ mod cp_link_locality_tests {
         let src = db.get_record("SRC").unwrap();
 
         assert!(
-            !db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
+            !db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
             "no CP edge names SRC yet"
         );
         assert!(
-            !db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
+            !db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
             "the second ask is the cached one and must answer the same"
         );
 
         db.register_cp_link("SRC", "HOLDER", "INP", false).await;
         assert!(
-            db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
+            db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
             "the registration moved the registry revision, so the cached \
              `false` must not have survived it"
         );
 
         db.remove_record("HOLDER").await;
         assert!(
-            !db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
+            !db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
             "removing the holder drops the edge, and the same revision gate \
              must expire the cached `true`"
         );
@@ -5660,17 +5677,17 @@ mod external_link_pv_name_tests {
 
         // Two records, one upstream PV, two spellings: the bare ` CA`
         // modifier and the explicit scheme. One registry entry.
-        db.get_record("IN1").unwrap().write().common.text.inp = "UP:ZED CP".to_string();
-        db.get_record("IN2").unwrap().write().common.text.inp = "ca://UP:ZED CP".to_string();
+        db.get_record("IN1").unwrap().write().common.text.inp = "UP:ZED CP".into();
+        db.get_record("IN2").unwrap().write().common.text.inp = "ca://UP:ZED CP".into();
         // An OUT link reaches `dbCaAddLink` in C exactly as an IN link does.
-        db.get_record("OUT1").unwrap().write().common.text.out = "ca://UP:ALPHA".to_string();
+        db.get_record("OUT1").unwrap().write().common.text.out = "ca://UP:ALPHA".into();
         // A link to a record this IOC does have is local and must not count.
         db.get_record("LOCAL_HOLDER")
             .unwrap()
             .write()
             .common
             .text
-            .inp = "LOCAL_SRC CP".to_string();
+            .inp = "LOCAL_SRC CP".into();
 
         db.initialize_link_locality().await;
 
@@ -5715,8 +5732,8 @@ mod nonlocal_db_link_read_tests {
     async fn plain_nonlocal_db_link_reads_via_external_resolver() {
         let db = PvDatabase::new();
         // Stand-in for the calink/pvalink lset: resolve OTHER:PV remotely.
-        db.set_external_resolver(Arc::new(|name: &str| {
-            (name == "OTHER:PV").then_some(EpicsValue::Double(42.0))
+        db.set_external_resolver(Arc::new(|name: &[u8]| {
+            (name == b"OTHER:PV").then_some(EpicsValue::Double(42.0))
         }))
         .await;
 
@@ -5745,8 +5762,8 @@ mod nonlocal_db_link_read_tests {
     #[epics_macros_rs::epics_test]
     async fn nonlocal_db_link_value_and_alarm_via_external() {
         let db = PvDatabase::new();
-        db.set_external_resolver(Arc::new(|name: &str| {
-            (name == "OTHER:PV").then_some(EpicsValue::Double(5.0))
+        db.set_external_resolver(Arc::new(|name: &[u8]| {
+            (name == b"OTHER:PV").then_some(EpicsValue::Double(5.0))
         }))
         .await;
 
@@ -5774,7 +5791,7 @@ mod nonlocal_db_link_read_tests {
         db.add_pv("SRC", EpicsValue::Double(7.0)).await.unwrap();
         // A resolver returning a DIFFERENT value proves the local read
         // wins and the external path is not taken for a local target.
-        db.set_external_resolver(Arc::new(|_name: &str| Some(EpicsValue::Double(-1.0))))
+        db.set_external_resolver(Arc::new(|_name: &[u8]| Some(EpicsValue::Double(-1.0))))
             .await;
 
         let link = parse_link_v2("SRC");
@@ -5957,7 +5974,7 @@ mod link_metadata_tests {
         // key is `DbLink::pvname` — the link text itself, so two links whose
         // text differs stay separate entries even when they address the same
         // field.
-        visited.insert("SRC".to_string());
+        visited.insert("SRC".into());
         assert_eq!(
             db.link_metadata(&link, &mut visited),
             None,
@@ -6001,16 +6018,16 @@ mod no_reactor_gate_tests {
 
     #[async_trait::async_trait]
     impl LinkSet for WillingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn put_admission(&self, _: &str) -> PutAdmission {
+        fn put_admission(&self, _: &[u8]) -> PutAdmission {
             PutAdmission::Connected
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+        async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
             Ok(())
         }
     }
@@ -6042,7 +6059,7 @@ mod no_reactor_gate_tests {
         .expect("a plain test thread is blockable");
 
         let err = db
-            .external_put_admitted("ca://SOME:PV")
+            .external_put_admitted(b"ca://SOME:PV")
             .expect_err("a database with no reactor must refuse the external put");
         assert!(
             err.to_string().contains("no tokio runtime"),
@@ -6110,7 +6127,7 @@ mod db_link_addr_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let cycle = db.clone();
         std::thread::spawn(move || {
-            let r = cycle.process_record_with_links_sync("RD", &mut ProcStack::new());
+            let r = cycle.process_record_with_links_sync(b"RD", &mut ProcStack::new());
             let v = read(&cycle, &link);
             let _ = tx.send((r.is_ok(), v));
         });
@@ -6215,8 +6232,8 @@ mod db_link_addr_tests {
     #[epics_macros_rs::epics_test]
     async fn a_removed_target_falls_through_to_the_external_path() {
         let db = PvDatabase::new();
-        db.set_external_resolver(Arc::new(|name: &str| {
-            (name == "SRC").then_some(EpicsValue::Double(9.0))
+        db.set_external_resolver(Arc::new(|name: &[u8]| {
+            (name == b"SRC").then_some(EpicsValue::Double(9.0))
         }))
         .await;
         db.add_record("SRC", Box::new(AiRecord::new(1.0)))
@@ -6594,7 +6611,7 @@ mod db_link_addr_tests {
             ("HEX", LinkReadAs::Enum, None),
             ("M", LinkReadAs::Enum, Some(EpicsValue::Enum(2))),
         ] {
-            let parsed = parse_link_v2(&format!("{text} MS"));
+            let parsed = parse_link_v2(format!("{text} MS"));
             let ParsedLink::Db(link) = &parsed else {
                 panic!("{text} parses to a Db link");
             };
@@ -6659,7 +6676,7 @@ mod record_link_uses_tests {
 
     fn instance(rtype: &str) -> RecordInstance {
         let record = crate::server::db_loader::create_record(rtype).unwrap();
-        RecordInstance::new_boxed("R".into(), record)
+        RecordInstance::new_boxed("R", record)
     }
 
     #[test]
@@ -6681,18 +6698,31 @@ mod record_link_uses_tests {
 /// One CP/CPP link's trigger: the source it watches, and whether that source
 /// is served here or by a link set.
 struct CpEdge {
-    external: bool,
-    source: String,
+    source: CpEdgeSource,
     /// The put-posted source field it reads ([`super::put_posted_field`]).
     put_field: Option<&'static str>,
     passive_only: bool,
 }
 
+/// Where a [`CpEdge`]'s source is served.
+enum CpEdgeSource {
+    /// A record here, by the bytes its link names.
+    Local(RecordName),
+    /// A link set's channel, by its link text.
+    External(RecordName),
+}
+
+impl CpEdge {
+    fn external(&self) -> bool {
+        matches!(self.source, CpEdgeSource::External(_))
+    }
+}
+
 /// The external registry's key: the PV the calink/pvalink monitor dispatches
 /// under, which the lset has stripped of its scheme.
-fn external_cp_key(pv: &str) -> &str {
-    pv.strip_prefix("ca://")
-        .or_else(|| pv.strip_prefix("pva://"))
+fn external_cp_key(pv: &[u8]) -> &[u8] {
+    pv.strip_prefix(b"ca://")
+        .or_else(|| pv.strip_prefix(b"pva://"))
         .unwrap_or(pv)
 }
 /// Why [`PvDatabase::write_external_pv`] staged nothing.
@@ -6707,10 +6737,11 @@ pub(crate) enum ExternalPutRefusal {
 
 impl ExternalPutRefusal {
     /// What the refusal owes the errlog: nothing for a down link, as in C.
-    pub(crate) fn report(&self, name: &str) {
+    pub(crate) fn report(&self, name: &[u8]) {
         if let Self::Unserviceable(why) = self {
             crate::runtime::log::errlog_vprintf(format_args!(
-                "OUT-link write to external PV '{name}' failed: {why}\n"
+                "OUT-link write to external PV '{}' failed: {why}\n",
+                String::from_utf8_lossy(name)
             ));
         }
     }
@@ -6742,7 +6773,7 @@ mod out_link_held_set_tests {
     fn point_out(db: &PvDatabase, from: &str, to: &str) {
         let rec = db.get_record(from).expect("record");
         let mut inst = rec.write();
-        inst.common.text.out = to.to_string();
+        inst.common.text.out = to.into();
         inst.set_link_cache("OUT", parse_link_field(to, LinkFieldType::Out));
     }
 
@@ -6763,9 +6794,9 @@ mod out_link_held_set_tests {
         db.build_lock_sets();
         point_out(&db, "HS:SO", "HS:OUT.VAL PP");
         let members = |r: &str| db.lock_set_of(r).expect("a set").members;
-        assert!(members("HS:SI").contains(&"HS:IN".to_string()));
+        assert!(members("HS:SI").iter().any(|n| n == "HS:IN"));
         assert!(
-            !members("HS:SO").contains(&"HS:OUT".to_string()),
+            !members("HS:SO").iter().any(|n| n == "HS:OUT"),
             "the precondition: HS:OUT is outside HS:SO's set"
         );
 
@@ -6817,7 +6848,8 @@ mod enum_read_held_set_tests {
             !db.lock_set_of("OTHER")
                 .unwrap()
                 .members
-                .contains(&"BSRC".to_string())
+                .iter()
+                .any(|n| n == "BSRC")
         );
         let mut posts = db
             .get_record("BSRC")
@@ -6836,7 +6868,7 @@ mod enum_read_held_set_tests {
             let held = db.lock_record(reader);
             let (fetch, _) = db.read_link_value_as_with_alarm(
                 Some(held.set()),
-                &parse_link_v2(&format!("BSRC.{field} NPP")),
+                &parse_link_v2(format!("BSRC.{field} NPP")),
                 LinkReadAs::Enum,
                 &mut ProcStack::new(),
             );
@@ -6877,13 +6909,13 @@ mod external_forward_borrow_tests {
 
     #[async_trait::async_trait]
     impl LinkSet for CountAtForward {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        fn scan_forward(&self, _: &str) -> Result<(), String> {
+        fn scan_forward(&self, _: &[u8]) -> Result<(), String> {
             if let Some(link) = &*self.watched.lock().unwrap() {
                 self.seen.lock().unwrap().push(Arc::strong_count(link));
             }
@@ -7022,7 +7054,7 @@ record(fanout, "F") { field(LNK1, "T") }
             .await
             .unwrap();
         let mut fan = FanoutRecord::new();
-        fan.lnk1 = "LATE".to_string();
+        fan.lnk1 = "LATE".into();
         db.add_record("U", Box::new(fan)).await.unwrap();
         assert!(
             matches!(*flnk(&db), ParsedLink::Ca(_)),

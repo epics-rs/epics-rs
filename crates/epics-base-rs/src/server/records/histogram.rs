@@ -1,3 +1,4 @@
+use crate::types::PvString;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::error::{CaError, CaResult};
@@ -44,7 +45,7 @@ pub struct HistogramRecord {
     /// then holds. The port had no SVL at all and drove the record from a
     /// nonexistent INP, so `field(SVL,"MYSIG")` was dropped at load and the
     /// record was inert.
-    pub svl: String,
+    pub svl: PvString,
     pub cmd: i16,   // 0=Read, 1=Clear, 2=Start, 3=Stop
     pub csta: bool, // Counting state — TRUE while counting is enabled
     pub sdel: f64,  // Signal deadband (monitor refresh period, seconds)
@@ -60,9 +61,9 @@ pub struct HistogramRecord {
     // (`RecordInstance::rec_gbl_save_simm` / `rec_gbl_check_simm`), never by
     // the record.
     pub simm: i16,
-    pub siol: String,
+    pub siol: PvString,
     pub sval: f64,
-    pub siml: String,
+    pub siml: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Did `init_record` pass 1 seed SGNL from a CONSTANT SVL? C
@@ -104,7 +105,7 @@ impl Default for HistogramRecord {
             llim,
             wdth: (ulim - llim) / nelm as f64,
             sgnl: 0.0,
-            svl: String::new(),
+            svl: PvString::new(),
             cmd: 0,
             // C init leaves CSTA at its DBD default; the histogram
             // record counts by default (CSTA defaults TRUE) so a
@@ -115,9 +116,9 @@ impl Default for HistogramRecord {
             mdel: 0,
             mcnt: 0,
             simm: 0,
-            siol: String::new(),
+            siol: PvString::new(),
             sval: 0.0,
-            siml: String::new(),
+            siml: PvString::new(),
             sims: 0,
             sdly: -1.0,
             constant_svl_loaded: false,
@@ -658,11 +659,11 @@ impl Record for HistogramRecord {
         Ok(())
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "SVL" => Some(&self.svl),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "SVL" => Some(self.svl.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -767,7 +768,7 @@ impl Record for HistogramRecord {
             }
             "SVL" => match value {
                 EpicsValue::String(s) => {
-                    self.svl = s.as_str_lossy().into_owned();
+                    self.svl = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SVL".into())),
@@ -811,7 +812,7 @@ impl Record for HistogramRecord {
             },
             "SIOL" => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s.as_str_lossy().into_owned();
+                    self.siol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -825,7 +826,7 @@ impl Record for HistogramRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s.as_str_lossy().into_owned();
+                    self.siml = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
@@ -1040,7 +1041,7 @@ mod tests {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
         rec.put_field("SIMM", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(1)));
-        let inst = RecordInstance::new("HIST:SIMM".into(), rec);
+        let inst = RecordInstance::new("HIST:SIMM", rec);
         let snap = inst.snapshot_for_field("SIMM").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
@@ -1106,7 +1107,7 @@ mod tests {
 
         // OLDSIMM is special(SPC_NOMOD), and lives in the common fields (the
         // simulation-mode owner's latch) — readable, not client-writable.
-        let mut inst = RecordInstance::new("HIST:SIM".into(), rec);
+        let mut inst = RecordInstance::new("HIST:SIM", rec);
         assert!(matches!(
             inst.put_common_field("OLDSIMM", EpicsValue::Short(1)),
             Err(CaError::ReadOnlyField(_))

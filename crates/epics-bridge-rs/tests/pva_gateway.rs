@@ -31,6 +31,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::types::RecordName;
+
 /// The executor a test body spawns on. Every `#[tokio::test]` here is
 /// already inside one; the gateway constructors now take it by value
 /// instead of looking it up behind the caller's back.
@@ -818,7 +820,7 @@ async fn br_r6_gateway_typed_put_passthrough() {
         );
         s
     });
-    src.put_value("BR:R6:PV", put_value)
+    src.put_value(b"BR:R6:PV", put_value)
         .await
         .expect("typed structure PUT through gateway source must succeed");
 
@@ -877,14 +879,14 @@ async fn gateway_is_writable_proxies_upstream_connection_not_cache_presence() {
     // monitor. The pre-fix `self.cache.peek(name).is_some()` returned false on
     // this cold-cache probe; the connection-state proxy returns true.
     assert!(
-        src.is_writable("GW:WR:PV").await,
+        src.is_writable(b"GW:WR:PV").await,
         "is_writable must proxy the connectable upstream channel (cold cache)"
     );
 
     // A PV no upstream serves cannot be connected, so it is not writable — the
     // probe fails within `connect_timeout` rather than reporting a stale flag.
     assert!(
-        !src.is_writable("GW:NOSUCH:PV").await,
+        !src.is_writable(b"GW:NOSUCH:PV").await,
         "is_writable must be false for a PV the gateway cannot connect to"
     );
 }
@@ -944,7 +946,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     // directly, so 1.0 is NOT delivered here — the regression guarded is
     // that live UPDATES flow through the typed broadcast.
     let mut rx = src
-        .subscribe("BR:R41:PV")
+        .subscribe(b"BR:R41:PV")
         .await
         .expect("subscribe must return Some for a known PV");
 
@@ -1509,36 +1511,36 @@ fn array_doubles(field: &PvField) -> Vec<f64> {
 }
 
 impl ChannelSource for UpstreamArraySource {
-    async fn list_pvs(&self) -> Vec<String> {
-        vec![self.pv.clone()]
+    async fn list_pvs(&self) -> Vec<RecordName> {
+        vec![self.pv.as_str().into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let matches = n == self.pv;
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let matches = n == self.pv.as_bytes();
         async move { matches }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
             fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
         })
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(doubles_field(&self.data.lock().unwrap()))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Ok(())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 
-    async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {
+    async fn channel_array_init(&self, _: &[u8], _: ChannelContext) -> Result<FieldDesc, OpError> {
         Ok(FieldDesc::ScalarArray(ScalarType::Double))
     }
     async fn channel_array_get(
@@ -1821,25 +1823,25 @@ fn has_record_member(req: &PvField) -> bool {
 }
 
 impl ChannelSource for RecordingDoublingSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let n = self.pv_name.clone();
-        async move { vec![n] }
+        async move { vec![n.into()] }
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let want = self.pv_name.clone();
-        let got = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone().into_bytes();
+        let got = n.to_vec();
         async move { got == want }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(nt_double_desc())
     }
-    fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, _: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let v = *self.value.lock().unwrap();
         async move { Some(nt_double_value(v)) }
     }
     fn put_value(
         &self,
-        _: &str,
+        _: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let store = self.value.clone();
@@ -1850,12 +1852,12 @@ impl ChannelSource for RecordingDoublingSource {
             Ok(())
         }
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -2045,19 +2047,19 @@ fn partial_value() -> PvField {
 }
 
 impl ChannelSource for PartialReadSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let n = self.pv_name.clone();
-        async move { vec![n] }
+        async move { vec![n.into()] }
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let want = self.pv_name.clone();
-        let got = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone().into_bytes();
+        let got = n.to_vec();
         async move { got == want }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(partial_desc())
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(partial_value())
     }
     async fn read_checked(
@@ -2071,15 +2073,15 @@ impl ChannelSource for PartialReadSource {
             vec!["value".to_string()],
         ))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err(OpError::denied("read-only fixture"))
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -2173,19 +2175,19 @@ struct MarkedMonitorSource {
 }
 
 impl ChannelSource for MarkedMonitorSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let n = self.pv_name.clone();
-        async move { vec![n] }
+        async move { vec![n.into()] }
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let want = self.pv_name.clone();
-        let got = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone().into_bytes();
+        let got = n.to_vec();
         async move { got == want }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(partial_desc())
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(partial_value())
     }
     /// The monitor seed: `value` assigned, `spare` not.
@@ -2211,15 +2213,15 @@ impl ChannelSource for MarkedMonitorSource {
         self.updates.lock().unwrap().push(tx);
         Some(epics_pva_rs::server_native::MonitorStream::Channel(rx))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err(OpError::denied("read-only fixture"))
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -2271,7 +2273,7 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
         log: Default::default(),
     };
     let checked = src
-        .revalidate_read(pv, ctx.clone())
+        .revalidate_read(pv.as_bytes(), ctx.clone())
         .await
         .expect("read must be allowed by the default gate");
 
@@ -2316,28 +2318,28 @@ impl RefusingUpstream {
 }
 
 impl ChannelSource for RefusingUpstream {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         vec![Self::PV.into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let matches = n == Self::PV;
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let matches = n == Self::PV.as_bytes();
         async move { matches }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(nt_double_desc())
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(nt_double_value(1.0))
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err(OpError::remote(Self::refusal()))
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }

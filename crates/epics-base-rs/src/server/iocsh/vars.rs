@@ -322,11 +322,13 @@ fn cmd_var() -> CommandDef {
         ),
         |args: &[ArgValue], ctx: &CommandContext| {
             let name = match args.first() {
-                Some(ArgValue::String(s)) => Some(s.as_str()),
+                Some(ArgValue::String(s)) => Some(s),
                 _ => None,
             };
+            // `strtol`/`epicsStrtod` read bytes; a non-UTF-8 one is no
+            // digit to either parser.
             let value = match args.get(1) {
-                Some(ArgValue::String(s)) => Some(s.as_str()),
+                Some(ArgValue::String(s)) => Some(s.to_str_lossy()),
                 _ => None,
             };
             let table = VARIABLES.lock().unwrap_or_else(|e| e.into_inner());
@@ -360,14 +362,18 @@ fn cmd_var() -> CommandDef {
             };
 
             // With a value the name is looked up exactly, not globbed.
-            let Some(def) = name.and_then(|name| table.get(name)) else {
+            let Some(def) = name
+                .and_then(|name| name.to_str().ok())
+                .and_then(|name| table.get(name))
+            else {
                 // The set path's own sentence, unframed for the same
                 // reason (`iocsh.cpp:1468-1472`).
-                ctx.eprintln(&format!("No known var '{}'.", name.unwrap_or_default()));
+                let name = name.map(|n| n.to_str_lossy()).unwrap_or_default();
+                ctx.eprintln(&format!("No known var '{name}'."));
                 return Ok(CommandOutcome::Failed);
             };
             match &def.access {
-                VarAccess::Int { set, .. } => match strtol_base0(value) {
+                VarAccess::Int { set, .. } => match strtol_base0(&value) {
                     Some(parsed) => set(parsed),
                     // C leaves the variable alone and prints, but does
                     // not fail the command (`varHandler` never calls
@@ -378,12 +384,13 @@ fn cmd_var() -> CommandDef {
                 },
                 // C reaches `epicsStrtod` from here and from `cvtArg`
                 // alike, so both go through the one port of it.
-                VarAccess::Double { set, .. } => match super::registry::epics_strtod_whole(value) {
-                    Some(parsed) => set(parsed),
-                    None => {
-                        ctx.eprintln(&format!("Invalid double, var '{}' not changed.", def.name))
+                VarAccess::Double { set, .. } => {
+                    match super::registry::epics_strtod_whole(&value) {
+                        Some(parsed) => set(parsed),
+                        None => ctx
+                            .eprintln(&format!("Invalid double, var '{}' not changed.", def.name)),
                     }
-                },
+                }
             }
             Ok(CommandOutcome::Continue)
         },
@@ -418,7 +425,7 @@ mod tests {
         let mut reg = CommandRegistry::new();
         super::super::commands::register_builtins(&mut reg);
         let cmd = reg.get("var").expect("`var` must be registered").clone();
-        let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let out_tmp = tempfile::NamedTempFile::new().unwrap();
         let err_tmp = tempfile::NamedTempFile::new().unwrap();
@@ -695,7 +702,7 @@ mod tests {
             .get("scanParallelThreads")
             .expect("`scanParallelThreads` must be registered")
             .clone();
-        let tokens: Vec<String> = ["0", "-1"].iter().map(|t| (*t).to_string()).collect();
+        let tokens: Vec<IocshString> = ["0", "-1"].iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),

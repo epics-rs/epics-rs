@@ -524,7 +524,7 @@ impl HscHolder {
             "simHscCreate(port, [pollMs]) - Create a simulated HSC-1 slit controller",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("port must be a string".into()),
                 };
                 let poll_ms = match &args[1] {

@@ -75,7 +75,7 @@ async fn every_reader_renders_the_source_get_enum_str() {
             db.process_record_with_links(&name, &mut stack)
                 .await
                 .unwrap();
-            let got = text(db.get_pv(&format!("{name}.VAL")).unwrap());
+            let got = text(db.get_pv(format!("{name}.VAL")).unwrap());
             assert_eq!(String::from_utf8_lossy(&got), expected, "{name}");
         }
     }

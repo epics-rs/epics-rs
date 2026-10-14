@@ -69,19 +69,19 @@ impl ReadGateLset {
 impl LinkSet for ReadGateLset {
     /// Always up: C's lset `isConnected` (`dbCa.c:604-612`) returns
     /// `pca->isConnected` alone — READ-access loss does not disconnect.
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
 
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
         self.readable().then(|| self.cached.clone())
     }
 
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         self.readable().then(|| self.cached.clone())
     }
 
-    async fn connect_link(&self, _: &str) {}
+    async fn connect_link(&self, _: &[u8]) {}
 }
 
 fn alarm_of(db: &PvDatabase, name: &str) -> (u16, u16) {
@@ -99,7 +99,7 @@ async fn holder_db(lset: Arc<ReadGateLset>) -> PvDatabase {
     {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.common.text.inp = "ca://UP:PV CP".to_string();
+        inst.common.text.inp = "ca://UP:PV CP".into();
         inst.install_link_cache(
             "INP",
             std::sync::Arc::new(epics_base_rs::server::record::parse_link_v2(

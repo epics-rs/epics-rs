@@ -207,7 +207,7 @@ pub enum ServerConnectionEvent {
     /// transitions (see `ca_gateway::cache::GwPvEntry::add_subscriber`).
     ChannelCreated {
         peer: SocketAddr,
-        pv_name: Arc<str>,
+        pv_name: Arc<[u8]>,
         cid: u32,
     },
     /// `CA_PROTO_CLEAR_CHANNEL` (or implicit teardown) closed a channel
@@ -215,7 +215,7 @@ pub enum ServerConnectionEvent {
     /// [`Self::ChannelCreated`] event one-to-one. Reverse of that event.
     ChannelCleared {
         peer: SocketAddr,
-        pv_name: Arc<str>,
+        pv_name: Arc<[u8]>,
         cid: u32,
     },
     /// `CA_PROTO_EVENT_ADD` accepted; a new subscription is live.
@@ -230,7 +230,7 @@ pub enum ServerConnectionEvent {
     /// (`gatePv.cc:1749-1752`).
     SubscriptionOpened {
         peer: SocketAddr,
-        pv_name: Arc<str>,
+        pv_name: Arc<[u8]>,
         sub_id: u32,
         mask: u16,
     },
@@ -240,7 +240,7 @@ pub enum ServerConnectionEvent {
     /// count.
     SubscriptionClosed {
         peer: SocketAddr,
-        pv_name: Arc<str>,
+        pv_name: Arc<[u8]>,
         sub_id: u32,
     },
 }
@@ -286,18 +286,20 @@ impl ChannelTarget {
     /// every channel-scoped `send_err` carries, and what libca prints as the
     /// exception block's `ctx=`. It is the record's name, never `REC.FIELD`.
     /// Read without the record's lock set.
-    pub(crate) fn rsrv_record_name(&self) -> &str {
+    pub(crate) fn rsrv_record_name(&self) -> &[u8] {
         match self {
-            ChannelTarget::SimplePv(pv) => &pv.name,
+            ChannelTarget::SimplePv(pv) => pv.name.as_bytes(),
             ChannelTarget::RecordField { record, .. } => record.name(),
         }
     }
 
     /// The name the audit log and the trap-write listeners record: `REC.FIELD`.
-    fn audit_name(&self) -> String {
+    fn audit_name(&self) -> Vec<u8> {
         match self {
-            ChannelTarget::SimplePv(pv) => pv.name.clone(),
-            ChannelTarget::RecordField { record, field } => format!("{}.{}", record.name(), field),
+            ChannelTarget::SimplePv(pv) => pv.name.to_vec(),
+            ChannelTarget::RecordField { record, field } => {
+                [&record.name()[..], b".", field.as_bytes()].concat()
+            }
         }
     }
 
@@ -668,7 +670,7 @@ struct ChannelEntry {
     /// `.FIELD` suffix). Retained so the `ChannelCleared` lifecycle
     /// event can emit the same name as `ChannelCreated`, and shared with
     /// every lifecycle event rather than copied into it.
-    pv_name: Arc<str>,
+    pv_name: Arc<[u8]>,
     /// Raw channel-filter JSON suffix the client appended after the
     /// record (epics-base 3.15.7). `None` for ordinary channels;
     /// `Some` when the client requested `REC.{"dbnd":{"d":0.5}}`
@@ -1170,7 +1172,7 @@ impl ClientState {
         self.event_user.clone()
     }
 
-    fn audit(&self, event: &str, pv: &str, value: &str, result: &str) {
+    fn audit(&self, event: &str, pv: impl AsRef<[u8]>, value: &str, result: &str) {
         if let Some(ref logger) = self.audit {
             logger.log(crate::audit::AuditEvent {
                 event,
@@ -1178,7 +1180,7 @@ impl ClientState {
                 // The audit log is Rust-only JSON, which needs text.
                 user: &String::from_utf8_lossy(&self.username),
                 host: &String::from_utf8_lossy(self.hostname.as_bytes()),
-                pv,
+                pv: &String::from_utf8_lossy(pv.as_ref()),
                 value,
                 result,
             });
@@ -2957,21 +2959,7 @@ pub(crate) async fn dispatch_message(
                 .position(|&b| b == 0)
                 .unwrap_or(scan_end);
             let client_cid = hdr.cid;
-            // A non-UTF-8 name names no PV in the UTF-8-keyed database (C
-            // compares the bytes, and so finds none either).
-            let Ok(pv_name) = std::str::from_utf8(&payload[..end]) else {
-                let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
-                fail.cid = client_cid;
-                writer.push(fail.to_bytes().to_vec());
-                state.audit(
-                    "create_chan",
-                    &String::from_utf8_lossy(&payload[..end]),
-                    "",
-                    "not_found",
-                );
-                return Ok(());
-            };
-            let pv_name = pv_name.to_string();
+            let pv_name = &payload[..end];
             // epics-base 3.15.7 channel-filter suffix
             // (`REC.{"dbnd":{"d":0.5}}`). Split the JSON suffix off
             // for the record lookup, but keep `pv_name` verbatim so
@@ -2987,10 +2975,10 @@ pub(crate) async fn dispatch_message(
             // missed the record entirely. `long_string` makes every delivery
             // path convert the value to DBR_CHAR with a NUL terminator.
             let parsed_channel =
-                epics_base_rs::server::database::filters::parse_channel_name(&pv_name);
+                epics_base_rs::server::database::filters::parse_channel_name(pv_name);
             let filter_suffix = parsed_channel.json_suffix;
             let long_string = parsed_channel.string_view;
-            let record_path = parsed_channel.record_path.as_str();
+            let record_path = parsed_channel.record_path.as_slice();
             let field = parsed_channel.field.clone();
 
             // thread the connection peer into the search
@@ -3003,27 +2991,27 @@ pub(crate) async fn dispatch_message(
                 // C `dbChannelCreate` returning NULL — a field or `$` the
                 // record refuses, or a filter suffix `chf_parse` stops on —
                 // is CREATE_CH_FAIL on the CA wire.
-                let channel =
-                    match epics_base_rs::server::database::filters::db_channel_create(db, &pv_name)
-                    {
-                        Ok(channel) => channel,
-                        Err(e) => {
-                            tracing::debug!(
-                                pv = %pv_name,
-                                error = %e,
-                                "rejecting CREATE_CHAN: dbChannelCreate failed",
-                            );
-                            let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
-                            fail.cid = client_cid;
-                            writer.push(fail.to_bytes().to_vec());
-                            let reason = match e {
-                                ChannelCreateError::NotFound => "not_found",
-                                ChannelCreateError::Filter(_) => "filter_parse_fail",
-                            };
-                            state.audit("create_chan", &pv_name, "", reason);
-                            return Ok(());
-                        }
-                    };
+                let channel = match epics_base_rs::server::database::filters::db_channel_create(
+                    db, pv_name,
+                ) {
+                    Ok(channel) => channel,
+                    Err(e) => {
+                        tracing::debug!(
+                            pv = %String::from_utf8_lossy(pv_name),
+                            error = %e,
+                            "rejecting CREATE_CHAN: dbChannelCreate failed",
+                        );
+                        let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                        fail.cid = client_cid;
+                        writer.push(fail.to_bytes().to_vec());
+                        let reason = match e {
+                            ChannelCreateError::NotFound => "not_found",
+                            ChannelCreateError::Filter(_) => "filter_parse_fail",
+                        };
+                        state.audit("create_chan", pv_name, "", reason);
+                        return Ok(());
+                    }
+                };
 
                 let (dbr_type, element_count, target, long_string_mode) = match entry {
                     PvEntry::Simple(pv) => {
@@ -3267,7 +3255,7 @@ pub(crate) async fn dispatch_message(
                     _ => AccessLevel::NoAccess,
                 };
 
-                let shared_name: Arc<str> = pv_name.as_str().into();
+                let shared_name: Arc<[u8]> = pv_name.into();
                 state.channels.insert(
                     sid,
                     ChannelEntry {
@@ -3323,7 +3311,7 @@ pub(crate) async fn dispatch_message(
                     AccessLevel::NoAccess => "denied",
                     _ => "ok",
                 };
-                state.audit("create_chan", &pv_name, "", result);
+                state.audit("create_chan", pv_name, "", result);
 
                 // Notify subscribers (e.g. ca_gateway tracking PV → client
                 // attachments for `Active`/`Inactive` state transitions).
@@ -3343,7 +3331,7 @@ pub(crate) async fn dispatch_message(
                 fail.cid = client_cid;
                 writer.push(fail.to_bytes().to_vec());
 
-                state.audit("create_chan", &pv_name, "", "not_found");
+                state.audit("create_chan", pv_name, "", "not_found");
             }
         }
 
@@ -4069,9 +4057,7 @@ pub(crate) async fn dispatch_message(
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(scan_end);
-            // A non-UTF-8 name names no PV in the UTF-8-keyed database (C
-            // compares the bytes, and so finds none either).
-            let pv_name = std::str::from_utf8(&payload[..end]);
+            let pv_name = &payload[..end];
 
             // Thread the connection peer into the existence check just
             // like TCP CREATE_CHANNEL (`find_entry_from(.., Some(peer))`)
@@ -4081,11 +4067,7 @@ pub(crate) async fn dispatch_message(
             // host's TCP SEARCH could resolve (and lazily instantiate) a
             // PV the pvlist forbids — parity with C `pvExistTest` passing
             // the client host to `gateAs::findEntry`.
-            let found = match pv_name {
-                Ok(name) => db.has_name_from(name, Some(peer)).await,
-                Err(_) => false,
-            };
-            if found {
+            if db.has_name_from(pv_name, Some(peer)).await {
                 // C parity: `search_reply_tcp`
                 // (`rsrv/camessage.c:2275-2277`) sends:
                 //   m_postsize  = 0  (no payload — TCP search reply
@@ -4498,7 +4480,7 @@ pub(crate) async fn serve_write_head(
         }
         let result = match &entry.target {
             ChannelTarget::RecordField { record, field } => {
-                let name: &str = record.name();
+                let name: &[u8] = record.name();
                 // Alarm-ack puts are immediate in C even for the
                 // notify variant — `rsrv/camessage.c` writes ACKT/
                 // ACKS via `dbPutField` and replies straight away,
@@ -4993,7 +4975,7 @@ pub(crate) async fn serve_write_head(
                     }
                 }
                 ChannelTarget::RecordField { record, field } => {
-                    let name: &str = record.name();
+                    let name: &[u8] = record.name();
                     // A `$` channel puts by its `$` name, which the database
                     // resolves to C's DBR_CHAR address of the field.
                     let dollar;
@@ -5217,7 +5199,7 @@ pub(crate) struct PendingWriteNotify {
     /// record it parked on. `None` for a simple PV, which has no `dbCommon`
     /// and so no `ppn` slot to release. C carries the equivalent as
     /// `pciu->pPutNotify`'s `dbChannel`.
-    cancel: Option<(Arc<PvDatabase>, Arc<str>)>,
+    cancel: Option<(Arc<PvDatabase>, epics_base_rs::types::RecordName)>,
 }
 
 /// C `rsrvFreePutNotify` (`rsrv/camessage.c:1630-1638`): a client torn down
@@ -7473,7 +7455,7 @@ mod delivery_reads_options {
         let got = deliver(&m, posted(&db, 2.0, 0, 0)).await;
         assert_eq!(got.class_name.as_deref(), Some("ai"));
 
-        let pv = Arc::new(ProcessVariable::new("S".into(), EpicsValue::Double(0.0)));
+        let pv = Arc::new(ProcessVariable::new("S", EpicsValue::Double(0.0)));
         let m = monitor(&db, ChannelTarget::SimplePv(pv.clone()), DBR_CLASS_NAME);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let event = MonitorEvent::read_log(&mut pv.snapshot(), EventMask::VALUE);
@@ -7788,18 +7770,48 @@ async fn run_write_notify_queue(
     }
 }
 
-/// Truncate `message` to at most `CA_PROTO_ERROR_MAX_DIAG_LEN` bytes
-/// on a char boundary (so the resulting `&str` slice is always valid
-/// UTF-8). `pad_string` appends the NUL terminator and 8-aligns.
-fn truncate_diag(message: &str) -> &str {
-    if message.len() <= CA_PROTO_ERROR_MAX_DIAG_LEN {
-        return message;
+/// A `CA_PROTO_ERROR` diagnostic. C `vsend_err` formats it with `%s`, so a
+/// record name goes on the wire as its bytes.
+pub(crate) trait CaDiag {
+    fn write_to(&self, out: &mut Vec<u8>);
+}
+
+impl CaDiag for [u8] {
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self);
     }
-    let mut end = CA_PROTO_ERROR_MAX_DIAG_LEN;
-    while end > 0 && !message.is_char_boundary(end) {
-        end -= 1;
+}
+
+impl CaDiag for str {
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.as_bytes());
     }
-    &message[..end]
+}
+
+impl CaDiag for String {
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.as_bytes());
+    }
+}
+
+impl CaDiag for std::fmt::Arguments<'_> {
+    fn write_to(&self, out: &mut Vec<u8>) {
+        std::io::Write::write_fmt(out, *self).expect("writing to a Vec cannot fail");
+    }
+}
+
+impl<T: CaDiag + ?Sized> CaDiag for &T {
+    fn write_to(&self, out: &mut Vec<u8>) {
+        (**self).write_to(out);
+    }
+}
+
+impl<A: CaDiag, B: CaDiag, C: CaDiag> CaDiag for (A, B, C) {
+    fn write_to(&self, out: &mut Vec<u8>) {
+        self.0.write_to(out);
+        self.1.write_to(out);
+        self.2.write_to(out);
+    }
 }
 
 /// C `read_reply` frames an update's header from the request before it checks
@@ -7856,8 +7868,8 @@ impl<'a> RefusalChannel<'a> {
         target: None,
     };
 
-    fn pv(&self) -> &'a str {
-        self.target.map_or("", ChannelTarget::rsrv_record_name)
+    fn pv(&self) -> &'a [u8] {
+        self.target.map_or(b"", ChannelTarget::rsrv_record_name)
     }
 }
 
@@ -7895,13 +7907,15 @@ pub(crate) fn send_16k_array_client_err(
         request_hdr,
         ECA_16KARRAYCLIENT,
         *chan.cid,
-        format_args!(
-            "server unable to load {what} response into protocol buffer PV=\"{}\" \
-             dbf={} count={count} avail={} max bytes={}",
+        (
+            format_args!("server unable to load {what} response into protocol buffer PV=\""),
             chan.pv(),
-            request_hdr.data_type,
-            request_hdr.available,
-            crate::protocol::max_array_bytes_buffer(),
+            format_args!(
+                "\" dbf={} count={count} avail={} max bytes={}",
+                request_hdr.data_type,
+                request_hdr.available,
+                crate::protocol::max_array_bytes_buffer(),
+            ),
         ),
         client_minor,
     )
@@ -7969,11 +7983,12 @@ fn refuse_install(
     failure: InstallFailure,
 ) -> epics_base_rs::error::CaError {
     let pv = entry.target.rsrv_record_name();
-    let (context, diagnostic) = match failure {
-        InstallFailure::EventExt => ("no memory to add subscription", pv.to_string()),
+    let (context, before, after) = match failure {
+        InstallFailure::EventExt => ("no memory to add subscription", "", ""),
         InstallFailure::DbAddEvent => (
             "no memory to add subscription to db",
-            format!("subscription install into record {pv} failed"),
+            "subscription install into record ",
+            " failed",
         ),
     };
     log_request(state, hdr, context);
@@ -7982,10 +7997,13 @@ fn refuse_install(
         hdr,
         ECA_ALLOCMEM,
         entry.cid,
-        &diagnostic,
+        (before, pv, after),
         state.client_minor_version,
     );
-    epics_base_rs::error::CaError::Protocol(format!("EVENT_ADD on {pv}: {context}"))
+    epics_base_rs::error::CaError::Protocol(format!(
+        "EVENT_ADD on {}: {context}",
+        String::from_utf8_lossy(pv)
+    ))
 }
 
 /// Push a `CA_PROTO_ERROR` reply into the connection outbox. The connection
@@ -7998,7 +8016,7 @@ pub(crate) fn send_ca_error(
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,
-    message: impl std::fmt::Display,
+    message: impl CaDiag,
     client_minor: u16,
 ) -> CaResult<()> {
     writer.push(build_ca_error_frame(
@@ -8018,17 +8036,15 @@ pub(crate) fn build_ca_error_frame(
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,
-    message: impl std::fmt::Display,
+    message: impl CaDiag,
     client_minor: u16,
 ) -> Vec<u8> {
     // Formatted straight into the one buffer `pad_string` used to allocate, so
-    // a `format_args!` context costs nothing beyond it.
+    // a `format_args!` context costs nothing beyond it. Cut at a byte count,
+    // as `epicsVsnprintf` does.
     let mut error_msg_bytes = Vec::new();
-    std::io::Write::write_fmt(&mut error_msg_bytes, format_args!("{message}"))
-        .expect("writing to a Vec cannot fail");
-    let kept =
-        truncate_diag(std::str::from_utf8(&error_msg_bytes).expect("Display writes UTF-8")).len();
-    error_msg_bytes.truncate(kept);
+    message.write_to(&mut error_msg_bytes);
+    error_msg_bytes.truncate(CA_PROTO_ERROR_MAX_DIAG_LEN);
     error_msg_bytes.push(0);
     error_msg_bytes.resize(align8(error_msg_bytes.len()), 0);
     // C `vsend_err` (`rsrv/camessage.c:201-223`) picks the echo's form from
@@ -8687,7 +8703,7 @@ mod put_notify_serialize_tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == "overdue:trap" {
+            if msg.pv_name == b"overdue:trap" {
                 sink.lock()
                     .unwrap()
                     .push((msg.op, msg.status.map(str::to_owned)));
@@ -8695,7 +8711,7 @@ mod put_notify_serialize_tests {
         }));
 
         let guard = TrapWriteGuard::begin(TrapWriteFields {
-            pv_name: "overdue:trap".to_string(),
+            pv_name: b"overdue:trap".to_vec(),
             user: b"u".to_vec(),
             host: b"h".to_vec(),
             peer: "h:5064".to_string(),
@@ -8728,47 +8744,50 @@ mod put_notify_serialize_tests {
 }
 
 #[cfg(test)]
-mod truncate_diag_tests {
-    use super::{CA_PROTO_ERROR_MAX_DIAG_LEN, truncate_diag};
+mod ca_diag_tests {
+    use super::{CA_PROTO_ERROR_MAX_DIAG_LEN, build_ca_error_frame};
+    use crate::protocol::{CA_MINOR_VERSION, CA_PROTO_READ_NOTIFY, CaHeader, ECA_INTERNAL};
 
-    #[test]
-    fn passes_through_short_message() {
-        let s = "channel limit reached";
-        assert_eq!(truncate_diag(s), s);
+    /// The diagnostic a `CA_PROTO_ERROR` frame carries, up to its NUL.
+    fn diag(message: impl super::CaDiag) -> Vec<u8> {
+        let frame = build_ca_error_frame(
+            &CaHeader::new(CA_PROTO_READ_NOTIFY),
+            ECA_INTERNAL,
+            0,
+            message,
+            CA_MINOR_VERSION,
+        );
+        let body = &frame[2 * CaHeader::SIZE..];
+        body[..body.iter().position(|b| *b == 0).unwrap()].to_vec()
     }
 
     #[test]
-    fn truncates_at_exact_limit() {
-        let s = "x".repeat(CA_PROTO_ERROR_MAX_DIAG_LEN);
-        assert_eq!(truncate_diag(&s).len(), CA_PROTO_ERROR_MAX_DIAG_LEN);
+    fn passes_through_short_message() {
+        assert_eq!(diag("channel limit reached"), b"channel limit reached");
     }
 
     #[test]
     fn truncates_oversize_to_limit() {
         let s = "x".repeat(CA_PROTO_ERROR_MAX_DIAG_LEN + 100);
-        let out = truncate_diag(&s);
-        assert_eq!(out.len(), CA_PROTO_ERROR_MAX_DIAG_LEN);
-        assert!(out.chars().all(|c| c == 'x'));
+        assert_eq!(diag(&s), s.as_bytes()[..CA_PROTO_ERROR_MAX_DIAG_LEN]);
     }
 
+    /// `epicsVsnprintf` cuts at a byte count, inside a UTF-8 sequence too.
     #[test]
-    fn truncation_lands_on_utf8_char_boundary() {
-        // Construct a string that crosses the 480-byte cap inside
-        // a multi-byte UTF-8 sequence: 'é' (U+00E9) is 2 bytes in
-        // UTF-8. Padding with 479 'a's puts the first byte of 'é'
-        // exactly at byte 479 — within the limit — and the second
-        // at byte 480 — past it. Naive byte slicing would split it
-        // and panic. `truncate_diag` must back off to the previous
-        // char boundary (byte 479).
+    fn truncation_is_by_bytes() {
         let mut s = "a".repeat(479);
-        s.push('é');
-        assert_eq!(s.len(), 481);
-        let out = truncate_diag(&s);
-        assert!(out.is_char_boundary(out.len()));
-        assert!(out.len() <= CA_PROTO_ERROR_MAX_DIAG_LEN);
-        // Standard library guarantees: the returned &str is valid
-        // UTF-8 (otherwise this method-call would panic).
-        let _ = out.to_owned();
+        s.push('\u{e9}');
+        assert_eq!(diag(&s), s.as_bytes()[..480]);
+    }
+
+    /// A record name goes out as its bytes, as `%s` prints it.
+    #[test]
+    fn a_record_name_is_sent_as_its_bytes() {
+        let name: &[u8] = b"nu\xe9b";
+        assert_eq!(
+            diag(("subscription install into record ", name, " failed")),
+            b"subscription install into record nu\xe9b failed"
+        );
     }
 }
 
@@ -9916,6 +9935,128 @@ mod non_graceful_disconnect_teardown_tests {
                     return hdr;
                 }
                 offset += msg_len;
+            }
+        }
+    }
+
+    /// A CA name is bytes: softIoc R7.0.10 serves `caget` on a record named
+    /// `nu\xe9b` and answers its UTF-8 spelling `not found`, on SEARCH (UDP
+    /// and TCP) and on CREATE_CHAN alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_latin1_name_is_found_and_its_utf8_spelling_is_not() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        const LATIN1: &[u8] = b"nu\xe9b";
+        const UTF8: &[u8] = b"nu\xc3\xa9b";
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(LATIN1, Box::new(StringinRecord::new("d")))
+            .await
+            .expect("add stringin record");
+
+        let search = |cid: u32, name: &[u8]| {
+            let padded = crate::protocol::pad_bytes(name);
+            let mut h = CaHeader::new(CA_PROTO_SEARCH);
+            h.data_type = CA_DO_REPLY;
+            h.count = CA_MINOR_VERSION;
+            h.cid = cid;
+            h.available = cid;
+            h.postsize = padded.len() as u16;
+            [h.to_bytes().as_slice(), &padded].concat()
+        };
+        let peer: SocketAddr = "127.0.0.1:55225".parse().unwrap();
+        for (name, found) in [(LATIN1, true), (UTF8, false)] {
+            let mut batch = crate::server::udp::SearchReplyBatch::default();
+            let mut ready = Vec::new();
+            crate::server::udp::parse_search_datagram(
+                &search(1, name),
+                &db,
+                5064,
+                peer,
+                &mut batch,
+                &mut ready,
+            )
+            .await;
+            let replied = !ready.is_empty() || batch.shape_trailing().is_some();
+            assert_eq!(replied, found, "UDP SEARCH {name:?}");
+        }
+
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, mut conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server_db = db.clone();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                server_db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+
+        for (cid, name, want) in [(1, LATIN1, CA_PROTO_SEARCH), (2, UTF8, CA_PROTO_NOT_FOUND)] {
+            client.write_all(&search(cid, name)).await.expect("search");
+            let hdr = read_reply(&mut client, &[CA_PROTO_SEARCH, CA_PROTO_NOT_FOUND]).await;
+            assert_eq!(hdr.cmmd, want, "TCP SEARCH {name:?}");
+        }
+
+        for (cid, name, want) in [
+            (0xA1, LATIN1, CA_PROTO_CREATE_CHAN),
+            (0xA2, UTF8, CA_PROTO_CREATE_CH_FAIL),
+        ] {
+            client
+                .write_all(&create_chan_frame(cid, name))
+                .await
+                .expect("create_chan");
+            let hdr = read_create_chan_result(&mut client, Duration::from_secs(3)).await;
+            assert_eq!(hdr.cmmd, want, "CREATE_CHAN {name:?}");
+        }
+        let created = await_event(&mut conn_rx, Duration::from_secs(3), |ev| {
+            matches!(ev, ServerConnectionEvent::ChannelCreated { .. })
+        })
+        .await;
+        assert!(
+            matches!(
+                created,
+                Some(ServerConnectionEvent::ChannelCreated { ref pv_name, .. }) if **pv_name == *LATIN1
+            ),
+            "{created:?}"
+        );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// The next reply whose command is one of `cmmds`.
+    async fn read_reply<R: tokio::io::AsyncRead + Unpin>(
+        client: &mut R,
+        cmmds: &[u16],
+    ) -> CaHeader {
+        loop {
+            let mut head = [0u8; CaHeader::SIZE];
+            tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut head))
+                .await
+                .expect("reply within timeout")
+                .expect("read ok");
+            let hdr = CaHeader::from_bytes(&head).expect("header parses");
+            let mut body = vec![0u8; hdr.postsize as usize];
+            client.read_exact(&mut body).await.expect("body");
+            if cmmds.contains(&hdr.cmmd) {
+                return hdr;
             }
         }
     }
@@ -13978,7 +14119,7 @@ mod scalar_string_without_nul_tests {
             assert_eq!(val, "x", "{name} cmd {cmmd}");
             if name != "SO" {
                 assert_eq!(
-                    db.get_pv(&format!("{name}.LEN")).unwrap().to_f64(),
+                    db.get_pv(format!("{name}.LEN")).unwrap().to_f64(),
                     Some(2.0),
                     "{name} cmd {cmmd}"
                 );

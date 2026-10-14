@@ -953,7 +953,7 @@ pub struct DbLink {
     /// whose remainder is not a field identifier (`src.[2]`, `A.B.C`) keeps
     /// the whole string here, exactly as C leaves it until
     /// `dbChannelCreate` walks the filter.
-    record: String,
+    record: crate::types::RecordName,
     /// The field half of the same split, or `VAL` when the name carried
     /// none — again the split, not the addressed field: `src.NORD[2]` leaves
     /// `VAL` here while the channel it names addresses `NORD`.
@@ -978,6 +978,15 @@ pub struct DbLink {
     /// link resolved to, so a read does no name work. Not part of the link's
     /// identity — a clone starts empty and equality ignores it.
     addr: DbAddrCell,
+}
+
+/// `record` for a default-`VAL` split, `record.FIELD` otherwise.
+fn reassemble<'a>(record: &'a [u8], field: &str) -> std::borrow::Cow<'a, [u8]> {
+    if field == "VAL" {
+        std::borrow::Cow::Borrowed(record)
+    } else {
+        std::borrow::Cow::Owned([record, b".", field.as_bytes()].concat())
+    }
 }
 
 /// What a [`DbLink`]'s target name answers at one name-map revision.
@@ -1039,7 +1048,7 @@ struct CachedDbAddr {
 enum CachedAnswer {
     Local {
         rec: std::sync::Weak<super::record_instance::RecordCell>,
-        name: std::sync::Arc<str>,
+        name: crate::types::RecordName,
         put: super::record_instance::PutAddr,
         f64_slot: Option<super::record_trait::FieldSlot>,
     },
@@ -1240,19 +1249,23 @@ impl DbLink {
     /// one implementation rather than one per construction site, and a
     /// `record`/`field` pair that the split could never have produced is
     /// not constructible.
-    pub fn new(pvname: &str, policy: LinkProcessPolicy, monitor_switch: MonitorSwitch) -> Self {
+    pub fn new(
+        pvname: impl AsRef<[u8]>,
+        policy: LinkProcessPolicy,
+        monitor_switch: MonitorSwitch,
+    ) -> Self {
+        let pvname = pvname.as_ref();
         let (record, field) = match split_record_field(pvname) {
-            Some((record, field)) => (record.to_string(), field),
-            None => (pvname.to_string(), "VAL".to_string()),
+            Some((record, field)) => (record, field),
+            None => (pvname, "VAL".to_string()),
         };
+        let record = crate::types::RecordName::from(record);
         // From the REASSEMBLED name, not the caller's: `src.VAL` and `src`
         // split alike but are not the same `record_path`, and `pvname` is
         // what every reader of this link addresses.
-        let channel = crate::server::database::filters::parse_channel_name(&if field == "VAL" {
-            record.clone()
-        } else {
-            format!("{record}.{field}")
-        });
+        let channel = crate::server::database::filters::parse_channel_name(
+            reassemble(&record, &field).as_ref(),
+        );
         let target_is_val = channel.field == "VAL";
         Self {
             record,
@@ -1276,11 +1289,10 @@ impl DbLink {
     /// Ask for it when the CA/PVA boundary is what you are feeding, or when
     /// you want a per-link identity; ask [`Self::target`] for anything that
     /// resolves against this IOC's record map.
-    pub fn pvname(&self) -> String {
-        if self.field == "VAL" {
-            self.record.clone()
-        } else {
-            format!("{}.{}", self.record, self.field)
+    pub fn pvname(&self) -> crate::types::RecordName {
+        match reassemble(&self.record, &self.field) {
+            std::borrow::Cow::Borrowed(_) => self.record.clone(),
+            std::borrow::Cow::Owned(name) => name.into(),
         }
     }
 
@@ -1320,7 +1332,7 @@ impl DbLink {
 /// it may retain a `ca://` scheme prefix, which the resolver strips.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaLink {
-    pub pv: String,
+    pub pv: crate::types::RecordName,
     pub monitor_switch: MonitorSwitch,
     /// Link-processing policy carried by this link's parsed modifier,
     /// exactly as [`DbLink::policy`] does. When it is `CP`/`CPP`, the dbCa
@@ -1345,8 +1357,12 @@ pub struct CaLink {
 
 /// C's `pvlOptFWD` test for a CA link in a field of type `ftype`:
 /// `strrchr(pvname, '.')` then `strstr(pperiod, "PROC")`.
-pub fn ca_forward_flag(ftype: LinkFieldType, pv: &str) -> bool {
-    ftype == LinkFieldType::Fwd && pv.rfind('.').is_some_and(|dot| pv[dot..].contains("PROC"))
+pub fn ca_forward_flag(ftype: LinkFieldType, pv: &[u8]) -> bool {
+    ftype == LinkFieldType::Fwd
+        && pv
+            .iter()
+            .rposition(|&b| b == b'.')
+            .is_some_and(|dot| has_modifier(&pv[dot..], b"PROC"))
 }
 
 /// What C `dbScanFwdLink` hands an external forward link's lset, borrowed
@@ -1354,7 +1370,7 @@ pub fn ca_forward_flag(ftype: LinkFieldType, pv: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalForward<'a> {
     /// dbCa: put 1 through `pv` when `fwd` ([`CaLink::fwd`]), else nothing.
-    Ca { pv: &'a str, fwd: bool },
+    Ca { pv: &'a [u8], fwd: bool },
     /// The `pva` lset's `scanForward`, handed this name.
     Pva(&'a str),
 }
@@ -1363,7 +1379,7 @@ impl CaLink {
     /// CA link with the default (`NoMaximize`) alarm policy and no
     /// CP/CPP processing — the shape used by callers that have only a
     /// bare PV name (JSON `{ca:…}` links carry no plaintext modifier).
-    pub fn new(pv: impl Into<String>) -> Self {
+    pub fn new(pv: impl Into<crate::types::RecordName>) -> Self {
         Self {
             pv: pv.into(),
             monitor_switch: MonitorSwitch::NoMaximize,
@@ -1563,10 +1579,18 @@ pub fn declared_link_type(
 ///
 /// Two failure arms, both C's: a brace-delimited link naming no registered
 /// jlink type, and a `#` form whose identifier letters name no bus.
-pub fn check_link_text(record_type: &str, upper_field: &str, text: &str) -> CaResult<()> {
+pub fn check_link_text(
+    record_type: &str,
+    upper_field: &str,
+    text: impl AsRef<[u8]>,
+) -> CaResult<()> {
     let Some(class) = crate::types::dbf_link_class(record_type, upper_field) else {
         return Ok(());
     };
+    // Both arms read a JSON or hardware form; a record name's bytes do not
+    // reach either, so the lossy view refuses what the bytes would.
+    let text = String::from_utf8_lossy(text.as_ref());
+    let text = text.as_ref();
     check_json_link_text(text, LinkFieldType::for_class(class))?;
     check_hw_link_text(text)
 }
@@ -1583,7 +1607,7 @@ pub fn link_type_mismatch(
     record_type: &str,
     dtyp: Option<&str>,
     upper_field: &str,
-    text: &str,
+    text: impl AsRef<[u8]>,
 ) -> Option<(DbLinkType, DbLinkType)> {
     let class = crate::types::dbf_link_class(record_type, upper_field)?;
     let expected = declared_link_type(record_type, dtyp, upper_field)?;
@@ -1601,8 +1625,9 @@ pub fn link_type_refusal(
     record_type: &str,
     dtyp: Option<&str>,
     upper_field: &str,
-    text: &str,
+    text: impl AsRef<[u8]>,
 ) -> Option<String> {
+    let text = text.as_ref();
     let mismatch = link_type_mismatch(record_type, dtyp, upper_field, text)?;
     Some(refusal_line(record_name, upper_field, text, mismatch))
 }
@@ -1617,9 +1642,10 @@ pub fn link_type_refusal(
 fn refusal_line(
     subject: &str,
     upper_field: &str,
-    text: &str,
+    text: &[u8],
     (expected, parsed): (DbLinkType, DbLinkType),
 ) -> String {
+    let text = String::from_utf8_lossy(text);
     format!(
         "{subject}.{upper_field}: can't initialize link type {} with \"{text}\" (type {})",
         expected.c_name(),
@@ -1637,8 +1663,9 @@ pub fn check_link_assignment(
     record_type: &str,
     dtyp: Option<&str>,
     upper_field: &str,
-    text: &str,
+    text: impl AsRef<[u8]>,
 ) -> CaResult<()> {
+    let text = text.as_ref();
     check_link_text(record_type, upper_field, text)?;
     match link_type_mismatch(record_type, dtyp, upper_field, text) {
         None => Ok(()),
@@ -1708,8 +1735,12 @@ impl ParsedLink {
     /// same two variants a bare `1` and this port's `pva://X` scheme
     /// extension produce. Nothing in the parse tree distinguishes them
     /// afterwards; the text does.
-    pub fn link_type_after_init(&self, raw: &str, ftype: LinkFieldType) -> DbLinkType {
-        if matches!(parse_json_link(raw.trim(), ftype), JsonLinkParse::Parsed(_)) {
+    pub fn link_type_after_init(&self, raw: impl AsRef<[u8]>, ftype: LinkFieldType) -> DbLinkType {
+        // A JSON link is UTF-8 or yajl refuses it.
+        let json = std::str::from_utf8(raw.as_ref()).is_ok_and(|raw| {
+            matches!(parse_json_link(raw.trim(), ftype), JsonLinkParse::Parsed(_))
+        });
+        if json {
             return DbLinkType::JsonLink;
         }
         match self {
@@ -1826,7 +1857,7 @@ impl ParsedLink {
     pub fn external_forward(&self) -> Option<ExternalForward<'_>> {
         match self {
             ParsedLink::Ca(ca) => Some(ExternalForward::Ca {
-                pv: &ca.pv,
+                pv: ca.pv.as_bytes(),
                 fwd: ca.fwd,
             }),
             ParsedLink::Pva(name) => Some(ExternalForward::Pva(name)),
@@ -1850,9 +1881,9 @@ impl ParsedLink {
     /// `ioc/pvalink.h:65,116`). Callers feed the result to the
     /// link-set, which is the only consumer; nothing relies on this
     /// returning the bare PV name.
-    pub fn external_pv_name(&self) -> Option<Cow<'_, str>> {
+    pub fn external_pv_name(&self) -> Option<Cow<'_, [u8]>> {
         match self {
-            ParsedLink::Ca(ca) => Some(Cow::Borrowed(ca.pv.as_str())),
+            ParsedLink::Ca(ca) => Some(Cow::Borrowed(ca.pv.as_bytes())),
             // Scheme-qualified, because these two variants KNOW their scheme
             // and the boundary must not lose it: `split_external_link_name`
             // reads the prefix back into `LinkTarget::Scheme("pva")`, and
@@ -1862,11 +1893,10 @@ impl ParsedLink {
             // set: `INPA="{pva:{pv:\"SRC\"}}"` was read from the CA link set.
             // The lset itself still sees the unprefixed body, which is what
             // `split_external_link_name` hands it.
-            ParsedLink::Pva(name) => Some(Cow::Owned(format!("pva://{name}"))),
-            ParsedLink::PvaJson(j) => Some(Cow::Owned(format!(
-                "pva://{key}",
-                key = j.link_identity_key()
-            ))),
+            ParsedLink::Pva(name) => Some(Cow::Owned(format!("pva://{name}").into_bytes())),
+            ParsedLink::PvaJson(j) => Some(Cow::Owned(
+                format!("pva://{key}", key = j.link_identity_key()).into_bytes(),
+            )),
             _ => None,
         }
     }
@@ -2067,8 +2097,10 @@ pub enum LsLoad {
 /// record(lsi,"L3"){field(INP,{const:"hi there"})} VAL "hi there" LEN 9 UDF 0
 /// record(lsi,"L4"){field(INP,"5")}              VAL ""         LEN 1  UDF 0
 /// ```
-pub fn load_link_ls(text: &str) -> Option<LsLoad> {
-    let s = text.trim();
+pub fn load_link_ls(text: impl AsRef<[u8]>) -> Option<LsLoad> {
+    // A constant is JSON to C (`dbLSConvertJSON`, `{const:…}`), and yajl
+    // refuses text that is not UTF-8, so such a link loads nothing.
+    let s = std::str::from_utf8(text.as_ref()).ok()?.trim();
     if s.is_empty() {
         return None;
     }
@@ -3541,21 +3573,26 @@ impl ProcessClass {
     /// `strstr(pstr, …)` in the order `NPP, CPP, PP, CA, CP` that *assigns*
     /// (never OR-s) exactly one class. The order is load-bearing: `CPP` must be
     /// tested before `PP`, since `"CPP"` contains `"PP"`.
-    fn from_modifier_text(mods: &str) -> Self {
-        if mods.contains("NPP") {
+    fn from_modifier_text(mods: &[u8]) -> Self {
+        if has_modifier(mods, b"NPP") {
             Self::Npp
-        } else if mods.contains("CPP") {
+        } else if has_modifier(mods, b"CPP") {
             Self::Cpp
-        } else if mods.contains("PP") {
+        } else if has_modifier(mods, b"PP") {
             Self::Pp
-        } else if mods.contains("CA") {
+        } else if has_modifier(mods, b"CA") {
             Self::Ca
-        } else if mods.contains("CP") {
+        } else if has_modifier(mods, b"CP") {
             Self::Cp
         } else {
             Self::Npp
         }
     }
+}
+
+/// C's `strstr(pmod, name)` over the modifier text.
+fn has_modifier(mods: &[u8], name: &[u8]) -> bool {
+    mods.windows(name.len()).any(|w| w == name)
 }
 
 /// Which link *field* a link string is being parsed for — C's `ftype` argument
@@ -3644,19 +3681,19 @@ impl LinkFieldType {
 /// the same modifier resolution as the parser, so it cannot drift from what is
 /// actually discarded — unlike a trailing-`" CP"` text test, which misses
 /// `"TARGET CP MS"` and mis-fires on a target whose *name* ends in `CP`.
-pub fn out_link_discards_cp(s: &str) -> bool {
-    let s = s.trim();
+pub fn out_link_discards_cp(s: impl AsRef<[u8]>) -> bool {
+    let s = trim_link_text(s.as_ref());
     // Only a plain PV link reaches the modifier scan in C; a JSON/hardware/
     // scheme link never does.
-    if s.is_empty() || s.starts_with(['{', '@', '#', '"']) {
+    if matches!(s.first(), None | Some(b'{' | b'@' | b'#' | b'"')) {
         return false;
     }
-    let Some((_, mods)) = s.split_once(' ') else {
+    let Some(space) = s.iter().position(|&b| b == b' ') else {
         return false;
     };
     // Resolve through the same chain the parser uses, so the warning cannot
     // drift from the mask: exactly the classes the OUT mask downgrades.
-    ProcessClass::from_modifier_text(mods).is_cp_or_cpp()
+    ProcessClass::from_modifier_text(&s[space + 1..]).is_cp_or_cpp()
 }
 
 /// Split a link string into its target and its modifiers, mirroring C
@@ -3675,27 +3712,28 @@ pub fn out_link_discards_cp(s: &str) -> bool {
 /// and the `ca://` scheme path so `ca://PV MS` parses its `MS` instead of
 /// folding it into the PV name.
 fn split_link_modifiers(
-    s: &str,
+    s: &[u8],
     ftype: LinkFieldType,
-) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
-    let Some((target, mods)) = s.split_once(' ') else {
+) -> (&[u8], LinkProcessPolicy, MonitorSwitch, bool) {
+    let Some(space) = s.iter().position(|&b| b == b' ') else {
         // No space ⇒ no modifier text at all ⇒ modifiers stay zeroed (NPP),
         // and every mask leaves zero at zero.
         let (policy, force_ca) = ProcessClass::default().resolve();
         return (s, policy, MonitorSwitch::NoMaximize, force_ca);
     };
+    let (target, mods) = (&s[..space], &s[space + 1..]);
 
     // Process class — one assignment, C's fixed chain order.
     let class = ProcessClass::from_modifier_text(mods);
 
     // Maximize-severity switch — independent chain, longest match first.
-    let ms = if mods.contains("NMS") {
+    let ms = if has_modifier(mods, b"NMS") {
         MonitorSwitch::NoMaximize
-    } else if mods.contains("MSI") {
+    } else if has_modifier(mods, b"MSI") {
         MonitorSwitch::MaximizeIfInvalid
-    } else if mods.contains("MSS") {
+    } else if has_modifier(mods, b"MSS") {
         MonitorSwitch::MaximizeStatus
-    } else if mods.contains("MS") {
+    } else if has_modifier(mods, b"MS") {
         MonitorSwitch::Maximize
     } else {
         MonitorSwitch::NoMaximize
@@ -3711,7 +3749,7 @@ fn split_link_modifiers(
 
 /// Parse a `DBF_INLINK` (`INP`, `INPA`…, `DOL`, `SDIS`, `TSEL`, `SIML`, …).
 /// Every modifier is accepted — see [`parse_link_field`].
-pub fn parse_link_v2(s: &str) -> ParsedLink {
+pub fn parse_link_v2(s: impl AsRef<[u8]>) -> ParsedLink {
     parse_link_field(s, LinkFieldType::In)
 }
 
@@ -3720,11 +3758,47 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
 /// "link text → [`ParsedLink`]"; [`parse_link_v2`],
 /// [`parse_output_link_v2`] and [`parse_forward_link_v2`] are its three
 /// field-type entry points.
-pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
-    let s = s.trim();
+///
+/// The text is bytes, as C's `dbParseLink` reads it: a record name is not
+/// text, so a Latin-1 target must reach the lookup as the bytes the record
+/// was loaded under.
+pub fn parse_link_field(s: impl AsRef<[u8]>, ftype: LinkFieldType) -> ParsedLink {
+    parse_link_bytes(s.as_ref(), ftype)
+}
+
+/// C `isspace` in the "C" locale, which `dbParseLink` trims with.
+fn is_c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// A link's text with the C `isspace` run `dbParseLink` strips from each end.
+pub(crate) fn trim_link_text(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&b| !is_c_space(b)).unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|&b| !is_c_space(b))
+        .map_or(start, |i| i + 1);
+    &s[start..end]
+}
+
+fn parse_link_bytes(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
+    let s = trim_link_text(s);
+    // Only names may be any bytes. JSON is refused by yajl unless it is
+    // UTF-8 (`dbJLink.c` leaves yajl's string validation on), so C keeps
+    // that link unset; the hardware payload stays text until it has a byte
+    // consumer.
+    let Ok(text) = std::str::from_utf8(s) else {
+        if s.first() == Some(&b'{') && s.last() == Some(&b'}') {
+            return ParsedLink::None;
+        }
+        if matches!(s.first(), Some(b'@' | b'#')) {
+            return try_parse_hw_link(&String::from_utf8_lossy(s)).unwrap_or(ParsedLink::None);
+        }
+        return parse_name_link(s, ftype);
+    };
     // JSON-style links (epics-base PR #86) — try first so a leading
     // `{` is not mistaken for a leading-special record-name warning.
-    match parse_json_link(s, ftype) {
+    match parse_json_link(text, ftype) {
         JsonLinkParse::Parsed(parsed) => return parsed,
         // C never builds a link out of JSON it could not resolve: the put
         // fails and the field keeps its unset value. The load-time gate
@@ -3737,7 +3811,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     // Hardware link (epics-base PR #213). `@` starts INST_IO; `#` is
     // followed by identifier letters that name the bus. Everything else
     // falls through to legacy parsing.
-    if let Some(parsed) = try_parse_hw_link(s) {
+    if let Some(parsed) = try_parse_hw_link(text) {
         return parsed;
     }
     if s.is_empty() {
@@ -3748,30 +3822,8 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     // put fails and the field keeps the unset CONSTANT link it was born
     // with. Falling through instead would build a PV link whose name starts
     // with `#`, a channel that can never connect.
-    if s.starts_with('#') {
+    if text.starts_with('#') {
         return ParsedLink::None;
-    }
-
-    // CA/PVA protocol links. a `ca://PV MS` link carries
-    // the same trailing maximize-severity modifiers as the legacy form,
-    // so strip them off the scheme body before storing the PV name —
-    // otherwise `MS` would be folded into the PV name (`"PV MS"`). The
-    // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
-    // alarm gate is applied at the record-processing boundary.
-    if let Some(rest) = s.strip_prefix("ca://") {
-        let (pv, policy, ms, _force_ca) = split_link_modifiers(rest, ftype);
-        return ParsedLink::Ca(CaLink {
-            pv: pv.to_string(),
-            monitor_switch: ms,
-            // Carry the parsed CP/CPP policy so `ca://OTHER:PV CPP`
-            // drives holder processing;
-            // pre-fix it was discarded into a bare latest-value link.
-            policy,
-            fwd: ca_forward_flag(ftype, pv),
-        });
-    }
-    if let Some(rest) = s.strip_prefix("pva://") {
-        return ParsedLink::Pva(rest.to_string());
     }
 
     // There is NO quoted-string constant. C's `dbParseLink` has exactly three
@@ -3809,9 +3861,38 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     // `"<number> <modifier>"` link into a constant: `SDIS="3 NPP"` with
     // `DISV=3` would disable the record forever, and `OUT="5 PP"` would drop
     // the write instead of alarming. Keep this test above
-    // `split_link_modifiers`.
-    if parse_c_double(s).is_some() {
-        return ParsedLink::constant(s);
+    // `split_link_modifiers`, and above the scheme links, which are not numbers.
+    if parse_c_double(text).is_some() {
+        return ParsedLink::constant(text);
+    }
+    parse_name_link(s, ftype)
+}
+
+/// The tail of [`parse_link_field`] that reads the text as a PV name: the
+/// scheme links, the array constant and the modifier split, all of them on
+/// the name's bytes.
+fn parse_name_link(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
+    // CA/PVA protocol links. a `ca://PV MS` link carries
+    // the same trailing maximize-severity modifiers as the legacy form,
+    // so strip them off the scheme body before storing the PV name —
+    // otherwise `MS` would be folded into the PV name (`"PV MS"`). The
+    // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
+    // alarm gate is applied at the record-processing boundary.
+    if let Some(rest) = s.strip_prefix(b"ca://") {
+        let (pv, policy, ms, _force_ca) = split_link_modifiers(rest, ftype);
+        return ParsedLink::Ca(CaLink {
+            pv: pv.into(),
+            monitor_switch: ms,
+            // Carry the parsed CP/CPP policy so `ca://OTHER:PV CPP`
+            // drives holder processing;
+            // pre-fix it was discarded into a bare latest-value link.
+            policy,
+            fwd: ca_forward_flag(ftype, pv),
+        });
+    }
+    if let Some(rest) = s.strip_prefix(b"pva://") {
+        // PVA names are text until the PVA name layer.
+        return ParsedLink::Pva(String::from_utf8_lossy(rest).into_owned());
     }
 
     // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
@@ -3830,8 +3911,9 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     // the modifier scan only after both constant tests. Note the one form that
     // is NOT a constant: `"1 2 3"` — `epicsParseDouble` rejects the trailing
     // garbage, so C parses it as a PV_LINK to a record named `1`.
-    if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
-        return ParsedLink::constant(s);
+    if s.starts_with(b"[") && s.ends_with(b"]") && s.len() >= 2 {
+        // `dbConstLoadArray` hands the text to yajl, which refuses non-UTF-8.
+        return std::str::from_utf8(s).map_or(ParsedLink::None, ParsedLink::constant);
     }
 
     // Isolate the target from its modifiers — see [`split_link_modifiers`].
@@ -3851,7 +3933,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
         // holder. The maximize-severity switch is a *separate* chain and does
         // ride along (`REC.VAL CA MS` keeps its MS gate).
         return ParsedLink::Ca(CaLink {
-            pv: link_part.to_string(),
+            pv: link_part.into(),
             monitor_switch: ms,
             policy,
             fwd: ca_forward_flag(ftype, link_part),
@@ -3896,17 +3978,18 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
 /// the whole string as the record name in that case is also what preserves a
 /// dotted *remote* PV name (`OTHER:PV.1:X`) for the CA-link fallback, which
 /// reconstructs the channel name from `record`/`field`.
-fn split_record_field(link_part: &str) -> Option<(&str, String)> {
-    let (rec, field) = link_part.split_once('.')?;
-    let mut chars = field.chars();
-    let first = chars.next()?;
-    if !(first.is_ascii_alphabetic() || first == '_') {
+fn split_record_field(link_part: &[u8]) -> Option<(&[u8], String)> {
+    let dot = link_part.iter().position(|&b| b == b'.')?;
+    let (rec, field) = (&link_part[..dot], &link_part[dot + 1..]);
+    let (&first, rest) = field.split_first()?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
         return None;
     }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !rest.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_') {
         return None;
     }
-    Some((rec, field.to_string()))
+    // An identifier is ASCII.
+    Some((rec, String::from_utf8_lossy(field).into_owned()))
 }
 
 /// Parse a `DBF_OUTLINK` (record `OUT`, `dfanout.OUTA`…, `sseq.LNK1`…,
@@ -3926,7 +4009,7 @@ fn split_record_field(link_part: &str) -> Option<(&str, String)> {
 /// `.PROC` — lives in the write path
 /// (`PvDatabase::write_db_link_value_in`), matching C
 /// `dbDbPutValue` (`dbDbLink.c:387-390`).
-pub fn parse_output_link_v2(s: &str) -> ParsedLink {
+pub fn parse_output_link_v2(s: impl AsRef<[u8]>) -> ParsedLink {
     parse_link_field(s, LinkFieldType::Out)
 }
 
@@ -3937,7 +4020,7 @@ pub fn parse_output_link_v2(s: &str) -> ParsedLink {
 /// forward link only triggers processing, so every process-class modifier
 /// other than `CA` and every maximize-severity modifier is dropped. `CA` is
 /// kept because it still decides whether the trigger crosses IOCs.
-pub fn parse_forward_link_v2(s: &str) -> ParsedLink {
+pub fn parse_forward_link_v2(s: impl AsRef<[u8]>) -> ParsedLink {
     parse_link_field(s, LinkFieldType::Fwd)
 }
 
@@ -3951,7 +4034,7 @@ pub fn parse_forward_link_v2(s: &str) -> ParsedLink {
 /// `prec->inp.type` (`devEpidSoft.c:110`,
 /// `devEpidSoftCallback.c:116`): the existing string link fields are
 /// kept as-is, and this query is layered on top.
-pub fn link_field_type(s: &str) -> LinkType {
+pub fn link_field_type(s: impl AsRef<[u8]>) -> LinkType {
     parse_link_v2(s).link_type()
 }
 
@@ -4491,7 +4574,7 @@ mod json_link_tests {
         assert_eq!(
             parse_link_v2("REC.VAL CA MS"),
             ParsedLink::Ca(CaLink {
-                pv: "REC.VAL".to_string(),
+                pv: "REC.VAL".into(),
                 monitor_switch: MonitorSwitch::Maximize,
                 policy: LinkProcessPolicy::NoProcess,
                 fwd: false,
@@ -4501,7 +4584,7 @@ mod json_link_tests {
         assert_eq!(
             parse_link_v2("REC.VAL CA NMS"),
             ParsedLink::Ca(CaLink {
-                pv: "REC.VAL".to_string(),
+                pv: "REC.VAL".into(),
                 monitor_switch: MonitorSwitch::NoMaximize,
                 policy: LinkProcessPolicy::NoProcess,
                 fwd: false,
@@ -4535,7 +4618,7 @@ mod json_link_tests {
         assert_eq!(
             parse_link_v2("OTHER:PV CP CA"),
             ParsedLink::Ca(CaLink {
-                pv: "OTHER:PV".to_string(),
+                pv: "OTHER:PV".into(),
                 monitor_switch: MonitorSwitch::NoMaximize,
                 policy: LinkProcessPolicy::NoProcess,
                 fwd: false,
@@ -4609,7 +4692,7 @@ mod json_link_tests {
         assert_eq!(
             parse_link_v2("ca://SR:DCCT MS"),
             ParsedLink::Ca(CaLink {
-                pv: "SR:DCCT".to_string(),
+                pv: "SR:DCCT".into(),
                 monitor_switch: MonitorSwitch::Maximize,
                 policy: LinkProcessPolicy::NoProcess,
                 fwd: false,
@@ -4618,7 +4701,7 @@ mod json_link_tests {
         assert_eq!(
             parse_link_v2("ca://SR:DCCT MSI"),
             ParsedLink::Ca(CaLink {
-                pv: "SR:DCCT".to_string(),
+                pv: "SR:DCCT".into(),
                 monitor_switch: MonitorSwitch::MaximizeIfInvalid,
                 policy: LinkProcessPolicy::NoProcess,
                 fwd: false,
@@ -4627,7 +4710,7 @@ mod json_link_tests {
         assert_eq!(
             parse_link_v2("ca://SR:DCCT MSS"),
             ParsedLink::Ca(CaLink {
-                pv: "SR:DCCT".to_string(),
+                pv: "SR:DCCT".into(),
                 monitor_switch: MonitorSwitch::MaximizeStatus,
                 policy: LinkProcessPolicy::NoProcess,
                 fwd: false,
@@ -4719,7 +4802,7 @@ mod json_link_tests {
     fn pva_json_external_pv_name() {
         let link = parse_link_v2(r#"{pva: {pv: "TARGET:AI", proc: "CP"}}"#);
         let key = link.external_pv_name().expect("PvaJson carries a key");
-        assert_eq!(key.as_ref(), "pva://TARGET:AI\u{1f}proc=s:CP");
+        assert_eq!(key.as_ref(), b"pva://TARGET:AI\x1fproc=s:CP");
         assert_eq!(link.link_type(), LinkType::Ca);
         assert!(link.is_writable_out_link());
     }

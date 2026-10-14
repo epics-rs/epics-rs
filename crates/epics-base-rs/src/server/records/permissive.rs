@@ -273,7 +273,7 @@ mod tests {
     fn val_snapshot_is_ushort() {
         let mut rec = PermissiveRecord::default();
         rec.put_field("VAL", EpicsValue::UShort(3)).unwrap();
-        let inst = RecordInstance::new("PERM:VAL".into(), rec);
+        let inst = RecordInstance::new("PERM:VAL", rec);
         let snap = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap.value, EpicsValue::UShort(3));
     }

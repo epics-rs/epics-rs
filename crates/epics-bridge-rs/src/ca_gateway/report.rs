@@ -224,7 +224,7 @@ pub fn render_r3(
                     pattern.as_str(),
                     asg_label(asg),
                     asl.unwrap_or(1),
-                    target_template,
+                    String::from_utf8_lossy(target_template),
                 ));
             }
             PvListEntry::Deny { .. } => {}
@@ -393,7 +393,7 @@ mod tests {
     }
 
     fn sample_pvlist() -> PvList {
-        use regex::Regex;
+        use regex::bytes::Regex;
         PvList {
             order: EvaluationOrder::DenyAllow,
             entries: vec![
@@ -404,7 +404,7 @@ mod tests {
                 },
                 PvListEntry::Alias {
                     pattern: Regex::new("^(?:GW:(.*))$").unwrap(),
-                    target_template: "UPSTREAM:$1".to_string(),
+                    target_template: b"UPSTREAM:$1".to_vec(),
                     asg: None,
                     asl: None,
                 },

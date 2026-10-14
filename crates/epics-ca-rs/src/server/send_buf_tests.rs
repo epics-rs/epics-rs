@@ -232,7 +232,7 @@ fn monitored_pvs(db: &PvDatabase, user: &Arc<EventUser>, k: u32) -> Vec<MonitorD
 
 fn destroy(db: &PvDatabase, k: u32) {
     for cid in 0..k {
-        block_on_sync(db.remove_simple_pv(&format!("SENDBUF:{cid}")))
+        block_on_sync(db.remove_simple_pv(format!("SENDBUF:{cid}")))
             .unwrap()
             .expect("registered");
     }

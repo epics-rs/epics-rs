@@ -6,9 +6,10 @@
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
-// RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(25): checked - these run and pass in the exec-backend
 // suite.
 
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -142,7 +143,7 @@ impl PvaPvHandle {
 // ---------------------------------------------------------------------------
 
 static PVA_PV_REGISTRY: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, PvaPvHandle>>,
+    std::sync::Mutex<std::collections::HashMap<RecordName, PvaPvHandle>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Register a native PVA PV before the CA+PVA runner starts.
@@ -152,16 +153,16 @@ static PVA_PV_REGISTRY: std::sync::LazyLock<
 /// descriptor before storing it, so a stored value always matches the
 /// advertised wire shape by construction — there is no separate
 /// registration-time root-kind check to perform.
-pub fn register_pva_pv_global(pv_name: &str, handle: PvaPvHandle) {
+pub fn register_pva_pv_global(pv_name: impl AsRef<[u8]>, handle: PvaPvHandle) {
     PVA_PV_REGISTRY
         .lock()
         .unwrap()
-        .insert(pv_name.to_string(), handle);
+        .insert(RecordName::from(pv_name.as_ref()), handle);
 }
 
 /// Take all registered native PVA PVs. Called by `run_ca_pva_qsrv_ioc_app`'s
 /// runner to wire them into `QsrvPvStore`.
-pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandle> {
+pub fn take_registered_pva_pvs() -> std::collections::HashMap<RecordName, PvaPvHandle> {
     std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
 }
 
@@ -208,7 +209,7 @@ pub struct QsrvPvStore {
     /// and every source method below returns `impl Future<..> + Send`, so
     /// holding one across an `.await` is a
     /// compile error rather than a review finding.
-    pva_pvs: Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
+    pva_pvs: Arc<parking_lot::RwLock<HashMap<RecordName, PvaPvHandle>>>,
     /// Per-peer cache of resolved channels, keyed `(peer, pv name)`.
     /// A pvput client mints a fresh op per put, and every op used to
     /// re-run the full name→record/group resolution plus a fresh
@@ -233,7 +234,8 @@ pub struct QsrvPvStore {
 }
 
 /// See [`QsrvPvStore::channel_cache`].
-type ChannelCache = Arc<parking_lot::Mutex<HashMap<SocketAddr, HashMap<String, CachedChannel>>>>;
+type ChannelCache =
+    Arc<parking_lot::Mutex<HashMap<SocketAddr, HashMap<RecordName, CachedChannel>>>>;
 
 struct CachedChannel {
     creds: Arc<epics_pva_rs::server_native::config::ClientCredentials>,
@@ -248,7 +250,7 @@ struct CachedChannel {
 async fn cached_channel(
     provider: &Arc<BridgeProvider>,
     cache: &ChannelCache,
-    name: &str,
+    name: &[u8],
     ctx: &epics_pva_rs::server_native::source::ChannelContext,
 ) -> crate::BridgeResult<Arc<super::group::GroupChannel>> {
     let generation = provider.group_generation();
@@ -267,7 +269,7 @@ async fn cached_channel(
             .await?,
     );
     cache.lock().entry(ctx.peer).or_default().insert(
-        name.to_string(),
+        RecordName::from(name),
         CachedChannel {
             creds: ctx.creds.clone(),
             generation,
@@ -303,8 +305,10 @@ impl QsrvPvStore {
     /// PV only ever serves descriptor-valid values, by construction.
     /// Synchronous: the whole body is one `parking_lot` write guard over a
     /// `HashMap::insert`, with nothing to await.
-    pub fn register_pva_pv(&self, pv_name: &str, handle: PvaPvHandle) {
-        self.pva_pvs.write().insert(pv_name.to_string(), handle);
+    pub fn register_pva_pv(&self, pv_name: impl AsRef<[u8]>, handle: PvaPvHandle) {
+        self.pva_pvs
+            .write()
+            .insert(RecordName::from(pv_name.as_ref()), handle);
     }
 
     /// Legacy ctx-less channel path — used only by the default
@@ -312,7 +316,7 @@ impl QsrvPvStore {
     /// `subscribe`) that lack a `ChannelContext`. Anonymous
     /// identity, no per-op caching. The `_checked` overrides
     /// below carry the real `user/host` through to ACF.
-    async fn channel(&self, name: &str) -> Option<super::group::GroupChannel> {
+    async fn channel(&self, name: &[u8]) -> Option<super::group::GroupChannel> {
         self.channel_for(name, "", "").await
     }
 
@@ -328,7 +332,7 @@ impl QsrvPvStore {
     /// so the per-call cost stays low.
     async fn channel_for(
         &self,
-        name: &str,
+        name: &[u8],
         user: &str,
         host: &str,
     ) -> Option<super::group::GroupChannel> {
@@ -381,8 +385,8 @@ enum OpenedMonitor {
 /// `getScalarValue`) and leaves `value.choices` to the property set.
 async fn read_marks(
     provider: &Arc<BridgeProvider>,
-    pva_pvs: &Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
-    name: &str,
+    pva_pvs: &Arc<parking_lot::RwLock<HashMap<RecordName, PvaPvHandle>>>,
+    name: &[u8],
     value: &PvField,
 ) -> Option<Vec<String>> {
     if pva_pvs.read().contains_key(name) {
@@ -410,7 +414,7 @@ async fn read_marks(
 /// exact same native-PVA / channel / DBE / queue-depth resolution.
 async fn open_monitor(
     provider: Arc<BridgeProvider>,
-    pva_pvs: Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
+    pva_pvs: Arc<parking_lot::RwLock<HashMap<RecordName, PvaPvHandle>>>,
     checked: epics_pva_rs::server_native::source::AccessChecked,
     ctx: epics_pva_rs::server_native::source::ChannelContext,
     opts: epics_pva_rs::server_native::MonitorOptions,
@@ -418,7 +422,7 @@ async fn open_monitor(
     if !checked.allows_read() {
         return None;
     }
-    let name = checked.pv_name().to_string();
+    let name = checked.pv_name().clone();
     if let Some(handle) = pva_pvs.read().get(&name).cloned() {
         // Frames arrive only through `PvaPvHandle::post`, which validates
         // against the canonical descriptor before fanout (pvxs
@@ -427,7 +431,7 @@ async fn open_monitor(
         return Some(OpenedMonitor::Native(handle.add_subscriber()));
     }
     let group = provider
-        .create_group_channel_with_creds(&name, ctx_to_creds(&ctx))
+        .create_group_channel_with_creds(name.as_bytes(), ctx_to_creds(&ctx))
         .await
         .ok()?;
     // R10-33: the negotiated monitor queue limit is the SERVER's, not a
@@ -519,7 +523,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// channel.
     fn notify_channel_close(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: &epics_pva_rs::server_native::source::ChannelContext,
     ) {
         let mut cache = self.channel_cache.lock();
@@ -543,7 +547,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             if !checked.allows_read() {
                 return None;
             }
-            let name = checked.pv_name().to_string();
+            let name = checked.pv_name().clone();
             // Native PVA-pushed PVs (NDPluginPva) carry no per-record ACF
             // — they are always readable. The snapshot is descriptor-valid
             // by construction (every write went through
@@ -593,7 +597,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            let name = checked.pv_name().to_string();
+            let name = checked.pv_name().clone();
             let value = self.get_value_checked(checked, ctx).await?;
             let marked = read_marks(&provider, &pva_pvs, &name, &value).await;
             Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
@@ -617,7 +621,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     ctx.creds.host
                 )));
             }
-            let name = checked.pv_name().to_string();
+            let name = checked.pv_name().clone();
             let pv = match value {
                 PvField::Structure(s) => s,
                 other => {
@@ -701,7 +705,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     ctx.creds.host
                 )));
             }
-            let name = checked.pv_name().to_string();
+            let name = checked.pv_name().clone();
             let init_req = match ctx.pv_request {
                 Some(PvField::Structure(ref req)) => Some(req),
                 _ => None,
@@ -741,9 +745,12 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// pvxs `GroupSource` has no `onProcess`: neither a group nor a native
     /// PVA PV has a processing chain, so a caller is refused rather than
     /// handed the default's silent success.
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+    fn process(
+        &self,
+        name: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pva_pvs = self.pva_pvs.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             let kind = if pva_pvs.read().contains_key(&name) {
                 "native PVA PV"
@@ -897,7 +904,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     let mut monitor = monitor;
                     let handles = std::sync::Arc::new(monitor.activation_handles());
                     let initial = if handles.is_empty() {
-                        let name = checked.pv_name().to_string();
+                        let name = checked.pv_name().clone();
                         match monitor.seed().await.map(PvField::Structure) {
                             Some(value) => {
                                 let mut marked =
@@ -948,11 +955,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            let mut names = provider.group_list().await;
+            let mut names: Vec<RecordName> = provider
+                .group_list()
+                .await
+                .into_iter()
+                .map(RecordName::from)
+                .collect();
             for key in pva_pvs.read().keys() {
                 if !names.contains(key) {
                     names.push(key.clone());
@@ -966,37 +978,37 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// pvxs `onCreate`: the channel can be built. `AI.VAL$` passes the
     /// search below and is refused here, as `dbChannelCreate` refuses `$` on
     /// a field that is neither a string nor a link.
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             if pva_pvs.read().contains_key(&name) {
                 return true;
             }
-            provider.group_claimed(&name).await
+            provider.group_claimed(name.as_bytes()).await
         }
     }
 
     /// pvxs `onSearch`: `dbChannelTest`, which resolves the record and field
     /// and ignores what follows them (`singlesource.cpp:466-473`).
-    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn searchable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             if pva_pvs.read().contains_key(&name) {
                 return true;
             }
-            provider.group_claimed(&name).await
+            provider.group_claimed(name.as_bytes()).await
         }
     }
 
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<epics_pva_rs::pvdata::FieldDesc>> + Send {
-        let name_owned = name.to_string();
+        let name_owned = RecordName::from(name);
         let pva_pvs = self.pva_pvs.clone();
         async move {
             // Native-registered PVA PVs (NTNDArray etc.) live only in
@@ -1019,8 +1031,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
-        let name_owned = name.to_string();
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let name_owned = RecordName::from(name);
         let pva_pvs = self.pva_pvs.clone();
         async move {
             if let Some(handle) = pva_pvs.read().get(&name_owned).cloned()
@@ -1042,10 +1054,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name_owned = name.to_string();
+        let name_owned = RecordName::from(name);
         async move {
             let channel = self
                 .channel(&name_owned)
@@ -1066,10 +1078,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             // previously returned `true` for any existing PV via
             // channel_find, lying for read-only records (DISP=1) and
@@ -1081,15 +1093,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             if pva_pvs.read().contains_key(&name) {
                 return false;
             }
-            provider.is_servable_group(&name).await && provider.is_writable(&name).await
+            provider.is_servable_group(name.as_bytes()).await
+                && provider.is_writable(name.as_bytes()).await
         }
     }
 
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
-        let name_owned = name.to_string();
+        let name_owned = RecordName::from(name);
         let pva_pvs = self.pva_pvs.clone();
         let reactor = self.reactor.clone();
         async move {
@@ -1808,11 +1821,11 @@ mod tests {
         let provider = Arc::new(BridgeProvider::new_with_serving(db, false));
 
         assert!(
-            !provider.channel_find("TEST:Y").await,
+            !provider.channel_find(b"TEST:Y").await,
             "disabled provider must not find a DB record"
         );
         assert!(
-            provider.create_channel("TEST:Y").await.is_err(),
+            provider.create_channel(b"TEST:Y").await.is_err(),
             "disabled provider must refuse to create a DB channel"
         );
         assert!(
@@ -1826,7 +1839,7 @@ mod tests {
         // serves a natively registered PVA PV (NDPluginPva equivalent).
         let store = QsrvPvStore::new(crate::test_reactor(), provider);
         assert!(
-            !store.has_pv("TEST:Y").await,
+            !store.has_pv(b"TEST:Y").await,
             "DB record hidden when disabled"
         );
 
@@ -1836,8 +1849,30 @@ mod tests {
             .expect("descriptor-less post accepted");
         store.register_pva_pv("NATIVE:PV", handle);
         assert!(
-            store.has_pv("NATIVE:PV").await,
+            store.has_pv(b"NATIVE:PV").await,
             "native PVA PV stays served even when QSRV2 DB serving is off"
+        );
+    }
+
+    /// A native PV is keyed by its name bytes: a Latin-1 name is served
+    /// as registered, and its lossy UTF-8 rendering names nothing.
+    #[tokio::test]
+    async fn a_native_pv_with_a_latin1_name_is_served_by_its_bytes() {
+        use epics_pva_rs::server_native::ChannelSource;
+        let db = Arc::new(epics_base_rs::server::database::PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new_with_serving(db, true));
+        let store = QsrvPvStore::new(crate::test_reactor(), provider);
+        let handle = PvaPvHandle::new(None);
+        handle
+            .post(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)))
+            .expect("descriptor-less post accepted");
+        store.register_pva_pv(b"TEMP:\xb0C", handle);
+        assert!(store.has_pv(b"TEMP:\xb0C").await);
+        assert!(store.get_value(b"TEMP:\xb0C").await.is_some());
+        assert!(!store.has_pv("TEMP:\u{fffd}C".as_bytes()).await);
+        assert_eq!(
+            store.list_pvs().await,
+            vec![RecordName::from(&b"TEMP:\xb0C"[..])]
         );
     }
 
@@ -1943,14 +1978,14 @@ mod tests {
             vec![("qsrvSingle".to_string(), 0), ("qsrvGroup".to_string(), 1)]
         );
         let single = composite.get_source("qsrvSingle", 0).unwrap();
-        assert!(single.has_pv("TEST:GATE").await);
-        assert!(composite.has_pv("TEST:GATE").await);
+        assert!(single.has_pv(b"TEST:GATE").await);
+        assert!(composite.has_pv(b"TEST:GATE").await);
 
         let (db, mount) = mount_with(false).await;
         let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
         mount.install_channel_sources(&db, &composite).unwrap();
         assert_eq!(composite.list_source(), vec![("qsrvGroup".to_string(), 1)]);
-        assert!(!composite.has_pv("TEST:GATE").await);
+        assert!(!composite.has_pv(b"TEST:GATE").await);
     }
 
     /// The store is pvxs's `qsrvGroup` and nothing more: a record is not a
@@ -1973,19 +2008,19 @@ mod tests {
             .unwrap();
         assert_eq!(provider.process_groups().await, 1);
         let store = QsrvPvStore::new(crate::test_reactor(), provider.clone());
-        assert!(!store.has_pv("TEST:X").await);
-        assert!(!store.searchable("TEST:X").await);
-        assert!(store.get_value("TEST:X").await.is_none());
-        assert!(store.get_introspection("TEST:X").await.is_none());
-        assert!(store.subscribe("TEST:X").await.is_none());
+        assert!(!store.has_pv(b"TEST:X").await);
+        assert!(!store.searchable(b"TEST:X").await);
+        assert!(store.get_value(b"TEST:X").await.is_none());
+        assert!(store.get_introspection(b"TEST:X").await.is_none());
+        assert!(store.subscribe(b"TEST:X").await.is_none());
         assert_eq!(store.list_pvs().await, vec!["G".to_string()]);
-        assert!(store.has_pv("G").await);
+        assert!(store.has_pv(b"G").await);
 
         let composite = qsrv_composite(provider);
         let single = composite.get_source("qsrvSingle", 0).unwrap();
-        assert!(single.has_pv("TEST:X").await);
-        assert!(composite.get_value("TEST:X").await.is_some());
-        assert!(composite.subscribe("TEST:X").await.is_some());
+        assert!(single.has_pv(b"TEST:X").await);
+        assert!(composite.get_value(b"TEST:X").await.is_some());
+        assert!(composite.subscribe(b"TEST:X").await.is_some());
     }
 
     /// pvxs answers the search for `AI.VAL$` (`dbChannelTest` resolves
@@ -2005,11 +2040,11 @@ mod tests {
             .await
             .unwrap();
         let store = qsrv_composite(Arc::new(BridgeProvider::new(db)));
-        assert!(store.searchable("AI.VAL$").await);
-        assert!(!store.has_pv("AI.VAL$").await);
-        assert!(store.searchable("SI.VAL$").await);
-        assert!(store.has_pv("SI.VAL$").await);
-        assert!(!store.searchable("AI.NOSUCH$").await);
+        assert!(store.searchable(b"AI.VAL$").await);
+        assert!(!store.has_pv(b"AI.VAL$").await);
+        assert!(store.searchable(b"SI.VAL$").await);
+        assert!(store.has_pv(b"SI.VAL$").await);
+        assert!(!store.searchable(b"AI.NOSUCH$").await);
     }
 
     /// Top-level `UnionArray` PV: when the producer hands the canonical
@@ -2050,7 +2085,7 @@ mod tests {
             .expect("value matches canonical descriptor");
         store.register_pva_pv("TEST:UARR", handle);
 
-        let got = store.get_introspection("TEST:UARR").await.unwrap();
+        let got = store.get_introspection(b"TEST:UARR").await.unwrap();
         assert_eq!(got, canonical, "supplied descriptor must round-trip");
     }
 
@@ -2076,7 +2111,7 @@ mod tests {
         handle.post(value).expect("descriptor-less post accepted");
         store.register_pva_pv("TEST:UARR_LOSSY", handle);
 
-        let got = store.get_introspection("TEST:UARR_LOSSY").await.unwrap();
+        let got = store.get_introspection(b"TEST:UARR_LOSSY").await.unwrap();
         assert_eq!(
             got,
             FieldDesc::UnionArray {
@@ -2127,7 +2162,7 @@ mod tests {
         store.register_pva_pv("TEST:NTS", handle.clone());
 
         assert_eq!(
-            store.get_value("TEST:NTS").await,
+            store.get_value(b"TEST:NTS").await,
             Some(good.clone()),
             "accepted value is served"
         );
@@ -2152,7 +2187,7 @@ mod tests {
         // GET still returns the last *accepted* value — not None, not the
         // bad value (pvxs `fetch()` after a thrown post).
         assert_eq!(
-            store.get_value("TEST:NTS").await,
+            store.get_value(b"TEST:NTS").await,
             Some(good),
             "rejected post must leave the prior accepted value readable"
         );
@@ -2263,7 +2298,7 @@ mod tests {
 
         store.register_pva_pv("TEST:NTS:EMPTY", handle);
         assert_eq!(
-            store.get_value("TEST:NTS:EMPTY").await,
+            store.get_value(b"TEST:NTS:EMPTY").await,
             None,
             "no accepted post yet: GET has no current value"
         );
@@ -2291,7 +2326,7 @@ mod tests {
 
         // Parameterless RPC: rejected (pvxs has no RPC-as-GET for records).
         let err = store
-            .rpc("RPC:AO", FieldDesc::Variant, PvField::Null)
+            .rpc(b"RPC:AO", FieldDesc::Variant, PvField::Null)
             .await
             .expect_err("parameterless RPC on a QSRV record must be rejected");
         assert!(
@@ -2310,7 +2345,7 @@ mod tests {
             .push(("query".into(), PvField::Structure(query)));
         let request = PvField::Structure(nturi);
         let err = store
-            .rpc("RPC:AO", request.descriptor(), request)
+            .rpc(b"RPC:AO", request.descriptor(), request)
             .await
             .expect_err("RPC write-through on a QSRV record must be rejected");
         assert!(
@@ -2320,7 +2355,7 @@ mod tests {
 
         // The record value is untouched: RPC never wrote.
         let value = store
-            .get_value("RPC:AO")
+            .get_value(b"RPC:AO")
             .await
             .expect("record GET must return a value");
         let PvField::Structure(s) = value else {
@@ -2379,7 +2414,7 @@ mod tests {
         let request = PvField::Structure(nturi);
 
         let err = store
-            .rpc("RPC:GRP", request.descriptor(), request)
+            .rpc(b"RPC:GRP", request.descriptor(), request)
             .await
             .expect_err("RPC on a QSRV group must be rejected");
         assert!(
@@ -2389,7 +2424,7 @@ mod tests {
 
         // Members untouched: the rejected RPC wrote nothing.
         let value = store
-            .get_value("RPC:GRP")
+            .get_value(b"RPC:GRP")
             .await
             .expect("group GET must return a value");
         let PvField::Structure(s) = value else {
@@ -2873,7 +2908,7 @@ mod tests {
         // coarse clock granularity.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         store
-            .process("TEST:proc_call")
+            .process(b"TEST:proc_call")
             .await
             .expect("PROCESS must run");
         let after = {
@@ -2989,7 +3024,7 @@ mod tests {
 
         // --- PROCESS path ---
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        store.process("FLNK:a").await.expect("PROCESS must run");
+        store.process(b"FLNK:a").await.expect("PROCESS must run");
         let b_after_process = b_time(db.clone()).await;
         assert!(
             b_after_process > b_after_put,
@@ -3011,7 +3046,7 @@ mod tests {
         let store = QsrvPvStore::new(crate::test_reactor(), provider);
 
         let err = store
-            .process("UNKNOWN:PV")
+            .process(b"UNKNOWN:PV")
             .await
             .expect_err("PROCESS on unknown PV must error");
         assert!(
@@ -3056,13 +3091,13 @@ mod tests {
 
         // The shadowed name processes through the record chain.
         store
-            .process("SP:rec")
+            .process(b"SP:rec")
             .await
             .expect("PROCESS on a record-shadowed group name must process the record");
 
         // The non-colliding group is still rejected as a group PV.
         let err = store
-            .process("SP:grp")
+            .process(b"SP:grp")
             .await
             .expect_err("PROCESS on a real group PV must error");
         assert!(

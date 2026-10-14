@@ -108,7 +108,7 @@ pub struct ASubRecord {
     pub inam: PvString,
     /// Input links `INPA..INPU`. Private with `fta`: [`Self::put_field`] is
     /// their one writer, and it moves `links_generation`.
-    inp: [String; NUM_ARGS],
+    inp: [PvString; NUM_ARGS],
     /// Input values `A..U` — native typed via `fta`.
     pub a: [EpicsValue; NUM_ARGS],
     /// Output values `VALA..VALU` — native typed via `ftva`. Private with
@@ -127,7 +127,7 @@ pub struct ASubRecord {
     out_dirty: u32,
     /// Output links `OUTA..OUTU`. Private with `wired_outs`: [`Self::put_field`]
     /// is their one writer.
-    out: [String; NUM_ARGS],
+    out: [PvString; NUM_ARGS],
     /// The `(OUTx, VALx)` pairs whose `OUTx` is set, in channel order: what
     /// C's push loop does work for, `dbPutLink` on an unset link being a no-op.
     wired_outs: Vec<(&'static str, &'static str)>,
@@ -167,7 +167,7 @@ pub struct ASubRecord {
     /// Subroutine-name input link `SUBL` (`DBF_INLINK`). C `init_record`
     /// seeds SNAM from a constant SUBL; with LFLG=READ, `fetch_values` reads
     /// the current name from this link every process.
-    pub subl: String,
+    pub subl: PvString,
     /// Old subroutine name `ONAM`. C `fetch_values` re-resolves the
     /// subroutine only when SNAM differs from ONAM; ONAM is set to SNAM on a
     /// successful swap.
@@ -246,7 +246,7 @@ impl Default for ASubRecord {
             oval: 0,
             snam: PvString::new(),
             inam: PvString::new(),
-            inp: std::array::from_fn(|_| String::new()),
+            inp: std::array::from_fn(|_| PvString::new()),
             a: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
             vala: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
             ovla: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
@@ -254,7 +254,7 @@ impl Default for ASubRecord {
             val_marks: 0,
             nev_marks: 0,
             out_dirty: 0,
-            out: std::array::from_fn(|_| String::new()),
+            out: std::array::from_fn(|_| PvString::new()),
             wired_outs: Vec::new(),
             fta: [FTYPE_DOUBLE; NUM_ARGS],
             ftva: [FTYPE_DOUBLE; NUM_ARGS],
@@ -266,7 +266,7 @@ impl Default for ASubRecord {
             prec: 0,
             eflg: EFLG_ON_CHANGE,
             lflg: 0,
-            subl: String::new(),
+            subl: PvString::new(),
             onam: PvString::new(),
             // Never processed: C's `status` is only 0 after a `do_sub` that
             // returned 0, so nothing is driven out before then.
@@ -702,12 +702,12 @@ impl Record for ASubRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp.get(slot).map(String::as_str)
+        self.inp.get(slot).map(PvString::as_bytes)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -814,7 +814,7 @@ impl Record for ASubRecord {
             "SUBL" => {
                 return match value {
                     EpicsValue::String(s) => {
-                        self.subl = s.as_str_lossy().into_owned();
+                        self.subl = s;
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch(name.into())),
@@ -850,9 +850,8 @@ impl Record for ASubRecord {
                 ChannelDelivery::Empty => self.nea[idx] = 0,
             },
             Chan::Inp | Chan::Out => {
-                let s = match value {
-                    EpicsValue::String(s) => s.as_str_lossy().into_owned(),
-                    _ => return Err(CaError::TypeMismatch(name.into())),
+                let EpicsValue::String(s) = value else {
+                    return Err(CaError::TypeMismatch(name.into()));
                 };
                 if chan == Chan::Inp {
                     self.inp[idx] = s;
@@ -1226,7 +1225,7 @@ mod tests {
                 .iter()
                 .map(|&(link, _)| {
                     (
-                        rec.link_text_ref(link).map(str::to_owned),
+                        rec.link_text_ref(link).map(<[u8]>::to_vec),
                         rec.input_link_request(link),
                         rec.input_link_failure_is_inert(link),
                     )

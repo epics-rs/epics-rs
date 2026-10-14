@@ -26,16 +26,16 @@ struct Lset {
 
 #[async_trait::async_trait]
 impl LinkSet for Lset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         self.up.load(Ordering::SeqCst)
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         if self.drops {
             self.up.store(false, Ordering::SeqCst);
             return Err("channel disconnected".into());

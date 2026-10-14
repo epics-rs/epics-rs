@@ -3,6 +3,7 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
+use epics_base_rs::types::RecordName;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -68,7 +69,7 @@ struct NativeChannel {
 /// [`ChannelSource::notify_channel_close`], which the wire layer fires for
 /// explicit DESTROY_CHANNEL and for connection teardown alike.
 type NativeChannelCache =
-    Arc<parking_lot::Mutex<HashMap<SocketAddr, HashMap<String, Arc<NativeChannel>>>>>;
+    Arc<parking_lot::Mutex<HashMap<SocketAddr, HashMap<RecordName, Arc<NativeChannel>>>>>;
 
 /// Resolve `name` into its channel object, minting it on first use.
 ///
@@ -78,7 +79,7 @@ type NativeChannelCache =
 fn channel_for(
     db: &PvDatabase,
     cache: &NativeChannelCache,
-    name: &str,
+    name: &[u8],
     peer: SocketAddr,
 ) -> Option<Arc<NativeChannel>> {
     if let Some(hit) = cache.lock().get(&peer).and_then(|m| m.get(name)).cloned() {
@@ -95,7 +96,7 @@ fn channel_for(
         .lock()
         .entry(peer)
         .or_default()
-        .insert(name.to_string(), ch.clone());
+        .insert(RecordName::from(name), ch.clone());
     Some(ch)
 }
 
@@ -136,7 +137,7 @@ impl PvDatabaseSource {
         if !checked.allows_read() {
             return None;
         }
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         // Both chains come off the channel object, which owns the
         // value/property split: the value chain is the SAME instance the
         // GET path runs, and the property chain is the independent
@@ -1014,7 +1015,7 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
 /// Filters are read-side. C runs the pre/post chains from `dbChannelGet`
 /// and from the event queue, never from `dbChannelPut`, so the PUT and
 /// PROCESS paths resolve the name and drop the chain on the floor.
-fn resolve_channel(db: &PvDatabase, name: &str) -> Option<(ChannelName, FilterChain)> {
+fn resolve_channel(db: &PvDatabase, name: &[u8]) -> Option<(ChannelName, FilterChain)> {
     let channel = db_channel_create(db, name).ok()?;
     Some((channel.name, channel.chain))
 }
@@ -1035,7 +1036,7 @@ async fn channel_entry(db: &PvDatabase, cn: &ChannelName) -> Option<PvEntry> {
     Some(entry)
 }
 
-async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
+async fn snapshot_for(db: &PvDatabase, name: &[u8]) -> Option<Snapshot> {
     let (cn, filters) = resolve_channel(db, name)?;
     channel_snapshot(db, &cn, &filters).await
 }
@@ -1219,7 +1220,7 @@ impl ChannelSource for PvDatabaseSource {
     /// with the channel exactly as `dbChannelDelete` frees the filter pvt
     /// (`dbChannel.c:714-725`). The wire layer fires this once per opened
     /// channel, for explicit DESTROY_CHANNEL and connection teardown alike.
-    fn notify_channel_close(&self, name: &str, ctx: &crate::server_native::ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], ctx: &crate::server_native::ChannelContext) {
         let mut cache = self.channels.lock();
         if let Some(by_name) = cache.get_mut(&ctx.peer) {
             by_name.remove(name);
@@ -1229,7 +1230,7 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let db = self.db.clone();
         async move {
             let mut names = db.all_record_names().await;
@@ -1267,9 +1268,9 @@ impl ChannelSource for PvDatabaseSource {
     /// failing later with "field introspection unavailable".
     ///
     /// A simple PV has no field to narrow, so it resolves exactly as before.
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { snapshot_for(&db, &name).await.is_some() }
     }
 
@@ -1283,27 +1284,27 @@ impl ChannelSource for PvDatabaseSource {
     /// silent search timeout, which is a different divergence, not a fix.
     /// Keeping `has_name` here also keeps the search reply cheap: no snapshot
     /// is built for a broadcast that may match nothing.
-    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn searchable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { db.has_name(&name).await }
     }
 
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             let snap = snapshot_for(&db, &name).await?;
             Some(snapshot_to_field_desc(&snap))
         }
     }
 
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             let snap = snapshot_for(&db, &name).await?;
             Some(snapshot_to_pv_field(&snap))
@@ -1349,7 +1350,7 @@ impl ChannelSource for PvDatabaseSource {
             if !checked.allows_read() {
                 return None;
             }
-            let name = checked.pv_name().to_string();
+            let name = checked.pv_name().clone();
             // The channel's own chain, not one minted for this GET: C runs
             // the read through the same `dbChannel` the monitor uses, which
             // is what lets a read move `dbnd`'s baseline (see
@@ -1389,11 +1390,11 @@ impl ChannelSource for PvDatabaseSource {
 
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             // The WRITE gate ran in `put_value_checked` before reaching
             // here, so every failure below is operational (Failed), not a
@@ -1486,7 +1487,7 @@ impl ChannelSource for PvDatabaseSource {
             if !checked.allows_write() {
                 return Err(crate::server_native::source::put_denied(&checked, &ctx));
             }
-            let name = checked.pv_name().to_string();
+            let name = checked.pv_name().clone();
             let Some((cn, _filters)) = resolve_channel(&db, &name) else {
                 return Err(OpError::failed(format!("PUT: no such PV '{name}'")));
             };
@@ -1533,9 +1534,12 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+    fn process(
+        &self,
+        name: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             // The WRITE-class gate ran in `process_checked` (trait
             // default) before reaching here, so a failure below is
@@ -1581,9 +1585,9 @@ impl ChannelSource for PvDatabaseSource {
     // the record itself — so this source no longer carries any
     // duplicate ACF logic.
 
-    fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { db.has_name(&name).await }
     }
 
@@ -1613,7 +1617,7 @@ impl ChannelSource for PvDatabaseSource {
     ) -> impl std::future::Future<Output = Result<(), crate::server_native::source::OpError>> + Send
     {
         let db = self.db.clone();
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let pv_request = ctx.pv_request.clone();
         // The op's `RemoteLogger` sink — drained by the wire layer after
         // this hook returns Ok, before the INIT reply.
@@ -1683,11 +1687,11 @@ impl ChannelSource for PvDatabaseSource {
 
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let db = self.db.clone();
         let events = self.events.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             let (cn, filters) = resolve_channel(&db, &name)?;
             let entry = channel_entry(&db, &cn).await?;
@@ -1781,7 +1785,7 @@ impl ChannelSource for PvDatabaseSource {
 fn report_subscribe_refused(
     why: epics_base_rs::server::pv::SubscribeRefused,
     peer: std::net::SocketAddr,
-    name: &str,
+    name: &RecordName,
 ) {
     if why == epics_base_rs::server::pv::SubscribeRefused::CapReached {
         tracing::error!(
@@ -1864,7 +1868,7 @@ impl<T: crate::server_native::shared_pv::SquashTail + Send + 'static> RecordSink
 /// value half's mask, the value and property chains, the `$` view and the
 /// ring's limit.
 struct RecordPair<'a> {
-    path: &'a str,
+    path: &'a [u8],
     value_mask: u16,
     filters: [&'a FilterChain; 2],
     dollar: Option<DollarView>,
@@ -3934,25 +3938,25 @@ mod tests {
         let src = PvDatabaseSource::new(db.clone());
 
         // Boundary: record base name — servable (VAL), both gates true.
-        assert!(src.searchable("ORACLE:AI").await);
-        assert!(src.has_pv("ORACLE:AI").await);
+        assert!(src.searchable(b"ORACLE:AI").await);
+        assert!(src.has_pv(b"ORACLE:AI").await);
 
         // Boundary: an explicitly addressed servable field.
-        assert!(src.searchable("ORACLE:AI.EGU").await);
-        assert!(src.has_pv("ORACLE:AI.EGU").await);
+        assert!(src.searchable(b"ORACLE:AI.EGU").await);
+        assert!(src.has_pv(b"ORACLE:AI.EGU").await);
 
         // Boundary: THE case. `MLOK` is `DBF_NOACCESS` in ai.dbd (a mutex, so
         // this port models no field for it). The record resolves, so search
         // must still answer; the field has no value, so create must refuse.
         // This is the one name where the two gates disagree.
         assert!(
-            src.searchable("ORACLE:AI.MLOK").await,
+            src.searchable(b"ORACLE:AI.MLOK").await,
             "a DBF_NOACCESS field's record resolves, so pvxs answers the \
              SEARCH — withholding it would replace `Refused to create \
              Channel` with a client timeout"
         );
         assert!(
-            !src.has_pv("ORACLE:AI.MLOK").await,
+            !src.has_pv(b"ORACLE:AI.MLOK").await,
             "a DBF_NOACCESS field has no NT, so CREATE_CHANNEL must be refused \
              rather than claimed and later failed with `field introspection \
              unavailable`"
@@ -3974,19 +3978,19 @@ mod tests {
         .await
         .unwrap();
         for name in ["ORACLE:AI.VAL$", "DL:WF.VAL$"] {
-            assert!(src.searchable(name).await, "{name}");
-            assert!(!src.has_pv(name).await, "{name}");
+            assert!(src.searchable(name.as_bytes()).await, "{name}");
+            assert!(!src.has_pv(name.as_bytes()).await, "{name}");
         }
-        assert!(!src.searchable("ORACLE:AI.NOSUCH$").await);
+        assert!(!src.searchable(b"ORACLE:AI.NOSUCH$").await);
 
         // Boundary: a record that does not exist at all — neither gate.
-        assert!(!src.searchable("NO:SUCH:RECORD").await);
-        assert!(!src.has_pv("NO:SUCH:RECORD").await);
+        assert!(!src.searchable(b"NO:SUCH:RECORD").await);
+        assert!(!src.has_pv(b"NO:SUCH:RECORD").await);
 
         // Boundary: a simple PV has no field to narrow, so the stricter create
         // gate must not change its answer.
-        assert!(src.searchable("SIMPLE:PV").await);
-        assert!(src.has_pv("SIMPLE:PV").await);
+        assert!(src.searchable(b"SIMPLE:PV").await);
+        assert!(src.has_pv(b"SIMPLE:PV").await);
     }
 
     /// Regression: a monitor on a *simple* native PV must observe later
@@ -4501,7 +4505,7 @@ ASG(LOCKED) {
         let id = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
             sink.lock().unwrap().push(m.to_string());
         });
-        assert!(!source.has_pv(r#"Y.VAL{"bad":{}}"#).await);
+        assert!(!source.has_pv(br#"Y.VAL{"bad":{}}"#).await);
         epics_base_rs::runtime::log::errlog_flush();
         epics_base_rs::runtime::log::errlog_remove_listener(id);
         let lines = heard.lock().unwrap().clone();
@@ -4544,7 +4548,7 @@ ASG(LOCKED) {
             "the GET must be served (dbnd drops the read, so it falls back to the raw field)"
         );
 
-        let ch = channel_for(&source.db, &source.channels, name, ctx.peer)
+        let ch = channel_for(&source.db, &source.channels, name.as_bytes(), ctx.peer)
             .expect("the GET minted the channel");
         assert!(
             ch.value_filters
@@ -4562,7 +4566,7 @@ ASG(LOCKED) {
         // Control, so this test carries its own fails-first evidence: a chain
         // minted per operation — the pre-fix shape — still holds the `NaN`
         // baseline `parse_ok` seeded (`dbnd.c:61`) and passes the same 105.0.
-        let (_, per_operation) = resolve_channel(&db, name).unwrap();
+        let (_, per_operation) = resolve_channel(&db, name.as_bytes()).unwrap();
         assert!(
             per_operation
                 .apply_to_event_value(EpicsValue::Double(105.0), EventMask::VALUE)
@@ -4591,19 +4595,19 @@ ASG(LOCKED) {
         let mut ctx_b = make_ctx("hostb", "bob", "anonymous");
         ctx_b.peer = "127.0.0.1:5002".parse().unwrap();
 
-        let first = channel_for(&source.db, &source.channels, name, ctx_a.peer).unwrap();
-        let again = channel_for(&source.db, &source.channels, name, ctx_a.peer).unwrap();
+        let first = channel_for(&source.db, &source.channels, name.as_bytes(), ctx_a.peer).unwrap();
+        let again = channel_for(&source.db, &source.channels, name.as_bytes(), ctx_a.peer).unwrap();
         assert!(
             Arc::ptr_eq(&first, &again),
             "every operation of one peer's channel shares the one object"
         );
-        let other = channel_for(&source.db, &source.channels, name, ctx_b.peer).unwrap();
+        let other = channel_for(&source.db, &source.channels, name.as_bytes(), ctx_b.peer).unwrap();
         assert!(
             !Arc::ptr_eq(&first, &other),
             "a second peer's channel owns its own filter state"
         );
 
-        source.notify_channel_close(name, &ctx_a);
+        source.notify_channel_close(name.as_bytes(), &ctx_a);
         assert!(
             source.channels.lock().get(&ctx_a.peer).is_none(),
             "closing the channel drops the peer's map entirely once empty"
@@ -4641,7 +4645,7 @@ ASG(LOCKED) {
             .await
             .expect("ulong PUT must succeed");
 
-        let snap = snapshot_for(&db, "UL:SCALAR").await.unwrap();
+        let snap = snapshot_for(&db, b"UL:SCALAR").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::UInt64(big),
@@ -4679,7 +4683,7 @@ ASG(LOCKED) {
             .await
             .expect("ulong[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UL:WF").await.unwrap();
+        let snap = snapshot_for(&db, b"UL:WF").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::UInt64Array(values.into()),
@@ -4718,7 +4722,7 @@ ASG(LOCKED) {
             .await
             .expect("wire-decoded ulong[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UL:WFT").await.unwrap();
+        let snap = snapshot_for(&db, b"UL:WFT").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::UInt64Array(values.into()),
@@ -4752,7 +4756,7 @@ ASG(LOCKED) {
             .await
             .expect("uint PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:SCALAR").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:SCALAR").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Int64(i64::from(big)),
@@ -4788,7 +4792,7 @@ ASG(LOCKED) {
             .await
             .expect("uint[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:WF").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:WF").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Int64Array(values.iter().map(|v| i64::from(*v)).collect()),
@@ -4822,7 +4826,7 @@ ASG(LOCKED) {
             .await
             .expect("wire-decoded uint[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:WFT").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:WFT").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Int64Array(values.iter().map(|v| i64::from(*v)).collect()),
@@ -4856,7 +4860,7 @@ ASG(LOCKED) {
             .await
             .expect("uint PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:LO").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:LO").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Long(-1),
@@ -4891,7 +4895,7 @@ ASG(LOCKED) {
             .await
             .expect("uint[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:WFL").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:WFL").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::LongArray(vec![1, 2, -1].into()),
@@ -4928,7 +4932,7 @@ ASG(LOCKED) {
             .await
             .expect("empty double[] PUT must be accepted, not rejected");
 
-        let snap = snapshot_for(&db, "EMPTY:DBL").await.unwrap();
+        let snap = snapshot_for(&db, b"EMPTY:DBL").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::DoubleArray(vec![].into()),
@@ -4958,7 +4962,7 @@ ASG(LOCKED) {
             .await
             .expect("empty string[] PUT must be accepted, not rejected");
 
-        let snap = snapshot_for(&db, "EMPTY:STR").await.unwrap();
+        let snap = snapshot_for(&db, b"EMPTY:STR").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::StringArray(vec![].into()),
@@ -4988,7 +4992,7 @@ ASG(LOCKED) {
             .await
             .expect("empty int[] PUT must be accepted, not rejected");
 
-        let snap = snapshot_for(&db, "EMPTY:INT").await.unwrap();
+        let snap = snapshot_for(&db, b"EMPTY:INT").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::LongArray(vec![].into()),
@@ -5045,7 +5049,7 @@ ASG(LOCKED) {
 
         // Read the snapshot back; the simple PV must have persisted the
         // client-supplied alarm + timeStamp, not local defaults.
-        let snap = snapshot_for(&db, "MB:PV").await.unwrap();
+        let snap = snapshot_for(&db, b"MB:PV").await.unwrap();
         assert_eq!(snap.value, EpicsValue::Double(42.5), "value");
         assert_eq!(snap.alarm.severity, 2, "alarm.severity persisted");
         assert_eq!(snap.alarm.status, 3, "alarm.status persisted");
@@ -5565,7 +5569,7 @@ ASG(DEFAULT) {
                     &events,
                     &db,
                     RecordPair {
-                        path: "AI:A",
+                        path: b"AI:A",
                         value_mask: (EventMask::VALUE | EventMask::ALARM).bits(),
                         filters: [&chain, &chain],
                         dollar: None,
@@ -5964,7 +5968,7 @@ ASG(AUDIT) {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == "AI:AUDIT" {
+            if msg.pv_name == b"AI:AUDIT" {
                 sink.lock().unwrap().push((
                     msg.op,
                     msg.status.map(str::to_string),
@@ -6032,7 +6036,7 @@ ASG(PLAIN) {
         let hits = Arc::new(AtomicUsize::new(0));
         let sink = hits.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == "AI:PLAIN" {
+            if msg.pv_name == b"AI:PLAIN" {
                 sink.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -6694,10 +6698,10 @@ ASG(PLAIN) {
         let source = PvDatabaseSource::new(db.clone());
 
         assert!(
-            source.has_pv("AI:LS.DESC$").await,
+            source.has_pv(b"AI:LS.DESC$").await,
             "`$` on a DBF_STRING field must create the channel"
         );
-        let value = source.get_value("AI:LS.DESC$").await.expect("a value");
+        let value = source.get_value(b"AI:LS.DESC$").await.expect("a value");
         let PvField::Structure(s) = &value else {
             panic!("expected an NTScalarArray structure, got {value:?}");
         };
@@ -6793,7 +6797,11 @@ ASG(PLAIN) {
             ("LZ:C.INPA$", dollar_text("LZ:J NPP NMS")),
         ];
         for (name, want) in cases {
-            assert_eq!(dollar_value(source.get_value(name).await), want, "{name}");
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "{name}"
+            );
         }
     }
 
@@ -6822,7 +6830,11 @@ ASG(PLAIN) {
             ),
         ];
         for (name, want) in cases {
-            assert_eq!(dollar_value(source.get_value(name).await), want, "{name}");
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "{name}"
+            );
         }
     }
 
@@ -6860,20 +6872,21 @@ ASG(PLAIN) {
             (r#"W.VAL{"arr":{"s":1,"e":1}}"#, ScalarValue::Int(2)),
         ];
         for (name, want) in cases {
-            let Some(FieldDesc::Structure { fields, .. }) = source.get_introspection(name).await
+            let Some(FieldDesc::Structure { fields, .. }) =
+                source.get_introspection(name.as_bytes()).await
             else {
                 panic!("{name}: no NT descriptor");
             };
             let desc = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
             assert_eq!(desc, Some(&FieldDesc::Scalar(want.scalar_type())), "{name}");
             assert_eq!(
-                dollar_value(source.get_value(name).await),
+                dollar_value(source.get_value(name.as_bytes()).await),
                 Some(PvField::Scalar(want)),
                 "{name}"
             );
         }
         let mut mon = source
-            .subscribe(r#"FS.VAL${"arr":{"s":1,"e":1}}"#)
+            .subscribe(br#"FS.VAL${"arr":{"s":1,"e":1}}"#)
             .await
             .expect("subscribes");
         for (put, want) in [("world", 111), ("ab", 98), ("x", 0)] {
@@ -6923,7 +6936,11 @@ ASG(PLAIN) {
             (r#"FS.RTYP${"arr":{"s":0,"e":0}}"#, byte(0)),
         ];
         for (name, want) in cases {
-            assert_eq!(dollar_value(source.get_value(name).await), want, "{name}");
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "{name}"
+            );
         }
     }
 
@@ -6961,7 +6978,7 @@ ASG(PLAIN) {
         for (name, first, second, want) in cases {
             dollar_put(&source, name, first).await;
             let mut mon = source
-                .subscribe(&format!("{name}$"))
+                .subscribe(format!("{name}$").as_bytes())
                 .await
                 .expect("subscribes");
             dollar_put(&source, name, second).await;
@@ -6991,7 +7008,7 @@ ASG(PLAIN) {
             .unwrap();
         let source = PvDatabaseSource::new(db);
         let mut mon = source
-            .subscribe(r#"FS.VAL${"arr":{"s":1,"e":3}}"#)
+            .subscribe(br#"FS.VAL${"arr":{"s":1,"e":3}}"#)
             .await
             .expect("subscribes");
         for (put, want) in [("world", &b"or\0"[..]), ("ab", b"b\0"), ("x", b"\0")] {
@@ -7021,11 +7038,11 @@ ASG(PLAIN) {
         for (put, text, chars) in [(&b"hi\0"[..], "hi", &b"hi\0"[..]), (b"jk", "jk", b"jk\0")] {
             dollar_put(&source, "LZ:O.VAL$", dollar_chars(put).unwrap()).await;
             assert_eq!(
-                dollar_value(source.get_value("LZ:O.VAL").await),
+                dollar_value(source.get_value(b"LZ:O.VAL").await),
                 dollar_text(text)
             );
             assert_eq!(
-                dollar_value(source.get_value("LZ:O.VAL$").await),
+                dollar_value(source.get_value(b"LZ:O.VAL$").await),
                 dollar_chars(chars)
             );
         }
@@ -7088,11 +7105,11 @@ ASG(PLAIN) {
                 .unwrap();
             let source = PvDatabaseSource::new(db.clone());
             assert_eq!(
-                text(source.get_value("LS:O.VAL").await),
+                text(source.get_value(b"LS:O.VAL").await),
                 string(""),
                 "{sizv}"
             );
-            let mut mon = source.subscribe("LS:O.VAL").await.expect("subscribes");
+            let mut mon = source.subscribe(b"LS:O.VAL").await.expect("subscribes");
             source
                 .put_value_ctx(
                     "LS:O.VAL",
@@ -7102,7 +7119,7 @@ ASG(PLAIN) {
                 .await
                 .expect("PUT must succeed");
             assert_eq!(
-                text(source.get_value("LS:O.VAL").await),
+                text(source.get_value(b"LS:O.VAL").await),
                 string("abc"),
                 "{sizv}"
             );
@@ -7171,7 +7188,7 @@ ASG(PLAIN) {
             );
         }
         let source = PvDatabaseSource::new(db);
-        let value = source.get_value("LS:G").await.expect("a value");
+        let value = source.get_value(b"LS:G").await.expect("a value");
         let PvField::Structure(s) = &value else {
             panic!("expected an NTScalar structure, got {value:?}");
         };
@@ -7191,7 +7208,7 @@ ASG(PLAIN) {
         let db = ai_db("AI:NOLS").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            !source.has_pv("AI:NOLS.VAL$").await,
+            !source.has_pv(b"AI:NOLS.VAL$").await,
             "`$` on a DBF_DOUBLE field must refuse the channel"
         );
     }
@@ -7238,10 +7255,10 @@ ASG(PLAIN) {
         for (field, expect) in [("INP", "OTHER:PV CP MS"), ("FLNK", "NEXT:REC")] {
             let name = format!("AI:LNK.{field}");
             assert!(
-                source.has_pv(&name).await,
+                source.has_pv(name.as_bytes()).await,
                 "{name} must create a channel (pvxs channel.cpp:69-74 promotes it)"
             );
-            let value = source.get_value(&name).await.expect("a value");
+            let value = source.get_value(name.as_bytes()).await.expect("a value");
             let PvField::Structure(s) = &value else {
                 panic!("expected an NTScalar structure for {name}, got {value:?}");
             };
@@ -7310,9 +7327,12 @@ ASG(PLAIN) {
         let db = wf_db("WF:FILT").await;
         let source = PvDatabaseSource::new(db);
         let name = r#"WF:FILT.{"arr":{"s":1,"e":2}}"#;
-        assert!(source.has_pv(name).await, "a parseable filter must connect");
+        assert!(
+            source.has_pv(name.as_bytes()).await,
+            "a parseable filter must connect"
+        );
         let value = source
-            .get_value(name)
+            .get_value(name.as_bytes())
             .await
             .expect("GET on a filtered channel");
         assert_eq!(
@@ -7336,11 +7356,11 @@ ASG(PLAIN) {
         let source = PvDatabaseSource::new(db);
         let name = r#"AI:FILT2.{"dbnd":{"d":0.5}}"#;
         assert!(
-            source.has_pv(name).await,
+            source.has_pv(name.as_bytes()).await,
             "a dotted suffix parses like any other"
         );
         assert!(
-            source.get_value(name).await.is_some(),
+            source.get_value(name.as_bytes()).await.is_some(),
             "a deadband filter gates the monitor stream, never the one-shot read"
         );
     }
@@ -7353,7 +7373,7 @@ ASG(PLAIN) {
         let db = wf_db("WF:RANGE").await;
         let source = PvDatabaseSource::new(db);
         let value = source
-            .get_value("WF:RANGE.VAL[1:2]")
+            .get_value(b"WF:RANGE.VAL[1:2]")
             .await
             .expect("GET on a range-suffixed channel");
         assert_eq!(
@@ -7374,7 +7394,7 @@ ASG(PLAIN) {
         let db = wf_db("WF:BADF").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            !source.has_pv(r#"WF:BADF.{"nosuchfilter":{}}"#).await,
+            !source.has_pv(br#"WF:BADF.{"nosuchfilter":{}}"#).await,
             "an unknown filter name must refuse the channel, not connect it raw"
         );
     }
@@ -7389,11 +7409,11 @@ ASG(PLAIN) {
         db.add_pv("MB:FILT", EpicsValue::Double(1.0)).await.unwrap();
         let source = PvDatabaseSource::new(db);
         assert!(
-            source.has_pv("MB:FILT").await,
+            source.has_pv(b"MB:FILT").await,
             "the mailbox itself is served"
         );
         assert!(
-            !source.has_pv(r#"MB:FILT.{"arr":{"s":0,"e":1}}"#).await,
+            !source.has_pv(br#"MB:FILT.{"arr":{"s":0,"e":1}}"#).await,
             "a mailbox has no filter machinery, so a filtered name addresses nothing"
         );
     }
@@ -7448,7 +7468,7 @@ ASG(PLAIN) {
         let db = ai_db("AI:SRCH").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            source.searchable(r#"AI:SRCH.{"arr":{"s":0}}"#).await,
+            source.searchable(br#"AI:SRCH.{"arr":{"s":0}}"#).await,
             "search claims what dbChannelTest resolves; the refusal belongs at \
              create, where the client can be told"
         );

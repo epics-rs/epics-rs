@@ -37,16 +37,16 @@ struct TimedLset;
 
 #[epics_base_rs::async_trait]
 impl LinkSet for TimedLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         Some(EpicsValue::Double(3.0))
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    fn time_stamp(&self, _: &str) -> Option<(i64, i32, u64)> {
+    fn time_stamp(&self, _: &[u8]) -> Option<(i64, i32, u64)> {
         Some((REMOTE_SECS, REMOTE_NSEC, REMOTE_UTAG))
     }
 }

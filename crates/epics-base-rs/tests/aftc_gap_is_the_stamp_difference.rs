@@ -34,7 +34,7 @@ async fn a_pause_reaches_the_filter_as_the_stamp_gap_birecord_259() {
     for rec in ["P", "PSIM"] {
         put(rec, "PROC", EpicsValue::Short(1)).await;
         assert_eq!(
-            db.get_pv(&format!("{rec}.SEVR")).ok(),
+            db.get_pv(format!("{rec}.SEVR")).ok(),
             Some(EpicsValue::Short(2)),
             "{rec}"
         );
@@ -45,7 +45,7 @@ async fn a_pause_reaches_the_filter_as_the_stamp_gap_birecord_259() {
     for rec in ["P", "PSIM"] {
         put(rec, "PROC", EpicsValue::Short(1)).await;
         assert_eq!(
-            db.get_pv(&format!("{rec}.SEVR")).ok(),
+            db.get_pv(format!("{rec}.SEVR")).ok(),
             Some(EpicsValue::Short(1)),
             "{rec}"
         );

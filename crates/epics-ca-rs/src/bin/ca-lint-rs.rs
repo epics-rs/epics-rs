@@ -151,7 +151,7 @@ fn lint_db_file(path: &str, macros: &HashMap<String, String>, issues: &mut Vec<I
             return;
         }
     };
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashMap<epics_base_rs::types::RecordName, usize> = HashMap::new();
     for (i, r) in recs.iter().enumerate() {
         if let Some(prev) = seen.insert(r.name.clone(), i) {
             issues.push(Issue::Error(format!(
@@ -166,13 +166,13 @@ fn lint_db_file(path: &str, macros: &HashMap<String, String>, issues: &mut Vec<I
         }
         // Distinguish "unsubstituted macro" (loud, common cause of bugs)
         // from generic odd-character warnings.
-        if r.name.contains("$(") {
+        if r.name.windows(2).any(|w| w == b"$(") {
             issues.push(Issue::Warn(format!(
                 "{path}: record name {:?} contains unsubstituted macro — pass macros via --macro KEY=VALUE",
                 r.name
             )));
         } else {
-            for c in r.name.chars() {
+            for c in r.name.to_str_lossy().chars() {
                 if !(c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-' || c == '.') {
                     issues.push(Issue::Warn(format!(
                         "{path}: record name {:?} contains unusual character {c:?}",

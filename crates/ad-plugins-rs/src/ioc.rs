@@ -940,7 +940,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 // avoid an unused-variable warning when `ioc` is built without `pva`.
                 #[cfg(feature = "pva")]
                 let pva_pv_name = match args.get(5) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => format!("{port_name}:Image"),
                 };
 

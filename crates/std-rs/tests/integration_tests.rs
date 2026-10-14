@@ -1602,7 +1602,7 @@ record(ao, "W2") { field(OUT, "E2.UDF NPP") }
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let read = |e: &str| {
-        let num = |f: &str| db.get_pv(&format!("{e}.{f}")).unwrap().to_f64().unwrap();
+        let num = |f: &str| db.get_pv(format!("{e}.{f}")).unwrap().to_f64().unwrap();
         let rec = db.get_record(e).unwrap();
         let g = rec.read();
         let (udf, stat, sevr) = (g.common.udf, g.common.stat, g.common.sevr as u16);
@@ -1642,7 +1642,7 @@ record(ao, "W2") { field(OUT, "E2.UDF NPP") }
             .await
             .unwrap();
     }
-    let cval = |e: &str| db.get_pv(&format!("{e}.CVAL")).unwrap().to_f64().unwrap();
+    let cval = |e: &str| db.get_pv(format!("{e}.CVAL")).unwrap().to_f64().unwrap();
     assert_eq!((cval("E1"), cval("E2")), (0.0, 0.5));
 }
 

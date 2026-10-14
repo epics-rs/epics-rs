@@ -94,7 +94,12 @@ fn load(name: &str, body: &str) -> (Arc<PvDatabase>, String, String) {
 
 /// The names `dbl` would list, in load order.
 async fn listed(db: &PvDatabase) -> Vec<String> {
-    let mut names = db.all_record_names().await;
+    let mut names: Vec<String> = db
+        .all_record_names()
+        .await
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
     names.sort();
     names
 }

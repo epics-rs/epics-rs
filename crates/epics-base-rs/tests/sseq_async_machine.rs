@@ -80,22 +80,22 @@ struct CaHoldLset(Arc<CaHoldState>);
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CaHoldLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         let held = op == LinkPutOp::Async;
         self.0
             .puts
             .lock()
             .unwrap()
-            .push((name.to_string(), value, held));
+            .push((String::from_utf8_lossy(name).into_owned(), value, held));
         if held {
             // The completion-aware put stays outstanding until the test
             // completes it — this is what keeps the sseq's `WAITn` parked.
@@ -106,13 +106,19 @@ impl LinkSet for CaHoldLset {
             // executor's `cbMedium` thread, which has no tokio reactor, and
             // a `tokio::time` timer there panics rather than sleeping —
             // taking the whole test's sequence down with it.
-            while !self.0.released.lock().unwrap().contains(name) {
+            while !self
+                .0
+                .released
+                .lock()
+                .unwrap()
+                .contains(std::str::from_utf8(name).unwrap())
+            {
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
             }
         }
         Ok(())
     }
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &[u8]) -> Option<LinkMetadata> {
         // Connected, DBF_DOUBLE scalar: the destination type sseq's
         // `processCallback` switch resolves (R16-1) so the step is put at all.
         Some(LinkMetadata {

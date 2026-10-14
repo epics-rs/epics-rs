@@ -266,10 +266,13 @@ async fn rights_after_an_unresponsive_window(
     .await;
     let db = Arc::new(PvDatabase::new());
     let mgr = manager(db.clone()).await;
-    tokio::time::timeout(bound, mgr.ensure_subscribed(name, name, None, 0))
-        .await
-        .expect("ensure_subscribed returns")
-        .unwrap_or_else(|e| panic!("subscribe through the proxy: {e}\n{}", rig.console()));
+    tokio::time::timeout(
+        bound,
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0),
+    )
+    .await
+    .expect("ensure_subscribed returns")
+    .unwrap_or_else(|e| panic!("subscribe through the proxy: {e}\n{}", rig.console()));
     let rights = |hook: &epics_base_rs::server::pv::AccessHook| {
         let r = hook(b"alice", b"host1");
         (r.read, r.write)

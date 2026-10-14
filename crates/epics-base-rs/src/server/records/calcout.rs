@@ -84,27 +84,27 @@ pub struct CalcoutRecord {
     pub ivoa: i16, // Invalid Output Action: 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
     // Input links (INPA..INPU)
-    pub inpa: String,
-    pub inpb: String,
-    pub inpc: String,
-    pub inpd: String,
-    pub inpe: String,
-    pub inpf: String,
-    pub inpg: String,
-    pub inph: String,
-    pub inpi: String,
-    pub inpj: String,
-    pub inpk: String,
-    pub inpl: String,
-    pub inpm: String,
-    pub inpn: String,
-    pub inpo: String,
-    pub inpp: String,
-    pub inpq: String,
-    pub inpr: String,
-    pub inps: String,
-    pub inpt: String,
-    pub inpu: String,
+    pub inpa: PvString,
+    pub inpb: PvString,
+    pub inpc: PvString,
+    pub inpd: PvString,
+    pub inpe: PvString,
+    pub inpf: PvString,
+    pub inpg: PvString,
+    pub inph: PvString,
+    pub inpi: PvString,
+    pub inpj: PvString,
+    pub inpk: PvString,
+    pub inpl: PvString,
+    pub inpm: PvString,
+    pub inpn: PvString,
+    pub inpo: PvString,
+    pub inpp: PvString,
+    pub inpq: PvString,
+    pub inpr: PvString,
+    pub inps: PvString,
+    pub inpt: PvString,
+    pub inpu: PvString,
     // Input values (A..U)
     pub a: f64,
     pub b: f64,
@@ -181,7 +181,7 @@ pub struct CalcoutRecord {
     // When output fires and OEVT names a non-empty event, `execOutput` posts
     // it (`postEvent(eventNameToHandle(oevt))`) right after `writeValue`; see
     // [`Record::output_event`].
-    pub oevt: String,
+    pub oevt: PvString,
     // Internal: captured output decision while an ODLY delay is pending.
     // The delayed re-process must write the output that the *original*
     // cycle decided on, not re-evaluate should_output() against the
@@ -234,14 +234,14 @@ pub struct CalcoutRecord {
     out_status: i16,
     // The common OUT-link text as `init_links` saw it at load, for the init
     // classification; a runtime OUT put classifies nothing.
-    out: crate::server::record::SparseText,
+    out: Box<[u8]>,
     // The posts the last `special()` owes, a bit per put-post table entry:
     // one put's worth, so a mark no put path drains is overwritten, never
     // queued.
     put_posts: u64,
     // Async surface for posting the live INAV..INUV/OUTV diagnostics
     // (C `checkLinks`), wired by `set_async_context`.
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     // A refused CALC/OCAL put's report, made by `special()` under the put's
     // hold and printed by the put's owner after it.
     put_report: Option<PutReport>,
@@ -268,27 +268,27 @@ impl Default for CalcoutRecord {
             povl: 0.0,
             ivoa: 0,
             ivov: 0.0,
-            inpa: String::new(),
-            inpb: String::new(),
-            inpc: String::new(),
-            inpd: String::new(),
-            inpe: String::new(),
-            inpf: String::new(),
-            inpg: String::new(),
-            inph: String::new(),
-            inpi: String::new(),
-            inpj: String::new(),
-            inpk: String::new(),
-            inpl: String::new(),
-            inpm: String::new(),
-            inpn: String::new(),
-            inpo: String::new(),
-            inpp: String::new(),
-            inpq: String::new(),
-            inpr: String::new(),
-            inps: String::new(),
-            inpt: String::new(),
-            inpu: String::new(),
+            inpa: PvString::new(),
+            inpb: PvString::new(),
+            inpc: PvString::new(),
+            inpd: PvString::new(),
+            inpe: PvString::new(),
+            inpf: PvString::new(),
+            inpg: PvString::new(),
+            inph: PvString::new(),
+            inpi: PvString::new(),
+            inpj: PvString::new(),
+            inpk: PvString::new(),
+            inpl: PvString::new(),
+            inpm: PvString::new(),
+            inpn: PvString::new(),
+            inpo: PvString::new(),
+            inpp: PvString::new(),
+            inpq: PvString::new(),
+            inpr: PvString::new(),
+            inps: PvString::new(),
+            inpt: PvString::new(),
+            inpu: PvString::new(),
             a: 0.0,
             b: 0.0,
             c: 0.0,
@@ -345,7 +345,7 @@ impl Default for CalcoutRecord {
             odly: 0.0,
             dlya: 0,
             dlya_moved: false,
-            oevt: String::new(),
+            oevt: PvString::new(),
             pending_output: false,
             pact: false,
             calc_alarm: None,
@@ -360,7 +360,7 @@ impl Default for CalcoutRecord {
             // async context exists.
             in_status: [LINK_CON; 21],
             out_status: LINK_CON,
-            out: crate::server::record::SparseText::default(),
+            out: Box::default(),
             put_posts: 0,
             async_ctx: None,
             put_report: None,
@@ -399,8 +399,11 @@ impl CalcoutRecord {
     /// `init_record` is not under a put's hold, so it prints at once.
     fn init_report(&self, report: Option<PutReport>) {
         if let Some(report) = report {
-            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-            report.emit(name, "");
+            let name = self
+                .async_ctx
+                .as_ref()
+                .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+            report.emit(&name, "");
         }
     }
 
@@ -553,7 +556,7 @@ impl CalcoutRecord {
     }
 
     /// The 21 input link strings (INPA..INPU) in input order A..U.
-    fn input_links(&self) -> [String; 21] {
+    fn input_links(&self) -> [PvString; 21] {
         [
             self.inpa.clone(),
             self.inpb.clone(),
@@ -613,13 +616,13 @@ impl CalcoutRecord {
     /// (`set_async_context`, `init_links`): a runtime link put is `special()`'s,
     /// which C answers without classifying. No-op without an async context.
     fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String)> = self
+        let mut links: Vec<(&'static str, PvString)> = self
             .input_links()
             .into_iter()
             .enumerate()
             .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link))
             .collect();
-        links.push(("OUTV", String::from(&self.out)));
+        links.push(("OUTV", PvString::from(&*self.out)));
         // C `calcoutRecord.c:404`, `:752`, `:757`.
         post_link_status(
             self.async_ctx.as_ref(),
@@ -1099,32 +1102,32 @@ impl Record for CalcoutRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         Some(match slot {
-            b'A' => &self.inpa,
-            b'B' => &self.inpb,
-            b'C' => &self.inpc,
-            b'D' => &self.inpd,
-            b'E' => &self.inpe,
-            b'F' => &self.inpf,
-            b'G' => &self.inpg,
-            b'H' => &self.inph,
-            b'I' => &self.inpi,
-            b'J' => &self.inpj,
-            b'K' => &self.inpk,
-            b'L' => &self.inpl,
-            b'M' => &self.inpm,
-            b'N' => &self.inpn,
-            b'O' => &self.inpo,
-            b'P' => &self.inpp,
-            b'Q' => &self.inpq,
-            b'R' => &self.inpr,
-            b'S' => &self.inps,
-            b'T' => &self.inpt,
-            b'U' => &self.inpu,
+            b'A' => self.inpa.as_bytes(),
+            b'B' => self.inpb.as_bytes(),
+            b'C' => self.inpc.as_bytes(),
+            b'D' => self.inpd.as_bytes(),
+            b'E' => self.inpe.as_bytes(),
+            b'F' => self.inpf.as_bytes(),
+            b'G' => self.inpg.as_bytes(),
+            b'H' => self.inph.as_bytes(),
+            b'I' => self.inpi.as_bytes(),
+            b'J' => self.inpj.as_bytes(),
+            b'K' => self.inpk.as_bytes(),
+            b'L' => self.inpl.as_bytes(),
+            b'M' => self.inpm.as_bytes(),
+            b'N' => self.inpn.as_bytes(),
+            b'O' => self.inpo.as_bytes(),
+            b'P' => self.inpp.as_bytes(),
+            b'Q' => self.inpq.as_bytes(),
+            b'R' => self.inpr.as_bytes(),
+            b'S' => self.inps.as_bytes(),
+            b'T' => self.inpt.as_bytes(),
+            b'U' => self.inpu.as_bytes(),
             _ => return None,
         })
     }
@@ -1171,7 +1174,7 @@ impl Record for CalcoutRecord {
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::UShort(self.dlya)),
-            "OEVT" => Some(EpicsValue::String(self.oevt.clone().into())),
+            "OEVT" => Some(EpicsValue::String(self.oevt.clone())),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
@@ -1384,7 +1387,7 @@ impl Record for CalcoutRecord {
             "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
             "OEVT" => match value {
                 EpicsValue::String(s) => {
-                    self.oevt = s.as_str_lossy().into_owned();
+                    self.oevt = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OEVT".into())),
@@ -1426,147 +1429,147 @@ impl Record for CalcoutRecord {
             },
             "INPA" => match value {
                 EpicsValue::String(s) => {
-                    self.inpa = s.as_str_lossy().into_owned();
+                    self.inpa = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPA".into())),
             },
             "INPB" => match value {
                 EpicsValue::String(s) => {
-                    self.inpb = s.as_str_lossy().into_owned();
+                    self.inpb = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPB".into())),
             },
             "INPC" => match value {
                 EpicsValue::String(s) => {
-                    self.inpc = s.as_str_lossy().into_owned();
+                    self.inpc = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPC".into())),
             },
             "INPD" => match value {
                 EpicsValue::String(s) => {
-                    self.inpd = s.as_str_lossy().into_owned();
+                    self.inpd = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPD".into())),
             },
             "INPE" => match value {
                 EpicsValue::String(s) => {
-                    self.inpe = s.as_str_lossy().into_owned();
+                    self.inpe = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPE".into())),
             },
             "INPF" => match value {
                 EpicsValue::String(s) => {
-                    self.inpf = s.as_str_lossy().into_owned();
+                    self.inpf = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPF".into())),
             },
             "INPG" => match value {
                 EpicsValue::String(s) => {
-                    self.inpg = s.as_str_lossy().into_owned();
+                    self.inpg = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPG".into())),
             },
             "INPH" => match value {
                 EpicsValue::String(s) => {
-                    self.inph = s.as_str_lossy().into_owned();
+                    self.inph = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPH".into())),
             },
             "INPI" => match value {
                 EpicsValue::String(s) => {
-                    self.inpi = s.as_str_lossy().into_owned();
+                    self.inpi = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPI".into())),
             },
             "INPJ" => match value {
                 EpicsValue::String(s) => {
-                    self.inpj = s.as_str_lossy().into_owned();
+                    self.inpj = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPJ".into())),
             },
             "INPK" => match value {
                 EpicsValue::String(s) => {
-                    self.inpk = s.as_str_lossy().into_owned();
+                    self.inpk = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPK".into())),
             },
             "INPL" => match value {
                 EpicsValue::String(s) => {
-                    self.inpl = s.as_str_lossy().into_owned();
+                    self.inpl = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPL".into())),
             },
             "INPM" => match value {
                 EpicsValue::String(s) => {
-                    self.inpm = s.as_str_lossy().into_owned();
+                    self.inpm = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPM".into())),
             },
             "INPN" => match value {
                 EpicsValue::String(s) => {
-                    self.inpn = s.as_str_lossy().into_owned();
+                    self.inpn = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPN".into())),
             },
             "INPO" => match value {
                 EpicsValue::String(s) => {
-                    self.inpo = s.as_str_lossy().into_owned();
+                    self.inpo = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPO".into())),
             },
             "INPP" => match value {
                 EpicsValue::String(s) => {
-                    self.inpp = s.as_str_lossy().into_owned();
+                    self.inpp = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPP".into())),
             },
             "INPQ" => match value {
                 EpicsValue::String(s) => {
-                    self.inpq = s.as_str_lossy().into_owned();
+                    self.inpq = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPQ".into())),
             },
             "INPR" => match value {
                 EpicsValue::String(s) => {
-                    self.inpr = s.as_str_lossy().into_owned();
+                    self.inpr = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPR".into())),
             },
             "INPS" => match value {
                 EpicsValue::String(s) => {
-                    self.inps = s.as_str_lossy().into_owned();
+                    self.inps = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPS".into())),
             },
             "INPT" => match value {
                 EpicsValue::String(s) => {
-                    self.inpt = s.as_str_lossy().into_owned();
+                    self.inpt = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPT".into())),
             },
             "INPU" => match value {
                 EpicsValue::String(s) => {
-                    self.inpu = s.as_str_lossy().into_owned();
+                    self.inpu = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPU".into())),
@@ -1650,27 +1653,27 @@ impl Record for CalcoutRecord {
     /// See [`Record::set_input_link_slots`].
     fn set_input_link_slots(&self) -> Option<(u64, u64)> {
         crate::server::record::input_link_slots_of(&[
-            self.inpa.as_str(),
-            self.inpb.as_str(),
-            self.inpc.as_str(),
-            self.inpd.as_str(),
-            self.inpe.as_str(),
-            self.inpf.as_str(),
-            self.inpg.as_str(),
-            self.inph.as_str(),
-            self.inpi.as_str(),
-            self.inpj.as_str(),
-            self.inpk.as_str(),
-            self.inpl.as_str(),
-            self.inpm.as_str(),
-            self.inpn.as_str(),
-            self.inpo.as_str(),
-            self.inpp.as_str(),
-            self.inpq.as_str(),
-            self.inpr.as_str(),
-            self.inps.as_str(),
-            self.inpt.as_str(),
-            self.inpu.as_str(),
+            self.inpa.as_bytes(),
+            self.inpb.as_bytes(),
+            self.inpc.as_bytes(),
+            self.inpd.as_bytes(),
+            self.inpe.as_bytes(),
+            self.inpf.as_bytes(),
+            self.inpg.as_bytes(),
+            self.inph.as_bytes(),
+            self.inpi.as_bytes(),
+            self.inpj.as_bytes(),
+            self.inpk.as_bytes(),
+            self.inpl.as_bytes(),
+            self.inpm.as_bytes(),
+            self.inpn.as_bytes(),
+            self.inpo.as_bytes(),
+            self.inpp.as_bytes(),
+            self.inpq.as_bytes(),
+            self.inpr.as_bytes(),
+            self.inps.as_bytes(),
+            self.inpt.as_bytes(),
+            self.inpu.as_bytes(),
         ])
     }
 
@@ -1731,8 +1734,8 @@ impl Record for CalcoutRecord {
     /// `Don't_drive` veto. The event name is posted verbatim (a numeric name
     /// is canonicalised by the event router to match a `SCAN="Event"` record's
     /// `EVNT`). An empty `OEVT` is C's `epvt == NULL` (no event).
-    fn output_event(&self) -> Option<String> {
-        if self.cached_should_output && !self.oevt.trim().is_empty() {
+    fn output_event(&self) -> Option<PvString> {
+        if self.cached_should_output && !self.oevt.as_bytes().trim_ascii().is_empty() {
             Some(self.oevt.clone())
         } else {
             None
@@ -1744,7 +1747,7 @@ impl Record for CalcoutRecord {
         false
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (calcoutRecord.c:160-189) classifies every INP and
         // the OUT link into INAV..INUV/OUTV. The INP links are calcout fields
@@ -1762,7 +1765,7 @@ impl Record for CalcoutRecord {
         // `set_async_context` (which ran before the common fields were
         // applied), so capture it here, once the framework has resolved it,
         // and classify so a passive never-processed record already shows OUTV.
-        self.out.set(&common.text.out);
+        self.out = common.text.out.as_bytes().into();
         // A load-time `special()` marked posts nobody could watch; this full
         // classification supersedes them, so the first runtime put must not
         // drain them.

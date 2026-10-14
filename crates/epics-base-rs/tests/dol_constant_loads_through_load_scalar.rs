@@ -37,7 +37,7 @@ async fn a_dol_constant_loads_as_its_link_s_load_scalar() {
         .unwrap();
     let got: Vec<_> = ["LO", "QO", "QJ", "LH", "LJ", "LK", "BO"]
         .iter()
-        .map(|r| (db.get_pv(r).ok(), db.get_pv(&format!("{r}.UDF")).ok()))
+        .map(|r| (db.get_pv(r).ok(), db.get_pv(format!("{r}.UDF")).ok()))
         .collect();
     let udf = |u| Some(EpicsValue::UChar(u));
     assert_eq!(

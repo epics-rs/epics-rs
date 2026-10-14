@@ -419,11 +419,11 @@ async fn main() -> CaResult<()> {
         "seqStart program macros - Start an optics SNL program",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let program = match &args[0] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("expected program name".into()),
             };
             let macros = match &args[1] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("expected macros string".into()),
             };
             optics_rs::seq_runner::seq_start(&program, &macros, ctx.bridge(), ctx.db())?;

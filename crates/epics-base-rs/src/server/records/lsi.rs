@@ -1,5 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDeclaration, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::types::PvString;
 use crate::types::{EpicsValue, SharedArray};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -191,8 +192,8 @@ pub struct LsiRecord {
     pub oval: LongStringVal,
     pub sizv: u16,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// `menuPost` Post Value Monitors: `menuPost_OnChange` (0, default)
@@ -221,8 +222,8 @@ impl Default for LsiRecord {
             // parity bug.
             sizv: 256,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             mpst: 0,
@@ -511,10 +512,10 @@ impl Record for LsiRecord {
         }
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -575,14 +576,14 @@ impl Record for LsiRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

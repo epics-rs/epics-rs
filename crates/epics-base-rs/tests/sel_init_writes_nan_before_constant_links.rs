@@ -23,7 +23,7 @@ async fn init_writes_nan_before_the_constant_links() {
         .await
         .unwrap()
         .0;
-    let a = |f: &str| db.get_pv(&format!("S.{f}")).unwrap().to_f64().unwrap();
+    let a = |f: &str| db.get_pv(format!("S.{f}")).unwrap().to_f64().unwrap();
     assert!(a("A").is_nan(), "A {}", a("A"));
     assert_eq!(a("B"), 3.0);
     assert!(a("C").is_nan(), "C {}", a("C"));

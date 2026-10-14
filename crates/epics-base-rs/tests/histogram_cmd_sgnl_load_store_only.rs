@@ -25,7 +25,7 @@ fn stored(db: &PvDatabase, rec: &str, field: &str) -> EpicsValue {
 }
 
 fn udf(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.UDF")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.UDF")).unwrap().to_f64().unwrap()
 }
 
 fn bins(db: &PvDatabase) -> Vec<u32> {

@@ -14,6 +14,7 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client")]
 
+use epics_base_rs::types::RecordName;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,31 +53,31 @@ fn extract_doubles(field: &PvField) -> Vec<f64> {
 /// `channel_array_*` at the trait default ("not supported").
 struct NoArraySource;
 impl ChannelSource for NoArraySource {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         vec!["dut".into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let n = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let n = RecordName::from(n);
         async move { n == "dut" }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
             fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
         })
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         None
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Ok(())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -126,37 +127,37 @@ struct ArraySource {
 }
 
 impl ChannelSource for ArraySource {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         vec!["arr".into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let n = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let n = RecordName::from(n);
         async move { n == "arr" }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
             fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
         })
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(doubles(&self.data.lock().unwrap()))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Ok(())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 
     // ChannelArray: the bound field is the whole double array.
-    async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {
+    async fn channel_array_init(&self, _: &[u8], _: ChannelContext) -> Result<FieldDesc, OpError> {
         Ok(FieldDesc::ScalarArray(ScalarType::Double))
     }
     async fn channel_array_get(

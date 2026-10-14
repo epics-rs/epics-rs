@@ -49,8 +49,8 @@ async fn sim_aai_reads_siol_array_into_val_and_raises_simm_alarm() {
     // VAL sentinel, distinct from the SIOL source array, to show it is replaced
     // by the inward SIOL read (not left stale, not written out).
     let _ = aai.put_field("VAL", EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0].into()));
-    aai.siml = "AAI_SW".to_string();
-    aai.siol = "AAI_SIOL".to_string();
+    aai.siml = "AAI_SW".into();
+    aai.siol = "AAI_SIOL".into();
     aai.sims = MINOR;
     db.add_record("AAIIN", Box::new(aai)).await.unwrap();
 

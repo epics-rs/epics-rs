@@ -94,7 +94,7 @@ fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
     match args.get(i) {
         Some(ArgValue::Int(v)) => Some(*v),
         Some(ArgValue::Double(v)) => Some(*v as i64),
-        Some(ArgValue::String(s)) => s.parse::<i64>().ok(),
+        Some(ArgValue::String(s)) => s.to_str_lossy().parse::<i64>().ok(),
         _ => None,
     }
 }
@@ -103,18 +103,20 @@ fn arg_f64(args: &[ArgValue], i: usize) -> Option<f64> {
     match args.get(i) {
         Some(ArgValue::Double(v)) => Some(*v),
         Some(ArgValue::Int(v)) => Some(*v as f64),
-        Some(ArgValue::String(s)) => s.parse::<f64>().ok(),
+        Some(ArgValue::String(s)) => s.to_str_lossy().parse::<f64>().ok(),
         _ => None,
     }
 }
 
-fn arg_str(args: &[ArgValue], i: usize) -> Option<String> {
-    match args.get(i) {
-        Some(ArgValue::String(s)) => Some(s.clone()),
+/// A text argument. The port registry and the drivers key on `String`, so
+/// bytes that are not UTF-8 are refused here rather than renamed.
+fn arg_str(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
+    Ok(match args.get(i) {
+        Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
         Some(ArgValue::Int(v)) => Some(v.to_string()),
         Some(ArgValue::Double(v)) => Some(v.to_string()),
         _ => None,
-    }
+    })
 }
 
 /// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`):
@@ -127,8 +129,8 @@ fn arg_str(args: &[ArgValue], i: usize) -> Option<String> {
 /// `default:` arm). `\xXX` consumes up to two hex digits; a `\x` with no
 /// following hex digit emits nothing and the next character is reprocessed
 /// as ordinary input (C's `goto input`). A raw or `\0` NUL ends the scan.
-fn raw_from_escaped(src: &str) -> Vec<u8> {
-    let b = src.as_bytes();
+fn raw_from_escaped(src: &[u8]) -> Vec<u8> {
+    let b = src;
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -248,9 +250,13 @@ fn asyn_set_eos(
     } else {
         "asynOctetSetOutputEos"
     };
-    let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+    let port = arg_str(args, 0)?.ok_or_else(|| "portName required".to_string())?;
     let addr = arg_int(args, 1).unwrap_or(0) as i32;
-    let eos = raw_from_escaped(&arg_str(args, 2).unwrap_or_default());
+    // C `asynOctetSetInputEos` decodes the argument's bytes as they are.
+    let eos = match args.get(2) {
+        Some(ArgValue::String(s)) => raw_from_escaped(s),
+        _ => Vec::new(),
+    };
     match mgr.find_port_handle(&port) {
         Ok(handle) => {
             // The shell's own user ([`shell_eos_user`]), carrying the device the
@@ -287,7 +293,7 @@ fn asyn_show_eos(
     } else {
         "asynOctetGetOutputEos"
     };
-    let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+    let port = arg_str(args, 0)?.ok_or_else(|| "portName required".to_string())?;
     let addr = arg_int(args, 1).unwrap_or(0) as i32;
     match mgr.find_port_handle(&port) {
         Ok(handle) => {
@@ -353,7 +359,7 @@ fn shell_enable_target(
     cmd: &str,
     args: &[ArgValue],
 ) -> Option<(crate::port_handle::PortHandle, i32, bool)> {
-    let port = arg_str(args, 0).filter(|s| !s.is_empty())?;
+    let port = arg_str(args, 0).ok().flatten().filter(|s| !s.is_empty())?;
     let addr = arg_int(args, 1).unwrap_or(0) as i32;
     let yes = arg_int(args, 2).unwrap_or(0) != 0;
     match mgr.find_port_handle(&port) {
@@ -431,7 +437,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynReport [level] [portName] - Report registered ports",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let level = arg_int(args, 0).unwrap_or(0) as i32;
-                let port = arg_str(args, 1);
+                let port = arg_str(args, 1)?;
                 report_ports(&mgr_r, level, port.as_deref());
                 Ok(CommandOutcome::Continue)
             },
@@ -463,10 +469,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetOption portName addr key value",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+                let port = arg_str(args, 0)?.ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
-                let key = arg_str(args, 2).ok_or_else(|| "key required".to_string())?;
-                let value = arg_str(args, 3).unwrap_or_default();
+                let key = arg_str(args, 2)?.ok_or_else(|| "key required".to_string())?;
+                let value = arg_str(args, 3)?.unwrap_or_default();
                 // C `asynSetOption` builds its own asynUser and gives it
                 // `timeout = 2` (asynShellCommands.c:119) before queueing the
                 // setOption callback; `addr` rides on the same user, as C's
@@ -618,7 +624,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynInterposeEcho portName [addr] - install the echo interpose \
              (half-duplex devices that echo each char)",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
@@ -668,7 +674,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynInterposeDelay portName addr delay(sec) - install the delay \
              interpose (one write per character, delay after each)",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
@@ -719,9 +725,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynShowOption portName addr key - print one driver option",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+                let port = arg_str(args, 0)?.ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
-                let Some(key) = arg_str(args, 2) else {
+                let Some(key) = arg_str(args, 2)? else {
                     // C: "Missing key argument" (:160-163).
                     ctx.println("Missing key argument");
                     return Ok(CommandOutcome::Continue);
@@ -763,7 +769,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceIOTruncateSize portName addr size - bytes of each I/O to trace",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
                 let size = arg_int(args, 2).unwrap_or(0).max(0) as usize;
                 let trace = match trace_for(&mgr_r, port.as_deref()) {
@@ -806,8 +812,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
              the named source",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let (Some(port), Some(function)) = (
-                    arg_str(args, 0).filter(|s| !s.is_empty()),
-                    arg_str(args, 1).filter(|s| !s.is_empty()),
+                    arg_str(args, 0)?.filter(|s| !s.is_empty()),
+                    arg_str(args, 1)?.filter(|s| !s.is_empty()),
                 ) else {
                     // C's usage line (asynShellCommands.c:1187-1190).
                     ctx.println("Usage: asynRegisterTimeStampSource portName functionName");
@@ -839,7 +845,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             }],
             "asynUnregisterTimeStampSource portName - back to the port's default clock",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let Some(port) = arg_str(args, 0).filter(|s| !s.is_empty()) else {
+                let Some(port) = arg_str(args, 0)?.filter(|s| !s.is_empty()) else {
                     ctx.println("Usage: asynUnregisterTimeStampSource portName");
                     return Ok(CommandOutcome::Continue);
                 };
@@ -898,7 +904,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynSetQueueLockPortTimeout portName timeout - least seconds a SyncIO call \
              waits in the port's queue (C default 2.0)",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).unwrap_or_default();
+                let port = arg_str(args, 0)?.unwrap_or_default();
                 match mgr_r.find_port_handle(&port) {
                     Ok(handle) => handle.set_queue_lock_port_timeout(duration_from_secs(
                         arg_f64(args, 1).unwrap_or(0.0),
@@ -932,7 +938,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynWaitConnect portName timeout - block until the port is connected",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let timeout = duration_from_secs(arg_f64(args, 1).unwrap_or(0.0));
@@ -1012,7 +1018,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynInterposeEosConfig portName addr processIn processOut - install the EOS \
              interpose (terminator handling) on the port",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
@@ -1055,7 +1061,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynInterposeFlushConfig portName addr timeout(msec) - install the flush \
              interpose (a read with this timeout drains the input before each write)",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
@@ -1100,9 +1106,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
+                let mask_str = arg_str(args, 2)?.ok_or_else(|| "mask required".to_string())?;
                 match TraceMask::from_symbolic(&mask_str) {
                     Ok(m) => {
                         let trace = match trace_for(&mgr_r, port.as_deref()) {
@@ -1153,9 +1159,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceIOMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
+                let mask_str = arg_str(args, 2)?.ok_or_else(|| "mask required".to_string())?;
                 match TraceIoMask::from_symbolic(&mask_str) {
                     Ok(m) => {
                         let trace = match trace_for(&mgr_r, port.as_deref()) {
@@ -1214,9 +1220,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceInfoMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
+                let mask_str = arg_str(args, 2)?.ok_or_else(|| "mask required".to_string())?;
                 match TraceInfoMask::from_symbolic(&mask_str) {
                     Ok(m) => {
                         let trace = match trace_for(&mgr_r, port.as_deref()) {
@@ -1273,9 +1279,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceFile [portName] [addr] [filename]",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let filename = arg_str(args, 2).unwrap_or_default();
+                let filename = arg_str(args, 2)?.unwrap_or_default();
                 let target = match filename.as_str() {
                     "" | "stderr" => TraceFile::Stderr,
                     "stdout" => TraceFile::Stdout,
@@ -1438,10 +1444,10 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
         "drvAsynIPPortConfigure portName hostInfo [priority] [noAutoConnect] [noProcessEos] \
          - create an IP octet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let host = arg_str(args, 1)
+            let host = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "hostInfo required".to_string())?;
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
@@ -1520,10 +1526,10 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
         "drvAsynIPServerPortConfigure portName serverInfo maxClients [priority] \
          [noAutoConnect] [noProcessEos] - create an IP server (listening) port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let server_info = arg_str(args, 1)
+            let server_info = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "serverInfo required".to_string())?;
             let max_clients = arg_int(args, 2).unwrap_or(0);
@@ -1680,10 +1686,10 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
         "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
          - create a serial octet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let tty = arg_str(args, 1)
+            let tty = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "ttyName required".to_string())?;
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
@@ -1757,10 +1763,10 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
         "prologixGPIBConfigure portName host [priority] [noAutoConnect] \
          - create a Prologix GPIB-Ethernet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let host = arg_str(args, 1)
+            let host = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "host required".to_string())?;
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
@@ -1918,7 +1924,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
         "drvAsynFTDIPortConfigure portName vendorID productID baudrate latency [priority] \
          [noAutoConnect] [noProcessEos] [mode] - create an FTDI octet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
             let driver = match DrvAsynFtdiPort::configure(
@@ -2000,18 +2006,18 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
         "vxi11Configure portName hostName [flags] [defaultTimeout] [vxiName] [priority] \
          [noAutoConnect] - create a VXI-11 port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let host = arg_str(args, 1)
+            let host = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "hostName required".to_string())?;
             let driver = match DrvVxi11Port::configure(
                 &port,
                 &host,
                 arg_int(args, 2).unwrap_or(0) as i32,
-                &arg_str(args, 3).unwrap_or_default(),
-                &arg_str(args, 4).unwrap_or_default(),
+                &arg_str(args, 3)?.unwrap_or_default(),
+                &arg_str(args, 4)?.unwrap_or_default(),
                 arg_int(args, 5).unwrap_or(0) as i32,
                 arg_int(args, 6).unwrap_or(0) != 0,
             ) {
@@ -2078,14 +2084,14 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
         "usbtmcConfigure portName [vendorID] [productID] [serialNumber] [priority] [flags] \
          - create a USBTMC port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
             let driver = match DrvAsynUsbtmcPort::configure(
                 &port,
                 arg_int(args, 1).unwrap_or(0) as i32,
                 arg_int(args, 2).unwrap_or(0) as i32,
-                &arg_str(args, 3).unwrap_or_default(),
+                &arg_str(args, 3)?.unwrap_or_default(),
                 arg_int(args, 4).unwrap_or(0) as i32,
                 arg_int(args, 5).unwrap_or(0) as i32,
             ) {
@@ -2875,23 +2881,23 @@ mod tests {
     /// commands depend on this for st.cmd terminators.
     #[test]
     fn raw_from_escaped_decodes_c_escapes() {
-        assert_eq!(raw_from_escaped(r"\r\n"), vec![b'\r', b'\n']);
-        assert_eq!(raw_from_escaped(r"\t"), vec![b'\t']);
-        assert_eq!(raw_from_escaped(r"\\"), vec![b'\\']);
-        assert_eq!(raw_from_escaped("AB"), vec![b'A', b'B']);
+        assert_eq!(raw_from_escaped(br"\r\n"), vec![b'\r', b'\n']);
+        assert_eq!(raw_from_escaped(br"\t"), vec![b'\t']);
+        assert_eq!(raw_from_escaped(br"\\"), vec![b'\\']);
+        assert_eq!(raw_from_escaped(b"AB"), vec![b'A', b'B']);
         // \xXX hex escape: two digits, then a single digit.
-        assert_eq!(raw_from_escaped(r"\x41"), vec![0x41]);
-        assert_eq!(raw_from_escaped(r"\x4"), vec![0x04]);
+        assert_eq!(raw_from_escaped(br"\x41"), vec![0x41]);
+        assert_eq!(raw_from_escaped(br"\x4"), vec![0x04]);
         // Unknown escape → the escaped char passes through (C `default:`).
-        assert_eq!(raw_from_escaped(r"\z"), vec![b'z']);
+        assert_eq!(raw_from_escaped(br"\z"), vec![b'z']);
         // \0 → NUL byte.
-        assert_eq!(raw_from_escaped(r"\0"), vec![0]);
+        assert_eq!(raw_from_escaped(br"\0"), vec![0]);
         // Trailing lone backslash with no following char is dropped (C break).
-        assert_eq!(raw_from_escaped(r"a\"), vec![b'a']);
+        assert_eq!(raw_from_escaped(br"a\"), vec![b'a']);
         // \x with no hex digit emits nothing; the char is reprocessed as
         // ordinary input (C `goto input`).
-        assert_eq!(raw_from_escaped(r"\xg"), vec![b'g']);
-        assert!(raw_from_escaped("").is_empty());
+        assert_eq!(raw_from_escaped(br"\xg"), vec![b'g']);
+        assert!(raw_from_escaped(b"").is_empty());
     }
 
     /// The EOS shell commands hand their `asynUser` C's 2 s I/O deadline.
@@ -2980,9 +2986,9 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("eos_port".to_string()),
+                    ArgValue::String("eos_port".into()),
                     ArgValue::Int(0),
-                    ArgValue::String(r"\r\n".to_string()),
+                    ArgValue::String(r"\r\n".into()),
                 ],
                 &ctx,
             )
@@ -3003,9 +3009,9 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("eos_port".to_string()),
+                    ArgValue::String("eos_port".into()),
                     ArgValue::Int(0),
-                    ArgValue::String(r"\n".to_string()),
+                    ArgValue::String(r"\n".into()),
                 ],
                 &ctx,
             )
@@ -3146,7 +3152,7 @@ mod tests {
         assert_eq!(escaped_from_raw(b"", n), "");
         for s in [r"\r\n", r"\t", r"\x1b", "ab"] {
             assert_eq!(
-                escaped_from_raw(&raw_from_escaped(s), n),
+                escaped_from_raw(&raw_from_escaped(s.as_bytes()), n),
                 s,
                 "escape/unescape must round-trip"
             );
@@ -3157,10 +3163,10 @@ mod tests {
         // decodes `\0` via C's `case '0'` (one NUL, following digits literal), so
         // `\0` is unambiguous and a NUL-then-digit round-trips exactly.
         assert_eq!(escaped_from_raw(b"\0", n), r"\0");
-        assert_eq!(raw_from_escaped(r"\0"), vec![0u8]); // `\0` in -> single NUL out
-        assert_eq!(raw_from_escaped(r"\x00"), vec![0u8]); // decoder also accepts `\x00`
+        assert_eq!(raw_from_escaped(br"\0"), vec![0u8]); // `\0` in -> single NUL out
+        assert_eq!(raw_from_escaped(br"\x00"), vec![0u8]); // decoder also accepts `\x00`
         assert_eq!(escaped_from_raw(b"\x001", n), r"\01"); // NUL then '1'
-        assert_eq!(raw_from_escaped(r"\01"), vec![0u8, b'1']); // no octal: NUL then '1'
+        assert_eq!(raw_from_escaped(br"\01"), vec![0u8, b'1']); // no octal: NUL then '1'
         // C sizes `cbuf` at 4 * sizeof(eos) + 2 precisely so the widest
         // terminator — 10 bytes, every one of them `\xNN` — still escapes whole
         // (40 chars, one under the bound).
@@ -3274,7 +3280,7 @@ mod tests {
             .expect("asynInterposeEcho must be registered");
         echo_cmd
             .handler
-            .call(&[ArgValue::String("echo_port".to_string())], &ctx)
+            .call(&[ArgValue::String("echo_port".into())], &ctx)
             .expect("handler returns Ok");
 
         // After the command: the echo layer is on the port, so the same
@@ -3297,7 +3303,7 @@ mod tests {
         // panic and not a silent success.
         echo_cmd
             .handler
-            .call(&[ArgValue::String("no_such_port".to_string())], &ctx)
+            .call(&[ArgValue::String("no_such_port".into())], &ctx)
             .expect("unknown port is reported, not an Err");
     }
 
@@ -3383,7 +3389,7 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("delay_port".to_string()),
+                    ArgValue::String("delay_port".into()),
                     ArgValue::Int(0),
                     ArgValue::Double(0.001),
                 ],
@@ -3411,7 +3417,7 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("no_such_port".to_string()),
+                    ArgValue::String("no_such_port".into()),
                     ArgValue::Int(0),
                     ArgValue::Double(0.001),
                 ],
@@ -3600,9 +3606,9 @@ mod tests {
             .expect("asynSetTraceIOMask must be registered");
         let _ = io_cmd.handler.call(
             &[
-                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::String("trace_dev_port".into()),
                 ArgValue::Int(5),
-                ArgValue::String("HEX".to_string()),
+                ArgValue::String("HEX".into()),
             ],
             &ctx,
         );
@@ -3614,9 +3620,9 @@ mod tests {
             .expect("asynSetTraceInfoMask must be registered");
         let _ = info_cmd.handler.call(
             &[
-                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::String("trace_dev_port".into()),
                 ArgValue::Int(7),
-                ArgValue::String("SOURCE".to_string()),
+                ArgValue::String("SOURCE".into()),
             ],
             &ctx,
         );
@@ -3628,9 +3634,9 @@ mod tests {
             .expect("asynSetTraceFile must be registered");
         let _ = file_cmd.handler.call(
             &[
-                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::String("trace_dev_port".into()),
                 ArgValue::Int(2),
-                ArgValue::String("stderr".to_string()),
+                ArgValue::String("stderr".into()),
             ],
             &ctx,
         );
@@ -4039,7 +4045,7 @@ mod tests {
                 ArgValue::String("iocsh_usbtmc_cfg_test".into()),
                 ArgValue::Int(0x0699),
                 ArgValue::Int(0x0368),
-                ArgValue::String(String::new()),
+                ArgValue::String(Default::default()),
                 ArgValue::Int(0),
                 ArgValue::Int(0),
             ],
@@ -4162,7 +4168,7 @@ mod tests {
                 ArgValue::String("refuse_usbtmc".into()),
                 ArgValue::Int(0x0699),
                 ArgValue::Int(0x0368),
-                ArgValue::String(String::new()),
+                ArgValue::String(Default::default()),
                 ArgValue::Int(0),
                 ArgValue::Int(0),
             ];

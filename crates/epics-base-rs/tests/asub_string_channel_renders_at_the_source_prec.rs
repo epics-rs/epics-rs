@@ -41,7 +41,7 @@ async fn strings(db: &PvDatabase, rec: &str, field: &str) -> Vec<String> {
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
-    match db.get_pv(&format!("{rec}.{field}")).unwrap() {
+    match db.get_pv(format!("{rec}.{field}")).unwrap() {
         EpicsValue::StringArray(a) => a.iter().map(|s| s.to_string()).collect(),
         EpicsValue::String(s) => vec![s.to_string()],
         other => panic!("{rec}: {other:?}"),

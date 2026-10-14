@@ -241,17 +241,17 @@ async fn a_non_local_time_input_supplies_the_remote_stamp() {
     struct RemoteLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for RemoteLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-            (name == "REMOTE:A").then_some(EpicsValue::Double(10.0))
+        fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+            (name == b"REMOTE:A").then_some(EpicsValue::Double(10.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
-            (name == "REMOTE:A").then_some((1_700_000_456, 321, A_UTAG))
+        fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
+            (name == b"REMOTE:A").then_some((1_700_000_456, 321, A_UTAG))
         }
     }
 

@@ -363,7 +363,7 @@ mod menu_choice_tests {
     fn timestamp_tst_snapshot_is_enum_with_labels() {
         let mut rec = TimestampRecord::default();
         rec.put_field("TST", EpicsValue::Short(4)).unwrap(); // HH:MM:SS
-        let inst = RecordInstance::new("TS:TST".into(), rec);
+        let inst = RecordInstance::new("TS:TST", rec);
 
         let snap = inst.snapshot_for_field("TST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(4));

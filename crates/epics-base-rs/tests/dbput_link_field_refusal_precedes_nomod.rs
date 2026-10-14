@@ -99,12 +99,12 @@ record(seq, "SQ") {
             .unwrap();
         assert_eq!(heard(), [said], "{w}");
         assert_eq!(
-            db.get_pv(&format!("{w}.STAT")).unwrap().to_f64(),
+            db.get_pv(format!("{w}.STAT")).unwrap().to_f64(),
             Some(14.0),
             "{w} LINK"
         );
         assert_eq!(
-            db.get_pv(&format!("{w}.SEVR")).unwrap().to_f64(),
+            db.get_pv(format!("{w}.SEVR")).unwrap().to_f64(),
             Some(3.0),
             "{w} INVALID"
         );
@@ -144,7 +144,7 @@ record(seq, "SQ") {
     db.post_event_named("5").await;
     assert_eq!(heard(), [NOMOD.to_string(), line("A.SUBL")], "E5");
     for rec in ["E5", "W6"] {
-        let num = |f: &str| db.get_pv(&format!("{rec}.{f}")).unwrap().to_f64();
+        let num = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().to_f64();
         assert_eq!([num("STAT"), num("SEVR")], [Some(14.0), Some(3.0)], "{rec}");
     }
 

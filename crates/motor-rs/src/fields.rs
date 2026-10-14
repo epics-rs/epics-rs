@@ -347,20 +347,20 @@ impl Default for DisplayFields {
 /// (0 = supervisory, 1 = closed_loop).
 #[derive(Debug, Clone, Default)]
 pub struct LinkFields {
-    pub out: String,
+    pub out: PvString,
     /// `field(CARD,DBF_SHORT)` (motorRecord.dbd:239-243), the one field that is
     /// a pure function of [`Self::out`]: `init_record` switches on the OUT link
     /// TYPE and stores the card number, -1, or 0 (`motorRecord.cc:653-670`).
     /// It lives beside the link it is derived from; `motor_derive_card` is the
     /// only writer.
     pub card: i16,
-    pub rdbl: String,
-    pub dol: String,
-    pub rlnk: String,
-    pub stoo: String,
-    pub dinp: String,
-    pub rinp: String,
-    pub post: String,
+    pub rdbl: PvString,
+    pub dol: PvString,
+    pub rlnk: PvString,
+    pub stoo: PvString,
+    pub dinp: PvString,
+    pub rinp: PvString,
+    pub post: PvString,
     pub omsl: i16,
 }
 

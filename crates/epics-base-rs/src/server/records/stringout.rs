@@ -30,10 +30,10 @@ pub struct StringoutRecord {
     pub ivoa: i16,
     pub ivov: PvString,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// `menu(stringoutPOST)` Post Value Monitors (0=On Change, 1=Always).
@@ -53,10 +53,10 @@ impl Default for StringoutRecord {
             ivoa: 0,
             ivov: PvString::new(),
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             mpst: 0,
@@ -232,11 +232,11 @@ impl Record for StringoutRecord {
         Ok(ProcessOutcome::complete())
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -327,7 +327,7 @@ impl Record for StringoutRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(s) => {
-                    self.dol = s.as_str_lossy().into_owned();
+                    self.dol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("DOL".into())),
@@ -341,14 +341,14 @@ impl Record for StringoutRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s.as_str_lossy().into_owned();
+                    self.siml = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s.as_str_lossy().into_owned();
+                    self.siol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -407,7 +407,7 @@ mod tests {
         let mut rec = StringoutRecord::default();
         rec.put_field("APST", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("APST"), Some(EpicsValue::Short(1)));
-        let inst = RecordInstance::new("SO:APST".into(), rec);
+        let inst = RecordInstance::new("SO:APST", rec);
         let snap = inst.snapshot_for_field("APST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(

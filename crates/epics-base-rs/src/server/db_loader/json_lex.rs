@@ -31,27 +31,27 @@ enum Kind {
     Scalar {
         key: bool,
     },
-    Punct(char),
+    Punct(u8),
     Eof,
 }
 
 struct Token {
     kind: Kind,
     /// C `yytext`.
-    text: String,
+    text: Vec<u8>,
     line: usize,
 }
 
 struct Lexer<'a> {
-    chars: &'a [char],
+    chars: &'a [u8],
     pos: &'a mut usize,
     line: &'a mut usize,
     col: &'a mut usize,
     aborts: &'a mut LexAborts,
 }
 
-fn is_barechar(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.')
+fn is_barechar(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'+' | b'.')
 }
 
 /// `exp` of `dbLex.l`: `[eE]{sign}[0-9]+`, the whole of `s`.
@@ -67,11 +67,11 @@ fn is_exp(s: &[u8]) -> bool {
 }
 
 /// C's `number` rule (`dbLex.l:40-47`) matched against the whole of `s`.
-fn is_json_number(s: &str) -> bool {
-    if s == "NaN" {
+fn is_json_number(s: &[u8]) -> bool {
+    if s == b"NaN" {
         return true;
     }
-    let b = s.as_bytes();
+    let b = s;
     let b = match b {
         [b'+' | b'-', r @ ..] => r,
         r => r,
@@ -110,23 +110,23 @@ fn is_json_number(s: &str) -> bool {
 /// The interior of a quoted string is `jsondqchar*` / `jsonsqchar*`
 /// (`dbLex.l:26-33`): no control character, no bare backslash escape of
 /// `u`, `x` or `1`-`9` unless it is the full `\xHH` / `\uHHHH` form.
-fn is_json_string_body(body: &[char]) -> bool {
+fn is_json_string_body(body: &[u8]) -> bool {
     let mut i = 0;
     while i < body.len() {
         match body[i] {
-            '\\' => {
+            b'\\' => {
                 let hex = |n: usize| {
                     body.get(i + 2..i + 2 + n)
-                        .is_some_and(|h| h.iter().all(char::is_ascii_hexdigit))
+                        .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
                 };
                 match body.get(i + 1) {
-                    Some('u') if hex(4) => i += 6,
-                    Some('x') if hex(2) => i += 4,
-                    Some('u' | 'x' | '1'..='9') | None => return false,
+                    Some(b'u') if hex(4) => i += 6,
+                    Some(b'x') if hex(2) => i += 4,
+                    Some(b'u' | b'x' | b'1'..=b'9') | None => return false,
                     Some(_) => i += 2,
                 }
             }
-            c if (c as u32) < 0x20 => return false,
+            c if c < 0x20 => return false,
             _ => i += 1,
         }
     }
@@ -135,7 +135,7 @@ fn is_json_string_body(body: &[char]) -> bool {
 
 impl Lexer<'_> {
     fn advance(&mut self) {
-        if self.chars[*self.pos] == '\n' {
+        if self.chars[*self.pos] == b'\n' {
             *self.line += 1;
             *self.col = 0;
         } else {
@@ -152,7 +152,7 @@ impl Lexer<'_> {
             self.aborts.eof = Some(
                 self.chars[start..]
                     .iter()
-                    .position(|&c| c == '\n')
+                    .position(|&c| c == b'\n')
                     .map_or(self.chars.len(), |at| start + at + 1),
             );
         }
@@ -173,15 +173,15 @@ impl Lexer<'_> {
         loop {
             // Whitespace and `#` comments.
             while let Some(&c) = self.chars.get(*self.pos) {
-                if c == '\n' && self.aborted() {
+                if c == b'\n' && self.aborted() {
                     // `yyAbort`: the next line read is EOF.
                     return self.eof();
                 }
-                if c == '#' {
-                    while self.chars.get(*self.pos).is_some_and(|&c| c != '\n') {
+                if c == b'#' {
+                    while self.chars.get(*self.pos).is_some_and(|&c| c != b'\n') {
                         self.advance();
                     }
-                } else if matches!(c, ' ' | '\t' | '\r' | '\n') {
+                } else if matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
                     self.advance();
                 } else {
                     break;
@@ -191,18 +191,18 @@ impl Lexer<'_> {
                 return self.eof();
             };
             let (start, line) = (*self.pos, *self.line);
-            if matches!(c, ':' | ',' | '[' | ']' | '{' | '}') {
+            if matches!(c, b':' | b',' | b'[' | b']' | b'{' | b'}') {
                 self.advance();
                 return Token {
                     kind: Kind::Punct(c),
-                    text: c.to_string(),
+                    text: vec![c],
                     line,
                 };
             }
-            if c == '"' || c == '\'' {
+            if c == b'"' || c == b'\'' {
                 match self.string_end(c) {
                     Some(end) => {
-                        let text: String = self.chars[start..=end].iter().collect();
+                        let text = self.chars[start..=end].to_vec();
                         let valid = is_json_string_body(&self.chars[start + 1..end]);
                         while *self.pos <= end {
                             self.advance();
@@ -214,7 +214,7 @@ impl Lexer<'_> {
                                 line,
                             };
                         }
-                        self.refuse_at(start, line, JsonLexFault::BadString(text));
+                        self.refuse_at(start, line, JsonLexFault::BadString(lossy(&text)));
                     }
                     None => {
                         self.advance();
@@ -227,9 +227,9 @@ impl Lexer<'_> {
                 while self.chars.get(*self.pos).is_some_and(|&c| is_barechar(c)) {
                     self.advance();
                 }
-                let text: String = self.chars[start..*self.pos].iter().collect();
-                let key =
-                    !(matches!(text.as_str(), "null" | "true" | "false") || is_json_number(&text));
+                let text = self.chars[start..*self.pos].to_vec();
+                let key = !(matches!(text.as_slice(), b"null" | b"true" | b"false")
+                    || is_json_number(&text));
                 return Token {
                     kind: Kind::Scalar { key },
                     text,
@@ -245,13 +245,13 @@ impl Lexer<'_> {
     /// error rule `{q}({schar}|{escape})*{q}` (`dbLex.l:131-141`): it ends at
     /// the first unescaped quote on the line, and an escape needs a
     /// character that is not the newline.
-    fn string_end(&self, quote: char) -> Option<usize> {
+    fn string_end(&self, quote: u8) -> Option<usize> {
         let mut j = *self.pos + 1;
         loop {
             match *self.chars.get(j)? {
-                '\n' => return None,
-                '\\' => match self.chars.get(j + 1) {
-                    Some('\n') | None => return None,
+                b'\n' => return None,
+                b'\\' => match self.chars.get(j + 1) {
+                    Some(b'\n') | None => return None,
                     Some(_) => j += 2,
                 },
                 c if c == quote => return Some(j),
@@ -269,14 +269,14 @@ impl Lexer<'_> {
     fn lookahead(&mut self) {
         loop {
             while let Some(&c) = self.chars.get(*self.pos) {
-                if c == '\n' && self.aborted() {
+                if c == b'\n' && self.aborted() {
                     return;
                 }
-                if c == '#' {
-                    while self.chars.get(*self.pos).is_some_and(|&c| c != '\n') {
+                if c == b'#' {
+                    while self.chars.get(*self.pos).is_some_and(|&c| c != b'\n') {
                         self.advance();
                     }
-                } else if matches!(c, ' ' | '\t' | '\r' | '\n') {
+                } else if matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
                     self.advance();
                 } else {
                     break;
@@ -286,28 +286,31 @@ impl Lexer<'_> {
                 return;
             };
             let start = *self.pos;
-            if c == '"' {
+            if c == b'"' {
                 // `{doublequote}({dqschar}|{escape})*` then a quote (a token)
                 // or a newline (the error rule, which takes the newline too).
-                match self.string_end('"') {
+                match self.string_end(b'"') {
                     Some(_) => return,
                     None => {
                         let line = *self.line;
                         while let Some(&c) = self.chars.get(*self.pos) {
                             self.advance();
-                            if c == '\n' {
+                            if c == b'\n' {
                                 break;
                             }
                         }
-                        let text: String = self.chars[start..*self.pos].iter().collect();
+                        let text = lossy(&self.chars[start..*self.pos]);
                         self.refuse_at(start, line, JsonLexFault::NewlineInString(text));
                         continue;
                     }
                 }
             }
-            let is_initial_token = matches!(c, '{' | '}' | '(' | ')' | ',' | '%')
+            let is_initial_token = matches!(c, b'{' | b'}' | b'(' | b')' | b',' | b'%')
                 || c.is_ascii_alphanumeric()
-                || matches!(c, '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';');
+                || matches!(
+                    c,
+                    b'_' | b'-' | b'+' | b':' | b'.' | b'[' | b']' | b'<' | b'>' | b';'
+                );
             if is_initial_token {
                 return;
             }
@@ -319,7 +322,7 @@ impl Lexer<'_> {
     fn eof(&self) -> Token {
         Token {
             kind: Kind::Eof,
-            text: String::new(),
+            text: Vec::new(),
             line: *self.line,
         }
     }
@@ -329,29 +332,31 @@ impl Lexer<'_> {
     /// bare key quoted when it holds `+`, `-` or `.`, a member's trailing
     /// comma dropped and an element's kept. The error is the token the
     /// grammar rejected.
-    fn value(&mut self, first: Token) -> Result<String, Token> {
+    fn value(&mut self, first: Token) -> Result<Vec<u8>, Token> {
         match first.kind {
             Kind::Scalar { key: false } => Ok(first.text),
-            Kind::Scalar { key: true } if first.text.starts_with(['"', '\'']) => Ok(first.text),
-            Kind::Scalar { key: true } => Ok(format!("\"{}\"", first.text)),
-            Kind::Punct('[') => {
-                let mut out = String::from("[");
+            Kind::Scalar { key: true } if matches!(first.text.first(), Some(b'"' | b'\'')) => {
+                Ok(first.text)
+            }
+            Kind::Scalar { key: true } => Ok(quoted(&first.text)),
+            Kind::Punct(b'[') => {
+                let mut out = b"[".to_vec();
                 let mut t = self.token();
-                if t.kind != Kind::Punct(']') {
+                if t.kind != Kind::Punct(b']') {
                     loop {
-                        out.push_str(&self.value(t)?);
+                        out.extend_from_slice(&self.value(t)?);
                         match self.token() {
                             Token {
-                                kind: Kind::Punct(']'),
+                                kind: Kind::Punct(b']'),
                                 ..
                             } => break,
                             Token {
-                                kind: Kind::Punct(','),
+                                kind: Kind::Punct(b','),
                                 ..
                             } => {
-                                out.push(',');
+                                out.push(b',');
                                 t = self.token();
-                                if t.kind == Kind::Punct(']') {
+                                if t.kind == Kind::Punct(b']') {
                                     break;
                                 }
                             }
@@ -359,41 +364,44 @@ impl Lexer<'_> {
                         }
                     }
                 }
-                out.push(']');
+                out.push(b']');
                 Ok(out)
             }
-            Kind::Punct('{') => {
+            Kind::Punct(b'{') => {
                 let mut members = Vec::new();
                 let mut t = self.token();
-                if t.kind != Kind::Punct('}') {
+                if t.kind != Kind::Punct(b'}') {
                     loop {
                         if !matches!(t.kind, Kind::Scalar { key: true }) {
                             return Err(t);
                         }
-                        let key = if !t.text.starts_with(['"', '\''])
-                            && t.text.contains(['+', '-', '.'])
+                        let key = if !matches!(t.text.first(), Some(b'"' | b'\''))
+                            && t.text.iter().any(|c| matches!(c, b'+' | b'-' | b'.'))
                         {
-                            format!("\"{}\"", t.text)
+                            quoted(&t.text)
                         } else {
                             t.text
                         };
                         let colon = self.token();
-                        if colon.kind != Kind::Punct(':') {
+                        if colon.kind != Kind::Punct(b':') {
                             return Err(colon);
                         }
                         let v = self.token();
-                        members.push(format!("{key}:{}", self.value(v)?));
+                        let mut member = key;
+                        member.push(b':');
+                        member.extend_from_slice(&self.value(v)?);
+                        members.push(member);
                         match self.token() {
                             Token {
-                                kind: Kind::Punct('}'),
+                                kind: Kind::Punct(b'}'),
                                 ..
                             } => break,
                             Token {
-                                kind: Kind::Punct(','),
+                                kind: Kind::Punct(b','),
                                 ..
                             } => {
                                 t = self.token();
-                                if t.kind == Kind::Punct('}') {
+                                if t.kind == Kind::Punct(b'}') {
                                     break;
                                 }
                             }
@@ -401,7 +409,10 @@ impl Lexer<'_> {
                         }
                     }
                 }
-                Ok(format!("{{{}}}", members.join(",")))
+                let mut out = b"{".to_vec();
+                out.extend_from_slice(&members.join(&b','));
+                out.push(b'}');
+                Ok(out)
             }
             _ => Err(first),
         }
@@ -413,14 +424,14 @@ impl Lexer<'_> {
 /// completes if the grammar lets it; only the grammar's own rejection is an
 /// error, its `syntax error`.
 pub(super) fn read_json_value(
-    chars: &[char],
+    chars: &[u8],
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
     aborts: &mut LexAborts,
-) -> CaResult<String> {
+) -> CaResult<Vec<u8>> {
     let start_line = *line;
-    let close = if chars.get(*pos) == Some(&'[') {
+    let close = if chars.get(*pos) == Some(&b'[') {
         ']'
     } else {
         '}'
@@ -446,7 +457,7 @@ pub(super) fn read_json_value(
         }),
         Err(t) => Err(CaError::DbParseError {
             line: t.line,
-            token: t.text,
+            token: lossy(&t.text),
             message: super::SYNTAX_ERROR.to_string(),
         }),
     }
@@ -455,7 +466,7 @@ pub(super) fn read_json_value(
 /// What the lexer refuses between a value that parsed and the token that
 /// follows it, which it does not consume.
 pub(super) fn after_value(
-    chars: &[char],
+    chars: &[u8],
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -469,6 +480,20 @@ pub(super) fn after_value(
         aborts,
     }
     .look_past();
+}
+
+/// `"` + `text` + `"`, as the grammar's actions quote a bare token.
+fn quoted(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 2);
+    out.push(b'"');
+    out.extend_from_slice(text);
+    out.push(b'"');
+    out
+}
+
+/// `yytext` as a diagnostic prints it.
+fn lossy(text: &[u8]) -> String {
+    String::from_utf8_lossy(text).into_owned()
 }
 
 impl Lexer<'_> {

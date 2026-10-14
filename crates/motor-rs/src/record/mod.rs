@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn rlnk_readback_link_fired_with_rbv_each_process() {
         let mut rec = MotorRecord::new();
-        rec.links.rlnk = "readback_sink.PROC".to_string();
+        rec.links.rlnk = "readback_sink.PROC".into();
         rec.pos.rbv = 12.5;
         let outcome = rec.process().unwrap();
         let rbv = rec.pos.rbv;
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn rlnk_readback_link_fired_on_move_start_async_pending() {
         let mut rec = MotorRecord::new();
-        rec.links.rlnk = "readback_sink.PROC".to_string();
+        rec.links.rlnk = "readback_sink.PROC".into();
         // Enter a move: DMOV goes true→false. The first process() of a fresh
         // move returns the intermediate DMOV=0 notification.
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
@@ -1038,7 +1038,7 @@ mod tests {
     fn urip_pulls_rdbl_link_before_process() {
         let mut rec = MotorRecord::new();
         rec.conv.urip = true;
-        rec.links.rdbl = "ext_readback.RBV".to_string();
+        rec.links.rdbl = "ext_readback.RBV".into();
         let actions = rec.pre_process_actions();
         assert!(
             actions.iter().any(|a| matches!(
@@ -1057,7 +1057,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         // Link configured, but URIP=No — C reads RRBV from the controller.
         rec.conv.urip = false;
-        rec.links.rdbl = "ext_readback.RBV".to_string();
+        rec.links.rdbl = "ext_readback.RBV".into();
         let actions = rec.pre_process_actions();
         assert!(
             !actions.iter().any(|a| matches!(
@@ -1078,7 +1078,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.conv.urip = true;
         rec.conv.ueip = true;
-        rec.links.rdbl = "ext_readback.RBV".to_string();
+        rec.links.rdbl = "ext_readback.RBV".into();
         let actions = rec.pre_process_actions();
         assert!(
             !actions.iter().any(|a| matches!(
@@ -1110,7 +1110,7 @@ mod tests {
     fn closed_loop_db_dol_drives_val() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // menuOmsl: closed_loop
-        rec.links.dol = "setpoint_src.VAL".to_string(); // resolves to a DB link
+        rec.links.dol = "setpoint_src.VAL".into(); // resolves to a DB link
         assert!(rec.stat.dmov, "record starts done");
         assert!(
             has_dol_read(&rec.pre_process_actions()),
@@ -1122,7 +1122,7 @@ mod tests {
     fn supervisory_omsl_ignores_dol() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 0; // supervisory
-        rec.links.dol = "setpoint_src.VAL".to_string();
+        rec.links.dol = "setpoint_src.VAL".into();
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "supervisory OMSL must not read DOL"
@@ -1137,7 +1137,7 @@ mod tests {
         use epics_base_rs::server::record::CommonFields;
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
-        rec.links.dol = "setpoint_src.VAL".to_string();
+        rec.links.dol = "setpoint_src.VAL".into();
         assert!(rec.stat.dmov, "record starts done");
         let mut common = CommonFields::default();
 
@@ -1228,7 +1228,7 @@ mod tests {
     fn constant_dol_clears_udf_at_init() {
         use epics_base_rs::server::record::CommonFields;
         let mut rec = MotorRecord::new();
-        rec.links.dol = String::new(); // unset DOL == CONSTANT
+        rec.links.dol = "".into(); // unset DOL == CONSTANT
         let status = asyn_rs::interfaces::motor::MotorStatus {
             position: 0.0,
             encoder_position: 0.0,
@@ -1255,7 +1255,7 @@ mod tests {
         use epics_base_rs::server::record::CommonFields;
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
-        rec.links.dol = "setpoint_src.VAL".to_string(); // DB_LINK
+        rec.links.dol = "setpoint_src.VAL".into(); // DB_LINK
         let status = asyn_rs::interfaces::motor::MotorStatus {
             position: 0.0,
             encoder_position: 0.0,
@@ -1283,7 +1283,7 @@ mod tests {
     fn closed_loop_constant_dol_not_reread() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1;
-        rec.links.dol = "5.0".to_string(); // CONSTANT, not a DB link
+        rec.links.dol = "5.0".into(); // CONSTANT, not a DB link
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "a constant DOL must not be re-read each pass"
@@ -1296,7 +1296,7 @@ mod tests {
     fn closed_loop_dol_not_read_mid_move() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1;
-        rec.links.dol = "setpoint_src.VAL".to_string();
+        rec.links.dol = "setpoint_src.VAL".into();
         rec.stat.dmov = false; // a move is in flight
         assert!(
             !has_dol_read(&rec.pre_process_actions()),

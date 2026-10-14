@@ -282,7 +282,7 @@ impl GroupPump {
     pub(crate) fn attach(
         &self,
         db: &PvDatabase,
-        pv_name: &str,
+        pv_name: &[u8],
         mask: u16,
         filters: &FilterChain,
         dollar: Option<DollarView>,

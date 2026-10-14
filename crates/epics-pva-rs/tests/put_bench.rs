@@ -32,6 +32,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
 // suite.
+use epics_base_rs::types::RecordName;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,14 +49,14 @@ use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 
 #[derive(Clone)]
 struct BenchSource {
-    values: Arc<Mutex<HashMap<String, PvField>>>,
+    values: Arc<Mutex<HashMap<RecordName, PvField>>>,
 }
 
 impl BenchSource {
     fn with_scalars(names: &[String], v: f64) -> Self {
         let mut m = HashMap::with_capacity(names.len());
         for n in names {
-            m.insert(n.clone(), make_nt_scalar(v));
+            m.insert(RecordName::from(n.as_str()), make_nt_scalar(v));
         }
         Self {
             values: Arc::new(Mutex::new(m)),
@@ -78,21 +79,21 @@ fn nt_scalar_desc() -> FieldDesc {
 }
 
 impl ChannelSource for BenchSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let values = self.values.clone();
         async move { values.lock().await.keys().cloned().collect() }
     }
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { values.lock().await.contains_key(&name) }
     }
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             if values.lock().await.contains_key(&name) {
                 Some(nt_scalar_desc())
@@ -101,29 +102,29 @@ impl ChannelSource for BenchSource {
             }
         }
     }
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { values.lock().await.get(&name).cloned() }
     }
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             values.lock().await.insert(name, value);
             Ok(())
         }
     }
-    async fn is_writable(&self, _name: &str) -> bool {
+    async fn is_writable(&self, _name: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _name: &str,
+        _name: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         // No monitors in this benchmark.
         None

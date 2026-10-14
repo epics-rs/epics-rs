@@ -43,8 +43,8 @@ enum Tok {
     /// back around a `QUOTE` when they build `sub_collect`
     /// (`dbLoadTemplate.y:220-255`, `:301-323`).
     Str {
-        text: String,
-        quote: Option<char>,
+        text: Vec<u8>,
+        quote: Option<u8>,
     },
     Equals,
     Comma,
@@ -65,8 +65,12 @@ fn tok_text(tok: &Tok) -> String {
         Tok::Str {
             text,
             quote: Some(q),
-        } => format!("{q}{text}{q}"),
-        Tok::Str { text, quote: None } => text.clone(),
+        } => format!(
+            "{q}{}{q}",
+            String::from_utf8_lossy(text),
+            q = char::from(*q)
+        ),
+        Tok::Str { text, quote: None } => String::from_utf8_lossy(text).into_owned(),
         Tok::Equals => "=".into(),
         Tok::Comma => ",".into(),
         Tok::OBrace => "{".into(),
@@ -111,11 +115,12 @@ impl SubstitutionFault {
 
     /// C's catch-all lexer rule, `dbLoadTemplate_lex.l:47-56`:
     /// `sprintf(message, "invalid character '%c'", yytext[0])`.
-    fn invalid_character(line: usize, c: char) -> Self {
+    fn invalid_character(line: usize, c: u8) -> Self {
+        let c = String::from_utf8_lossy(&[c]).into_owned();
         Self {
             line,
             message: Some(format!("invalid character '{c}'")),
-            yytext: c.to_string(),
+            yytext: c,
         }
     }
 }
@@ -160,8 +165,7 @@ pub struct Substitutions {
 /// (`dbLoadTemplate_lex.l:47-56`), which calls `yyerror`, returns NO token
 /// and lets flex resume at the next character — so a stray byte costs one
 /// character, not the file. Every fault this raises is one C recovered from.
-fn lex(input: &str) -> Lexed {
-    let chars: Vec<char> = input.chars().collect();
+fn lex(chars: &[u8]) -> Lexed {
     let mut out: Vec<(Tok, usize)> = Vec::new();
     // Each fault remembers how many tokens the lexer had produced when
     // it hit it, which is what puts it back in C's order among the rows.
@@ -169,44 +173,44 @@ fn lex(input: &str) -> Lexed {
     let mut i = 0;
     let mut line = 1usize;
 
-    let is_bareword = |c: char| {
+    let is_bareword = |c: u8| {
         c.is_ascii_alphanumeric()
             || matches!(
                 c,
-                '_' | '-' | '+' | ':' | '.' | '/' | '\\' | '[' | ']' | '<' | '>' | ';'
+                b'_' | b'-' | b'+' | b':' | b'.' | b'/' | b'\\' | b'[' | b']' | b'<' | b'>' | b';'
             )
     };
 
     while i < chars.len() {
         let c = chars[i];
         match c {
-            '\n' => {
+            b'\n' => {
                 line += 1;
                 i += 1;
             }
-            ' ' | '\t' | '\r' => i += 1,
-            '#' => {
-                while i < chars.len() && chars[i] != '\n' {
+            b' ' | b'\t' | b'\r' => i += 1,
+            b'#' => {
+                while i < chars.len() && chars[i] != b'\n' {
                     i += 1;
                 }
             }
-            '=' => {
+            b'=' => {
                 out.push((Tok::Equals, line));
                 i += 1;
             }
-            ',' => {
+            b',' => {
                 out.push((Tok::Comma, line));
                 i += 1;
             }
-            '{' => {
+            b'{' => {
                 out.push((Tok::OBrace, line));
                 i += 1;
             }
-            '}' => {
+            b'}' => {
                 out.push((Tok::CBrace, line));
                 i += 1;
             }
-            '"' | '\'' => {
+            b'"' | b'\'' => {
                 // C's QUOTE rule is ONE flex pattern that has to reach a
                 // closing quote on the same line: `dstringchar`/`sstringchar`
                 // are `[^"\n\\]`/`[^'\n\\]` and `{escape}` is
@@ -217,7 +221,7 @@ fn lex(input: &str) -> Lexed {
                 // `invalid character '"'` and the rest of the line lexes as
                 // ordinary tokens. Measured on softIoc: `{ N="A1 }` reports
                 // the quote and still loads the row as `N=A1`.
-                match scan_quoted(&chars, i) {
+                match scan_quoted(chars, i) {
                     Some((text, next)) => {
                         out.push((
                             Tok::Str {
@@ -235,15 +239,15 @@ fn lex(input: &str) -> Lexed {
                 }
             }
             _ if is_bareword(c) => {
-                let mut s = String::new();
+                let mut s = Vec::new();
                 while i < chars.len() && is_bareword(chars[i]) {
                     s.push(chars[i]);
                     i += 1;
                 }
-                let tok = match s.as_str() {
-                    "pattern" => Tok::Pattern,
-                    "file" => Tok::File,
-                    "global" => Tok::Global,
+                let tok = match s.as_slice() {
+                    b"pattern" => Tok::Pattern,
+                    b"file" => Tok::File,
+                    b"global" => Tok::Global,
                     _ => Tok::Str {
                         text: s,
                         quote: None,
@@ -286,27 +290,27 @@ struct Lexed {
 ///
 /// Escape bytes stay raw: they are forwarded into the macro substitution
 /// string verbatim, which is what C's `dbmfStrdup` of `yytext` does.
-fn scan_quoted(chars: &[char], at: usize) -> Option<(String, usize)> {
+fn scan_quoted(chars: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {
     let quote = chars[at];
-    let mut text = String::new();
+    let mut text = Vec::new();
     let mut i = at + 1;
     loop {
         let ch = *chars.get(i)?;
         if ch == quote {
             return Some((text, i + 1));
         }
-        if ch == '\n' {
+        if ch == b'\n' {
             return None;
         }
-        if ch == '\\' {
+        if ch == b'\\' {
             // `{escape}` is a backslash and ONE character, and flex's `.`
             // does not match a newline, so a backslash at end of line is not
             // an escape and the pattern cannot match from here.
             let next = *chars.get(i + 1)?;
-            if next == '\n' {
+            if next == b'\n' {
                 return None;
             }
-            text.push('\\');
+            text.push(b'\\');
             text.push(next);
             i += 2;
             continue;
@@ -334,8 +338,8 @@ pub struct TemplateLoad {
 /// substitute the same `1`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowMacro {
-    pub name: String,
-    pub value: String,
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
     pub quoted: bool,
 }
 
@@ -370,7 +374,7 @@ pub fn set_db_template_max_vars(value: i32) {
 
 /// A `WORD`/`QUOTE` in value position, before it is paired with a name.
 struct RowValue {
-    text: String,
+    text: Vec<u8>,
     quoted: bool,
 }
 
@@ -481,7 +485,7 @@ impl Parser {
     /// A `WORD` or `QUOTE`, where C's grammar takes either —
     /// `template_filename: DBFILE WORD | DBFILE QUOTE`
     /// (`dbLoadTemplate.y:117-137`).
-    fn expect_str(&mut self) -> ParseResult<String> {
+    fn expect_str(&mut self) -> ParseResult<Vec<u8>> {
         Ok(self.expect_value()?.text)
     }
 
@@ -490,7 +494,7 @@ impl Parser {
     /// (`:301`, `:312`), and the extraneous word of a deprecated row
     /// (`:197`, `:279`). Quoting one of those is a syntax error on a real
     /// IOC, so accepting it here would only move the failure to the site.
-    fn expect_word(&mut self) -> ParseResult<String> {
+    fn expect_word(&mut self) -> ParseResult<Vec<u8>> {
         if let Some(Tok::Str { quote: Some(_), .. }) = self.peek() {
             return Err(self.syntax_error());
         }
@@ -541,7 +545,8 @@ impl Parser {
     fn parse_file(&mut self) -> ParseResult<()> {
         let entry_line = self.line();
         self.expect(&Tok::File)?;
-        let filename = self.expect_str()?;
+        // A path is UTF-8 in every load route.
+        let filename = String::from_utf8_lossy(&self.expect_str()?).into_owned();
         let loads_before = self.load_count;
         self.expect(&Tok::OBrace)?;
         // `file "x" {}` — empty body, no loads.
@@ -574,7 +579,7 @@ impl Parser {
     fn parse_pattern_block(&mut self, filename: &str) -> ParseResult<()> {
         self.expect(&Tok::Pattern)?;
         self.expect(&Tok::OBrace)?;
-        let mut names: Vec<String> = Vec::new();
+        let mut names: Vec<Vec<u8>> = Vec::new();
         while self.peek() != Some(&Tok::CBrace) {
             match self.peek() {
                 Some(Tok::Comma) => {
@@ -659,7 +664,7 @@ impl Parser {
     /// reports the same surplus as "Warning, too many values given".
     /// Neither aborts the load, and a short row leaving the remaining
     /// names unbound is silent in C, so only the surplus is reported.
-    fn pattern_macros(&mut self, names: &[String], row: &[(RowValue, usize)]) -> Vec<RowMacro> {
+    fn pattern_macros(&mut self, names: &[Vec<u8>], row: &[(RowValue, usize)]) -> Vec<RowMacro> {
         // C reports the surplus from `pattern_value` as the value is
         // reduced (`dbLoadTemplate.y:233`, `:250`), so `line_num` is that
         // value's own line and not the row's closing brace: measured, a
@@ -768,7 +773,8 @@ impl Parser {
     /// string — it is the row's closing brace and not the word's own line:
     /// measured, a word on line 3 before a row that closes on line 4 is
     /// reported as line 4.
-    fn deprecated_row_notice(&mut self, word: &str) {
+    fn deprecated_row_notice(&mut self, word: &[u8]) {
+        let word = String::from_utf8_lossy(word);
         let line = self.last_line();
         self.notice(format!(
             "dbLoadTemplate: Substitution file uses deprecated syntax.\n    \
@@ -786,12 +792,12 @@ impl Parser {
 /// (`dbLoadTemplate_lex.l:47-56`) and its parser has already run the
 /// grammar action — the `dbLoadRecords` — of every row it reduced before
 /// stopping, so a broken file still loads the rows it got through.
-pub fn parse_substitutions(input: &str) -> Substitutions {
+pub fn parse_substitutions(input: impl AsRef<[u8]>) -> Substitutions {
     let Lexed {
         toks,
         faults,
         final_line,
-    } = lex(input);
+    } = lex(input.as_ref());
     let mut parser = Parser::new(toks, final_line);
     let stopped = parser.parse().err();
 
@@ -828,7 +834,12 @@ mod tests {
     fn pairs(macros: &[RowMacro]) -> Vec<(String, String)> {
         macros
             .iter()
-            .map(|m| (m.name.clone(), m.value.clone()))
+            .map(|m| {
+                (
+                    String::from_utf8(m.name.clone()).unwrap(),
+                    String::from_utf8(m.value.clone()).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -903,6 +914,18 @@ file "rec.db" {
             pairs(&loads[1].macros),
             vec![("P".into(), "IOC:".into()), ("N".into(), "2".into())]
         );
+    }
+
+    /// C's lexer copies a quoted value's bytes as read, so a Latin-1 value
+    /// reaches the row's macro unconverted.
+    #[test]
+    fn a_latin1_value_keeps_its_bytes() {
+        let subs = parse_substitutions(b"file \"x.db\" { pattern { P } { \"caf\xe9\" } }");
+        assert_eq!(subs.stopped, None);
+        let loads = loads_of_events(&subs);
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].macros[0].name, b"P");
+        assert_eq!(loads[0].macros[0].value, b"caf\xe9");
     }
 
     #[test]

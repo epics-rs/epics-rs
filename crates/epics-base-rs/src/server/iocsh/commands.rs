@@ -4,13 +4,12 @@ use super::registry::*;
 use crate::calc::engine::string::escaped_from_raw;
 use crate::error::{CaError, CaResult};
 use crate::runtime::log::ERL_ERROR;
-use crate::runtime::mac_lib::macro_defn_pairs;
 use crate::server::database::char_view::{CharView, char_view, field_addr_types, long_string_len};
 use crate::server::database::filters::sync::DbState;
 use crate::server::database::{DbNode, parse_pv_name};
 use crate::server::db_loader;
 use crate::server::record::{Base, FieldDeclaration, FieldDesc, Special, served_element_size};
-use crate::types::{DbFieldType, DbfCode, EpicsValue};
+use crate::types::{DbFieldType, DbfCode, EpicsValue, RecordName};
 use std::sync::Arc;
 
 /// C `dbRecordsOnceOnly` (`dbLexRoutines.c:52-53`), the exported `int` a
@@ -318,7 +317,7 @@ fn cmd_after_ioc_running() -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            ctx.db().queue_after_ioc_running(line);
+            ctx.db().queue_after_ioc_running(line.into_bytes());
             Ok(CommandOutcome::Continue)
         },
     )
@@ -411,11 +410,13 @@ fn cmd_help() -> CommandDef {
 /// SPACES, not commas — `epicsStrtok_r(fieldnames, " ", ...)` — so
 /// `dbl("ai","VAL DESC")` asks for two fields and `dbl("ai","VAL,DESC")`
 /// asks for one field literally named `VAL,DESC`.
-fn split_fields_list(fields: &str) -> Vec<String> {
+fn split_fields_list(fields: &[u8]) -> Vec<String> {
+    // A field name is an ASCII identifier, so a lossy spelling of bytes
+    // that are not text matches no field, as `dbFindField` would not.
     fields
-        .split(' ')
+        .split(|&b| b == b' ')
         .filter(|f| !f.is_empty())
-        .map(str::to_string)
+        .map(|f| String::from_utf8_lossy(f).into_owned())
         .collect()
 }
 
@@ -427,8 +428,8 @@ fn split_fields_list(fields: &str) -> Vec<String> {
 /// the separator and `continue`s), except the pseudo-field
 /// `recordType`, which C answers from `dbGetRecordTypeName` when
 /// `dbFindField` fails.
-fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
-    let mut line = String::from(name);
+fn print_fields_list(ctx: &CommandContext, name: &[u8], fields: &[String]) {
+    let mut line = name.to_vec();
     let record = ctx.db().get_record(name);
     for field in fields {
         // C asks `dbFindField` and then `dbGetString`, and nothing else. The
@@ -447,7 +448,7 @@ fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
                 // (`dbStaticLib.c:2053`) and `printFieldsList` prints the
                 // empty string for it (`dbTest.c:145`).
                 if desc.no_access() {
-                    return Some(String::new());
+                    return Some(Vec::new());
                 }
                 return Some(
                     inst.resolve_field(field)
@@ -460,17 +461,17 @@ fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
             // `dbFldDes` in C, so `dbFindField` finds it and the NULL above
             // is what `dbGetString` answers.
             if inst.resolves_noaccess_name(&field.to_ascii_uppercase()) {
-                return Some(String::new());
+                return Some(Vec::new());
             }
             // C's one exception to `dbFindField` failing (`dbTest.c:135-137`).
-            (field == "recordType").then(|| inst.record.record_type().to_string())
+            (field == "recordType").then(|| inst.record.record_type().as_bytes().to_vec())
         });
         match value {
-            Some(v) => line.push_str(&format!(", \"{v}\"")),
-            None => line.push_str(", "),
+            Some(v) => line.extend_from_slice(&[&b", \""[..], &v, b"\""].concat()),
+            None => line.extend_from_slice(b", "),
         }
     }
-    ctx.println(&line);
+    ctx.println_bytes(&line);
 }
 
 /// C `dbl` and `dbglob` walk the database record-type MAJOR
@@ -520,7 +521,7 @@ fn db_nodes_type_major(ctx: &CommandContext) -> Vec<DbNode> {
 /// `if (dbIsAlias(pdbentry)) continue`, which `dbjlr` (`dbJLink.c:520`),
 /// `dbcar` (`dbCaTest.c:85`) and `dbWriteRecordFP` (`dbStaticLib.c:826`)
 /// each spell for themselves.
-fn record_names_type_major(ctx: &CommandContext) -> Vec<String> {
+fn record_names_type_major(ctx: &CommandContext) -> Vec<RecordName> {
     db_nodes_type_major(ctx)
         .into_iter()
         .filter(|node| node.alias_of.is_none())
@@ -548,7 +549,7 @@ fn cmd_dbl() -> CommandDef {
             // `precordTypename = NULL`; an empty field list is likewise
             // no field list (`:167-168`).
             let type_filter = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.as_str()),
+                ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.as_bytes()),
                 _ => None,
             };
             let fields = match &args[1] {
@@ -568,7 +569,7 @@ fn cmd_dbl() -> CommandDef {
                 let known = nodes.iter().any(|node| {
                     ctx.db()
                         .get_record(&node.name)
-                        .is_some_and(|rec| rec.read().record.record_type() == filter)
+                        .is_some_and(|rec| rec.read().record.record_type().as_bytes() == filter)
                 });
                 if !known {
                     ctx.println("No record type");
@@ -581,7 +582,7 @@ fn cmd_dbl() -> CommandDef {
                     let rec = ctx.db().get_record(&node.name);
                     if let Some(rec) = rec {
                         let inst = rec.read();
-                        if inst.record.record_type() != filter {
+                        if inst.record.record_type().as_bytes() != filter {
                             continue;
                         }
                     }
@@ -604,11 +605,14 @@ fn cmd_dbl() -> CommandDef {
 /// `tab` is a parameter for the same reason it is one in C: `dbgf`
 /// passes 10 (`dbTest.c:377`) and `dbpr` passes 20 (`dbTest.c:442`),
 /// and those two are the only values C accepts (`dbTest.c:1286-1289`).
+///
+/// Bytes, as C's `char` buffer is: a value's high bytes are copied, not
+/// re-encoded, so a tab stop counts the bytes that are printed.
 struct TabBuffer {
-    out: String,
+    out: Vec<u8>,
     tab: usize,
     next_tab: usize,
-    lines: Vec<String>,
+    lines: Vec<Vec<u8>>,
 }
 
 impl TabBuffer {
@@ -616,7 +620,7 @@ impl TabBuffer {
 
     fn new(tab: usize) -> Self {
         Self {
-            out: String::new(),
+            out: Vec::new(),
             tab,
             next_tab: tab,
             lines: Vec::new(),
@@ -626,21 +630,21 @@ impl TabBuffer {
     /// C reads `out_buff` as a zero-filled fixed buffer, so a position
     /// past the written text is NUL.
     fn at(&self, i: usize) -> u8 {
-        self.out.as_bytes().get(i).copied().unwrap_or(0)
+        self.out.get(i).copied().unwrap_or(0)
     }
 
-    fn insert(&mut self, msg: &str) {
+    fn insert(&mut self, msg: &[u8]) {
         if self.out.len() + msg.len() > Self::MAXLINE {
             self.flush();
         }
-        for b in msg.bytes() {
-            self.out.push(b as char);
+        for &b in msg {
+            self.out.push(b);
             if self.at(self.next_tab - 1) != 0 {
                 self.next_tab += self.tab;
             }
         }
         while self.at(self.next_tab - 1) != b' ' && self.out.len() < Self::MAXLINE {
-            self.out.push(' ');
+            self.out.push(b' ');
         }
     }
 
@@ -651,7 +655,7 @@ impl TabBuffer {
         self.next_tab = self.tab;
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> Vec<Vec<u8>> {
         self.flush();
         self.lines
     }
@@ -877,20 +881,24 @@ fn printbuffer_block(label: &str, dbr: DbfCode, val: &EpicsValue) -> Vec<String>
 fn printbuffer_lines(dbr: &str, count: usize, elements: Option<&[String]>) -> Vec<String> {
     let mut buf = TabBuffer::new(10);
     match count {
-        1 => buf.insert(&format!("DBF_{dbr}: ")),
-        0 => buf.insert(&format!("DBF_{dbr}[0]: (empty)")),
-        n => buf.insert(&format!("DBF_{dbr}[{n}]: ")),
+        1 => buf.insert(format!("DBF_{dbr}: ").as_bytes()),
+        0 => buf.insert(format!("DBF_{dbr}[0]: (empty)").as_bytes()),
+        n => buf.insert(format!("DBF_{dbr}[{n}]: ").as_bytes()),
     }
     match elements {
         // `status != 0` prints `failed.` regardless of the count.
-        None => buf.insert("failed."),
+        None => buf.insert(b"failed."),
         Some(values) => {
             for v in values {
-                buf.insert(v);
+                buf.insert(v.as_bytes());
             }
         }
     }
+    // Every insert above is a whole `str` and the padding is spaces.
     buf.finish()
+        .into_iter()
+        .map(|line| String::from_utf8(line).expect("whole str inserts"))
+        .collect()
 }
 
 /// C `dbgf` (`dbTest.c:363-389`) once `nameToAddr` has resolved the name.
@@ -965,7 +973,7 @@ fn dbgf_echo(ctx: &CommandContext, addr: &DbAddr) {
         }
         return;
     }
-    match ctx.db().get_pv(&addr.pv()) {
+    match ctx.db().get_pv(addr.pv()) {
         Ok(val) => {
             for line in dbgf_lines(addr, &val) {
                 ctx.println(&line);
@@ -987,8 +995,8 @@ const DBGF_BUFFER_BYTES: usize = 800;
 /// line on stdout and the caller then returns -1 without printing
 /// anything else, so the port must not route it through the shell's
 /// error channel, which writes to stderr and prefixes `Error:`.
-fn print_pv_not_found(ctx: &CommandContext, pname: &str) {
-    ctx.println(&format!("PV '{pname}' not found"));
+fn print_pv_not_found(ctx: &CommandContext, pname: &[u8]) {
+    ctx.println_bytes(&[b"PV '", pname, b"' not found"].concat());
 }
 
 /// C `nameToAddr` (`dbTest.c:787-795`) — the ONE resolution every `dbTest.c`
@@ -1033,7 +1041,7 @@ fn print_pv_not_found(ctx: &CommandContext, pname: &str) {
 /// callers need it, and C's `DBADDR` likewise carries `precord` and
 /// `pfldDes` together: a caller that re-looked-up the record could pick a
 /// different one than the name resolved to.
-fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
+fn name_to_addr(ctx: &CommandContext, pname: &[u8]) -> Option<DbAddr> {
     let parts = DbNameParts::of(pname);
     let field = if parts.field.is_empty() {
         "VAL"
@@ -1048,7 +1056,8 @@ fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
         .filter(|_| !field.bytes().any(|c| c.is_ascii_lowercase()))
         .filter(|_| {
             !matches!(
-                ctx.db().get_pv(&format!("{}.{field}", parts.record)),
+                ctx.db()
+                    .get_pv([parts.record, b".", field.as_bytes()].concat()),
                 Err(CaError::ChannelNotFound(_))
             )
         });
@@ -1056,12 +1065,11 @@ fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
         let fld_des = rec.read().field_desc(field);
         let addr = DbAddr {
             rec,
-            record: parts.record.to_string(),
+            record: parts.record.to_vec(),
             field: field.to_string(),
             fld_des,
-            char_view: parts.tail.starts_with('$'),
-            find_field_ok: parts.tail.is_empty()
-                || parts.tail.starts_with(|c: char| c.is_ascii_whitespace()),
+            char_view: parts.tail.starts_with(b"$"),
+            find_field_ok: parts.tail.first().is_none_or(u8::is_ascii_whitespace),
         };
         // `dbAccess.c:697-699`: `$` on anything but a string or a link is
         // `S_dbLib_fieldNotFound`.
@@ -1079,30 +1087,32 @@ fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
 /// modifier read is the single character after that, so `LSI.VAL$x` and
 /// `LSI.$` are both `VAL$` and an undotted `LSI$` is a record name.
 struct DbNameParts<'a> {
-    record: &'a str,
+    record: &'a [u8],
     field: &'a str,
-    tail: &'a str,
+    tail: &'a [u8],
 }
 
 impl<'a> DbNameParts<'a> {
-    fn of(pname: &'a str) -> Self {
-        let Some((record, rest)) = pname.split_once('.') else {
+    fn of(pname: &'a [u8]) -> Self {
+        let Some(dot) = pname.iter().position(|&c| c == b'.') else {
             return Self {
                 record: pname,
                 field: "",
-                tail: "",
+                tail: b"",
             };
         };
-        let len = match rest.bytes().next() {
-            Some(c) if c == b'_' || c.is_ascii_alphabetic() => rest
-                .bytes()
-                .position(|c| c != b'_' && !c.is_ascii_alphanumeric())
+        let (record, rest) = (&pname[..dot], &pname[dot + 1..]);
+        let len = match rest.first() {
+            Some(&c) if c == b'_' || c.is_ascii_alphabetic() => rest
+                .iter()
+                .position(|&c| c != b'_' && !c.is_ascii_alphanumeric())
                 .unwrap_or(rest.len()),
             _ => 0,
         };
         Self {
             record,
-            field: &rest[..len],
+            // An identifier: ASCII by the scan above.
+            field: std::str::from_utf8(&rest[..len]).unwrap_or_default(),
             tail: &rest[len..],
         }
     }
@@ -1123,7 +1133,7 @@ impl<'a> DbNameParts<'a> {
 struct DbAddr {
     rec: Arc<crate::server::record::RecordCell>,
     /// The record part of the name as given, alias or not.
-    record: String,
+    record: Vec<u8>,
     /// C's `pfldDes->name`: `VAL` when the name carried no field part.
     field: String,
     /// C's `paddr->pfldDes`, which is never null after `dbNameToAddr`.
@@ -1163,8 +1173,8 @@ impl DbAddr {
     /// The `REC.FIELD` name [`PvDatabase::get_pv`] reads this address by.
     ///
     /// [`PvDatabase::get_pv`]: crate::server::database::PvDatabase::get_pv
-    fn pv(&self) -> String {
-        format!("{}.{}", self.record, self.field)
+    fn pv(&self) -> Vec<u8> {
+        [&self.record[..], b".", self.field.as_bytes()].concat()
     }
 
     /// The field as C's `$` modifier re-types it (`dbAccess.c:682-701`), or
@@ -1253,8 +1263,8 @@ fn dbgf_failed(ctx: &CommandContext, addr: &DbAddr) {
         }
         None => (DbfCode::NoAccess, DbfCode::NoAccess, addr.field.as_str()),
     };
-    let rec_name = addr.record.as_str();
-    crate::server::recgbl::rec_gbl_bad_dbrtype("dbGet", dbr, field_type, rec_name, field_name);
+    let rec_name = String::from_utf8_lossy(&addr.record);
+    crate::server::recgbl::rec_gbl_bad_dbrtype("dbGet", dbr, field_type, &rec_name, field_name);
     for line in printbuffer_lines(dbr.name(), 1, None) {
         ctx.println(&line);
     }
@@ -1470,7 +1480,7 @@ fn cmd_dbpf() -> CommandDef {
                 });
             }
 
-            let base = addr.record.as_str();
+            let base = addr.record.as_slice();
             let field = addr.field.clone();
 
             // C `dbTest.c:413-429`: an ARRAY field is put through its OWN
@@ -1505,9 +1515,16 @@ fn cmd_dbpf() -> CommandDef {
                     })
                 }
                 Some((capacity, dbr)) => {
-                    match crate::server::db_convert_json::db_put_convert_json(
-                        value_str, dbr, capacity,
-                    ) {
+                    // yajl validates UTF-8, so bytes that are not text are a
+                    // refused literal before any conversion.
+                    let json = match value_str.to_str() {
+                        Ok(json) => json,
+                        Err(e) => {
+                            crate::runtime::log::errlog_printf(&format!("dbConvertJSON: {e}\n"));
+                            return Ok(CommandOutcome::Failed);
+                        }
+                    };
+                    match crate::server::db_convert_json::db_put_convert_json(json, dbr, capacity) {
                         Ok(v) => Some(v),
                         // C `dbTest.c:425-426` returns the status BEFORE
                         // `dbPutField` and before the closing `dbgf`, so a
@@ -1555,7 +1572,7 @@ fn cmd_dbpf() -> CommandDef {
                 // port for the numeric widths. Text no conversion takes is a
                 // failed PUT — value unchanged, nothing printed by `dbpf`, and
                 // the closing `dbgf` still run.
-                EpicsValue::String(value_str.as_str().into())
+                EpicsValue::String(value_str.as_bytes().into())
             };
 
             // C `dbpf` writes via `dbPutField` — processing put, but no
@@ -1615,7 +1632,7 @@ pub(super) fn db_get_string(
     inst: &crate::server::record::RecordInstance,
     desc: &crate::server::record::FieldDesc,
     value: &EpicsValue,
-) -> String {
+) -> Vec<u8> {
     // C `dbGetString` (`dbStaticLib.c:1888-1906`) switches on the DECLARED
     // `DBF_*` token and nothing else: `DBF_MENU` and `DBF_DEVICE` render their
     // choice string (`dbGetStringNum`, `:2131-2160`), while `DBF_ENUM` and
@@ -1661,7 +1678,12 @@ pub(super) fn db_get_string(
             _ => None,
         },
     };
-    text.unwrap_or_else(|| value.to_string())
+    match (text, value) {
+        (Some(text), _) => text.into_bytes(),
+        // C returns the field's own bytes.
+        (None, EpicsValue::String(s)) => s.as_bytes().to_vec(),
+        (None, value) => value.to_string().into_bytes(),
+    }
 }
 
 /// C's two hex converters, chosen the way `dbGetStringNum` chooses them.
@@ -1887,7 +1909,7 @@ fn c_format_e(value: f64, prec: usize) -> String {
 pub(super) fn db_get_string_field(
     inst: &crate::server::record::RecordInstance,
     field: &str,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let desc = inst.field_desc(field)?;
     let value = inst.resolve_field(field)?;
     Some(db_get_string(inst, desc, &value))
@@ -1980,21 +2002,20 @@ enum LinkShape {
 fn render_dbpr_link(
     ctx: &CommandContext,
     class: crate::types::DbfLinkClass,
-    raw: &str,
-    rendered: &str,
+    raw: &crate::types::PvString,
+    rendered: &[u8],
     running: bool,
-) -> String {
+) -> Vec<u8> {
     if !running && !raw.is_empty() {
-        return format!("LINK {raw}");
+        return [b"LINK ", raw.as_bytes()].concat();
     }
     let ftype = crate::server::record::LinkFieldType::for_class(class);
-    let parsed = ctx
-        .db()
-        .db_init_link_locality(crate::server::record::parse_link_field(raw, ftype), ftype);
-    format!(
-        "{} {rendered}",
-        parsed.link_type_after_init(raw, ftype).c_name()
-    )
+    let parsed = ctx.db().db_init_link_locality(
+        crate::server::record::parse_link_field(raw.as_bytes(), ftype),
+        ftype,
+    );
+    let link_type = parsed.link_type_after_init(raw.as_bytes(), ftype).c_name();
+    [link_type.as_bytes(), b" ", rendered].concat()
 }
 
 fn cmd_dbpr() -> CommandDef {
@@ -2116,14 +2137,14 @@ struct DbprHeld {
 }
 
 impl DbprHeld {
-    async fn of(ctx: &CommandContext, name: &str, scan: crate::server::record::ScanType) -> Self {
+    async fn of(ctx: &CommandContext, name: &[u8], scan: crate::server::record::ScanType) -> Self {
         let db = ctx.db();
         let on_scan_list = scan.scan_list().is_some()
-            && (db.records_for_scan(scan).await.iter().any(|n| n == name)
+            && (db.records_for_scan(scan).await.iter().any(|n| **n == *name)
                 || db
                     .event_lists()
                     .iter()
-                    .any(|(_, recs)| recs.iter().any(|n| n == name)));
+                    .any(|(_, recs)| recs.iter().any(|n| **n == *name)));
         Self {
             lset: db
                 .lock_set_of(name)
@@ -2244,7 +2265,7 @@ fn dbpr_private_pointers(
     }
 }
 
-pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool {
+pub(super) fn dbpr_report(ctx: &CommandContext, name: &[u8], level: i32) -> bool {
     // C's `nameToAddr` prints this line and the caller then returns
     // without printing anything else (`dbTest.c:449-450`, `:789-791`).
     // `false` is that failure: `dbpr` turns it into its -1, and `dbtr`
@@ -2267,9 +2288,10 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // The file and line are ours, as at `access_commands.rs`'s `errMessage`.
     if !find_field_ok {
         crate::runtime::log::errlog_vprintf(format_args!(
-            "Record Not Found filename=\"{}\" line number={}  {name}\n",
+            "Record Not Found filename=\"{}\" line number={}  {}\n",
             file!(),
-            line!()
+            line!(),
+            String::from_utf8_lossy(name)
         ));
         return false;
     }
@@ -2283,7 +2305,7 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // hand-written per-level whitelist instead, so `interest`
     // was never read and a field C shows at level 0 could be
     // missing at level 2.
-    let (fields, extras): (Vec<(String, String)>, Vec<(String, String)>) = ctx.block_on(async {
+    let (fields, extras): (Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>) = ctx.block_on(async {
         let (rec_name, scan) = {
             let inst = rec.read();
             (inst.name.clone(), inst.common.scan)
@@ -2317,8 +2339,12 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
         // record map, which nothing in this crate does under a record lock.
         let rows: Vec<(
             String,
-            String,
-            Option<(crate::types::DbfLinkClass, String, LinkShape)>,
+            Vec<u8>,
+            Option<(
+                crate::types::DbfLinkClass,
+                crate::types::PvString,
+                LinkShape,
+            )>,
         )> = descs
             .iter()
             .filter(|d| i32::from(d.interest) <= level)
@@ -2329,13 +2355,14 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
                 // `dbf_type` — a "served as" answer these rows do not have —
                 // out of the walk: the declaration alone renders them.
                 if d.no_access() {
-                    return dbpr_no_access(&inst, d, &held).map(|t| (d.name.to_string(), t, None));
+                    return dbpr_no_access(&inst, d, &held)
+                        .map(|t| (d.name.to_string(), t.into_bytes(), None));
                 }
                 let value = inst.resolve_field(d.name)?;
                 let link = crate::types::link_class_of(d).map(|class| {
                     let raw = match inst.resolve_field_stored(d.name) {
-                        Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                        _ => String::new(),
+                        Some(EpicsValue::String(s)) => s,
+                        _ => crate::types::PvString::new(),
                     };
                     let shape = if inst.link_unadded(d.name) {
                         LinkShape::Unadded
@@ -2358,14 +2385,15 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
         // `Q:group`) has to be checkable from the shell.
         let mut extras = Vec::new();
         if !aliases.is_empty() {
-            extras.push(("ALIASES".to_string(), aliases.join(", ")));
+            let names: Vec<&[u8]> = aliases.iter().map(|a| &a[..]).collect();
+            extras.push(("ALIASES".to_string(), names.join(&b", "[..])));
         }
         if level >= 2 {
             let mut info_keys: Vec<&String> = inst.info().keys().collect();
             info_keys.sort();
             for key in info_keys {
                 let val = inst.info().get(key).cloned().unwrap_or_default();
-                extras.push((format!("info({key})"), val));
+                extras.push((format!("info({key})"), val.into_bytes()));
             }
         }
         drop(inst);
@@ -2377,11 +2405,14 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
                 None => (name, text),
                 // C's `PN_LINK` is set by `add_record`, so it is never seen
                 // before `iocInit`.
-                Some((_, _, LinkShape::Pn)) if running => (name, format!("PN_LINK {text}")),
+                Some((_, _, LinkShape::Pn)) if running => {
+                    (name, [&b"PN_LINK "[..], &text].concat())
+                }
                 Some((class, raw, LinkShape::Unadded)) => {
                     let ftype = crate::server::record::LinkFieldType::for_class(class);
-                    let parsed = crate::server::record::parse_link_field(&raw, ftype);
-                    (name, format!("{} {text}", parsed.db_link_type().c_name()))
+                    let parsed = crate::server::record::parse_link_field(raw.as_bytes(), ftype);
+                    let link_type = parsed.db_link_type().c_name();
+                    (name, [link_type.as_bytes(), b" ", &text].concat())
                 }
                 Some((class, raw, _)) => {
                     let text = render_dbpr_link(ctx, class, &raw, &text, running);
@@ -2396,13 +2427,13 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // `dbpr_msgOut` at tab stop 20 (`dbTest.c:442`).
     let mut buf = TabBuffer::new(20);
     for (name, value) in &fields {
-        buf.insert(&format!("{name:<4}: {value}"));
+        buf.insert(&[format!("{name:<4}: ").as_bytes(), value].concat());
     }
     for line in buf.finish() {
-        ctx.println(&line);
+        ctx.println_bytes(&line);
     }
     for (name, value) in &extras {
-        ctx.println(&format!("{name:<4}: {value}"));
+        ctx.println_bytes(&[format!("{name:<4}: ").as_bytes(), value].concat());
     }
     true
 }
@@ -2870,7 +2901,7 @@ fn cmd_dbtpf() -> CommandDef {
             if !dbt_requires_ioc_init(ctx, "dbtpf") {
                 return Ok(CommandOutcome::Failed);
             }
-            let (base, field) = (addr.record.as_str(), addr.field.as_str());
+            let (base, field) = (addr.record.as_slice(), addr.field.as_str());
 
             for (dbr, target) in DBTGF_REQUEST_TYPES {
                 // C parses the text ITSELF before the put, with
@@ -2884,19 +2915,22 @@ fn cmd_dbtpf() -> CommandDef {
                 // straight through — and `DBR_ENUM` is `epicsParseUInt16`.
                 let parsed = match target {
                     crate::types::DbFieldType::String => {
-                        Some(EpicsValue::String(value_str.as_str().into()))
+                        Some(EpicsValue::String(value_str.as_bytes().into()))
                     }
                     crate::types::DbFieldType::Enum => {
                         match crate::types::c_parse::parse_base10_units_null(
                             crate::types::c_parse::NumericField::UShort,
-                            value_str,
+                            &value_str.to_str_lossy(),
                         ) {
                             Some(EpicsValue::UShort(v)) => Some(EpicsValue::Enum(v)),
                             _ => None,
                         }
                     }
                     t => crate::types::c_parse::NumericField::of(t).and_then(|nf| {
-                        crate::types::c_parse::parse_base10_units_null(nf, value_str)
+                        crate::types::c_parse::parse_base10_units_null(
+                            nf,
+                            &value_str.to_str_lossy(),
+                        )
                     }),
                 };
                 let Some(value) = parsed else {
@@ -3399,7 +3433,7 @@ fn ca_request_family(dbr: u16) -> Option<crate::types::DbFieldType> {
 struct CaChannel {
     /// C `dbChannelRecord(chan)->name` — the RECORD's own name, so an alias
     /// prints the record it resolves to.
-    record_name: String,
+    record_name: RecordName,
     /// C `dbGetRecordTypeName`, the answer `DBR_CLASS_NAME` carries.
     record_type: String,
     /// The channel's field, already defaulted to `VAL` and upper-cased —
@@ -3435,7 +3469,7 @@ impl CaChannel {
     /// every reply carries (`dbAccess.c:352-365`), so `DBR_STSACK_STRING` sees
     /// them. The port's `Snapshot` leaves them `None` on the GET path, so they
     /// are filled from the record here rather than defaulted to zero.
-    fn create(ctx: &CommandContext, pname: &str) -> Option<Self> {
+    fn create(ctx: &CommandContext, pname: &[u8]) -> Option<Self> {
         let (base, field) = parse_pv_name(pname);
         let field = if field.is_empty() {
             "VAL".to_string()
@@ -3545,8 +3579,8 @@ impl CaChannel {
     /// The channel addressed as a PV name, always `record.FIELD` — the form
     /// the put and re-read below hand back to the database. Built from the
     /// RECORD's own name, so an alias and its target share one channel.
-    fn pv_name(&self) -> String {
-        format!("{}.{}", self.record_name, self.field)
+    fn pv_name(&self) -> Vec<u8> {
+        [self.record_name.as_bytes(), b".", self.field.as_bytes()].concat()
     }
 
     /// C `dbChannel_put(chan, ..., 1)` (`dbChannel.h:295`), which is `dbPut`:
@@ -3652,8 +3686,8 @@ fn cmd_gft() -> CommandDef {
 /// narrowing table, so `%hd` really wraps into a `short` here. Its one output
 /// object is a `f64`, so a `%ld` result above 2^53 loses C's low bits before
 /// the caller truncates it to `dbr_long_t`.
-fn c_scan_int(s: &str, fmt: &[u8]) -> Option<i64> {
-    match crate::calc::engine::scanf::sscanf(s.as_bytes(), fmt) {
+fn c_scan_int(s: &[u8], fmt: &[u8]) -> Option<i64> {
+    match crate::calc::engine::scanf::sscanf(s, fmt) {
         Ok(crate::calc::engine::value::StackValue::Double(v)) => Some(v as i64),
         _ => None,
     }
@@ -3770,7 +3804,7 @@ fn cmd_pft() -> CommandDef {
                 &mut out,
                 &mut chan,
                 DBR_STRING,
-                EpicsValue::String(value.as_str().into()),
+                EpicsValue::String(value.as_bytes().into()),
                 "\n\t failed ",
                 // The one rung whose GET failure has no leading space and no
                 // type name (`db_test.c:124`).
@@ -3809,10 +3843,11 @@ fn cmd_pft() -> CommandDef {
             }
             // `epicsScanFloat` — STRICT, so a trailing tail refuses the rung
             // where the two `sscanf` rungs above accepted it.
-            let scanned_float = match parse_base10_units_null(NumericField::Float, value) {
-                Some(EpicsValue::Float(f)) => Some(f),
-                _ => None,
-            };
+            let scanned_float =
+                match parse_base10_units_null(NumericField::Float, &value.to_str_lossy()) {
+                    Some(EpicsValue::Float(f)) => Some(f),
+                    _ => None,
+                };
             if let Some(f) = scanned_float {
                 rung(
                     &mut out,
@@ -3888,7 +3923,7 @@ fn cmd_dbtr() -> CommandDef {
             let Some(DbAddr { rec, record, .. }) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
             };
-            let base = record.as_str();
+            let base = record.as_slice();
             if !dbt_requires_ioc_init(ctx, "dbtr") {
                 return Ok(CommandOutcome::Failed);
             }
@@ -3907,7 +3942,7 @@ fn cmd_dbtr() -> CommandDef {
                 // error's own text takes that slot.
                 crate::server::recgbl::rec_gbl_record_error(
                     &e.to_string(),
-                    base,
+                    &String::from_utf8_lossy(base),
                     "dbtr(dbProcess)",
                 );
             }
@@ -4071,7 +4106,10 @@ fn cmd_dbior() -> CommandDef {
             };
 
             for (name, drvet) in crate::server::driver_support::driver_supports() {
-                if wanted.as_ref().is_some_and(|want| *want != name) {
+                if wanted
+                    .as_ref()
+                    .is_some_and(|want| want.as_bytes() != name.as_bytes())
+                {
                     continue;
                 }
                 match drvet.report(level) {
@@ -4139,7 +4177,10 @@ fn cmd_dbjlr() -> CommandDef {
             ctx.println("");
 
             for name in record_names_type_major(ctx) {
-                if target.as_ref().is_some_and(|want| *want != name) {
+                if target
+                    .as_ref()
+                    .is_some_and(|want| want.as_bytes() != &*name)
+                {
                     continue;
                 }
                 let Some(rec) = ctx.db().get_record(&name) else {
@@ -4148,7 +4189,11 @@ fn cmd_dbjlr() -> CommandDef {
                 let record_type = rec.read().record.record_type();
                 ctx.println(&format!("  {record_type} record '{name}':"));
                 for (field, raw, _) in ctx.db().record_link_fields(&name) {
-                    let text = raw.trim();
+                    // A JSON link is UTF-8 or yajl never built it.
+                    let Ok(text) = std::str::from_utf8(raw.as_bytes()) else {
+                        continue;
+                    };
+                    let text = text.trim();
                     if !(text.starts_with('{') && text.ends_with('}')) {
                         continue;
                     }
@@ -4294,7 +4339,7 @@ fn cmd_dbel() -> CommandDef {
                 _ => 0,
             };
 
-            let record = name.split('.').next().unwrap_or(name);
+            let record = name.split(|&b| b == b'.').next().unwrap_or(name);
             let Some(rec) = ctx.db().get_record(record) else {
                 // C `errMessage(status, " dbNameToAddr failed")`
                 // (`dbEvent.c:164`), which `errlog.c:503-508` renders on the
@@ -4378,10 +4423,11 @@ fn cmd_dbel() -> CommandDef {
 /// [`PvDatabase::process_record_with_notify`]: crate::server::database::PvDatabase::process_record_with_notify
 async fn dbtpn_lines(
     db: &std::sync::Arc<crate::server::database::PvDatabase>,
-    name: &str,
-    value: Option<String>,
+    name: &[u8],
+    value: Option<IocshString>,
 ) -> Vec<String> {
     let (base, field) = parse_pv_name(name);
+    let shown = String::from_utf8_lossy(base);
     let field = field.to_ascii_uppercase();
     let mut lines = Vec::new();
 
@@ -4396,7 +4442,7 @@ async fn dbtpn_lines(
             Err(_) => false,
         };
         if !ok {
-            lines.push(format!("{base} dbtpnCallback processNotify.status 2"));
+            lines.push(format!("{shown} dbtpnCallback processNotify.status 2"));
             return lines;
         }
         // C `getCallback` -> `dbChannelGet(ppn->chan, DBR_STRING, ...)`
@@ -4411,17 +4457,17 @@ async fn dbtpn_lines(
             Some(text) => lines.push(format!("dbtpn:getCallback value {text}")),
             None => {
                 lines.push("dbtpn:getCallback error".to_string());
-                lines.push(format!("{base} dbtpnCallback processNotify.status 2"));
+                lines.push(format!("{shown} dbtpnCallback processNotify.status 2"));
                 return lines;
             }
         }
-        lines.push(format!("dbtpnCallback: success record={base}"));
+        lines.push(format!("dbtpnCallback: success record={shown}"));
         return lines;
     };
 
     // C `putProcessRequest` (`dbNotify.c:607`).
     let put = db
-        .put_record_field_from_ca(base, &field, EpicsValue::String(text.as_str().into()))
+        .put_record_field_from_ca(base, &field, EpicsValue::String(text.as_bytes().into()))
         .await;
     match put {
         Ok(completion) => {
@@ -4430,12 +4476,12 @@ async fn dbtpn_lines(
                 None => true,
             };
             if settled {
-                lines.push(format!("dbtpnCallback: success record={base}"));
+                lines.push(format!("dbtpnCallback: success record={shown}"));
             } else {
-                lines.push(format!("{base} dbtpnCallback processNotify.status 2"));
+                lines.push(format!("{shown} dbtpnCallback processNotify.status 2"));
             }
         }
-        Err(_) => lines.push(format!("{base} dbtpnCallback processNotify.status 2")),
+        Err(_) => lines.push(format!("{shown} dbtpnCallback processNotify.status 2")),
     }
     lines
 }
@@ -4532,13 +4578,14 @@ fn cmd_dbtpn() -> CommandDef {
 /// this reuses the same string put the `dbtpn` arm takes.
 async fn tpn_lines(
     db: &std::sync::Arc<crate::server::database::PvDatabase>,
-    name: &str,
-    value: String,
+    name: &[u8],
+    value: IocshString,
 ) -> Vec<String> {
     let (base, field) = parse_pv_name(name);
+    let shown = String::from_utf8_lossy(base);
     let field = field.to_ascii_uppercase();
     let put = db
-        .put_record_field_from_ca(base, &field, EpicsValue::String(value.as_str().into()))
+        .put_record_field_from_ca(base, &field, EpicsValue::String(value.as_bytes().into()))
         .await;
     let ok = match put {
         Ok(completion) => match completion.into_handle() {
@@ -4550,11 +4597,11 @@ async fn tpn_lines(
     // C prints the RECORD name — `dbChannelRecord(ppn->chan)->name`
     // (`db_test.c:206`) — not the channel name the caller typed.
     if ok {
-        vec![format!("tpnCallback '{base}': Success")]
+        vec![format!("tpnCallback '{shown}': Success")]
     } else {
         // `notifyError` (2), the status the port's other notify path
         // reports a failed completion as.
-        vec![format!("tpnCallback '{base}': Notify status 2")]
+        vec![format!("tpnCallback '{shown}': Notify status 2")]
     }
 }
 
@@ -4631,7 +4678,7 @@ fn dbglob_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // C `dbTest.c:307-309`: a missing or empty pattern is a usage
     // error, not an implicit `*`, and a 1 return.
     let pattern = match args.first() {
-        Some(ArgValue::String(s)) if !s.is_empty() => s.as_str(),
+        Some(ArgValue::String(s)) if !s.is_empty() => s.as_bytes(),
         _ => {
             ctx.println("Usage: dbglob \"pattern\" \"fields\"");
             return Ok(CommandOutcome::Failed);
@@ -4650,11 +4697,11 @@ fn dbglob_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // confused to miss. Field lookup via `get_record` follows
     // alias→canonical; for a simple PV the field-dump branch silently skips,
     // since it is not a record.
-    let mut names: Vec<String> = db_nodes_type_major(ctx)
+    let mut names: Vec<RecordName> = db_nodes_type_major(ctx)
         .into_iter()
         .map(|node| node.name)
         .collect();
-    let mut extra: Vec<String> = ctx.block_on(ctx.db().all_simple_pv_names());
+    let mut extra: Vec<RecordName> = ctx.block_on(ctx.db().all_simple_pv_names());
     extra.sort();
     extra.dedup();
     extra.retain(|n| !names.contains(n));
@@ -4860,7 +4907,7 @@ const SCAN_PRIORITY_NAMES: [&str; 3] = ["Low", "Medium", "High"];
 /// C `printList` (`dbScan.c:969-992`): print nothing at all when the
 /// list is empty, otherwise the caller's header and then one
 /// left-justified 28-column record name per line.
-fn print_scan_list(ctx: &CommandContext, header: &str, names: &[String]) {
+fn print_scan_list(ctx: &CommandContext, header: &str, names: &[RecordName]) {
     if names.is_empty() {
         return;
     }
@@ -4875,8 +4922,8 @@ fn print_scan_list(ctx: &CommandContext, header: &str, names: &[String]) {
 /// (or I/O event) head and `scanAdd` files the record by `precord->prio`
 /// (`dbScan.c:601-612`), so the grouping is a property of the record,
 /// not of the report.
-fn scan_lists_by_priority(ctx: &CommandContext, names: &[String]) -> [Vec<String>; 3] {
-    let mut out: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+fn scan_lists_by_priority(ctx: &CommandContext, names: &[RecordName]) -> [Vec<RecordName>; 3] {
+    let mut out: [Vec<RecordName>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for name in names {
         let Some(rec) = ctx.db().get_record(name) else {
             continue;
@@ -4917,11 +4964,11 @@ fn cmd_scanpel() -> CommandDef {
 
             for (event, names) in &by_event {
                 if let Some(pattern) = &pattern
-                    && !epics_strn_glob_match(event.as_bytes(), event.len(), pattern.as_bytes())
+                    && !epics_strn_glob_match(event, event.len(), pattern.as_bytes())
                 {
                     continue;
                 }
-                ctx.println(&format!("Event \"{event}\""));
+                ctx.println_bytes(&[&b"Event \""[..], event, b"\""].concat());
                 for (prio, list) in scan_lists_by_priority(ctx, names).iter().enumerate() {
                     print_scan_list(
                         ctx,
@@ -4998,7 +5045,9 @@ fn cmd_pushd() -> CommandDef {
             };
             match &args[0] {
                 ArgValue::String(dir) => {
-                    if let Err(e) = super::core_commands::set_working_dir(dir) {
+                    if let Err(e) = dir.to_path().and_then(|path| {
+                        super::core_commands::set_working_dir(path).map_err(|e| e.to_string())
+                    }) {
                         return Err(format!("pushd: {dir}: {e}"));
                     }
                     dir_stack().lock().unwrap().push(cwd);
@@ -5150,7 +5199,7 @@ fn cmd_db_create_record() -> CommandDef {
             // base wraps exactly these in `iocshSetError`
             // (`dbStaticIocRegister.c:282-310` at `f4ccf7bc8`);
             // epics-base#498 / UI-105.
-            if let Err(e) = db_loader::validate_record_name(&name, 0, 0) {
+            if let Err(e) = db_loader::validate_record_name(name.as_bytes(), 0, 0) {
                 return Err(format!("dbCreateRecord: {e}"));
             }
             if ctx.db().get_record(&name).is_some() {
@@ -5159,7 +5208,7 @@ fn cmd_db_create_record() -> CommandDef {
             // C reaches this through `dbFindRecordType`
             // (`dbStaticIocRegister.c:299` at `f4ccf7bc8`), whose miss is the same
             // status as a missing type argument.
-            let record = db_loader::create_record(&rec_type).map_err(|_| {
+            let record = db_loader::create_record(&rec_type.to_str_lossy()).map_err(|_| {
                 format!("{S_DB_LIB_RECORD_TYPE_NOT_FOUND} Record Type does not exist")
             })?;
             if let Err(e) = ctx.block_on(ctx.db().add_record(&name, record)) {
@@ -5209,8 +5258,8 @@ fn post_event_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult 
     // (`dbScan.c:480-482`) and `postEvent(NULL)` returns at once, so a
     // bare `postEvent` scans nothing.
     match args.first() {
-        Some(ArgValue::String(name)) if !name.trim().is_empty() => {
-            ctx.block_on(ctx.db().post_event_named(name));
+        Some(ArgValue::String(name)) if !name.trim_ascii().is_empty() => {
+            ctx.block_on(ctx.db().post_event_named(name.as_bytes()));
         }
         _ => {}
     }
@@ -5265,8 +5314,8 @@ pub(super) fn epics_strn_glob_match(s: &[u8], len: usize, pattern: &[u8]) -> boo
 }
 
 /// [`epics_strn_glob_match`] over whole strings — C `epicsStrGlobMatch`.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    epics_strn_glob_match(text.as_bytes(), text.len(), pattern.as_bytes())
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    epics_strn_glob_match(text, text.len(), pattern)
 }
 
 /// `iocStats` — record count, uptime, RSS, cores and scan-list totals.
@@ -5357,7 +5406,7 @@ fn cmd_db_load_records() -> CommandDef {
             // C `dbAccess.c:799-802` tests the file name only for NULL,
             // so an empty name still reaches the open and fails there.
             let path = match &args[0] {
-                ArgValue::String(s) => s,
+                ArgValue::String(s) => s.to_str()?,
                 _ => {
                     // C prints the usage line and returns -1 (`dbAccess.c:799-802`),
                     // which `dbLoadRecordsCallFunc` hands straight to
@@ -5368,8 +5417,8 @@ fn cmd_db_load_records() -> CommandDef {
                 }
             };
             let macros_str = match &args[1] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.as_bytes(),
+                _ => b"",
             };
 
             // C says NOTHING on the success path: `dbLoadRecords` calls
@@ -5434,19 +5483,19 @@ fn cmd_db_load_database() -> CommandDef {
             // way; `astac` is the exception, because `astacCallFunc`
             // (`asIocRegister.c:126-129`) discards `astac`'s status.
             let file = match &args[0] {
-                ArgValue::String(s) => s,
+                ArgValue::String(s) => s.to_str()?,
                 _ => {
                     ctx.println("Usage: dbLoadDatabase \"file\", \"path\", \"subs\"");
                     return Ok(CommandOutcome::Failed);
                 }
             };
             let path = match &args[1] {
-                ArgValue::String(s) => s.as_str(),
+                ArgValue::String(s) => s.to_str()?,
                 _ => "",
             };
             let substitutions = match &args[2] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.as_bytes(),
+                _ => b"",
             };
 
             let mut faults = db_loader::DbFaults::default();
@@ -5497,7 +5546,7 @@ fn db_read_database(
     ctx: &CommandContext,
     file: &str,
     path: &str,
-    substitutions: &str,
+    substitutions: &[u8],
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
     db_read_database_macros(ctx, file, path, parse_macro_string(substitutions), faults)
@@ -5515,7 +5564,7 @@ fn db_read_database_macros(
     ctx: &CommandContext,
     file: &str,
     path: &str,
-    macros: HashMap<String, String>,
+    macros: HashMap<Vec<u8>, Vec<u8>>,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
     // A load OPENS the load phase; it does not close it — the boundary a
@@ -5559,8 +5608,12 @@ fn db_read_database_macros(
     // column 6: expected 'field', got 'qqq'`, and that positionless line
     // was the whole of what an operator with a syntax error in a real
     // `.db` got: no file, no line, no source.
-    let parsed = db_loader::parse_db_opened_held(&file_path, &macros, &config)
-        .map_err(|_| DbReadFailure::Rejected)?;
+    let parsed = db_loader::parse_db_opened_held(
+        &file_path,
+        crate::runtime::mac_lib::MacroDefs::from_byte_map(&macros),
+        &config,
+    )
+    .map_err(|_| DbReadFailure::Rejected)?;
 
     // Merge any `breaktable(...)` definitions into the database's shared
     // breakpoint-table registry (C `bptList`) and snapshot it for the
@@ -5622,7 +5675,7 @@ fn db_read_database_macros(
 fn db_load_records(
     ctx: &CommandContext,
     file: &str,
-    macros: HashMap<String, String>,
+    macros: HashMap<Vec<u8>, Vec<u8>>,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
     // C passes a hard `0` for the search path (`dbAccess.c:803`), so a
@@ -5704,6 +5757,10 @@ fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
     }
     for macro_ in row {
         let db_loader::RowMacro { name, value, .. } = macro_;
+        let (name, value) = (
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(value),
+        );
         if macro_.quoted {
             parts.push(format!("{name}=\"{value}\""));
         } else {
@@ -5795,18 +5852,18 @@ fn cmd_db_load_template() -> CommandDef {
             // `dbLoadTemplateCallFunc` passes that status to `iocshSetError`
             // (`dbtoolsIocRegister.c:33-36`), so the line FAILED.
             let path = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() => s,
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?,
                 _ => {
                     ctx.eprintln("must specify variable substitution file");
                     return Ok(CommandOutcome::Failed);
                 }
             };
             let macros_str = match &args[1] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.as_bytes(),
+                _ => b"",
             };
             let search_path = match &args[2] {
-                ArgValue::String(s) => s.as_str(),
+                ArgValue::String(s) => s.to_str()?,
                 _ => "",
             };
 
@@ -5830,7 +5887,7 @@ fn cmd_db_load_template() -> CommandDef {
             // port has that shape, and it is one half of what the merged
             // `parse error: <e>` could not say.
             let file_path = resolve_substitutions_file(path, search_path);
-            let text = match std::fs::read_to_string(&file_path) {
+            let text = match std::fs::read(&file_path) {
                 Ok(text) => text,
                 Err(e) => {
                     ctx.eprintln(&format!(
@@ -5898,7 +5955,7 @@ fn cmd_db_load_template() -> CommandDef {
                     ctx.eprintln(&format!(
                         "dbLoadRecords(\"{}\", {})",
                         load.file,
-                        c_sub_collect(macros_str, &load.macros)
+                        c_sub_collect(&String::from_utf8_lossy(macros_str), &load.macros)
                     ));
                     eprint_substitution_fault(
                         ctx,
@@ -5964,7 +6021,7 @@ fn cmd_epics_env_set() -> CommandDef {
             // `iocshLoad("inner.cmd","PORT=OLD")` macro stops shadowing
             // the variable the loaded script is setting.
             super::iocsh_env_clear(name);
-            crate::runtime::env::set(name, value);
+            crate::runtime::env::set(name.to_os_str()?, value.to_os_str()?);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -6036,13 +6093,14 @@ fn cmd_exit() -> CommandDef {
 /// `$(X)` the caller deliberately quoted through.
 ///
 /// Splitting honors quotes/escapes and trims whitespace via
-/// [`macro_defn_pairs`] so `DESC="a,b",P=IOC:` keeps `a,b` as one value
+/// [`macro_defn_pairs_bytes`](crate::runtime::mac_lib::macro_defn_pairs_bytes)
+/// so `DESC="a,b",P=IOC:` keeps `a,b` as one value
 /// instead of tearing it on the embedded comma (libCom `macParseDefns`
 /// parity). Deletion entries (a name with no `=`) have nothing to remove
 /// from a fresh map and are skipped.
-pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
+pub(super) fn parse_macro_string(s: &[u8]) -> HashMap<Vec<u8>, Vec<u8>> {
     let mut macros = HashMap::new();
-    for (k, v) in macro_defn_pairs(s) {
+    for (k, v) in crate::runtime::mac_lib::macro_defn_pairs_bytes(s) {
         if let Some(v) = v {
             if k.is_empty() {
                 continue;
@@ -6068,7 +6126,7 @@ pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
 /// same treatment, so the check is shared rather than re-inlined per command.
 pub(super) fn check_pdbbase(arg: &ArgValue) -> Result<(), String> {
     if let ArgValue::String(pdbbase) = arg
-        && !(pdbbase.is_empty() || pdbbase.starts_with('0') || pdbbase == "pdbbase")
+        && !(pdbbase.is_empty() || pdbbase.starts_with(b"0") || pdbbase == "pdbbase")
     {
         return Err(format!("Expecting 'pdbbase' got '{pdbbase}'."));
     }
@@ -6119,7 +6177,7 @@ fn link_field_kind(record_type: &str, field: &str) -> Option<&'static str> {
 /// Only a link that resolved LOCALLY appears, because C reads
 /// `plink->type != DB_LINK` and skips everything else — a `ca://` target is a
 /// `CA_LINK` and prints nothing here even when the name is local.
-fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &str) -> Vec<String> {
+fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &[u8]) -> Vec<Vec<u8>> {
     use crate::server::record::ParsedLink;
     let Some(record_type) = db
         .get_record(record)
@@ -6145,13 +6203,14 @@ fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &str) -> V
                 } else {
                     "NPP"
                 };
-                Some(format!(
-                    "\t{field}{} {pp} {} {target}",
+                let head = format!(
+                    "\t{field}{} {pp} {} ",
                     link_field_kind(record_type, &field)?,
                     crate::server::record::record_instance::monitor_switch_word(
                         link.monitor_switch
                     )
-                ))
+                );
+                Some([head.as_bytes(), &target].concat())
             }
             _ => None,
         })
@@ -6164,24 +6223,27 @@ fn dblsr_set_lines(
     db: &crate::server::database::PvDatabase,
     set: &crate::server::database::LockSetInfo,
     level: i64,
-) -> Vec<String> {
-    let mut lines = vec![format!(
-        "Lock Set {} {} members {} refs epicsMutexId {}",
-        set.id,
-        set.members.len(),
-        set.refs,
-        // C prints the `epicsMutexId` with `%p`; this is the same identity the
-        // process mutex list carries for that mutex, so `dbLockShowLocked` and
-        // `epicsMutexShowAll` name the set with the same number.
-        set.mutex
-            .as_ref()
-            .map_or_else(|| "(nil)".to_string(), |m| format!("{:#x}", m.addr()))
-    )];
+) -> Vec<Vec<u8>> {
+    let mut lines = vec![
+        format!(
+            "Lock Set {} {} members {} refs epicsMutexId {}",
+            set.id,
+            set.members.len(),
+            set.refs,
+            // C prints the `epicsMutexId` with `%p`; this is the same identity the
+            // process mutex list carries for that mutex, so `dbLockShowLocked` and
+            // `epicsMutexShowAll` name the set with the same number.
+            set.mutex
+                .as_ref()
+                .map_or_else(|| "(nil)".to_string(), |m| format!("{:#x}", m.addr()))
+        )
+        .into_bytes(),
+    ];
     if level == 0 {
         return lines;
     }
     for member in &set.members {
-        lines.push(member.clone());
+        lines.push(member.to_vec());
         if level <= 1 {
             continue;
         }
@@ -6246,7 +6308,7 @@ fn cmd_dblsr() -> CommandDef {
 
             for set in &sets {
                 for line in dblsr_set_lines(db, set, level) {
-                    ctx.println(&line);
+                    ctx.println_bytes(&line);
                 }
             }
             Ok(CommandOutcome::Continue)
@@ -6384,7 +6446,7 @@ fn cmd_dbcar() -> CommandDef {
             // instead short-circuits after the first match (`dbCaTest.c:138`)
             // and DOES match an alias, which `get_record` resolves.
             let records = match &only {
-                Some(name) => vec![name.clone()],
+                Some(name) => vec![RecordName::from(name.as_bytes())],
                 None => record_names_type_major(ctx),
             };
             let ca_lset = ctx.block_on(ctx.db().link_set("ca"));
@@ -6420,7 +6482,7 @@ fn cmd_dbcar() -> CommandDef {
                     ncalinks += 1;
                     let diagnostics = ca_lset
                         .as_ref()
-                        .and_then(|lset| ctx.block_on(lset.link_diagnostics(&ca.pv)));
+                        .and_then(|lset| ctx.block_on(lset.link_diagnostics(ca.pv.as_bytes())));
                     let no_write = ctx.db().external_link_puts_coalesced_for(&ca.pv);
                     match diagnostics {
                         Some(d) if d.connected => {
@@ -6505,7 +6567,7 @@ fn cmd_db_notify_dump() -> CommandDef {
             // already holding — the waitList of one block names records
             // whose own blocks are still to come.
             struct Row {
-                name: String,
+                name: RecordName,
                 notify: Option<Arc<crate::server::record::NotifyWaitSet>>,
                 pact: bool,
                 queued: usize,
@@ -6530,7 +6592,7 @@ fn cmd_db_notify_dump() -> CommandDef {
             // appear only inside the entry's `waitList`.
             for row in rows
                 .iter()
-                .filter(|r| r.notify.as_ref().and_then(|w| w.entry_record()) == Some(&r.name[..]))
+                .filter(|r| r.notify.as_ref().and_then(|w| w.entry_record()) == Some(&r.name))
             {
                 let ws = row.notify.as_ref().expect("filtered");
                 // C's `notifyProcessInProgress` / `notifyUserCallbackRequested`
@@ -6614,12 +6676,12 @@ fn cmd_db_put_attribute() -> CommandDef {
             // and an argument given as `""` is a zero-length string, and
             // `dbPutAttribute` treats the two differently.
             let text = |arg: &ArgValue| match arg {
-                ArgValue::String(s) => Some(s.clone()),
-                _ => None,
+                ArgValue::String(s) => s.to_str().map(|s| Some(s.to_owned())),
+                _ => Ok(None),
             };
-            let record_type = text(&args[0]).unwrap_or_default();
-            let name = text(&args[1]);
-            let value = text(&args[2]);
+            let record_type = text(&args[0])?.unwrap_or_default();
+            let name = text(&args[1])?;
+            let value = text(&args[2])?;
 
             match ctx.db().put_record_type_attribute(
                 &record_type,
@@ -6795,7 +6857,7 @@ fn cmd_dbla() -> CommandDef {
                 }
                 // C prints the target's NAME field (`dbTest.c:265-266`),
                 // which is the record's own name.
-                ctx.println(&format!("{} -> {target}", node.name));
+                ctx.println_bytes(&[&node.name[..], b" -> ", &target].concat());
             }
             Ok(CommandOutcome::Continue)
         },
@@ -6837,7 +6899,7 @@ fn cmd_dbli() -> CommandDef {
                 tags.sort();
                 for (key, value) in tags {
                     if let Some(pattern) = &pattern
-                        && !glob_match(pattern, &key)
+                        && !glob_match(pattern, key.as_bytes())
                     {
                         continue;
                     }
@@ -6890,7 +6952,7 @@ fn cmd_db_create_alias() -> CommandDef {
             let target = ctx
                 .db()
                 .resolve_alias(record)
-                .unwrap_or_else(|| record.clone());
+                .unwrap_or_else(|| RecordName::from(record.as_bytes()));
             match ctx.block_on(ctx.db().add_alias(alias, &target)) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 // `add_alias` rejects a missing target with `ChannelNotFound`
@@ -6946,7 +7008,8 @@ fn cmd_db_state_create() -> CommandDef {
                 // line fails and nothing is printed.
                 return Ok(CommandOutcome::Failed);
             };
-            crate::server::database::filters::sync::db_state_registry().get_or_create(name);
+            crate::server::database::filters::sync::db_state_registry()
+                .get_or_create(name.to_str()?);
             let _ = ctx;
             Ok(CommandOutcome::Continue)
         },
@@ -7004,14 +7067,14 @@ fn cmd_db_state_show() -> CommandDef {
                 return Ok(CommandOutcome::Failed);
             };
             let name = match &args[0] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.to_str_lossy(),
+                _ => "".into(),
             };
             let level = match args[1] {
                 ArgValue::Int(v) => v,
                 _ => 0,
             };
-            print_db_state(ctx, name, &state, level);
+            print_db_state(ctx, &name, &state, level);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -7052,7 +7115,7 @@ fn find_db_state(arg: &ArgValue) -> Option<std::sync::Arc<DbState>> {
     let ArgValue::String(name) = arg else {
         return None;
     };
-    crate::server::database::filters::sync::db_state_registry().find(name)
+    crate::server::database::filters::sync::db_state_registry().find(name.to_str().ok()?)
 }
 
 /// `dbDumpBreaktable pdbbase [tableName]` — C `dbDumpBreaktable`
@@ -7119,7 +7182,7 @@ fn cmd_db_dump_breaktable() -> CommandDef {
             let registry = ctx.db().breaktable_registry();
             for table in registry.tables() {
                 if let Some(wanted) = &wanted
-                    && *wanted != table.name
+                    && wanted.as_bytes() != table.name.as_bytes()
                 {
                     continue;
                 }
@@ -7532,17 +7595,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::server::database::LinkSet for StubCaLset {
-        fn is_connected(&self, name: &str) -> bool {
+        fn is_connected(&self, name: &[u8]) -> bool {
             self.links
                 .lock()
                 .unwrap()
-                .get(name)
+                .get(std::str::from_utf8(name).unwrap())
                 .is_some_and(|d| d.connected)
         }
-        async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _name: &[u8]) -> Option<EpicsValue> {
             None
         }
-        fn put_admission(&self, name: &str) -> crate::server::database::PutAdmission {
+        fn put_admission(&self, name: &[u8]) -> crate::server::database::PutAdmission {
             if self.is_connected(name) {
                 crate::server::database::PutAdmission::Connected
             } else {
@@ -7551,7 +7614,7 @@ mod tests {
         }
         async fn put_value(
             &self,
-            _name: &str,
+            _name: &[u8],
             _value: EpicsValue,
             _op: crate::server::database::LinkPutOp,
         ) -> Result<(), String> {
@@ -7567,12 +7630,21 @@ mod tests {
         }
         async fn link_diagnostics(
             &self,
-            name: &str,
+            name: &[u8],
         ) -> Option<crate::server::database::LinkDiagnostics> {
-            self.links.lock().unwrap().get(name).cloned()
+            self.links
+                .lock()
+                .unwrap()
+                .get(std::str::from_utf8(name).unwrap())
+                .cloned()
         }
-        fn link_names(&self) -> Vec<String> {
-            self.links.lock().unwrap().keys().cloned().collect()
+        fn link_names(&self) -> Vec<crate::types::RecordName> {
+            self.links
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str().into())
+                .collect()
         }
     }
 
@@ -7731,7 +7803,7 @@ mod tests {
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbcar").unwrap();
-        let tokens = ["L:UP".to_string(), "2".to_string()];
+        let tokens = ["L:UP", "2"].map(IocshString::from);
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         ctx.with_output(std::fs::File::create(tmp.path()).unwrap(), || {
@@ -7886,15 +7958,15 @@ mod tests {
         let (db, ctx, lset, _dir) = dbcar_ctx();
         lset.set("UP:PV", diag(true, true, true, 0));
         let entered = lset.hold_puts();
-        db.write_external_pv("UP:PV", EpicsValue::Double(1.0), None)
+        db.write_external_pv(b"UP:PV", EpicsValue::Double(1.0), None)
             .unwrap();
         entered.recv().expect("the first write reached the lset");
         // Staged behind an in-flight write: restaged, nothing displaced.
-        db.write_external_pv("UP:PV", EpicsValue::Double(2.0), None)
+        db.write_external_pv(b"UP:PV", EpicsValue::Double(2.0), None)
             .unwrap();
         assert_eq!(db.external_link_puts_coalesced_for("UP:PV"), 0);
         // Now one IS displaced.
-        db.write_external_pv("UP:PV", EpicsValue::Double(3.0), None)
+        db.write_external_pv(b"UP:PV", EpicsValue::Double(3.0), None)
             .unwrap();
         assert_eq!(db.external_link_puts_coalesced_for("UP:PV"), 1);
         let out = run_cmd(&ctx, "dbcar", &["L:UP", "2"]);
@@ -8435,9 +8507,9 @@ mod tests {
                 .unwrap();
         });
         db.get_record("TICKER").unwrap().write().common.scan = ScanType::SEC1;
-        db.update_scan_index("TICKER", ScanType::Passive, ScanType::SEC1, 0, 0);
+        db.update_scan_index(b"TICKER", ScanType::Passive, ScanType::SEC1, 0, 0);
         db.get_record("IDLE").unwrap().write().common.scan = ScanType::Event;
-        db.update_scan_index("IDLE", ScanType::Passive, ScanType::Event, 0, 0);
+        db.update_scan_index(b"IDLE", ScanType::Passive, ScanType::Event, 0, 0);
         for _ in 0..3 {
             db.record_scan_overrun(ScanType::SEC1);
         }
@@ -8493,7 +8565,7 @@ mod tests {
         // record on a second rate and check the order rather than asserting
         // on one list.
         db.get_record("IDLE").unwrap().write().common.scan = ScanType::SEC10;
-        db.update_scan_index("IDLE", ScanType::Event, ScanType::SEC10, 0, 0);
+        db.update_scan_index(b"IDLE", ScanType::Event, ScanType::SEC10, 0, 0);
         let buf2 = Arc::new(Mutex::new(Vec::new()));
         ctx.with_output(Sink(buf2.clone()), || {
             cmd.handler.call(&args, &ctx).unwrap();
@@ -8552,7 +8624,7 @@ mod tests {
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = scan;
-                w.common.text.evnt = evnt.to_string();
+                w.common.text.evnt = evnt.into();
             }
             db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
         }
@@ -8639,7 +8711,7 @@ mod tests {
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = ScanType::Event;
-                w.common.text.evnt = evnt.to_string();
+                w.common.text.evnt = evnt.into();
             }
             db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
         }
@@ -9419,7 +9491,7 @@ record(lso, "SOD") { field(SIZV, "128") }
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = scan;
-                w.common.text.evnt = evnt.to_string();
+                w.common.text.evnt = evnt.into();
                 w.common.prio = prio;
             }
             db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
@@ -9982,7 +10054,7 @@ record(lso, "SOD") { field(SIZV, "128") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         capture(ctx, || {
             cmd.handler.call(&args, ctx).unwrap();
@@ -9996,7 +10068,7 @@ record(lso, "SOD") { field(SIZV, "128") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let mut failed = false;
         let printed = capture(ctx, || {
@@ -10810,22 +10882,22 @@ BO_REC
     /// `glob_match` call `dbglob_handler` filters record names with.
     #[test]
     fn glob_match_question_mark_consumes_exactly_one() {
-        assert!(glob_match("ab?", "abc"));
-        assert!(!glob_match("ab?", "ab"));
-        assert!(!glob_match("ab?", "abcd"));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("a*d", "abcd"));
-        assert!(!glob_match("a*d", "abce"));
-        assert!(glob_match("", ""));
-        assert!(!glob_match("", "x"));
+        assert!(glob_match(b"ab?", b"abc"));
+        assert!(!glob_match(b"ab?", b"ab"));
+        assert!(!glob_match(b"ab?", b"abcd"));
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"a*d", b"abcd"));
+        assert!(!glob_match(b"a*d", b"abce"));
+        assert!(glob_match(b"", b""));
+        assert!(!glob_match(b"", b"x"));
 
         // The live-IOC transcript above, name by name.
-        assert!(!glob_match("REC?", "REC"));
-        assert!(glob_match("REC?", "RECX"));
-        assert!(!glob_match("REC?", "RECXY"));
-        assert!(glob_match("REC*", "REC"));
-        assert!(glob_match("REC*", "RECX"));
-        assert!(glob_match("REC*", "RECXY"));
+        assert!(!glob_match(b"REC?", b"REC"));
+        assert!(glob_match(b"REC?", b"RECX"));
+        assert!(!glob_match(b"REC?", b"RECXY"));
+        assert!(glob_match(b"REC*", b"REC"));
+        assert!(glob_match(b"REC*", b"RECX"));
+        assert!(glob_match(b"REC*", b"RECXY"));
     }
 
     /// Every command the mechanical registration sweep found declaring
@@ -10862,14 +10934,14 @@ BO_REC
         register_builtins(&mut reg);
         let cmd = reg.get("dbCreateRecord").unwrap();
 
-        let tokens = ["pdbbase", "ai", "SIM:NEW"].map(str::to_string);
+        let tokens = ["pdbbase", "ai", "SIM:NEW"].map(IocshString::from);
         let args = parse_args(&tokens, &cmd.args).unwrap();
         cmd.handler
             .call(&args, &ctx)
             .expect("must create the record");
         assert!(db.get_record("SIM:NEW").is_some());
 
-        let bad = ["ai", "SIM:OTHER", "x"].map(str::to_string);
+        let bad = ["ai", "SIM:OTHER", "x"].map(IocshString::from);
         let args = parse_args(&bad, &cmd.args).unwrap();
         let Err(msg) = cmd.handler.call(&args, &ctx) else {
             panic!("a non-pdbbase first argument must be refused");
@@ -10889,7 +10961,7 @@ BO_REC
         register_builtins(&mut reg);
         let cmd = reg.get("dbCreateRecord").unwrap();
         let call = |tokens: &[&str]| {
-            let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
             let args = parse_args(&tokens, &cmd.args).expect("C accepts a missing argument");
             match cmd.handler.call(&args, &ctx) {
                 Err(msg) => msg,
@@ -10937,16 +11009,35 @@ BO_REC
         let mut reg = CommandRegistry::new();
         register_builtins(&mut reg);
         let cmd = reg.get("dbLoadTemplate").unwrap();
-        let tokens = [
-            "t.substitutions".to_string(),
-            String::new(),
-            subs_dir.path().display().to_string(),
+        let tokens: Vec<IocshString> = vec![
+            "t.substitutions".into(),
+            IocshString::default(),
+            subs_dir.path().display().to_string().into(),
         ];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         cmd.handler
             .call(&args, &ctx)
             .expect("the third argument must locate the .substitutions file");
         assert!(db.get_record("SIM:FROM_ARG").is_some());
+    }
+
+    /// A `.substitutions` that is not UTF-8 loads: C reads it as bytes.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_template_reads_a_latin1_substitutions_file() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.template"), "record(ai,\"$(P)\") { }\n").unwrap();
+        std::fs::write(
+            dir.path().join("t.substitutions"),
+            b"file \"t.template\" { pattern { P } { \"caf\xe9\" } }\n",
+        )
+        .unwrap();
+        let _guard = DbIncludePath::set(dir.path());
+        let subs = dir.path().join("t.substitutions");
+        let (_, failed) = run_cmd_outcome(&ctx, "dbLoadTemplate", &[subs.to_str().unwrap()]);
+        assert!(!failed);
+        assert!(db.get_record(&b"caf\xe9"[..]).is_some());
     }
 
     #[test]
@@ -10983,7 +11074,7 @@ BO_REC
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbgf").unwrap();
-        let tokens = vec!["TEMP".to_string()];
+        let tokens: Vec<IocshString> = vec!["TEMP".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -11188,9 +11279,9 @@ record(bo, "$(P)_calc_ctrl") {{
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let tokens = vec![
-            path.to_str().unwrap().to_string(),
-            "P=SCALER1,DTYP=Scaler-rs".to_string(),
+        let tokens: Vec<IocshString> = vec![
+            path.to_str().unwrap().to_string().into(),
+            "P=SCALER1,DTYP=Scaler-rs".into(),
         ];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         cmd.handler.call(&args, &ctx).unwrap();
@@ -11227,7 +11318,7 @@ record(bo, "$(P)_calc_ctrl") {{
 
         // Put a value
         let cmd = registry.get("dbpf").unwrap();
-        let tokens = vec!["TEMP".to_string(), "42.0".to_string()];
+        let tokens: Vec<IocshString> = vec!["TEMP".into(), "42.0".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -11267,7 +11358,7 @@ record(bo, "$(P)_calc_ctrl") {{
         register_builtins(&mut registry);
 
         let cmd = registry.get("dbpf").unwrap();
-        let tokens = vec!["DEV.DTYP".to_string(), "Async Soft Channel".to_string()];
+        let tokens: Vec<IocshString> = vec!["DEV.DTYP".into(), "Async Soft Channel".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         if let Err(e) = &result {
@@ -11309,7 +11400,7 @@ record(bo, "$(P)_calc_ctrl") {{
         let cmd = registry.get("dbpf").unwrap();
 
         let put = |label: &str| {
-            let tokens = vec!["SL.SELM".to_string(), label.to_string()];
+            let tokens: Vec<IocshString> = vec!["SL.SELM".into(), label.to_string().into()];
             let args = parse_args(&tokens, &cmd.args).unwrap();
             cmd.handler.call(&args, &ctx)
         };
@@ -11371,10 +11462,7 @@ record(bo, "$(P)_calc_ctrl") {{
         register_builtins(&mut registry);
 
         let cmd = registry.get("dbpf").unwrap();
-        let tokens = vec![
-            "CONTRIB.DTYP".to_string(),
-            "Dbpf Contributed Probe".to_string(),
-        ];
+        let tokens: Vec<IocshString> = vec!["CONTRIB.DTYP".into(), "Dbpf Contributed Probe".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         if let Err(e) = &result {
@@ -11406,7 +11494,7 @@ record(bo, "$(P)_calc_ctrl") {{
 
         for level in [0, 1, 2] {
             let cmd = registry.get("dbpr").unwrap();
-            let tokens = vec!["TEMP".to_string(), level.to_string()];
+            let tokens: Vec<IocshString> = vec!["TEMP".into(), level.to_string().into()];
             let args = parse_args(&tokens, &cmd.args).unwrap();
             let result = cmd.handler.call(&args, &ctx);
             assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -11565,7 +11653,7 @@ CAL ASP=(nil) DPVT=(nil) DSET=(nil) LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSE
             let rec = cells.next().unwrap();
             for level in [2, 4] {
                 let printed = capture(&ctx, || {
-                    dbpr_report(&ctx, rec, level);
+                    dbpr_report(&ctx, rec.as_bytes(), level);
                 });
                 for cell in line.split(' ').skip(1) {
                     let (row, want) = cell.split_once('=').unwrap();
@@ -11603,7 +11691,7 @@ record(ai, "AIN") { field(SIMM, "YES") field(SIOL, "5") field(SDLY, "-1") }"#,
         let simpvt = |rec: &str| {
             dbpr_field(
                 &capture(&ctx, || {
-                    dbpr_report(&ctx, rec, 4);
+                    dbpr_report(&ctx, rec.as_bytes(), 4);
                 }),
                 "SIMPVT",
             )
@@ -11632,7 +11720,7 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
         let wptr = |rec: &str| {
             dbpr_field(
                 &capture(&ctx, || {
-                    dbpr_report(&ctx, rec, 4);
+                    dbpr_report(&ctx, rec.as_bytes(), 4);
                 }),
                 "WPTR",
             )
@@ -11652,7 +11740,7 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
         assert_eq!(
             dbpr_field(
                 &capture(&ctx, || {
-                    dbpr_report(&ctx, "A:AI", 4);
+                    dbpr_report(&ctx, b"A:AI", 4);
                 }),
                 "ASP"
             ),
@@ -11664,7 +11752,7 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
         )));
         let asp = dbpr_field(
             &capture(&ctx, || {
-                dbpr_report(&ctx, "A:AI", 4);
+                dbpr_report(&ctx, b"A:AI", 4);
             }),
             "ASP",
         );
@@ -11687,7 +11775,7 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
         ctx.block_on(db.ioc_init());
 
         let printed = capture(&ctx, || {
-            dbpr_report(&ctx, "N:AI", 4);
+            dbpr_report(&ctx, b"N:AI", 4);
         });
         // `size` bytes as `%02x ` (`dbTest.c:1249-1262`); BKPT is one byte.
         assert_eq!(dbpr_field(&printed, "BKPT"), "00", "dbpr N:AI 4 BKPT");
@@ -11723,8 +11811,8 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
 record(waveform, "WD") { field(FTVL, "DOUBLE") }"#,
         )
         .expect("db must load");
-        assert!(db.channel_create_found("WS.VAL$"));
-        assert!(!db.channel_create_found("WD.VAL$"));
+        assert!(db.channel_create_found(b"WS.VAL$"));
+        assert!(!db.channel_create_found(b"WD.VAL$"));
     }
 
     /// A device-link put drops the device private, as C `dbPutFieldLink`
@@ -11748,11 +11836,11 @@ record(ai, "SM") { field(INP, "S1") field(SMOO, "0.5") }"#,
         ctx.block_on(db.ioc_init());
         let dpvt = |rec: &str| {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, rec, 4);
+                dbpr_report(&ctx, rec.as_bytes(), 4);
             });
             dbpr_field(&printed, "DPVT") != "PTR (nil)"
         };
-        let val = |rec: &str| match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+        let val = |rec: &str| match db.get_pv(format!("{rec}.VAL")).unwrap() {
             EpicsValue::Double(v) => v,
             other => panic!("{other:?}"),
         };
@@ -11863,11 +11951,11 @@ record(bi, "SMB") { field(DTYP, "Async Soft Channel") field(INP, "S1") }"#,
         ctx.block_on(db.ioc_init());
         let row = |rec: &str, field: &str| {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, rec, 4);
+                dbpr_report(&ctx, rec.as_bytes(), 4);
             });
             dbpr_field(&printed, field)
         };
-        let inp = |rec: &str| match db.get_pv(&format!("{rec}.INP")).unwrap() {
+        let inp = |rec: &str| match db.get_pv(format!("{rec}.INP")).unwrap() {
             EpicsValue::String(s) => s.as_str_lossy().into_owned(),
             other => panic!("{other:?}"),
         };
@@ -11900,7 +11988,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
         ctx.block_on(db.ioc_init());
         let row = |field: &str| {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, "ACB", 1);
+                dbpr_report(&ctx, b"ACB", 1);
             });
             dbpr_field(&printed, field)
         };
@@ -11936,7 +12024,7 @@ record(ai, "AP") { field(DTYP, "Soft Channel") field(INP, "SRC") }"#,
         run_cmd(&ctx, "dbpf", &["AP.DTYP", "Async Soft Channel"]);
         run_cmd(&ctx, "dbpf", &["AP.INP", "NOPE"]);
         let printed = capture(&ctx, || {
-            dbpr_report(&ctx, "AP", 4);
+            dbpr_report(&ctx, b"AP", 4);
         });
         assert_eq!(dbpr_field(&printed, "DPVT"), "PTR (nil)");
         assert_eq!(dbpr_field(&printed, "DSET"), "PTR (nil)");
@@ -11988,7 +12076,7 @@ record(compress, "CMP") { field(INP, "SRC") field(ALG, "N to 1 Average") field(N
             let mut words = line.split(' ');
             let rec = words.next().unwrap();
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, rec, 4);
+                dbpr_report(&ctx, rec.as_bytes(), 4);
             });
             let mut port: Vec<String> = printed
                 .split("  ")
@@ -12019,7 +12107,7 @@ record(compress, "CMP") { field(INP, "SRC") field(ALG, "N to 1 Average") field(N
 
         // C's DPVT is `&devAiSoft`, so it prints the DSET row's address.
         let printed = capture(&ctx, || {
-            dbpr_report(&ctx, "AI", 4);
+            dbpr_report(&ctx, b"AI", 4);
         });
         let ai = crate::server::record::dev_sup_of("ai", "Soft Channel").unwrap();
         assert_eq!(dbpr_field(&printed, "DPVT"), format!("PTR {:p}", &ai.dset));
@@ -12054,7 +12142,7 @@ record(stringin, "P") { field(INP, "SRC.DESC") }"#,
         }
         let row = |rec: &str, field: &str| {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, rec, 1);
+                dbpr_report(&ctx, rec.as_bytes(), 1);
             });
             dbpr_field(&printed, field)
         };
@@ -12108,7 +12196,7 @@ record(aSub, "AC") { field(SUBL, "") }"#,
         ctx.block_on(db.initialize_link_locality());
         let row = |rec: &str, field: &str| {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, rec, 1);
+                dbpr_report(&ctx, rec.as_bytes(), 1);
             });
             dbpr_field(&printed, field)
         };
@@ -12383,7 +12471,7 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S") }"#,
         run_cmd(&ctx, "dbpf", &["AR.INP", "NOSUCH"]);
         for rec in ["TS", "C", "AR"] {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, rec, 4);
+                dbpr_report(&ctx, rec.as_bytes(), 4);
             });
             assert_eq!(dbpr_field(&printed, "DPVT"), "PTR (nil)", "{rec}");
         }
@@ -12407,7 +12495,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
         ctx.block_on(db.ioc_init());
         let dset_nil = || {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, "ACB", 4);
+                dbpr_report(&ctx, b"ACB", 4);
             });
             dbpr_field(&printed, "DSET") == "PTR (nil)"
         };
@@ -12447,7 +12535,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
         ctx.block_on(db.ioc_init());
         let rec = db.get_record("DS").unwrap();
         let text = || crate::types::EpicsValue::String("@st2".into());
-        let mut link = crate::server::record::PreparedCommonLink::for_put("DS", "INP", &text());
+        let mut link = crate::server::record::PreparedCommonLink::for_put(b"DS", "INP", &text());
         link.as_mut().unwrap().ask_add_record(&db, &rec);
         rec.write().common.dtyp.set_name("Soft Channel");
         let put = rec.write().gate_device_link_put(link.as_ref().unwrap());
@@ -12511,7 +12599,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
         ctx.block_on(db.ioc_init());
         let nil = |t: &str| {
             let printed = capture(&ctx, || {
-                dbpr_report(&ctx, &format!("R_{t}"), 4);
+                dbpr_report(&ctx, format!("R_{t}").as_bytes(), 4);
             });
             dbpr_field(&printed, "DSET") == "PTR (nil)"
         };
@@ -12543,7 +12631,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
         ctx.block_on(db.ioc_init());
 
         let printed = capture(&ctx, || {
-            dbpr_report(&ctx, "H:I", 2);
+            dbpr_report(&ctx, b"H:I", 2);
         });
         for (field, expected) in [
             ("ZRVL", "0xa"),
@@ -12706,7 +12794,7 @@ record(ai, "P:FL")      { field(FLNK, "L:B") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbl").unwrap();
-        let tokens = vec!["ai".to_string()];
+        let tokens: Vec<IocshString> = vec!["ai".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -12759,7 +12847,7 @@ record(mbbo, "DUP:CM") {{
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().into()], &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(
             matches!(result, Ok(CommandOutcome::Continue)),
@@ -12817,7 +12905,7 @@ record(mbbo, "DUP:CM") {{
             r#"record(ao, "BPT:RBK") {{ field(DESC, "first") }}"#
         )
         .expect("write tempfile 1");
-        let args = parse_args(&[tmp1.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp1.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -12836,7 +12924,7 @@ record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
 "#
         )
         .expect("write tempfile 2");
-        let args = parse_args(&[tmp2.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp2.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -12891,7 +12979,7 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
 "#
         )
         .expect("write tempfile 1");
-        let args = parse_args(&[tmp1.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp1.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -12904,7 +12992,7 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
             .expect("tempfile");
         writeln!(tmp2.as_file(), r#"breaktable(alpha) {{ 0 0  100 100 }}"#)
             .expect("write tempfile 2");
-        let args = parse_args(&[tmp2.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp2.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -13606,13 +13694,13 @@ record(ai, "SIM:C") { field(VAL, "1") }
         ctx.block_on(db.ioc_init());
 
         assert_eq!(
-            ctx.block_on(dbtpn_lines(&db, "R:LO", Some("7".to_string()))),
+            ctx.block_on(dbtpn_lines(&db, b"R:LO", Some("7".into()))),
             vec!["dbtpnCallback: success record=R:LO"]
         );
         assert_eq!(db.get_pv("R:LO").unwrap(), EpicsValue::Long(7));
 
         assert_eq!(
-            ctx.block_on(dbtpn_lines(&db, "R:SRC", None)),
+            ctx.block_on(dbtpn_lines(&db, b"R:SRC", None)),
             vec![
                 "dbtpn:getCallback value 3.500",
                 "dbtpnCallback: success record=R:SRC",
@@ -13661,14 +13749,14 @@ record(ai, "SIM:C") { field(VAL, "1") }
         ctx.block_on(db.ioc_init());
 
         assert_eq!(
-            ctx.block_on(tpn_lines(&db, "R:LO", "7".to_string())),
+            ctx.block_on(tpn_lines(&db, b"R:LO", "7".into())),
             vec!["tpnCallback 'R:LO': Success"]
         );
         assert_eq!(db.get_pv("R:LO").unwrap(), EpicsValue::Long(7));
 
         // The callback names the record, not the channel the caller typed.
         assert_eq!(
-            ctx.block_on(tpn_lines(&db, "R:LO.VAL", "9".to_string())),
+            ctx.block_on(tpn_lines(&db, b"R:LO.VAL", "9".into())),
             vec!["tpnCallback 'R:LO': Success"]
         );
 
@@ -13705,7 +13793,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
         write!(tmp.as_file(), "{body}").unwrap();
         let mut faults = db_loader::DbFaults::default();
-        match db_read_database(ctx, &tmp.path().to_string_lossy(), "", "", &mut faults) {
+        match db_read_database(ctx, &tmp.path().to_string_lossy(), "", b"", &mut faults) {
             Ok(_) => Ok(()),
             Err(DbReadFailure::Rejected) => Err(faults
                 .first_diagnostic()
@@ -13725,11 +13813,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbCreateRecord").unwrap();
-        let args = parse_args(
-            &["pdbbase".to_string(), "ai".to_string(), name.to_string()],
-            &cmd.args,
-        )
-        .unwrap();
+        let args = parse_args(&["pdbbase".into(), "ai".into(), name.into()], &cmd.args).unwrap();
         cmd.handler.call(&args, ctx).map(|_| ())
     }
 
@@ -13799,7 +13883,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
         for name in ["a.db", "b.db"] {
-            let args = parse_args(&[name.to_string()], &cmd.args).unwrap();
+            let args = parse_args(&[name.to_string().into()], &cmd.args).unwrap();
             cmd.handler.call(&args, &ctx).unwrap_or_else(|e| {
                 panic!("{name}: {e}");
             });
@@ -13807,7 +13891,10 @@ record(ai, "SIM:C") { field(VAL, "1") }
 
         assert!(exists(&db, &ctx, "BASE:TEMP"));
         assert!(exists(&db, &ctx, "B:X"), "b.db's own record must load");
-        assert_eq!(db.resolve_alias("OLD:TEMP").as_deref(), Some("BASE:TEMP"));
+        assert_eq!(
+            db.resolve_alias("OLD:TEMP").as_deref(),
+            Some(&b"BASE:TEMP"[..])
+        );
     }
 
     /// I-R3-4(b): a target NO load owns is a diagnostic that fails the
@@ -13829,7 +13916,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         // At the read, which owns the wording: the command keeps none of
         // it — it writes C's summary and answers `Failed`.
         let mut faults = db_loader::DbFaults::default();
-        let Err(DbReadFailure::Rejected) = db_read_database(&ctx, "c.db", "", "", &mut faults)
+        let Err(DbReadFailure::Rejected) = db_read_database(&ctx, "c.db", "", b"", &mut faults)
         else {
             panic!("an unknown alias target must fail the call's status");
         };
@@ -13940,11 +14027,11 @@ record(ai, "LATER2") { field(VAL, "2") }
 
     #[test]
     fn test_parse_macro_string() {
-        let macros = parse_macro_string("P=IOC:,R=TEMP");
-        assert_eq!(macros.get("P").unwrap(), "IOC:");
-        assert_eq!(macros.get("R").unwrap(), "TEMP");
+        let macros = parse_macro_string(b"P=IOC:,R=TEMP");
+        assert_eq!(macros.get(b"P".as_slice()).unwrap(), b"IOC:");
+        assert_eq!(macros.get(b"R".as_slice()).unwrap(), b"TEMP");
 
-        let empty = parse_macro_string("");
+        let empty = parse_macro_string(b"");
         assert!(empty.is_empty());
     }
 
@@ -13957,46 +14044,47 @@ record(ai, "LATER2") { field(VAL, "2") }
     #[test]
     fn parse_macro_string_keeps_values_raw_for_the_expander() {
         use crate::server::db_loader::{MacroExpandOptions, expand_macros};
-        fn expand(m: &HashMap<String, String>, name: &str) -> String {
+        fn expand(m: &HashMap<Vec<u8>, Vec<u8>>, name: &str) -> String {
+            let m = crate::runtime::mac_lib::MacroDefs::from_byte_map(m);
             expand_macros(&format!("$({name})"), m, MacroExpandOptions::default()).text
         }
 
         // Quoted comma stays inside the value (macParseDefns parity):
         // raw split would tear this into `DESC="a` + a stray `b"`.
-        let m = parse_macro_string(r#"DESC="a,b",P=IOC:"#);
-        assert_eq!(m.get("DESC").unwrap(), r#""a,b""#);
+        let m = parse_macro_string(br#"DESC="a,b",P=IOC:"#);
+        assert_eq!(m.get(b"DESC".as_slice()).unwrap(), br#""a,b""#);
         assert_eq!(expand(&m, "DESC"), "a,b");
-        assert_eq!(m.get("P").unwrap(), "IOC:");
+        assert_eq!(m.get(b"P".as_slice()).unwrap(), b"IOC:");
 
         // Escaped comma is a literal; the backslash survives the parse
         // and the expansion drops it.
-        let m = parse_macro_string(r#"DESC=a\,b,P=IOC:"#);
-        assert_eq!(m.get("DESC").unwrap(), r#"a\,b"#);
+        let m = parse_macro_string(br#"DESC=a\,b,P=IOC:"#);
+        assert_eq!(m.get(b"DESC".as_slice()).unwrap(), br#"a\,b"#);
         assert_eq!(expand(&m, "DESC"), "a,b");
 
         // Two backslashes: one removal, not two — C expands this to
         // `a\b`.
-        let m = parse_macro_string(r#"B=a\\b"#);
-        assert_eq!(m.get("B").unwrap(), r#"a\\b"#);
+        let m = parse_macro_string(br#"B=a\\b"#);
+        assert_eq!(m.get(b"B".as_slice()).unwrap(), br#"a\\b"#);
         assert_eq!(expand(&m, "B"), r#"a\b"#);
 
         // Whitespace around names and values is trimmed; a quoted NAME
         // is stripped in place, because a name is not re-parsed.
-        let m = parse_macro_string(r#" P = IOC: , "R" = TEMP "#);
-        assert_eq!(m.get("P").unwrap(), "IOC:");
-        assert_eq!(m.get("R").unwrap(), "TEMP");
+        let m = parse_macro_string(br#" P = IOC: , "R" = TEMP "#);
+        assert_eq!(m.get(b"P".as_slice()).unwrap(), b"IOC:");
+        assert_eq!(m.get(b"R".as_slice()).unwrap(), b"TEMP");
 
         // Quoted whitespace inside a value is preserved.
-        let m = parse_macro_string(r#"MSG="a b c""#);
-        assert_eq!(m.get("MSG").unwrap(), r#""a b c""#);
+        let m = parse_macro_string(br#"MSG="a b c""#);
+        assert_eq!(m.get(b"MSG".as_slice()).unwrap(), br#""a b c""#);
         assert_eq!(expand(&m, "MSG"), "a b c");
 
         // A name with no '=' is a deletion: nothing to remove from a
         // fresh map, and the surrounding assignments still parse.
-        let m = parse_macro_string("A=1,DROP,B=2");
-        assert_eq!(m.get("A").unwrap(), "1");
-        assert_eq!(m.get("B").unwrap(), "2");
-        assert!(!m.contains_key("DROP"));
+        let m = parse_macro_string(b"A=1,DROP,B=2");
+        assert_eq!(m.get(b"A".as_slice()).unwrap(), b"1");
+        assert_eq!(m.get(b"B".as_slice()).unwrap(), b"2");
+        assert!(!m.contains_key(b"DROP".as_slice()));
     }
 
     /// R17-66: `dbLoadRecords` is a record-creation path, so the records it
@@ -14039,7 +14127,7 @@ record(mbboDirect, "MBD0") {{ }}
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -14097,7 +14185,7 @@ record(mbboDirect, "MBD0") {{ }}
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let err_file = tempfile::NamedTempFile::new().unwrap();
         let err_path = err_file.path().to_path_buf();
@@ -14606,7 +14694,7 @@ record(ai, "C6") { field(DESC, "ok") }
             &ctx,
             &dir.path().join("all.db").to_string_lossy(),
             "",
-            "",
+            b"",
             &mut faults,
         );
         assert!(matches!(read, Err(DbReadFailure::Rejected)));
@@ -14771,9 +14859,9 @@ record(ai, "C6") { field(DESC, "ok") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadTemplate").unwrap();
-        let mut tokens = vec![sub_file.to_string_lossy().to_string()];
+        let mut tokens: Vec<IocshString> = vec![sub_file.to_string_lossy().into_owned().into()];
         if let Some(g) = global_macros {
-            tokens.push(g.to_string());
+            tokens.push(g.into());
         }
         let args = parse_args(&tokens, &cmd.args).unwrap();
         // `dbLoadTemplate` writes C's summary itself and answers `Failed`,
@@ -15279,17 +15367,17 @@ Total 3 records, 2 aliases
         register_builtins(&mut registry);
         let cmd = registry.get("dbCreateAlias").unwrap();
         let call = |tokens: &[&str]| {
-            let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
             let args = parse_args(&tokens, &cmd.args).expect("C accepts a missing argument");
             cmd.handler.call(&args, &ctx).map(|_| ())
         };
 
         assert!(call(&["pdbbase", "A:one", "A:alias2"]).is_ok());
-        assert_eq!(db.resolve_alias("A:alias2").as_deref(), Some("A:one"));
+        assert_eq!(db.resolve_alias("A:alias2").as_deref(), Some(&b"A:one"[..]));
         // C does not gate this on iocState, so an alias of an alias resolves
         // to the real record (`dbStaticLib.c:1675-1677`).
         assert!(call(&["pdbbase", "A:alias2", "A:alias3"]).is_ok());
-        assert_eq!(db.resolve_alias("A:alias3").as_deref(), Some("A:one"));
+        assert_eq!(db.resolve_alias("A:alias3").as_deref(), Some(&b"A:one"[..]));
 
         assert_eq!(
             call(&["pdbbase", "A:one", "A:alias2"]).unwrap_err(),
@@ -15357,10 +15445,10 @@ Total 3 records, 2 aliases
         register_builtins(&mut registry);
         for name in ["dbStateSet", "dbStateClear", "dbStateShow", "dbStateCreate"] {
             let cmd = registry.get(name).unwrap();
-            let tokens = if name == "dbStateCreate" {
+            let tokens: Vec<IocshString> = if name == "dbStateCreate" {
                 Vec::new()
             } else {
-                vec!["IOCSH_TEST_NO_SUCH_STATE".to_string()]
+                vec!["IOCSH_TEST_NO_SUCH_STATE".into()]
             };
             let args = parse_args(&tokens, &cmd.args).unwrap();
             let printed = capture(&ctx, || {
@@ -15463,7 +15551,7 @@ Total 3 records, 2 aliases
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let args = parse_args(&["one.db".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["one.db".into()], &cmd.args).unwrap();
         capture(&ctx, || {
             cmd.handler.call(&args, &ctx).unwrap();
         });
@@ -15478,7 +15566,7 @@ Total 3 records, 2 aliases
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbDumpPath").unwrap();
-        let args = parse_args(&["notpdbbase".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["notpdbbase".into()], &cmd.args).unwrap();
         assert!(
             cmd.handler.call(&args, &ctx).is_err(),
             "dbDumpPath must reject a first argument that is not pdbbase"

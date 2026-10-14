@@ -596,7 +596,7 @@ async fn transform_cav_holds_each_clc_compile_status() {
         .await
         .unwrap()
         .0;
-    let lv = |f: &str| db.get_pv(&format!("TR.{f}")).unwrap().to_f64().unwrap();
+    let lv = |f: &str| db.get_pv(format!("TR.{f}")).unwrap().to_f64().unwrap();
     assert_eq!([lv("CAV"), lv("CBV"), lv("CCV")], [0.0, -1.0, 0.0]);
 
     let mut got = Vec::new();

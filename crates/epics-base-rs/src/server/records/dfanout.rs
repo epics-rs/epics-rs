@@ -2,6 +2,7 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
 /// Choice labels for the SELM link-selection menu, in index order.
 /// C `menu(dfanoutSELM)`: 0=All, 1=Specified, 2=Mask.
@@ -18,25 +19,25 @@ pub struct DfanoutRecord {
     /// (dfanoutRecord.dbd.pod:188): unsigned 0..65535, used as a bit
     /// mask in `SELM=Mask`.
     pub seln: u16,
-    pub outa: String,
-    pub outb: String,
-    pub outc: String,
-    pub outd: String,
-    pub oute: String,
-    pub outf: String,
-    pub outg: String,
-    pub outh: String,
-    pub outi: String,
-    pub outj: String,
-    pub outk: String,
-    pub outl: String,
-    pub outm: String,
-    pub outn: String,
-    pub outo: String,
-    pub outp: String,
-    pub dol: String,
+    pub outa: PvString,
+    pub outb: PvString,
+    pub outc: PvString,
+    pub outd: PvString,
+    pub oute: PvString,
+    pub outf: PvString,
+    pub outg: PvString,
+    pub outh: PvString,
+    pub outi: PvString,
+    pub outj: PvString,
+    pub outk: PvString,
+    pub outl: PvString,
+    pub outm: PvString,
+    pub outn: PvString,
+    pub outo: PvString,
+    pub outp: PvString,
+    pub dol: PvString,
     pub omsl: i16,
-    pub sell: String,
+    pub sell: PvString,
     pub ivoa: i16,
     pub ivov: f64,
     // Limit-alarm configuration (C `dfanoutRecord.c::checkAlarms`).
@@ -67,25 +68,25 @@ impl Default for DfanoutRecord {
             // selected output is `seln - 1` (dfanoutRecord.c:316-322), so the
             // C default 1 drives OUTA while 0 would drive nothing.
             seln: 1,
-            outa: String::new(),
-            outb: String::new(),
-            outc: String::new(),
-            outd: String::new(),
-            oute: String::new(),
-            outf: String::new(),
-            outg: String::new(),
-            outh: String::new(),
-            outi: String::new(),
-            outj: String::new(),
-            outk: String::new(),
-            outl: String::new(),
-            outm: String::new(),
-            outn: String::new(),
-            outo: String::new(),
-            outp: String::new(),
-            dol: String::new(),
+            outa: PvString::new(),
+            outb: PvString::new(),
+            outc: PvString::new(),
+            outd: PvString::new(),
+            oute: PvString::new(),
+            outf: PvString::new(),
+            outg: PvString::new(),
+            outh: PvString::new(),
+            outi: PvString::new(),
+            outj: PvString::new(),
+            outk: PvString::new(),
+            outl: PvString::new(),
+            outm: PvString::new(),
+            outn: PvString::new(),
+            outo: PvString::new(),
+            outp: PvString::new(),
+            dol: PvString::new(),
             omsl: 0,
-            sell: String::new(),
+            sell: PvString::new(),
             ivoa: 0,
             ivov: 0.0,
             hihi: 0.0,
@@ -124,7 +125,7 @@ impl DfanoutRecord {
     }
 
     /// Get all non-empty output link targets.
-    pub fn output_links(&self) -> Vec<&str> {
+    pub fn output_links(&self) -> Vec<&[u8]> {
         [
             &self.outa, &self.outb, &self.outc, &self.outd, &self.oute, &self.outf, &self.outg,
             &self.outh, &self.outi, &self.outj, &self.outk, &self.outl, &self.outm, &self.outn,
@@ -132,11 +133,11 @@ impl DfanoutRecord {
         ]
         .iter()
         .filter(|s| !s.is_empty())
-        .map(|s| s.as_str())
+        .map(|s| s.as_bytes())
         .collect()
     }
 
-    fn out_slot_mut(&mut self, name: &str) -> Option<&mut String> {
+    fn out_slot_mut(&mut self, name: &str) -> Option<&mut PvString> {
         Some(match name {
             "OUTA" => &mut self.outa,
             "OUTB" => &mut self.outb,
@@ -158,7 +159,7 @@ impl DfanoutRecord {
         })
     }
 
-    fn out_slot(&self, name: &str) -> Option<&str> {
+    fn out_slot(&self, name: &str) -> Option<&PvString> {
         Some(match name {
             "OUTA" => &self.outa,
             "OUTB" => &self.outb,
@@ -381,32 +382,32 @@ impl Record for DfanoutRecord {
         Ok(())
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SELL" => Some(&self.sell),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SELL" => Some(self.sell.as_bytes()),
             // OUTA..OUTP, which the output row reads every cycle.
             _ => {
                 let [b'O', b'U', b'T', slot] = *link_field.as_bytes() else {
                     return None;
                 };
                 Some(match slot {
-                    b'A' => &self.outa,
-                    b'B' => &self.outb,
-                    b'C' => &self.outc,
-                    b'D' => &self.outd,
-                    b'E' => &self.oute,
-                    b'F' => &self.outf,
-                    b'G' => &self.outg,
-                    b'H' => &self.outh,
-                    b'I' => &self.outi,
-                    b'J' => &self.outj,
-                    b'K' => &self.outk,
-                    b'L' => &self.outl,
-                    b'M' => &self.outm,
-                    b'N' => &self.outn,
-                    b'O' => &self.outo,
-                    b'P' => &self.outp,
+                    b'A' => self.outa.as_bytes(),
+                    b'B' => self.outb.as_bytes(),
+                    b'C' => self.outc.as_bytes(),
+                    b'D' => self.outd.as_bytes(),
+                    b'E' => self.oute.as_bytes(),
+                    b'F' => self.outf.as_bytes(),
+                    b'G' => self.outg.as_bytes(),
+                    b'H' => self.outh.as_bytes(),
+                    b'I' => self.outi.as_bytes(),
+                    b'J' => self.outj.as_bytes(),
+                    b'K' => self.outk.as_bytes(),
+                    b'L' => self.outl.as_bytes(),
+                    b'M' => self.outm.as_bytes(),
+                    b'N' => self.outn.as_bytes(),
+                    b'O' => self.outo.as_bytes(),
+                    b'P' => self.outp.as_bytes(),
                     _ => return None,
                 })
             }
@@ -439,9 +440,7 @@ impl Record for DfanoutRecord {
             "ADEL" => Some(EpicsValue::Double(self.adel)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
-            _ => self
-                .out_slot(name)
-                .map(|s| EpicsValue::String(s.to_string().into())),
+            _ => self.out_slot(name).map(|s| EpicsValue::String(s.clone())),
         }
     }
 
@@ -516,8 +515,8 @@ impl Record for DfanoutRecord {
             "DOL" | "SELL" => match value {
                 EpicsValue::String(s) => {
                     match name {
-                        "DOL" => self.dol = s.as_str_lossy().into_owned(),
-                        "SELL" => self.sell = s.as_str_lossy().into_owned(),
+                        "DOL" => self.dol = s,
+                        "SELL" => self.sell = s,
                         _ => unreachable!(),
                     }
                     Ok(())
@@ -526,7 +525,7 @@ impl Record for DfanoutRecord {
             },
             _ => match (self.out_slot_mut(name), value) {
                 (Some(slot), EpicsValue::String(s)) => {
-                    *slot = s.as_str_lossy().into_owned();
+                    *slot = s;
                     Ok(())
                 }
                 (Some(_), _) => Err(CaError::TypeMismatch(name.into())),

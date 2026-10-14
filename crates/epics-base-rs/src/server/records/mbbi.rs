@@ -74,8 +74,8 @@ pub struct MbbiRecord {
     pub ftst: PvString,
     pub ffst: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     // SVAL is `DBF_ULONG` (mbbiRecord.dbd.pod:299-301) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
     // &prec->sval)`, mbbiRecord.c:388) before publishing `val = sval`.
@@ -151,8 +151,8 @@ impl Default for MbbiRecord {
             ftst: PvString::new(),
             ffst: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: 0,
             sims: 0,
             sdly: -1.0,
@@ -261,7 +261,7 @@ macro_rules! mbb_put_field {
     // `.as_str_lossy().into_owned()`.
     (@put $self:expr, $field:ident, String, $value:expr, $name:expr) => {
         if let EpicsValue::String(v) = $value {
-            $self.$field = v.as_str_lossy().into_owned();
+            $self.$field = v;
         } else {
             return Err(CaError::TypeMismatch($name.into()));
         }
@@ -630,10 +630,10 @@ impl Record for MbbiRecord {
         ))
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }

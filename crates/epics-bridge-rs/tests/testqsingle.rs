@@ -244,12 +244,12 @@ async fn dollar_modifier_serves_string_field_as_its_char_image() {
 
     // Search must answer for the `$`-modified channel name.
     assert!(
-        provider.channel_find("TEST:str.VAL$").await,
+        provider.channel_find(b"TEST:str.VAL$").await,
         "`REC.VAL$` must resolve at search"
     );
 
     let any = provider
-        .create_channel_for("TEST:str.VAL$", "u", "h")
+        .create_channel_for(b"TEST:str.VAL$", "u", "h")
         .await
         .expect("`REC.VAL$` must resolve through the `$` modifier");
     let ch = match any {
@@ -258,7 +258,7 @@ async fn dollar_modifier_serves_string_field_as_its_char_image() {
     };
 
     // Resolved field drops the `$`; the channel serves the string view.
-    assert_eq!(ch.record_name(), "TEST:str");
+    assert_eq!(ch.record_name(), b"TEST:str");
     assert_eq!(ch.field(), "VAL");
     assert_eq!(ch.nt_type(), NtType::Dollar(PvaDollar::Chars));
 
@@ -299,7 +299,11 @@ async fn a_cached_dollar_channel_keeps_the_view_of_its_name() {
     let build = |name: &'static str| {
         let provider = provider.clone();
         async move {
-            match provider.create_channel_for(name, "u", "h").await.unwrap() {
+            match provider
+                .create_channel_for(name.as_bytes(), "u", "h")
+                .await
+                .unwrap()
+            {
                 epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
                 _ => panic!("expected single-record channel"),
             }
@@ -354,7 +358,7 @@ async fn dollar_modifier_serves_link_field_as_string() {
     let provider = Arc::new(BridgeProvider::new(db.clone()));
 
     let any = provider
-        .create_channel_for("TEST:lnk.FLNK$", "u", "h")
+        .create_channel_for(b"TEST:lnk.FLNK$", "u", "h")
         .await
         .expect("`REC.FLNK$` must resolve the link as a char-array string view");
     let ch = match any {
@@ -392,7 +396,7 @@ async fn dollar_modifier_with_filter_suffix_resolves() {
     let provider = Arc::new(BridgeProvider::new(db.clone()));
 
     let any = provider
-        .create_channel_for(r#"TEST:fstr.VAL${"dbnd":{"d":0.5}}"#, "u", "h")
+        .create_channel_for(br#"TEST:fstr.VAL${"dbnd":{"d":0.5}}"#, "u", "h")
         .await
         .expect("`$` combined with a filter suffix must resolve");
     let ch = match any {
@@ -421,7 +425,9 @@ async fn dollar_modifier_on_non_string_field_rejects_channel() {
         .unwrap();
     let provider = Arc::new(BridgeProvider::new(db.clone()));
 
-    let result = provider.create_channel_for("TEST:num.VAL$", "u", "h").await;
+    let result = provider
+        .create_channel_for(b"TEST:num.VAL$", "u", "h")
+        .await;
     assert!(
         result.is_err(),
         "`$` on a numeric DBF_DOUBLE field must reject the channel \
@@ -481,7 +487,7 @@ fn channel_name_matches_record() {
         NtType::Scalar,
         DbFieldType::Double,
     );
-    assert_eq!(ch.channel_name(), "TEST:abc");
+    assert_eq!(ch.channel_name(), b"TEST:abc");
 
     let ch_field = BridgeChannel::from_cached(
         db,
@@ -491,8 +497,8 @@ fn channel_name_matches_record() {
         NtType::Scalar,
         DbFieldType::String,
     );
-    assert_eq!(ch_field.channel_name(), "TEST:abc.DESC");
-    assert_eq!(ch_field.record_name(), "TEST:abc");
+    assert_eq!(ch_field.channel_name(), b"TEST:abc.DESC");
+    assert_eq!(ch_field.record_name(), b"TEST:abc");
     assert_eq!(ch_field.field(), "DESC");
 }
 
@@ -514,7 +520,7 @@ async fn channel_filter_suffix_strips_before_resolution() {
     let provider = Arc::new(BridgeProvider::new(db.clone()));
 
     let any = provider
-        .create_channel_for(r#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#, "u", "h")
+        .create_channel_for(br#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#, "u", "h")
         .await
         .expect("filtered channel must resolve through split_channel_name");
     let ch = match any {
@@ -523,9 +529,9 @@ async fn channel_filter_suffix_strips_before_resolution() {
     };
 
     // The full client identity is preserved (used by ACF and error msgs).
-    assert_eq!(ch.channel_name(), r#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#);
+    assert_eq!(ch.channel_name(), br#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#);
     // Record / field resolution uses the un-suffixed form.
-    assert_eq!(ch.record_name(), "TEST:filt_ai");
+    assert_eq!(ch.record_name(), b"TEST:filt_ai");
     assert_eq!(ch.field(), "VAL");
 
     // GET works against the resolved record despite the filter suffix.
@@ -566,7 +572,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
 
     // `arr` slice [1..=3] over the 5-element seed selects 20,30,40.
     let any = provider
-        .create_channel_for(r#"TEST:filt_wf.VAL{"arr":{"s":1,"e":3}}"#, "u", "h")
+        .create_channel_for(br#"TEST:filt_wf.VAL{"arr":{"s":1,"e":3}}"#, "u", "h")
         .await
         .expect("filtered channel resolves");
     let ch = match any {
@@ -593,7 +599,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     // The monitor event on the same filtered channel, from `qsrvSingle`,
     // carries the identical slice.
     let mut mon = epics_pva_rs::server::PvDatabaseSource::new(db.clone())
-        .subscribe(r#"TEST:filt_wf.VAL{"arr":{"s":1,"e":3}}"#)
+        .subscribe(br#"TEST:filt_wf.VAL{"arr":{"s":1,"e":3}}"#)
         .await
         .expect("monitor");
     {
@@ -675,14 +681,14 @@ async fn legacy_array_range_modifier_resolves_and_slices() {
     // `[start:end]` → arr slice [1..=3] over the 5-element seed.
     let ch = single(
         provider
-            .create_channel_for("TEST:rng_wf.VAL[1:3]", "u", "h")
+            .create_channel_for(b"TEST:rng_wf.VAL[1:3]", "u", "h")
             .await
             .expect("`[1:3]` range must resolve through split_channel_name"),
     );
     // Resolution uses the un-suffixed record/field; the full client
     // identity is preserved for ACF / error messages.
-    assert_eq!(ch.channel_name(), "TEST:rng_wf.VAL[1:3]");
-    assert_eq!(ch.record_name(), "TEST:rng_wf");
+    assert_eq!(ch.channel_name(), b"TEST:rng_wf.VAL[1:3]");
+    assert_eq!(ch.record_name(), b"TEST:rng_wf");
     assert_eq!(ch.field(), "VAL");
     let g = ch
         .get(&empty_request())
@@ -698,7 +704,7 @@ async fn legacy_array_range_modifier_resolves_and_slices() {
     // softIocPVX 1.5.3 serves `W.VAL[2]` over `[1,2,3]` as `int32_t = 3`.
     let ch1 = single(
         provider
-            .create_channel_for("TEST:rng_wf.VAL[2]", "u", "h")
+            .create_channel_for(b"TEST:rng_wf.VAL[2]", "u", "h")
             .await
             .expect("`[2]` range resolves"),
     );
@@ -711,7 +717,7 @@ async fn legacy_array_range_modifier_resolves_and_slices() {
     // `[start:incr:end]` strides the slice.
     let ch2 = single(
         provider
-            .create_channel_for("TEST:rng_wf.VAL[0:2:4]", "u", "h")
+            .create_channel_for(b"TEST:rng_wf.VAL[0:2:4]", "u", "h")
             .await
             .expect("`[0:2:4]` range resolves"),
     );
@@ -738,7 +744,7 @@ async fn channel_with_field_suffix_binds_to_field() {
 
     let provider = Arc::new(BridgeProvider::new(db.clone()));
     let any = provider
-        .create_channel_for("TEST:fld_ai.EGU", "u", "h")
+        .create_channel_for(b"TEST:fld_ai.EGU", "u", "h")
         .await
         .expect("create_channel");
     let ch = match any {
@@ -746,7 +752,7 @@ async fn channel_with_field_suffix_binds_to_field() {
         _ => panic!("expected single-record channel"),
     };
 
-    assert_eq!(ch.channel_name(), "TEST:fld_ai.EGU");
+    assert_eq!(ch.channel_name(), b"TEST:fld_ai.EGU");
 
     // GET returns EGU string, not VAL double.
     let result = ch.get(&empty_request()).await.expect("get EGU");
@@ -798,7 +804,7 @@ async fn lso_long_string_put_len(sizv: u16) -> f64 {
         .build()
         .await
         .unwrap();
-    let ch = BridgeChannel::new(db.clone(), "LS:O").await.expect("new");
+    let ch = BridgeChannel::new(db.clone(), b"LS:O").await.expect("new");
     let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
     put.fields.push((
         "value".into(),
@@ -832,7 +838,7 @@ async fn lsi_long_string_get_put_round_trips_as_string() {
 
     // `BridgeChannel::new` classifies the channel from the field.s
     // `FieldDesc::long_string` declaration.
-    let ch = BridgeChannel::new(db.clone(), "TEST:lsi")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:lsi")
         .await
         .expect("new");
     assert_eq!(ch.nt_type(), NtType::LongString);
@@ -910,7 +916,9 @@ async fn common_field_descriptor_matches_value_type() {
     ];
 
     for (name, expected) in cases {
-        let ch = BridgeChannel::new(db.clone(), name).await.expect("new");
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect("new");
 
         let desc = ch.get_field().await.expect("get_field");
         let desc_ty = match &desc {
@@ -964,7 +972,7 @@ async fn non_val_enum_field_is_ntenum() {
         .unwrap();
 
     // `.SCAN` is a DBF_MENU/ENUM common field → NTEnum.
-    let scan = BridgeChannel::new(db.clone(), "TEST:ai.SCAN")
+    let scan = BridgeChannel::new(db.clone(), b"TEST:ai.SCAN")
         .await
         .expect("new");
     assert_eq!(scan.nt_type(), NtType::Enum, ".SCAN must be NTEnum");
@@ -997,7 +1005,7 @@ async fn non_val_enum_field_is_ntenum() {
     }
 
     // A non-VAL scalar common field is NOT promoted — it stays NTScalar.
-    let desc = BridgeChannel::new(db.clone(), "TEST:ai.DESC")
+    let desc = BridgeChannel::new(db.clone(), b"TEST:ai.DESC")
         .await
         .expect("new");
     assert_eq!(desc.nt_type(), NtType::Scalar, ".DESC must stay NTScalar");
@@ -1025,7 +1033,7 @@ use epics_bridge_rs::qsrv::{AccessContext, AccessControl, ClientCreds, WriteGran
 #[derive(Clone, Debug)]
 struct CapturedTrap {
     op: TrapWriteOp,
-    pv_name: String,
+    pv_name: Vec<u8>,
     user: Vec<u8>,
     host: Vec<u8>,
     value_str: String,
@@ -1042,7 +1050,7 @@ struct TrapStub {
 }
 #[async_trait::async_trait]
 impl AccessControl for TrapStub {
-    async fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
+    async fn write_grant(&self, _channel: &[u8], _creds: &ClientCreds) -> WriteGrant {
         WriteGrant {
             allowed: true,
             rule_was_trap: self.rule_was_trap,
@@ -1058,12 +1066,12 @@ fn capture_listener_for(
     sink: Arc<Mutex<Vec<CapturedTrap>>>,
 ) -> TrapWriteListenerHandle {
     register_trap_write_listener(Arc::new(move |msg: &TrapWriteMessage<'_>| {
-        if msg.pv_name != pv {
+        if msg.pv_name != pv.as_bytes() {
             return;
         }
         sink.lock().unwrap().push(CapturedTrap {
             op: msg.op,
-            pv_name: msg.pv_name.to_string(),
+            pv_name: msg.pv_name.to_vec(),
             user: msg.user.to_vec(),
             host: msg.host.to_vec(),
             value_str: msg.value_str.to_string(),
@@ -1118,7 +1126,7 @@ async fn trapped_single_put_emits_before_after_astrapwrite() {
         "the Before/After pair shares one event id"
     );
     for e in [before, after] {
-        assert_eq!(e.pv_name, "TEST:trap_li.VAL");
+        assert_eq!(e.pv_name, b"TEST:trap_li.VAL");
         assert_eq!(e.user, b"operator");
         assert_eq!(e.host, b"host.acme");
         assert_eq!(e.value_str, "42");
@@ -1182,7 +1190,7 @@ async fn denied_single_put_emits_nothing() {
     struct DenyAll;
     #[async_trait::async_trait]
     impl AccessControl for DenyAll {
-        async fn can_write(&self, _: &str, _: &[u8], _: &str) -> bool {
+        async fn can_write(&self, _: &[u8], _: &[u8], _: &str) -> bool {
             false
         }
     }
@@ -1302,7 +1310,7 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
         .await
         .expect("seed");
 
-    let ch = BridgeChannel::new(db.clone(), "TEST:lstr")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:lstr")
         .await
         .expect("new");
     assert_eq!(
@@ -1372,7 +1380,7 @@ async fn r17_31_char_waveform_without_qform_stays_a_byte_array() {
         .await
         .expect("seed");
 
-    let ch = BridgeChannel::new(db.clone(), "TEST:bytes")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:bytes")
         .await
         .expect("new");
     assert_eq!(ch.nt_type(), NtType::ScalarArray);
@@ -1466,7 +1474,7 @@ async fn a_one_element_array_field_is_a_scalar_channel() {
     .await
     .unwrap();
 
-    let one = BridgeChannel::new(db.clone(), "TEST:one")
+    let one = BridgeChannel::new(db.clone(), b"TEST:one")
         .await
         .expect("new");
     assert_eq!(
@@ -1492,7 +1500,7 @@ async fn a_one_element_array_field_is_a_scalar_channel() {
         &PvField::Scalar(ScalarValue::Double(6.25))
     );
 
-    let two = BridgeChannel::new(db.clone(), "TEST:two")
+    let two = BridgeChannel::new(db.clone(), b"TEST:two")
         .await
         .expect("new");
     assert_eq!(two.nt_type(), NtType::ScalarArray, "NELM=2 keeps arrayOf()");
@@ -1513,7 +1521,7 @@ async fn a_one_element_string_array_field_serves_and_takes_a_string_scalar() {
     .await
     .unwrap();
 
-    let ch = BridgeChannel::new(db.clone(), "TEST:s1")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:s1")
         .await
         .expect("new");
     assert_eq!(ch.nt_type(), NtType::Scalar);
@@ -1550,7 +1558,7 @@ async fn q_form_string_needs_the_array_half_too() {
         rec.write().set_info("Q:form", "String");
     }
 
-    let ch = BridgeChannel::new(db.clone(), "TEST:c1")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:c1")
         .await
         .expect("new");
     assert_eq!(
@@ -1577,7 +1585,7 @@ async fn a_scalar_put_reaches_an_array_only_destination() {
         .await
         .unwrap();
 
-    let ch = BridgeChannel::new(db.clone(), "TEST:h1")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:h1")
         .await
         .expect("new");
     assert_eq!(ch.nt_type(), NtType::Scalar, "NELM=1 histogram VAL");
@@ -1606,7 +1614,7 @@ async fn a_one_character_long_string_stays_a_long_string() {
         .await
         .unwrap();
 
-    let ch = BridgeChannel::new(db.clone(), "TEST:ls1")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:ls1")
         .await
         .expect("new");
     assert_eq!(ch.nt_type(), NtType::LongString);
@@ -1636,7 +1644,7 @@ async fn a_dollar_put_is_bounded_by_sizv_not_40() {
     let mut li = LsiRecord::default();
     li.sizv = 50;
     db.add_record("TEST:li", Box::new(li)).await.unwrap();
-    let ch = BridgeChannel::new(db.clone(), "TEST:li.VAL$")
+    let ch = BridgeChannel::new(db.clone(), b"TEST:li.VAL$")
         .await
         .expect("new");
     let mut image: Vec<u8> = (b'a'..=b'z').chain(b'A'..=b'S').collect();
@@ -1663,7 +1671,7 @@ async fn monitor_values(
 ) -> Vec<PvField> {
     use epics_pva_rs::server_native::source::ChannelSource;
     let mut mon = epics_pva_rs::server::PvDatabaseSource::new(db.clone())
-        .subscribe(name)
+        .subscribe(name.as_bytes())
         .await
         .expect("monitor");
     let mut seen = Vec::new();
@@ -1698,8 +1706,8 @@ async fn lso_long_string_monitor_posts_the_text() {
         .build()
         .await
         .unwrap();
-    let val = BridgeChannel::new(db.clone(), "LS64").await.expect("VAL");
-    let writer = BridgeChannel::new(db.clone(), "LS64")
+    let val = BridgeChannel::new(db.clone(), b"LS64").await.expect("VAL");
+    let writer = BridgeChannel::new(db.clone(), b"LS64")
         .await
         .expect("writer");
     let put = async move {
@@ -1739,7 +1747,9 @@ async fn dollar_db() -> Arc<PvDatabase> {
 }
 
 async fn dollar_put(db: &Arc<PvDatabase>, name: &str, value: PvField) {
-    let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+    let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+        .await
+        .expect(name);
     let mut put = PvStructure::new("structure");
     put.fields.push(("value".into(), value));
     ch.put(&put).await.expect("put");
@@ -1776,7 +1786,9 @@ async fn a_dollar_get_serves_what_softiocpvx_serves() {
         ("LZ:C.INPA$", text("LZ:J NPP NMS")),
     ];
     for (name, want) in cases {
-        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect(name);
         let got = ch.get(&empty_request()).await.expect("get");
         assert_eq!(extract_value(&got), Some(&want), "{name}");
     }
@@ -1819,7 +1831,9 @@ async fn a_dollar_char_put_is_a_dbr_char_put() {
     for (put, t, image) in [(&b"hi\0"[..], "hi", &b"hi\0"[..]), (b"jk", "jk", b"jk\0")] {
         dollar_put(&db, "LZ:O.VAL$", chars(put)).await;
         for (name, want) in [("LZ:O", text(t)), ("LZ:O.VAL$", chars(image))] {
-            let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+            let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+                .await
+                .expect(name);
             let got = ch.get(&empty_request()).await.expect("get");
             assert_eq!(extract_value(&got), Some(&want), "{name}");
         }
@@ -1853,7 +1867,9 @@ async fn a_dollar_arr_slice_serves_what_softiocpvx_serves() {
         (r#"FS.VAL${"arr":{"s":2,"e":5}}"#, chars(b"llo\0")),
     ];
     for (name, want) in cases {
-        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect(name);
         let got = ch.get(&empty_request()).await.expect("get");
         assert_eq!(extract_value(&got), Some(&want), "{name}");
     }
@@ -1890,7 +1906,9 @@ async fn a_one_element_arr_slice_serves_what_softiocpvx_serves() {
         (r#"W.VAL{"arr":{"s":1,"e":1}}"#, ScalarValue::Int(2)),
     ];
     for (name, want) in cases {
-        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect(name);
         let epics_pva_rs::pvdata::FieldDesc::Structure { fields, .. } =
             ch.get_field().await.expect("get_field")
         else {
@@ -1937,7 +1955,9 @@ async fn a_dollar_link_arr_slice_serves_what_softiocpvx_serves() {
         (r#"FS.RTYP${"arr":{"s":0,"e":0}}"#, byte(0)),
     ];
     for (name, want) in cases {
-        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect(name);
         let got = ch.get(&empty_request()).await.expect("get");
         assert_eq!(extract_value(&got), Some(&want), "{name}");
     }

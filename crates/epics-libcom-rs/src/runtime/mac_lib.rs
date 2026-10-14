@@ -45,9 +45,13 @@ pub struct MacroExpandOptions {
 /// the other one's broken text as success; that is not hypothetical, it
 /// is what the autosave `.req` reader did for as long as `undefined`
 /// was `pub`.
+///
+/// `T` is the text's type: `String` for a caller that handed in text,
+/// `Vec<u8>` for one that handed in bytes ([`MacroTable::expand_bytes_deferred`]),
+/// because C's macLib is a byte engine and a `.db` file is bytes.
 #[derive(Clone, Debug, Default)]
-pub struct MacroExpansion {
-    pub text: String,
+pub struct MacroExpansion<T = String> {
+    pub text: T,
     faults: MacroFaults,
 }
 
@@ -103,7 +107,7 @@ pub enum MacroFault<'a> {
     Unterminated(&'a str),
 }
 
-impl MacroExpansion {
+impl<T> MacroExpansion<T> {
     /// The single owner of "did this expansion come out wrong, and
     /// why". Every arm is read here so that no caller can read only
     /// some of them.
@@ -221,15 +225,15 @@ impl MacroFaults {
 #[derive(Clone, Debug)]
 struct MacEntry {
     /// C `entry->name`. The scope markers carry the literal `<scope>`.
-    name: String,
+    name: Vec<u8>,
     /// C `entry->type` — one of the `KIND_*` constants above.
     kind: &'static str,
     /// C `entry->rawval`: the definition exactly as given.
-    rawval: String,
+    rawval: Vec<u8>,
     /// C `entry->value`: the definition with its own references
     /// resolved. `None` until [`expand_table`] fills it, and set back to
     /// `None` by any redefinition of this entry.
-    value: Option<String>,
+    value: Option<Vec<u8>>,
     /// C `entry->error`, as the causes that raised it — see
     /// [`TableFault`]. Reset at the top of every [`expand_table`] pass,
     /// exactly where C resets the bool (`macCore.c:670`).
@@ -264,8 +268,9 @@ struct MacEntry {
 /// the notices reproducible from run to run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MacroDefs {
-    /// Name/value pairs in definition order, at most one entry per name.
-    defs: Vec<(String, String)>,
+    /// Name/value pairs in definition order, at most one entry per name —
+    /// bytes, as C's `macPutValue` takes them.
+    defs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl MacroDefs {
@@ -279,7 +284,7 @@ impl MacroDefs {
     /// value and keeps the entry where it is, because `rawval` writes
     /// through the entry `lookup` found rather than appending a second
     /// one.
-    pub fn put(&mut self, name: impl Into<String>, value: impl Into<String>) {
+    pub fn put(&mut self, name: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
         let name = name.into();
         match self.defs.iter_mut().find(|(n, _)| *n == name) {
             Some(slot) => slot.1 = value.into(),
@@ -288,8 +293,8 @@ impl MacroDefs {
     }
 
     /// The definitions in order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.defs.iter().map(|(n, v)| (n.as_str(), v.as_str()))
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.defs.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))
     }
 
     /// How many names are defined.
@@ -342,6 +347,21 @@ impl From<&HashMap<String, String>> for MacroDefs {
             .into_iter()
             .map(|name| (name.clone(), macros[name].clone()))
             .collect()
+    }
+}
+
+impl MacroDefs {
+    /// [`From<&HashMap<String, String>>`]'s rule over byte definitions.
+    /// Not a `From`: a second map impl would leave every `&HashMap::new()`
+    /// argument without an inferable type.
+    pub fn from_byte_map(macros: &HashMap<Vec<u8>, Vec<u8>>) -> Self {
+        let mut names: Vec<&Vec<u8>> = macros.keys().collect();
+        names.sort_unstable();
+        let mut defs = Self::new();
+        for name in names {
+            defs.put(name.clone(), macros[name].clone());
+        }
+        defs
     }
 }
 
@@ -440,21 +460,41 @@ impl MacroTable {
     /// lexer expands and reports one line as it reads it.
     #[must_use]
     pub fn expand_deferred(&mut self, src: &str) -> (MacroExpansion, Vec<String>) {
+        let (expansion, notices) = self.expand_bytes_deferred(src.as_bytes());
+        let text = match String::from_utf8(expansion.text) {
+            Ok(text) => text,
+            // Only a byte value can get here — an environment value or a
+            // `.db` `substitute` — and a text caller reads it as text.
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        (
+            MacroExpansion {
+                text,
+                faults: expansion.faults,
+            },
+            notices,
+        )
+    }
+
+    /// [`Self::expand_deferred`] over bytes, which is what C's engine
+    /// translates: a `.db` line is whatever `fgets` read, and a record
+    /// name in it need not be UTF-8.
+    #[must_use]
+    pub fn expand_bytes_deferred(&mut self, src: &[u8]) -> (MacroExpansion<Vec<u8>>, Vec<String>) {
         let suppressed = self.opts.suppress_warnings;
         let mut ctx = ExpandCtx {
             table: self,
             seat: Seat {
                 kind: KIND_STRING,
-                name: src.to_string(),
+                name: String::from_utf8_lossy(src).into_owned(),
                 faults: MacroFaults::default(),
             },
             suppressed,
             notices: Vec::new(),
         };
         expand_table(&mut ctx);
-        let chars: Vec<char> = src.chars().collect();
-        let mut out = String::with_capacity(src.len());
-        trans(&chars, 0, &mut ctx, &mut out);
+        let mut out = Vec::with_capacity(src.len());
+        trans(src, 0, &mut ctx, &mut out);
         (
             MacroExpansion {
                 text: out,
@@ -473,8 +513,8 @@ impl MacroTable {
     /// bytes `macParseDefns` cut out (`macUtil.c:250-275`) — so a
     /// definition that mentions another macro stays live and follows
     /// whatever that macro is when it is finally read.
-    pub fn define(&mut self, name: &str, rawval: String) {
-        self.put(name, KIND_MACRO, rawval);
+    pub fn define(&mut self, name: impl AsRef<[u8]>, rawval: impl Into<Vec<u8>>) {
+        self.put(name.as_ref(), KIND_MACRO, rawval.into());
     }
 
     /// C `macPutValue( handle, name, NULL )` (`macCore.c:274-280`): the
@@ -485,8 +525,8 @@ impl MacroTable {
     /// Deleting is not the same as defining nothing: an OUTER definition
     /// of the same name is uncovered by it, and a reference that finds
     /// nothing at all is undefined rather than empty.
-    pub fn undefine(&mut self, name: &str) {
-        let Some(idx) = self.lookup(name) else {
+    pub fn undefine(&mut self, name: impl AsRef<[u8]>) {
+        let Some(idx) = self.lookup(name.as_ref()) else {
             return;
         };
         self.entries.remove(idx);
@@ -496,7 +536,7 @@ impl MacroTable {
     /// C `lookup( handle, name, FALSE )` (`macCore.c:571-585`): search
     /// backwards "so scoping works" — the newest definition of a name
     /// wins — and never match a scope marker.
-    fn lookup(&self, name: &str) -> Option<usize> {
+    fn lookup(&self, name: &[u8]) -> Option<usize> {
         self.entries
             .iter()
             .rposition(|e| !e.special && e.name == name)
@@ -511,14 +551,14 @@ impl MacroTable {
     /// hit dirties the table: the entry arrives with no cached value, so
     /// every reference after it in the same string resolves from raw
     /// values until the next expansion pass.
-    fn lookup_or_env(&mut self, name: &str) -> Option<usize> {
+    fn lookup_or_env(&mut self, name: &[u8]) -> Option<usize> {
         if let Some(i) = self.lookup(name) {
             return Some(i);
         }
         if !self.opts.env_fallback || name.is_empty() {
             return None;
         }
-        let value = crate::runtime::env::get_lossy(name)?;
+        let value = env_bytes(name)?;
         Some(self.put(name, KIND_ENVIRONMENT, value))
     }
 
@@ -531,14 +571,14 @@ impl MacroTable {
     /// Either way the whole table goes dirty, because any other entry
     /// may reference this one and no cached value can be trusted until
     /// they are all rebuilt.
-    fn put(&mut self, name: &str, kind: &'static str, rawval: String) -> usize {
+    fn put(&mut self, name: &[u8], kind: &'static str, rawval: Vec<u8>) -> usize {
         let idx = match self.lookup(name) {
             Some(i) if self.entries[i].level >= self.level => i,
             _ => {
                 self.entries.push(MacEntry {
-                    name: name.to_string(),
+                    name: name.to_vec(),
                     kind,
-                    rawval: String::new(),
+                    rawval: Vec::new(),
                     value: None,
                     faults: MacroFaults::default(),
                     visited: false,
@@ -562,9 +602,9 @@ impl MacroTable {
     fn push_scope(&mut self) {
         self.level += 1;
         self.entries.push(MacEntry {
-            name: String::from("<scope>"),
+            name: b"<scope>".to_vec(),
             kind: KIND_SCOPE_MARKER,
-            rawval: String::new(),
+            rawval: Vec::new(),
             value: None,
             faults: MacroFaults::default(),
             visited: false,
@@ -591,6 +631,21 @@ impl MacroTable {
         self.entries.truncate(at);
         self.level -= 1;
         self.dirty = true;
+    }
+}
+
+/// C `getenv( name )` for [`MacroTable::lookup_or_env`]: the name and the
+/// value are both the bytes C hands around.
+fn env_bytes(name: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        crate::runtime::env::get(std::ffi::OsStr::from_bytes(name)).map(OsStringExt::into_vec)
+    }
+    #[cfg(not(unix))]
+    {
+        let value = crate::runtime::env::get(std::str::from_utf8(name).ok()?)?;
+        Some(value.into_string().ok()?.into_bytes())
     }
 }
 
@@ -721,13 +776,13 @@ fn expand_table(ctx: &mut ExpandCtx) {
             i += 1;
             continue;
         }
-        let raw: Vec<char> = ctx.table.entries[i].rawval.chars().collect();
+        let raw = ctx.table.entries[i].rawval.clone();
         let seat = Seat {
             kind: ctx.table.entries[i].kind,
-            name: ctx.table.entries[i].name.clone(),
+            name: String::from_utf8_lossy(&ctx.table.entries[i].name).into_owned(),
             faults: MacroFaults::default(),
         };
-        let mut value = String::new();
+        let mut value = Vec::new();
         // C starts at level 1 "so quotes and escapes will be removed
         // from expanded value" (`macCore.c:672-673`) — a cached value is
         // never the user's own text.
@@ -841,11 +896,11 @@ pub fn substitute_macros_per_line(input: &str, macros: impl Into<MacroDefs>) -> 
 /// built — runs one deeper, which is what decides whether quotes and
 /// backslashes are syntax or text. Scopes and the recursion guard live
 /// in [`ExpandCtx::table`].
-fn trans(chars: &[char], level: usize, ctx: &mut ExpandCtx, out: &mut String) {
+fn trans(chars: &[u8], level: usize, ctx: &mut ExpandCtx, out: &mut Vec<u8>) {
     // C `macCore.c:701-703`: "discard quotes and escapes if level is > 0
     // (i.e. if these aren't the user's quotes and escapes)".
     let discard = level > 0;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<u8> = None;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -859,7 +914,7 @@ fn trans(chars: &[char], level: usize, ctx: &mut ExpandCtx, out: &mut String) {
                     continue;
                 }
             }
-        } else if c == '"' || c == '\'' {
+        } else if c == b'"' || c == b'\'' {
             quote = Some(c);
             if discard {
                 i += 1;
@@ -868,17 +923,18 @@ fn trans(chars: &[char], level: usize, ctx: &mut ExpandCtx, out: &mut String) {
         }
 
         // `$$` → literal `$` (opt-in; autosave `.req` convenience).
-        if ctx.table.opts.dollar_escape && c == '$' && i + 1 < chars.len() && chars[i + 1] == '$' {
-            out.push('$');
+        if ctx.table.opts.dollar_escape && c == b'$' && i + 1 < chars.len() && chars[i + 1] == b'$'
+        {
+            out.push(b'$');
             i += 2;
             continue;
         }
 
         // `\<char>`: skip macro detection; the backslash itself is
         // emitted only at level 0 (C `if (v < valend && !discard)`).
-        if c == '\\' && i + 1 < chars.len() {
+        if c == b'\\' && i + 1 < chars.len() {
             if !discard {
-                out.push('\\');
+                out.push(b'\\');
             }
             out.push(chars[i + 1]);
             i += 2;
@@ -888,8 +944,8 @@ fn trans(chars: &[char], level: usize, ctx: &mut ExpandCtx, out: &mut String) {
         // Macro reference: `$` followed by `(` or `{`, and NOT inside
         // single quotes (C `macRef && quote != '\''`).
         let mac_ref =
-            c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
-        if mac_ref && quote != Some('\'') {
+            c == b'$' && i + 1 < chars.len() && (chars[i + 1] == b'(' || chars[i + 1] == b'{');
+        if mac_ref && quote != Some(b'\'') {
             i = refer(chars, i, level, ctx, out);
             continue;
         }
@@ -906,24 +962,25 @@ fn trans(chars: &[char], level: usize, ctx: &mut ExpandCtx, out: &mut String) {
 /// `macCore.c:862-875`). `None` is never returned: every `$(`/`${` the
 /// caller hands over is consumed here, terminated or not.
 fn refer(
-    chars: &[char],
+    chars: &[u8],
     start: usize,
     level: usize,
     ctx: &mut ExpandCtx,
-    out: &mut String,
+    out: &mut Vec<u8>,
 ) -> usize {
-    let close = if chars[start + 1] == '(' { ')' } else { '}' };
+    let close = if chars[start + 1] == b'(' { b')' } else { b'}' };
     // Find the matching close bracket, honoring nested `$(`/`${`.
     let body_start = start + 2;
     let mut depth = 1usize;
     let mut j = body_start;
     while j < chars.len() && depth > 0 {
-        if j + 1 < chars.len() && chars[j] == '$' && (chars[j + 1] == '(' || chars[j + 1] == '{') {
+        if j + 1 < chars.len() && chars[j] == b'$' && (chars[j + 1] == b'(' || chars[j + 1] == b'{')
+        {
             depth += 1;
             j += 2;
             continue;
         }
-        if depth == 1 && chars[j] == close || depth > 1 && (chars[j] == ')' || chars[j] == '}') {
+        if depth == 1 && chars[j] == close || depth > 1 && (chars[j] == b')' || chars[j] == b'}') {
             depth -= 1;
             if depth == 0 {
                 break;
@@ -957,10 +1014,10 @@ fn refer(
         // leaves the table dirty afterwards and this does not, so C may
         // re-expand — and re-announce — a faulty macro value that this
         // announces once.
-        let verbatim: String = chars[start..].iter().collect();
-        ctx.seat
-            .faults
-            .raise(TableFault::Unterminated(verbatim.clone()));
+        let verbatim = &chars[start..];
+        ctx.seat.faults.raise(TableFault::Unterminated(
+            String::from_utf8_lossy(verbatim).into_owned(),
+        ));
         if !ctx.suppressed {
             // C's third `macLib:` notice, alongside `undefined` and
             // `recursive` below and painted by the same `ANSI_MAGENTA`
@@ -979,7 +1036,7 @@ fn refer(
                 ctx.seat.kind, ctx.seat.name
             ));
         }
-        out.push_str(&verbatim);
+        out.extend_from_slice(verbatim);
         return chars.len();
     }
     let body = &chars[body_start..j];
@@ -1000,14 +1057,16 @@ fn refer(
     // unresolved inner reference leaves in the name is the SHORT `$(X)`
     // form and no notice is written for it. The fault still lands,
     // because C hands the name translation the caller's own seat.
-    let mut name = String::new();
+    let mut name = Vec::new();
     ctx.suppressing(|ctx| trans(name_chars, level + 1, ctx, &mut name));
+    // What a notice or a fault prints; the lookup keeps the bytes.
+    let shown = String::from_utf8_lossy(&name).into_owned();
 
     // Default value (`=...`) and scoped definitions (`,k=v`).
-    let mut default: Option<&[char]> = None;
-    let mut scoped: Option<&[char]> = None;
+    let mut default: Option<&[u8]> = None;
+    let mut scoped: Option<&[u8]> = None;
     if let Some(first) = rest.first() {
-        if *first == '=' {
+        if *first == b'=' {
             // Default runs until the first top-level `,` or end.
             let dflt = &rest[1..];
             match top_level_comma(dflt) {
@@ -1017,7 +1076,7 @@ fn refer(
                 }
                 None => default = Some(dflt),
             }
-        } else if *first == ',' {
+        } else if *first == b',' {
             scoped = Some(rest);
         }
     }
@@ -1037,7 +1096,7 @@ fn refer(
     let pop = scoped.is_some();
     if let Some(defs) = scoped {
         ctx.table.push_scope();
-        parse_scoped(defs, level, ctx, &name);
+        parse_scoped(defs, level, ctx, &shown);
     }
 
     match ctx.table.lookup_or_env(&name) {
@@ -1057,7 +1116,7 @@ fn refer(
                 // notice reads `macro A is recursive (expanding macro
                 // B)`, which is what `softIoc R7.0.10` writes.
                 let refkind = ctx.table.entries[idx].kind;
-                ctx.seat.faults.raise(TableFault::Recursive(name.clone()));
+                ctx.seat.faults.raise(TableFault::Recursive(shown.clone()));
                 if !ctx.suppressed {
                     let recursive = if crate::runtime::log::errlog_console_paints() {
                         "\x1b[35;1mrecursive\x1b[0m"
@@ -1065,26 +1124,25 @@ fn refer(
                         "recursive"
                     };
                     ctx.notices.push(format!(
-                        "macLib: {} {} is {recursive} (expanding {refkind} {name})\n",
+                        "macLib: {} {} is {recursive} (expanding {refkind} {shown})\n",
                         ctx.seat.kind, ctx.seat.name
                     ));
                 }
-                out.push('$');
-                out.push('(');
-                out.push_str(&name);
+                out.extend_from_slice(b"$(");
+                out.extend_from_slice(&name);
                 // Same knob, same two texts as the undefined arm
                 // (`macCore.c:920-928`).
                 if ctx.suppressed {
-                    out.push(')');
+                    out.push(b')');
                 } else {
-                    out.push_str(",recursive)");
+                    out.extend_from_slice(b",recursive)");
                 }
             } else if ctx.table.dirty {
                 // No cached value can be trusted, so translate the raw
                 // one under the CALLER's seat — C passes `entry`, not
                 // `refentry` (`macCore.c:890`) — with the entry's
                 // `visited` guard raised around it.
-                let raw: Vec<char> = ctx.table.entries[idx].rawval.chars().collect();
+                let raw = ctx.table.entries[idx].rawval.clone();
                 ctx.table.entries[idx].visited = true;
                 trans(&raw, level + 1, ctx, out);
                 ctx.table.entries[idx].visited = false;
@@ -1099,8 +1157,8 @@ fn refer(
                 let entry = &ctx.table.entries[idx];
                 let value = entry.value.clone().unwrap_or_default();
                 let mut faults = entry.faults.clone();
-                faults.rename_recursive(&name);
-                out.push_str(&value);
+                faults.rename_recursive(&shown);
+                out.extend_from_slice(&value);
                 ctx.seat.faults.merge(&faults);
             }
         }
@@ -1119,7 +1177,7 @@ fn refer(
                 // errlog strips escapes when its console is not a
                 // terminal (`errlog.c:672-681`) and a direct `fprintf`
                 // never enters that pump.
-                ctx.seat.faults.raise(TableFault::Undefined(name.clone()));
+                ctx.seat.faults.raise(TableFault::Undefined(shown.clone()));
                 if !ctx.suppressed {
                     let undefined = if crate::runtime::log::errlog_console_paints() {
                         "\x1b[35;1mundefined\x1b[0m"
@@ -1127,21 +1185,20 @@ fn refer(
                         "undefined"
                     };
                     ctx.notices.push(format!(
-                        "macLib: macro {name} is {undefined} (expanding {} {})\n",
+                        "macLib: macro {shown} is {undefined} (expanding {} {})\n",
                         ctx.seat.kind, ctx.seat.name
                     ));
                 }
-                out.push('$');
-                out.push('(');
-                out.push_str(&name);
+                out.extend_from_slice(b"$(");
+                out.extend_from_slice(&name);
                 // C writes the bare `)` under suppression and the
                 // `,undefined)` tail otherwise (`macCore.c:920-928`), so
                 // the knob changes the loader's own view of the value and
                 // not just what the operator reads.
                 if ctx.suppressed {
-                    out.push(')');
+                    out.push(b')');
                 } else {
-                    out.push_str(",undefined)");
+                    out.extend_from_slice(b",undefined)");
                 }
             }
         },
@@ -1169,10 +1226,10 @@ fn refer(
 /// a fault in a scoped name or value is neither warned about nor merged
 /// into the enclosing expansion. `refname` is the seat name C uses for
 /// the first half and the definition's own name the seat for the second.
-fn parse_scoped(rest: &[char], level: usize, ctx: &mut ExpandCtx, refname: &str) {
+fn parse_scoped(rest: &[u8], level: usize, ctx: &mut ExpandCtx, refname: &str) {
     let mut k = 0;
     while k < rest.len() {
-        if rest[k] != ',' {
+        if rest[k] != b',' {
             break;
         }
         k += 1; // step over ','
@@ -1182,19 +1239,19 @@ fn parse_scoped(rest: &[char], level: usize, ctx: &mut ExpandCtx, refname: &str)
             Some(t) => (&seg[..t], &seg[t..]),
             None => (seg, &seg[seg.len()..]),
         };
-        let mut sname = String::new();
+        let mut sname = Vec::new();
         ctx.detached(refname.to_string(), |ctx| {
             trans(name_part, level + 1, ctx, &mut sname);
         });
         k += name_part.len();
-        if let Some('=') = tail.first() {
+        if let Some(b'=') = tail.first() {
             let valseg = &tail[1..];
             let (val_part, _) = match top_level_comma(valseg) {
                 Some(t) => (&valseg[..t], &valseg[t..]),
                 None => (valseg, &valseg[valseg.len()..]),
             };
-            let mut sval = String::new();
-            ctx.detached(sname.clone(), |ctx| {
+            let mut sval = Vec::new();
+            ctx.detached(String::from_utf8_lossy(&sname).into_owned(), |ctx| {
                 trans(val_part, level + 1, ctx, &mut sval);
             });
             // C `macPutValue`, which types the new entry `"macro"` even
@@ -1209,19 +1266,19 @@ fn parse_scoped(rest: &[char], level: usize, ctx: &mut ExpandCtx, refname: &str)
 
 /// Index of the first top-level `=` or `,` in `body`, skipping any
 /// `$(...)` / `${...}` nested reference.
-fn top_level_terminator(body: &[char]) -> Option<usize> {
+fn top_level_terminator(body: &[u8]) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = 0;
     while i < body.len() {
         let c = body[i];
-        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
+        if c == b'$' && i + 1 < body.len() && (body[i + 1] == b'(' || body[i + 1] == b'{') {
             depth += 1;
             i += 2;
             continue;
         }
-        if (c == ')' || c == '}') && depth > 0 {
+        if (c == b')' || c == b'}') && depth > 0 {
             depth -= 1;
-        } else if depth == 0 && (c == '=' || c == ',') {
+        } else if depth == 0 && (c == b'=' || c == b',') {
             return Some(i);
         }
         i += 1;
@@ -1231,19 +1288,19 @@ fn top_level_terminator(body: &[char]) -> Option<usize> {
 
 /// Index of the first top-level `,` in `body` (used to split a
 /// default value from trailing scoped definitions).
-fn top_level_comma(body: &[char]) -> Option<usize> {
+fn top_level_comma(body: &[u8]) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = 0;
     while i < body.len() {
         let c = body[i];
-        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
+        if c == b'$' && i + 1 < body.len() && (body[i + 1] == b'(' || body[i + 1] == b'{') {
             depth += 1;
             i += 2;
             continue;
         }
-        if (c == ')' || c == '}') && depth > 0 {
+        if (c == b')' || c == b'}') && depth > 0 {
             depth -= 1;
-        } else if depth == 0 && c == ',' {
+        } else if depth == 0 && c == b',' {
             return Some(i);
         }
         i += 1;
@@ -1273,6 +1330,17 @@ fn top_level_comma(body: &[char]) -> Option<usize> {
 /// NOT run `parse_macro_string`, which additionally substitutes the
 /// environment eagerly.
 pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
+    // Only ASCII bytes are ever dropped, so every piece is still UTF-8.
+    let text = |b: Vec<u8>| String::from_utf8(b).expect("only ASCII bytes are removed");
+    macro_defn_pairs_bytes(s.as_bytes())
+        .into_iter()
+        .map(|(name, value)| (text(name), value.map(text)))
+        .collect()
+}
+
+/// [`macro_defn_pairs`] over bytes, as C's `macParseDefns` reads its
+/// `char *`: an iocsh argument need not be UTF-8.
+pub fn macro_defn_pairs_bytes(s: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     #[derive(PartialEq, Clone, Copy)]
     enum St {
         PreName,
@@ -1280,14 +1348,14 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
         PreValue,
         InValue,
     }
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut out: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut state = St::PreName;
-    let mut name = String::new();
-    let mut value = String::new();
+    let mut name = Vec::new();
+    let mut value = Vec::new();
     // Unquoted whitespace seen mid-token: buffered so trailing whitespace
     // before a delimiter is dropped while interior whitespace is kept.
-    let mut pending_ws = String::new();
-    let mut quote: Option<char> = None;
+    let mut pending_ws = Vec::new();
+    let mut quote: Option<u8> = None;
 
     // Enter the token from a "pre" state if needed and report whether it
     // is a VALUE: C removes quotes and escapes from names in place
@@ -1318,22 +1386,22 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
             } else {
                 &mut value
             };
-            target.push_str(&pending_ws);
+            target.extend_from_slice(&pending_ws);
             pending_ws.clear();
             target.push($c);
         }};
     }
 
-    let chars: Vec<char> = s.chars().collect();
+    let chars = s;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
 
         // Escape: `\X` makes `X` a literal (and not a delimiter).
         // Quotes do not suppress escapes.
-        if c == '\\' && i + 1 < chars.len() {
+        if c == b'\\' && i + 1 < chars.len() {
             if enter_token!() {
-                push_lit!('\\');
+                push_lit!(b'\\');
             }
             push_lit!(chars[i + 1]);
             i += 2;
@@ -1353,7 +1421,7 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
             i += 1;
             continue;
         }
-        if c == '\'' || c == '"' {
+        if c == b'\'' || c == b'"' {
             quote = Some(c);
             // An opening quote also begins the token (e.g. `=""`).
             if enter_token!() {
@@ -1365,50 +1433,50 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
 
         match state {
             St::PreName => {
-                if c == '=' {
+                if c == b'=' {
                     state = St::PreValue;
-                } else if !(crate::runtime::stdlib::c_isspace(c) || c == ',') {
+                } else if !(crate::runtime::stdlib::c_isspace(char::from(c)) || c == b',') {
                     state = St::InName;
                     name.push(c);
                 }
                 // leading whitespace and bare commas: skip
             }
             St::InName => {
-                if c == '=' {
+                if c == b'=' {
                     pending_ws.clear();
                     state = St::PreValue;
-                } else if c == ',' {
+                } else if c == b',' {
                     // name with no '=' → deletion
                     pending_ws.clear();
                     out.push((std::mem::take(&mut name), None));
                     state = St::PreName;
-                } else if crate::runtime::stdlib::c_isspace(c) {
+                } else if crate::runtime::stdlib::c_isspace(char::from(c)) {
                     pending_ws.push(c);
                 } else {
-                    name.push_str(&pending_ws);
+                    name.extend_from_slice(&pending_ws);
                     pending_ws.clear();
                     name.push(c);
                 }
             }
             St::PreValue => {
-                if c == ',' {
-                    out.push((std::mem::take(&mut name), Some(String::new())));
+                if c == b',' {
+                    out.push((std::mem::take(&mut name), Some(Vec::new())));
                     state = St::PreName;
-                } else if !crate::runtime::stdlib::c_isspace(c) {
+                } else if !crate::runtime::stdlib::c_isspace(char::from(c)) {
                     state = St::InValue;
                     value.push(c);
                 }
                 // leading value whitespace: skip
             }
             St::InValue => {
-                if c == ',' {
+                if c == b',' {
                     pending_ws.clear();
                     out.push((std::mem::take(&mut name), Some(std::mem::take(&mut value))));
                     state = St::PreName;
-                } else if crate::runtime::stdlib::c_isspace(c) {
+                } else if crate::runtime::stdlib::c_isspace(char::from(c)) {
                     pending_ws.push(c);
                 } else {
-                    value.push_str(&pending_ws);
+                    value.extend_from_slice(&pending_ws);
                     pending_ws.clear();
                     value.push(c);
                 }
@@ -1421,7 +1489,7 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
     match state {
         St::PreName => {}
         St::InName => out.push((std::mem::take(&mut name), None)),
-        St::PreValue => out.push((std::mem::take(&mut name), Some(String::new()))),
+        St::PreValue => out.push((std::mem::take(&mut name), Some(Vec::new()))),
         St::InValue => out.push((std::mem::take(&mut name), Some(std::mem::take(&mut value)))),
     }
     out
@@ -1436,7 +1504,7 @@ mod tests {
     // C `$(name,undefined)` placeholder for the no-fail callers.
     #[test]
     fn expand_macros_reports_undefined_names() {
-        let macros = HashMap::new();
+        let macros = MacroDefs::new();
         let r = expand_macros("$(A)$(B=def)$(C)", &macros, MacroExpandOptions::default());
         assert_eq!(r.text, "$(A,undefined)def$(C,undefined)");
         // B had a default → not undefined; A and C are, in scan order.
@@ -1447,7 +1515,7 @@ mod tests {
     // and `$$` is NOT an escape (macLib leaves it verbatim).
     #[test]
     fn expand_macros_default_opts_leave_dollar_dollar_verbatim() {
-        let macros = HashMap::new();
+        let macros = MacroDefs::new();
         assert_eq!(substitute_macros("$$100", &macros), "$$100");
         let r = expand_macros("$$100", &macros, MacroExpandOptions::default());
         assert_eq!(r.text, "$$100");
@@ -1462,7 +1530,7 @@ mod tests {
         let var = "_EPICS_LIBCOM_RS_MACRO_ENV_TEST";
         // Off by default: unset macro stays undefined even with the env set.
         unsafe { std::env::set_var(var, "FROM_ENV") };
-        let macros = HashMap::new();
+        let macros = MacroDefs::new();
         let off = expand_macros(&format!("$({var})"), &macros, MacroExpandOptions::default());
         assert_eq!(off.text, format!("$({var},undefined)"));
         // On: resolves from the environment.

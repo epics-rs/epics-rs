@@ -163,7 +163,7 @@ async fn lnk_const_load_array_matches_softioc_lnkconst_c_451() {
 
     let mut wrong = Vec::new();
     for (rec, (nord, udf, val)) in expect {
-        let f = |field: &str| db.get_pv(&format!("{rec}.{field}")).ok();
+        let f = |field: &str| db.get_pv(format!("{rec}.{field}")).ok();
         let got = (
             f("NORD").and_then(|v| v.to_f64()),
             f("UDF").and_then(|v| v.to_f64()),

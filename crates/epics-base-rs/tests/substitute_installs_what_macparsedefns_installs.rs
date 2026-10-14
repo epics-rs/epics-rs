@@ -57,7 +57,7 @@ fn expanded(path: &Path, macros: &MacroDefs) -> String {
     // report has nowhere to go.
     assert!(unsafe { libc::dup2(saved, 2) } >= 0, "restore fd 2 failed");
     unsafe { libc::close(saved) };
-    ran.expect("the expansion").expect("the flattened text")
+    String::from_utf8(ran.expect("the expansion").expect("the flattened text")).expect("ASCII")
 }
 
 /// Write `text` as a `.db`, expand it against `macros`, and give back the

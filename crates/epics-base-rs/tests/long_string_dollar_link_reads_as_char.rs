@@ -32,7 +32,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 fn text(db: &PvDatabase, rec: &str) -> String {
-    match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+    match db.get_pv(format!("{rec}.VAL")).unwrap() {
         EpicsValue::CharArray(b) => String::from_utf8_lossy(&b)
             .trim_end_matches('\0')
             .to_owned(),
@@ -62,7 +62,7 @@ async fn a_dollar_link_reads_the_long_string_up_to_sizv_like_softioc() {
             for kind in ["LI", "LO"] {
                 let rec = format!("{kind}{n}-{z}");
                 process(&db, &rec).await;
-                let got = db.get_pv(&format!("{rec}.LEN")).unwrap().to_f64().unwrap();
+                let got = db.get_pv(format!("{rec}.LEN")).unwrap().to_f64().unwrap();
                 assert_eq!(got, len as f64, "{rec}.LEN");
                 assert_eq!(text(&db, &rec), X[..len - 1], "{rec}.VAL");
             }

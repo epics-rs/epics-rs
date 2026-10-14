@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use epics_base_rs::types::RecordName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -1329,6 +1330,7 @@ mod chan_table {
 
     use super::{
         Arc, ByteOrder, ClientCredentials, DynSource, FieldDesc, OpState, ParkedOp, PvField,
+        RecordName,
     };
 
     // Not `Clone`: `parked` owns the abort handles for the descriptor waits
@@ -1337,7 +1339,7 @@ mod chan_table {
     // a channel — the read loop owns the one instance and hands out `&`/`&mut`.
     #[allow(dead_code)]
     pub(super) struct ChannelState {
-        pub(super) name: String,
+        pub(super) name: RecordName,
         pub(super) cid: u32,
         pub(super) sid: u32,
         /// Channel-invariant negotiated descriptor, shared by refcount with
@@ -1413,7 +1415,7 @@ mod chan_table {
     /// else in a [`ChannelState`] starts empty, and its op membership is
     /// reachable only through the [`ChannelMut`] the table hands out.
     pub(super) struct ChannelOpen {
-        pub(super) name: String,
+        pub(super) name: RecordName,
         pub(super) cid: u32,
         pub(super) sid: u32,
         pub(super) introspection: Option<Arc<FieldDesc>>,
@@ -1470,7 +1472,7 @@ mod chan_table {
         /// pvxs's `conn->onClose` erases them from `pending` / `mpending`
         /// (`sharedpv.cpp:231-237`, `:263-270`); the callback then runs
         /// with what it needs.
-        pub(super) fn into_close(self) -> (String, DynSource, Arc<ClientCredentials>) {
+        pub(super) fn into_close(self) -> (RecordName, DynSource, Arc<ClientCredentials>) {
             let Self {
                 name,
                 source,
@@ -1907,7 +1909,7 @@ struct MonitorPipelineCredit<'a> {
     wm_seq: &'a Arc<std::sync::atomic::AtomicU64>,
     monitor_op_id: u64,
     src: &'a DynSource,
-    pv_name: &'a str,
+    pv_name: &'a RecordName,
     mon_ctx: &'a crate::server_native::source::ChannelContext,
 }
 
@@ -1962,7 +1964,7 @@ impl MonitorPipelineCredit<'_> {
             return;
         };
         let mut slot = ACK_AFTER_WINDOW_READ.lock().unwrap();
-        if let Some((_, count)) = slot.take_if(|(name, _)| *name == self.pv_name) {
+        if let Some((_, count)) = slot.take_if(|(name, _)| *self.pv_name == *name) {
             drop(slot);
             refill_monitor_window(w, n, count);
         }
@@ -2106,7 +2108,7 @@ fn next_op_id() -> u64 {
 /// send), so it is safe to run from `Drop`.
 struct WatermarkWithdrawOnDrop {
     src: DynSource,
-    pv_name: String,
+    pv_name: RecordName,
     ctx: crate::server_native::source::ChannelContext,
     op_id: u64,
 }
@@ -2251,7 +2253,7 @@ impl MonitorGateDriver {
 /// gives the edge test atomically.
 struct MonitorStartControl {
     src: DynSource,
-    pv_name: String,
+    pv_name: RecordName,
     ctx: crate::server_native::source::ChannelContext,
     executing: std::sync::atomic::AtomicBool,
     /// Publishes each Executing<->Idle edge to this op's subscriber task,
@@ -2279,7 +2281,7 @@ impl std::fmt::Debug for MonitorStartControl {
 impl MonitorStartControl {
     fn new(
         src: DynSource,
-        pv_name: String,
+        pv_name: RecordName,
         ctx: crate::server_native::source::ChannelContext,
         exec_tx: tokio::sync::watch::Sender<bool>,
     ) -> Self {
@@ -2609,7 +2611,7 @@ impl<'a> MonitorQueue<'a> {
 struct MonitorSubscriberArgs {
     sid: u32,
     ioid: u32,
-    pv_name: String,
+    pv_name: RecordName,
     intro: Arc<FieldDesc>,
     mask: BitSet,
     /// Per-channel writer (clone of the connection `ChannelTx`).
@@ -4338,7 +4340,7 @@ impl ChannelTxPermit<'_> {
 /// order; the peer matches each by `cid`.
 struct CreateChannelCompletion {
     cid: u32,
-    name: String,
+    name: RecordName,
     /// Credential in force when CREATE_CHANNEL was dispatched, captured
     /// before the async resolver runs and carried back so the channel's
     /// lifecycle callbacks use the credential the channel was opened under —
@@ -4375,7 +4377,7 @@ type CcTx = mpsc::Sender<CreateChannelCompletion>;
 /// dispatched (see [`CreateChannelCompletion::open_cred`]).
 struct CreateChannelRequest {
     cid: u32,
-    name: String,
+    name: RecordName,
     open_cred: Arc<ClientCredentials>,
 }
 
@@ -4907,7 +4909,7 @@ pub(super) async fn handle_connection_io(
                     // the connection's channel table and the PeerEntry
                     // (keyed by SID) so handler-side tx/rx attribution is
                     // visible to the report (pvxs chan->statTx/statRx).
-                    let stat = crate::server_native::peers::ChannelStat::new(cc.name.clone());
+                    let stat = crate::server_native::peers::ChannelStat::new(cc.name.to_string());
                     // Attach the source-supplied report info captured at
                     // resolution — the single writer of the channel's
                     // `report_info`, surfaced as `Report::Channel::info`
@@ -7097,10 +7099,10 @@ fn decode_create_channel(
         let cid = cur
             .get_u32(inbound_order)
             .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL cid: {e}")))?;
-        let name = match crate::proto::decode_string(&mut cur, inbound_order)
+        let name = match crate::proto::decode_string_bytes(&mut cur, inbound_order)
             .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL name: {e}")))?
         {
-            Some(s) => s,
+            Some(s) => RecordName::from(s),
             None => break,
         };
         if name.is_empty() {
@@ -7385,13 +7387,13 @@ async fn finalize_channel_destroy(
 /// server-wide). A channel hosts every op under one name, so this ends that
 /// name's GET/PUT/MONITOR together, matching pva2pva's per-channel destroy.
 async fn invalidate_named_channels(
-    pv: &str,
+    pv: &RecordName,
     channels: &mut ChannelTable,
     ctx: &ChannelTeardownCtx<'_>,
 ) -> usize {
     let victims: Vec<(u32, u32)> = channels
         .iter()
-        .filter(|(_, ch)| ch.name == pv)
+        .filter(|(_, ch)| ch.name == *pv)
         .map(|(&sid, ch)| (sid, ch.cid))
         .collect();
     let mut torn_down = 0;
@@ -7594,7 +7596,8 @@ fn handle_message(frame: &Frame, channels: &ChannelTable, peer: &SocketAddr) -> 
         );
         return Ok(());
     };
-    let pv = channel.name.as_str();
+    let pv_text = channel.name.to_str_lossy();
+    let pv: &str = &pv_text;
     // pvxs `mtype2level` (pvaproto.h:704-712, serverconn.cpp:346-351):
     // 0 -> Info, 1 -> Warn, 2 -> Err, and every other value (including the
     // protocol's Fatal=3 and any unknown type) -> Crit. The tracing stack
@@ -10107,33 +10110,33 @@ mod tests {
             events: Arc<parking_lot::Mutex<Vec<(u64, WatermarkKind)>>>,
         }
         impl crate::server_native::source::ChannelSource for RecordingWmSource {
-            async fn list_pvs(&self) -> Vec<String> {
+            async fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["WM:PV".into()]
             }
-            async fn has_pv(&self, name: &str) -> bool {
-                name == "WM:PV"
+            async fn has_pv(&self, name: &[u8]) -> bool {
+                name == b"WM:PV"
             }
-            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
                 Some(FieldDesc::Variant)
             }
-            async fn get_value(&self, _name: &str) -> Option<PvField> {
+            async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
                 Some(PvField::Scalar(ScalarValue::Double(1.0)))
             }
-            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+            async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
                 Ok(())
             }
-            async fn is_writable(&self, _name: &str) -> bool {
+            async fn is_writable(&self, _name: &[u8]) -> bool {
                 false
             }
             async fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_watermark(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _ctx: &crate::server_native::source::ChannelContext,
                 ev: WatermarkEvent,
             ) {
@@ -13284,7 +13287,7 @@ mod tests {
             wm_seq: &wm_seq,
             monitor_op_id: 1,
             src: &src,
-            pv_name: "dut",
+            pv_name: &RecordName::from("dut"),
             mon_ctx: &ctx,
         };
         assert!(credit.available());
@@ -13325,7 +13328,7 @@ mod tests {
             wm_seq: &wm_seq,
             monitor_op_id: 1,
             src: &src,
-            pv_name: "dut",
+            pv_name: &RecordName::from("dut"),
             mon_ctx: &ctx,
         };
 
@@ -13377,7 +13380,7 @@ mod tests {
             wm_seq: &wm_seq,
             monitor_op_id: 1,
             src: &src,
-            pv_name: "dut",
+            pv_name: &RecordName::from("dut"),
             mon_ctx: &ctx,
         };
         assert!(
@@ -14306,30 +14309,30 @@ mod tests {
 
     #[cfg(test)]
     impl crate::server_native::source::ChannelSource for RawSeedSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, name: &str) -> bool {
-            name == "dut"
+        async fn has_pv(&self, name: &[u8]) -> bool {
+            name == b"dut"
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(self.intro.clone())
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(self.seed.clone())
         }
-        async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
-            _name: &str,
+            _name: &[u8],
         ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
@@ -14585,25 +14588,25 @@ mod tests {
 
     #[cfg(test)]
     impl crate::server_native::source::ChannelSource for ChanSeedSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, name: &str) -> bool {
-            name == "dut"
+        async fn has_pv(&self, name: &[u8]) -> bool {
+            name == b"dut"
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(self.intro.clone())
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(self.seed.clone())
         }
-        async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             self.rx.lock().unwrap().take()
         }
     }
@@ -15011,30 +15014,30 @@ mod tests {
         fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
             &self.gate
         }
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, name: &str) -> bool {
-            name == "dut"
+        async fn has_pv(&self, name: &[u8]) -> bool {
+            name == b"dut"
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(self.intro.clone())
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(self.seed.clone())
         }
-        async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
-            _name: &str,
+            _name: &[u8],
         ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
@@ -15189,25 +15192,25 @@ mod tests {
         fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
             &self.gate
         }
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, n: &str) -> bool {
-            n == "dut"
+        async fn has_pv(&self, n: &[u8]) -> bool {
+            n == b"dut"
         }
-        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
             Some(three_field_intro())
         }
-        async fn get_value(&self, _: &str) -> Option<PvField> {
+        async fn get_value(&self, _: &[u8]) -> Option<PvField> {
             Some(three_field_value(0, 0, 0))
         }
-        async fn put_value(&self, _: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _: &str) -> bool {
+        async fn is_writable(&self, _: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(4);
             Some(rx.into())
         }
@@ -16065,31 +16068,31 @@ mod tests {
         log: Arc<parking_lot::Mutex<Vec<String>>>,
     }
     impl crate::server_native::source::ChannelSource for AckOrderSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, n: &str) -> bool {
-            n == "dut"
+        async fn has_pv(&self, n: &[u8]) -> bool {
+            n == b"dut"
         }
-        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _n: &[u8]) -> Option<FieldDesc> {
             Some(self.intro.clone())
         }
-        async fn get_value(&self, _n: &str) -> Option<PvField> {
+        async fn get_value(&self, _n: &[u8]) -> Option<PvField> {
             Some(self.value.clone())
         }
-        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _n: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _n: &str) -> bool {
+        async fn is_writable(&self, _n: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _n: &[u8]) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(1);
             Some(rx.into())
         }
         fn notify_monitor_start(
             &self,
-            _name: &str,
+            _name: &[u8],
             _ctx: &crate::server_native::source::ChannelContext,
             start: bool,
         ) {
@@ -16097,7 +16100,7 @@ mod tests {
         }
         fn notify_watermark(
             &self,
-            _name: &str,
+            _name: &[u8],
             _ctx: &crate::server_native::source::ChannelContext,
             ev: crate::server_native::source::WatermarkEvent,
         ) {
@@ -16673,7 +16676,7 @@ mod tests {
                 ),
             );
             ChannelState::new(ChannelOpen {
-                name: format!("dut:pv{sid}"),
+                name: format!("dut:pv{sid}").into(),
                 cid: 0,
                 sid,
                 introspection: Some(std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int))),
@@ -17884,36 +17887,38 @@ mod tests {
             closed: Arc<parking_lot::Mutex<Vec<String>>>,
         }
         impl crate::server_native::source::ChannelSource for RecordingCloseSource {
-            async fn list_pvs(&self) -> Vec<String> {
+            async fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
-            async fn has_pv(&self, name: &str) -> bool {
-                name == "dut"
+            async fn has_pv(&self, name: &[u8]) -> bool {
+                name == b"dut"
             }
-            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
                 Some(FieldDesc::Variant)
             }
-            async fn get_value(&self, _name: &str) -> Option<PvField> {
+            async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
                 None
             }
-            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+            async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
                 Ok(())
             }
-            async fn is_writable(&self, _name: &str) -> bool {
+            async fn is_writable(&self, _name: &[u8]) -> bool {
                 false
             }
             async fn subscribe(
                 &self,
-                _name: &str,
+                _name: &[u8],
             ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_channel_close(
                 &self,
-                name: &str,
+                name: &[u8],
                 _ctx: &crate::server_native::source::ChannelContext,
             ) {
-                self.closed.lock().push(name.to_string());
+                self.closed
+                    .lock()
+                    .push(String::from_utf8_lossy(name).into_owned());
             }
         }
 
@@ -18003,16 +18008,16 @@ mod tests {
         value: PvField,
     }
     impl crate::server_native::source::ChannelSource for CredRecordingSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, name: &str) -> bool {
-            name == "dut"
+        async fn has_pv(&self, name: &[u8]) -> bool {
+            name == b"dut"
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(self.intro.clone())
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(self.value.clone())
         }
         async fn get_value_checked(
@@ -18028,18 +18033,18 @@ mod tests {
             }
             Some(self.value.clone())
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
         fn notify_channel_open(
             &self,
-            _name: &str,
+            _name: &[u8],
             ctx: &crate::server_native::source::ChannelContext,
         ) {
             self.opened
@@ -18048,7 +18053,7 @@ mod tests {
         }
         fn notify_channel_close(
             &self,
-            _name: &str,
+            _name: &[u8],
             ctx: &crate::server_native::source::ChannelContext,
         ) {
             self.closed
@@ -18157,6 +18162,21 @@ mod tests {
             "notify_channel_open must run under the channel's CREATE-time identity (alice), \
              not the re-authed connection identity (bob)"
         );
+    }
+
+    /// pvxs keeps a CREATE_CHANNEL name as the wire's std::string bytes; a
+    /// Latin-1 name must reach the source unchanged, not lossily decoded.
+    #[test]
+    fn create_channel_decodes_a_latin1_name_byte_for_byte() {
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u16(1, order);
+        payload.put_u32(7, order);
+        crate::proto::encode_string_bytes_into(b"TEMP:\xb0C", order, &mut payload);
+        let frame = synth_frame(Command::CreateChannel, order, payload);
+        let reqs = decode_create_channel(&frame, &cred_ca("alice")).expect("decode ok");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(&reqs[0].name[..], b"TEMP:\xb0C");
     }
 
     /// Client-DESTROY
@@ -18422,7 +18442,8 @@ mod tests {
             peer_entry: &peer_entry,
         };
 
-        let torn = invalidate_named_channels("X", &mut channels, &teardown).await;
+        let torn =
+            invalidate_named_channels(&RecordName::from("X"), &mut channels, &teardown).await;
 
         assert_eq!(torn, 1, "exactly the one channel named X is torn down");
         assert!(!channels.contains_key(&1), "X (sid 1) removed");
@@ -18487,7 +18508,8 @@ mod tests {
             peer_entry: &peer_entry,
         };
 
-        let torn = invalidate_named_channels("Z", &mut channels, &teardown).await;
+        let torn =
+            invalidate_named_channels(&RecordName::from("Z"), &mut channels, &teardown).await;
         assert_eq!(torn, 0);
         assert!(channels.contains_key(&1), "non-matching channel untouched");
         assert_eq!(
@@ -18687,7 +18709,7 @@ mod tests {
             .unwrap();
         let db_source = PvDatabaseSource::new(db.clone());
         let intro = db_source
-            .get_introspection("P:AI")
+            .get_introspection(b"P:AI")
             .await
             .expect("the record has an NTScalar descriptor");
         let source: DynSource = Arc::new(db_source);
@@ -19608,21 +19630,21 @@ mod tests {
             used_ctxless_get: Arc<AtomicBool>,
         }
         impl ChannelSource for SplitReadSource {
-            async fn list_pvs(&self) -> Vec<String> {
+            async fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
-            fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-                let n = n.to_string();
+            fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let n = RecordName::from(n);
                 async move { n == "dut" }
             }
-            async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+            async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
                 Some(three_field_intro())
             }
             // Ctx-less read — the WRONG prior. If the default
             // put_delta_checked uses this, the merge loses a/c.
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 self.used_ctxless_get.store(true, Ordering::SeqCst);
                 async { Some(three_field_value(0, 0, 0)) }
@@ -19640,16 +19662,16 @@ mod tests {
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 value: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 *self.stored.lock() = Some(value);
                 async { Ok(()) }
             }
-            async fn is_writable(&self, _: &str) -> bool {
+            async fn is_writable(&self, _: &[u8]) -> bool {
                 true
             }
-            async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+            async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -19849,7 +19871,7 @@ mod tests {
 
         // The server must apply ONLY field `b`; `a` and `c` keep
         // their prior values.
-        let stored = source.get_value("dut").await.expect("PV value present");
+        let stored = source.get_value(b"dut").await.expect("PV value present");
         assert_eq!(
             three_field_extract(&stored),
             (10, 99, 30),
@@ -19982,7 +20004,7 @@ mod tests {
         let resp = rx.recv().await.expect("PUT_GET data response emitted");
 
         // Server-side state: only `c` changed.
-        let stored = source.get_value("dut").await.expect("PV value present");
+        let stored = source.get_value(b"dut").await.expect("PV value present");
         assert_eq!(
             three_field_extract(&stored),
             (10, 20, 77),
@@ -20135,7 +20157,7 @@ mod tests {
             task_a.await.unwrap().expect("PUT A ok");
             task_c.await.unwrap().expect("PUT C ok");
 
-            let stored = source.get_value("dut").await.expect("PV value present");
+            let stored = source.get_value(b"dut").await.expect("PV value present");
             let (a, b, c) = three_field_extract(&stored);
             assert_eq!(
                 (a, c),
@@ -20193,38 +20215,38 @@ mod tests {
         fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
             &self.gate
         }
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-            let n = n.to_string();
+        fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+            let n = RecordName::from(n);
             async move { n == "dut" }
         }
-        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
             Some(three_field_intro())
         }
-        fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        fn get_value(&self, _: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
             let v = *self.value.lock();
             async move { Some(three_field_value(v, v, v)) }
         }
         fn put_value(
             &self,
-            _: &str,
+            _: &[u8],
             value: PvField,
         ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             let (a, _, _) = three_field_extract(&value);
             *self.value.lock() = a;
             async { Ok(()) }
         }
-        async fn is_writable(&self, _: &str) -> bool {
+        async fn is_writable(&self, _: &[u8]) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
         fn process(
             &self,
-            _: &str,
+            _: &[u8],
         ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             self.process_hits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -22104,27 +22126,27 @@ mod tests {
             calls: Arc<AtomicUsize>,
         }
         impl ChannelSource for GatedIntrospectSource {
-            async fn list_pvs(&self) -> Vec<String> {
+            async fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
-            async fn has_pv(&self, name: &str) -> bool {
-                name == "dut"
+            async fn has_pv(&self, name: &[u8]) -> bool {
+                name == b"dut"
             }
-            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let _permit = self.gate.acquire().await.unwrap();
                 Some(FieldDesc::Variant)
             }
-            async fn get_value(&self, _name: &str) -> Option<PvField> {
+            async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
                 None
             }
-            async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+            async fn put_value(&self, _name: &[u8], _v: PvField) -> Result<(), OpError> {
                 Ok(())
             }
-            async fn is_writable(&self, _name: &str) -> bool {
+            async fn is_writable(&self, _name: &[u8]) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+            async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -22486,25 +22508,25 @@ mod tests {
         starts: Arc<parking_lot::Mutex<Vec<bool>>>,
     }
     impl crate::server_native::source::ChannelSource for Bfr12Source {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, n: &str) -> bool {
-            n == "dut"
+        async fn has_pv(&self, n: &[u8]) -> bool {
+            n == b"dut"
         }
-        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _n: &[u8]) -> Option<FieldDesc> {
             Some(self.intro.clone())
         }
-        async fn get_value(&self, _n: &str) -> Option<PvField> {
+        async fn get_value(&self, _n: &[u8]) -> Option<PvField> {
             Some(self.value.clone())
         }
-        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _n: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _n: &str) -> bool {
+        async fn is_writable(&self, _n: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _n: &[u8]) -> Option<MonitorStream<PvField>> {
             // Sender dropped immediately → receiver closed → the subscriber
             // loop sees end-of-stream and the task ends (source close).
             let (_tx, rx) = mpsc::channel(1);
@@ -22512,7 +22534,7 @@ mod tests {
         }
         fn notify_monitor_start(
             &self,
-            _name: &str,
+            _name: &[u8],
             _ctx: &crate::server_native::source::ChannelContext,
             start: bool,
         ) {
@@ -22533,30 +22555,30 @@ mod tests {
     fn a_panicking_monitor_start_callback_cannot_escape_the_drop() {
         struct PanickingSource;
         impl crate::server_native::source::ChannelSource for PanickingSource {
-            async fn list_pvs(&self) -> Vec<String> {
+            async fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
-            async fn has_pv(&self, n: &str) -> bool {
-                n == "dut"
+            async fn has_pv(&self, n: &[u8]) -> bool {
+                n == b"dut"
             }
-            async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+            async fn get_introspection(&self, _n: &[u8]) -> Option<FieldDesc> {
                 None
             }
-            async fn get_value(&self, _n: &str) -> Option<PvField> {
+            async fn get_value(&self, _n: &[u8]) -> Option<PvField> {
                 None
             }
-            async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+            async fn put_value(&self, _n: &[u8], _v: PvField) -> Result<(), OpError> {
                 Ok(())
             }
-            async fn is_writable(&self, _n: &str) -> bool {
+            async fn is_writable(&self, _n: &[u8]) -> bool {
                 false
             }
-            async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+            async fn subscribe(&self, _n: &[u8]) -> Option<MonitorStream<PvField>> {
                 None
             }
             fn notify_monitor_start(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _ctx: &crate::server_native::source::ChannelContext,
                 _start: bool,
             ) {
@@ -22754,25 +22776,25 @@ mod tests {
         keep: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::MonitorUpdate>>>>,
     }
     impl crate::server_native::source::ChannelSource for GatedQuietSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, n: &str) -> bool {
-            n == "dut"
+        async fn has_pv(&self, n: &[u8]) -> bool {
+            n == b"dut"
         }
-        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _n: &[u8]) -> Option<FieldDesc> {
             Some(self.intro.clone())
         }
-        async fn get_value(&self, _n: &str) -> Option<PvField> {
+        async fn get_value(&self, _n: &[u8]) -> Option<PvField> {
             None
         }
-        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _n: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _n: &str) -> bool {
+        async fn is_writable(&self, _n: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _n: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_seeded(
@@ -22886,25 +22908,25 @@ mod tests {
         raw: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>>,
     }
     impl crate::server_native::source::ChannelSource for QuietRawSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             self.quiet.list_pvs().await
         }
-        async fn has_pv(&self, n: &str) -> bool {
+        async fn has_pv(&self, n: &[u8]) -> bool {
             self.quiet.has_pv(n).await
         }
-        async fn get_introspection(&self, n: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, n: &[u8]) -> Option<FieldDesc> {
             self.quiet.get_introspection(n).await
         }
-        async fn get_value(&self, _n: &str) -> Option<PvField> {
+        async fn get_value(&self, _n: &[u8]) -> Option<PvField> {
             None
         }
-        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _n: &[u8], _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _n: &str) -> bool {
+        async fn is_writable(&self, _n: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _n: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw_seeded(
@@ -23588,26 +23610,26 @@ mod tests {
     /// `send_op_error` path. INIT still succeeds via `ch.introspection`.
     struct Bfr13FailSource;
     impl crate::server_native::source::ChannelSource for Bfr13FailSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-            let n = n.to_string();
+        fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+            let n = RecordName::from(n);
             async move { n == "dut" }
         }
-        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
             Some(three_field_intro())
         }
-        async fn get_value(&self, _: &str) -> Option<PvField> {
+        async fn get_value(&self, _: &[u8]) -> Option<PvField> {
             None
         }
-        async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _: &str) -> bool {
+        async fn is_writable(&self, _: &[u8]) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -23763,7 +23785,7 @@ mod tests {
             channels.insert(
                 sid,
                 ChannelState::new(ChannelOpen {
-                    name: format!("dut{sid}"),
+                    name: format!("dut{sid}").into(),
                     cid: sid - 1,
                     sid,
                     introspection: Some(std::sync::Arc::new(three_field_intro())),
@@ -24840,28 +24862,28 @@ mod r14_tests {
     struct SlowGetSource;
 
     impl crate::server_native::source::ChannelSource for SlowGetSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["slow".into()]
         }
-        async fn has_pv(&self, name: &str) -> bool {
-            name == "slow"
+        async fn has_pv(&self, name: &[u8]) -> bool {
+            name == b"slow"
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(FieldDesc::Variant)
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             Some(PvField::Scalar(ScalarValue::Double(1.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             false
         }
         async fn subscribe(
             &self,
-            _name: &str,
+            _name: &[u8],
         ) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
@@ -25038,16 +25060,16 @@ mod bfr15_tests {
     }
 
     impl crate::server_native::source::ChannelSource for ExecBlockSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, name: &str) -> bool {
-            name == "dut"
+        async fn has_pv(&self, name: &[u8]) -> bool {
+            name == b"dut"
         }
-        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
             Some(nt_scalar_desc())
         }
-        async fn get_value(&self, _: &str) -> Option<PvField> {
+        async fn get_value(&self, _: &[u8]) -> Option<PvField> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
             if self.block_get {
                 let _d = DropSignal(self.get_cancelled.clone());
@@ -25055,7 +25077,7 @@ mod bfr15_tests {
             }
             Some(nt_scalar_value(1.0))
         }
-        async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
             self.put_calls.fetch_add(1, Ordering::SeqCst);
             if self.block_put {
                 let _d = DropSignal(self.put_cancelled.clone());
@@ -25063,10 +25085,13 @@ mod bfr15_tests {
             }
             Ok(())
         }
-        async fn is_writable(&self, _: &str) -> bool {
+        async fn is_writable(&self, _: &[u8]) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<crate::server_native::MonitorStream<PvField>> {
+        async fn subscribe(
+            &self,
+            _: &[u8],
+        ) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }
@@ -26280,28 +26305,28 @@ mod hosted_subscriber_tests {
     struct Dut<S>(S);
 
     impl<S: Subscribe> ChannelSource for Dut<S> {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
             vec!["dut".into()]
         }
-        async fn has_pv(&self, n: &str) -> bool {
-            n == "dut"
+        async fn has_pv(&self, n: &[u8]) -> bool {
+            n == b"dut"
         }
-        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
             Some(FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
                 fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
             })
         }
-        async fn get_value(&self, _: &str) -> Option<PvField> {
+        async fn get_value(&self, _: &[u8]) -> Option<PvField> {
             Some(nt_scalar(1.0))
         }
-        async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
             Err("read-only".into())
         }
-        async fn is_writable(&self, _: &str) -> bool {
+        async fn is_writable(&self, _: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
             self.0.subscribe()
         }
     }

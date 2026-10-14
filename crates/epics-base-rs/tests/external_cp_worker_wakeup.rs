@@ -51,19 +51,19 @@ fn until(done: impl Fn() -> bool, what: &str) {
 
 #[async_trait::async_trait]
 impl LinkSet for CounterLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
 
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
         self.value()
     }
 
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         self.value()
     }
 
-    async fn connect_link(&self, _: &str) {}
+    async fn connect_link(&self, _: &[u8]) {}
 }
 
 async fn holder_db(lset: Arc<CounterLset>) -> PvDatabase {
@@ -75,7 +75,7 @@ async fn holder_db(lset: Arc<CounterLset>) -> PvDatabase {
     {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.common.text.inp = "ca://UP:PV CP".to_string();
+        inst.common.text.inp = "ca://UP:PV CP".into();
         inst.install_link_cache(
             "INP",
             Arc::new(epics_base_rs::server::record::parse_link_v2(

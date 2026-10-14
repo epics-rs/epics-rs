@@ -38,7 +38,7 @@ pub fn db_pvxr_command(resolver: PvaLinkResolver) -> CommandDef {
         "pvxr <pv_name>",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("pvxr: missing pv_name".into()),
             };
             let resolver = resolver.clone();
@@ -121,32 +121,30 @@ fn sevr_label(s: SevrMode) -> &'static str {
 /// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`), the
 /// matcher pvxs's `dbpvxr` applies to each attached link's record name
 /// (`epicsStrGlobMatch(pval->plink->precord->name, precordname)`,
-/// `pvxs/ioc/pvalink.cpp:224,269`): `*` matches any run of characters,
-/// `?` matches exactly one, every other character is literal.
-fn glob_match(s: &str, pattern: &str) -> bool {
-    let text: Vec<char> = s.chars().collect();
-    let pat: Vec<char> = pattern.chars().collect();
+/// `pvxs/ioc/pvalink.cpp:224,269`): `*` matches any run of bytes, `?`
+/// matches exactly one, every other byte is literal.
+fn glob_match(text: &[u8], pat: &[u8]) -> bool {
     let mut i = 0usize;
     let mut p = 0usize;
     let mut mp: Option<usize> = None;
     let mut cp = 0usize;
 
-    while i < text.len() && p < pat.len() && pat[p] != '*' {
-        if pat[p] != text[i] && pat[p] != '?' {
+    while i < text.len() && p < pat.len() && pat[p] != b'*' {
+        if pat[p] != text[i] && pat[p] != b'?' {
             return false;
         }
         p += 1;
         i += 1;
     }
     while i < text.len() {
-        if p < pat.len() && pat[p] == '*' {
+        if p < pat.len() && pat[p] == b'*' {
             p += 1;
             if p >= pat.len() {
                 return true;
             }
             mp = Some(p);
             cp = i + 1;
-        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == '?') {
+        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == b'?') {
             p += 1;
             i += 1;
         } else if let Some(m) = mp {
@@ -157,7 +155,7 @@ fn glob_match(s: &str, pattern: &str) -> bool {
             return false;
         }
     }
-    while p < pat.len() && pat[p] == '*' {
+    while p < pat.len() && pat[p] == b'*' {
         p += 1;
     }
     p >= pat.len()
@@ -167,7 +165,7 @@ fn glob_match(s: &str, pattern: &str) -> bool {
 /// mirroring pvxs `dbpvxr`'s per-channel block
 /// (`pvxs/ioc/pvalink.cpp:243-306`). When `glob` is set, only attached
 /// records whose name matches it are printed (`pvxs/ioc/pvalink.cpp:269`).
-fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Option<&str>) {
+fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Option<&[u8]>) {
     // pvxs right-justifies the channel name in a 28-wide column.
     ctx.println(&format!(
         "{:>28} conn={} dir={} Q={} pipe={}",
@@ -204,7 +202,11 @@ fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Op
         let mut printed_any = false;
         for rec in &d.records {
             if glob.map(|g| glob_match(rec, g)).unwrap_or(true) {
-                ctx.println(&format!("{:30}{rec} {detail}", ""));
+                // The record name as C prints it: its bytes.
+                let mut row = vec![b' '; 30];
+                row.extend_from_slice(rec);
+                row.extend_from_slice(format!(" {detail}").as_bytes());
+                ctx.println_bytes(&row);
                 printed_any = true;
             }
         }
@@ -269,7 +271,9 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
             // First arg is a record-name GLOB; empty / missing / "*" =>
             // every channel (`pvxs/ioc/pvalink.cpp:193`).
             let glob = match args.first() {
-                Some(ArgValue::String(s)) if !s.is_empty() && s != "*" => Some(s.clone()),
+                Some(ArgValue::String(s)) if !s.is_empty() && s != "*" => {
+                    Some(s.as_bytes().to_vec())
+                }
                 _ => None,
             };
             let level = match args.get(1) {
@@ -279,7 +283,12 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
 
             match &glob {
                 None => ctx.println("PVA links in all records\n"),
-                Some(g) => ctx.println(&format!("PVA links in records matching '{g}'\n")),
+                Some(g) => {
+                    let mut line = b"PVA links in records matching '".to_vec();
+                    line.extend_from_slice(g);
+                    line.extend_from_slice(b"'\n");
+                    ctx.println_bytes(&line);
+                }
             }
 
             // Channel-centric listing for BOTH all-records and
@@ -457,15 +466,17 @@ mod tests {
     /// (`pvxs/ioc/pvalink.cpp:224,269`).
     #[test]
     fn dbpvar_glob_match_semantics() {
-        assert!(glob_match("TST:AI1", "TST:*"));
-        assert!(glob_match("TST:AI1", "*AI1"));
-        assert!(glob_match("TST:AI1", "TST:AI?"));
-        assert!(glob_match("TST:AI1", "*"));
-        assert!(glob_match("TST:AI1", "TST:AI1"));
+        assert!(glob_match(b"TST:AI1", b"TST:*"));
+        assert!(glob_match(b"TST:AI1", b"*AI1"));
+        assert!(glob_match(b"TST:AI1", b"TST:AI?"));
+        assert!(glob_match(b"TST:AI1", b"*"));
+        assert!(glob_match(b"TST:AI1", b"TST:AI1"));
         // Non-matches: a literal `TST:*` is NOT how a glob is matched.
-        assert!(!glob_match("OTH:AI1", "TST:*"));
-        assert!(!glob_match("TST:AI11", "TST:AI?"));
-        assert!(!glob_match("TST:AI1", "TST:AI1X"));
+        assert!(!glob_match(b"OTH:AI1", b"TST:*"));
+        assert!(!glob_match(b"TST:AI11", b"TST:AI?"));
+        assert!(!glob_match(b"TST:AI1", b"TST:AI1X"));
+        // `?` is one byte, as in C.
+        assert!(glob_match(b"caf\xe9", b"caf?"));
     }
 
     #[tokio::test]

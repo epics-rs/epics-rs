@@ -68,10 +68,10 @@ pub(crate) struct StampBegun(());
 /// on a put; the cycle reads the parse cached on the instance, never these.
 #[derive(Clone, Debug, Default)]
 pub struct CommonText {
-    pub flnk: String,
-    pub inp: String,
-    pub out: String,
-    pub tsel: String,
+    pub flnk: PvString,
+    pub inp: PvString,
+    pub out: PvString,
+    pub tsel: PvString,
     /// Access security group — C `dbCommon.ASG`, a `DBF_STRING` with NO
     /// `initial()` in `dbCommon.dbd`, so a record that does not name a group
     /// holds the EMPTY string and `caget -t REC.ASG` on any C IOC prints an
@@ -90,8 +90,8 @@ pub struct CommonText {
     /// an event *name* (resolved by `eventNameToHandle`), not a
     /// numeric subscript. A numeric string ("5") still works for
     /// backward compatibility. Empty means "no event".
-    pub evnt: String,
-    pub sdis: String,
+    pub evnt: PvString,
+    pub sdis: PvString,
 }
 
 /// Common fields shared by all records.

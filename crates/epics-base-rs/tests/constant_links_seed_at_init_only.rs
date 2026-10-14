@@ -85,10 +85,10 @@ async fn a_constant_input_does_not_gate_the_record_body() {
     let db = PvDatabase::new();
     let mut sel = SelRecord::default();
     sel.selm = 0; // Specified
-    sel.nvl = "2".to_string(); // constant NVL → SELN=2 at init
-    sel.inpa = "11".to_string();
-    sel.inpb = "22".to_string();
-    sel.inpc = "33".to_string();
+    sel.nvl = "2".into(); // constant NVL → SELN=2 at init
+    sel.inpa = "11".into();
+    sel.inpb = "22".into();
+    sel.inpc = "33".into();
     db.add_record("S1", Box::new(sel)).await.unwrap();
 
     assert_eq!(
@@ -112,8 +112,8 @@ async fn a_constant_input_does_not_gate_the_record_body() {
 async fn seq_seeds_constant_sell_and_doln_at_init() {
     let db = PvDatabase::new();
     let seq = SeqRecord {
-        sell: "3".to_string(),
-        dol1: "4.5".to_string(),
+        sell: "3".into(),
+        dol1: "4.5".into(),
         ..Default::default()
     };
     db.add_record("Q1", Box::new(seq)).await.unwrap();

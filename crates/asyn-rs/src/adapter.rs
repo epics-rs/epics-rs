@@ -6949,7 +6949,7 @@ mod tests {
             let db = epics_base_rs::server::database::PvDatabase::new();
             let source = WriteDoneSource::new(
                 &db,
-                "TEST:WRITEALLOC",
+                b"TEST:WRITEALLOC",
                 epics_libcom_rs::runtime::task::CallbackPriority::Low,
             );
             let mut put = || {

@@ -27,7 +27,7 @@ pub struct PrintfRecord {
     /// and it moves `links_generation`.
     fmt: PvString,
     /// INP0-INP9: input link strings.
-    inp_links: [String; 10],
+    inp_links: [PvString; 10],
     /// A-J: current values from the input links, kept in their native
     /// type. `%s` reads the string form, numeric conversions read the
     /// numeric form.
@@ -1010,12 +1010,12 @@ impl Record for PrintfRecord {
     /// C reads `prec->inp0..inp9` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 10 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'0')?);
-        self.inp_links.get(slot).map(String::as_str)
+        self.inp_links.get(slot).map(PvString::as_bytes)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -1083,7 +1083,7 @@ impl Record for PrintfRecord {
             _ => {
                 if let Some(idx) = Self::inp_index(name) {
                     if let EpicsValue::String(s) = value {
-                        self.inp_links[idx] = s.as_str_lossy().into_owned();
+                        self.inp_links[idx] = s;
                         self.links_generation += 1;
                     } else {
                         return Err(CaError::TypeMismatch(name.into()));
@@ -2231,7 +2231,7 @@ mod tests {
                 .iter()
                 .map(|&(link, _)| {
                     (
-                        rec.link_text_ref(link).map(str::to_owned),
+                        rec.link_text_ref(link).map(<[u8]>::to_vec),
                         rec.input_link_request(link),
                         rec.input_link_failure_is_inert(link),
                     )

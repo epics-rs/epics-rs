@@ -60,7 +60,7 @@ async fn state_posts_val_only_on_a_change_staterecord_c_115() {
     }
     assert_eq!(posts, ["run", "stop", "", "abcdefghijklmnopqrs"]);
 
-    let get = |f: &str| db.get_pv(&format!("ST.{f}")).ok();
+    let get = |f: &str| db.get_pv(format!("ST.{f}")).ok();
     assert_eq!(
         get("OVAL"),
         Some(EpicsValue::String("abcdefghijklmnopqrs".into()))
@@ -112,7 +112,7 @@ async fn an_alarm_only_change_posts_no_val_staterecord_c_118() {
         }
     }
     assert_eq!(posts, ["x"]);
-    let get = |f: &str| db.get_pv(&format!("ST.{f}")).ok().and_then(|v| v.to_f64());
+    let get = |f: &str| db.get_pv(format!("ST.{f}")).ok().and_then(|v| v.to_f64());
     assert_eq!((get("UDF"), get("SEVR")), (Some(0.0), Some(0.0)));
 }
 
@@ -156,6 +156,6 @@ async fn an_alarm_only_change_posts_no_val_permissiverecord_c_107() {
         }
     }
     assert_eq!(posts, ["1"]);
-    let get = |f: &str| db.get_pv(&format!("PM.{f}")).ok().and_then(|v| v.to_f64());
+    let get = |f: &str| db.get_pv(format!("PM.{f}")).ok().and_then(|v| v.to_f64());
     assert_eq!((get("UDF"), get("SEVR")), (Some(0.0), Some(0.0)));
 }

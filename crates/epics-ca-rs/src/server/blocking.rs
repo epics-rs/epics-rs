@@ -5220,7 +5220,7 @@ mod tests {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = events.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == "BLK:TRAPREF" {
+            if msg.pv_name == b"BLK:TRAPREF" {
                 sink.lock().unwrap().push((
                     msg.op,
                     msg.status.map(str::to_owned),

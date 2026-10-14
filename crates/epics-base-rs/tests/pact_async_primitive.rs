@@ -341,7 +341,7 @@ impl Record for HandleCaptureRecord {
     fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
-    fn set_async_context(&mut self, _name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, _name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {
         *self.sink.lock().unwrap() = Some(db);
     }
 }

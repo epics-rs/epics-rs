@@ -208,7 +208,7 @@ async fn a_state_link_reports_itself_as_a_json_link() {
 async fn an_array_put_is_its_element_zero_and_an_empty_one_writes_nothing() {
     let db = build().await;
     let state = |name: &str| db_state_registry().get(name);
-    let stat = |rec: &str| db.get_pv(&format!("{rec}.STAT")).unwrap().to_f64();
+    let stat = |rec: &str| db.get_pv(format!("{rec}.STAT")).unwrap().to_f64();
 
     db_state_registry().set("AZ", true);
     process(&db, "A:Z").await;

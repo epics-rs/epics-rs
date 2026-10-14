@@ -43,10 +43,10 @@ pub struct LongoutRecord {
     pub alst: i32,
     pub mlst: i32,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Output Execution Option (epics-base 7.0.8):
@@ -115,10 +115,10 @@ impl Default for LongoutRecord {
             alst: 0,
             mlst: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             oopt: 0,
@@ -306,11 +306,11 @@ impl Record for LongoutRecord {
         }
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -466,7 +466,7 @@ impl Record for LongoutRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                 }
             }
             "SIMM" => {
@@ -476,12 +476,12 @@ impl Record for LongoutRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 }
             }
             "SIMS" => {

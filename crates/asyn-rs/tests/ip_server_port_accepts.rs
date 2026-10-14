@@ -75,8 +75,8 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
             .handler
             .call(
                 &[
-                    ArgValue::String(name.clone()),
-                    ArgValue::String(format!("127.0.0.1:{port} TCP")),
+                    ArgValue::String((&name).into()),
+                    ArgValue::String(format!("127.0.0.1:{port} TCP").into()),
                     ArgValue::Int(2),
                 ],
                 &ctx,
@@ -178,7 +178,7 @@ fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
         .call(
             &[
                 ArgValue::String("R19114".into()),
-                ArgValue::String(format!("127.0.0.1:{port} TCP")),
+                ArgValue::String(format!("127.0.0.1:{port} TCP").into()),
                 ArgValue::Int(0),
             ],
             &ctx,

@@ -82,7 +82,7 @@ async fn probe_ioc(db: &str) -> Arc<PvDatabase> {
 /// `field` of each probe outcome's record, as `[Live, Dead, Err]`.
 fn by_outcome(db: &PvDatabase, rtype: &str, field: &str) -> [Option<EpicsValue>; 3] {
     ["probeLive", "probeDead", "probeErr"].map(|dtyp| {
-        db.get_record(&format!("{rtype}:{dtyp}"))
+        db.get_record(format!("{rtype}:{dtyp}"))
             .unwrap()
             .read()
             .record

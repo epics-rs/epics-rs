@@ -28,7 +28,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 fn udf(db: &PvDatabase, rec: &str) -> u8 {
-    db.get_pv(&format!("{rec}.UDF")).unwrap().to_f64().unwrap() as u8
+    db.get_pv(format!("{rec}.UDF")).unwrap().to_f64().unwrap() as u8
 }
 
 #[epics_macros_rs::epics_test]

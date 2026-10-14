@@ -12,6 +12,7 @@
 
 #![cfg(tokio_backend)]
 
+use epics_base_rs::types::RecordName;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -58,10 +59,10 @@ impl GatedSource {
 }
 
 impl ChannelSource for GatedSource {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         Vec::new()
     }
-    async fn has_pv(&self, _: &str) -> bool {
+    async fn has_pv(&self, _: &[u8]) -> bool {
         self.entered.fetch_add(1, Ordering::SeqCst);
         let now = self.in_has_pv.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_has_pv.fetch_max(now, Ordering::SeqCst);
@@ -73,19 +74,19 @@ impl ChannelSource for GatedSource {
         self.in_has_pv.fetch_sub(1, Ordering::SeqCst);
         true
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Scalar(ScalarType::Double))
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         None
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err("read-only".into())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
         None
     }
 }

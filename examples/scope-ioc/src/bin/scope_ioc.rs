@@ -48,7 +48,7 @@ struct ConfigHandler {
 impl CommandHandler for ConfigHandler {
     fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let port_name = match &args[0] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("portName required".into()),
         };
 

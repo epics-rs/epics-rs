@@ -174,7 +174,7 @@ fn value_overrun_paths(value: &PvField) -> Vec<String> {
 /// hot path of every GET / PUT / MONITOR. Avoid regex recompilation
 /// or hashmap allocation per call — capture pre-built tables in the
 /// closure.
-pub type AsgResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
+pub type AsgResolver = Arc<dyn Fn(&[u8]) -> String + Send + Sync>;
 
 fn default_asg_resolver() -> AsgResolver {
     Arc::new(|_pv| "DEFAULT".to_string())
@@ -522,7 +522,7 @@ impl GatewayChannelSource {
                 // itself should be O(1) — comment on `AsgResolver`
                 // documents this.
                 let resolver = self.asg_resolver.read().await;
-                let asg = (resolver)(pv);
+                let asg = (resolver)(pv.as_bytes());
                 cfg.check_access_method(
                     &asg,
                     &ctx.creds.host,
@@ -1052,6 +1052,21 @@ fn monitor_updates_to_values(
     MonitorStream::Channel(out)
 }
 
+/// Upstream `PvaClient` names are text: a downstream name that is not UTF-8
+/// has no upstream counterpart and is refused here, as the CA gateway does.
+fn upstream_name(name: &[u8]) -> Option<&str> {
+    std::str::from_utf8(name).ok()
+}
+
+fn upstream_name_op(name: &[u8]) -> Result<&str, OpError> {
+    upstream_name(name).ok_or_else(|| {
+        OpError::failed(format!(
+            "PV name '{}' is not UTF-8 and cannot be forwarded upstream",
+            String::from_utf8_lossy(name)
+        ))
+    })
+}
+
 impl ChannelSource for GatewayChannelSource {
     fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
         &self.gate
@@ -1079,7 +1094,7 @@ impl ChannelSource for GatewayChannelSource {
         }
     }
 
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         // pva2pva's `GWServerChannelProvider` overrides only `channelFind`
         // and `createChannel`, NOT `channelList` (p2pApp/server.h:9-31), so
         // the base `ChannelProvider::channelList` returns
@@ -1099,7 +1114,10 @@ impl ChannelSource for GatewayChannelSource {
         Vec::new()
     }
 
-    async fn has_pv(&self, name: &str) -> bool {
+    async fn has_pv(&self, name: &[u8]) -> bool {
+        let Some(name) = upstream_name(name) else {
+            return false;
+        };
         // Admit a channel on upstream CONNECTION, not on a first MONITOR
         // event. pva2pva `p2pApp/server.cpp:35-57` answers `channelFind`
         // from `ChannelCache::lookup`, which returns an entry only once
@@ -1123,7 +1141,8 @@ impl ChannelSource for GatewayChannelSource {
             .is_ok()
     }
 
-    async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, name: &[u8]) -> Option<FieldDesc> {
+        let name = upstream_name(name)?;
         // Forward a real upstream GET_FIELD rather than reading the monitor
         // cache descriptor. pva2pva forwards introspection through the
         // connected channel independently of monitor setup
@@ -1155,7 +1174,10 @@ impl ChannelSource for GatewayChannelSource {
     /// connection-only channel counts in that cache's `cacheSize` and is
     /// reachable by the all-layers `:drop`/`:flush` — the same accounting
     /// `has_pv` gets on the shared cache.
-    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+    async fn has_pv_checked(&self, name: &[u8], ctx: ChannelContext) -> bool {
+        let Some(name) = upstream_name(name) else {
+            return false;
+        };
         self.upstream_cache_for(&ctx)
             .admit_connection(name, self.connect_timeout)
             .await
@@ -1170,9 +1192,10 @@ impl ChannelSource for GatewayChannelSource {
     /// waits on a monitor event (see `get_introspection`).
     async fn get_introspection_checked(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Option<FieldDesc> {
+        let name = upstream_name(name)?;
         epics_base_rs::runtime::task::timeout(
             self.connect_timeout,
             self.upstream_client_for(&ctx).pvinfo(name),
@@ -1182,7 +1205,8 @@ impl ChannelSource for GatewayChannelSource {
         .ok()
     }
 
-    async fn get_value(&self, name: &str) -> Option<PvField> {
+    async fn get_value(&self, name: &[u8]) -> Option<PvField> {
+        let name = upstream_name(name)?;
         // Forward a real upstream ChannelGet rather than serving the cached
         // monitor snapshot. pva2pva `p2pApp/channel.cpp:109-115` implements
         // GET as `entry->channel->createChannelGet(channelGetRequester,
@@ -1203,17 +1227,19 @@ impl ChannelSource for GatewayChannelSource {
     /// with empty/anonymous credentials (the only identity available
     /// on this path); when no ACF is installed the gate returns
     /// `ReadWrite`, preserving the legacy pass-through.
-    async fn put_value(&self, name: &str, value: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, name: &[u8], value: PvField) -> Result<(), OpError> {
         let checked = self.gate.check(name, "", "", "anonymous", "").await;
         if !checked.allows_write() {
             tracing::debug!(
-                pv = %name,
+                pv = %String::from_utf8_lossy(name),
                 "pva-gateway: ctx-less PUT denied by gateway ACF"
             );
             return Err(OpError::denied(format!(
-                "PUT denied by gateway access security: PV '{name}' (anonymous)"
+                "PUT denied by gateway access security: PV '{}' (anonymous)",
+                String::from_utf8_lossy(name)
             )));
         }
+        let name = upstream_name_op(name)?;
         // No monitor-gated preflight. The PUT forwards through the shared
         // client, which connects on demand and surfaces the upstream error
         // itself — exactly as `put_value_checked` does. pva2pva forwards
@@ -1263,7 +1289,7 @@ impl ChannelSource for GatewayChannelSource {
             )));
         }
 
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         // no shared-cache preflight. The earlier
         // `self.cache.lookup(...)` confirmed existence but warmed the
         // *shared* client's pool and opened an upstream monitor under
@@ -1346,7 +1372,7 @@ impl ChannelSource for GatewayChannelSource {
             )));
         }
 
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         let client = self.upstream_client_for(&ctx);
         tracing::debug!(
             pv = %name,
@@ -1375,7 +1401,10 @@ impl ChannelSource for GatewayChannelSource {
             .map_err(upstream_op_error)
     }
 
-    async fn is_writable(&self, name: &str) -> bool {
+    async fn is_writable(&self, name: &[u8]) -> bool {
+        let Some(name) = upstream_name(name) else {
+            return false;
+        };
         // Proxy the UPSTREAM channel's connection state, not the local cache.
         //
         // pva2pva `GWChannel::getAccessRights` delegates to the connected
@@ -1409,10 +1438,11 @@ impl ChannelSource for GatewayChannelSource {
     /// connection-pool entry so we don't pay a fresh search per call.
     async fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> Result<RpcReply, OpError> {
+        let name = upstream_name_op(name)?;
         // No monitor-gated preflight (see `put_value`): the RPC forwards
         // through the shared client, which connects on demand and surfaces
         // the upstream error itself.
@@ -1466,7 +1496,7 @@ impl ChannelSource for GatewayChannelSource {
                 method = ctx.creds.method,
             )));
         }
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         // no shared-cache preflight (see put_value_checked).
         // The RPC runs through the per-credential client, which resolves
         // existence and returns the upstream error itself.
@@ -1505,7 +1535,8 @@ impl ChannelSource for GatewayChannelSource {
     /// success, so a downstream `caput -c` / `pvcall .PROC` never
     /// actually triggers the upstream record. This override forwards
     /// `pvprocess` through the shared client, which connects on demand.
-    async fn process(&self, name: &str) -> Result<(), OpError> {
+    async fn process(&self, name: &[u8]) -> Result<(), OpError> {
+        let name = upstream_name_op(name)?;
         // No monitor-gated preflight (see `put_value`): PROCESS forwards
         // through the shared client, which connects on demand and surfaces
         // the upstream error itself.
@@ -1543,7 +1574,7 @@ impl ChannelSource for GatewayChannelSource {
                 method = ctx.creds.method,
             )));
         }
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         // no shared-cache preflight (see put_value_checked).
         // PROCESS runs through the per-credential client, which resolves
         // existence and returns the upstream error itself.
@@ -1592,9 +1623,10 @@ impl ChannelSource for GatewayChannelSource {
 
     async fn channel_array_init(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Result<FieldDesc, OpError> {
+        let name = upstream_name_op(name)?;
         // INIT only resolves the bound array field's introspection — no
         // access check here, exactly as the native server gates per sub-op
         // rather than at create. Forward an upstream describe carrying the
@@ -1625,7 +1657,7 @@ impl ChannelSource for GatewayChannelSource {
                 method = ctx.creds.method,
             )));
         }
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         let client = self.upstream_client_for(&ctx);
         let result = match ctx.pv_request.as_ref() {
             Some(req) => {
@@ -1658,7 +1690,7 @@ impl ChannelSource for GatewayChannelSource {
                 method = ctx.creds.method,
             )));
         }
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         let client = self.upstream_client_for(&ctx);
         let result = match ctx.pv_request.as_ref() {
             Some(req) => {
@@ -1687,7 +1719,7 @@ impl ChannelSource for GatewayChannelSource {
                 method = ctx.creds.method,
             )));
         }
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         let client = self.upstream_client_for(&ctx);
         let result = match ctx.pv_request.as_ref() {
             Some(req) => {
@@ -1715,7 +1747,7 @@ impl ChannelSource for GatewayChannelSource {
                 method = ctx.creds.method,
             )));
         }
-        let name = checked.pv_name();
+        let name = upstream_name_op(checked.pv_name())?;
         let client = self.upstream_client_for(&ctx);
         let result = match ctx.pv_request.as_ref() {
             Some(req) => {
@@ -1730,8 +1762,9 @@ impl ChannelSource for GatewayChannelSource {
 
     async fn subscribe_raw(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
+        let name = upstream_name(name)?;
         // legacy ctx-less path: updates-only, seed discarded (the
         // single-seed server path uses `subscribe_raw_seeded`).
         self.subscribe_raw_inner(self.cache.clone(), name, None)
@@ -1739,7 +1772,8 @@ impl ChannelSource for GatewayChannelSource {
             .map(|(_initial, updates)| MonitorStream::Channel(updates))
     }
 
-    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, name: &[u8]) -> Option<MonitorStream<PvField>> {
+        let name = upstream_name(name)?;
         // legacy ctx-less path: updates-only, seed discarded (the
         // single-seed server path uses `subscribe_seeded`). The internal
         // stream is `MonitorUpdate`; adapt to bare `PvField` for this
@@ -1772,6 +1806,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> Option<SourceRead> {
+        let name = upstream_name(checked.pv_name())?;
         if !checked.allows_read() {
             return None;
         }
@@ -1779,10 +1814,10 @@ impl ChannelSource for GatewayChannelSource {
         let read = match ctx.pv_request.as_ref() {
             Some(req) => {
                 client
-                    .pvget_pv_field_with_request_value_marked(checked.pv_name(), req)
+                    .pvget_pv_field_with_request_value_marked(name, req)
                     .await
             }
-            None => client.pvget_marked(checked.pv_name()).await,
+            None => client.pvget_marked(name).await,
         };
         read.ok().map(upstream_read)
     }
@@ -1792,6 +1827,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> Option<PvField> {
+        let name = upstream_name(checked.pv_name())?;
         if !checked.allows_read() {
             return None;
         }
@@ -1815,11 +1851,11 @@ impl ChannelSource for GatewayChannelSource {
         let client = self.upstream_client_for(&ctx);
         match ctx.pv_request.as_ref() {
             Some(req) => client
-                .pvget_pv_field_with_request_value(checked.pv_name(), req)
+                .pvget_pv_field_with_request_value(name, req)
                 .await
                 .map(|(_desc, value)| value)
                 .ok(),
-            None => client.pvget(checked.pv_name()).await.ok(),
+            None => client.pvget(name).await.ok(),
         }
     }
 
@@ -1829,16 +1865,13 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> Option<MonitorStream<PvField>> {
+        let name = upstream_name(checked.pv_name())?;
         if !checked.allows_read() {
             return None;
         }
-        self.subscribe_inner(
-            self.upstream_cache_for(&ctx),
-            checked.pv_name(),
-            ctx.pv_request.as_ref(),
-        )
-        .await
-        .map(|(_initial, updates)| monitor_updates_to_values(self.reactor(), updates))
+        self.subscribe_inner(self.upstream_cache_for(&ctx), name, ctx.pv_request.as_ref())
+            .await
+            .map(|(_initial, updates)| monitor_updates_to_values(self.reactor(), updates))
     }
 
     /// route raw MONITOR through per-credential upstream cache.
@@ -1847,16 +1880,13 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
+        let name = upstream_name(checked.pv_name())?;
         if !checked.allows_read() {
             return None;
         }
-        self.subscribe_raw_inner(
-            self.upstream_cache_for(&ctx),
-            checked.pv_name(),
-            ctx.pv_request.as_ref(),
-        )
-        .await
-        .map(|(_initial, updates)| MonitorStream::Channel(updates))
+        self.subscribe_raw_inner(self.upstream_cache_for(&ctx), name, ctx.pv_request.as_ref())
+            .await
+            .map(|(_initial, updates)| MonitorStream::Channel(updates))
     }
 
     /// decoded MONITOR with the downstream's event-affecting
@@ -1928,15 +1958,12 @@ impl ChannelSource for GatewayChannelSource {
             epics_pva_rs::server_native::source::MonitorUpdate,
         >,
     > {
+        let name = upstream_name(checked.pv_name())?;
         if !checked.allows_read() {
             return None;
         }
         let (initial, updates) = self
-            .subscribe_inner(
-                self.upstream_cache_for(&ctx),
-                checked.pv_name(),
-                ctx.pv_request.as_ref(),
-            )
+            .subscribe_inner(self.upstream_cache_for(&ctx), name, ctx.pv_request.as_ref())
             .await?;
         // `subscribe_inner` already yields a `MonitorUpdate` stream that
         // carries the `type_changed` boundary; forward it as the
@@ -1974,15 +2001,12 @@ impl ChannelSource for GatewayChannelSource {
             epics_pva_rs::server_native::RawMonitorEvent,
         >,
     > {
+        let name = upstream_name(checked.pv_name())?;
         if !checked.allows_read() {
             return None;
         }
         let (initial, updates) = self
-            .subscribe_raw_inner(
-                self.upstream_cache_for(&ctx),
-                checked.pv_name(),
-                ctx.pv_request.as_ref(),
-            )
+            .subscribe_raw_inner(self.upstream_cache_for(&ctx), name, ctx.pv_request.as_ref())
             .await?;
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
             // Same contract as `subscribe_seeded`: the seed is whole-structure
@@ -2016,7 +2040,8 @@ impl ChannelSource for GatewayChannelSource {
     /// (broadcast lag → `pending_overrun` → the overrun mark on the next body,
     /// see `subscribe_raw_inner` / `subscribe_inner`) IS pva2pva's mechanism,
     /// and it needs no upstream throttle.
-    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    async fn monitor_watermarks(&self, name: &[u8]) -> Option<(usize, usize)> {
+        let name = upstream_name(name)?;
         let _ = name;
         None
     }
@@ -2027,6 +2052,16 @@ mod tests {
     use super::*;
     use epics_base_rs::server::access_security::parse_acf;
     use epics_pva_rs::server_native::source::OpErrorKind;
+
+    /// The upstream client names text, so a non-UTF-8 downstream name is
+    /// refused at the gateway rather than forwarded under a lossy rename.
+    #[test]
+    fn a_non_utf8_name_is_refused_at_the_upstream_boundary() {
+        assert_eq!(upstream_name(b"GW:PV"), Some("GW:PV"));
+        assert_eq!(upstream_name(b"TEMP:\xb0C"), None);
+        let err = upstream_name_op(b"TEMP:\xb0C").unwrap_err();
+        assert_eq!(err.kind, OpErrorKind::Failed);
+    }
 
     fn make_ctx(host: &str, account: &str, method: &str) -> ChannelContext {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2164,7 +2199,7 @@ mod tests {
     async fn r18_25_gateway_declares_no_pipeline_watermarks() {
         let src = make_source();
         assert_eq!(
-            <GatewayChannelSource as ChannelSource>::monitor_watermarks(&src, "ANY:PV").await,
+            <GatewayChannelSource as ChannelSource>::monitor_watermarks(&src, b"ANY:PV").await,
             None,
             "a downstream monitor must never throttle the shared upstream"
         );
@@ -2322,10 +2357,10 @@ ASG(LOCKED) {
         .unwrap();
         src.set_acf(Some(cfg)).await;
 
-        src.set_asg_resolver(Some(Arc::new(|pv: &str| {
-            if pv.starts_with("set:") {
+        src.set_asg_resolver(Some(Arc::new(|pv: &[u8]| {
+            if pv.starts_with(b"set:") {
                 "OPERATOR".to_string()
-            } else if pv.starts_with("dev:") {
+            } else if pv.starts_with(b"dev:") {
                 "LOCKED".to_string()
             } else {
                 "DEFAULT".to_string()
@@ -2482,7 +2517,7 @@ ASG(DEFAULT) {
 
         let dummy = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
         let err = src
-            .put_value("any:pv", dummy)
+            .put_value(b"any:pv", dummy)
             .await
             .expect_err("ctx-less PUT must be denied by the gateway ACF");
         assert_eq!(
@@ -2504,7 +2539,7 @@ ASG(DEFAULT) {
     async fn bug3_put_value_passthrough_when_no_acf() {
         let src = make_source();
         let dummy = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
-        if let Err(msg) = src.put_value("any:pv", dummy).await {
+        if let Err(msg) = src.put_value(b"any:pv", dummy).await {
             assert!(
                 !msg.message.contains("denied by gateway access security"),
                 "no-ACF PUT must NOT be ACL-denied: {msg:?}",

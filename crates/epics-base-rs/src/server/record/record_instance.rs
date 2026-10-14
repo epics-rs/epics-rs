@@ -70,11 +70,11 @@ pub(crate) fn monitor_switch_word(switch_: super::MonitorSwitch) -> &'static str
 /// Rendering is idempotent under the parser — `L:B NPP NMS` parses to the link
 /// `L:B` does — so a consumer that re-parses what a reader saw gets the link
 /// the store holds.
-pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &str) -> String {
+pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &[u8]) -> PvString {
     use super::{LinkFieldType, LinkProcessPolicy};
     use crate::types::DbfLinkClass;
 
-    let text = raw.trim();
+    let text = super::trim_link_text(raw);
     let ftype = LinkFieldType::for_class(class);
     // The parse already applied C's per-field-type modifier mask
     // (`dbStaticLib.c:2380-2391`), so a `DBF_FWDLINK` reaching the arm below
@@ -84,19 +84,19 @@ pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &str) ->
         ParsedLink::Ca(link) => (link.policy, link.monitor_switch, true),
         // The store holds the parsed bus numbers, so the text comes from
         // them and from nowhere else.
-        ParsedLink::Hw(hw) => return hw.render(),
-        _ => return text.to_string(),
+        ParsedLink::Hw(hw) => return hw.render().into(),
+        _ => return text.into(),
     };
-    let target = text.split_once(' ').map_or(text, |(head, _)| head);
+    let target = link_target_head(text);
 
     // A forward link prints its target and, alone among the modifiers, ` CA`
     // (`dbStaticLib.c:2034-2044`): no process class and no maximize-severity
     // switch, which is why C answers a bare `FLNK` with just the record name.
     if matches!(class, DbfLinkClass::FwdLink) {
         return if ca_class {
-            format!("{target} CA")
+            [target, b" CA"].concat().into()
         } else {
-            target.to_string()
+            target.into()
         };
     }
 
@@ -114,7 +114,19 @@ pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &str) ->
             LinkProcessPolicy::ChannelProcessPassive => " CPP",
         }
     };
-    format!("{target}{pp} {}", monitor_switch_word(ms))
+    [
+        target,
+        pp.as_bytes(),
+        b" ",
+        monitor_switch_word(ms).as_bytes(),
+    ]
+    .concat()
+    .into()
+}
+
+/// The slice of a link's text before its first space: C's `pv_link.pvname`.
+fn link_target_head(text: &[u8]) -> &[u8] {
+    text.split(|&b| b == b' ').next().unwrap_or(text)
 }
 
 /// [`render_link_field`] for a link `dbRemoveLink` removed, of type `ty`:
@@ -124,31 +136,36 @@ pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &str) ->
 fn render_removed_link(
     class: crate::types::DbfLinkClass,
     ty: super::DbLinkType,
-    raw: &str,
-) -> String {
-    let text = raw.trim();
+    raw: &[u8],
+) -> PvString {
+    let text = super::trim_link_text(raw);
     if ty != super::DbLinkType::PvLink {
-        return text.to_string();
+        return text.into();
     }
-    let target = text.split_once(' ').map_or(text, |(head, _)| head);
+    let target = link_target_head(text);
     if matches!(class, crate::types::DbfLinkClass::FwdLink) {
-        target.to_string()
+        target.into()
     } else {
-        format!("{target} NPP NMS")
+        [target, b" NPP NMS"].concat().into()
     }
 }
 
 /// C `dbGetString`'s `PN_LINK` arm (`dbStaticLib.c:1930-1933`): the target
 /// and the severity switch, nothing else.
-fn render_pn_link(raw: &str) -> String {
-    let text = raw.trim();
+fn render_pn_link(raw: &[u8]) -> PvString {
+    let text = super::trim_link_text(raw);
     let ms = match super::parse_link_field(text, super::LinkFieldType::In) {
         ParsedLink::Db(link) => link.monitor_switch,
         ParsedLink::Ca(link) => link.monitor_switch,
-        _ => return text.to_string(),
+        _ => return text.into(),
     };
-    let target = text.split_once(' ').map_or(text, |(head, _)| head);
-    format!("{target} {}", monitor_switch_word(ms))
+    [
+        link_target_head(text),
+        b" ",
+        monitor_switch_word(ms).as_bytes(),
+    ]
+    .concat()
+    .into()
 }
 
 /// Every client-visible `special(SPC_NOMOD)` field of `dbCommon.dbd:13-190`.
@@ -296,7 +313,7 @@ pub struct NotifyWaitSet {
     /// holding this set is named here or as [`Self::entry`]" holds by
     /// construction. The entry record is never repeated here: it is named
     /// already, and a WRITE_NOTIFY then pays no second copy of its name.
-    joined: StdMutex<Vec<Box<str>>>,
+    joined: StdMutex<Vec<crate::types::RecordName>>,
     tx: StdMutex<Option<crate::runtime::sync::oneshot::Sender<()>>>,
     /// C `dbChannelRecord(ppn->chan)` — the record the notify was ISSUED
     /// against, as opposed to the records that joined its chain.
@@ -318,7 +335,7 @@ pub struct NotifyWaitSet {
     /// the member `dbNotifyDump` prints a block for (`dbNotify.c:659-660`).
     ///
     /// [`PvDatabase::new_put_notify`]: crate::server::database::PvDatabase::new_put_notify
-    entry: Option<Box<str>>,
+    entry: Option<crate::types::RecordName>,
 }
 
 impl NotifyWaitSet {
@@ -343,21 +360,21 @@ impl NotifyWaitSet {
     /// `dbChannelRecord(ppn->chan)` is `record` and that is the one record
     /// `dbNotifyDump` prints a block for.
     pub(crate) fn for_entry_record(
-        record: &str,
+        record: &crate::types::RecordName,
         tx: crate::runtime::sync::oneshot::Sender<()>,
     ) -> Arc<Self> {
         Arc::new(Self {
             pending: AtomicUsize::new(1),
             joined: StdMutex::new(Vec::new()),
             tx: StdMutex::new(Some(tx)),
-            entry: Some(record.into()),
+            entry: Some(record.clone()),
         })
     }
 
     /// The record this notify was issued against, or `None` for a set with
     /// no `processNotify` behind it. See [`Self::entry`].
-    pub(crate) fn entry_record(&self) -> Option<&str> {
-        self.entry.as_deref()
+    pub(crate) fn entry_record(&self) -> Option<&crate::types::RecordName> {
+        self.entry.as_ref()
     }
 
     /// A PP target joined the chain (C `dbNotifyAdd`). Balanced by exactly
@@ -392,9 +409,9 @@ impl NotifyWaitSet {
     /// Private to this module and called from the one slot writer
     /// ([`RecordInstance::take_notify_slot`]), so joining the list and taking
     /// the slot are one act and cannot be done separately.
-    fn record_joined(&self, name: &str) {
-        if self.entry.as_deref() != Some(name) {
-            self.joined.lock().unwrap().push(name.into());
+    fn record_joined(&self, name: &crate::types::RecordName) {
+        if self.entry.as_ref() != Some(name) {
+            self.joined.lock().unwrap().push(name.clone());
         }
     }
 
@@ -405,7 +422,7 @@ impl NotifyWaitSet {
     /// hold this mutex while it does. Growth after the snapshot is not a
     /// missed member: a record can only join a set that is still answerable,
     /// and this is read only of a set that is not.
-    pub(crate) fn joined_records(&self) -> Vec<Box<str>> {
+    pub(crate) fn joined_records(&self) -> Vec<crate::types::RecordName> {
         let joined = self.joined.lock().unwrap();
         self.entry.iter().chain(joined.iter()).cloned().collect()
     }
@@ -1226,6 +1243,7 @@ mod link_cache {
     use crate::server::device_support::SoftDtyp;
     use crate::server::recgbl::simm::has_const_lset;
     use crate::server::record::{DbLinkType, LinkFieldType, MonitorSwitch, ParsedLink};
+    use crate::types::PvString;
     use std::sync::{Arc, LazyLock};
 
     /// A parsed `dbCommon` link, readable as the [`ParsedLink`] it holds and
@@ -1428,7 +1446,7 @@ mod link_cache {
     pub(crate) struct PreparedCommonLink {
         pub(super) field: &'static str,
         ftype: LinkFieldType,
-        pub(super) text: String,
+        pub(super) text: PvString,
         pub(super) parsed: Arc<ParsedLink>,
         /// The new dset of a device-link put, prepared before the hold by
         /// [`Self::ask_add_record`].
@@ -1473,7 +1491,7 @@ mod link_cache {
         /// `Some` when `field` is one of the `dbCommon` link fields (and
         /// swait's `OUTN`) and `value` a string.
         pub(crate) fn for_put(
-            record: &str,
+            record: &[u8],
             field: &str,
             value: &crate::types::EpicsValue,
         ) -> Option<Self> {
@@ -1492,14 +1510,14 @@ mod link_cache {
             ]
             .into_iter()
             .find(|(f, _)| f.eq_ignore_ascii_case(field))?;
-            let text = text.as_str_lossy().into_owned();
+            let text = text.clone();
             // C `dbParseLink` (dbStaticLib.c:2382-2386) discards a CP/CPP
             // modifier on a DBF_OUTLINK and warns once, as it parses; the
             // discard itself is `parse_link_field`'s.
             if field == "OUT" && crate::server::record::out_link_discards_cp(&text) {
                 tracing::warn!(
                     target: "epics_base_rs::record",
-                    record = %record,
+                    record = %String::from_utf8_lossy(record),
                     field = "OUT",
                     link = %text,
                     "Discarding CP/CPP modifier in CA output link"
@@ -1508,7 +1526,7 @@ mod link_cache {
             Some(PreparedCommonLink {
                 field,
                 ftype,
-                parsed: parse(&text, ftype),
+                parsed: parse(text.as_bytes(), ftype),
                 text,
                 device: None,
                 add_record_refusal: None,
@@ -1576,7 +1594,7 @@ mod link_cache {
                         db,
                         record_type,
                         &dtyp,
-                        &self.text,
+                        self.text.as_bytes(),
                     )
                 } else {
                     Ok(crate::server::device_support::Dpvt::Null)
@@ -1591,10 +1609,13 @@ mod link_cache {
             } else if bound_here && !row.is_some_and(|row| row.dset.extends) {
                 NewDset::Keep
             } else {
+                // A device address is text to its support; a name's bytes
+                // reach no dset through this context.
+                let text = self.text.as_str_lossy();
                 let (inp, out) = if self.field == "INP" {
-                    (self.text.as_str(), "")
+                    (text.as_ref(), "")
                 } else {
-                    ("", self.text.as_str())
+                    ("", text.as_ref())
                 };
                 let ctx = crate::server::ioc_app::DeviceSupportContext {
                     record_type,
@@ -1680,7 +1701,7 @@ mod link_cache {
         /// The text parsed, for the debug check that no writer went around
         /// the put funnel.
         #[cfg(debug_assertions)]
-        text: String,
+        text: PvString,
     }
 
     /// The first eight bytes of a field name, zero-padded: with the length, a
@@ -1723,7 +1744,7 @@ mod link_cache {
         }
     }
 
-    fn parse(text: &str, ftype: LinkFieldType) -> Arc<ParsedLink> {
+    fn parse(text: &[u8], ftype: LinkFieldType) -> Arc<ParsedLink> {
         match crate::server::record::parse_link_field(text, ftype) {
             ParsedLink::None => SHARED[NONE].clone(),
             parsed => Arc::new(parsed),
@@ -1749,7 +1770,7 @@ mod link_cache {
         ftype: LinkFieldType,
         parsed: Arc<ParsedLink>,
         #[cfg(debug_assertions)]
-        text: String,
+        text: PvString,
     }
 
     impl PreparedLink {
@@ -1770,13 +1791,12 @@ mod link_cache {
             // is one the record holds and has a slot ([`LinkSlots::of`]).
             let desc = super::field_desc_in(fields, field)?;
             let ftype = slot_type(desc)?;
-            let text = text.as_str_lossy();
             Some(PreparedLink {
                 field: desc.name,
                 ftype,
-                parsed: parse(&text, ftype),
+                parsed: parse(text.as_bytes(), ftype),
                 #[cfg(debug_assertions)]
-                text: text.into_owned(),
+                text: text.clone(),
             })
         }
 
@@ -1849,7 +1869,7 @@ mod link_cache {
                 slots.0.push(LinkSlot {
                     key: field_key(field),
                     field,
-                    parsed: parse(&text, ftype),
+                    parsed: parse(text.as_bytes(), ftype),
                     #[cfg(debug_assertions)]
                     text,
                 });
@@ -1890,7 +1910,7 @@ mod link_cache {
             &mut self,
             i: usize,
             desc: &crate::server::record::FieldDesc,
-            text: &str,
+            text: &[u8],
         ) {
             let Some(ftype) = slot_type(desc) else {
                 return;
@@ -1898,7 +1918,7 @@ mod link_cache {
             self.set(i, parse(text, ftype));
             #[cfg(debug_assertions)]
             {
-                self.0[i].text = text.to_owned();
+                self.0[i].text = text.into();
             }
         }
 
@@ -1971,8 +1991,8 @@ mod link_cache {
         }
 
         #[cfg(debug_assertions)]
-        pub(super) fn text_at(&self, i: usize) -> &str {
-            &self.0[i].text
+        pub(super) fn text_at(&self, i: usize) -> &[u8] {
+            self.0[i].text.as_bytes()
         }
 
         /// The slot of each [`CycleLink`] the type declares. The slots never
@@ -2024,9 +2044,9 @@ mod link_cache {
                     .map(|field| LinkSlot {
                         key: field_key(field),
                         field,
-                        parsed: parse("", LinkFieldType::In),
+                        parsed: parse(b"", LinkFieldType::In),
                         #[cfg(debug_assertions)]
-                        text: String::new(),
+                        text: PvString::new(),
                     })
                     .into(),
                 SimlLset::default(),
@@ -2052,7 +2072,7 @@ mod link_cache {
             slots.remove(i);
             assert!(!slots.siml_has_const_lset());
             let desc = super::super::field_desc_in(ai.field_list(), "SIML").unwrap();
-            slots.install_text(i, desc, "");
+            slots.install_text(i, desc, b"");
             assert!(slots.siml_has_const_lset());
             assert!(LinkSlots::default().siml_has_const_lset(), "no SIML");
         }
@@ -2064,9 +2084,9 @@ mod link_cache {
                     .map(|field| LinkSlot {
                         key: field_key(field),
                         field,
-                        parsed: parse("", LinkFieldType::In),
+                        parsed: parse(b"", LinkFieldType::In),
                         #[cfg(debug_assertions)]
-                        text: String::new(),
+                        text: PvString::new(),
                     })
                     .into(),
                 SimlLset::default(),
@@ -2404,7 +2424,7 @@ pub struct RecordCell {
     cp_edges_revision: std::sync::atomic::AtomicU64,
     /// C `dbCommon::name`, fixed at construction like `rdes`, so a message
     /// naming the record is built with no borrow of it held.
-    name: std::sync::Arc<str>,
+    name: crate::types::RecordName,
     /// The cached answer, valid only while [`Self::cp_edges_revision`] still
     /// matches the registry's.
     cp_edges: std::sync::atomic::AtomicBool,
@@ -3349,7 +3369,7 @@ impl RecordCell {
             cp_edges_revision: std::sync::atomic::AtomicU64::new(0),
             cp_edges: std::sync::atomic::AtomicBool::new(false),
             rdes: RecordDesc::of(&*instance.record),
-            name: instance.name.as_str().into(),
+            name: instance.name.clone(),
             put_facts: put_facts(&mut instance, &slots),
             slots,
             multi_input_val_slots: instance
@@ -3494,7 +3514,7 @@ impl RecordCell {
     }
 
     /// The record's name — C `precord->name` — without taking its lock set.
-    pub fn name(&self) -> &std::sync::Arc<str> {
+    pub fn name(&self) -> &crate::types::RecordName {
         &self.name
     }
 
@@ -3895,7 +3915,7 @@ impl Drop for RecordMut<'_> {
 /// One entry of [`RecordInstance::parsed_inputs`]: a link text the record
 /// held at some read, its parse, and the local record the parse addressed.
 pub(crate) struct ParsedInputLink {
-    text: String,
+    text: PvString,
     /// The [`Record::input_links_generation`] the record answered when
     /// `text` was last read off it, for a type that answers one: while the
     /// record still answers it, `text` IS the field's text and the cycle
@@ -4015,7 +4035,7 @@ impl ParsedInputLink {
             && entry.generation == generation
         {
             debug_assert!(
-                record.link_text_ref(declared[slot].0) == Some(entry.text.as_str()),
+                record.link_text_ref(declared[slot].0) == Some(entry.text.as_bytes()),
                 "{}: the link text changed under generation {generation:?} — \
                  a writer of the text does not move input_links_generation",
                 declared[slot].0
@@ -4024,12 +4044,12 @@ impl ParsedInputLink {
         }
         let link_field = declared[slot].0;
         let owned;
-        let text: &str = match record.link_text_ref(link_field) {
-            Some("") => return None,
+        let text: &[u8] = match record.link_text_ref(link_field) {
+            Some([]) => return None,
             Some(text) => text,
             None => {
                 owned = link_text_of(record, link_field)?;
-                &owned
+                owned.as_bytes()
             }
         };
         if cell.as_ref().is_none_or(|entry| entry.text != text) {
@@ -4043,9 +4063,9 @@ impl ParsedInputLink {
     /// A slot's entry for a text it has not held: the parse, with no target
     /// resolved yet. Its own frame so the cycle's byte-for-byte reuse test
     /// does not carry the parser's.
-    fn fresh(text: &str) -> ParsedInputLink {
+    fn fresh(text: &[u8]) -> ParsedInputLink {
         ParsedInputLink {
-            text: text.to_owned(),
+            text: text.into(),
             generation: None,
             parsed: Arc::new(parse_link_v2(text)),
             answers: None,
@@ -4192,12 +4212,12 @@ impl SimLink {
 
 /// The text of link field `field` of `record`, `None` when the link is unset
 /// — [`RecordInstance::link_text`] over the record alone.
-fn link_text_of(record: &dyn Record, field: &str) -> Option<String> {
+fn link_text_of(record: &dyn Record, field: &str) -> Option<PvString> {
     if let Some(text) = record.link_text_ref(field) {
-        return (!text.is_empty()).then(|| text.to_owned());
+        return (!text.is_empty()).then(|| text.into());
     }
     match record.get_field(field)? {
-        EpicsValue::String(text) if !text.is_empty() => Some(text.as_str_lossy().into_owned()),
+        EpicsValue::String(text) if !text.is_empty() => Some(text),
         _ => None,
     }
 }
@@ -4207,7 +4227,7 @@ fn link_text_of(record: &dyn Record, field: &str) -> Option<String> {
 pub(crate) struct ResolvedTarget {
     pub(crate) rec: Arc<RecordCell>,
     /// The record's canonical name — the link may name an alias.
-    pub(crate) name: Arc<str>,
+    pub(crate) name: crate::types::RecordName,
     /// The field, with the answers a `dbPut` through the link asks.
     pub(crate) put: PutAddr,
     /// The slot a `DBR_DOUBLE` read takes straight off the record: the link
@@ -4750,7 +4770,8 @@ pub struct RecordInstance {
     /// [`Self::take_next_notify_restart`], which pops only onto a record no
     /// put-notify owns.
     notify_restart_list: std::collections::VecDeque<DeferredNotify>,
-    pub name: String,
+    /// C `dbCommon::name`: bytes — see [`RecordName`](crate::types::RecordName).
+    pub name: crate::types::RecordName,
     /// What this record's TYPE can reach in a process cycle, settled once at
     /// construction. See [`ProcessPlan`].
     /// C's `UDF_ALARM` guard for this type, or `None` for a type whose C
@@ -5731,19 +5752,19 @@ impl RecordInstance {
         }
     }
 
-    pub fn new(name: String, record: impl Record) -> Self {
+    pub fn new(name: impl Into<crate::types::RecordName>, record: impl Record) -> Self {
         Self::new_boxed(name, Box::new(record))
     }
 
     /// The raw text of one `dbCommon` link field, or `None` for any
     /// other field name.
-    pub fn common_link_text(&self, field: &str) -> Option<&str> {
+    pub fn common_link_text(&self, field: &str) -> Option<&[u8]> {
         Some(match field {
-            "INP" => self.common.text.inp.as_str(),
-            "OUT" => self.common.text.out.as_str(),
-            "TSEL" => self.common.text.tsel.as_str(),
-            "SDIS" => self.common.text.sdis.as_str(),
-            "FLNK" => self.common.text.flnk.as_str(),
+            "INP" => self.common.text.inp.as_bytes(),
+            "OUT" => self.common.text.out.as_bytes(),
+            "TSEL" => self.common.text.tsel.as_bytes(),
+            "SDIS" => self.common.text.sdis.as_bytes(),
+            "FLNK" => self.common.text.flnk.as_bytes(),
             _ => return None,
         })
     }
@@ -6292,12 +6313,12 @@ impl RecordInstance {
         link_field: &str,
     ) -> Option<Arc<ParsedLink>> {
         let owned;
-        let text: &str = match self.record.link_text_ref(link_field) {
-            Some("") => return None,
+        let text: &[u8] = match self.record.link_text_ref(link_field) {
+            Some([]) => return None,
             Some(text) => text,
             None => {
                 owned = self.link_text(link_field)?;
-                &owned
+                owned.as_bytes()
             }
         };
         match self.parsed_inputs.get(slot) {
@@ -6369,7 +6390,7 @@ impl RecordInstance {
             let field = self.link_slots.field_at(i);
             let held = match self.record.link_text_ref(field) {
                 Some(text) if !text.is_empty() => Cow::Borrowed(text),
-                _ => Cow::Owned(self.link_text(field).unwrap_or_default()),
+                _ => Cow::Owned(self.link_text(field).unwrap_or_default().into_bytes()),
             };
             debug_assert_eq!(
                 held,
@@ -6452,17 +6473,17 @@ impl RecordInstance {
     /// A link the record leaves to the framework (`mca`'s SIML/SIOL) keeps
     /// its text in the override store, read here after the record.
     #[inline]
-    pub(crate) fn link_text(&self, field: &str) -> Option<String> {
+    pub(crate) fn link_text(&self, field: &str) -> Option<PvString> {
         link_text_of(&*self.record, field).or_else(|| self.override_link_text(field))
     }
 
     #[cold]
-    fn override_link_text(&self, field: &str) -> Option<String> {
+    fn override_link_text(&self, field: &str) -> Option<PvString> {
         if self.cold.declared_overrides.is_empty() {
             return None;
         }
         match self.cold.declared_overrides.get(field)? {
-            EpicsValue::String(text) if !text.is_empty() => Some(text.as_str_lossy().into_owned()),
+            EpicsValue::String(text) if !text.is_empty() => Some(text.clone()),
             _ => None,
         }
     }
@@ -6476,7 +6497,7 @@ impl RecordInstance {
         }
     }
 
-    pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
+    pub fn new_boxed(name: impl Into<crate::types::RecordName>, record: Box<dyn Record>) -> Self {
         let rtype = record.record_type();
         // The reverse index of `Record::link_backed_metadata_field`, built once
         // from the record's own declaration so no second list can go stale.
@@ -6557,7 +6578,7 @@ impl RecordInstance {
 
         Self {
             destroyed: false,
-            name,
+            name: name.into(),
             record,
             common,
             subscribers: smallvec::SmallVec::new(),
@@ -7354,7 +7375,7 @@ impl RecordInstance {
 
     /// [`Record::output_event`].
     #[inline(always)]
-    pub(crate) fn output_event(&self) -> Option<String> {
+    pub(crate) fn output_event(&self) -> Option<crate::types::PvString> {
         if self.has_hook(crate::server::record::CycleHooks::OUTPUT_HOOKS) {
             self.record.output_event()
         } else {
@@ -7818,13 +7839,13 @@ impl RecordInstance {
         else {
             return value;
         };
-        let text = text.as_str_lossy();
+        let text = text.as_bytes();
         let rendered = match self.declared_record_link(desc.name).map(|l| &**l) {
-            Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, &text),
-            _ if desc.name == "INP" && self.inp_is_pn_link() => render_pn_link(&text),
-            _ => render_link_field(class, &text),
+            Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, text),
+            _ if desc.name == "INP" && self.inp_is_pn_link() => render_pn_link(text),
+            _ => render_link_field(class, text),
         };
-        EpicsValue::String(rendered.as_str().into())
+        EpicsValue::String(rendered)
     }
 
     /// C `!dbLinkIsDefined(plink)` for a link a runtime put removed: a
@@ -8028,7 +8049,7 @@ impl RecordInstance {
     fn check_link_assignment(
         &self,
         upper_field: &str,
-        text: &str,
+        text: &[u8],
         bound: MenuBound,
     ) -> CaResult<()> {
         if matches!(bound, MenuBound::DbLoad) {
@@ -8956,7 +8977,7 @@ impl RecordInstance {
             CommonField::Asl => Some(EpicsValue::Char(self.common.asl)),
             CommonField::Desc => Some(EpicsValue::String(self.common.text.desc.clone())),
             CommonField::Phas => Some(EpicsValue::Short(self.common.phas)),
-            CommonField::Evnt => Some(EpicsValue::String(self.common.text.evnt.clone().into())),
+            CommonField::Evnt => Some(EpicsValue::String(self.common.text.evnt.clone())),
             CommonField::Prio => Some(EpicsValue::Short(self.common.prio)),
             CommonField::Disv => Some(EpicsValue::Short(self.common.disv)),
             CommonField::Disa => Some(EpicsValue::Short(self.common.disa)),
@@ -9259,7 +9280,7 @@ impl RecordInstance {
     ) -> CaResult<CommonFieldPutResult> {
         let mut link = PreparedCommonLink::for_put(&self.name, name, &value);
         if let Some(link) = &mut link {
-            self.check_link_assignment(link.field, &link.text, bound)?;
+            self.check_link_assignment(link.field, link.text.as_bytes(), bound)?;
             // The database's put bodies run the gate under their own hold.
             if matches!(bound, MenuBound::DbPut) {
                 self.gate_device_link_put(link)?;
@@ -9813,14 +9834,14 @@ impl RecordInstance {
                 // backward compatibility (numeric events / a calc
                 // record driving EVNT) by formatting it as a string.
                 match value {
-                    EpicsValue::String(s) => self.common.text.evnt = s.as_str_lossy().into_owned(),
-                    EpicsValue::Short(v) => self.common.text.evnt = v.to_string(),
-                    EpicsValue::Long(v) => self.common.text.evnt = v.to_string(),
-                    EpicsValue::Enum(v) => self.common.text.evnt = v.to_string(),
+                    EpicsValue::String(s) => self.common.text.evnt = s,
+                    EpicsValue::Short(v) => self.common.text.evnt = v.to_string().into(),
+                    EpicsValue::Long(v) => self.common.text.evnt = v.to_string().into(),
+                    EpicsValue::Enum(v) => self.common.text.evnt = v.to_string().into(),
                     EpicsValue::Double(v) => {
                         // Match C `eventNameToHandle`: a double with
                         // an integer part is treated as that integer.
-                        self.common.text.evnt = (v as i64).to_string();
+                        self.common.text.evnt = (v as i64).to_string().into();
                     }
                     _ => {}
                 }
@@ -10099,8 +10120,7 @@ impl RecordInstance {
                 if let (Some(i), EpicsValue::String(text)) =
                     (self.link_slots.position(desc.name), &coerced)
                 {
-                    self.link_slots
-                        .install_text(i, desc, text.as_str_lossy().as_ref());
+                    self.link_slots.install_text(i, desc, text.as_bytes());
                 }
                 self.cold
                     .declared_overrides
@@ -10115,7 +10135,7 @@ impl RecordInstance {
     /// Get virtual fields (NAME, RTYP).
     pub fn get_virtual_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "NAME" => Some(EpicsValue::String(self.name.clone().into())),
+            "NAME" => Some(EpicsValue::String(self.name.as_bytes().into())),
             "RTYP" => Some(EpicsValue::String(
                 self.record.record_type().to_string().into(),
             )),
@@ -12945,7 +12965,7 @@ mod device_menu_marking_tests {
     /// an empty list instead.
     #[test]
     fn dtyp_of_a_record_type_with_no_device_support_supplies_no_choices() {
-        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        let inst = RecordInstance::new("X", CalcRecord::default());
         assert!(
             super::super::dbd_generated::device_menu("calc").is_none(),
             "precondition: calc declares no device() line (C ftPvt == NULL)"
@@ -12965,7 +12985,7 @@ mod device_menu_marking_tests {
     /// support, so its menu exists and its choices are served.
     #[test]
     fn dtyp_of_a_record_type_with_device_support_supplies_its_choices() {
-        let inst = RecordInstance::new("X".into(), AiRecord::default());
+        let inst = RecordInstance::new("X", AiRecord::default());
         let choices = inst
             .device_choices()
             .expect("ai declares device() lines, so its menu exists");
@@ -12981,7 +13001,7 @@ mod device_menu_marking_tests {
     /// rather than panicking or shifting.
     #[test]
     fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
-        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        let inst = RecordInstance::new("X", CalcRecord::default());
         assert_eq!(inst.dtyp_index(), 0);
     }
 
@@ -12990,7 +13010,7 @@ mod device_menu_marking_tests {
     #[test]
     fn a_dtyp_put_stores_the_device_menu_choice() {
         use crate::server::device_support::DtypName;
-        let mut inst = RecordInstance::new("X".into(), AiRecord::default());
+        let mut inst = RecordInstance::new("X", AiRecord::default());
         let raw = super::super::device_menu_choices("ai")
             .position(|c| c == "Raw Soft Channel")
             .unwrap();
@@ -13010,7 +13030,7 @@ mod device_menu_marking_tests {
 
     #[test]
     fn a_record_without_its_dset_is_still_bound_iocinit_529() {
-        let mut inst = RecordInstance::new("X".into(), AiRecord::default());
+        let mut inst = RecordInstance::new("X", AiRecord::default());
         inst.common.dtyp = "asynInt32".into();
         assert!(!inst.init_record_reaches_body());
         inst.run_init_passes("X", None);
@@ -13032,7 +13052,7 @@ mod device_menu_marking_tests {
             &[test_row("asynInt32"), test_row("asynUInt32Digital")];
         super::super::register_device_menu("mbbo", ASYN_MBBO);
 
-        let mut inst = RecordInstance::new("X".into(), MbboRecord::default());
+        let mut inst = RecordInstance::new("X", MbboRecord::default());
         let merged: Vec<String> = inst
             .device_choices()
             .expect("mbbo declares device() lines")
@@ -13069,7 +13089,7 @@ mod device_menu_marking_tests {
             &[test_row("asynInt32"), test_row("asynUInt32Digital")];
         super::super::register_device_menu("mbbo", ASYN_MBBO);
 
-        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        let inst = RecordInstance::new("X", CalcRecord::default());
         assert!(
             inst.device_choices().is_none(),
             "calc declares no device() and gets no contribution — still None"
@@ -13132,7 +13152,7 @@ mod metadata_cache_tests {
         let _ = rec.put_field("HOPR", EpicsValue::Double(100.0));
         let _ = rec.put_field("LOPR", EpicsValue::Double(0.0));
         let _ = rec.put_field("VAL", EpicsValue::Double(25.0));
-        RecordInstance::new("TEMP".to_string(), rec)
+        RecordInstance::new("TEMP", rec)
     }
 
     /// a record-field monitor whose event queue has run short of room
@@ -13685,19 +13705,19 @@ mod metadata_cache_tests {
         );
 
         // longout: `#define get_precision NULL`.
-        let lo = RecordInstance::new("LO".to_string(), LongoutRecord::default());
+        let lo = RecordInstance::new("LO", LongoutRecord::default());
         let lo = lo.snapshot_for_field("VAL").unwrap();
         assert!(!lo.properties.precision && lo.precision().is_none());
         assert!(lo.properties.units && lo.properties.graphic_double);
 
         // stringout: no property slot at all.
-        let so = RecordInstance::new("SO".to_string(), StringoutRecord::default());
+        let so = RecordInstance::new("SO", StringoutRecord::default());
         let so = so.snapshot_for_field("VAL").unwrap();
         assert_eq!(so.properties, PropertySupport::NONE);
         assert!(so.units().is_none(), "a stringout supplies no EGU");
 
         // waveform: `#define get_alarm_double NULL`.
-        let wf = RecordInstance::new("WF".to_string(), WaveformRecord::default());
+        let wf = RecordInstance::new("WF", WaveformRecord::default());
         let wf = wf.snapshot_for_field("VAL").unwrap();
         assert!(
             !wf.properties.alarm_double && wf.alarm_limits().is_none(),
@@ -13763,7 +13783,7 @@ mod metadata_cache_tests {
 
     #[test]
     fn field_metadata_override_applies_on_get_and_monitor_paths() {
-        let inst = RecordInstance::new("PFM".to_string(), PerFieldMetaRecord);
+        let inst = RecordInstance::new("PFM", PerFieldMetaRecord);
 
         // VAL: no override — record-level metadata serves it.
         let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -13856,7 +13876,7 @@ mod metadata_cache_tests {
     fn deadband_field_routes_readback_and_val_posts_only_on_change() {
         use crate::server::recgbl::EventMask;
         let mut inst = RecordInstance::new(
-            "RDB".to_string(),
+            "RDB",
             ReadbackDeadbandRecord {
                 val: 5.0,
                 rbv: 0.0,
@@ -13945,7 +13965,7 @@ mod metadata_cache_tests {
         use crate::server::recgbl::EventMask;
         use crate::server::records::asub_record::ASubRecord;
 
-        let mut inst = RecordInstance::new("ASUB".to_string(), ASubRecord::default());
+        let mut inst = RecordInstance::new("ASUB", ASubRecord::default());
         // The default record: no subroutine bound, SNAM empty.
         assert!(inst.subroutine.is_none());
         let _val_rx = inst
@@ -14045,7 +14065,7 @@ mod metadata_cache_tests {
     fn force_posted_field_reposts_unchanged_value_each_cycle() {
         use crate::server::recgbl::EventMask;
         let mut inst = RecordInstance::new(
-            "FP".to_string(),
+            "FP",
             ForcePostRecord {
                 diff: 2.5,
                 val: 1.0,
@@ -14173,7 +14193,7 @@ mod metadata_cache_tests {
     #[test]
     fn log_swept_field_reposts_unchanged_with_log_mask_only() {
         use crate::server::recgbl::EventMask;
-        let mut inst = RecordInstance::new("SW".to_string(), LogSweepRecord { s1: 7, s2: 9 });
+        let mut inst = RecordInstance::new("SW", LogSweepRecord { s1: 7, s2: 9 });
         let _s1_rx = inst
             .add_subscriber(
                 "S1",
@@ -14345,7 +14365,7 @@ mod metadata_cache_tests {
     fn b19_log_swept_field_carries_the_alarm_transition_bits() {
         use crate::server::recgbl::EventMask;
         let mut inst = RecordInstance::new(
-            "SW".to_string(),
+            "SW",
             AlarmingLogSweepRecord {
                 s1: 7,
                 alarm: false,
@@ -14457,7 +14477,7 @@ mod metadata_cache_tests {
     #[test]
     fn process_local_invalidates_cache_on_took_metadata_change() {
         let mut inst = RecordInstance::new(
-            "MUT".to_string(),
+            "MUT",
             MutatingMetaRecord {
                 val: 1.0,
                 egu: "V".to_string(),
@@ -14518,7 +14538,7 @@ mod metadata_cache_tests {
 
     #[test]
     fn process_local_keeps_cache_when_no_metadata_change() {
-        let mut inst = RecordInstance::new("STABLE".to_string(), StableMetaRecord { val: 0.0 });
+        let mut inst = RecordInstance::new("STABLE", StableMetaRecord { val: 0.0 });
 
         let _ = inst.snapshot_for_field("VAL");
         assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
@@ -14539,7 +14559,7 @@ mod metadata_cache_tests {
     /// current value or the change-detection suppresses the post either way.
     fn property_event_on_put<R: Record>(rec: R, field: &str, put: EpicsValue) -> bool {
         use crate::server::recgbl::EventMask;
-        let mut inst = RecordInstance::new("PROPGATE".to_string(), rec);
+        let mut inst = RecordInstance::new("PROPGATE", rec);
         let mut rx = inst
             .add_subscriber(
                 "VAL",
@@ -14674,7 +14694,7 @@ mod metadata_cache_tests {
     fn r47_process_local_property_event_on_took_metadata_change() {
         use crate::server::recgbl::EventMask;
         let mut inst = RecordInstance::new(
-            "MUT2".to_string(),
+            "MUT2",
             MutatingMetaRecord {
                 val: 1.0,
                 egu: "V".to_string(),
@@ -14734,10 +14754,7 @@ mod metadata_cache_tests {
             db_link(input.sim_link(SimLink::Siol)).policy,
             crate::server::record::LinkProcessPolicy::ChannelProcess
         );
-        let mut output = RecordInstance::new(
-            "AO".to_string(),
-            crate::server::records::ao::AoRecord::default(),
-        );
+        let mut output = RecordInstance::new("AO", crate::server::records::ao::AoRecord::default());
         put_siol(&mut output, "OTHER.VAL CP");
         assert_eq!(
             db_link(output.sim_link(SimLink::Siol)).policy,
@@ -14976,16 +14993,16 @@ mod check_deadband_tests {
         use crate::server::records::ai::AiRecord;
         use crate::server::records::asub_record::ASubRecord;
 
-        let mut asub = RecordInstance::new("A".into(), ASubRecord::default());
+        let mut asub = RecordInstance::new("A", ASubRecord::default());
         assert_eq!(asub.value_include_classes(), (false, false, false));
         let mut moved = ASubRecord::default();
         moved.val = 2;
-        let mut asub = RecordInstance::new("A".into(), moved);
+        let mut asub = RecordInstance::new("A", moved);
         assert_eq!(asub.value_include_classes(), (true, true, false));
 
         let mut seeded = AiRecord::default();
         (seeded.val, seeded.mlst, seeded.alst) = (5.0, 5.0, 5.0);
-        let mut ai = RecordInstance::new("B".into(), seeded);
+        let mut ai = RecordInstance::new("B", seeded);
         assert_eq!(ai.check_deadband_ext(), (false, false));
     }
 
@@ -15013,7 +15030,7 @@ mod common_field_dbload_tests {
     /// typed variant. One assertion per affected common-field arm.
     #[test]
     fn db_loaded_string_common_fields_take_effect() {
-        let mut inst = RecordInstance::new("REC".to_string(), AiRecord::default());
+        let mut inst = RecordInstance::new("REC", AiRecord::default());
         let put = |inst: &mut RecordInstance, f: &str, v: &str| {
             inst.put_common_field_db_load(f, EpicsValue::String(v.into()))
                 .unwrap_or_else(|e| panic!("put_common_field_db_load({f}, {v:?}) failed: {e}"));
@@ -15077,7 +15094,7 @@ mod declared_override_tests {
     /// `resolve_field` must serve the written value — not the `.dbd` initial.
     #[test]
     fn declared_but_unmodeled_field_put_is_stored_and_served() {
-        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+        let mut inst = RecordInstance::new("DF", DfanoutRecord::default());
 
         // Untouched: reads its declared default (initial / type-zero), NOT an
         // error, and the override store is empty.
@@ -15109,7 +15126,7 @@ mod declared_override_tests {
     /// prior value — never wraps to a garbage `Short`.
     #[test]
     fn declared_override_honors_declared_type_range() {
-        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+        let mut inst = RecordInstance::new("DF", DfanoutRecord::default());
         inst.put_common_field("PREC", EpicsValue::String("3".into()))
             .expect("in-range PREC accepted");
         assert!(
@@ -15131,7 +15148,7 @@ mod declared_override_tests {
     /// refused exactly as C's `dbNameToAddr` refuses it.
     #[test]
     fn undeclared_field_is_still_not_found() {
-        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+        let mut inst = RecordInstance::new("DF", DfanoutRecord::default());
         assert!(matches!(
             inst.put_common_field("XYZZY", EpicsValue::String("1".into())),
             Err(CaError::FieldNotFound(_))
@@ -15148,7 +15165,7 @@ mod declared_override_tests {
     #[test]
     fn partially_modeled_field_is_not_captured_by_override() {
         use crate::server::records::calcout::CalcoutRecord;
-        let mut inst = RecordInstance::new("CO".to_string(), CalcoutRecord::default());
+        let mut inst = RecordInstance::new("CO", CalcoutRecord::default());
         // PVAL is served by the record (its own storage), so it is not stored
         // in the override map; the map stays empty and no ghost cell shadows
         // the record's read.
@@ -15166,7 +15183,7 @@ mod pact_exit_tests {
     use crate::server::records::ai::AiRecord;
 
     fn instance() -> RecordInstance {
-        RecordInstance::new("PACT:REC".to_string(), AiRecord::new(0.0))
+        RecordInstance::new("PACT:REC", AiRecord::new(0.0))
     }
 
     /// The two boundary values of the bit `leave_pact` mints. It is minted
@@ -15203,9 +15220,9 @@ mod subroutine_gate_tests {
     /// cannot carry a flag nothing clears.
     #[test]
     fn the_subroutine_runner_and_its_skip_flag_belong_to_sub_and_asub_alone() {
-        let mut ai = RecordInstance::new("G:AI".to_string(), AiRecord::new(0.0));
-        let mut sub = RecordInstance::new("G:SUB".to_string(), SubRecord::default());
-        let mut asub = RecordInstance::new("G:ASUB".to_string(), ASubRecord::default());
+        let mut ai = RecordInstance::new("G:AI", AiRecord::new(0.0));
+        let mut sub = RecordInstance::new("G:SUB", SubRecord::default());
+        let mut asub = RecordInstance::new("G:ASUB", ASubRecord::default());
         for (inst, has) in [(&mut ai, false), (&mut sub, true), (&mut asub, true)] {
             assert_eq!(ProcessPlan::of(&*inst.record).runs_subroutine, has);
             inst.skip_subroutine_this_cycle();
@@ -15376,8 +15393,8 @@ mod declaration_gate_tests {
                 .collect();
             for lf in declared {
                 let materialised = match instance.record.get_field(lf) {
-                    Some(EpicsValue::String(text)) => text.as_str_lossy().into_owned(),
-                    _ => String::new(),
+                    Some(EpicsValue::String(text)) => text,
+                    _ => PvString::new(),
                 };
                 assert_eq!(
                     instance.link_text(lf),
@@ -15415,11 +15432,12 @@ mod declaration_gate_tests {
                     continue;
                 };
                 let materialised = match record.get_field(lf) {
-                    Some(EpicsValue::String(text)) => text.as_str_lossy().into_owned(),
-                    _ => String::new(),
+                    Some(EpicsValue::String(text)) => text,
+                    _ => PvString::new(),
                 };
                 assert_eq!(
-                    lent, materialised,
+                    lent,
+                    materialised.as_bytes(),
                     "{rtype}.{lf} lent a text its get_field does not hold"
                 );
             }
@@ -15435,8 +15453,8 @@ mod declaration_gate_tests {
             .put_field("INPA", EpicsValue::String("SRC:ONE.VAL CP".into()))
             .expect("INPA takes a link string");
         assert_eq!(
-            instance.link_text("INPA").as_deref(),
-            Some("SRC:ONE.VAL CP")
+            instance.link_text("INPA").as_ref().map(PvString::as_bytes),
+            Some(&b"SRC:ONE.VAL CP"[..])
         );
         // A numeric field is not a link, and neither is one the type does not
         // declare: both have to read as "no link", not as an empty one.
@@ -15496,7 +15514,11 @@ mod link_field_rendering_tests {
             (InLink, "@dev p1 p2", "@dev p1 p2"),
             (InLink, "{\"const\":1}", "{\"const\":1}"),
         ] {
-            assert_eq!(render_link_field(class, text), want, "{class:?} {text:?}");
+            assert_eq!(
+                render_link_field(class, text.as_bytes()),
+                want,
+                "{class:?} {text:?}"
+            );
         }
     }
 }
@@ -15507,7 +15529,7 @@ mod unanswerable_notify_tests {
     use crate::server::records::calc::CalcRecord;
 
     fn rec(name: &str) -> RecordInstance {
-        RecordInstance::new(name.into(), CalcRecord::default())
+        RecordInstance::new(name, CalcRecord::default())
     }
 
     /// The ordinary case: the client is still waiting, so the slot is its own.
@@ -15677,7 +15699,7 @@ mod claimed_field_tests {
     /// subscriber still gets one post per mark, as from C's `monitor()`.
     #[test]
     fn a_claimed_field_is_never_published() {
-        let mut inst = RecordInstance::new("R".to_string(), MarksSent::default());
+        let mut inst = RecordInstance::new("R", MarksSent::default());
         inst.process_local().unwrap();
         assert!(inst.last_posted.is_empty(), "an unwatched marked cycle");
         let all = (EventMask::VALUE | EventMask::LOG).bits();
@@ -15704,7 +15726,7 @@ mod forced_secondary_post_tests {
         let mut rec = AoRecord::default();
         rec.rval = rval;
         rec.omod = true;
-        RecordInstance::new("AO:FORCED".to_string(), rec)
+        RecordInstance::new("AO:FORCED", rec)
     }
 
     /// One guarded monitor cycle; the fields it posted, in order.
@@ -15808,25 +15830,25 @@ mod forced_secondary_post_tests {
             );
             SECONDARY_TAKES.with(|n| n.get())
         };
-        let mut bo = RecordInstance::new("BO:TAKE".to_string(), BoRecord::default());
+        let mut bo = RecordInstance::new("BO:TAKE", BoRecord::default());
         assert_eq!(cycle(&mut bo, EventMask::NONE), 1, "bo idle");
         assert_eq!(cycle(&mut bo, EventMask::VALUE), 1, "bo VAL posts");
         let mut moved = BoRecord::default();
         moved.rval = 1;
         moved.rbv = 1;
-        let mut bo = RecordInstance::new("BO:MOVED".to_string(), moved);
+        let mut bo = RecordInstance::new("BO:MOVED", moved);
         assert_eq!(cycle(&mut bo, EventMask::NONE), 1, "bo RVAL and RBV moved");
         assert_eq!(bo.record.get_field("ORAW"), Some(EpicsValue::ULong(1)));
         assert_eq!(bo.record.get_field("ORBV"), Some(EpicsValue::ULong(1)));
 
-        let mut ai = RecordInstance::new("AI:TAKE".to_string(), AiRecord::default());
+        let mut ai = RecordInstance::new("AI:TAKE", AiRecord::default());
         ai.record.put_field("RVAL", EpicsValue::Long(5)).unwrap();
         assert_eq!(cycle(&mut ai, EventMask::NONE), 0, "ai VAL shut");
         assert_eq!(ai.record.get_field("ORAW"), Some(EpicsValue::Long(0)));
         assert_eq!(cycle(&mut ai, EventMask::VALUE), 1, "ai VAL posts");
         assert_eq!(ai.record.get_field("ORAW"), Some(EpicsValue::Long(5)));
 
-        let mut ao = RecordInstance::new("AO:TAKE".to_string(), AoRecord::default());
+        let mut ao = RecordInstance::new("AO:TAKE", AoRecord::default());
         assert_eq!(cycle(&mut ao, EventMask::NONE), 1, "ao idle");
         let mut ao = ao_with_moved_rval(7);
         assert_eq!(cycle(&mut ao, EventMask::NONE), 1, "ao omod");
@@ -15889,10 +15911,7 @@ mod forced_secondary_post_tests {
         rbv_moved.rbv = 3;
         let instances = [
             (ao_with_moved_rval(7), ["OVAL", "RVAL"]),
-            (
-                RecordInstance::new("AO:RBV".to_string(), rbv_moved),
-                ["OVAL", "RBV"],
-            ),
+            (RecordInstance::new("AO:RBV", rbv_moved), ["OVAL", "RBV"]),
         ];
         for (mut inst, first) in instances {
             for (sid, field) in ["OVAL", "RVAL", "RBV"].into_iter().enumerate() {
@@ -15919,7 +15938,7 @@ mod forced_secondary_post_tests {
         use crate::server::records::ai::AiRecord;
         let mut rec = AiRecord::default();
         rec.rval = 7;
-        let mut inst = RecordInstance::new("AI:RVAL".to_string(), rec);
+        let mut inst = RecordInstance::new("AI:RVAL", rec);
         let cycle = |inst: &mut RecordInstance, mask| {
             let mut snapshot = ProcessSnapshot::new();
             inst.collect_subscriber_posts(&mut snapshot, mask, EventMask::NONE, true, false);
@@ -15956,7 +15975,7 @@ mod mlis_tests {
     use crate::types::DbFieldType;
 
     fn ao() -> RecordInstance {
-        RecordInstance::new("AO:MLIS".to_string(), AoRecord::default())
+        RecordInstance::new("AO:MLIS", AoRecord::default())
     }
 
     fn attach(inst: &mut RecordInstance, field: &str, mask: EventMask) -> EventReader {
@@ -16209,7 +16228,7 @@ mod mlis_tests {
     fn an_async_notify_posts_by_index_and_reads_no_name_bytes() {
         use crate::server::record::{dbd_generated::CALCOUT_FIELDS, declared_field_ix};
         use crate::server::records::calcout::CalcoutRecord;
-        let mut inst = RecordInstance::new("CO:NFY".to_string(), CalcoutRecord::default());
+        let mut inst = RecordInstance::new("CO:NFY", CalcoutRecord::default());
         let mut reader = attach(&mut inst, "A", EventMask::VALUE);
         const A: FieldIx = declared_field_ix(CALCOUT_FIELDS, "A");
         inst.record.put_field("A", EpicsValue::Double(3.0)).unwrap();
@@ -16230,8 +16249,8 @@ mod mlis_tests {
     #[test]
     fn a_declared_set_settle_reads_no_name_bytes() {
         use crate::server::records::{asub_record::ASubRecord, calcout::CalcoutRecord};
-        let mut calcout = RecordInstance::new("CO:SET".to_string(), CalcoutRecord::default());
-        let mut asub = RecordInstance::new("AS:SET".to_string(), ASubRecord::default());
+        let mut calcout = RecordInstance::new("CO:SET", CalcoutRecord::default());
+        let mut asub = RecordInstance::new("AS:SET", ASubRecord::default());
         asub.record
             .put_field("EFLG", EpicsValue::Short(2))
             .expect("EFLG ALWAYS");
@@ -16296,7 +16315,7 @@ mod mlis_tests {
         let mut rec = AoRecord::default();
         rec.rval = 7;
         rec.omod = true;
-        let mut inst = RecordInstance::new("AO:PTR".to_string(), rec);
+        let mut inst = RecordInstance::new("AO:PTR", rec);
         let mut readers: Vec<_> = ["VAL", "OVAL", "RVAL"]
             .into_iter()
             .map(|field| attach(&mut inst, field, EventMask::VALUE))
@@ -16592,7 +16611,7 @@ mod skipped_posted_tests {
     use crate::types::DbFieldType;
 
     fn calc() -> RecordInstance {
-        RecordInstance::new("CALC:SKIP".to_string(), CalcRecord::default())
+        RecordInstance::new("CALC:SKIP", CalcRecord::default())
     }
 
     /// Boundary: a field the walk always skips. Its published value must not
@@ -16783,7 +16802,7 @@ mod walk_post_name_tests {
     /// The walk's posts for one cycle with `key` subscribed and HOPR, a
     /// change-detected field, moved since.
     fn hopr_posts(key: &str) -> Vec<PostName> {
-        let mut inst = RecordInstance::new("AI:NAME".to_string(), WalkProbe::default());
+        let mut inst = RecordInstance::new("AI:NAME", WalkProbe::default());
         let _rx = inst
             .add_subscriber(key, 1, DbFieldType::Double, EventMask::VALUE.bits())
             .expect("subscriber");
@@ -16884,7 +16903,7 @@ mod posted_settle_tests {
     }
 
     fn toggles(closed: bool) -> RecordInstance {
-        let mut inst = RecordInstance::new("T".to_string(), Toggles { closed });
+        let mut inst = RecordInstance::new("T", Toggles { closed });
         let _rx = inst
             .add_subscriber("X", 1, DbFieldType::Double, EventMask::VALUE.bits())
             .expect("X subscriber");
@@ -16909,8 +16928,8 @@ mod posted_settle_tests {
     #[test]
     fn the_deadband_post_reads_the_listed_membership() {
         use crate::server::records::transform::TransformRecord;
-        let mut transform = RecordInstance::new("T".to_string(), TransformRecord::default());
-        let mut asub = RecordInstance::new("AS".to_string(), ASubRecord::default());
+        let mut transform = RecordInstance::new("T", TransformRecord::default());
+        let mut asub = RecordInstance::new("AS", ASubRecord::default());
         for (inst, member) in [(&mut transform, false), (&mut asub, true)] {
             let _rx = inst
                 .add_subscriber("VAL", 1, DbFieldType::Double, EventMask::ALARM.bits())
@@ -16999,7 +17018,7 @@ mod link_cache_fact_tests {
     /// parse would make the cycle skip or take a link its text no longer has.
     #[test]
     fn every_install_restates_the_entrys_facts() {
-        let mut inst = RecordInstance::new("LCF".to_string(), AiRecord::new(0.0));
+        let mut inst = RecordInstance::new("LCF", AiRecord::new(0.0));
         let fresh = &inst.parsed_out;
         assert!(fresh.is_constant() && !fresh.is_writable_out_link());
         for text in ["OTHER.VAL", "5", "ca://OTHER", "@hw 1", "OTHER NPP", ""] {
@@ -17033,7 +17052,7 @@ mod link_cache_fact_tests {
     fn the_out_facts_follow_the_parse() {
         use crate::server::database::ProcessTargetGate::{ProcField, ScanPassive};
         use crate::server::record::MonitorSwitch;
-        let mut inst = RecordInstance::new("LCF".to_string(), AiRecord::new(0.0));
+        let mut inst = RecordInstance::new("LCF", AiRecord::new(0.0));
         for (text, gate, switch) in [
             ("OTHER.PROC PP MS", Some(ProcField), MonitorSwitch::Maximize),
             ("OTHER.PROC NPP", Some(ProcField), MonitorSwitch::NoMaximize),
@@ -17061,12 +17080,12 @@ mod link_cache_fact_tests {
     fn the_out_target_empties_where_its_entry_can_go() {
         use crate::server::records::ao::AoRecord;
         let target = Arc::new(RecordCell::new(
-            RecordInstance::new("TGT".to_string(), AoRecord::new(0.0)),
+            RecordInstance::new("TGT", AoRecord::new(0.0)),
             0,
             false,
         ));
         let put = PutAddr::resolve_in(&target, "VAL");
-        let mut inst = RecordInstance::new("SRC".to_string(), AoRecord::new(0.0));
+        let mut inst = RecordInstance::new("SRC", AoRecord::new(0.0));
         let parse = parse_link_field("TGT.VAL PP", LinkFieldType::Out);
         let lend = |inst: &mut RecordInstance| {
             inst.parsed_out

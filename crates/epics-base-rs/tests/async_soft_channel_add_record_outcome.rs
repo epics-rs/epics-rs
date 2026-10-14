@@ -66,7 +66,7 @@ async fn processed(names: &[&str]) -> (Arc<PvDatabase>, String) {
 /// `(VAL, SEVR, STAT, UDF)`.
 fn state(db: &PvDatabase, name: &str) -> (f64, f64, f64, f64) {
     let get = |f: &str| {
-        db.get_pv(&format!("{name}.{f}"))
+        db.get_pv(format!("{name}.{f}"))
             .ok()
             .and_then(|v| v.to_f64())
             .unwrap_or_else(|| panic!("{name}.{f}"))

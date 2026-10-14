@@ -34,8 +34,8 @@ async fn sim_waveform_reads_siol_array_into_val() {
     db.add_record("WFIN_SRC", Box::new(src)).await.unwrap();
 
     let mut wf = WaveformRecord::new(8, DbFieldType::Double);
-    wf.siml = "WFIN_SW".to_string();
-    wf.siol = "WFIN_SRC".to_string();
+    wf.siml = "WFIN_SW".into();
+    wf.siol = "WFIN_SRC".into();
     db.add_record("WFIN", Box::new(wf)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
@@ -75,8 +75,8 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
         .unwrap();
 
     let mut hg = HistogramRecord::new(4, 0.0, 100.0);
-    hg.siml = "HGIN_SW".to_string();
-    hg.siol = "HGIN_SRC".to_string();
+    hg.siml = "HGIN_SW".into();
+    hg.siol = "HGIN_SRC".into();
     db.add_record("HGIN", Box::new(hg)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
@@ -115,8 +115,8 @@ async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
         .unwrap();
 
     let mut hg = HistogramRecord::new(4, 0.0, 100.0);
-    hg.siml = "HGF_SW".to_string();
-    hg.siol = "NO:SUCH:RECORD".to_string();
+    hg.siml = "HGF_SW".into();
+    hg.siol = "NO:SUCH:RECORD".into();
     hg.sval = 42.0; // would land in bin 1 if the read were treated as OK
     db.add_record("HGF", Box::new(hg)).await.unwrap();
 

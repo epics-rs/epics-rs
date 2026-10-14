@@ -740,7 +740,7 @@ fn test_multi_output_links_gated_on_fbon_and_compute() {
 
     // CONSTANT INP → C `:110-112` returns before the OUTL write.
     let mut konst = EpidRecord::default();
-    konst.inp = "5.0".to_string();
+    konst.inp = "5.0".into();
     assert_eq!(link_field_type(&konst.inp), LinkType::Constant);
     konst.fbon = 1;
     konst.fbop = 1;
@@ -1209,7 +1209,7 @@ fn pre_input(
 fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
     let mut rec = EpidRecord::default();
     // CONSTANT INP link — a literal value, not a PV reference.
-    rec.inp = "3.14".to_string();
+    rec.inp = "3.14".into();
     rec.kp = 2.0;
     rec.val = 100.0;
     rec.cval = 10.0;
@@ -1239,7 +1239,7 @@ fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
 #[test]
 fn test_db_inp_does_not_raise_soft_alarm() {
     let mut rec = EpidRecord::default();
-    rec.inp = "OTHER:REC.VAL".to_string();
+    rec.inp = "OTHER:REC.VAL".into();
     assert_eq!(link_field_type(&rec.inp), LinkType::Db);
     rec.kp = 2.0;
     rec.val = 100.0;
@@ -1268,7 +1268,7 @@ fn test_db_inp_does_not_raise_soft_alarm() {
 fn test_db_trig_link_synchronous_fallthrough() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "READBACK:REC.VAL".to_string();
+    rec.trig = "READBACK:REC.VAL".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Db);
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1316,7 +1316,7 @@ fn test_db_trig_link_synchronous_fallthrough() {
 fn test_non_callback_dtyp_emits_no_trig_write() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "READBACK:REC.VAL".to_string();
+    rec.trig = "READBACK:REC.VAL".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Db);
 
     rec.set_process_context(&ctx_with_dtyp("Soft Channel"));
@@ -1333,7 +1333,7 @@ fn test_non_callback_dtyp_emits_no_trig_write() {
 fn test_ca_trig_link_deferred_second_pass() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "ca://REMOTE:READBACK".to_string();
+    rec.trig = "ca://REMOTE:READBACK".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1381,7 +1381,7 @@ fn test_ca_trig_link_deferred_second_pass() {
 fn a_device_link_put_mid_trigger_fires_the_trigger_again() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "ca://REMOTE:READBACK".to_string();
+    rec.trig = "ca://REMOTE:READBACK".into();
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
     let fires = |actions: &epics_base_rs::server::record::ProcessActions| {
         actions.iter().any(|a| {
@@ -1413,7 +1413,7 @@ fn a_device_link_put_mid_trigger_fires_the_trigger_again() {
 #[test]
 fn test_bumpless_edge_emits_outl_readback_for_db_link() {
     let mut rec = EpidRecord::default();
-    rec.outl = "DAC:REC.VAL".to_string();
+    rec.outl = "DAC:REC.VAL".into();
     rec.fmod = 0; // PID mode
     rec.fbon = 1;
     rec.fbop = 0; // OFF -> ON edge
@@ -1438,7 +1438,7 @@ fn test_bumpless_edge_emits_outl_readback_for_db_link() {
 #[test]
 fn test_bumpless_edge_no_readback_for_constant_outl() {
     let mut rec = EpidRecord::default();
-    rec.outl = "5.0".to_string(); // CONSTANT link
+    rec.outl = "5.0".into(); // CONSTANT link
     assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
     rec.fmod = 0;
     rec.fbon = 1;
@@ -1455,7 +1455,7 @@ fn test_bumpless_edge_no_readback_for_constant_outl() {
 #[test]
 fn test_no_bumpless_readback_when_no_edge() {
     let mut rec = EpidRecord::default();
-    rec.outl = "DAC:REC.VAL".to_string();
+    rec.outl = "DAC:REC.VAL".into();
     rec.fmod = 0;
     rec.fbon = 1;
     rec.fbop = 1; // steady ON, not an edge
@@ -1674,7 +1674,7 @@ use epics_base_rs::server::record::RecordProcessResult;
 fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "ca://REMOTE:READBACK".to_string();
+    rec.trig = "ca://REMOTE:READBACK".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1682,7 +1682,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     // A CONSTANT STPL clears UDF (C `epidRecord.c:160-164`) so the
     // UDF gate does not pre-empt the trigger path — isolate the
     // CA-TRIG path under test.
-    rec.stpl = "10.0".to_string();
+    rec.stpl = "10.0".into();
     let mut udf = true;
     rec.post_init_finalize_undef(&mut udf).unwrap();
 
@@ -1745,7 +1745,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
 #[test]
 fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
     let mut rec = EpidRecord::default();
-    rec.outl = "DAC:REC.VAL".to_string();
+    rec.outl = "DAC:REC.VAL".into();
     rec.fmod = 1; // MaxMin mode
     rec.fbon = 1;
     rec.fbop = 0; // OFF -> ON edge
@@ -1782,7 +1782,7 @@ fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
     rec.oval = 0.0;
     rec.drvh = 100.0;
     rec.drvl = -100.0;
-    rec.inp = "SENSOR".to_string();
+    rec.inp = "SENSOR".into();
     rec.put_field_internal("__OUTL_SEED", EpicsValue::Double(7.0))
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1802,7 +1802,7 @@ fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
 #[test]
 fn test_bumpless_seed_is_gated_by_mdt() {
     let mut rec = EpidRecord::default();
-    rec.inp = "SENSOR".to_string();
+    rec.inp = "SENSOR".into();
     rec.fmod = 0; // PID
     rec.kp = 1.0;
     rec.ki = 0.5;
@@ -1845,7 +1845,7 @@ fn test_bumpless_seed_is_gated_by_mdt() {
 #[test]
 fn test_maxmin_bumpless_edge_no_readback_for_constant_outl() {
     let mut rec = EpidRecord::default();
-    rec.outl = "5.0".to_string(); // CONSTANT link
+    rec.outl = "5.0".into(); // CONSTANT link
     assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
     rec.fmod = 1; // MaxMin
     rec.fbon = 1;

@@ -102,7 +102,7 @@ use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
     RecordInstance, SoftRead, SoftReading,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
 use super::{FrameGate, InFrame, PvDatabase};
 
@@ -196,7 +196,7 @@ fn string_link_text(value: &EpicsValue) -> PvString {
 /// calls `fire`; the no-op-when-stale is guaranteed by construction.
 pub struct AsyncToken {
     /// Canonical record name to re-enter.
-    name: String,
+    name: RecordName,
     /// Shared generation counter owned by the record
     /// (`RecordInstance::reprocess_generation`).
     generation: Arc<AtomicU64>,
@@ -207,7 +207,7 @@ pub struct AsyncToken {
 
 impl AsyncToken {
     /// The record this token re-enters.
-    pub fn record_name(&self) -> &str {
+    pub fn record_name(&self) -> &RecordName {
         &self.name
     }
 
@@ -276,7 +276,7 @@ impl ProcessCallback {
 /// The body of a [`ProcessCallback`].
 struct ProcessReentry {
     db: std::sync::Weak<super::PvDatabaseInner>,
-    name: String,
+    name: RecordName,
 }
 
 impl crate::runtime::background::CallbackBody for ProcessReentry {
@@ -327,14 +327,14 @@ impl WriteDone {
 /// the record's [`WriteDone`] and the band its `PRIO` selects.
 pub struct WriteDoneSource<'a> {
     db: &'a PvDatabase,
-    name: &'a str,
+    name: &'a [u8],
     priority: crate::runtime::task::CallbackPriority,
 }
 
 impl<'a> WriteDoneSource<'a> {
     pub fn new(
         db: &'a PvDatabase,
-        name: &'a str,
+        name: &'a [u8],
         priority: crate::runtime::task::CallbackPriority,
     ) -> Self {
         Self { db, name, priority }
@@ -351,7 +351,7 @@ impl<'a> WriteDoneSource<'a> {
         WriteDone(crate::runtime::background::CallbackCell::new(
             WriteReentry {
                 db: Arc::downgrade(&self.db.inner),
-                name: self.name.to_string(),
+                name: RecordName::from(self.name),
                 outcome: std::sync::Mutex::new(None),
             },
         ))
@@ -361,7 +361,7 @@ impl<'a> WriteDoneSource<'a> {
 /// The body of a [`WriteDone`].
 struct WriteReentry {
     db: std::sync::Weak<super::PvDatabaseInner>,
-    name: String,
+    name: RecordName,
     outcome: std::sync::Mutex<Option<CaResult<()>>>,
 }
 
@@ -498,9 +498,10 @@ impl AsyncDbHandle {
     /// empty `Vec` (no-op) if the database has been dropped.
     pub fn post_fields(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         fields: Vec<(String, EpicsValue)>,
     ) -> CaResult<Vec<String>> {
+        let name = name.as_ref();
         match self.db() {
             Some(db) => db.post_fields(name, fields),
             None => Ok(Vec::new()),
@@ -512,10 +513,11 @@ impl AsyncDbHandle {
     /// if the database has been dropped.
     pub fn post_fields_with_mask(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
     ) -> CaResult<Vec<String>> {
+        let name = name.as_ref();
         match self.db() {
             Some(db) => db.post_fields_with_mask(name, fields, mask),
             None => Ok(Vec::new()),
@@ -527,11 +529,12 @@ impl AsyncDbHandle {
     /// [`PvDatabase::post_fields_with_mask_if`].
     pub(crate) fn post_fields_with_mask_if<P: PostItem>(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         fields: Vec<P>,
         mask: crate::server::recgbl::EventMask,
         current: impl FnOnce() -> bool,
     ) -> CaResult<Vec<String>> {
+        let name = name.as_ref();
         match self.db() {
             Some(db) => db.post_fields_with_mask_if(name, fields, mask, current),
             None => Ok(Vec::new()),
@@ -551,7 +554,7 @@ impl AsyncDbHandle {
     /// A link whose target is a LOCAL record is C's non-`CA_LINK` case, which
     /// never reaches that gate (`dbPutLink`, no callback): `true`. So is a
     /// database that has been dropped — nothing is left to refuse.
-    pub fn put_link_admitted(&self, link: &str) -> bool {
+    pub fn put_link_admitted(&self, link: impl AsRef<[u8]>) -> bool {
         let Some(db) = self.db() else {
             return true;
         };
@@ -563,7 +566,7 @@ impl AsyncDbHandle {
                 if db.has_name_no_resolve(&target.target().record) {
                     return true;
                 }
-                db.external_put_admitted(&target.pvname()).is_ok()
+                db.external_put_admitted(target.pvname().as_bytes()).is_ok()
             }
             other => match other.external_pv_name() {
                 Some(name) => db.external_put_admitted(&name).is_ok(),
@@ -579,9 +582,12 @@ impl AsyncDbHandle {
     /// the link is constant / external / unresolvable, or the database is
     /// gone. (Distinct from the free `server::record::link_field_type`,
     /// which returns the link *class* `LinkType`, not the target's type.)
-    pub fn link_target_field_type(&self, link: &str) -> Option<crate::types::DbFieldType> {
+    pub fn link_target_field_type(
+        &self,
+        link: impl AsRef<[u8]>,
+    ) -> Option<crate::types::DbFieldType> {
         match self.db() {
-            Some(db) => db.link_target_field_type(link),
+            Some(db) => db.link_target_field_type(link.as_ref()),
             None => None,
         }
     }
@@ -595,9 +601,10 @@ impl AsyncDbHandle {
     /// is gone.
     pub fn schedule_record_init(
         &self,
-        record: &str,
+        record: impl AsRef<[u8]>,
         init: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
+        let record = record.as_ref();
         if let Some(db) = self.db() {
             db.schedule_record_init(record, init);
         }
@@ -635,7 +642,8 @@ impl AsyncDbHandle {
 
     /// Mint an async re-entry token — see [`PvDatabase::mint_async_token`].
     /// `None` if the record is absent or the database has been dropped.
-    pub fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {
+    pub fn mint_async_token(&self, name: impl AsRef<[u8]>) -> Option<AsyncToken> {
+        let name = name.as_ref();
         match self.db() {
             Some(db) => db.mint_async_token(name),
             None => None,
@@ -646,18 +654,20 @@ impl AsyncDbHandle {
     /// record support that owns it. `name` must be canonical. Holds the
     /// database weakly, as this handle does: a run after the database or
     /// the record is gone re-enters nothing.
-    pub fn process_callback(&self, name: &str) -> ProcessCallback {
+    pub fn process_callback(&self, name: impl AsRef<[u8]>) -> ProcessCallback {
+        let name = name.as_ref();
         ProcessCallback(crate::runtime::background::CallbackCell::new(
             ProcessReentry {
                 db: self.inner.clone(),
-                name: name.to_string(),
+                name: RecordName::from(name),
             },
         ))
     }
 
     /// Cancel an outstanding async re-entry — see
     /// [`PvDatabase::cancel_async_reentry`]. No-op if the database is gone.
-    pub fn cancel_async_reentry(&self, name: &str) {
+    pub fn cancel_async_reentry(&self, name: impl AsRef<[u8]>) {
+        let name = name.as_ref();
         if let Some(db) = self.db() {
             db.cancel_async_reentry(name);
         }
@@ -667,7 +677,12 @@ impl AsyncDbHandle {
     /// that holds no record: asynRecord's `exceptCallback` (asynRecord.c:911-916).
     /// The marks `f` leaves are posted under the same hold. A no-op if the
     /// record or the database is gone.
-    pub fn with_record(&self, name: &str, f: impl FnOnce(&mut dyn crate::server::record::Record)) {
+    pub fn with_record(
+        &self,
+        name: impl AsRef<[u8]>,
+        f: impl FnOnce(&mut dyn crate::server::record::Record),
+    ) {
+        let name = name.as_ref();
         let Some(db) = self.db() else {
             return;
         };
@@ -706,11 +721,12 @@ impl AsyncDbHandle {
     /// the source record is missing.
     pub async fn put_link_notify(
         &self,
-        record_name: &str,
+        record_name: impl AsRef<[u8]>,
         link_field: &'static str,
-        link_str: &str,
+        link_str: impl AsRef<[u8]>,
         value: EpicsValue,
     ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        let record_name = record_name.as_ref();
         match self.db() {
             Some(db) => {
                 db.put_link_notify(record_name, link_field, link_str, value)
@@ -852,10 +868,10 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
 /// name is truncated at `.TIME` to address the record. Matched on the
 /// `.TIME` suffix (the realistic spelling) case-insensitively, to stay
 /// consistent with the DB branch's `field.eq_ignore_ascii_case("TIME")`.
-fn ca_tsel_time_record(pv: &str) -> Option<&str> {
+fn ca_tsel_time_record(pv: &[u8]) -> Option<&[u8]> {
     let idx = pv.len().checked_sub(".TIME".len())?;
     pv[idx..]
-        .eq_ignore_ascii_case(".TIME")
+        .eq_ignore_ascii_case(b".TIME")
         .then_some(&pv[..idx])
 }
 
@@ -1481,7 +1497,7 @@ impl PvDatabase {
         // the record's own name.
         if native.shadowed {
             let pv_name = local_name(&target.record, field);
-            if let Some(pv) = self.inner.simple_pvs.lock().get(&pv_name).cloned() {
+            if let Some(pv) = self.simple_pv_bytes(&pv_name) {
                 let failed = !deliver_multi_input(record, declared[cache_slot].1, pv.get(), false);
                 if failed && sets_link_alarm {
                     crate::server::recgbl::rec_gbl_set_link_alarm(common, declared[cache_slot].0);
@@ -1912,15 +1928,14 @@ fn deliver_converted(
 /// What a process frame is asked to run: a name still to be looked up, or a
 /// scan-list entry already resolved to its canonical name and cell.
 enum ProcessTarget<'a> {
-    Name(&'a str),
-    Resolved(&'a str, &'a Arc<RecordCell>),
+    Name(&'a [u8]),
+    Resolved(&'a [u8], &'a Arc<RecordCell>),
 }
 
 /// The frame's record cell: borrowed from the caller's scan snapshot when the
-/// entry came resolved, owned when the frame looked it up. The sibling of
-/// [`FrameName`], and for the same reason — a sweep step otherwise pays an
-/// `Arc` refcount round trip per record per cycle for a cell the scan list
-/// already holds.
+/// entry came resolved, owned when the frame looked it up — a sweep step
+/// otherwise pays an `Arc` refcount round trip per record per cycle for a
+/// cell the scan list already holds.
 enum FrameRec<'a> {
     Borrowed(&'a Arc<RecordCell>),
     Owned(Arc<RecordCell>),
@@ -1937,27 +1952,9 @@ impl std::ops::Deref for FrameRec<'_> {
     }
 }
 
-/// The frame's record name: borrowed from the caller's scan snapshot when the
-/// entry came resolved, shared out of the registry when the frame looked it
-/// up. Either way no name is copied per cycle.
-enum FrameName<'a> {
-    Borrowed(&'a str),
-    Shared(Arc<str>),
-}
-
-impl std::ops::Deref for FrameName<'_> {
-    type Target = str;
-    fn deref(&self) -> &str {
-        match self {
-            FrameName::Borrowed(s) => s,
-            FrameName::Shared(s) => s,
-        }
-    }
-}
-
 /// What the cycle prologue settled and [`PvDatabase::process_cycle`] consumes.
 struct CycleCtx<'c, 'a> {
-    name: &'c str,
+    name: &'c [u8],
     rec: InFrame<'a>,
     is_continuation: bool,
     device_callback: bool,
@@ -2315,7 +2312,8 @@ impl LinkInputs {
 impl PvDatabase {
     /// Process a record by name (process_local + notify).
     /// Alias-aware (epics-base PR #336).
-    pub async fn process_record(&self, name: &str) -> CaResult<()> {
+    pub async fn process_record(&self, name: impl AsRef<[u8]>) -> CaResult<()> {
+        let name = name.as_ref();
         // Delegate to the canonical engine path so a direct process fetches
         // input links (DOL/INPx), runs the record body, evaluates alarms,
         // writes outputs and dispatches FLNK exactly as a C `dbProcess` does.
@@ -2332,7 +2330,8 @@ impl PvDatabase {
     /// PUT applying a `+proc` member. The gate is not
     /// reentrant; the atomic group path MUST use this entry. See
     /// [`crate::server::database::PvDatabase::lock_records`].
-    pub async fn process_record_already_locked(&self, name: &str) -> CaResult<()> {
+    pub async fn process_record_already_locked(&self, name: impl AsRef<[u8]>) -> CaResult<()> {
+        let name = name.as_ref();
         // Same delegation as [`Self::process_record`], but to the gate-held
         // engine entry since the caller already owns the advisory write gate.
         let mut visited = ProcStack::new();
@@ -2359,9 +2358,10 @@ impl PvDatabase {
     /// `visited` cycle guard prevents re-processing the entry record.
     pub fn process_record_with_links<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a (impl AsRef<[u8]> + ?Sized),
         visited: &'a mut ProcStack,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        let name = name.as_ref();
         Box::pin(async move { self.process_record_with_links_sync(name, visited) })
     }
 
@@ -2374,7 +2374,7 @@ impl PvDatabase {
     /// on a thread it is allowed to occupy, so it takes the frame directly.
     pub(crate) fn process_record_with_links_sync(
         &self,
-        name: &str,
+        name: &[u8],
         visited: &mut ProcStack,
     ) -> CaResult<()> {
         self.run_process_frame(ProcessTarget::Name(name), visited, true, false, false)
@@ -2385,7 +2385,7 @@ impl PvDatabase {
     /// the name it is walking.
     pub(crate) fn process_record_with_links_resolved(
         &self,
-        name: &str,
+        name: &[u8],
         rec: &Arc<RecordCell>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
@@ -2420,9 +2420,10 @@ impl PvDatabase {
     /// foreign caller w.r.t. any QSRV atomic group / pvalink epoch.
     pub fn process_record_readback<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a (impl AsRef<[u8]> + ?Sized),
         visited: &'a mut ProcStack,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        let name = name.as_ref();
         Box::pin(async move {
             // C `devAsynInt32.c::outputCallbackCallback` (asyn devEpics):
             // arm the output-callback "expected pop" before dbProcess, then
@@ -2447,9 +2448,9 @@ impl PvDatabase {
 
     /// Arm the entry record's output driver-callback cycle before a readback
     /// process pass — see [`crate::server::device_support::DeviceSupport::arm_readback_callback`].
-    fn arm_readback_callback(&self, name: &str) {
+    fn arm_readback_callback(&self, name: &[u8]) {
         let canonical = self.resolve_alias(name);
-        let key: &str = canonical.as_deref().unwrap_or(name);
+        let key: &[u8] = canonical.as_deref().unwrap_or(name);
         // Collect-then-act: clone the instance handle under a brief map read,
         // then drop the map lock before taking the per-record write. Never
         // hold `records.read()` across `rec.write()` — same lock discipline
@@ -2468,9 +2469,9 @@ impl PvDatabase {
     /// Reconcile the entry record's output driver-callback cycle after a
     /// readback process pass — see
     /// [`crate::server::device_support::DeviceSupport::reconcile_readback_callback`].
-    fn reconcile_readback_callback(&self, name: &str) {
+    fn reconcile_readback_callback(&self, name: &[u8]) {
         let canonical = self.resolve_alias(name);
-        let key: &str = canonical.as_deref().unwrap_or(name);
+        let key: &[u8] = canonical.as_deref().unwrap_or(name);
         // Collect-then-act: clone the handle under a brief map read, drop the
         // map lock, then take the per-record write — see `arm_readback_callback`.
         let rec = {
@@ -2500,9 +2501,10 @@ impl PvDatabase {
     /// no-suspension contract lives.
     pub fn process_record_with_links_already_locked(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
+        let name = name.as_ref();
         self.run_process_frame(ProcessTarget::Name(name), visited, false, false, false)
     }
 
@@ -2535,7 +2537,11 @@ impl PvDatabase {
     ) -> CaResult<()> {
         // A `None` here found the name already present, so the marker is the
         // outer frame's and there is nothing to unwind.
-        let Some((name, rec)) = self.process_entry_prelude(target, visited)? else {
+        // Holds the registry's share of the name when the frame looked the
+        // record up; `name` borrows it or the scan snapshot. A plain slice
+        // stays in registers, where a borrowed-or-shared enum was spilled.
+        let mut looked_up = None;
+        let Some((name, rec)) = self.process_entry_prelude(target, &mut looked_up, visited)? else {
             return Ok(());
         };
 
@@ -2582,8 +2588,7 @@ impl PvDatabase {
         // only that thread reaches the parking arm.
         let breakpoints = self.breakpoints_if_debugging();
         if let Some(table) = breakpoints.as_ref() {
-            if table.before_process(self, &name)
-                == crate::server::database::breakpoint::Before::Skip
+            if table.before_process(self, name) == crate::server::database::breakpoint::Before::Skip
             {
                 // C's `goto all_done`, which unwinds the same way the normal
                 // path does. `visited` was inserted by the prelude above and
@@ -2596,7 +2601,7 @@ impl PvDatabase {
         // NO `.await` may appear below this line while `_record_gate` is
         // live — see the module note on `process_record_with_links_body`.
         let result = self.process_record_with_links_body(
-            &name,
+            name,
             record_gate.frame(&rec),
             visited,
             is_continuation,
@@ -2609,7 +2614,7 @@ impl PvDatabase {
         // than reusing the handle above: a `dbd` during this record's own
         // processing can have retired the observer, and C re-tests the count.
         if let Some(table) = self.breakpoints_if_debugging() {
-            table.after_process(self, &name);
+            table.after_process(self, name);
         }
 
         // The unwind. C `dbDbLink.c:521-526`, `if (claim_dst)
@@ -2627,7 +2632,7 @@ impl PvDatabase {
     /// chain below may park inside the breakpoint hook. That is legal on this
     /// call and on no other: the caller is the lock set's dedicated thread,
     /// which exists to be parked, never a runtime worker.
-    pub(crate) fn process_record_for_breakpoint(&self, name: &str) -> CaResult<()> {
+    pub(crate) fn process_record_for_breakpoint(&self, name: &[u8]) -> CaResult<()> {
         self.run_process_frame(
             ProcessTarget::Name(name),
             &mut ProcStack::new(),
@@ -2651,7 +2656,7 @@ impl PvDatabase {
     /// `processTarget` is likewise a direct call under the caller's lock set.
     pub(crate) fn process_record_with_links_recursive(
         &self,
-        name: &str,
+        name: &[u8],
         visited: &mut ProcStack,
     ) -> CaResult<()> {
         // The target may park in a breakpoint hook with the set given up, and a
@@ -2670,7 +2675,7 @@ impl PvDatabase {
     /// resolved — a link's address, whose `name` is the canonical one.
     pub(crate) fn process_record_with_links_recursive_at(
         &self,
-        name: &str,
+        name: &[u8],
         rec: &Arc<RecordCell>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
@@ -2706,9 +2711,10 @@ impl PvDatabase {
     /// QSRV atomic group or another foreign scan of the same record.
     pub fn process_record_continuation<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a (impl AsRef<[u8]> + ?Sized),
         visited: &'a mut ProcStack,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        let name = name.as_ref();
         Box::pin(async move {
             self.process_record_with_links_inner(name, visited, true, true, false)
                 .await
@@ -2733,25 +2739,26 @@ impl PvDatabase {
     /// `callbackRequestDelayed` replacing an outstanding delayed callback
     /// for a record. `name` must be the canonical record name (the value
     /// of `RecordInstance::name`). Returns `None` if the record is absent.
-    pub fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {
+    pub fn mint_async_token(&self, name: impl AsRef<[u8]>) -> Option<AsyncToken> {
+        let name = name.as_ref();
         let rec = self.get_record_no_resolve(name)?;
         let generation = rec.read().reprocess_generation.clone();
         Some(Self::advance_async_generation(name, generation))
     }
 
     /// [`Self::mint_async_token`] for the frame's own record.
-    fn mint_async_token_in(name: &str, rec: InFrame<'_>) -> AsyncToken {
+    fn mint_async_token_in(name: &[u8], rec: InFrame<'_>) -> AsyncToken {
         let generation = rec.read().reprocess_generation.clone();
         Self::advance_async_generation(name, generation)
     }
 
     fn advance_async_generation(
-        name: &str,
+        name: &[u8],
         generation: Arc<std::sync::atomic::AtomicU64>,
     ) -> AsyncToken {
         let epoch = Self::advance_generation(&generation);
         AsyncToken {
-            name: name.to_string(),
+            name: RecordName::from(name),
             generation,
             epoch,
         }
@@ -2783,7 +2790,8 @@ impl PvDatabase {
     /// every previously-minted [`AsyncToken`] for it becomes stale and its
     /// `fire` is a no-op. A subsequent [`Self::mint_async_token`] produces a
     /// fresh, current token. No-op if the record is absent.
-    pub fn cancel_async_reentry(&self, name: &str) {
+    pub fn cancel_async_reentry(&self, name: impl AsRef<[u8]>) {
+        let name = name.as_ref();
         if let Some(rec) = self.get_record_no_resolve(name) {
             rec.read()
                 .reprocess_generation
@@ -2801,7 +2809,11 @@ impl PvDatabase {
     /// [`ProcessContext::callback_priority`](crate::server::record::ProcessContext)
     /// instead. A record that is gone answers `Low`, the band an unwritten
     /// `PRIO` already has; the work being scheduled for it is a no-op anyway.
-    pub fn record_callback_priority(&self, name: &str) -> crate::runtime::task::CallbackPriority {
+    pub fn record_callback_priority(
+        &self,
+        name: impl AsRef<[u8]>,
+    ) -> crate::runtime::task::CallbackPriority {
+        let name = name.as_ref();
         match self.get_record_no_resolve(name) {
             Some(rec) => rec.read().common.callback_priority(),
             None => crate::runtime::task::CallbackPriority::Low,
@@ -2815,7 +2827,12 @@ impl PvDatabase {
     /// defer ([`SimOutcome::DeferRead`]). Minting advances the record's
     /// generation so a newer schedule supersedes any pending one; a stale
     /// token's `fire` is a structural no-op. No-op if the record is absent.
-    fn schedule_delayed_reprocess(&self, name: &str, rec: InFrame<'_>, delay: std::time::Duration) {
+    fn schedule_delayed_reprocess(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+        delay: std::time::Duration,
+    ) {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
@@ -2836,11 +2853,11 @@ impl PvDatabase {
     /// other process cycle can consume the one-shot. Re-arming mints a fresh
     /// token, exactly as C's re-`callbackRequestDelayed` replaces the pending
     /// delayed callback.
-    fn schedule_delayed_callback(&self, name: &str, rec: InFrame<'_>, delay: std::time::Duration) {
+    fn schedule_delayed_callback(&self, name: &[u8], rec: InFrame<'_>, delay: std::time::Duration) {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         crate::runtime::task::spawn_background(prio, async move {
             let mut token = token;
             let mut delay = delay;
@@ -2853,7 +2870,7 @@ impl PvDatabase {
                 }
                 let outcome = {
                     let records = db.inner.records.read();
-                    let Some(rec) = records.get(name.as_str()) else {
+                    let Some(rec) = records.get(&*name) else {
                         return;
                     };
                     let rec = rec.clone();
@@ -2884,7 +2901,7 @@ impl PvDatabase {
     /// C throttle's `callbackRequestDelayed(&delayFuncCb, delay)`
     /// (`throttleRecord.c:593`). Shares the record's reprocess generation, so
     /// a newer arm supersedes a pending one as C's single callback does.
-    fn schedule_value_put(&self, name: &str, rec: InFrame<'_>, delay: std::time::Duration) {
+    fn schedule_value_put(&self, name: &[u8], rec: InFrame<'_>, delay: std::time::Duration) {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
@@ -2905,7 +2922,7 @@ impl PvDatabase {
     /// `dbScanLock`, never `dbProcess` — no disable test, no PACT, no TPRO
     /// line and no `monitor()`; the record's own marks carry its posts, stamp
     /// and alarm reset.
-    fn value_put_in(&self, name: &str, rec: InFrame<'_>, visited: &mut ProcStack) {
+    fn value_put_in(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
         let actions = rec.write().record.delayed_value_put();
         self.execute_process_actions_in(name, rec, actions, visited);
         let forward = {
@@ -2964,7 +2981,7 @@ impl PvDatabase {
     /// for the fields the record named — no `add_count`, no alarm tail, no
     /// FLNK. A record with no watchdog (`watchdog_interval() == None`) spawns
     /// nothing.
-    pub(crate) fn arm_watchdog(&self, name: &str) {
+    pub(crate) fn arm_watchdog(&self, name: &[u8]) {
         if let Some(rec) = self.get_record_no_resolve(name) {
             self.with_frame(&rec, |frame| self.arm_watchdog_in(frame));
         }
@@ -3057,9 +3074,10 @@ impl PvDatabase {
     /// record is absent.
     pub fn post_fields(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         fields: Vec<(String, EpicsValue)>,
     ) -> CaResult<Vec<String>> {
+        let name = name.as_ref();
         self.post_fields_with_mask(
             name,
             fields,
@@ -3085,14 +3103,16 @@ impl PvDatabase {
     /// labels. Returns the field names actually written.
     pub fn post_property(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         post: crate::server::device_support::PropertyPost,
     ) -> CaResult<Vec<String>> {
+        let name = name.as_ref();
         let rec = {
             let records = self.inner.records.read();
             records.get(name).cloned()
         };
-        let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
+        let rec = rec
+            .ok_or_else(|| CaError::ChannelNotFound(String::from_utf8_lossy(name).into_owned()))?;
         let mut links = crate::server::record::PreparedLinks::for_puts(
             self,
             &rec,
@@ -3121,10 +3141,11 @@ impl PvDatabase {
     /// records post `DBE_VALUE` and a fourth posts `DBE_VALUE|DBE_LOG`.
     pub(crate) fn post_fields_with_mask(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
     ) -> CaResult<Vec<String>> {
+        let name = name.as_ref();
         self.post_fields_with_mask_if(name, fields, mask, || true)
     }
 
@@ -3135,16 +3156,18 @@ impl PvDatabase {
     /// before any item's [`PostItem::rule`] is read.
     pub(crate) fn post_fields_with_mask_if<P: PostItem>(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         fields: Vec<P>,
         mask: crate::server::recgbl::EventMask,
         current: impl FnOnce() -> bool,
     ) -> CaResult<Vec<String>> {
+        let name = name.as_ref();
         let rec = {
             let records = self.inner.records.read();
             records.get(name).cloned()
         };
-        let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
+        let rec = rec
+            .ok_or_else(|| CaError::ChannelNotFound(String::from_utf8_lossy(name).into_owned()))?;
         let mut links = crate::server::record::PreparedLinks::for_puts(
             self,
             &rec,
@@ -3240,7 +3263,7 @@ impl PvDatabase {
     /// `CA`/`PVA` (external) link returns `None` — epics-base-rs has no
     /// client-side introspection of a remote field's type, so the caller
     /// renders those as the `DBF_unknown` sentinel.
-    pub(crate) fn link_target_field_type(&self, link: &str) -> Option<crate::types::DbFieldType> {
+    pub(crate) fn link_target_field_type(&self, link: &[u8]) -> Option<crate::types::DbFieldType> {
         let db = match crate::server::record::parse_link_v2(link) {
             crate::server::record::ParsedLink::Db(db) => db,
             _ => return None,
@@ -3309,7 +3332,7 @@ impl PvDatabase {
     #[inline(never)]
     fn async_soft_inp_stage(
         &self,
-        name: &str,
+        name: &[u8],
         guard: &mut DataGuard<'_>,
         is_soft: bool,
         wants_source_time: bool,
@@ -3468,11 +3491,12 @@ impl PvDatabase {
     /// the set).
     pub async fn put_link_notify(
         &self,
-        record_name: &str,
+        record_name: impl AsRef<[u8]>,
         link_field: &'static str,
-        link_str: &str,
+        link_str: impl AsRef<[u8]>,
         value: EpicsValue,
     ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        let record_name = record_name.as_ref();
         let rec = {
             let records = self.inner.records.read();
             records.get(record_name)?.clone()
@@ -3484,6 +3508,7 @@ impl PvDatabase {
         // inherits the source's PENDING alarm.
         let src_putf = rec.read().common.putf;
         let (waitset, completion) = Self::new_put_notify();
+        let link_str = link_str.as_ref();
         if !link_str.is_empty() {
             let parsed = crate::server::record::parse_output_link_v2(link_str);
             // Seed the cycle-guard with the source so a target linking back
@@ -3625,8 +3650,9 @@ impl PvDatabase {
     fn process_entry_prelude<'a>(
         &self,
         target: ProcessTarget<'a>,
+        looked_up: &'a mut Option<RecordName>,
         visited: &mut ProcStack,
-    ) -> CaResult<Option<(FrameName<'a>, FrameRec<'a>)>> {
+    ) -> CaResult<Option<(&'a [u8], FrameRec<'a>)>> {
         // Normalise to the canonical record name once at entry — both
         // for cycle-detection (`visited` would otherwise treat alias
         // and canonical as distinct entries) and for the records-map
@@ -3643,11 +3669,9 @@ impl PvDatabase {
         // outlived its key answers `is_destroyed`; the body checks that under
         // the data lock it takes anyway and reports the record missing.
         let (name, rec) = match target {
-            ProcessTarget::Resolved(name, rec) => {
-                (FrameName::Borrowed(name), FrameRec::Borrowed(rec))
-            }
+            ProcessTarget::Resolved(name, rec) => (name, FrameRec::Borrowed(rec)),
             ProcessTarget::Name(name) => match self.lookup_record(name) {
-                Some((name, rec)) => (FrameName::Shared(name), FrameRec::Owned(rec)),
+                Some((name, rec)) => (&**looked_up.insert(name), FrameRec::Owned(rec)),
                 // Nothing is registered under the name — C `S_db_notFound`,
                 // which C reaches in `dbNameToAddr` before `dbProcess` is
                 // called at all. Answered BEFORE the marker goes in: this
@@ -3658,8 +3682,8 @@ impl PvDatabase {
                 // answer is an error anyway.
                 None => {
                     let name = match self.resolve_alias(name) {
-                        Some(target) => target,
-                        None => name.to_string(),
+                        Some(target) => target.to_string(),
+                        None => String::from_utf8_lossy(name).into_owned(),
                     };
                     return Err(CaError::ChannelNotFound(name));
                 }
@@ -3760,7 +3784,7 @@ impl PvDatabase {
     fn entry_did_not_run<'a>(
         &self,
         rec: Option<&Arc<RecordCell>>,
-    ) -> CaResult<Option<(FrameName<'a>, FrameRec<'a>)>> {
+    ) -> CaResult<Option<(&'a [u8], FrameRec<'a>)>> {
         if let Some(rec) = rec {
             let notify = {
                 let mut instance = rec.write();
@@ -3803,7 +3827,7 @@ impl PvDatabase {
     /// straight-line C).
     async fn process_record_with_links_inner(
         &self,
-        name: &str,
+        name: &[u8],
         visited: &mut ProcStack,
         is_continuation: bool,
         acquire_gate: bool,
@@ -3845,10 +3869,10 @@ impl PvDatabase {
     ) -> Option<(crate::types::WallTime, u64)> {
         match link {
             crate::server::record::ParsedLink::Db(l) => {
-                self.record_time_stamp_tag(&l.target().record)
+                self.record_time_stamp_tag(l.target().record.as_bytes())
             }
             crate::server::record::ParsedLink::Ca(ca) => self
-                .external_link_time(&format!("ca://{}", ca.pv))
+                .external_link_time(&[b"ca://", ca.pv.as_bytes()].concat())
                 .map(ext_time_pair),
             // `lnkCalc_getTimestampTag` (`lnkCalc.c:749-762`) answers from
             // `clink->time`/`clink->utag`, and the only thing that ever fills
@@ -3927,8 +3951,8 @@ impl PvDatabase {
             None => {
                 let pvname = match siol {
                     crate::server::record::ParsedLink::Db(l) => l.pvname(),
-                    crate::server::record::ParsedLink::Ca(ca) => ca.pv.to_string(),
-                    _ => String::new(),
+                    crate::server::record::ParsedLink::Ca(ca) => ca.pv.clone(),
+                    _ => crate::types::RecordName::from(""),
                 };
                 crate::runtime::log::errlog_vprintf(format_args!(
                     "recGblGetTimeStampSimm: dbGetTimeStamp (sim mode) failed, {}.SIOL = {pvname}\n",
@@ -3944,7 +3968,7 @@ impl PvDatabase {
     /// makes a DB-style link naming a record this IOC does not hold a CA
     /// link, so its timestamp comes from the CA lset's cached monitor and
     /// carries no userTag.
-    fn record_time_stamp_tag(&self, record: &str) -> Option<(crate::types::WallTime, u64)> {
+    fn record_time_stamp_tag(&self, record: &[u8]) -> Option<(crate::types::WallTime, u64)> {
         match self.link_target(record) {
             super::links::LinkTarget::Local(src) => {
                 let g = src.read();
@@ -3952,7 +3976,7 @@ impl PvDatabase {
             }
             super::links::LinkTarget::LocalNotRecord => None,
             super::links::LinkTarget::External => self
-                .external_link_time(&format!("ca://{record}"))
+                .external_link_time(&[b"ca://", record].concat())
                 .map(ext_time_pair),
         }
     }
@@ -4037,7 +4061,7 @@ impl PvDatabase {
                 crate::server::record::ParsedLink::Ca(ca) => match ca_tsel_time_record(&ca.pv) {
                     Some(rec_name) => self.db_get_time_stamp_tag(
                         &crate::server::record::ParsedLink::Ca(crate::server::record::CaLink {
-                            pv: rec_name.to_string(),
+                            pv: rec_name.into(),
                             ..ca.clone()
                         }),
                     ),
@@ -4180,7 +4204,7 @@ impl PvDatabase {
     fn fetch_string_inputs(
         &self,
         rec: InFrame<'_>,
-        name: &str,
+        name: &[u8],
         visited: &mut ProcStack,
         link_alarms: &mut Vec<(
             crate::server::record::MonitorSwitch,
@@ -4244,9 +4268,12 @@ impl PvDatabase {
                 // "%s:fetch(%s) failed", pcalc->name, sFldnames[i])` — the
                 // failed fetch REPLACES the value with the diagnostic; the
                 // previous string is not kept, and the record still computes.
-                crate::server::recgbl::simm::LinkFetch::Failed => truncate_string_field(
-                    PvString::from(format!("{name}:fetch({val_field}) failed")),
-                ),
+                crate::server::recgbl::simm::LinkFetch::Failed => {
+                    truncate_string_field(PvString::from(format!(
+                        "{}:fetch({val_field}) failed",
+                        String::from_utf8_lossy(name)
+                    )))
+                }
             };
             results.push((val_field.to_string(), EpicsValue::String(text)));
         }
@@ -4269,7 +4296,7 @@ impl PvDatabase {
     #[inline(always)]
     fn fetch_input_stage(
         &self,
-        name: &str,
+        name: &[u8],
         guard: &mut DataGuard<'_>,
         plan: &crate::server::record::record_instance::ProcessPlan,
         input_link_texts: &InputLinkTexts,
@@ -4946,7 +4973,7 @@ impl PvDatabase {
     #[inline(always)]
     fn process_record_with_links_body(
         &self,
-        name: &str,
+        name: &[u8],
         rec: InFrame<'_>,
         visited: &mut ProcStack,
         is_continuation: bool,
@@ -4982,7 +5009,9 @@ impl PvDatabase {
             let plan = guard.rec.process_plan();
             let instance = guard.hold();
             if instance.is_destroyed() {
-                return Err(CaError::ChannelNotFound(name.to_string()));
+                return Err(CaError::ChannelNotFound(
+                    String::from_utf8_lossy(name).into_owned(),
+                ));
             }
             let active = !is_continuation
                 && if instance.is_processing() {
@@ -5250,7 +5279,7 @@ impl PvDatabase {
                 guard.release();
                 crate::server::recgbl::rec_gbl_record_error(
                     &crate::server::recgbl::DevSupStatus::MissingSup.text(),
-                    name,
+                    &String::from_utf8_lossy(name),
                     message,
                 );
                 if let Some(ws) = notify {
@@ -5893,7 +5922,7 @@ impl PvDatabase {
                     // `as_str`: the record's address, which `process_and_drain`'s
                     // hooked path takes, is then not computed for this branch
                     // ahead of the test.
-                    trace_dbprocess(format_args!("dbProcess of '{}'", instance.name.as_str()));
+                    trace_dbprocess(format_args!("dbProcess of '{}'", instance.name));
                 }
 
                 // MS-class alarm propagation from input links. Mirrors C
@@ -6599,7 +6628,7 @@ impl PvDatabase {
                 // another record) and re-taken, the same way the pre-process
                 // `ReadDbLink` stage above does it; the record stays claimed by the
                 // `processing` guard meanwhile.
-                let out_time_reads: Option<Vec<(String, &'static str)>> =
+                let out_time_reads: Option<Vec<(crate::types::PvString, &'static str)>> =
                     if skip_out || !plan.reads_links_at_output {
                         debug_assert!(
                             plan.reads_links_at_output
@@ -6713,7 +6742,7 @@ impl PvDatabase {
                             crate::runtime::task::spawn_background(
                                 crate::runtime::task::CallbackPriority::Medium,
                                 async move {
-                                    db.post_event_named(&event_name).await;
+                                    db.post_event_named(event_name.as_bytes()).await;
                                 },
                             );
                         }
@@ -7136,7 +7165,7 @@ impl PvDatabase {
     /// by the two simulation early-returns: a put-notify on a SIMM record never
     /// left its wait-set (the callback never fired) and PUTF leaked into the next
     /// scan.
-    fn end_process_cycle(&self, name: &str, rec: InFrame<'_>, exit: PactExit) {
+    fn end_process_cycle(&self, name: &[u8], rec: InFrame<'_>, exit: PactExit) {
         finish_cycle(&mut rec.write());
         self.apply_pact_exit(name, exit);
     }
@@ -7156,7 +7185,7 @@ impl PvDatabase {
     /// take the record between the pop and the replay and thereby overtake a
     /// notify that has been waiting longer.
     #[inline(always)]
-    pub(super) fn apply_pact_exit(&self, name: &str, exit: PactExit) {
+    pub(super) fn apply_pact_exit(&self, name: &[u8], exit: PactExit) {
         // NO record lock here, deliberately. This runs from cycle tails and
         // from a `Drop` that can fire while a `rec.write()` guard is still
         // alive in the same scope; parking_lot is not reentrant, so a read
@@ -7169,9 +7198,9 @@ impl PvDatabase {
 
     #[cold]
     #[inline(never)]
-    fn spawn_notify_restart(&self, name: &str) {
+    fn spawn_notify_restart(&self, name: &[u8]) {
         let db = self.clone();
-        let put_name = name.to_string();
+        let put_name = RecordName::from(name);
         // C pins every put-notify callback to the low band —
         // `callbackSetPriority(priorityLow, &pnotifyPvt->callback)`
         // (`dbNotify.c:131`) — regardless of the record's PRIO.
@@ -7196,7 +7225,7 @@ impl PvDatabase {
     /// chain).
     fn run_forward_link_tail(
         &self,
-        name: &str,
+        name: &[u8],
         rec: InFrame<'_>,
         posts: CyclePosts,
         visited: &mut ProcStack,
@@ -7220,7 +7249,7 @@ impl PvDatabase {
     #[inline(always)]
     fn run_forward_link_tail_with_putf(
         &self,
-        name: &str,
+        name: &[u8],
         guard: &mut DataGuard<'_>,
         flnk: &crate::server::record::record_instance::ForwardTarget,
         src: TailCtx<'_>,
@@ -7291,7 +7320,7 @@ impl PvDatabase {
             };
             if needs_rpro {
                 let db = self.clone();
-                let rpro_name = name.to_string();
+                let rpro_name = RecordName::from(name);
                 // Middle band, not the record's PRIO: C `recGblFwdLink` hands
                 // RPRO to `scanOnce` (`recGbl.c`), whose single "scanOnce"
                 // thread runs at `epicsThreadPriorityScanLow + nPeriodic`
@@ -7606,7 +7635,7 @@ impl PvDatabase {
     /// the same answer whichever path read it.
     fn execute_read_db_links(
         &self,
-        record_name: &str,
+        record_name: &[u8],
         rec: InFrame<'_>,
         actions: &[crate::server::record::ProcessAction],
         visited: &mut ProcStack,
@@ -7667,7 +7696,7 @@ impl PvDatabase {
     /// - ReprocessAfter: schedules a delayed re-process via tokio::spawn
     pub(super) fn execute_process_actions_in(
         &self,
-        record_name: &str,
+        record_name: &[u8],
         rec: InFrame<'_>,
         actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
         visited: &mut ProcStack,
@@ -7819,7 +7848,7 @@ impl PvDatabase {
                         // `dbPutField` and releases the record gate this call is
                         // still holding.
                         let db = self.clone();
-                        let name = record_name.to_string();
+                        let name = RecordName::from(record_name);
                         // Middle band, not the record's PRIO: `scanOnce` is a
                         // dedicated thread in C (`dbScan.c:770-779`), not one
                         // of the three callback queues.
@@ -7919,8 +7948,9 @@ impl PvDatabase {
     /// held, which would dead-lock on the non-reentrant gate.
     pub fn complete_async_record<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a (impl AsRef<[u8]> + ?Sized),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        let name = name.as_ref();
         self.complete_async_record_with_outcome(name, Ok(()))
     }
 
@@ -7933,15 +7963,16 @@ impl PvDatabase {
     /// `NO_ALARM`.
     pub fn complete_async_record_with_outcome<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a (impl AsRef<[u8]> + ?Sized),
         outcome: CaResult<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        let name = name.as_ref();
         Box::pin(async move { self.complete_async_write(name, outcome) })
     }
 
     /// [`Self::complete_async_record_with_outcome`] on the calling thread: a
     /// [`WriteDone`]'s callback band runs it.
-    fn complete_async_write(&self, name: &str, outcome: CaResult<()>) -> CaResult<()> {
+    fn complete_async_write(&self, name: &[u8], outcome: CaResult<()>) -> CaResult<()> {
         // Alias-aware entry — same pattern as
         // `process_record_with_links_inner`. `name` may arrive as an alias
         // from an async device-support callback that captured the original
@@ -7958,7 +7989,10 @@ impl PvDatabase {
             // Nothing registered under the name. An alias whose target has
             // gone has always reported the TARGET as missing.
             None => {
-                let missing = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
+                let missing = self.resolve_alias(name).map_or_else(
+                    || String::from_utf8_lossy(name).into_owned(),
+                    |t| t.to_string(),
+                );
                 return Err(CaError::ChannelNotFound(missing));
             }
         };
@@ -7974,7 +8008,7 @@ impl PvDatabase {
 
     fn complete_async_record_inner(
         &self,
-        canonical: Arc<str>,
+        canonical: RecordName,
         rec: InFrame<'_>,
         write_error: Option<CaError>,
         visited: &mut ProcStack,
@@ -7993,7 +8027,7 @@ impl PvDatabase {
         if !visited.claim(rec.unframed()) {
             return Ok(()); // Already on this stack, skip
         }
-        let name: &str = &canonical;
+        let name: &[u8] = &canonical;
 
         // This pass IS C's `process()` re-entry, so it runs the whole
         // `recGblGetTimeStampSimm` again — TSEL read included, before the guard.
@@ -8157,7 +8191,7 @@ impl PvDatabase {
                         crate::runtime::task::spawn_background(
                             crate::runtime::task::CallbackPriority::Medium,
                             async move {
-                                db.post_event_named(&event_name).await;
+                                db.post_event_named(event_name.as_bytes()).await;
                             },
                         );
                     }
@@ -8304,7 +8338,7 @@ impl PvDatabase {
             };
             if needs_rpro {
                 let db = self.clone();
-                let rpro_name = name.to_string();
+                let rpro_name = RecordName::from(name);
                 // Middle band, not the record's PRIO: C `recGblFwdLink` hands
                 // RPRO to `scanOnce` (`recGbl.c`), whose single "scanOnce"
                 // thread runs at `epicsThreadPriorityScanLow + nPeriodic`
@@ -8392,7 +8426,7 @@ impl PvDatabase {
     /// skipped via the `visited` cycle guard.
     fn dispatch_cp_targets(
         &self,
-        name: &str,
+        name: &[u8],
         rec: InFrame<'_>,
         posts: CyclePosts,
         visited: &mut ProcStack,
@@ -8473,7 +8507,7 @@ impl PvDatabase {
     ///
     /// Private: [`ExternalCpProcess::run_worker`] is the only caller, so a
     /// link callback can request a process but never run one inline.
-    fn dispatch_external_cp_targets(&self, external_pv: &str) {
+    fn dispatch_external_cp_targets(&self, external_pv: &[u8]) {
         let targets = self.get_external_cp_targets(external_pv);
         if targets.is_empty() {
             return;
@@ -8725,7 +8759,7 @@ impl PvDatabase {
     /// it active.
     pub(super) fn execute_process_actions(
         &self,
-        record_name: &str,
+        record_name: &[u8],
         rec: &Arc<RecordCell>,
         actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
         visited: &mut ProcStack,
@@ -9135,7 +9169,10 @@ impl PvDatabase {
     /// steady cycle never does.
     fn check_simm_under_guard(
         instance: &mut crate::server::record::RecordInstance,
-    ) -> (Option<String>, crate::server::record::CommonFieldPutResult) {
+    ) -> (
+        Option<RecordName>,
+        crate::server::record::CommonFieldPutResult,
+    ) {
         use crate::server::record::CommonFieldPutResult;
         let result = instance.rec_gbl_check_simm();
         let name = matches!(result, CommonFieldPutResult::ScanChanged { .. })
@@ -9147,7 +9184,7 @@ impl PvDatabase {
     /// once the record lock is down.
     fn move_scan_for_simm(
         &self,
-        name: Option<String>,
+        name: Option<RecordName>,
         result: crate::server::record::CommonFieldPutResult,
     ) {
         use crate::server::record::CommonFieldPutResult;
@@ -9252,8 +9289,8 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             instance.common.text.inp.clone()
         } else {
             match instance.record.get_field(link_field) {
-                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                _ => String::new(),
+                Some(EpicsValue::String(s)) => s,
+                _ => crate::types::PvString::new(),
             }
         };
         if gated {
@@ -9415,9 +9452,7 @@ impl PvDatabase {
             let link_of = |instance: &RecordInstance, field: &str| {
                 instance.resolve_field(field).and_then(|v| {
                     if let EpicsValue::String(s) = v {
-                        Some(crate::server::record::parse_link_v2(
-                            s.as_str_lossy().as_ref(),
-                        ))
+                        Some(crate::server::record::parse_link_v2(s.as_bytes()))
                     } else {
                         None
                     }
@@ -10264,13 +10299,13 @@ fn sim_process_tail(
 /// later, from its own token.
 struct CycleEndGuard<'a> {
     db: &'a PvDatabase,
-    name: &'a str,
+    name: &'a [u8],
     rec: InFrame<'a>,
     exit: Option<crate::server::record::PactExit>,
 }
 
 impl<'a> CycleEndGuard<'a> {
-    fn new(db: &'a PvDatabase, name: &'a str, rec: InFrame<'a>) -> Self {
+    fn new(db: &'a PvDatabase, name: &'a [u8], rec: InFrame<'a>) -> Self {
         Self {
             db,
             name,
@@ -10358,15 +10393,15 @@ pub struct ExternalCpProcess {
     pending: std::sync::atomic::AtomicBool,
     /// The `workListEvent` signal (`dbCa.c:160`), sent on the 0→1 edge only.
     wake: crate::runtime::sync::Notify,
-    external_pv: String,
+    external_pv: RecordName,
 }
 
 impl ExternalCpProcess {
-    pub fn new(external_pv: String) -> Self {
+    pub fn new(external_pv: impl Into<RecordName>) -> Self {
         Self {
             pending: std::sync::atomic::AtomicBool::new(false),
             wake: crate::runtime::sync::Notify::new(),
-            external_pv,
+            external_pv: external_pv.into(),
         }
     }
 
@@ -10408,7 +10443,7 @@ mod input_link_texts_tests {
     use crate::types::EpicsValue;
 
     fn calc() -> RecordInstance {
-        RecordInstance::new_boxed("C:ONE".to_string(), Box::new(CalcRecord::default()))
+        RecordInstance::new_boxed("C:ONE", Box::new(CalcRecord::default()))
     }
 
     /// INPB's text through the funnel a slotted link's put takes.
@@ -10473,7 +10508,7 @@ mod input_link_texts_tests {
     fn a_type_with_no_multi_input_links_reads_as_none_set() {
         use crate::server::record::record_instance::ProcessPlan;
         let ai = RecordInstance::new_boxed(
-            "AI".to_string(),
+            "AI",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         );
         assert!(ai.record.multi_input_links().is_empty());
@@ -10544,7 +10579,7 @@ mod input_link_texts_tests {
 
     fn pvname(link: &crate::server::record::ParsedLink) -> String {
         match link {
-            crate::server::record::ParsedLink::Db(db) => db.pvname(),
+            crate::server::record::ParsedLink::Db(db) => db.pvname().to_string(),
             other => panic!("expected a DB link, got {other:?}"),
         }
     }
@@ -10559,8 +10594,7 @@ mod ls_init_udf_tests {
     use crate::types::EpicsValue;
 
     fn udf_after_seed(dset_init: DsetInit) -> u8 {
-        let mut instance =
-            RecordInstance::new_boxed("L:ONE".to_string(), Box::new(LsoRecord::default()));
+        let mut instance = RecordInstance::new_boxed("L:ONE", Box::new(LsoRecord::default()));
         instance
             .record
             .put_field("DOL", EpicsValue::String("5".into()))

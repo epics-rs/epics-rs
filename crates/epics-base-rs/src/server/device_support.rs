@@ -1041,7 +1041,9 @@ pub fn wire_device_to_record(instance: &mut RecordInstance, dev: Box<dyn DeviceS
 /// put the whole sequence after the record's init passes, so `init_record`
 /// could not see its own dset and ran the tail C's early return skips.
 pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn DeviceSupport>) {
-    let name = instance.name.clone();
+    // Device supports take a `&str` name; one that is not UTF-8 reaches
+    // them in its lossy form.
+    let name = instance.name.to_str_lossy().into_owned();
     dev.set_record_info(&name, instance.common.scan);
     dev.apply_record_info(instance.info());
     instance.device = Some(dev);
@@ -1165,7 +1167,7 @@ mod tests {
 
     /// Wire a probe with `verdict` onto a fresh ai and hand back the instance.
     fn wire(verdict: InitVerdict) -> RecordInstance {
-        let mut instance = RecordInstance::new("TEST:DEAD".to_string(), AiRecord::new(0.0));
+        let mut instance = RecordInstance::new("TEST:DEAD", AiRecord::new(0.0));
         instance.common.dtyp = "ProbeDev".into();
         wire_device_to_record(
             &mut instance,
@@ -1235,7 +1237,7 @@ mod tests {
     /// IocBuilder path discarded the error with `let _ =`.)
     #[test]
     fn wire_device_init_failure_flags_record_invalid() {
-        let mut instance = RecordInstance::new("TEST:AI".to_string(), AiRecord::new(0.0));
+        let mut instance = RecordInstance::new("TEST:AI", AiRecord::new(0.0));
         instance.common.dtyp = "ProbeDev".into();
         let obs = Arc::new(Mutex::new(WireObservation::default()));
         let dev = Box::new(ProbeDev {
@@ -1268,7 +1270,7 @@ mod tests {
     /// `set_record_info` must have run first.
     #[test]
     fn wire_device_applies_info_and_record_info_before_init() {
-        let mut instance = RecordInstance::new("TEST:AI2".to_string(), AiRecord::new(0.0));
+        let mut instance = RecordInstance::new("TEST:AI2", AiRecord::new(0.0));
         instance.common.dtyp = "ProbeDev".into();
         instance.set_info("asyn:READBACK", "1");
         let obs = Arc::new(Mutex::new(WireObservation::default()));

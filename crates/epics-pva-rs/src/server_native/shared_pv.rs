@@ -28,6 +28,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
+use epics_base_rs::types::RecordName;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -483,7 +484,7 @@ struct Inner {
     /// channel for this PV — the second half of pvxs `SharedPV::close()`
     /// (`sharedpv.cpp:411-414` closes every attached channel, not just the
     /// value/type). Empty for a standalone (never-registered) PV.
-    invalidators: Vec<(ChannelInvalidator, String)>,
+    invalidators: Vec<(ChannelInvalidator, RecordName)>,
 }
 
 impl Default for Inner {
@@ -645,7 +646,7 @@ impl SharedPV {
     /// [`SharedSource`] at registration time (and when the server installs
     /// the invalidator). Multiple bindings accumulate: one PV registered
     /// under several names / sources closes them all.
-    pub(crate) fn bind_invalidator(&self, invalidator: ChannelInvalidator, name: String) {
+    pub(crate) fn bind_invalidator(&self, invalidator: ChannelInvalidator, name: RecordName) {
         self.inner.lock().invalidators.push((invalidator, name));
     }
 
@@ -670,7 +671,7 @@ impl SharedPV {
         // Snapshot the bindings under the lock, then publish after releasing
         // it — `publish` only enqueues to per-connection mpsc queues, but
         // keeping it off the PV lock avoids re-entrancy hazards.
-        let invalidations: Vec<(ChannelInvalidator, String)> = {
+        let invalidations: Vec<(ChannelInvalidator, RecordName)> = {
             let mut g = self.inner.lock();
             g.state = PvState::Closed;
             g.subscribers.clear();
@@ -1335,13 +1336,13 @@ impl Default for SharedPV {
 /// first.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("SharedSource: PV '{0}' is already registered (remove() it first to replace)")]
-pub struct AddPvError(pub String);
+pub struct AddPvError(pub RecordName);
 
 /// Trivial map-of-named-SharedPV adapter that implements
 /// [`super::source::ChannelSource`]. Construct via `SharedSource::new()`,
 /// `add(name, shared_pv)`, then pass to `super::runtime::run_pva_server`.
 pub struct SharedSource {
-    pvs: Mutex<HashMap<String, SharedPV>>,
+    pvs: Mutex<HashMap<RecordName, SharedPV>>,
     /// Optional per-source access gate. When `None`, the trait
     /// default open gate is returned (back-compat). When `Some`,
     /// every wire op routes its allow/deny check through this
@@ -1405,7 +1406,7 @@ impl SharedSource {
     /// add path routes through it, so "a name is registered at most once"
     /// holds by construction and the served namespace can never silently
     /// swap underneath in-flight operations holding the old `SharedPV`.
-    pub fn try_add(&self, name: impl Into<String>, pv: SharedPV) -> Result<(), AddPvError> {
+    pub fn try_add(&self, name: impl Into<RecordName>, pv: SharedPV) -> Result<(), AddPvError> {
         use std::collections::hash_map::Entry;
         // Single lock-acquisition order across this and
         // `set_channel_invalidator`: `pvs` first, then `invalidator`. The PV
@@ -1438,7 +1439,7 @@ impl SharedSource {
     /// the existing PV is kept (never replaced) instead of surfacing an
     /// error — for the many infallible call sites. Callers that must
     /// observe the duplicate (the service framework) use `try_add`.
-    pub fn add(&self, name: impl Into<String>, pv: SharedPV) {
+    pub fn add(&self, name: impl Into<RecordName>, pv: SharedPV) {
         if let Err(e) = self.try_add(name, pv) {
             tracing::warn!(
                 pv = %e.0,
@@ -1454,8 +1455,8 @@ impl SharedSource {
     /// [`crate::service::remove_rpc_service`] to tear down an RPC
     /// service registered via `add_rpc_service`; also useful for
     /// dynamic IOC topologies where PVs come and go at runtime.
-    pub fn remove(&self, name: &str) -> Option<SharedPV> {
-        let removed = self.pvs.lock().remove(name);
+    pub fn remove(&self, name: impl AsRef<[u8]>) -> Option<SharedPV> {
+        let removed = self.pvs.lock().remove(name.as_ref());
         // pvxs `Server::removePV` bumps `beaconChange` unconditionally
         // (src/server.cpp:188-189): the `StaticSource::remove` it delegates to
         // returns without throwing when the name is absent
@@ -1468,8 +1469,8 @@ impl SharedSource {
         removed
     }
 
-    pub fn get(&self, name: &str) -> Option<SharedPV> {
-        self.pvs.lock().get(name).cloned()
+    pub fn get(&self, name: impl AsRef<[u8]>) -> Option<SharedPV> {
+        self.pvs.lock().get(name.as_ref()).cloned()
     }
 }
 
@@ -1519,19 +1520,19 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-        let names: Vec<String> = self.pvs.lock().keys().cloned().collect();
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
+        let names: Vec<RecordName> = self.pvs.lock().keys().cloned().collect();
         async move { names }
     }
 
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let exists = self.pvs.lock().contains_key(name);
         async move { exists }
     }
 
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move { pv.and_then(|p| p.introspection()) }
@@ -1543,7 +1544,7 @@ impl super::source::ChannelSource for SharedSource {
     /// immediately: that IS a permanent answer.
     fn await_introspection(
         &self,
-        name: &str,
+        name: &[u8],
         _ctx: super::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
@@ -1555,17 +1556,18 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move { pv.and_then(|p| p.current()) }
     }
 
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
+        let name = RecordName::from(name);
         async move {
             match pv {
                 Some(p) => p.put(value).map_err(OpError::failed),
@@ -1610,7 +1612,7 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         // Per-PV write policy, not mere existence: a PV is writable only
         // when it has an `on_put` handler (built via
         // [`SharedPV::build_mailbox`] or a custom `on_put`). A plain or
@@ -1622,7 +1624,7 @@ impl super::source::ChannelSource for SharedSource {
 
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move {
@@ -1678,12 +1680,12 @@ impl super::source::ChannelSource for SharedSource {
 
     fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             match pv {
                 // Routes through rpc_async so a SharedPV with an
@@ -1700,9 +1702,12 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+    fn process(
+        &self,
+        name: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             match pv {
                 Some(p) => p.process().map_err(OpError::failed),
@@ -1716,7 +1721,7 @@ impl super::source::ChannelSource for SharedSource {
     /// `MonitorControlOp` pipeline-pause semantics.
     fn notify_watermark(
         &self,
-        name: &str,
+        name: &[u8],
         _ctx: &super::source::ChannelContext,
         ev: super::source::WatermarkEvent,
     ) {
@@ -1750,7 +1755,7 @@ impl super::source::ChannelSource for SharedSource {
     /// extra meaning for a single-owner SharedPV — it matters only to the
     /// gateway, which fans per-credential upstreams into separate caches.
     /// The wire layer guarantees one call per Executing<->Idle edge.
-    fn notify_monitor_start(&self, name: &str, _ctx: &super::source::ChannelContext, start: bool) {
+    fn notify_monitor_start(&self, name: &[u8], _ctx: &super::source::ChannelContext, start: bool) {
         let cb = self
             .pvs
             .lock()
@@ -1767,7 +1772,7 @@ impl super::source::ChannelSource for SharedSource {
     /// `SharedPV::attach` (`sharedpv.cpp:299-313`), kept separate from
     /// monitor subscription. A GET/PUT/RPC/GET_FIELD-only channel opens
     /// the producer here, not only a monitoring one.
-    fn notify_channel_open(&self, name: &str, _ctx: &super::source::ChannelContext) {
+    fn notify_channel_open(&self, name: &[u8], _ctx: &super::source::ChannelContext) {
         let pv = self.pvs.lock().get(name).cloned();
         if let Some(p) = pv {
             p.attach_channel();
@@ -1778,7 +1783,7 @@ impl super::source::ChannelSource for SharedSource {
     /// `SharedPV` so it can fire `on_last_disconnect` on the last channel
     /// leaving (pvxs `sharedpv.cpp:278-296`). Mirror of
     /// [`super::source::ChannelSource::notify_channel_open`].
-    fn notify_channel_close(&self, name: &str, _ctx: &super::source::ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], _ctx: &super::source::ChannelContext) {
         let pv = self.pvs.lock().get(name).cloned();
         if let Some(p) = pv {
             p.detach_channel();
@@ -1788,7 +1793,7 @@ impl super::source::ChannelSource for SharedSource {
     /// expose the per-PV `(low, high)` watermark levels so the
     /// monitor loop fires the callbacks off the pipeline window rather
     /// than server-queue occupancy.
-    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    async fn monitor_watermarks(&self, name: &[u8]) -> Option<(usize, usize)> {
         self.pvs.lock().get(name).map(|p| p.watermarks())
     }
 }
@@ -2229,21 +2234,21 @@ mod tests {
         };
 
         // No channel yet: a GET-only path sees a closed PV.
-        assert!(src.get_value("dut").await.is_none());
+        assert!(src.get_value(b"dut").await.is_none());
 
         // Channel attach (the CREATE_CHANNEL owner's hook) drives lazy
         // open — no monitor subscription involved.
-        src.notify_channel_open("dut", &ctx);
+        src.notify_channel_open(b"dut", &ctx);
         assert_eq!(opened.load(Ordering::SeqCst), 1);
         assert!(
-            src.get_value("dut").await.is_some(),
+            src.get_value(b"dut").await.is_some(),
             "lazy GET sees value after first channel attaches"
         );
 
         // Channel close drives onLastDisconnect → PV closes again.
-        src.notify_channel_close("dut", &ctx);
+        src.notify_channel_close(b"dut", &ctx);
         assert!(
-            src.get_value("dut").await.is_none(),
+            src.get_value(b"dut").await.is_none(),
             "PV closed after last channel detaches"
         );
     }
@@ -2345,17 +2350,17 @@ mod tests {
             .unwrap();
         src.add("X", pv.clone());
 
-        assert!(src.get_value("X").await.is_some());
-        assert!(src.get_introspection("X").await.is_some());
+        assert!(src.get_value(b"X").await.is_some());
+        assert!(src.get_introspection(b"X").await.is_some());
 
         pv.close();
 
         assert!(
-            src.get_value("X").await.is_none(),
+            src.get_value(b"X").await.is_none(),
             "GET on a closed SharedPV must not return a stale value"
         );
         assert!(
-            src.get_introspection("X").await.is_none(),
+            src.get_introspection(b"X").await.is_none(),
             "GET_FIELD on a closed SharedPV must not return a stale descriptor"
         );
     }
@@ -2558,8 +2563,8 @@ mod tests {
         pv.set_high_watermark(5);
         let src = SharedSource::new();
         src.add("wm:pv", pv);
-        assert_eq!(src.monitor_watermarks("wm:pv").await, Some((2, 5)));
-        assert_eq!(src.monitor_watermarks("nope").await, None);
+        assert_eq!(src.monitor_watermarks(b"wm:pv").await, Some((2, 5)));
+        assert_eq!(src.monitor_watermarks(b"nope").await, None);
     }
 
     /// Regression: consecutive `put_delta` writes to a writable
@@ -2858,8 +2863,8 @@ mod tests {
         let src = SharedSource::new();
         src.add("test:pv", pv);
 
-        assert!(src.has_pv("test:pv").await);
-        let val = src.get_value("test:pv").await.expect("value");
+        assert!(src.has_pv(b"test:pv").await);
+        let val = src.get_value(b"test:pv").await.expect("value");
         if let PvField::Structure(s) = val {
             assert_eq!(
                 s.get_field("value"),
@@ -2917,11 +2922,11 @@ mod tests {
         // remove+re-add "b" within one interval. list_pvs() is identical
         // before and after, but the counter advances (net +2).
         src.add("b", SharedPV::new());
-        let before: Vec<String> = src.list_pvs().await;
+        let before: Vec<RecordName> = src.list_pvs().await;
         let v3 = src.beacon_change();
         assert!(src.remove("b").is_some());
         src.add("b", SharedPV::new());
-        let after: Vec<String> = src.list_pvs().await;
+        let after: Vec<RecordName> = src.list_pvs().await;
         let v4 = src.beacon_change();
         assert_eq!(
             before, after,

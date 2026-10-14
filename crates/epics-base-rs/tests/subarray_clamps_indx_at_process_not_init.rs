@@ -32,7 +32,7 @@ const WANT: [(State, State); 7] = [
 ];
 
 async fn state(db: &PvDatabase, r: &str) -> (i64, i64, i64) {
-    let n = |f: &str| db.get_pv(&format!("{r}.{f}")).unwrap().to_f64().unwrap() as i64;
+    let n = |f: &str| db.get_pv(format!("{r}.{f}")).unwrap().to_f64().unwrap() as i64;
     (n("NORD"), n("INDX"), n("NELM"))
 }
 

@@ -55,11 +55,11 @@ pub struct AoRecord {
     pub aslo: f64,
     pub aoff: f64,
     // Output control
-    pub omsl: i16,   // 0=supervisory, 1=closed_loop
-    pub dol: String, // desired output location link
-    pub oif: i16,    // 0=Full, 1=Incremental
-    pub oroc: f64,   // output rate of change
-    pub pval: f64,   // previous value
+    pub omsl: i16,     // 0=supervisory, 1=closed_loop
+    pub dol: PvString, // desired output location link
+    pub oif: i16,      // 0=Full, 1=Incremental
+    pub oroc: f64,     // output rate of change
+    pub pval: f64,     // previous value
     // Invalid output
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
@@ -106,8 +106,8 @@ pub struct AoRecord {
     skip_convert: bool,
     // Simulation
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
 }
@@ -137,7 +137,7 @@ impl Default for AoRecord {
             aslo: 0.0,
             aoff: 0.0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             oif: 0,
             oroc: 0.0,
             pval: 0.0,
@@ -156,8 +156,8 @@ impl Default for AoRecord {
             lbrk: 0,
             skip_convert: false,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
         }
@@ -649,11 +649,11 @@ impl Record for AoRecord {
         true
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -906,7 +906,7 @@ impl Record for AoRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(v) => {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -983,14 +983,14 @@ impl Record for AoRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

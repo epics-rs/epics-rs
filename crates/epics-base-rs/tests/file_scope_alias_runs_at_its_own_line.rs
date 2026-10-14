@@ -113,7 +113,7 @@ async fn db_load_records_runs_each_file_alias_at_its_line() {
     assert_eq!(err, want);
 
     // softIoc `dbl`: A A2 B C D, and A2 stays A's.
-    assert_eq!(db.resolve_alias("A2").as_deref(), Some("A"));
+    assert_eq!(db.resolve_alias("A2").as_deref(), Some(&b"A"[..]));
     assert!(db.resolve_alias("N2").is_none());
 }
 

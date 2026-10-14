@@ -23,7 +23,7 @@ use epics_base_rs::server::database::{
 };
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::DBR_CTRL_DOUBLE;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{EpicsValue, RecordName};
 use parking_lot::RwLock;
 
 /// CA record-link monitor event mask — `DBE_VALUE | DBE_ALARM`, matching
@@ -236,7 +236,7 @@ struct LinkConnState {
 }
 
 impl LinkConnState {
-    fn new(db: Arc<RwLock<Option<PvDatabase>>>, pv_name: String) -> Self {
+    fn new(db: Arc<RwLock<Option<PvDatabase>>>, pv_name: RecordName) -> Self {
         Self {
             flag: AtomicBool::new(false),
             read_access: AtomicBool::new(true),
@@ -611,7 +611,7 @@ pub struct CaLinkResolver {
     /// [`Self::with_client`] when a caller wants to share/pin a client.
     client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
     /// Open links keyed by bare PV name (`ca://` scheme stripped).
-    links: Arc<RwLock<HashMap<String, Arc<CaLink>>>>,
+    links: Arc<RwLock<HashMap<RecordName, Arc<CaLink>>>>,
     /// Database handle the link's processor uses to process external
     /// CP/CPP holder records on each remote change
     /// ([`ExternalCpProcess::run_worker`]). `None` until
@@ -689,8 +689,9 @@ impl CaLinkResolver {
     /// This is the entry point an IOC calls at init for every CA
     /// record link so the synchronous resolver hot path can serve
     /// from cache (the C `dbCaAddLink` analogue).
-    pub async fn open(&self, pv_name: &str) -> Result<Arc<CaLink>, CaLinkError> {
-        if let Some(existing) = self.links.read().get(pv_name).cloned() {
+    pub async fn open(&self, pv_name: impl AsRef<[u8]>) -> Result<Arc<CaLink>, CaLinkError> {
+        let pv_name = RecordName::from(pv_name.as_ref());
+        if let Some(existing) = self.links.read().get(pv_name.as_bytes()).cloned() {
             return Ok(existing);
         }
         // The receiver is taken with the channel, before its search starts:
@@ -698,7 +699,7 @@ impl CaLinkResolver {
         // watcher is lost for good — `meta` stays empty and the write right
         // stays at its default `true` (C `connectionCallback` scheduling
         // `CA_GET_ATTRIBUTES` and reading `ca_write_access`).
-        let (channel, conn_rx) = self.client().await?.create_channel_with_events(pv_name, 0);
+        let (channel, conn_rx) = self.client().await?.create_channel_with_events(&pv_name, 0);
         let channel = Arc::new(channel);
         // C `dbCa` opens the record-link monitor with `ca_add_array_event`
         // (`dbCa.c:1225-1229`), whose libca macro expands to
@@ -717,7 +718,7 @@ impl CaLinkResolver {
                 reason: e.to_string(),
             })?;
         let cache: Arc<ArcSwap<Option<CachedSnapshot>>> = Arc::new(ArcSwap::from_pointee(None));
-        let connected = Arc::new(LinkConnState::new(self.db.clone(), pv_name.to_string()));
+        let connected = Arc::new(LinkConnState::new(self.db.clone(), pv_name.clone()));
         let meta: Arc<ArcSwap<Option<LinkMetadata>>> = Arc::new(ArcSwap::from_pointee(None));
         // Connection-event watcher: keeps `connected` in sync with the
         // real circuit state so `is_connected()` reflects upstream
@@ -731,7 +732,7 @@ impl CaLinkResolver {
             connected.clone(),
             channel.clone(),
             meta.clone(),
-            pv_name.to_string(),
+            pv_name.clone(),
         ));
         let process_task = reactor.spawn(run_processor(connected.clone()));
         let monitor_task = reactor.spawn(run_monitor(
@@ -739,7 +740,7 @@ impl CaLinkResolver {
             cache.clone(),
             connected.clone(),
             channel.clone(),
-            pv_name.to_string(),
+            pv_name.clone(),
         ));
         let link = Arc::new(CaLink {
             cache,
@@ -754,10 +755,10 @@ impl CaLinkResolver {
         // converge on one link (the loser's freshly opened link drops,
         // unsubscribing its monitor).
         let mut links = self.links.write();
-        if let Some(existing) = links.get(pv_name).cloned() {
+        if let Some(existing) = links.get(pv_name.as_bytes()).cloned() {
             return Ok(existing);
         }
-        links.insert(pv_name.to_string(), link.clone());
+        links.insert(pv_name, link.clone());
         Ok(link)
     }
 
@@ -767,10 +768,10 @@ impl CaLinkResolver {
     /// the upstream IOC to come online".
     pub async fn wait_for_link_connected(
         &self,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         timeout: std::time::Duration,
     ) -> bool {
-        let name = strip_ca_scheme(pv_name);
+        let name = strip_ca_scheme(pv_name.as_ref());
         let link = match self.open(name).await {
             Ok(l) => l,
             Err(_) => return false,
@@ -808,7 +809,7 @@ impl CaLinkResolver {
             .links
             .read()
             .iter()
-            .map(|(name, link)| (name.clone(), link.is_connected()))
+            .map(|(name, link)| (name.to_string(), link.is_connected()))
             .collect();
         out.sort();
         out
@@ -830,7 +831,7 @@ impl CaLinkResolver {
     /// Lazily resolve `name` to its cached [`CaLink`]. Opens the link when
     /// it is not yet in the registry — the first-access slow path.
     /// Steady-state reads hit the registry directly.
-    async fn link_for(&self, name: &str) -> Option<Arc<CaLink>> {
+    async fn link_for(&self, name: &[u8]) -> Option<Arc<CaLink>> {
         if let Some(existing) = self.cached_link(name) {
             return Some(existing);
         }
@@ -844,7 +845,7 @@ impl CaLinkResolver {
     /// `CA_CONNECT` on the `dbCaTask`, reached here through
     /// [`LinkSet::connect_link`]. Every synchronous `LinkSet` accessor goes
     /// through this, so none of them can suspend the record thread.
-    fn cached_link(&self, name: &str) -> Option<Arc<CaLink>> {
+    fn cached_link(&self, name: &[u8]) -> Option<Arc<CaLink>> {
         self.links.read().get(name).cloned()
     }
 }
@@ -889,7 +890,7 @@ async fn run_monitor(
     cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
     connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
-    pv_name: String,
+    pv_name: RecordName,
 ) {
     while let Some(event) = monitor.recv().await {
         match event {
@@ -942,7 +943,7 @@ async fn run_connection_watcher(
     connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
     meta: Arc<ArcSwap<Option<LinkMetadata>>>,
-    pv_name: String,
+    pv_name: RecordName,
 ) {
     loop {
         let step = watch_step(&mut conn_rx, &connected, || channel.conn_fold()).await;
@@ -1000,7 +1001,7 @@ async fn watch_step(
 async fn fetch_link_metadata(
     channel: Arc<CaChannel>,
     meta: Arc<ArcSwap<Option<LinkMetadata>>>,
-    pv_name: String,
+    pv_name: RecordName,
 ) {
     // DBF type + element count from the channel's native description.
     let (dbf, element_count) = match channel.info().await {
@@ -1169,7 +1170,7 @@ fn map_dbf_type(t: DbFieldType) -> LinkDbfType {
 
 #[async_trait::async_trait]
 impl LinkSet for CaLinkResolver {
-    fn is_connected(&self, name: &str) -> bool {
+    fn is_connected(&self, name: &[u8]) -> bool {
         let name = strip_ca_scheme(name);
         match self.links.read().get(name) {
             Some(link) => link.is_connected(),
@@ -1179,7 +1180,7 @@ impl LinkSet for CaLinkResolver {
         }
     }
 
-    fn init_ready(&self, name: &str) -> bool {
+    fn init_ready(&self, name: &[u8]) -> bool {
         let name = strip_ca_scheme(name);
         match self.links.read().get(name) {
             Some(link) => link.init_ready(),
@@ -1187,7 +1188,7 @@ impl LinkSet for CaLinkResolver {
         }
     }
 
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         let name = strip_ca_scheme(name);
         let link = self.link_for(name).await?;
         link.note_read();
@@ -1203,7 +1204,7 @@ impl LinkSet for CaLinkResolver {
     /// `Self::link_for` fallback (`resolver.rs:452-457`), which opens the
     /// channel and awaits the subscription round trip. That open now happens
     /// on the database's link work owner via [`Self::connect_link`].
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
         let name = strip_ca_scheme(name);
         let link = self.links.read().get(name).cloned()?;
         link.note_read();
@@ -1218,7 +1219,7 @@ impl LinkSet for CaLinkResolver {
     /// `dbCa.c:866` once the channel is up. This port does both in one
     /// call; it runs on the link work owner, so the `subscribe` round trip
     /// inside `open` is off the record thread either way.
-    async fn connect_link(&self, name: &str) {
+    async fn connect_link(&self, name: &[u8]) {
         let name = strip_ca_scheme(name);
         let _ = self.open(name).await;
     }
@@ -1245,7 +1246,7 @@ impl LinkSet for CaLinkResolver {
     /// inside `put_value` / `get_value`. Reporting `Refused` would refuse
     /// the very write whose staging performs the open, and the link would
     /// never connect.
-    fn put_admission(&self, name: &str) -> PutAdmission {
+    fn put_admission(&self, name: &[u8]) -> PutAdmission {
         let name = strip_ca_scheme(name);
         let links = self.links.read();
         match links.get(name) {
@@ -1255,7 +1256,7 @@ impl LinkSet for CaLinkResolver {
         }
     }
 
-    async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         // Honour the C dbCore split between a plain link put and a
         // put-notify-aware put. `dbCaPutLink` (no callback) sets
         // `putType = CA_PUT`, and the CA task later issues a
@@ -1277,7 +1278,7 @@ impl LinkSet for CaLinkResolver {
         let link = self
             .link_for(name)
             .await
-            .ok_or_else(|| format!("CA link {name} not open"))?;
+            .ok_or_else(|| format!("CA link {} not open", String::from_utf8_lossy(name)))?;
         let channel = link.channel.clone();
         // The clamp C applies before the CA request is ever built:
         // `dbCaPutLinkCallback` converts the caller's buffer to the
@@ -1317,7 +1318,7 @@ impl LinkSet for CaLinkResolver {
         .map_err(|e| e.to_string())
     }
 
-    fn alarm_severity(&self, name: &str) -> Option<i32> {
+    fn alarm_severity(&self, name: &[u8]) -> Option<i32> {
         let name = strip_ca_scheme(name);
         let sev = self.cached_link(name)?.alarm_severity()?;
         // Mirror the lset contract: only a non-zero severity is a
@@ -1326,7 +1327,7 @@ impl LinkSet for CaLinkResolver {
         if sev > 0 { Some(sev) } else { None }
     }
 
-    fn alarm_status(&self, name: &str) -> Option<i32> {
+    fn alarm_status(&self, name: &[u8]) -> Option<i32> {
         // surface the remote STAT for `MSS` propagation.
         // Record processing only consults this when the alarm is
         // actually propagated (severity > 0 via `alarm_severity`), so
@@ -1335,12 +1336,12 @@ impl LinkSet for CaLinkResolver {
         self.cached_link(name)?.alarm_status()
     }
 
-    fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+    fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
         let name = strip_ca_scheme(name);
         self.cached_link(name)?.time_stamp()
     }
 
-    fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, name: &[u8]) -> Option<LinkMetadata> {
         // surface the remote display/control/alarm limits,
         // precision, units, DBF type and element count through the DB
         // link API so a record with a CA INP link inherits them, matching
@@ -1351,7 +1352,7 @@ impl LinkSet for CaLinkResolver {
         self.cached_link(name)?.link_metadata()
     }
 
-    fn link_names(&self) -> Vec<String> {
+    fn link_names(&self) -> Vec<RecordName> {
         self.links.read().keys().cloned().collect()
     }
 
@@ -1360,7 +1361,7 @@ impl LinkSet for CaLinkResolver {
     /// (`dbCaTest.c:127-132`). Never opens the link itself: `dbcar` is a
     /// report, and C's walk reads `plink->value.pv_link.pvt` without
     /// touching CA.
-    async fn link_diagnostics(&self, name: &str) -> Option<LinkDiagnostics> {
+    async fn link_diagnostics(&self, name: &[u8]) -> Option<LinkDiagnostics> {
         let name = strip_ca_scheme(name);
         let link = self.cached_link(name)?;
         Some(link.diagnostics().await)
@@ -1371,8 +1372,8 @@ impl LinkSet for CaLinkResolver {
 /// the scheme-prefixed and the bare form in `ParsedLink::Ca`
 /// depending on the link syntax (`ca://X` vs the bare ` CA` modifier),
 /// so the resolver normalises to the bare PV name.
-fn strip_ca_scheme(name: &str) -> &str {
-    name.strip_prefix("ca://").unwrap_or(name)
+fn strip_ca_scheme(name: &[u8]) -> &[u8] {
+    name.strip_prefix(b"ca://").unwrap_or(name)
 }
 
 /// Install a [`CaLinkResolver`] on `db`, registered under the `"ca"`
@@ -1409,8 +1410,8 @@ mod tests {
 
     #[test]
     fn strip_ca_scheme_handles_both_forms() {
-        assert_eq!(strip_ca_scheme("ca://OTHER:PV"), "OTHER:PV");
-        assert_eq!(strip_ca_scheme("OTHER:PV"), "OTHER:PV");
+        assert_eq!(strip_ca_scheme(b"ca://OTHER:PV"), b"OTHER:PV");
+        assert_eq!(strip_ca_scheme(b"OTHER:PV"), b"OTHER:PV");
     }
 
     /// The CA record-link monitor mask matches C `dbCa`'s
@@ -1452,7 +1453,7 @@ mod tests {
     /// reconnect followed by a second drop adds one more.
     #[test]
     fn the_disconnect_count_moves_once_per_edge() {
-        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
         // Never connected: C's `caLink` at its calloc zero.
         connected.sync(fold(false, RW, 0));
         assert_eq!(connected.disconnect_count(), 0);
@@ -1478,7 +1479,7 @@ mod tests {
     /// that includes a connect `run_monitor` flagged first.
     #[test]
     fn bug1_connection_event_tracks_disconnect() {
-        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
         assert!(connected.sync(fold(true, RW, 0)));
         assert!(connected.is_set());
         assert!(
@@ -1496,7 +1497,7 @@ mod tests {
         assert!(connected.is_set());
         assert!(!connected.has_read_access());
 
-        let early = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        let early = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
         early.mark_connected();
         assert!(
             early.sync(fold(true, RW, 0)),
@@ -1521,7 +1522,7 @@ mod tests {
     ///   clears on the next monitor event, not on the rights edge.
     #[test]
     fn access_rights_transitions_follow_dbca() {
-        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
 
         // Disconnected: C's early return. No dispatch, no cache update.
         assert!(!state.note_access_rights(false, false));
@@ -1584,16 +1585,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl epics_base_rs::server::database::LinkSet for FlagLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             self.state.is_set()
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
             self.read()
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             self.read()
         }
-        async fn connect_link(&self, _: &str) {}
+        async fn connect_link(&self, _: &[u8]) {}
     }
 
     /// A link state on `UP:PV` and a database whose ai `HOLDER` reads it
@@ -1601,7 +1602,7 @@ mod tests {
     fn cp_holder() -> (Arc<LinkConnState>, Arc<FlagLset>, PvDatabase) {
         use epics_base_rs::server::records::ai::AiRecord;
         let db_slot = Arc::new(RwLock::new(None));
-        let state = Arc::new(LinkConnState::new(db_slot.clone(), "UP:PV".to_string()));
+        let state = Arc::new(LinkConnState::new(db_slot.clone(), "UP:PV".into()));
         let lset = Arc::new(FlagLset {
             state: state.clone(),
             reads: AtomicU64::new(0),
@@ -1616,7 +1617,7 @@ mod tests {
             {
                 let rec = db.get_record("HOLDER").unwrap();
                 let mut inst = rec.write();
-                inst.common.text.inp = "ca://UP:PV CP".to_string();
+                inst.common.text.inp = "ca://UP:PV CP".into();
                 inst.install_link_cache(
                     "INP",
                     Arc::new(epics_base_rs::server::record::parse_link_v2(
@@ -1647,7 +1648,7 @@ mod tests {
 
     /// One processing of `UP:PV`'s holders, taken by a worker of its own.
     fn process_once(db: &PvDatabase) {
-        let process = ExternalCpProcess::new("UP:PV".to_string());
+        let process = ExternalCpProcess::new("UP:PV");
         process.request();
         run_to_wait(process.run_worker(|| Some(db.clone())));
     }
@@ -1811,7 +1812,7 @@ mod tests {
     /// transition owner is the thing that decides.
     #[test]
     fn disconnect_edge_dispatches_cp_holders_once() {
-        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
 
         // Never connected: a disconnect is not an edge and must not
         // dispatch — otherwise every link would process its holders once

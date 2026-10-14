@@ -131,7 +131,7 @@ pub fn attr_arg_defs() -> Vec<ArgDesc> {
 /// C format: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, ...)`
 pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String), String> {
     let port_name = match &args[0] {
-        ArgValue::String(s) => s.clone(),
+        ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
     };
     let queue_size = match args.get(1) {
@@ -139,7 +139,7 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String),
         _ => 20,
     };
     let ndarray_port = match args.get(3) {
-        Some(ArgValue::String(s)) => s.clone(),
+        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
         _ => String::new(),
     };
     Ok((port_name, queue_size, ndarray_port))

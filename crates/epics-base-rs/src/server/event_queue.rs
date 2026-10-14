@@ -2851,10 +2851,7 @@ mod tests {
     fn pv_owned_by_its_slot(user: &EventUser) -> (EventReader, EventReader) {
         use crate::server::pv::ProcessVariable;
         use crate::types::DbFieldType;
-        let pv = Arc::new(ProcessVariable::new(
-            "EVQ:LAST".into(),
-            EpicsValue::Double(1.0),
-        ));
+        let pv = Arc::new(ProcessVariable::new("EVQ:LAST", EpicsValue::Double(1.0)));
         let mask = (EventMask::VALUE | EventMask::LOG).bits();
         let ctx: DeliveryContext = Arc::new(pv.clone());
         let owner = pv

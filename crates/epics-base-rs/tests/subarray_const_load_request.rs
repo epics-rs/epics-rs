@@ -32,11 +32,11 @@ async fn subarray_init_load_requests_at_most_malm_devsasoft_c_64() {
     let mut wrong = Vec::new();
     for (rec, val, nord) in expect {
         let got = (
-            db.get_pv(&format!("{rec}.VAL")).ok(),
-            db.get_pv(&format!("{rec}.NORD"))
+            db.get_pv(format!("{rec}.VAL")).ok(),
+            db.get_pv(format!("{rec}.NORD"))
                 .ok()
                 .and_then(|v| v.to_f64()),
-            db.get_pv(&format!("{rec}.UDF"))
+            db.get_pv(format!("{rec}.UDF"))
                 .ok()
                 .and_then(|v| v.to_f64()),
         );

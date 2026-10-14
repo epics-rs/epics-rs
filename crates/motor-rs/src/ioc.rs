@@ -72,7 +72,7 @@ impl SimMotorHolder {
             "simMotorCreate(port, lowLimit, highLimit, [pollMs]) - Create a simulated motor",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("port must be a string".into()),
                 };
                 let low_limit = match &args[1] {

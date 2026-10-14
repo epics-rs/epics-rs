@@ -112,7 +112,7 @@ async fn an_unwatched_ramping_ao_advances_oraw() {
 fn an_unwatched_deadband_post_publishes_its_mask_without_a_value() {
     use epics_base_rs::server::record::RecordInstance;
     use epics_base_rs::server::records::ai::AiRecord;
-    let mut instance = RecordInstance::new("AI".into(), AiRecord::default());
+    let mut instance = RecordInstance::new("AI", AiRecord::default());
     instance.common.udf = 0;
     instance.record.set_val(EpicsValue::Double(5.0)).unwrap();
     instance.record.set_device_did_compute(true);

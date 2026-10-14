@@ -480,7 +480,7 @@ impl SoftScalerPorts {
                 if matches!(reader, Err(SubscribeRefused::CapReached)) {
                     break;
                 }
-                let current = db.get_pv(&format!("{}.{}", pv.record, pv.field)).ok();
+                let current = db.get_pv(format!("{}.{}", pv.record, pv.field)).ok();
                 let (Ok(reader), Some(record), Some(current)) = (reader, record, current) else {
                     // C asynPrint ASYN_TRACE_ERROR, then `stateFailed`.
                     eprintln!(

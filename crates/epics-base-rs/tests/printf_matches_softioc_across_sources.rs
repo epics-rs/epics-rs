@@ -81,10 +81,10 @@ async fn diverging(keep: impl Fn(&str, &str) -> bool) -> Vec<String> {
             db.process_record_with_links(&rec, &mut visited)
                 .await
                 .unwrap();
-            let EpicsValue::CharArray(got) = db.get_pv(&format!("{rec}.VAL")).unwrap() else {
+            let EpicsValue::CharArray(got) = db.get_pv(format!("{rec}.VAL")).unwrap() else {
                 panic!("{rec}.VAL is not a char array");
             };
-            let sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap().to_f64().unwrap();
+            let sevr = db.get_pv(format!("{rec}.SEVR")).unwrap().to_f64().unwrap();
             let mut expect = b"[".to_vec();
             expect.extend_from_slice(want);
             expect.extend_from_slice(b"]\0");

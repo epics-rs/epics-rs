@@ -361,8 +361,8 @@ async fn a_string_source_parses_or_refuses_as_cvt_st() {
                 Read::I(v) => v as f64,
                 Read::F(v) => v,
             };
-            let sevr = db.get_pv(&format!("{src}.SEVR")).unwrap().to_f64();
-            let stat = db.get_pv(&format!("{src}.STAT")).unwrap().to_f64();
+            let sevr = db.get_pv(format!("{src}.SEVR")).unwrap().to_f64();
+            let stat = db.get_pv(format!("{src}.STAT")).unwrap().to_f64();
             match want {
                 Some(want) => {
                     assert_eq!(got, want, "{target} <- {text:?}");

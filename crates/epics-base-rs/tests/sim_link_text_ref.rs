@@ -66,7 +66,7 @@ fn sim_links_are_lent_as_the_text_get_field_serves() {
     let mut failures = Vec::new();
     for mut rec in records {
         let rt = rec.record_type();
-        if rec.link_text_ref("SIML") != Some("") || rec.link_text_ref("SIOL") != Some("") {
+        if rec.link_text_ref("SIML") != Some(b"") || rec.link_text_ref("SIOL") != Some(b"") {
             failures.push(format!(
                 "{rt}: unset SIML/SIOL lent as {:?}/{:?}",
                 rec.link_text_ref("SIML"),
@@ -79,14 +79,14 @@ fn sim_links_are_lent_as_the_text_get_field_serves() {
             continue;
         }
         let owned = match rec.get_field("SIOL") {
-            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+            Some(EpicsValue::String(s)) => s,
             other => {
                 failures.push(format!("{rt}: get_field SIOL is {other:?}"));
                 continue;
             }
         };
         let lent = rec.link_text_ref("SIOL");
-        if lent != Some("OTHER.VAL") || lent != Some(owned.as_str()) {
+        if lent != Some(b"OTHER.VAL") || lent != Some(owned.as_bytes()) {
             failures.push(format!("{rt}: SIOL lent {lent:?}, get_field {owned:?}"));
         }
     }

@@ -39,7 +39,7 @@ pub struct BusyRecord {
     // Output control — OMSL is DBF_MENU menu(menuOmsl) (busyRecord.dbd:18-23);
     // stored raw so an out-of-range ordinal round-trips (mirrors bo).
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     // Monitoring
     pub mlst: u16,
     // Raw value (Phase B)
@@ -56,8 +56,8 @@ pub struct BusyRecord {
     // it off these fields — without them the record looks unconfigured and a
     // simulated busy drives the real output.
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     /// Set by `set_device_did_compute(true)` when a device readback has
     /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
@@ -83,7 +83,7 @@ impl Default for BusyRecord {
             ivoa: 0,
             ivov: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             mlst: 0,
             rval: 0,
             oraw: 0,
@@ -91,8 +91,8 @@ impl Default for BusyRecord {
             rbv: 0,
             orbv: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             skip_convert: false,
         }
@@ -419,11 +419,11 @@ impl Record for BusyRecord {
         true
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -612,7 +612,7 @@ impl Record for BusyRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(s) = value {
-                    self.dol = s.as_str_lossy().into_owned();
+                    self.dol = s;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -656,14 +656,14 @@ impl Record for BusyRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.to_string())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.to_string())),

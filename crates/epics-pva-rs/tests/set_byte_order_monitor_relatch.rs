@@ -52,28 +52,28 @@ fn nt_scalar(v: f64) -> PvField {
 struct StreamingSource;
 
 impl ChannelSource for StreamingSource {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["dut".into()]
     }
-    async fn has_pv(&self, n: &str) -> bool {
-        n == "dut"
+    async fn has_pv(&self, n: &[u8]) -> bool {
+        n == b"dut"
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         })
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(nt_scalar(0.0))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err("read-only".into())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
         let (tx, rx) = mpsc::channel::<PvField>(8);
         tokio::spawn(async move {
             let mut i = 1.0f64;

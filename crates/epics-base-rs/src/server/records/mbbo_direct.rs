@@ -3,6 +3,7 @@ use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     CycleHooks, CycleMarks, CyclePostMask, MENU_SIMM, ProcessOutcome, Record, uniform_post_table,
 };
+use crate::types::PvString;
 use crate::types::{EpicsValue, Scalar};
 
 use super::mbbi_direct::BIT_NAMES;
@@ -36,11 +37,11 @@ pub struct MbboDirectRecord {
     pub ivoa: i16,
     pub ivov: u32,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub bits: [u8; 32], // B0-B1F
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Set by `set_device_did_compute(true)` when a device readback has
@@ -69,11 +70,11 @@ impl Default for MbboDirectRecord {
             ivoa: 0,
             ivov: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             bits: [0; 32],
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -510,11 +511,11 @@ impl Record for MbboDirectRecord {
         crate::server::record::SecondaryTake::unguarded(u64::from(rval) | u64::from(rbv) << 1)
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -641,7 +642,7 @@ impl Record for MbboDirectRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -655,14 +656,14 @@ impl Record for MbboDirectRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

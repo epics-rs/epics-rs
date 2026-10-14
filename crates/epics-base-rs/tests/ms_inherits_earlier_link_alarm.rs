@@ -36,7 +36,7 @@ async fn a_later_ms_link_inherits_an_earlier_links_failure() {
         .0;
     db.scan_control().run();
     let alarm = |rec: &str| {
-        let num = |f: &str| db.get_pv(&format!("{rec}.{f}")).unwrap().to_f64();
+        let num = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().to_f64();
         [num("STAT"), num("SEVR")]
     };
     const LINK_INVALID: [Option<f64>; 2] = [Some(14.0), Some(3.0)];

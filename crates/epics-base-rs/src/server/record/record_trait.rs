@@ -1324,7 +1324,7 @@ pub const fn uniform_post_table<const N: usize>(
 ///
 /// Every slot is lent a text, so the "unknown" half of the pair is empty by
 /// construction: a type that can answer this way knows all of its own links.
-pub fn input_link_slots_of<S: AsRef<str>>(texts: &[S]) -> Option<(u64, u64)> {
+pub fn input_link_slots_of<S: AsRef<[u8]>>(texts: &[S]) -> Option<(u64, u64)> {
     debug_assert!(texts.len() <= u64::BITS as usize);
     let mut set = 0u64;
     for (slot, text) in texts.iter().enumerate() {
@@ -5177,11 +5177,14 @@ pub trait Record: Send + Sync + 'static {
     /// every link the type declares — 21 of them per `calc` cycle, whether or
     /// not a single one is wired.
     ///
-    /// `Some("")` is a declared link that is unset, which is what an unwired
+    /// The text is the field's bytes, as C's `struct link` holds them: a
+    /// link may name a record whose name is not UTF-8.
+    ///
+    /// `Some(b"")` is a declared link that is unset, which is what an unwired
     /// `INPA` holds. `None` is this type declining to lend the field, and the
     /// caller falls back to the owned [`Self::get_field`] path, so a type that
     /// does not override this loses nothing.
-    fn link_text_ref(&self, _link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, _link_field: &str) -> Option<&[u8]> {
         None
     }
 
@@ -5365,7 +5368,7 @@ pub trait Record: Send + Sync + 'static {
         let (mut set, mut unknown) = (0u64, 0u64);
         for (slot, (link_field, _)) in links.iter().enumerate() {
             match self.link_text_ref(link_field) {
-                Some("") => {}
+                Some([]) => {}
                 Some(_) => set |= 1 << slot,
                 None => unknown |= 1 << slot,
             }
@@ -6631,7 +6634,7 @@ pub trait Record: Send + Sync + 'static {
     /// so the post fires on exactly the cycles the OUT write does. Numeric
     /// `OEVT` (DBF_USHORT) stringifies to match the `EVNT` ingest; a string
     /// `OEVT` (DBF_STRING) is the event name verbatim.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<crate::types::PvString> {
         None
     }
 
@@ -6833,7 +6836,12 @@ pub trait Record: Send + Sync + 'static {
     /// Additive, framework-set-hook pattern (same shape as
     /// [`Self::set_process_context`]). Default: ignore — most records do
     /// no out-of-band async posting.
-    fn set_async_context(&mut self, _name: String, _db: crate::server::database::AsyncDbHandle) {}
+    fn set_async_context(
+        &mut self,
+        _name: crate::types::RecordName,
+        _db: crate::server::database::AsyncDbHandle,
+    ) {
+    }
 
     /// Framework init hook: called once at record load *after* the common
     /// link fields (`INP`/`OUT`/`FLNK`/...) have been resolved and the
@@ -8258,7 +8266,7 @@ pub(crate) mod tests {
                     let (mut set, mut unknown) = (0u64, 0u64);
                     for (slot, (link_field, _)) in links.iter().enumerate() {
                         match record.link_text_ref(link_field) {
-                            Some("") => {}
+                            Some([]) => {}
                             Some(_) => set |= 1 << slot,
                             None => unknown |= 1 << slot,
                         }

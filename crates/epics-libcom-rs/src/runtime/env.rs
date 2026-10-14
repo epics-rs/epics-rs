@@ -339,7 +339,7 @@ pub fn register_iocsh_env_vars() {
 /// # Safety
 /// Uses `std::env::set_var`, which is unsafe in multi-threaded programs. Call it
 /// from IOC startup or from a single known thread, not from arbitrary tasks.
-pub fn set(name: &str, value: &str) {
+pub fn set(name: impl AsRef<std::ffi::OsStr>, value: impl AsRef<std::ffi::OsStr>) {
     // SAFETY: as documented — startup or a single owning thread.
     unsafe { std::env::set_var(name, value) };
 }

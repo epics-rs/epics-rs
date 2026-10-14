@@ -35,7 +35,7 @@ fn epid() -> RecordInstance {
         rec.put_field(name, value)
             .unwrap_or_else(|e| panic!("epid models {name}: {e:?}"));
     }
-    RecordInstance::new("T:PID".to_string(), rec)
+    RecordInstance::new("T:PID", rec)
 }
 
 /// `(lower, upper)`, as the snapshot accessors return them.

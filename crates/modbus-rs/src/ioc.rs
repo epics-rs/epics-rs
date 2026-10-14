@@ -1910,7 +1910,7 @@ pub fn modbus_interpose_config_command() -> CommandDef {
 /// delay is `writeDelayMsec/1000`, zero when 0/unset.
 fn parse_interpose_args(args: &[ArgValue]) -> Result<(String, InterposeSettings), String> {
     let port = match args.first() {
-        Some(ArgValue::String(s)) => s.clone(),
+        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
     };
     let link = match args.get(1) {
@@ -1996,7 +1996,7 @@ struct ModbusConfigHandler {
 /// name (`INT32_LE`) or a numeric `modbusDataType_t` index.
 fn parse_configure_args(args: &[ArgValue]) -> Result<(String, String, ModbusConfig), String> {
     let s = |i: usize| match &args[i] {
-        ArgValue::String(v) => Ok(v.clone()),
+        ArgValue::String(v) => v.to_str().map(str::to_owned),
         _ => Err(format!("argument {i} must be a string")),
     };
     let n = |i: usize| match &args[i] {

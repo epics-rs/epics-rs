@@ -4,6 +4,7 @@ use crate::server::record::{
 };
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
 // Multi-bit binary input direct record.
 // VAL holds the full unsigned 32-bit value; B0-B1F expose individual bits
@@ -27,8 +28,8 @@ pub struct MbbiDirectRecord {
     /// `take_cycle_posted_fields`.
     bits_changed: u32,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     // SVAL is `DBF_LONG` (mbbiDirectRecord.dbd.pod:173) — the BUFFER C's
     // `readValue` reads SIOL into as `DBR_ULONG` (mbbiDirectRecord.c:260), so
     // it holds the u32's bits, before publishing `val = sval`.
@@ -54,8 +55,8 @@ impl Default for MbbiDirectRecord {
             bits: [0; 32],
             bits_changed: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: 0,
             sims: 0,
             sdly: -1.0,
@@ -357,10 +358,10 @@ impl Record for MbbiDirectRecord {
         ))
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -460,14 +461,14 @@ impl Record for MbbiDirectRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

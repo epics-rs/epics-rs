@@ -243,7 +243,7 @@ fn the_record_alone_cannot_serve_a_link_backed_field() {
     let mut calc = CalcRecord::default();
     calc.prec = 7;
     calc.set_inp_link(0, "SRC");
-    let inst = RecordInstance::new_boxed("T:CALC".to_string(), Box::new(calc));
+    let inst = RecordInstance::new_boxed("T:CALC", Box::new(calc));
 
     assert!(
         inst.snapshot_for_field("A").is_none(),

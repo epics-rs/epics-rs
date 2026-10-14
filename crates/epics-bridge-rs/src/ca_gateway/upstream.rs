@@ -54,7 +54,7 @@ use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::server::snapshot::DbrClass;
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName};
 use epics_ca_rs::client::{AccessRights, CaChannel, CaClient, ConnectionEvent, MonitorHandle};
 use epics_ca_rs::protocol::DBE_PROPERTY;
 #[cfg(tokio_backend)]
@@ -377,7 +377,7 @@ pub struct UpstreamManagerConfig {
 async fn upstream_death(
     cache: &Arc<RwLock<PvCache>>,
     db: &Arc<PvDatabase>,
-    name: &str,
+    name: &[u8],
 ) -> Option<Arc<epics_base_rs::server::pv::ProcessVariable>> {
     if let Some(entry_arc) = cache.read().await.get(name) {
         entry_arc.write().await.set_state(PvState::Disconnect);
@@ -403,11 +403,11 @@ pub struct UpstreamManager {
     /// `ensure_subscribed` can take `&self` and the search-resolver
     /// hot path doesn't serialise N concurrent first-creates behind
     /// a single tokio RwLock write held across ~500 ms of network IO.
-    subs: parking_lot::Mutex<HashMap<String, UpstreamSubscription>>,
+    subs: parking_lot::Mutex<HashMap<RecordName, UpstreamSubscription>>,
     /// In-flight first-create dedupe. A second concurrent caller for
     /// the same PV awaits the Notify instead of duplicating the
     /// upstream channel + subscribe + spawn work.
-    pending: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    pending: parking_lot::Mutex<HashMap<RecordName, Arc<tokio::sync::Notify>>>,
     /// Budget for the lazy-resolution `wait_connected` gate in
     /// `ensure_subscribed`. Sourced from `CacheTimeouts::connect_timeout`
     /// so the connect-timeout policy has ONE owner shared with the cache
@@ -558,8 +558,8 @@ impl UpstreamManager {
     }
 
     /// Whether a given upstream name is currently subscribed.
-    pub fn is_subscribed(&self, name: &str) -> bool {
-        self.subs.lock().contains_key(name)
+    pub fn is_subscribed(&self, name: impl AsRef<[u8]>) -> bool {
+        self.subs.lock().contains_key(name.as_ref())
     }
 
     /// Ensure an upstream subscription exists for `upstream_name`.
@@ -587,11 +587,19 @@ impl UpstreamManager {
     /// `gateVcData` (`gateServer.cc:1747`).
     pub async fn ensure_subscribed(
         &self,
-        served_name: &str,
-        upstream_name: &str,
+        served_name: &[u8],
+        upstream_name: &[u8],
         asg: Option<String>,
         asl: i32,
     ) -> BridgeResult<()> {
+        // The upstream CA client names a channel in text.
+        let Ok(upstream_name) = std::str::from_utf8(upstream_name) else {
+            return Err(BridgeError::PutRejected(format!(
+                "upstream name is not UTF-8: {}",
+                String::from_utf8_lossy(upstream_name)
+            )));
+        };
+        let shown = String::from_utf8_lossy(served_name);
         // Fast path: already subscribed.
         if self.subs.lock().contains_key(served_name) {
             return Ok(());
@@ -610,7 +618,7 @@ impl UpstreamManager {
                 Decision::WaitFor(existing.clone())
             } else {
                 let n = Arc::new(tokio::sync::Notify::new());
-                pending.insert(served_name.to_string(), n.clone());
+                pending.insert(served_name.into(), n.clone());
                 Decision::Owner(n)
             }
         };
@@ -622,7 +630,7 @@ impl UpstreamManager {
                     Ok(())
                 } else {
                     Err(BridgeError::PutRejected(format!(
-                        "upstream subscribe failed (peer creator): {served_name}"
+                        "upstream subscribe failed (peer creator): {shown}"
                     )))
                 };
             }
@@ -632,7 +640,7 @@ impl UpstreamManager {
         // on error / panic paths.
         struct PendingGuard<'a> {
             owner: &'a UpstreamManager,
-            key: &'a str,
+            key: &'a [u8],
             notify: Arc<tokio::sync::Notify>,
         }
         impl Drop for PendingGuard<'_> {
@@ -775,7 +783,7 @@ impl UpstreamManager {
         // rebuilding the closures.
         let acl: PvAclCell = Arc::new(ArcSwap::from_pointee(PvAcl { asg, asl }));
         let hook = build_write_hook(
-            served_name.to_string(),
+            served_name.into(),
             upstream_name.to_string(),
             channel.clone(),
             acl.clone(),
@@ -1034,7 +1042,7 @@ impl UpstreamManager {
         // repeat search for the same alias is a no-op (fast path above)
         // and a `.pvlist` reload prunes by the served name it admits.
         self.subs.lock().insert(
-            served_name.to_string(),
+            served_name.into(),
             UpstreamSubscription {
                 channel,
                 task,
@@ -1064,7 +1072,7 @@ impl UpstreamManager {
     /// the last cached value stays put, so no finalizer is needed.
     fn spawn_forward_task(
         &self,
-        served_name: &str,
+        served_name: &[u8],
         channel: Arc<CaChannel>,
         initial_monitor: Option<MonitorHandle>,
     ) -> TaskHandle<()> {
@@ -1079,7 +1087,7 @@ impl UpstreamManager {
         // the forwarding task addresses the cache entry, shadow PV, and
         // alarm post by `served_name` — the same key the shadow PV and
         // cache were registered under above.
-        let name = served_name.to_string();
+        let name = RecordName::from(served_name);
         self.reactor.spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
@@ -1301,13 +1309,13 @@ impl UpstreamManager {
     /// stream.
     fn spawn_prop_forward_task(
         &self,
-        served_name: &str,
+        served_name: &[u8],
         channel: Arc<CaChannel>,
         seed_succeeded: bool,
     ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
-        let name = served_name.to_string();
+        let name = RecordName::from(served_name);
         #[cfg(test)]
         let gate = self.prop_gate.lock().take();
         self.reactor.spawn(async move {
@@ -1409,7 +1417,7 @@ impl UpstreamManager {
     /// created eagerly at `ensure_subscribed`, so it is always present.
     /// Mirrors C ca-gateway's no-cache `getCB` creating `pv->monitor()`
     /// only when `vc->needPosting()` (gatePv.cc:1737-1753).
-    pub fn ensure_monitor(&self, served_name: &str) {
+    pub fn ensure_monitor(&self, served_name: &[u8]) {
         if !self.cache_mode.is_no_cache() {
             return;
         }
@@ -1444,7 +1452,7 @@ impl UpstreamManager {
     ///
     /// No-op in [`CacheMode::Cached`] — the persistent monitor must
     /// outlive any single downstream subscriber.
-    pub fn release_monitor(&self, served_name: &str) {
+    pub fn release_monitor(&self, served_name: &[u8]) {
         if !self.cache_mode.is_no_cache() {
             return;
         }
@@ -1469,7 +1477,7 @@ impl UpstreamManager {
     /// eagerly at `ensure_subscribed`, so it is always present. Mirrors C
     /// no-cache `getCB`/`propEventCB` enabling `propMonitor()` only on
     /// `needPosting() && client_mask == DBE_PROPERTY` (gatePv.cc:1749-1752).
-    pub fn ensure_prop_monitor(&self, served_name: &str) {
+    pub fn ensure_prop_monitor(&self, served_name: &[u8]) {
         if !self.cache_mode.is_no_cache() {
             return;
         }
@@ -1499,7 +1507,7 @@ impl UpstreamManager {
     /// stays in place. Idempotent: a no-op if no prop task is running. No-op
     /// in [`CacheMode::Cached`] — the persistent property monitor must
     /// outlive any single downstream subscriber.
-    pub fn release_prop_monitor(&self, served_name: &str) {
+    pub fn release_prop_monitor(&self, served_name: &[u8]) {
         if !self.cache_mode.is_no_cache() {
             return;
         }
@@ -1524,7 +1532,7 @@ impl UpstreamManager {
     /// shadow PV are registered under the downstream-facing name (alias
     /// or real), so callers (`.pvlist` reload prune, `sweep_orphaned`)
     /// pass the served name they read from the cache / subs map.
-    pub async fn unsubscribe(&self, served_name: &str) {
+    pub async fn unsubscribe(&self, served_name: &[u8]) {
         let removed = self.subs.lock().remove(served_name);
         if let Some(sub) = removed {
             if let Some(task) = sub.task {
@@ -1547,7 +1555,7 @@ impl UpstreamManager {
         let channel_for_op = self
             .subs
             .lock()
-            .get(upstream_name)
+            .get(upstream_name.as_bytes())
             .map(|s| s.channel.clone());
         if let Some(ch) = channel_for_op {
             return ch
@@ -1568,7 +1576,7 @@ impl UpstreamManager {
         let channel_for_op = self
             .subs
             .lock()
-            .get(upstream_name)
+            .get(upstream_name.as_bytes())
             .map(|s| s.channel.clone());
         if let Some(ch) = channel_for_op {
             let (_dbf, value) = ch
@@ -1590,7 +1598,7 @@ impl UpstreamManager {
     /// [`update_acl`](Self::update_acl) from an `AS`/`PVL` reload, not
     /// just the value resolved at first subscription. Used by tests +
     /// diagnostics.
-    pub fn asg_for(&self, served_name: &str) -> Option<(Option<String>, i32)> {
+    pub fn asg_for(&self, served_name: &[u8]) -> Option<(Option<String>, i32)> {
         self.subs.lock().get(served_name).map(|s| {
             let acl = s.acl.load();
             (acl.asg.clone(), acl.asl)
@@ -1616,7 +1624,7 @@ impl UpstreamManager {
     /// [`Self::notify_downstream_access_change`] once after re-resolving
     /// every still-admitted PV — one `asComputeAllAsg`-style recompute pass
     /// per reload rather than one broadcast per mutated PV.
-    pub fn update_acl(&self, served_name: &str, asg: Option<String>, asl: i32) -> bool {
+    pub fn update_acl(&self, served_name: &[u8], asg: Option<String>, asl: i32) -> bool {
         let subs = self.subs.lock();
         match subs.get(served_name) {
             Some(sub) => {
@@ -1636,7 +1644,7 @@ impl UpstreamManager {
     /// no longer exist in the cache (e.g., evicted by cleanup).
     pub async fn sweep_orphaned(&self) {
         let cache = self.cache.read().await;
-        let orphans: Vec<String> = self
+        let orphans: Vec<RecordName> = self
             .subs
             .lock()
             .keys()
@@ -1732,7 +1740,7 @@ fn build_access_hook(
 ///    granted write's attempt and only when its rule carried `TRAPWRITE`.
 ///    Always bump the put-count stat on success.
 fn build_write_hook(
-    served_name: String,
+    served_name: RecordName,
     pv_name: String,
     channel: Arc<CaChannel>,
     acl: PvAclCell,
@@ -1895,7 +1903,7 @@ fn build_write_hook(
 /// (upstream.rs:547/944). Returns `"?"` when no monitor update has
 /// populated the cache yet, matching C's `old_value == NULL` →
 /// `acOldVal = "?"` (gateResources.cc:476-480).
-async fn cached_old_for_audit(env: &WriteHookEnv, key: &str) -> String {
+async fn cached_old_for_audit(env: &WriteHookEnv, key: &[u8]) -> String {
     let entry = env.cache.read().await.get(key);
     if let Some(entry) = entry
         && let Some(snap) = &entry.read().await.cached
@@ -2338,11 +2346,11 @@ mod tests {
         let env = dummy_env();
 
         // (a) no cache entry under the key → "?" (C: old_value == NULL).
-        assert_eq!(cached_old_for_audit(&env, "GW:MISS").await, "?");
+        assert_eq!(cached_old_for_audit(&env, b"GW:MISS").await, "?");
 
         // (b) entry exists but no monitor value cached yet → "?".
         env.cache.write().await.get_or_create("GW:PV");
-        assert_eq!(cached_old_for_audit(&env, "GW:PV").await, "?");
+        assert_eq!(cached_old_for_audit(&env, b"GW:PV").await, "?");
 
         // (c) entry with a cached snapshot → rendered value.
         {
@@ -2355,7 +2363,7 @@ mod tests {
                 std::time::SystemTime::now(),
             ));
         }
-        assert_eq!(cached_old_for_audit(&env, "GW:PV").await, "24.8");
+        assert_eq!(cached_old_for_audit(&env, b"GW:PV").await, "24.8");
     }
 
     /// A held, silent UDP socket that OWNS a dead CA port for the test's
@@ -2731,29 +2739,34 @@ ASG(NewGroup) {
         let db = Arc::new(PvDatabase::new());
         let mgr = pinned_manager(db.clone()).await;
 
-        mgr.ensure_subscribed(name, name, Some("OldGroup".to_string()), 1)
-            .await
-            .expect("ensure_subscribed connects to the hosted upstream");
+        mgr.ensure_subscribed(
+            name.as_bytes(),
+            name.as_bytes(),
+            Some("OldGroup".to_string()),
+            1,
+        )
+        .await
+        .expect("ensure_subscribed connects to the hosted upstream");
         assert_eq!(
-            mgr.asg_for(name),
+            mgr.asg_for(name.as_bytes()),
             Some((Some("OldGroup".to_string()), 1)),
             "initial ASG/ASL is the value resolved at subscribe"
         );
 
         // Reload moves the still-admitted PV to a new ASG/ASL.
         assert!(
-            mgr.update_acl(name, Some("NewGroup".to_string()), 0),
+            mgr.update_acl(name.as_bytes(), Some("NewGroup".to_string()), 0),
             "a real ASG/ASL change reports true"
         );
         assert_eq!(
-            mgr.asg_for(name),
+            mgr.asg_for(name.as_bytes()),
             Some((Some("NewGroup".to_string()), 0)),
             "asg_for follows the reload immediately"
         );
 
         // Idempotent: re-applying the identical identity is a no-op.
         assert!(
-            !mgr.update_acl(name, Some("NewGroup".to_string()), 0),
+            !mgr.update_acl(name.as_bytes(), Some("NewGroup".to_string()), 0),
             "an unchanged ASG/ASL reports false"
         );
 
@@ -2801,7 +2814,10 @@ ASG(NewGroup) {
         *mgr.watch_gate.lock() = Some(WatchGate { reached, release });
         let subscribe = tokio::spawn({
             let mgr = mgr.clone();
-            async move { mgr.ensure_subscribed(name, name, None, 0).await }
+            async move {
+                mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
+                    .await
+            }
         });
 
         let channel = tokio::time::timeout(bound, reached_rx)
@@ -2914,7 +2930,7 @@ ASG(NewGroup) {
         let (release_prop, release) = epics_base_rs::runtime::sync::oneshot::channel();
         *mgr.prop_gate.lock() = Some(release);
 
-        mgr.ensure_subscribed(name, name, None, 0)
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
@@ -3000,7 +3016,7 @@ ASG(NewGroup) {
         let db = Arc::new(PvDatabase::new());
         let mgr = pinned_manager(db.clone()).await;
 
-        mgr.ensure_subscribed(served, real, None, 0)
+        mgr.ensure_subscribed(served.as_bytes(), real.as_bytes(), None, 0)
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
@@ -3057,7 +3073,7 @@ ASG(NewGroup) {
         let db = Arc::new(PvDatabase::new());
         let mgr = pinned_manager(db.clone()).await;
 
-        mgr.ensure_subscribed(name, name, None, 0)
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
@@ -3104,7 +3120,7 @@ ASG(NewGroup) {
         let db = Arc::new(PvDatabase::new());
         let mgr = pinned_manager(db.clone()).await;
 
-        mgr.ensure_subscribed(name, name, None, 0)
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("upstream connects");
         let shadow = db.find_pv(name).await.expect("shadow PV registered");
@@ -3204,7 +3220,9 @@ ASG(NewGroup) {
         .await;
 
         let name = "Ghost:pv";
-        let result = mgr.ensure_subscribed(name, name, None, 0).await;
+        let result = mgr
+            .ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
+            .await;
 
         assert!(
             result.is_err(),
@@ -3262,7 +3280,7 @@ ASG(NewGroup) {
         )
         .await;
 
-        mgr.ensure_subscribed(name, name, None, 0)
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
@@ -3317,7 +3335,7 @@ ASG(NewGroup) {
         let db = Arc::new(PvDatabase::new());
         let mgr = pinned_manager(db.clone()).await; // Cached
 
-        mgr.ensure_subscribed(name, name, None, 0)
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
@@ -3391,7 +3409,7 @@ ASG(NewGroup) {
         )
         .await;
 
-        mgr.ensure_subscribed(name, name, None, 0)
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("ensure_subscribed connects");
 
@@ -3399,7 +3417,7 @@ ASG(NewGroup) {
         assert!(
             mgr.subs
                 .lock()
-                .get(name)
+                .get(name.as_bytes())
                 .expect("sub tracked")
                 .task
                 .is_none(),
@@ -3407,11 +3425,11 @@ ASG(NewGroup) {
         );
 
         // First downstream monitor → task spawned.
-        mgr.ensure_monitor(name);
+        mgr.ensure_monitor(name.as_bytes());
         assert!(
             mgr.subs
                 .lock()
-                .get(name)
+                .get(name.as_bytes())
                 .expect("sub tracked")
                 .task
                 .is_some(),
@@ -3419,11 +3437,11 @@ ASG(NewGroup) {
         );
 
         // A second monitor-open is idempotent (task already present).
-        mgr.ensure_monitor(name);
+        mgr.ensure_monitor(name.as_bytes());
         assert!(
             mgr.subs
                 .lock()
-                .get(name)
+                .get(name.as_bytes())
                 .expect("sub tracked")
                 .task
                 .is_some(),
@@ -3431,11 +3449,11 @@ ASG(NewGroup) {
         );
 
         // Last downstream monitor → task aborted.
-        mgr.release_monitor(name);
+        mgr.release_monitor(name.as_bytes());
         assert!(
             mgr.subs
                 .lock()
-                .get(name)
+                .get(name.as_bytes())
                 .expect("sub tracked")
                 .task
                 .is_none(),
@@ -3474,7 +3492,7 @@ ASG(NewGroup) {
         let db = Arc::new(PvDatabase::new());
         let mgr = pinned_manager(db.clone()).await; // Cached
 
-        mgr.ensure_subscribed(name, name, None, 0)
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("ensure_subscribed connects");
 
@@ -3482,7 +3500,7 @@ ASG(NewGroup) {
         assert!(
             mgr.subs
                 .lock()
-                .get(name)
+                .get(name.as_bytes())
                 .expect("sub tracked")
                 .task
                 .is_some(),
@@ -3490,21 +3508,21 @@ ASG(NewGroup) {
         );
 
         // ensure_monitor / release_monitor are no-ops in cached mode.
-        mgr.ensure_monitor(name);
+        mgr.ensure_monitor(name.as_bytes());
         assert!(
             mgr.subs
                 .lock()
-                .get(name)
+                .get(name.as_bytes())
                 .expect("sub tracked")
                 .task
                 .is_some(),
             "cached: ensure_monitor is a no-op (task stays)"
         );
-        mgr.release_monitor(name);
+        mgr.release_monitor(name.as_bytes());
         assert!(
             mgr.subs
                 .lock()
-                .get(name)
+                .get(name.as_bytes())
                 .expect("sub tracked")
                 .task
                 .is_some(),
@@ -3557,7 +3575,7 @@ ASG(NewGroup) {
 
         let start = tokio::time::Instant::now();
         let result = mgr
-            .ensure_subscribed("Ghost:cfg", "Ghost:cfg", None, 0)
+            .ensure_subscribed(b"Ghost:cfg", b"Ghost:cfg", None, 0)
             .await;
         let elapsed = start.elapsed();
 

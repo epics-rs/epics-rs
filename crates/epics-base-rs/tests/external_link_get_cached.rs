@@ -70,26 +70,36 @@ impl LazyLset {
 
 #[async_trait::async_trait]
 impl LinkSet for LazyLset {
-    fn is_connected(&self, name: &str) -> bool {
-        self.cache.lock().contains_key(name)
+    fn is_connected(&self, name: &[u8]) -> bool {
+        self.cache
+            .lock()
+            .contains_key(std::str::from_utf8(name).unwrap())
     }
 
     /// The network read. Opens on demand — exactly what the record path must
     /// no longer call.
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.network_reads.fetch_add(1, Ordering::SeqCst);
         self.connect_link(name).await;
-        self.cache.lock().get(name).cloned()
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
     }
 
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        self.cache.lock().get(name).cloned()
+    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
     }
 
-    async fn connect_link(&self, name: &str) {
+    async fn connect_link(&self, name: &[u8]) {
         self.opens.fetch_add(1, Ordering::SeqCst);
         if let Some(v) = self.on_open.clone() {
-            self.cache.lock().insert(name.to_string(), v);
+            self.cache
+                .lock()
+                .insert(String::from_utf8_lossy(name).into_owned(), v);
         }
     }
 }

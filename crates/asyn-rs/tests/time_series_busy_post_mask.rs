@@ -290,7 +290,7 @@ async fn the_dsets_rarm_reset_posts_nothing() {
     assert_eq!(put.mask(), EventMask::VALUE | EventMask::LOG);
 
     assert_eq!(
-        db.get_pv(&format!("{REC}.RARM")).unwrap(),
+        db.get_pv(format!("{REC}.RARM")).unwrap(),
         EpicsValue::Short(0),
         "the dset did reset it (devAsynXXXTimeSeries.h:179) — the field moved"
     );

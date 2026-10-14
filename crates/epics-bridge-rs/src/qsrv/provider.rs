@@ -5,7 +5,7 @@
 //! The trait definitions here are temporary — they will move to `epics-pva-rs`
 //! once that crate's native PVA server exposes them directly.
 
-// RTEMS-EXEC-MODEL-ALLOW(19): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(20): checked - these run and pass in the exec-backend
 // suite.
 
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_pva_rs::pvdata::{FieldDesc, PvStructure};
 
-use epics_base_rs::types::DbFieldType;
+use epics_base_rs::types::{DbFieldType, RecordName};
 
 use super::channel::BridgeChannel;
 use super::group::GroupChannel;
@@ -92,12 +92,12 @@ pub struct WriteGrant {
 #[async_trait::async_trait]
 pub trait AccessControl: Send + Sync {
     /// Check if the client can read this channel.
-    async fn can_read(&self, _channel: &str, _user: &[u8], _host: &str) -> bool {
+    async fn can_read(&self, _channel: &[u8], _user: &[u8], _host: &str) -> bool {
         true
     }
 
     /// Check if the client can write to this channel.
-    async fn can_write(&self, _channel: &str, _user: &[u8], _host: &str) -> bool {
+    async fn can_write(&self, _channel: &[u8], _user: &[u8], _host: &str) -> bool {
         true
     }
 
@@ -107,13 +107,13 @@ pub trait AccessControl: Send + Sync {
     /// impls that do not need method/authority/roles need not override.
     /// `AcfAccessControl` overrides to pass the full credential set to
     /// `check_access_method`.
-    async fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+    async fn can_read_creds(&self, channel: &[u8], creds: &ClientCreds) -> bool {
         self.can_read(channel, creds.user.as_bytes(), &creds.host)
             .await
     }
 
     /// Method/authority/roles-aware write check.
-    async fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+    async fn can_write_creds(&self, channel: &[u8], creds: &ClientCreds) -> bool {
         self.can_write(channel, creds.user.as_bytes(), &creds.host)
             .await
     }
@@ -128,7 +128,7 @@ pub trait AccessControl: Send + Sync {
     /// mask, matching C `asComputePvt` leaving `trapMask = 0`.
     /// [`AcfAccessControl`] overrides this to read the granting rule's
     /// trap flag via `check_access_method_trap`.
-    async fn write_grant(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+    async fn write_grant(&self, channel: &[u8], creds: &ClientCreds) -> WriteGrant {
         WriteGrant {
             allowed: self.can_write_creds(channel, creds).await,
             rule_was_trap: false,
@@ -177,7 +177,7 @@ pub struct AcfAccessControl {
 /// of the key — a re-auth that only changes role claims must miss.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct GrantKey {
-    channel: String,
+    channel: RecordName,
     user: epics_base_rs::types::PvString,
     host: String,
     method: String,
@@ -186,9 +186,9 @@ struct GrantKey {
 }
 
 impl GrantKey {
-    fn new(channel: &str, creds: &ClientCreds) -> Self {
+    fn new(channel: &[u8], creds: &ClientCreds) -> Self {
         Self {
-            channel: channel.to_string(),
+            channel: RecordName::from(channel),
             user: creds.user.clone(),
             host: creds.host.clone(),
             method: creds.method.clone(),
@@ -260,7 +260,7 @@ impl AcfAccessControl {
     /// name's `DEFAULT` fallback would otherwise keep serving `DEFAULT`
     /// after the record appears (post-init `dbLoadRecords`), with no
     /// ASG-field put to move the invalidation generation.
-    async fn resolve_asg_and_asl(&self, channel: &str) -> (String, u8, bool) {
+    async fn resolve_asg_and_asl(&self, channel: &[u8]) -> (String, u8, bool) {
         let cn = epics_base_rs::server::database::filters::parse_channel_name(channel);
         if let Some(rec) = self.db.get_record(&cn.record) {
             let inst = rec.read();
@@ -301,7 +301,7 @@ impl AcfAccessControl {
     /// strings, then calls `check_access_method` for each. Access is the
     /// maximum level across all credentials — mirrors `SecurityClient::canWrite`
     /// `any_of` semantics (`pvxs/ioc/securityclient.cpp:42-45`).
-    async fn level_for_creds(&self, channel: &str, creds: &ClientCreds) -> AccessLevelLite {
+    async fn level_for_creds(&self, channel: &[u8], creds: &ClientCreds) -> AccessLevelLite {
         self.computed_access(channel, creds).await.level
     }
 
@@ -309,7 +309,7 @@ impl AcfAccessControl {
     /// through, cached per (channel, credential identity) — see the
     /// [`Self::grant_cache`] field doc for the C/pvxs model and the
     /// invalidation reasoning.
-    async fn computed_access(&self, channel: &str, creds: &ClientCreds) -> CachedAccess {
+    async fn computed_access(&self, channel: &[u8], creds: &ClientCreds) -> CachedAccess {
         use epics_base_rs::server::access_security::AccessLevel;
         let generation = epics_base_rs::server::access_security::asg_change_generation();
         let key = GrantKey::new(channel, creds);
@@ -398,7 +398,7 @@ impl AcfAccessControl {
     /// Write authorization plus the matched (granting) rule's
     /// `TRAPWRITE` flag, from the same cached evaluation every other
     /// check uses (see [`Self::computed_access`]).
-    async fn grant_for_creds(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+    async fn grant_for_creds(&self, channel: &[u8], creds: &ClientCreds) -> WriteGrant {
         let computed = self.computed_access(channel, creds).await;
         WriteGrant {
             allowed: computed.level == AccessLevelLite::ReadWrite,
@@ -416,7 +416,7 @@ enum AccessLevelLite {
 
 #[async_trait::async_trait]
 impl AccessControl for AcfAccessControl {
-    async fn can_read(&self, channel: &str, user: &[u8], host: &str) -> bool {
+    async fn can_read(&self, channel: &[u8], user: &[u8], host: &str) -> bool {
         self.can_read_creds(
             channel,
             &ClientCreds {
@@ -428,7 +428,7 @@ impl AccessControl for AcfAccessControl {
         .await
     }
 
-    async fn can_write(&self, channel: &str, user: &[u8], host: &str) -> bool {
+    async fn can_write(&self, channel: &[u8], user: &[u8], host: &str) -> bool {
         self.can_write_creds(
             channel,
             &ClientCreds {
@@ -440,18 +440,18 @@ impl AccessControl for AcfAccessControl {
         .await
     }
 
-    async fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+    async fn can_read_creds(&self, channel: &[u8], creds: &ClientCreds) -> bool {
         self.level_for_creds(channel, creds).await != AccessLevelLite::None
     }
 
-    async fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+    async fn can_write_creds(&self, channel: &[u8], creds: &ClientCreds) -> bool {
         // Route through `grant_for_creds` (the trap-carrying path) so the
         // allow/deny decision and the trap flag come from one rule
         // evaluation — `write_grant` cannot disagree with `can_write_creds`.
         self.grant_for_creds(channel, creds).await.allowed
     }
 
-    async fn write_grant(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+    async fn write_grant(&self, channel: &[u8], creds: &ClientCreds) -> WriteGrant {
         self.grant_for_creds(channel, creds).await
     }
 }
@@ -507,11 +507,11 @@ impl AccessContext {
         Self::anonymous(Arc::new(AllowAllAccess))
     }
 
-    pub async fn can_read(&self, channel: &str) -> bool {
+    pub async fn can_read(&self, channel: &[u8]) -> bool {
         self.access.can_read_creds(channel, &self.creds).await
     }
 
-    pub async fn can_write(&self, channel: &str) -> bool {
+    pub async fn can_write(&self, channel: &[u8]) -> bool {
         self.access.can_write_creds(channel, &self.creds).await
     }
 
@@ -520,7 +520,7 @@ impl AccessContext {
     /// this once and uses the result both to gate the write and to gate
     /// `asTrapWrite` put-logging — the grant is the single source of the
     /// trap decision.
-    pub async fn write_grant(&self, channel: &str) -> WriteGrant {
+    pub async fn write_grant(&self, channel: &[u8]) -> WriteGrant {
         self.access.write_grant(channel, &self.creds).await
     }
 }
@@ -544,15 +544,15 @@ pub trait ChannelProvider: Send + Sync {
     fn provider_name(&self) -> &str;
 
     /// Check if a channel name exists (for UDP search responses).
-    fn channel_find(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
+    fn channel_find(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send;
 
     /// List all available channel names.
-    fn channel_list(&self) -> impl std::future::Future<Output = Vec<String>> + Send;
+    fn channel_list(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send;
 
     /// Create a channel for the given name.
     fn create_channel(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = BridgeResult<AnyChannel>> + Send;
 }
 
@@ -562,7 +562,7 @@ pub trait ChannelProvider: Send + Sync {
 /// PV (record or group).
 pub trait Channel: Send + Sync {
     /// The channel (PV) name.
-    fn channel_name(&self) -> &str;
+    fn channel_name(&self) -> &[u8];
 
     /// Get: read current value + metadata as a PvStructure.
     fn get(
@@ -644,7 +644,7 @@ pub enum AnyChannel {
 }
 
 impl Channel for AnyChannel {
-    fn channel_name(&self) -> &str {
+    fn channel_name(&self) -> &[u8] {
         match self {
             Self::Single(ch) => ch.channel_name(),
             Self::Group(ch) => ch.channel_name(),
@@ -725,7 +725,7 @@ pub struct BridgeProvider {
     /// `+ Send` bound the `QsrvPvStore` source methods impose on every
     /// caller of this provider — the rule is enforced by construction, not
     /// by review.
-    record_cache: parking_lot::RwLock<HashMap<String, (NtType, DbFieldType)>>,
+    record_cache: parking_lot::RwLock<HashMap<RecordName, (NtType, DbFieldType)>>,
     /// Live access-control cell. Channels and AccessContexts hold an
     /// `Arc<LiveAccessProxy>` that points at this cell, so
     /// `set_access_control` is observed by all existing channels on
@@ -803,19 +803,19 @@ impl LiveAccessProxy {
 
 #[async_trait::async_trait]
 impl AccessControl for LiveAccessProxy {
-    async fn can_read(&self, channel: &str, user: &[u8], host: &str) -> bool {
+    async fn can_read(&self, channel: &[u8], user: &[u8], host: &str) -> bool {
         self.policy().can_read(channel, user, host).await
     }
-    async fn can_write(&self, channel: &str, user: &[u8], host: &str) -> bool {
+    async fn can_write(&self, channel: &[u8], user: &[u8], host: &str) -> bool {
         self.policy().can_write(channel, user, host).await
     }
-    async fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+    async fn can_read_creds(&self, channel: &[u8], creds: &ClientCreds) -> bool {
         self.policy().can_read_creds(channel, creds).await
     }
-    async fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+    async fn can_write_creds(&self, channel: &[u8], creds: &ClientCreds) -> bool {
         self.policy().can_write_creds(channel, creds).await
     }
-    async fn write_grant(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+    async fn write_grant(&self, channel: &[u8], creds: &ClientCreds) -> WriteGrant {
         // Forward to the live inner policy so a swapped-in
         // `AcfAccessControl`'s trap flag is observed; the default impl
         // would drop it to `rule_was_trap = false`.
@@ -853,7 +853,7 @@ impl BridgeProvider {
     /// any sub-field is given) is mutable. Conservative defaults to
     /// `false` for unknown PVs and group PVs (writability isn't
     /// modelled per-group yet).
-    pub async fn is_writable(&self, name: &str) -> bool {
+    pub async fn is_writable(&self, name: &[u8]) -> bool {
         // Group channel: writability per-member is complex; for now
         // assume true if the group is *served* (registered and not
         // shadowed by a backing record). A shadowed name falls through to
@@ -886,7 +886,7 @@ impl BridgeProvider {
     /// mark set. A name that resolves to no record supplies nothing.
     pub async fn channel_property_support(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> epics_base_rs::server::snapshot::PropertySupport {
         channel_property_support(&self.db, name).await
     }
@@ -945,13 +945,13 @@ impl BridgeProvider {
     }
 
     /// Check if a client can write to a channel.
-    pub async fn can_write(&self, channel: &str, user: &[u8], host: &str) -> bool {
+    pub async fn can_write(&self, channel: &[u8], user: &[u8], host: &str) -> bool {
         let policy = self.access_cell.read().clone();
         policy.can_write(channel, user, host).await
     }
 
     /// Check if a client can read from a channel.
-    pub async fn can_read(&self, channel: &str, user: &[u8], host: &str) -> bool {
+    pub async fn can_read(&self, channel: &[u8], user: &[u8], host: &str) -> bool {
         let policy = self.access_cell.read().clone();
         policy.can_read(channel, user, host).await
     }
@@ -1082,7 +1082,7 @@ impl BridgeProvider {
     }
 
     /// Load group definitions from a record's info(Q:group, ...) tag.
-    pub fn load_info_group(&self, record_name: &str, json: &str) -> BridgeResult<()> {
+    pub fn load_info_group(&self, record_name: &[u8], json: &str) -> BridgeResult<()> {
         let defs = super::group_config::parse_info_group(record_name, json)?;
         // `info(Q:group)` tags are base sources (pvxs `loadConfigFromDb`);
         // record the fragments and rebuild from all sources.
@@ -1264,7 +1264,7 @@ impl BridgeProvider {
     /// [`ChannelProvider::channel_find`] resolves, exposed as an
     /// inherent method so the pvalink `local=true` locality check can
     /// query it without depending on the `ChannelProvider` trait.
-    pub async fn hosts_pv(&self, name: &str) -> bool {
+    pub async fn hosts_pv(&self, name: &[u8]) -> bool {
         self.channel_find(name).await
     }
 
@@ -1277,7 +1277,7 @@ impl BridgeProvider {
     /// search resolver (no upstream gateway subscription) — a name
     /// only conflicts when it is *locally* a record, exactly as
     /// `dbChannelTest` tests the local database.
-    async fn record_exists(&self, name: &str) -> bool {
+    async fn record_exists(&self, name: &[u8]) -> bool {
         self.db.get_record(name).is_some() || self.db.find_pv(name).await.is_some()
     }
 
@@ -1289,8 +1289,12 @@ impl BridgeProvider {
     /// stays there: `GroupSource` still answers its search and create
     /// (ioc/groupsource.cpp:108-138) and every operation then fails for want
     /// of a prototype.
-    pub(crate) async fn group_serve(&self, name: &str) -> GroupServe {
-        let Some(def) = self.groups.read().get(name).cloned() else {
+    pub(crate) async fn group_serve(&self, name: &[u8]) -> GroupServe {
+        // Group names come from JSON, so a non-UTF-8 name names no group.
+        let def = std::str::from_utf8(name)
+            .ok()
+            .and_then(|n| self.groups.read().get(n).cloned());
+        let Some(def) = def else {
             return GroupServe::Absent;
         };
         if self.record_exists(name).await {
@@ -1303,7 +1307,7 @@ impl BridgeProvider {
     }
 
     /// The definition of a [`GroupServe::Created`] group.
-    pub(crate) async fn servable_group(&self, name: &str) -> Option<GroupPvDef> {
+    pub(crate) async fn servable_group(&self, name: &[u8]) -> Option<GroupPvDef> {
         match self.group_serve(name).await {
             GroupServe::Created(def) => Some(def),
             _ => None,
@@ -1311,7 +1315,7 @@ impl BridgeProvider {
     }
 
     /// `name` answers search and create as a group, built or not.
-    async fn claims_group(&self, name: &str) -> bool {
+    async fn claims_group(&self, name: &[u8]) -> bool {
         matches!(
             self.group_serve(name).await,
             GroupServe::Created(_) | GroupServe::NotCreated
@@ -1328,7 +1332,7 @@ impl BridgeProvider {
     /// only the find/list/create serve path. Avoids cloning the
     /// `GroupPvDef` when only the existence answer is needed (e.g. the
     /// `is_writable` / `PROCESS` admission checks).
-    pub(crate) async fn is_servable_group(&self, name: &str) -> bool {
+    pub(crate) async fn is_servable_group(&self, name: &[u8]) -> bool {
         // Defined in terms of the gate itself, so the bool answer and the
         // definition answer can never disagree about what is served.
         self.servable_group(name).await.is_some()
@@ -1362,7 +1366,7 @@ impl BridgeProvider {
         &self,
         group: &str,
         field: &str,
-    ) -> Option<(String, super::pvif::FieldMapping)> {
+    ) -> Option<(RecordName, super::pvif::FieldMapping)> {
         let g = self.groups.read();
         let def = g.get(group)?;
         // The PEELED `record.FIELD`, off the channel the member already
@@ -1401,7 +1405,7 @@ impl BridgeProvider {
         user: &[u8],
         host: &str,
     ) -> BridgeResult<()> {
-        if !self.can_write(group, user, host).await {
+        if !self.can_write(group.as_bytes(), user, host).await {
             return Err(crate::error::BridgeError::PutRejected(format!(
                 "write denied for group {group} (user='{}' host='{host}')",
                 String::from_utf8_lossy(user)
@@ -1438,7 +1442,7 @@ impl ChannelProvider for BridgeProvider {
         "BRIDGE"
     }
 
-    async fn channel_find(&self, name: &str) -> bool {
+    async fn channel_find(&self, name: &[u8]) -> bool {
         // QSRV2 disabled: no DB-backed or group channel is served.
         if !self.enabled {
             return false;
@@ -1459,15 +1463,15 @@ impl ChannelProvider for BridgeProvider {
         let core = if parsed.string_view {
             parsed
                 .record_path
-                .strip_suffix('$')
+                .strip_suffix(b"$")
                 .unwrap_or(&parsed.record_path)
         } else {
-            parsed.record_path.as_str()
+            parsed.record_path.as_slice()
         };
         self.db.has_name(core).await
     }
 
-    async fn channel_list(&self) -> Vec<String> {
+    async fn channel_list(&self) -> Vec<RecordName> {
         // QSRV2 disabled: advertise no DB record / alias / group names.
         if !self.enabled {
             return Vec::new();
@@ -1478,12 +1482,12 @@ impl ChannelProvider for BridgeProvider {
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
         names.extend(self.db.all_alias_names());
-        names.extend(self.group_list().await);
+        names.extend(self.group_list().await.into_iter().map(RecordName::from));
         names.sort();
         names
     }
 
-    async fn create_channel(&self, name: &str) -> BridgeResult<AnyChannel> {
+    async fn create_channel(&self, name: &[u8]) -> BridgeResult<AnyChannel> {
         // Default: create with allow-all (anonymous) access. PVA server
         // implementations should call create_channel_for to inject the
         // real client identity.
@@ -1494,7 +1498,7 @@ impl ChannelProvider for BridgeProvider {
 impl BridgeProvider {
     /// pvxs `GroupSource::onSearch`: `name` is a group this provider claims,
     /// built or not. A record of the same name shadows it.
-    pub async fn group_claimed(&self, name: &str) -> bool {
+    pub async fn group_claimed(&self, name: &[u8]) -> bool {
         self.enabled && self.claims_group(name).await
     }
 
@@ -1509,7 +1513,7 @@ impl BridgeProvider {
         let keys: Vec<String> = self.groups.read().keys().cloned().collect();
         let mut names = Vec::new();
         for k in keys {
-            if self.claims_group(&k).await {
+            if self.claims_group(k.as_bytes()).await {
                 names.push(k);
             }
         }
@@ -1520,17 +1524,18 @@ impl BridgeProvider {
     /// pvxs `GroupSource::onCreate`: the built group `name` for `creds`.
     pub async fn create_group_channel_with_creds(
         &self,
-        name: &str,
+        name: &[u8],
         creds: ClientCreds,
     ) -> BridgeResult<GroupChannel> {
         if !self.enabled {
-            return Err(BridgeError::ChannelNotFound(name.to_string()));
+            return Err(BridgeError::ChannelNotFound(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
         }
         self.note_channel_created();
-        let def = self
-            .servable_group(name)
-            .await
-            .ok_or_else(|| BridgeError::ChannelNotFound(name.to_string()))?;
+        let def = self.servable_group(name).await.ok_or_else(|| {
+            BridgeError::ChannelNotFound(String::from_utf8_lossy(name).into_owned())
+        })?;
         Ok(self.group_channel(def, creds))
     }
 
@@ -1542,7 +1547,7 @@ impl BridgeProvider {
 
     /// Whether [`Self::create_channel_with_creds`] would build `name`, asked
     /// of the same constructor without serving a client.
-    pub async fn channel_creatable(&self, name: &str) -> bool {
+    pub async fn channel_creatable(&self, name: &[u8]) -> bool {
         if !self.enabled {
             return false;
         }
@@ -1563,7 +1568,7 @@ impl BridgeProvider {
     /// [`Self::create_channel_with_creds`].
     pub async fn create_channel_for(
         &self,
-        name: &str,
+        name: &[u8],
         user: &str,
         host: &str,
     ) -> BridgeResult<AnyChannel> {
@@ -1585,7 +1590,7 @@ impl BridgeProvider {
     /// METHOD/AUTHORITY rules and role-based UAG entries.
     pub async fn create_channel_with_creds(
         &self,
-        name: &str,
+        name: &[u8],
         creds: ClientCreds,
     ) -> BridgeResult<AnyChannel> {
         // QSRV2 disabled: refuse to construct any DB-backed / group
@@ -1593,7 +1598,9 @@ impl BridgeProvider {
         // (iochooks.cpp:461-496); the not-counted early return keeps the
         // `qsrvStats` channel tally honest about what was actually served.
         if !self.enabled {
-            return Err(BridgeError::ChannelNotFound(name.to_string()));
+            return Err(BridgeError::ChannelNotFound(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
         }
         self.note_channel_created();
 
@@ -1607,10 +1614,12 @@ impl BridgeProvider {
             // Claimed but never built: no prototype, so the store's
             // descriptor is `None` and the server refuses each op.
             GroupServe::NotCreated => {
-                return Err(BridgeError::ChannelNotFound(name.to_string()));
+                return Err(BridgeError::ChannelNotFound(
+                    String::from_utf8_lossy(name).into_owned(),
+                ));
             }
             GroupServe::Shadowed => tracing::warn!(
-                group = %name,
+                group = %String::from_utf8_lossy(name),
                 "QSRV group name conflicts with record name; serving the record and ignoring the group"
             ),
             GroupServe::Absent => {}
@@ -1630,8 +1639,7 @@ impl BridgeProvider {
         // at the `has_name` gate below; `BridgeChannel::new` re-reads the
         // modifier from the full name to select the `$` view.
         let parsed = epics_base_rs::server::database::filters::parse_channel_name(name);
-        let resolution_name = parsed.record_path.as_str();
-        let record_name = parsed.record.as_str();
+        let resolution_name = parsed.record_path.as_slice();
         let field_upper = parsed.field.clone();
 
         // Cache hit only when the requested name has no filter
@@ -1646,8 +1654,8 @@ impl BridgeProvider {
                 return Ok(AnyChannel::Single(
                     BridgeChannel::from_cached(
                         self.db.clone(),
-                        name.to_string(),
-                        record_name.to_string(),
+                        RecordName::from(name),
+                        parsed.record.clone(),
                         field_upper,
                         nt_type,
                         value_dbf,
@@ -1671,13 +1679,18 @@ impl BridgeProvider {
             // its own chain.
             if parsed.json_suffix.is_none() {
                 let mut cache = self.record_cache.write();
-                cache.insert(name.to_string(), (channel.nt_type(), channel.value_dbf()));
+                cache.insert(
+                    RecordName::from(name),
+                    (channel.nt_type(), channel.value_dbf()),
+                );
             }
 
             return Ok(AnyChannel::Single(channel.with_access(access_ctx)));
         }
 
-        Err(BridgeError::ChannelNotFound(name.to_string()))
+        Err(BridgeError::ChannelNotFound(
+            String::from_utf8_lossy(name).into_owned(),
+        ))
     }
 }
 
@@ -1687,7 +1700,7 @@ impl BridgeProvider {
 /// provider and resolves its members' masks through this.
 pub async fn channel_property_support(
     db: &PvDatabase,
-    name: &str,
+    name: &[u8],
 ) -> epics_base_rs::server::snapshot::PropertySupport {
     use epics_base_rs::server::database::filters as f;
     let cn = f::parse_channel_name(name);
@@ -1714,7 +1727,7 @@ pub async fn member_property_support(
 /// (`dbAccess.c:341-348`), which a `ts` value mode rewrites.
 async fn property_support_for(
     db: &PvDatabase,
-    record: &str,
+    record: &[u8],
     field: &str,
     filters: &epics_base_rs::server::database::filters::FilterChain,
 ) -> epics_base_rs::server::snapshot::PropertySupport {
@@ -1822,58 +1835,58 @@ mod tests {
             "G:badfilter",
         ] {
             assert!(
-                provider.channel_find(refused).await,
+                provider.channel_find(refused.as_bytes()).await,
                 "{refused}: an uncreated group still answers a search"
             );
             assert!(
-                provider.channel_creatable(refused).await,
+                provider.channel_creatable(refused.as_bytes()).await,
                 "{refused}: an uncreated group still passes onCreate"
             );
             assert!(
-                provider.create_channel(refused).await.is_err(),
+                provider.create_channel(refused.as_bytes()).await.is_err(),
                 "{refused}: an uncreated group must not build a channel"
             );
         }
         assert!(
-            provider.channel_find("G:ok").await,
+            provider.channel_find(b"G:ok").await,
             "G:ok: every member resolves; the group is served"
         );
         assert!(
-            provider.channel_find("G:filtered").await,
+            provider.channel_find(b"G:filtered").await,
             "G:filtered: a parseable filter suffix is admitted, not refused"
         );
         assert!(
-            provider.channel_find("G:dollarstr").await,
+            provider.channel_find(b"G:dollarstr").await,
             "G:dollarstr: `$` on a DBF_STRING VAL is C's eligible branch"
         );
-        match provider.create_channel("G:ok").await.unwrap() {
+        match provider.create_channel(b"G:ok").await.unwrap() {
             AnyChannel::Group(_) => {}
             AnyChannel::Single(_) => panic!("G:ok must build as a group"),
         }
-        match provider.create_channel("G:fwdlink").await.unwrap() {
+        match provider.create_channel(b"G:fwdlink").await.unwrap() {
             AnyChannel::Group(_) => {}
             AnyChannel::Single(_) => panic!("G:fwdlink must build as a group"),
         }
-        match provider.create_channel("G:dollarstr").await.unwrap() {
+        match provider.create_channel(b"G:dollarstr").await.unwrap() {
             AnyChannel::Group(_) => {}
             AnyChannel::Single(_) => panic!("G:dollarstr must build as a group"),
         }
         // The refusal is the GROUP path's alone: `getValuePrototype` asks
         // the same function with `errOnLinks = false` (singlesource.cpp:192),
         // so the very field that killed `G:inlink` still serves on its own.
-        match provider.create_channel("G:calc.INPA").await.unwrap() {
+        match provider.create_channel(b"G:calc.INPA").await.unwrap() {
             AnyChannel::Single(_) => {}
             AnyChannel::Group(_) => panic!("G:calc.INPA must build as a single channel"),
         }
 
         let listed = provider.channel_list().await;
         assert_eq!(
-            listed.iter().filter(|n| n.starts_with("G:")).count(),
+            listed.iter().filter(|n| n.starts_with(b"G:")).count(),
             13,
             "the four records and all nine groups: {listed:?}"
         );
         assert!(
-            listed.contains(&"G:ok".to_string()),
+            listed.iter().any(|n| n == "G:ok"),
             "the created group must be listed: {listed:?}"
         );
     }
@@ -1909,23 +1922,23 @@ mod tests {
             .unwrap();
 
         // create_channel resolves the record, not the group.
-        match provider.create_channel("REC").await.unwrap() {
+        match provider.create_channel(b"REC").await.unwrap() {
             AnyChannel::Single(_) => {}
             AnyChannel::Group(_) => panic!("REC must resolve to the record, not the group"),
         }
         // The non-colliding group is still served as a group.
-        match provider.create_channel("GRP:ONLY").await.unwrap() {
+        match provider.create_channel(b"GRP:ONLY").await.unwrap() {
             AnyChannel::Group(_) => {}
             AnyChannel::Single(_) => panic!("GRP:ONLY has no backing record; must be a group"),
         }
 
-        assert!(provider.channel_find("REC").await);
+        assert!(provider.channel_find(b"REC").await);
 
         // channel_list emits exactly one "REC" (the record), not a
         // duplicate from the shadowed group; the live group survives.
         let list = provider.channel_list().await;
         assert_eq!(
-            list.iter().filter(|n| n.as_str() == "REC").count(),
+            list.iter().filter(|n| *n == "REC").count(),
             1,
             "REC must appear once (record), not duplicated by the group"
         );
@@ -1977,22 +1990,22 @@ mod tests {
 
         // The single shadow gate.
         assert!(
-            !provider.is_servable_group("SH:rec").await,
+            !provider.is_servable_group(b"SH:rec").await,
             "shadowed name is not a servable group"
         );
         assert!(
-            provider.is_servable_group("SH:grp").await,
+            provider.is_servable_group(b"SH:grp").await,
             "non-colliding group is servable"
         );
 
         // is_writable: the shadowed name falls to the record path, whose
         // DISP=1 makes it not writable (raw-registry leak returned true).
         assert!(
-            !provider.is_writable("SH:rec").await,
+            !provider.is_writable(b"SH:rec").await,
             "shadowed name must respect record DISP, not the group blanket-true"
         );
         assert!(
-            provider.is_writable("SH:grp").await,
+            provider.is_writable(b"SH:grp").await,
             "a real servable group is writable"
         );
     }
@@ -2128,7 +2141,7 @@ mod tests {
         // channel is prefixed with "REC.").
         provider
             .load_info_group(
-                "REC",
+                b"REC",
                 r#"{ "GRP": { "i": { "+channel": "VAL", "+type": "plain" } } }"#,
             )
             .unwrap();
@@ -2165,7 +2178,7 @@ mod tests {
     struct ReadOnly;
     #[async_trait::async_trait]
     impl AccessControl for ReadOnly {
-        async fn can_write(&self, _: &str, _: &[u8], _: &str) -> bool {
+        async fn can_write(&self, _: &[u8], _: &[u8], _: &str) -> bool {
             false
         }
     }
@@ -2174,11 +2187,11 @@ mod tests {
     struct DenySpecific(String);
     #[async_trait::async_trait]
     impl AccessControl for DenySpecific {
-        async fn can_read(&self, channel: &str, _: &[u8], _: &str) -> bool {
-            channel != self.0
+        async fn can_read(&self, channel: &[u8], _: &[u8], _: &str) -> bool {
+            channel != self.0.as_bytes()
         }
-        async fn can_write(&self, channel: &str, _: &[u8], _: &str) -> bool {
-            channel != self.0
+        async fn can_write(&self, channel: &[u8], _: &[u8], _: &str) -> bool {
+            channel != self.0.as_bytes()
         }
     }
 
@@ -2215,11 +2228,41 @@ ASG(SECURE) {
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Anyone can read.
-        assert!(acl.can_read("AI:SEC", b"guest", "anywhere").await);
-        assert!(acl.can_read("AI:SEC", b"admin", "anywhere").await);
+        assert!(acl.can_read(b"AI:SEC", b"guest", "anywhere").await);
+        assert!(acl.can_read(b"AI:SEC", b"admin", "anywhere").await);
         // Only admin can write.
-        assert!(acl.can_write("AI:SEC", b"admin", "anywhere").await);
-        assert!(!acl.can_write("AI:SEC", b"guest", "anywhere").await);
+        assert!(acl.can_write(b"AI:SEC", b"admin", "anywhere").await);
+        assert!(!acl.can_write(b"AI:SEC", b"guest", "anywhere").await);
+    }
+
+    /// A Latin-1 record name is found, created, listed and ACF-checked by
+    /// its bytes, as `dbChannelCreate` and `asAddClient` take them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_latin1_record_name_is_served_by_its_bytes() {
+        use epics_base_rs::server::access_security::parse_acf;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let name: &[u8] = b"AI:\xb5A";
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(name, Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.get_record(name).unwrap().write().common.text.asg = "LOCKED".to_string();
+
+        let provider = BridgeProvider::new(db.clone());
+        assert!(provider.channel_find(name).await);
+        assert!(!provider.channel_find("AI:\u{b5}A".as_bytes()).await);
+        assert!(provider.channel_list().await.iter().any(|n| n[..] == *name));
+        let ch = provider.create_channel(name).await.unwrap();
+        assert_eq!(ch.channel_name(), name);
+
+        let cfg = parse_acf("ASG(DEFAULT) {\n RULE(1, WRITE)\n}\nASG(LOCKED)\n").unwrap();
+        let acl = AcfAccessControl::new(db, cfg);
+        // LOCKED is reached only through the record's own bytes; the UTF-8
+        // spelling names no record and falls back to DEFAULT.
+        assert!(!acl.can_write(name, b"guest", "h").await);
+        assert!(acl.can_write("AI:\u{b5}A".as_bytes(), b"guest", "h").await);
     }
 
     /// The grant cache must repoint when the record's ASG changes
@@ -2250,14 +2293,14 @@ ASG(LOCKED)
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Twice: the second call is the cache-hit path.
-        assert!(acl.can_write("AI:MOVE", b"guest", "anywhere").await);
-        assert!(acl.can_write("AI:MOVE", b"guest", "anywhere").await);
+        assert!(acl.can_write(b"AI:MOVE", b"guest", "anywhere").await);
+        assert!(acl.can_write(b"AI:MOVE", b"guest", "anywhere").await);
 
         // The field-I/O layer's `dbPut record.ASG` sequence: mutate,
         // then notify.
         rec.write().common.text.asg = "LOCKED".to_string();
         notify_asg_field_changed();
-        assert!(!acl.can_write("AI:MOVE", b"guest", "anywhere").await);
+        assert!(!acl.can_write(b"AI:MOVE", b"guest", "anywhere").await);
     }
 
     /// Regression: AcfAccessControl must honor method, authority,
@@ -2337,13 +2380,13 @@ ASG(ROLE_GATED) {
         // ── Axis 4: field ASL ────────────────────────────────────────────
         // ASL=0 record: RULE(0, WRITE) applies.
         assert!(
-            acl.can_write("AI:ASL0", b"alice", "h").await,
+            acl.can_write(b"AI:ASL0", b"alice", "h").await,
             "ASL=0: alice should be allowed to write"
         );
         // ASL=1 record: RULE(0, WRITE) is skipped (epics-base asLibRoutines.c:1006:
         // `if(pasgclient->level > pasgrule->level) goto next_rule`).
         assert!(
-            !acl.can_write("AI:ASL1", b"alice", "h").await,
+            !acl.can_write(b"AI:ASL1", b"alice", "h").await,
             "ASL=1: RULE(0,WRITE) must be skipped → write denied"
         );
 
@@ -2358,7 +2401,7 @@ ASG(ROLE_GATED) {
             roles: Vec::new(),
         };
         assert!(
-            acl.can_write_creds("AI:METH", &x509_creds).await,
+            acl.can_write_creds(b"AI:METH", &x509_creds).await,
             "x509 client must match METHOD(\"x509\") rule"
         );
         let ca_creds = ClientCreds {
@@ -2369,7 +2412,7 @@ ASG(ROLE_GATED) {
             roles: Vec::new(),
         };
         assert!(
-            !acl.can_write_creds("AI:METH", &ca_creds).await,
+            !acl.can_write_creds(b"AI:METH", &ca_creds).await,
             "ca client must NOT match METHOD(\"x509\")-only rule"
         );
 
@@ -2382,7 +2425,7 @@ ASG(ROLE_GATED) {
             roles: Vec::new(),
         };
         assert!(
-            acl.can_write_creds("AI:AUTH", &trusted_creds).await,
+            acl.can_write_creds(b"AI:AUTH", &trusted_creds).await,
             "correct authority must match AUTHORITY(\"Trusted Root\")"
         );
         let other_ca_creds = ClientCreds {
@@ -2393,7 +2436,7 @@ ASG(ROLE_GATED) {
             roles: Vec::new(),
         };
         assert!(
-            !acl.can_write_creds("AI:AUTH", &other_ca_creds).await,
+            !acl.can_write_creds(b"AI:AUTH", &other_ca_creds).await,
             "wrong authority must NOT match"
         );
 
@@ -2408,7 +2451,7 @@ ASG(ROLE_GATED) {
             roles: vec!["ops".to_string().into()],
         };
         assert!(
-            acl.can_write_creds("AI:ROLE", &ops_creds).await,
+            acl.can_write_creds(b"AI:ROLE", &ops_creds).await,
             "client with role 'ops' must match UAG entry 'role/ops'"
         );
         let no_role_creds = ClientCreds {
@@ -2419,7 +2462,7 @@ ASG(ROLE_GATED) {
             roles: Vec::new(),
         };
         assert!(
-            !acl.can_write_creds("AI:ROLE", &no_role_creds).await,
+            !acl.can_write_creds(b"AI:ROLE", &no_role_creds).await,
             "client without 'ops' role must NOT write to ROLE_GATED"
         );
     }
@@ -2427,15 +2470,15 @@ ASG(ROLE_GATED) {
     #[tokio::test]
     async fn access_context_allow_all() {
         let ctx = AccessContext::allow_all();
-        assert!(ctx.can_read("ANY").await);
-        assert!(ctx.can_write("ANY").await);
+        assert!(ctx.can_read(b"ANY").await);
+        assert!(ctx.can_write(b"ANY").await);
     }
 
     #[tokio::test]
     async fn access_context_read_only() {
         let ctx = AccessContext::anonymous(Arc::new(ReadOnly));
-        assert!(ctx.can_read("X").await);
-        assert!(!ctx.can_write("X").await);
+        assert!(ctx.can_read(b"X").await);
+        assert!(!ctx.can_write(b"X").await);
     }
 
     #[tokio::test]
@@ -2449,10 +2492,10 @@ ASG(ROLE_GATED) {
     #[tokio::test]
     async fn access_context_deny_specific() {
         let ctx = AccessContext::anonymous(Arc::new(DenySpecific("SECRET".to_string())));
-        assert!(ctx.can_read("PUBLIC").await);
-        assert!(!ctx.can_read("SECRET").await);
-        assert!(ctx.can_write("PUBLIC").await);
-        assert!(!ctx.can_write("SECRET").await);
+        assert!(ctx.can_read(b"PUBLIC").await);
+        assert!(!ctx.can_read(b"SECRET").await);
+        assert!(ctx.can_write(b"PUBLIC").await);
+        assert!(!ctx.can_write(b"SECRET").await);
     }
 
     #[tokio::test]
@@ -2460,13 +2503,13 @@ ASG(ROLE_GATED) {
         let db = Arc::new(PvDatabase::new());
         let provider = BridgeProvider::new(db);
         // Default policy
-        assert!(provider.can_read("X", b"u", "h").await);
-        assert!(provider.can_write("X", b"u", "h").await);
+        assert!(provider.can_read(b"X", b"u", "h").await);
+        assert!(provider.can_write(b"X", b"u", "h").await);
 
         // Swap to read-only
         provider.set_access_control(Arc::new(ReadOnly));
-        assert!(provider.can_read("X", b"u", "h").await);
-        assert!(!provider.can_write("X", b"u", "h").await);
+        assert!(provider.can_read(b"X", b"u", "h").await);
+        assert!(!provider.can_write(b"X", b"u", "h").await);
     }
 
     #[tokio::test]
@@ -2479,8 +2522,8 @@ ASG(ROLE_GATED) {
         let access = AccessContext::anonymous(Arc::new(ReadOnly));
         let ch = BridgeChannel::from_cached(
             db,
-            "PROT".to_string(),
-            "PROT".to_string(),
+            "PROT".into(),
+            "PROT".into(),
             "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
             epics_base_rs::types::DbFieldType::Double,
@@ -2509,8 +2552,8 @@ ASG(ROLE_GATED) {
         let access = AccessContext::anonymous(Arc::new(DenySpecific("BLOCKED".to_string())));
         let ch = BridgeChannel::from_cached(
             db.clone(),
-            "BLOCKED".to_string(),
-            "BLOCKED".to_string(),
+            "BLOCKED".into(),
+            "BLOCKED".into(),
             "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
             epics_base_rs::types::DbFieldType::Double,
@@ -2525,8 +2568,8 @@ ASG(ROLE_GATED) {
         let ok_access = AccessContext::anonymous(Arc::new(DenySpecific("BLOCKED".to_string())));
         let ch2 = BridgeChannel::from_cached(
             db,
-            "ALLOWED".to_string(),
-            "ALLOWED".to_string(),
+            "ALLOWED".into(),
+            "ALLOWED".into(),
             "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
             epics_base_rs::types::DbFieldType::Double,
@@ -2556,26 +2599,26 @@ ASG(ROLE_GATED) {
         // AllowAllAccess.
         let ctx =
             AccessContext::with_identity(provider.live_access(), "alice".into(), "host1".into());
-        assert!(ctx.can_read("ANY").await);
-        assert!(ctx.can_write("ANY").await);
+        assert!(ctx.can_read(b"ANY").await);
+        assert!(ctx.can_write(b"ANY").await);
 
         // Swap to a deny-specific policy AFTER the context was created.
         provider.set_access_control(Arc::new(DenySpecific("SECRET".into())));
-        assert!(ctx.can_read("ALLOWED").await);
-        assert!(!ctx.can_read("SECRET").await, "swap must be observed live");
-        assert!(!ctx.can_write("SECRET").await);
+        assert!(ctx.can_read(b"ALLOWED").await);
+        assert!(!ctx.can_read(b"SECRET").await, "swap must be observed live");
+        assert!(!ctx.can_write(b"SECRET").await);
 
         // Swap to read-only — same context, fresh decision.
         provider.set_access_control(Arc::new(ReadOnly));
-        assert!(ctx.can_read("X").await);
+        assert!(ctx.can_read(b"X").await);
         assert!(
-            !ctx.can_write("X").await,
+            !ctx.can_write(b"X").await,
             "policy swap must take effect immediately"
         );
 
         // Swap back to allow-all — proxy still tracks.
         provider.set_access_control(Arc::new(AllowAllAccess));
-        assert!(ctx.can_write("X").await);
+        assert!(ctx.can_write(b"X").await);
     }
 
     /// a QSRV access context built through the legacy
@@ -2617,7 +2660,7 @@ ASG(ANON_GATED) {
         // Legacy 3-arg path (create_channel / create_channel_for
         // funnel through these). Empty method on the branch.
         assert!(
-            acl.can_read("AI:ANON", b"alice", "h").await,
+            acl.can_read(b"AI:ANON", b"alice", "h").await,
             "legacy can_read must match METHOD(\"anonymous\") rule"
         );
 
@@ -2630,7 +2673,7 @@ ASG(ANON_GATED) {
             roles: Vec::new(),
         };
         assert!(
-            acl.can_read_creds("AI:ANON", &id_creds).await,
+            acl.can_read_creds(b"AI:ANON", &id_creds).await,
             "empty-method ClientCreds must match METHOD(\"anonymous\") rule"
         );
 
@@ -2645,7 +2688,7 @@ ASG(ANON_GATED) {
             roles: Vec::new(),
         };
         assert!(
-            !acl.can_read_creds("AI:ANON", &ca_creds).await,
+            !acl.can_read_creds(b"AI:ANON", &ca_creds).await,
             "an explicit 'ca' method must NOT match a METHOD(\"anonymous\")-only rule"
         );
     }

@@ -60,26 +60,26 @@ struct AdmissionLset {
 
 #[async_trait::async_trait]
 impl LinkSet for AdmissionLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &str) -> PutAdmission {
+    fn put_admission(&self, _: &[u8]) -> PutAdmission {
         self.admission
     }
-    fn link_metadata(&self, _: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _: &[u8]) -> Option<LinkMetadata> {
         Some(LinkMetadata {
             dbf_type: Some(LinkDbfType::Double),
             element_count: Some(1),
             ..Default::default()
         })
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Ok(())
     }
 }

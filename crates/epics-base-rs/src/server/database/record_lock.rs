@@ -361,6 +361,7 @@ use crate::runtime::sync::{
 };
 
 use super::PvDatabase;
+use crate::types::RecordName;
 
 /// C's `lockSet` (`dbLockPvt.h:29-44`): the one mutex every member record
 /// locks through, plus the bookkeeping the guards need without the registry.
@@ -924,7 +925,7 @@ struct Registry {
     /// The [`LockRecord`] here is the SAME cell the record instance holds, so
     /// there is one association and not two: everything that moves a record
     /// between sets moves it by storing into this cell.
-    of_record: HashMap<String, Arc<LockRecord>>,
+    of_record: HashMap<RecordName, Arc<LockRecord>>,
     next_id: u64,
     /// Bumped by every change to the partition — a set minted, a cell moved,
     /// an entry dropped. A mover snapshots it, takes the sets it means to
@@ -946,7 +947,7 @@ struct SetState {
     set: Set,
     /// In list order, which `dblsr` prints: a merge appends the moved set's
     /// list to the survivor's (`dbLock.c:619-623`).
-    members: Vec<String>,
+    members: Vec<RecordName>,
 }
 
 impl Default for Registry {
@@ -983,7 +984,7 @@ impl Registry {
     /// including a registered record that is still on the bootstrap set,
     /// which is C's null `lset` and what `dblsr` reports as no set at all
     /// (`dbLock.c:900-901`).
-    fn real_set_of(&self, name: &str) -> Option<Set> {
+    fn real_set_of(&self, name: &[u8]) -> Option<Set> {
         self.of_record
             .get(name)
             .map(|lr| lr.set())
@@ -995,11 +996,12 @@ impl Registry {
     /// at all — it was removed between the graph read and this call, and
     /// its cell went with it. A registered name still on the bootstrap set
     /// is the invariant [`Self::adopt`] keeps, broken.
-    fn set_of_registered(&self, name: &str) -> Option<Set> {
+    fn set_of_registered(&self, name: &[u8]) -> Option<Set> {
         let set = self.real_set_of(name);
         debug_assert!(
             set.is_some() || !self.of_record.contains_key(name),
-            "registered record {name} is on the bootstrap set after iocInit"
+            "registered record {} is on the bootstrap set after iocInit",
+            String::from_utf8_lossy(name)
         );
         set
     }
@@ -1012,18 +1014,18 @@ impl Registry {
     /// Never mints for a registered record: its cell was adopted from the
     /// record itself ([`Self::adopt`]) and points at the bootstrap set until
     /// [`Self::mint_for`] moves it, under the hold that move requires.
-    fn lock_record_of(&mut self, name: &str) -> Arc<LockRecord> {
+    fn lock_record_of(&mut self, name: &[u8]) -> Arc<LockRecord> {
         if let Some(lr) = self.of_record.get(name) {
             return lr.clone();
         }
         let set = self.make_set();
         let lr = LockRecord::new(set);
-        self.of_record.insert(name.to_string(), lr.clone());
+        self.of_record.insert(RecordName::from(name), lr.clone());
         self.active.insert(
             set.id,
             SetState {
                 set,
-                members: vec![name.to_string()],
+                members: vec![RecordName::from(name)],
             },
         );
         lr
@@ -1047,16 +1049,16 @@ impl Registry {
     /// bootstrap set alone: a `LinkEdit` relink runs under a put that already
     /// holds the seed's set, and reaching for id 0 from there would invert
     /// the id order a `Membership` relink takes the sets in.
-    fn adopt(&mut self, name: &str, lr: &Arc<LockRecord>) {
+    fn adopt(&mut self, name: &[u8], lr: &Arc<LockRecord>) {
         match self.of_record.get(name) {
             Some(existing) if Arc::ptr_eq(existing, lr) => {}
             Some(existing) => {
                 lr.store(existing.set());
-                self.of_record.insert(name.to_string(), lr.clone());
+                self.of_record.insert(RecordName::from(name), lr.clone());
                 self.revision += 1;
             }
             None => {
-                self.of_record.insert(name.to_string(), lr.clone());
+                self.of_record.insert(RecordName::from(name), lr.clone());
                 if self.built {
                     self.mint_for(name, lr);
                 }
@@ -1071,7 +1073,7 @@ impl Registry {
     /// the set it moves a record out of. [`Self::adopt`] is the one caller
     /// that holds nothing — it runs before the record is in the records map,
     /// so no thread can be inside the record's data through the cell.
-    fn mint_for(&mut self, name: &str, lr: &Arc<LockRecord>) {
+    fn mint_for(&mut self, name: &[u8], lr: &Arc<LockRecord>) {
         if !lr.is_bootstrap() {
             return;
         }
@@ -1081,11 +1083,11 @@ impl Registry {
             set.id,
             SetState {
                 set,
-                members: vec![name.to_string()],
+                members: vec![RecordName::from(name)],
             },
         );
         self.of_record
-            .entry(name.to_string())
+            .entry(RecordName::from(name))
             .or_insert_with(|| lr.clone());
     }
 
@@ -1104,7 +1106,7 @@ impl Registry {
     /// that took those sets first, in id order, and re-read
     /// [`Self::revision`] under the registry lock to prove they are still the
     /// records' sets.
-    fn place(&mut self, names: impl IntoIterator<Item = String>, set: Set) {
+    fn place(&mut self, names: impl IntoIterator<Item = RecordName>, set: Set) {
         self.revision += 1;
         for name in names {
             match self.of_record.get(&name) {
@@ -1126,7 +1128,7 @@ impl Registry {
     ///
     /// Both names have real sets — [`PvDatabase::merge_sets`] gave them one
     /// and holds `second`'s, which is the one records move out of.
-    fn merge(&mut self, first: &str, second: &str) {
+    fn merge(&mut self, first: &[u8], second: &[u8]) {
         let (Some(a), Some(b)) = (self.real_set_of(first), self.real_set_of(second)) else {
             return;
         };
@@ -1164,8 +1166,8 @@ impl Registry {
     /// taking the region.
     fn repartition(
         &mut self,
-        seed: &str,
-        adjacency: &HashMap<String, BTreeSet<String>>,
+        seed: &[u8],
+        adjacency: &HashMap<RecordName, BTreeSet<RecordName>>,
         held: &[Set],
     ) {
         let Some(seed_set) = self.of_record.get(seed).map(|lr| lr.set()) else {
@@ -1173,8 +1175,8 @@ impl Registry {
         };
         let seed_id = seed_set.id;
 
-        let mut affected: BTreeSet<String> = BTreeSet::new();
-        let mut work: Vec<String> = vec![seed.to_string()];
+        let mut affected: BTreeSet<RecordName> = BTreeSet::new();
+        let mut work: Vec<RecordName> = vec![RecordName::from(seed)];
         while let Some(name) = work.pop() {
             if !affected.insert(name.clone()) {
                 continue;
@@ -1223,17 +1225,17 @@ impl Registry {
         // still a record. Each is closed inside `affected` by construction:
         // `affected` was built by following the same adjacency.
         let seed_present = adjacency.contains_key(seed);
-        let mut components: Vec<BTreeSet<String>> = Vec::new();
-        let mut placed: BTreeSet<String> = BTreeSet::new();
+        let mut components: Vec<BTreeSet<RecordName>> = Vec::new();
+        let mut placed: BTreeSet<RecordName> = BTreeSet::new();
         let starts = seed_present
-            .then(|| seed.to_string())
+            .then(|| RecordName::from(seed))
             .into_iter()
             .chain(affected.iter().cloned());
         for start in starts {
             if placed.contains(&start) || !adjacency.contains_key(&start) {
                 continue;
             }
-            let mut component: BTreeSet<String> = BTreeSet::new();
+            let mut component: BTreeSet<RecordName> = BTreeSet::new();
             let mut walk = vec![start];
             while let Some(name) = walk.pop() {
                 if !component.insert(name.clone()) {
@@ -1279,11 +1281,11 @@ impl Registry {
         // order `dbLockSetMerge`'s append leaves when one link joins two sets.
         // Every member is on one of those lists, since relinks run only after
         // `built` and a registered record is then never on the bootstrap set.
-        let ordered: Vec<Vec<String>> = components
+        let ordered: Vec<Vec<RecordName>> = components
             .iter()
             .zip(&assigned)
             .map(|(component, id)| {
-                let members: Vec<String> = id
+                let members: Vec<RecordName> = id
                     .iter()
                     .chain(touched.iter().filter(|other| Some(**other) != *id))
                     .flat_map(|id| &self.active[id].members)
@@ -1363,7 +1365,7 @@ pub struct LockSetInfo {
     /// C's `lockSet::id`.
     pub id: u64,
     /// C's `lockRecordList`, in the order `dblsr` walks it.
-    pub members: Vec<String>,
+    pub members: Vec<RecordName>,
     /// C's `lockSet::refcount`: one per member record, plus one for each
     /// [`PvDatabase::lock_records`] epoch currently holding this set.
     pub refs: usize,
@@ -1406,12 +1408,12 @@ impl RecordLockRegistry {
     }
 
     /// Which set `record` is behind right now, without creating one.
-    fn set_id_of(&self, record: &str) -> Option<u64> {
+    fn set_id_of(&self, record: &[u8]) -> Option<u64> {
         self.lock().real_set_of(record).map(|set| set.id)
     }
 
     /// See [`Registry::adopt`].
-    pub(crate) fn adopt(&self, name: &str, lr: &Arc<LockRecord>) {
+    pub(crate) fn adopt(&self, name: &[u8], lr: &Arc<LockRecord>) {
         self.lock().adopt(name, lr);
     }
 }
@@ -1434,7 +1436,7 @@ impl PvDatabase {
     pub fn build_lock_sets(&self) {
         // C's `forEachRecord` order, which is both the order sets are minted
         // in (their ids) and the order links merge in (their member lists).
-        let names: Vec<String> = self
+        let names: Vec<RecordName> = self
             .iterate_records()
             .into_iter()
             .map(|(name, _)| name)
@@ -1442,7 +1444,7 @@ impl PvDatabase {
         // Every edge is collected BEFORE the registry lock is taken:
         // `record_link_fields` reads the record map and each record's own
         // lock, and neither may be acquired underneath the registry.
-        let mut edges: Vec<(String, String)> = Vec::new();
+        let mut edges: Vec<(RecordName, RecordName)> = Vec::new();
         for name in &names {
             for target in self.db_link_targets(name) {
                 edges.push((name.clone(), target));
@@ -1463,14 +1465,14 @@ impl PvDatabase {
     /// record adopted after `names` was read is registered but unnamed, and
     /// `built` promises that no registered record is on the bootstrap set
     /// from here on ([`Registry::every_set`]).
-    fn init_sets(&self, names: &[String]) {
+    fn init_sets(&self, names: &[RecordName]) {
         let _out_of = bootstrap_set().acquire();
         let mut registry = self.inner.record_locks.lock();
         for name in names {
             let lr = registry.lock_record_of(name);
             registry.mint_for(name, &lr);
         }
-        let mut adopted: Vec<(String, Arc<LockRecord>)> = registry
+        let mut adopted: Vec<(RecordName, Arc<LockRecord>)> = registry
             .of_record
             .iter()
             .filter(|(_, lr)| lr.is_bootstrap())
@@ -1486,7 +1488,7 @@ impl PvDatabase {
     /// C `dbLockSetMerge` under C's protocol: both sets are taken before
     /// the registry decides anything, in id order, and the merge happens
     /// only if they are still the two records' sets once it is held.
-    fn merge_sets(&self, first: &str, second: &str) {
+    fn merge_sets(&self, first: &[u8], second: &[u8]) {
         loop {
             let (a, b) = {
                 let registry = self.inner.record_locks.lock();
@@ -1515,7 +1517,7 @@ impl PvDatabase {
 
     /// The cell `name` locks through, with a real set — minted now if the
     /// name has none. The by-name form of [`Self::ensure_set_for`].
-    fn ensure_set(&self, name: &str) -> Arc<LockRecord> {
+    fn ensure_set(&self, name: &[u8]) -> Arc<LockRecord> {
         let lr = self.inner.record_locks.lock().lock_record_of(name);
         self.ensure_set_for(name, &lr);
         lr
@@ -1527,7 +1529,7 @@ impl PvDatabase {
     /// bootstrap set is taken first and the registry under it: a mover holds
     /// the set it moves out of, and no set is ever taken under the registry
     /// lock.
-    fn ensure_set_for(&self, name: &str, lr: &Arc<LockRecord>) {
+    fn ensure_set_for(&self, name: &[u8], lr: &Arc<LockRecord>) {
         if !lr.is_bootstrap() {
             return;
         }
@@ -1543,7 +1545,7 @@ impl PvDatabase {
     /// merges nothing. `record_link_fields` has already applied that same
     /// locality rule, so a `ca://` link to a local record is a `Ca` link here
     /// and does not widen the set.
-    fn db_link_targets(&self, record: &str) -> Vec<String> {
+    fn db_link_targets(&self, record: &[u8]) -> Vec<RecordName> {
         use crate::server::record::ParsedLink;
         self.record_link_fields(record)
             .into_iter()
@@ -1588,10 +1590,11 @@ impl PvDatabase {
     ///
     /// Does not create a set: asking about a record must not change the
     /// report.
-    pub fn lock_set_of(&self, record: &str) -> Option<LockSetInfo> {
+    pub fn lock_set_of(&self, record: impl AsRef<[u8]>) -> Option<LockSetInfo> {
+        let record = record.as_ref();
         let canonical = self
             .resolve_alias(record)
-            .unwrap_or_else(|| record.to_string());
+            .unwrap_or_else(|| RecordName::from(record));
         let rows = mutex_rows_by_addr();
         let registry = self.inner.record_locks.lock();
         let id = registry.real_set_of(&canonical)?.id;
@@ -1612,12 +1615,12 @@ impl PvDatabase {
     /// text of every record in the affected component.
     pub(crate) fn link_field_write<'a>(
         &'a self,
-        record: &str,
+        record: &[u8],
         field: &str,
     ) -> Option<LockSetEdit<'a>> {
         let canonical = self
             .resolve_alias(record)
-            .unwrap_or_else(|| record.to_string());
+            .unwrap_or_else(|| RecordName::from(record));
         if !self.is_dbf_link_field(&canonical, field) {
             return None;
         }
@@ -1640,7 +1643,7 @@ impl PvDatabase {
     /// mutation, so the relink sees the database as it is afterwards.
     pub(crate) fn lock_set_membership_change<'a>(
         &'a self,
-        record: &str,
+        record: &[u8],
     ) -> Option<LockSetEdit<'a>> {
         if !self.inner.record_locks.lock().built {
             return None;
@@ -1649,7 +1652,7 @@ impl PvDatabase {
             db: self,
             record: self
                 .resolve_alias(record)
-                .unwrap_or_else(|| record.to_string()),
+                .unwrap_or_else(|| RecordName::from(record)),
             scope: RelinkScope::Membership,
         })
     }
@@ -1693,7 +1696,7 @@ impl PvDatabase {
     /// Sets are taken first and the registry lock under them, never the
     /// reverse; [`Registry::revision`] proves, under that lock, that the sets
     /// held are still the ones the region's records are behind.
-    fn relink_lock_sets(&self, record: &str, scope: RelinkScope) {
+    fn relink_lock_sets(&self, record: &[u8], scope: RelinkScope) {
         let mut region: Vec<Set> = Vec::new();
         loop {
             let revision = {
@@ -1726,7 +1729,7 @@ impl PvDatabase {
             let adjacency = match scope {
                 RelinkScope::Membership => self.db_link_adjacency(),
                 RelinkScope::LinkEdit => {
-                    let members: Vec<String> = {
+                    let members: Vec<RecordName> = {
                         let registry = self.inner.record_locks.lock();
                         region
                             .iter()
@@ -1769,14 +1772,8 @@ impl PvDatabase {
     /// the link points, and `dbLockSetSplit` walks `bklnk` as well as the
     /// record's own links (`dbLock.c:735-770`) for the same reason. A record
     /// that is only ever pointed AT is as much a member as the one pointing.
-    fn db_link_adjacency(&self) -> HashMap<String, BTreeSet<String>> {
-        let names: Vec<String> = self
-            .inner
-            .records
-            .read()
-            .keys()
-            .map(|n| n.to_string())
-            .collect();
+    fn db_link_adjacency(&self) -> HashMap<RecordName, BTreeSet<RecordName>> {
+        let names: Vec<RecordName> = self.inner.records.read().keys().cloned().collect();
         self.db_link_adjacency_of(&names)
     }
 
@@ -1784,8 +1781,11 @@ impl PvDatabase {
     /// sets a [`RelinkScope::LinkEdit`] relink holds. A target outside
     /// `names` still appears as a neighbour, which is how the relink notices
     /// a set it does not hold.
-    fn db_link_adjacency_of(&self, names: &[String]) -> HashMap<String, BTreeSet<String>> {
-        let mut adjacency: HashMap<String, BTreeSet<String>> = HashMap::new();
+    fn db_link_adjacency_of(
+        &self,
+        names: &[RecordName],
+    ) -> HashMap<RecordName, BTreeSet<RecordName>> {
+        let mut adjacency: HashMap<RecordName, BTreeSet<RecordName>> = HashMap::new();
         for name in names {
             adjacency.entry(name.clone()).or_default();
         }
@@ -1813,7 +1813,7 @@ impl PvDatabase {
 #[must_use = "the lock-set graph is only re-derived when this is dropped;               binding it to `_` drops it immediately and relinks too early"]
 pub(crate) struct LockSetEdit<'a> {
     db: &'a PvDatabase,
-    record: String,
+    record: RecordName,
     scope: RelinkScope,
 }
 
@@ -2013,9 +2013,10 @@ impl PvDatabase {
     /// does — which is not optional once a set spans a whole link component,
     /// because processing a record and then its link target takes one mutex
     /// twice.
-    pub fn lock_record(&self, record: &str) -> RecordWriteGuard {
+    pub fn lock_record(&self, record: impl AsRef<[u8]>) -> RecordWriteGuard {
+        let record = record.as_ref();
         let resolved = self.resolve_alias(record);
-        let canonical: &str = resolved.as_deref().unwrap_or(record);
+        let canonical: &[u8] = resolved.as_deref().unwrap_or(record);
         let lr = self.ensure_set(canonical);
         RecordWriteGuard {
             _guard: lr.acquire(),
@@ -2082,14 +2083,14 @@ impl PvDatabase {
     pub fn lock_records<I, S>(&self, records: I) -> ManyRecordWriteGuard
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        S: AsRef<[u8]>,
     {
-        let names: Vec<String> = records
+        let names: Vec<RecordName> = records
             .into_iter()
             .map(|record| {
                 let record = record.as_ref();
                 self.resolve_alias(record)
-                    .unwrap_or_else(|| record.to_string())
+                    .unwrap_or_else(|| RecordName::from(record))
             })
             .collect();
         let cells: Vec<Arc<LockRecord>> = names.iter().map(|name| self.ensure_set(name)).collect();
@@ -2282,11 +2283,11 @@ mod tests {
     fn a_name_reaches_one_set_and_two_unlinked_records_reach_two() {
         let db = PvDatabase::new();
         assert!(
-            std::ptr::eq(db.ensure_set("REC:A").set(), db.ensure_set("REC:A").set()),
+            std::ptr::eq(db.ensure_set(b"REC:A").set(), db.ensure_set(b"REC:A").set()),
             "the same canonical name must map to the same lock set"
         );
         assert!(
-            !std::ptr::eq(db.ensure_set("REC:A").set(), db.ensure_set("REC:B").set()),
+            !std::ptr::eq(db.ensure_set(b"REC:A").set(), db.ensure_set(b"REC:B").set()),
             "records no link joins must not share a lock set"
         );
     }
@@ -2384,18 +2385,20 @@ mod tests {
         let db = PvDatabase::new();
         let cell = |name: &str| {
             let cell = Arc::new(RecordCell::new(
-                RecordInstance::new(name.into(), CalcRecord::default()),
+                RecordInstance::new(name, CalcRecord::default()),
                 0,
                 false,
             ));
-            db.inner.record_locks.adopt(name, cell.lock_record());
-            db.ensure_set_for(name, cell.lock_record());
+            db.inner
+                .record_locks
+                .adopt(name.as_bytes(), cell.lock_record());
+            db.ensure_set_for(name.as_bytes(), cell.lock_record());
             cell
         };
         let reader = cell("RI:A");
         let linked = cell("RI:B");
         let apart = cell("RI:C");
-        db.merge_sets("RI:A", "RI:B");
+        db.merge_sets(b"RI:A", b"RI:B");
 
         let gate = db.lock_instance(&reader);
         let mut held = reader.write_in(gate.set());
@@ -2429,11 +2432,13 @@ mod tests {
         use crate::server::record::{RecordCell, RecordInstance};
         use crate::server::records::calc::CalcRecord;
         let cell = Arc::new(RecordCell::new(
-            RecordInstance::new(name.into(), CalcRecord::default()),
+            RecordInstance::new(name, CalcRecord::default()),
             0,
             false,
         ));
-        db.inner.record_locks.adopt(name, cell.lock_record());
+        db.inner
+            .record_locks
+            .adopt(name.as_bytes(), cell.lock_record());
         cell
     }
 
@@ -2444,7 +2449,7 @@ mod tests {
         let db = PvDatabase::new();
         let cell = adopted_cell(&db, "AD:PRE");
         assert!(cell.lock_record().is_bootstrap());
-        assert_eq!(db.inner.record_locks.set_id_of("AD:PRE"), None);
+        assert_eq!(db.inner.record_locks.set_id_of(b"AD:PRE"), None);
     }
 
     /// Boundary `built == true`: a record adopted after `iocInit` has a real
@@ -2457,7 +2462,7 @@ mod tests {
         let cell = adopted_cell(&db, "AD:POST");
         assert!(!cell.lock_record().is_bootstrap());
         assert_eq!(
-            db.inner.record_locks.set_id_of("AD:POST"),
+            db.inner.record_locks.set_id_of(b"AD:POST"),
             Some(cell.lock_record().set().id)
         );
     }
@@ -2472,7 +2477,7 @@ mod tests {
         assert!(cell.lock_record().is_bootstrap());
         db.build_lock_sets();
         assert!(!cell.lock_record().is_bootstrap());
-        assert!(db.inner.record_locks.set_id_of("AD:STRAGGLER").is_some());
+        assert!(db.inner.record_locks.set_id_of(b"AD:STRAGGLER").is_some());
     }
 
     /// Boundary: a fresh set taken under a records-map read guard is the
@@ -2564,7 +2569,7 @@ mod tests {
     #[test]
     fn a_many_epoch_counts_its_reference_and_returns_it() {
         let db = PvDatabase::new();
-        let lr = db.ensure_set("RE:MANY");
+        let lr = db.ensure_set(b"RE:MANY");
         let set = lr.set();
         let _plain = db.lock_record("RE:MANY");
         assert_eq!(set.many_holds.load(Ordering::Relaxed), 0);
@@ -2580,8 +2585,8 @@ mod tests {
     #[test]
     fn a_merge_while_a_thread_waits_sends_it_to_the_new_set() {
         let db = PvDatabase::new();
-        let a = db.ensure_set("MG:A");
-        db.ensure_set("MG:B");
+        let a = db.ensure_set(b"MG:A");
+        db.ensure_set(b"MG:B");
         let held = db.lock_record("MG:A");
 
         let db2 = db.clone();
@@ -2591,18 +2596,18 @@ mod tests {
             (
                 g.holds(&a2),
                 a2.set().id,
-                db2.inner.record_locks.set_id_of("MG:A"),
+                db2.inner.record_locks.set_id_of(b"MG:A"),
             )
         });
         std::thread::sleep(SETTLE);
-        db.merge_sets("MG:A", "MG:B");
+        db.merge_sets(b"MG:A", b"MG:B");
         drop(held);
         let (holds, id, registry_id) = h.join().unwrap();
         assert!(holds, "the guard holds the set the record is behind");
         assert_eq!(Some(id), registry_id);
         assert_eq!(
-            db.inner.record_locks.set_id_of("MG:A"),
-            db.inner.record_locks.set_id_of("MG:B"),
+            db.inner.record_locks.set_id_of(b"MG:A"),
+            db.inner.record_locks.set_id_of(b"MG:B"),
             "the merge joined the two"
         );
         assert!(!a.set().is_locked(), "every hold has been given back");
@@ -2899,14 +2904,14 @@ mod tests {
         {
             let src = db.get_record("LF:SRC").expect("record");
             let mut inst = src.write();
-            inst.common.text.inp = "LF:DST".to_string();
+            inst.common.text.inp = "LF:DST".into();
             inst.set_link_cache("INP", parse_link_field("LF:DST", LinkFieldType::In));
         }
         db.build_lock_sets();
         let locks = &db.inner.record_locks;
-        let before = locks.set_id_of("LF:SRC").expect("a set");
-        assert_eq!(locks.set_id_of("LF:DST"), Some(before));
-        assert_ne!(locks.set_id_of("LF:NEXT"), Some(before));
+        let before = locks.set_id_of(b"LF:SRC").expect("a set");
+        assert_eq!(locks.set_id_of(b"LF:DST"), Some(before));
+        assert_ne!(locks.set_id_of(b"LF:NEXT"), Some(before));
 
         let src = db.get_record("LF:SRC").expect("record");
         let gate = FrameGate::Taken(db.lock_instance(&src));
@@ -2941,12 +2946,12 @@ mod tests {
         );
 
         assert_eq!(
-            locks.set_id_of("LF:SRC"),
+            locks.set_id_of(b"LF:SRC"),
             Some(before),
             "the frame's record stayed"
         );
-        assert_eq!(locks.set_id_of("LF:DST"), Some(before));
-        assert_ne!(locks.set_id_of("LF:NEXT"), Some(before));
+        assert_eq!(locks.set_id_of(b"LF:DST"), Some(before));
+        assert_ne!(locks.set_id_of(b"LF:NEXT"), Some(before));
         assert!(gate.set().holds(src.lock_record()));
         // The frame handle still borrows under the held set after the relink.
         frame.write().common.putf = false;
@@ -3025,7 +3030,7 @@ mod tests {
         let before = generation.load(Ordering::Acquire);
 
         let mut visited = crate::server::database::ProcStack::new();
-        db.execute_process_actions("WD:ARM", &rec, [ProcessAction::ArmWatchdog], &mut visited);
+        db.execute_process_actions(b"WD:ARM", &rec, [ProcessAction::ArmWatchdog], &mut visited);
 
         assert_eq!(
             generation.load(Ordering::Acquire),

@@ -226,10 +226,10 @@ struct InFlight {
 /// A single step in the string sequence.
 #[derive(Clone)]
 struct SseqStep {
-    dly: f64,    // Delay before executing this step
-    dol: String, // Input link (DOLn)
-    dov: f64,    // Numeric value (DOn)
-    lnk: String, // Output link (LNKn)
+    dly: f64,      // Delay before executing this step
+    dol: PvString, // Input link (DOLn)
+    dov: f64,      // Numeric value (DOn)
+    lnk: PvString, // Output link (LNKn)
     /// `lnk`'s link type, written with it by the `LNKn` put arm, its one writer.
     lnk_type: LinkType,
     str_val: PvString, // String value (STRn)
@@ -314,9 +314,9 @@ impl Default for SseqStep {
     fn default() -> Self {
         Self {
             dly: 0.0,
-            dol: String::new(),
+            dol: PvString::new(),
             dov: 0.0,
-            lnk: String::new(),
+            lnk: PvString::new(),
             lnk_type: LinkType::Empty,
             str_val: PvString::default(),
             wait: 0,
@@ -355,7 +355,7 @@ pub struct SseqRecord {
     pub val: i32,
     pub selm: i16, // 0=All, 1=Specified, 2=Mask
     pub seln: u16,
-    pub sell: String,
+    pub sell: PvString,
     pub prec: i16,
     pub abort: i16,
     pub busy: i16,
@@ -386,7 +386,7 @@ pub struct SseqRecord {
     /// `add_record` via [`Record::set_async_context`]. Drives out-of-band
     /// status posts (`BUSY`/`WTGn`/`ABORTING`) and the `ABORT` finish
     /// re-entry — the surfaces a `process()` cannot reach itself.
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     /// The callback band this record's `PRIO` selects, refreshed from
     /// [`crate::server::record::ProcessContext`] before every `process()` — C
     /// `sseqRecord.c:178` `callbackSetPriority(pR->prio, &pcb->callback)`,
@@ -421,7 +421,7 @@ impl Default for SseqRecord {
             val: 0,
             selm: 0,
             seln: 1,
-            sell: String::new(),
+            sell: PvString::new(),
             prec: 0,
             abort: 0,
             busy: 0,
@@ -1067,7 +1067,7 @@ impl SseqRecord {
         };
         let name = name.clone();
         let handle = handle.clone();
-        let groups: Vec<(String, String, i16)> = (0..NUM_STEPS)
+        let groups: Vec<(PvString, PvString, i16)> = (0..NUM_STEPS)
             .map(|i| {
                 let s = &self.steps[i];
                 (s.dol.clone(), s.lnk.clone(), s.wait)
@@ -1192,7 +1192,7 @@ impl SseqRecord {
 /// pending delay). Minting supersedes any prior pending token; callers
 /// invoke it only where that is intended (phase `Wait`, where nothing is
 /// pending, or right after `cancel_async_reentry`).
-async fn reenter_now(name: &str, handle: &AsyncDbHandle) {
+async fn reenter_now(name: &[u8], handle: &AsyncDbHandle) {
     if let Some(token) = handle.mint_async_token(name) {
         let (waitset, completion) = AsyncDbHandle::new_put_notify();
         waitset.leave();
@@ -1548,7 +1548,7 @@ impl Record for SseqRecord {
         self.callback_priority = ctx.callback_priority;
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` classifies every DOL/LNK link and posts the
         // initial status (sseqRecord.c:203-240). This is the framework's
@@ -1894,7 +1894,7 @@ impl Record for SseqRecord {
             },
             "SELL" => match value {
                 EpicsValue::String(s) => {
-                    self.sell = s.as_str_lossy().into_owned();
+                    self.sell = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SELL".into())),
@@ -1960,7 +1960,7 @@ impl Record for SseqRecord {
                         }
                         "DOL" => match value {
                             EpicsValue::String(s) => {
-                                step.dol = s.as_str_lossy().into_owned();
+                                step.dol = s;
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1980,7 +1980,7 @@ impl Record for SseqRecord {
                         }
                         "LNK" => match value {
                             EpicsValue::String(s) => {
-                                step.lnk = s.as_str_lossy().into_owned();
+                                step.lnk = s;
                                 step.lnk_type = parse_link_v2(&step.lnk).link_type();
                                 Ok(())
                             }

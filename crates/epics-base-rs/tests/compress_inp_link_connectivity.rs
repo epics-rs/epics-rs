@@ -73,7 +73,7 @@ async fn alarm(db: &PvDatabase, rec: &str) -> (AlarmSeverity, u16) {
 }
 
 async fn nuse(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NUSE")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.NUSE")).unwrap().to_f64().unwrap()
 }
 
 /// An unset INP is not a connected link: LINK/INVALID, nothing ingested.

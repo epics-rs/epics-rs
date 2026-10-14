@@ -74,7 +74,7 @@ pub struct SubRecord {
     /// `.db` load, not runtime-settable by clients.
     pub inam: PvString,
     /// Input links `INPA..INPU`.
-    pub inp: [String; INP_ARG_MAX],
+    pub inp: [PvString; INP_ARG_MAX],
     /// Input values `A..U`.
     pub a: [f64; INP_ARG_MAX],
     /// `LA..LU`: the `A..U` `monitor()` last posted.
@@ -106,7 +106,7 @@ impl Default for SubRecord {
             val: 0.0,
             snam: PvString::new(),
             inam: PvString::new(),
-            inp: std::array::from_fn(|_| String::new()),
+            inp: std::array::from_fn(|_| PvString::new()),
             a: [0.0; INP_ARG_MAX],
             la: [0.0; INP_ARG_MAX],
             input_changes: 0,
@@ -264,12 +264,12 @@ impl Record for SubRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp.get(slot).map(String::as_str)
+        self.inp.get(slot).map(PvString::as_bytes)
     }
 
     fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
@@ -384,7 +384,7 @@ impl Record for SubRecord {
         if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
             return match value {
                 EpicsValue::String(s) => {
-                    self.inp[idx] = s.as_str_lossy().into_owned();
+                    self.inp[idx] = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

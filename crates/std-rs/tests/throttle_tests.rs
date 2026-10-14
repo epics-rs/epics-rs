@@ -96,7 +96,7 @@ fn test_process_sends_value_no_delay() {
     rec.dly = 0.0; // No delay
     // C `throttleRecord.c::valuePut` (line 557) only writes — and only
     // sets STS=Success / advances SENT — for a non-CONSTANT OUT link.
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 42.0;
     process_ok(&mut rec);
     assert_eq!(rec.sent, 42.0);
@@ -108,7 +108,7 @@ fn test_process_sends_value_no_delay() {
 fn test_process_sends_value_with_delay() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 1.0; // 1 second delay
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 42.0;
     let actions = process_ok(&mut rec);
     assert_eq!(rec.sent, 42.0);
@@ -131,7 +131,7 @@ fn test_process_sends_value_with_delay() {
 fn test_process_queues_during_delay() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 10.0; // Long delay
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 42.0;
     process_ok(&mut rec); // First value sent, delay starts
     assert_eq!(rec.sent, 42.0);
@@ -177,7 +177,7 @@ fn test_process_updates_oval() {
 fn test_process_osent_tracking() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 0.0;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 10.0;
     process_ok(&mut rec);
     assert_eq!(rec.sent, 10.0);
@@ -202,7 +202,7 @@ fn test_limit_clipping_on() {
     rec.drvll = 0.0;
     rec.drvlc = 1; // Clipping ON
     rec.dly = 0.0; // No delay for immediate send
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.init_record(1).unwrap();
 
     rec.val = 150.0;
@@ -219,7 +219,7 @@ fn test_limit_clipping_low() {
     rec.drvll = 10.0;
     rec.drvlc = 1; // Clipping ON
     rec.dly = 0.0;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.init_record(1).unwrap();
 
     rec.val = 5.0;
@@ -260,7 +260,7 @@ fn test_no_limits_when_equal() {
     rec.drvlh = 0.0;
     rec.drvll = 0.0; // Equal → limits disabled
     rec.dly = 0.0;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.init_record(1).unwrap();
 
     rec.val = 999.0;
@@ -284,7 +284,7 @@ fn test_pending_value_clamped_to_drive_limit_on_drain() {
     rec.drvll = 0.0;
     rec.drvlc = 1; // Clipping ON
     rec.dly = 0.05; // short delay so the drain is observable in-test
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.init_record(1).unwrap();
 
     // First (in-range) value: sent immediately, delay window opens.
@@ -332,7 +332,7 @@ fn test_pending_value_rejected_on_drain_when_clipping_off() {
     rec.drvll = 0.0;
     rec.drvlc = 0; // Clipping OFF → reject out-of-range
     rec.dly = 0.05;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.init_record(1).unwrap();
 
     rec.val = 50.0;
@@ -461,7 +461,7 @@ fn test_limit_clipping_low_bound_order() {
     rec.drvll = 10.0;
     rec.drvlc = 1; // clipping On
     rec.dly = 0.0;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.init_record(1).unwrap();
 
     rec.val = -50.0; // below low limit
@@ -501,7 +501,7 @@ fn test_can_device_write() {
 fn test_should_fire_forward_link_only_when_out_written() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 0.0;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 42.0;
     rec.process().unwrap();
     assert!(
@@ -514,7 +514,7 @@ fn test_should_fire_forward_link_only_when_out_written() {
 fn test_no_forward_link_on_queuing_cycle() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 10.0; // long delay
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 42.0;
     rec.process().unwrap(); // first value sent — wrote OUT
     assert!(
@@ -539,7 +539,7 @@ fn test_no_forward_link_on_rejected_cycle() {
     rec.drvll = 0.0;
     rec.drvlc = 0; // clipping OFF -> reject out-of-range
     rec.dly = 0.0;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.init_record(1).unwrap();
 
     rec.oval = 50.0;
@@ -555,7 +555,7 @@ fn test_no_forward_link_on_rejected_cycle() {
 fn test_no_forward_link_on_drain_with_nothing_queued() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 0.05;
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 10.0;
     rec.process().unwrap(); // send + arm delay timer
     assert!(rec.should_fire_forward_link());
@@ -580,7 +580,7 @@ fn test_no_forward_link_on_drain_with_nothing_queued() {
 fn test_constant_out_link_reports_error_and_no_write() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 0.0;
-    rec.out = "5.0".to_string(); // CONSTANT OUT link
+    rec.out = "5.0".into(); // CONSTANT OUT link
     rec.val = 42.0;
     let outcome = rec.process().unwrap();
 
@@ -625,7 +625,7 @@ fn test_empty_out_link_reports_error_and_no_write() {
 fn test_real_out_link_reports_success_and_writes() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 0.0;
-    rec.out = "OUTPUT:PV".to_string(); // real DB link
+    rec.out = "OUTPUT:PV".into(); // real DB link
     rec.val = 42.0;
     let actions = process_ok(&mut rec);
 
@@ -684,7 +684,7 @@ fn test_dly_infinity_does_not_panic_process() {
     // DLY stays finite, so process() with the rejected-then-unchanged
     // DLY=0.0 runs cleanly.
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     let _ = rec.put_field("DLY", EpicsValue::Double(f64::INFINITY));
     rec.val = 1.0;
     // Must not panic.
@@ -715,7 +715,7 @@ fn test_dly_huge_finite_does_not_panic_process() {
     // prior value (0.0), and a full process() cycle that reaches the
     // send path completes without panicking.
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     assert!(
         rec.put_field("DLY", EpicsValue::Double(1e300)).is_err(),
         "DLY = 1e300 must be rejected"
@@ -741,7 +741,7 @@ fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
     // exercise a process() cycle after a special() clamp to prove the
     // armed-delay path is safe.
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.dly = 1e300;
     rec.special("DLY", true).unwrap();
     assert!(
@@ -778,7 +778,7 @@ fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
 /// whose DLY cooldown is therefore armed.
 fn armed(dly: f64) -> ThrottleRecord {
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.dly = dly;
     rec.val = 5.0;
     process_ok(&mut rec);
@@ -942,7 +942,7 @@ fn dly_put_reanchors_the_running_cooldown() {
 #[test]
 fn dly_put_with_no_cooldown_running_arms_nothing() {
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     let actions = put_dly(&mut rec, 2.0);
     assert!(
         actions.is_empty(),
@@ -983,7 +983,7 @@ fn process_ok(rec: &mut ThrottleRecord) -> Vec<ProcessAction> {
 #[test]
 fn process_commits_no_sts_or_sent_before_the_out_put_runs() {
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
     rec.val = 5.0;
     let outcome = rec.process().unwrap();
 
@@ -998,7 +998,7 @@ fn process_commits_no_sts_or_sent_before_the_out_put_runs() {
 #[test]
 fn successful_out_put_sets_sts_success_and_advances_sent() {
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
 
     rec.val = 5.0;
     let first = rec.process().unwrap();
@@ -1017,7 +1017,7 @@ fn successful_out_put_sets_sts_success_and_advances_sent() {
 #[test]
 fn failed_out_put_sets_sts_error_and_leaves_sent() {
     let mut rec = ThrottleRecord::default();
-    rec.out = "NO:SUCH:REMOTE:PV".to_string();
+    rec.out = "NO:SUCH:REMOTE:PV".into();
     rec.val = 5.0;
     let outcome = rec.process().unwrap();
     report_put(&mut rec, &outcome.actions, true);
@@ -1032,7 +1032,7 @@ fn failed_out_put_sets_sts_error_and_leaves_sent() {
 #[test]
 fn failed_out_put_still_fires_the_forward_link() {
     let mut rec = ThrottleRecord::default();
-    rec.out = "NO:SUCH:REMOTE:PV".to_string();
+    rec.out = "NO:SUCH:REMOTE:PV".into();
     rec.val = 5.0;
     let outcome = rec.process().unwrap();
     report_put(&mut rec, &outcome.actions, true);
@@ -1043,7 +1043,7 @@ fn failed_out_put_still_fires_the_forward_link() {
 #[test]
 fn a_failed_put_after_a_successful_one_reports_error() {
     let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".to_string();
+    rec.out = "OUTPUT:PV".into();
 
     rec.val = 5.0;
     let ok = rec.process().unwrap();
@@ -1071,7 +1071,7 @@ fn dly_serves_dprec_and_every_other_double_field_serves_prec() {
     let mut rec = ThrottleRecord::default();
     rec.put_field("PREC", EpicsValue::Short(3)).unwrap();
     rec.put_field("DPREC", EpicsValue::Short(1)).unwrap();
-    let inst = RecordInstance::new("THR:PREC".into(), rec);
+    let inst = RecordInstance::new("THR:PREC", rec);
 
     assert_eq!(
         inst.snapshot_for_field("DLY").unwrap().precision(),

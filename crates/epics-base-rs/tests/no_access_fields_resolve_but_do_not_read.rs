@@ -218,7 +218,7 @@ async fn the_refused_set_is_exactly_the_declared_set_across_every_record_type() 
         for field in order {
             let key = format!("{rt}.{field}");
             if matches!(
-                db.get_pv(&format!("{name}.{field}")),
+                db.get_pv(format!("{name}.{field}")),
                 Err(CaError::BadDbrType(_))
             ) {
                 refused.insert(key.clone());

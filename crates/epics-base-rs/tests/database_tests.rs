@@ -371,19 +371,19 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
     struct AlarmingLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for AlarmingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             Some(EpicsValue::Double(12.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn alarm_severity(&self, _: &str) -> Option<i32> {
+        fn alarm_severity(&self, _: &[u8]) -> Option<i32> {
             Some(2) // MAJOR — as if the link's MS mode let it through
         }
-        fn alarm_message(&self, _: &str) -> Option<String> {
+        fn alarm_message(&self, _: &[u8]) -> Option<String> {
             Some("remote major".into())
         }
     }
@@ -437,13 +437,13 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
     struct QuietLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for QuietLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             Some(EpicsValue::Double(5.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
         // alarm_severity defaults to None.
@@ -497,25 +497,25 @@ struct CapturingLset {
 }
 #[epics_base_rs::async_trait]
 impl epics_base_rs::server::database::LinkSet for CapturingLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
     async fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: EpicsValue,
         op: epics_base_rs::server::database::LinkPutOp,
     ) -> Result<(), String> {
         self.writes
             .lock()
             .unwrap()
-            .push((name.to_string(), value, op));
+            .push((String::from_utf8_lossy(name).into_owned(), value, op));
         Ok(())
     }
 }
@@ -1434,7 +1434,7 @@ async fn test_ao_omsl_dol() {
 
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1;
-    ao.dol = "SOURCE".to_string();
+    ao.dol = "SOURCE".into();
     db.add_record("OUTPUT", Box::new(ao)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -1459,7 +1459,7 @@ async fn test_ao_oif_incremental() {
     let mut ao = AoRecord::new(100.0);
     ao.omsl = 1;
     ao.oif = 1;
-    ao.dol = "DELTA".to_string();
+    ao.dol = "DELTA".into();
     // C `aoRecord.c::init_record` ends with `prec->pval = prec->val`, so a
     // fresh record's first Incremental cycle bases off its initial VAL.
     // Without this the bypassed-init record has PVAL=0 and the increment
@@ -1695,8 +1695,8 @@ async fn test_sim_mode_input() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SIM_SW".to_string();
-    ai.siol = "SIM_VAL".to_string();
+    ai.siml = "SIM_SW".into();
+    ai.siol = "SIM_VAL".into();
     ai.sims = 1;
     db.add_record("SIM_AI", Box::new(ai)).await.unwrap();
 
@@ -1735,8 +1735,8 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SIM_SW2".to_string();
-    ai.siol = "SIM_VAL2".to_string();
+    ai.siml = "SIM_SW2".into();
+    ai.siol = "SIM_VAL2".into();
     ai.sims = 1; // SIMM severity = MINOR
     db.add_record("SIM_AI2", Box::new(ai)).await.unwrap();
     if let Some(rec) = db.get_record("SIM_AI2") {
@@ -1785,8 +1785,8 @@ async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SIM_SW3".to_string();
-    ai.siol = "SIM_VAL3".to_string();
+    ai.siml = "SIM_SW3".into();
+    ai.siol = "SIM_VAL3".into();
     ai.sims = 1; // SIMM severity = MINOR
     db.add_record("SIM_AI3", Box::new(ai)).await.unwrap();
 
@@ -1861,8 +1861,8 @@ async fn test_sim_alarm_transition_posts_per_field_masks() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SIM_SW4".to_string();
-    ai.siol = "SIM_VAL4".to_string();
+    ai.siml = "SIM_SW4".into();
+    ai.siol = "SIM_VAL4".into();
     ai.sims = 1; // SIMM severity = MINOR
     db.add_record("SIM_AI4", Box::new(ai)).await.unwrap();
 
@@ -1921,8 +1921,8 @@ async fn test_sim_val_respects_mdel_deadband() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SIM_SW5".to_string();
-    ai.siol = "SIM_VAL5".to_string();
+    ai.siml = "SIM_SW5".into();
+    ai.siol = "SIM_VAL5".into();
     ai.mdel = 0.5;
     db.add_record("SIM_AI5", Box::new(ai)).await.unwrap();
 
@@ -1980,8 +1980,8 @@ async fn test_sim_mode_toggle() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SIM_SW".to_string();
-    ai.siol = "SIM_VAL".to_string();
+    ai.siml = "SIM_SW".into();
+    ai.siol = "SIM_VAL".into();
     db.add_record("TEST_AI", Box::new(ai)).await.unwrap();
 
     if let Some(rec) = db.get_record("TEST_AI") {
@@ -2023,8 +2023,8 @@ async fn test_sim_mode_output() {
         .unwrap();
 
     let mut ao = AoRecord::new(77.0);
-    ao.siml = "SIM_SW".to_string();
-    ao.siol = "SIM_OUT".to_string();
+    ao.siml = "SIM_SW".into();
+    ao.siol = "SIM_OUT".into();
     db.add_record("TEST_AO", Box::new(ao)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -2053,15 +2053,15 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
     struct ValueCaLset(f64);
     #[epics_base_rs::async_trait]
     impl LinkSet for ValueCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
             // The bare non-local SIOL record name reaches the CA lset
             // via the read-locality fallback `resolve_external_pv`.
-            (name == "REMOTE:SIM").then_some(EpicsValue::Double(self.0))
+            (name == b"REMOTE:SIM").then_some(EpicsValue::Double(self.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
     }
@@ -2074,9 +2074,9 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SIM_SW".to_string();
+    ai.siml = "SIM_SW".into();
     // REMOTE:SIM is never added locally → dbInitLink makes it a CA link.
-    ai.siol = "REMOTE:SIM".to_string();
+    ai.siol = "REMOTE:SIM".into();
     ai.sims = 1;
     db.add_record("SIM_AI_NL", Box::new(ai)).await.unwrap();
 
@@ -2118,9 +2118,9 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
         .unwrap();
 
     let mut ao = AoRecord::new(55.0);
-    ao.siml = "SIM_SW".to_string();
+    ao.siml = "SIM_SW".into();
     // REMOTE:OUT is never added locally → dbInitLink makes it a CA link.
-    ao.siol = "REMOTE:OUT".to_string();
+    ao.siol = "REMOTE:OUT".into();
     db.add_record("TEST_AO_NL", Box::new(ao)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -2499,7 +2499,7 @@ async fn test_ca_put_scan_index_update() {
         .await
         .unwrap();
     let names = db.records_for_scan(ScanType::SEC1).await;
-    assert!(names.contains(&"REC".to_string()));
+    assert!(names.iter().any(|n| n == "REC"));
 }
 
 // --- Mock DeviceSupport for write/read counting ---
@@ -2657,7 +2657,7 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
     if let Some(rec) = db.get_record("BI_RAW") {
         let mut inst = rec.write();
         inst.common.dtyp = "Raw Soft Channel".into();
-        inst.common.text.inp = "SRC_LI".to_string();
+        inst.common.text.inp = "SRC_LI".into();
         let inp = epics_base_rs::server::record::parse_link_v2(&inst.common.text.inp);
         inst.install_link_cache("INP", std::sync::Arc::new(inp))
             .expect("a common link");
@@ -5603,8 +5603,8 @@ async fn test_fanout_all() {
     let db = PvDatabase::new();
     let mut fanout = FanoutRecord::new();
     fanout.selm = 0;
-    fanout.lnk1 = "TARGET_1".to_string();
-    fanout.lnk2 = "TARGET_2".to_string();
+    fanout.lnk1 = "TARGET_1".into();
+    fanout.lnk2 = "TARGET_2".into();
     db.add_record("FANOUT", Box::new(fanout)).await.unwrap();
     for name in ["TARGET_1", "TARGET_2"] {
         let mut tgt = CalcRecord::new("VAL+1");
@@ -5659,8 +5659,8 @@ async fn test_dfanout_value_write() {
     let db = PvDatabase::new();
     let mut dfan = DfanoutRecord::new(42.0);
     dfan.selm = 0;
-    dfan.outa = "DEST_A".to_string();
-    dfan.outb = "DEST_B".to_string();
+    dfan.outa = "DEST_A".into();
+    dfan.outb = "DEST_B".into();
     db.add_record("DFAN", Box::new(dfan)).await.unwrap();
     db.add_record("DEST_A", Box::new(AoRecord::new(0.0)))
         .await
@@ -5705,9 +5705,9 @@ async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
     // distributes VAL to OUTA + OUTB.
     let mut dfan = DfanoutRecord::new(0.0);
     dfan.selm = 0;
-    dfan.outa = "DFAN_DEST_A".to_string();
-    dfan.outb = "DFAN_DEST_B".to_string();
-    dfan.dol = "DOL_SRC".to_string();
+    dfan.outa = "DFAN_DEST_A".into();
+    dfan.outb = "DFAN_DEST_B".into();
+    dfan.dol = "DOL_SRC".into();
     dfan.omsl = 1; // closed_loop (menuOmslclosed_loop)
     db.add_record("DFAN_OMSL", Box::new(dfan)).await.unwrap();
 
@@ -5751,8 +5751,8 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
 
     let mut dfan = DfanoutRecord::new(3.0);
     dfan.selm = 0;
-    dfan.outa = "DFAN_DEST_A2".to_string();
-    dfan.dol = "DOL_SRC2".to_string();
+    dfan.outa = "DFAN_DEST_A2".into();
+    dfan.dol = "DOL_SRC2".into();
     dfan.omsl = 0; // supervisory (menuOmslsupervisory)
     db.add_record("DFAN_SUP", Box::new(dfan)).await.unwrap();
     db.add_record("DFAN_DEST_A2", Box::new(AoRecord::new(0.0)))
@@ -5809,7 +5809,7 @@ async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     // is rejected — C `dbPutLink` status != 0.
     let mut dfan = DfanoutRecord::new(5.0);
     dfan.selm = 0; // All
-    dfan.outa = "DFAN_NO_SUCH_DEST".to_string();
+    dfan.outa = "DFAN_NO_SUCH_DEST".into();
     db.add_record("DFAN_LINKFAIL", Box::new(dfan))
         .await
         .unwrap();
@@ -5858,7 +5858,7 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
 
     let mut dfan = DfanoutRecord::new(5.0);
     dfan.selm = 0; // All
-    dfan.outa = "DFAN_OK_DEST".to_string();
+    dfan.outa = "DFAN_OK_DEST".into();
     db.add_record("DFAN_OK", Box::new(dfan)).await.unwrap();
     // See `test_dfanout_out_link_write_failure_raises_link_alarm`: the
     // seeded VAL stands for `field(VAL,"5")`, which C loads with UDF=0.
@@ -5916,10 +5916,10 @@ async fn test_seq_dol_lnk_dispatch() {
         .unwrap();
     let mut seq = SeqRecord::new();
     seq.selm = 0;
-    seq.dol1 = "SEQ_SRC1".to_string();
-    seq.lnk1 = "SEQ_DEST1".to_string();
-    seq.dol2 = "SEQ_SRC2".to_string();
-    seq.lnk2 = "SEQ_DEST2".to_string();
+    seq.dol1 = "SEQ_SRC1".into();
+    seq.lnk1 = "SEQ_DEST1".into();
+    seq.dol2 = "SEQ_SRC2".into();
+    seq.lnk2 = "SEQ_DEST2".into();
     db.add_record("SEQ_REC", Box::new(seq)).await.unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEQ_REC", &mut visited)
@@ -5955,8 +5955,8 @@ async fn test_seq_writes_dol_readback_into_don() {
         .unwrap();
     let mut seq = SeqRecord::new();
     seq.selm = 0; // All
-    seq.dol0 = "SEQ9_SRC".to_string();
-    seq.lnk0 = "SEQ9_DEST".to_string();
+    seq.dol0 = "SEQ9_SRC".into();
+    seq.lnk0 = "SEQ9_DEST".into();
     db.add_record("SEQ9_REC", Box::new(seq)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -5995,7 +5995,7 @@ async fn test_seq_dol_only_group_updates_don_with_empty_lnk() {
         .unwrap();
     let mut seq = SeqRecord::new();
     seq.selm = 0; // All
-    seq.dol0 = "SEQ9B_SRC".to_string();
+    seq.dol0 = "SEQ9B_SRC".into();
     // lnk0 stays empty — DOL-only group
     db.add_record("SEQ9B_REC", Box::new(seq)).await.unwrap();
 
@@ -6087,10 +6087,10 @@ async fn test_seq_bare_lnk_does_not_process_passive_target() {
     seq.selm = 0;
     // Group 1: bare LNK — must NOT process the Passive target.
     seq.do1 = 11.0;
-    seq.lnk1 = "SEQ_BARE_TGT".to_string();
+    seq.lnk1 = "SEQ_BARE_TGT".into();
     // Group 2: explicit PP LNK — must process the Passive target.
     seq.do2 = 22.0;
-    seq.lnk2 = "SEQ_PP_TGT PP".to_string();
+    seq.lnk2 = "SEQ_PP_TGT PP".into();
     db.add_record("SEQ_NPP_REC", Box::new(seq)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -6359,11 +6359,11 @@ async fn test_sel_nvl_link() {
         .unwrap();
     let mut sel = SelRecord::default();
     sel.selm = 0;
-    sel.nvl = "NVL_SRC".to_string();
+    sel.nvl = "NVL_SRC".into();
     // Constant links: init_record resets A..L to NaN (selRecord.c:102-105).
-    sel.inpa = "10".to_string();
-    sel.inpb = "20".to_string();
-    sel.inpc = "30".to_string();
+    sel.inpa = "10".into();
+    sel.inpb = "20".into();
+    sel.inpc = "30".into();
     db.add_record("SEL_REC", Box::new(sel)).await.unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEL_REC", &mut visited)
@@ -6393,7 +6393,7 @@ async fn test_sel_nvl_link_high_index_unsigned() {
         .unwrap();
     let mut sel = SelRecord::default();
     sel.selm = 0;
-    sel.nvl = "NVL_SRC_HI".to_string();
+    sel.nvl = "NVL_SRC_HI".into();
     db.add_record("SEL_REC_HI", Box::new(sel)).await.unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEL_REC_HI", &mut visited)
@@ -6414,7 +6414,7 @@ async fn test_dol_cp_link_registration() {
         .unwrap();
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1;
-    ao.dol = "MTR CP".to_string();
+    ao.dol = "MTR CP".into();
     db.add_record("MOTOR_POS", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6432,7 +6432,7 @@ async fn test_dol_cp_link_triggers_processing() {
         .unwrap();
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1;
-    ao.dol = "SRC CP".to_string();
+    ao.dol = "SRC CP".into();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6518,7 +6518,7 @@ async fn test_cpp_link_registration_is_passive_only() {
         .unwrap();
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1;
-    ao.dol = "SRC CPP".to_string();
+    ao.dol = "SRC CPP".into();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6543,7 +6543,7 @@ async fn test_cpp_link_skips_nonpassive_target() {
         .unwrap();
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1;
-    ao.dol = "SRC CPP".to_string();
+    ao.dol = "SRC CPP".into();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     if let Some(rec_arc) = db.get_record("DST") {
         rec_arc.write().common.scan = ScanType::SEC1;
@@ -6574,7 +6574,7 @@ async fn test_cpp_link_processes_passive_target() {
         .unwrap();
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1;
-    ao.dol = "SRC CPP".to_string();
+    ao.dol = "SRC CPP".into();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     // DST keeps the default Passive SCAN.
     db.setup_cp_links().await;
@@ -6608,7 +6608,7 @@ async fn test_cp_link_processes_nonpassive_target() {
         .unwrap();
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1;
-    ao.dol = "SRC CP".to_string();
+    ao.dol = "SRC CP".into();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     if let Some(rec_arc) = db.get_record("DST") {
         rec_arc.write().common.scan = ScanType::SEC1;
@@ -6656,10 +6656,13 @@ record(calc, "DST") { field(INPA, "SRC CP") field(INPB, "SRC CPP") }
     let targets = db.get_cp_targets("SRC");
     let mut gates: Vec<_> = targets
         .iter()
-        .map(|t| (t.record.as_str(), t.passive_only))
+        .map(|t| (t.record.to_string(), t.passive_only))
         .collect();
     gates.sort();
-    assert_eq!(gates, [("DST", false), ("DST", true)]);
+    assert_eq!(
+        gates,
+        [("DST".to_string(), false), ("DST".to_string(), true)]
+    );
 }
 
 #[epics_macros_rs::epics_test]
@@ -6670,7 +6673,7 @@ async fn test_seq_dol_cp_link_registration() {
         .await
         .unwrap();
     let mut seq = SeqRecord::default();
-    seq.dol1 = "SENSOR CP".to_string();
+    seq.dol1 = "SENSOR CP".into();
     db.add_record("MY_SEQ", Box::new(seq)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6688,7 +6691,7 @@ async fn test_sel_nvl_cp_link_registration() {
         .await
         .unwrap();
     let mut sel = SelRecord::default();
-    sel.nvl = "INDEX_SRC CP".to_string();
+    sel.nvl = "INDEX_SRC CP".into();
     db.add_record("MY_SEL", Box::new(sel)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6708,7 +6711,7 @@ async fn test_sdis_cp_link_registration() {
         .await
         .unwrap();
     if let Some(rec_arc) = db.get_record("GUARDED") {
-        rec_arc.write().common.text.sdis = "DISABLE_SRC CP".to_string();
+        rec_arc.write().common.text.sdis = "DISABLE_SRC CP".into();
     }
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6841,7 +6844,7 @@ async fn test_tsel_cp_link_registration() {
         .unwrap();
     if let Some(rec_arc) = db.get_record("TARGET") {
         let mut inst = rec_arc.write();
-        inst.common.text.tsel = "TSE_SRC CP".to_string();
+        inst.common.text.tsel = "TSE_SRC CP".into();
         let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
@@ -6886,7 +6889,7 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
     {
         let rec = db.get_record("TS_DST").unwrap();
         let mut inst = rec.write();
-        inst.common.text.tsel = "TSE_SRC.TIME".to_string();
+        inst.common.text.tsel = "TSE_SRC.TIME".into();
         let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
@@ -6928,20 +6931,20 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
             // Only the source record name (with `.TIME` stripped) should
             // reach the lset, mirroring C `TSEL_modified` truncating the
             // pvname at `.TIME`.
-            assert_eq!(name, "TSE_SRC", "TSEL .TIME must strip the .TIME suffix");
+            assert_eq!(name, b"TSE_SRC", "TSEL .TIME must strip the .TIME suffix");
             Some((self.secs, self.nsec, 0))
         }
     }
@@ -6961,7 +6964,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     {
         let rec = db.get_record("TS_CADST").unwrap();
         let mut inst = rec.write();
-        inst.common.text.tsel = "ca://TSE_SRC.TIME".to_string();
+        inst.common.text.tsel = "ca://TSE_SRC.TIME".into();
         let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
@@ -7002,21 +7005,21 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
             // The bare Db record name (`.TIME` already split into the link
             // field by the parser) reaches the CA lset via the non-local
             // fallback `external_link_time("ca://TSE_SRC")`.
             assert_eq!(
-                name, "TSE_SRC",
+                name, b"TSE_SRC",
                 "non-local TSEL .TIME must address the bare record"
             );
             Some((self.secs, self.nsec, 0))
@@ -7039,7 +7042,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     {
         let rec = db.get_record("TS_NLDST").unwrap();
         let mut inst = rec.write();
-        inst.common.text.tsel = "TSE_SRC.TIME".to_string();
+        inst.common.text.tsel = "TSE_SRC.TIME".into();
         let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
@@ -8544,17 +8547,17 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for CalcCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-            (name == "REMOTE:A").then_some(EpicsValue::Double(10.0))
+        fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+            (name == b"REMOTE:A").then_some(EpicsValue::Double(10.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
-            (name == "REMOTE:A").then_some((self.secs, self.nsec, 0))
+        fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
+            (name == b"REMOTE:A").then_some((self.secs, self.nsec, 0))
         }
     }
 
@@ -8889,7 +8892,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
         let mut seq = SeqRecord::new();
         seq.selm = 0; // All
         seq.seln = 3; // distinct from the SELL source value (5)
-        seq.sell = "SEQALL:SRC".to_string();
+        seq.sell = "SEQALL:SRC".into();
         db.add_record("SEQALL:REC", Box::new(seq)).await.unwrap();
 
         let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -8917,7 +8920,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
         let mut seq = SeqRecord::new();
         seq.selm = 1; // Specified
         seq.seln = 0; // stale init value
-        seq.sell = "SEQSPEC:SRC".to_string();
+        seq.sell = "SEQSPEC:SRC".into();
         db.add_record("SEQSPEC:REC", Box::new(seq)).await.unwrap();
 
         let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -8983,7 +8986,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
     // the STORED acks, even after sevr has dropped below it.
     {
         let rec = AoRecord::new(0.0);
-        let mut inst = RecordInstance::new("ACKTEST1".into(), rec);
+        let mut inst = RecordInstance::new("ACKTEST1", rec);
         // Latched sticky alarm: acks=MAJOR(2); current sevr has since
         // dropped to MINOR(1).
         inst.common.acks = AlarmSeverity::Major;
@@ -9002,7 +9005,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         // `sevr`. Were it compared against sevr (Minor), a MINOR write
         // would wrongly clear.
         let rec2 = AoRecord::new(0.0);
-        let mut inst2 = RecordInstance::new("ACKTEST2".into(), rec2);
+        let mut inst2 = RecordInstance::new("ACKTEST2", rec2);
         inst2.common.acks = AlarmSeverity::Major;
         inst2.common.sevr = AlarmSeverity::Minor;
         inst2.put_acks(1);
@@ -9017,7 +9020,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
     // putAckt: ACKT set false with acks > sevr must lower acks to sevr.
     {
         let rec = AoRecord::new(0.0);
-        let mut inst = RecordInstance::new("ACKTEST3".into(), rec);
+        let mut inst = RecordInstance::new("ACKTEST3", rec);
         inst.common.ackt = true;
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
@@ -9209,7 +9212,8 @@ async fn scan_move_is_committed_when_put_pv_returns() {
     assert!(
         db.records_for_scan(ScanType::SEC1)
             .await
-            .contains(&"SIW_SCAN".to_string()),
+            .iter()
+            .any(|n| n == "SIW_SCAN"),
         "the record must be in the 1-second list the moment put_pv returns"
     );
 
@@ -9219,13 +9223,15 @@ async fn scan_move_is_committed_when_put_pv_returns() {
     assert!(
         !db.records_for_scan(ScanType::SEC1)
             .await
-            .contains(&"SIW_SCAN".to_string()),
+            .iter()
+            .any(|n| n == "SIW_SCAN"),
         "the old bucket must be swept in the same window, not later"
     );
     assert!(
         db.records_for_scan(ScanType::SEC2)
             .await
-            .contains(&"SIW_SCAN".to_string()),
+            .iter()
+            .any(|n| n == "SIW_SCAN"),
         "the record must be in the 2-second list the moment put_pv returns"
     );
 }
@@ -9314,7 +9320,8 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
     assert!(
         db.records_for_scan(ScanType::SEC1)
             .await
-            .contains(&"SIW_EPOCH".to_string()),
+            .iter()
+            .any(|n| n == "SIW_EPOCH"),
         "the move must be complete as soon as the put returns"
     );
 }
@@ -9344,21 +9351,21 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for RawCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             Some(EpicsValue::Double(7.0))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn alarm_severity(&self, _: &str) -> Option<i32> {
+        fn alarm_severity(&self, _: &[u8]) -> Option<i32> {
             // Mirror the real CA resolver: only a non-zero severity is a
             // contribution worth returning.
             if self.sevr > 0 { Some(self.sevr) } else { None }
         }
-        fn alarm_status(&self, _: &str) -> Option<i32> {
+        fn alarm_status(&self, _: &[u8]) -> Option<i32> {
             Some(self.stat)
         }
     }
@@ -10258,7 +10265,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
     let mut dest = AoRecord::new(0.0);
     dest.omsl = 1; // closed_loop
     dest.oif = 1; // Incremental
-    dest.dol = "AO_INCR_SRC".to_string();
+    dest.dol = "AO_INCR_SRC".into();
     dest.init_record(0).unwrap(); // C init: PVAL = VAL (= 0 here)
     db.add_record("AO_INCR_DST", Box::new(dest)).await.unwrap();
 
@@ -10316,7 +10323,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
     let db = PvDatabase::new();
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1; // closed_loop
-    ao.dol = "7".to_string(); // constant DOL
+    ao.dol = "7".into(); // constant DOL
     ao.init_record(0).unwrap(); // recGblInitConstantLink: VAL = 7
     db.add_record("AO_CONST", Box::new(ao)).await.unwrap();
 
@@ -10369,7 +10376,7 @@ async fn ao_constant_dol_incremental_does_not_increment() {
     let mut ao = AoRecord::new(0.0);
     ao.omsl = 1; // closed_loop
     ao.oif = 1; // Incremental
-    ao.dol = "5".to_string(); // constant DOL
+    ao.dol = "5".into(); // constant DOL
     ao.init_record(0).unwrap(); // VAL = 5, PVAL = 5
     db.add_record("AO_CONST_INCR", Box::new(ao)).await.unwrap();
 
@@ -10399,7 +10406,7 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     let db = PvDatabase::new();
     let mut lo = LongoutRecord::new(0);
     lo.omsl = 1; // closed_loop
-    lo.dol = "9".to_string(); // constant DOL
+    lo.dol = "9".into(); // constant DOL
     lo.init_record(0).unwrap();
     db.add_record("LO_CONST", Box::new(lo)).await.unwrap();
 
@@ -10442,7 +10449,7 @@ async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     let db = PvDatabase::new();
     let mut so = StringoutRecord::new("");
     so.omsl = 1; // closed_loop
-    so.dol = "1.50".to_string(); // CONSTANT — softIoc seeds VAL="1.50", UDF=0
+    so.dol = "1.50".into(); // CONSTANT — softIoc seeds VAL="1.50", UDF=0
     so.init_record(0).unwrap();
     db.add_record("SO_CONST", Box::new(so)).await.unwrap();
 
@@ -10488,8 +10495,8 @@ async fn init_applies_constant_dol_across_record_types() {
     let db = PvDatabase::new();
     let mut df = DfanoutRecord::default();
     df.omsl = 1;
-    df.dol = "3.5".to_string();
-    df.sell = "2".to_string();
+    df.dol = "3.5".into();
+    df.sell = "2".into();
     db.add_record("DF_CONST", Box::new(df)).await.unwrap();
     {
         let rec = db.get_record("DF_CONST").unwrap();
@@ -10509,7 +10516,7 @@ async fn init_applies_constant_dol_across_record_types() {
     // int64out: DBF_INT64. Seeded by the init-seed owner, like dfanout.
     let mut i64o = Int64outRecord::default();
     i64o.omsl = 1;
-    i64o.dol = "42".to_string();
+    i64o.dol = "42".into();
     db.add_record("I64_CONST", Box::new(i64o)).await.unwrap();
     {
         let rec = db.get_record("I64_CONST").unwrap();
@@ -10528,7 +10535,7 @@ async fn init_applies_constant_dol_across_record_types() {
     // tests/long_string_constant_link_load.rs.
     let mut lso = LsoRecord::default();
     lso.omsl = 1;
-    lso.dol = r#"{const:"hello"}"#.to_string();
+    lso.dol = r#"{const:"hello"}"#.into();
     db.add_record("LSO_CONST", Box::new(lso)).await.unwrap();
     {
         let rec = db.get_record("LSO_CONST").unwrap();
@@ -10550,7 +10557,7 @@ async fn init_applies_constant_dol_across_record_types() {
     // to RVAL (no state table defined → RVAL == state index).
     let mut mb = MbboRecord::default();
     mb.omsl = 1;
-    mb.dol = "2".to_string();
+    mb.dol = "2".into();
     db.add_record("MBBO_CONST", Box::new(mb)).await.unwrap();
     {
         let rec = db.get_record("MBBO_CONST").unwrap();
@@ -10576,7 +10583,7 @@ async fn init_applies_constant_dol_across_record_types() {
     // owner, not to `post_init_finalize_undef`, which runs before it.
     let mut mbd = MbboDirectRecord::default();
     mbd.omsl = 1;
-    mbd.dol = "5".to_string();
+    mbd.dol = "5".into();
     db.add_record("MBD_CONST", Box::new(mbd)).await.unwrap();
     {
         let rec = db.get_record("MBD_CONST").unwrap();
@@ -10685,8 +10692,8 @@ async fn sel_specified_mode_fetches_only_the_selected_input() {
     let mut sel = SelRecord::default();
     sel.selm = 0;
     sel.seln = 1;
-    sel.inpa = "R7_SRCA PP".to_string();
-    sel.inpb = "R7_SRCB PP".to_string();
+    sel.inpa = "R7_SRCA PP".into();
+    sel.inpb = "R7_SRCB PP".into();
     db.add_record("R7_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -10744,8 +10751,8 @@ async fn sel_high_mode_fetches_all_inputs() {
     // High mode ignores SELN and reads all inputs; both are PP links.
     let mut sel = SelRecord::default();
     sel.selm = 1;
-    sel.inpa = "R7H_SRCA PP".to_string();
-    sel.inpb = "R7H_SRCB PP".to_string();
+    sel.inpa = "R7H_SRCA PP".into();
+    sel.inpb = "R7H_SRCB PP".into();
     db.add_record("R7H_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -10796,7 +10803,7 @@ async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
     sel.selm = 0;
     sel.seln = 0; // selects INPA
     sel.val = 5.0; // value computed on a previous cycle
-    sel.inpa = "NO_SUCH_PV".to_string();
+    sel.inpa = "NO_SUCH_PV".into();
     db.add_record("R8_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -10832,8 +10839,8 @@ async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
     sel.selm = 0;
     sel.seln = 0;
     sel.val = 7.0;
-    sel.nvl = "NO_SUCH_NVL".to_string();
-    sel.inpa = "R8N_SRC".to_string();
+    sel.nvl = "NO_SUCH_NVL".into();
+    sel.inpa = "R8N_SRC".into();
     db.add_record("R8N_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();

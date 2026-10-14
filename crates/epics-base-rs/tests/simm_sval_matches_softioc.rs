@@ -29,7 +29,7 @@ async fn simm_reads_siol_into_sval_like_softioc() {
         let mut rs = String::new();
         for line in CMDS.lines() {
             shell
-                .execute_line(&format!("{line} > {}", out.path().display()))
+                .execute_line(format!("{line} > {}", out.path().display()))
                 .unwrap();
             rs.push_str(&std::fs::read_to_string(out.path()).unwrap());
         }

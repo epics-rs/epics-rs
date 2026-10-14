@@ -10,6 +10,7 @@ use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
 };
+use crate::types::PvString;
 use crate::types::{EpicsValue, Scalar, c_cast};
 
 /// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
@@ -77,7 +78,7 @@ pub struct SwaitRecord {
     // writes DOLD to OUT; see [`Record::output_time_input_links`]. With DOLN
     // unset (C `dolv == NO_PV`) the get is skipped and DOLD keeps whatever was
     // written to it (an operator/client put, or the init value).
-    pub doln: String,
+    pub doln: PvString,
     pub dold: f64,
     // OVAL ("Old Value", C `swaitRecord.dbd:440`): the VAL of the PREVIOUS
     // cycle. C sets it at `swaitRecord.c:471` (`pwait->oval = pwait->val`,
@@ -98,7 +99,7 @@ pub struct SwaitRecord {
     // `odly == 0` it calls `execOutput` immediately. `f32` mirrors the C
     // `float` field so a CA client sees DBR_FLOAT (not DBR_DOUBLE).
     pub odly: f32,
-    pub out: crate::server::record::SparseText,
+    pub out: Box<[u8]>,
     pub prec: i16,
     // MDEL / ADEL (C `swaitRecord.dbd:477-486`, both DBF_DOUBLE): the monitor
     // and archive deadbands `monitor()` (swaitRecord.c:622-640) tests VAL
@@ -117,8 +118,8 @@ pub struct SwaitRecord {
     pub mlst: f64,
     pub alst: f64,
     // INxN: input link names; INxP: process passive flags (0/1)
-    pub inp_names: [String; 12], // INAN..INLN
-    pub inp_passive: [i16; 12],  // INAP..INLP
+    pub inp_names: [PvString; 12], // INAN..INLN
+    pub inp_passive: [i16; 12],    // INAP..INLP
     // numeric input values A-L
     pub num_vals: [f64; 12],
     // LA..LL ("Last Val of Input x", C `swaitRecord.dbd:298-331`, DBF_DOUBLE,
@@ -168,9 +169,9 @@ pub struct SwaitRecord {
     // The framework owns the branch (`Record::simulation_substitutes_input_stage`
     // + `check_simulation_mode`): it resolves SIMM from SIML, reads SIOL into
     // SVAL, writes VAL, raises SIMM_ALARM, and pushes `simulation_active` here.
-    pub siml: String,
+    pub siml: PvString,
     pub simm: i16,
-    pub siol: String,
+    pub siol: PvString,
     pub sval: f64,
     pub sims: i16,
     // This cycle's simulation state, pushed by the framework through
@@ -182,7 +183,7 @@ pub struct SwaitRecord {
     // shape calcout/sseq use (see `link_status::LinkStatusGen`): a refresh
     // classifies a snapshot of the link names off-thread, and only the latest
     // one issued may publish.
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
     // A refused CALC put's report, made by `special()` under the put's hold
     // and printed by the put's owner after it.
@@ -213,12 +214,12 @@ impl Default for SwaitRecord {
             calc_succeeded: false,
             oopt: 0,
             dopt: 0,
-            doln: String::new(),
+            doln: PvString::new(),
             dold: 0.0,
             oval: 0.0,
             oevt: 0,
             odly: 0.0,
-            out: crate::server::record::SparseText::default(),
+            out: Box::default(),
             prec: 0,
             mdel: 0.0,
             adel: 0.0,
@@ -232,9 +233,9 @@ impl Default for SwaitRecord {
             // and every name starts blank.
             pv_status: [SWAIT_NO_PV; 14],
             fetch_gate_failed: false,
-            siml: String::new(),
+            siml: PvString::new(),
             simm: 0,
-            siol: String::new(),
+            siol: PvString::new(),
             sval: 0.0,
             sims: 0,
             simulation_active: false,
@@ -410,9 +411,9 @@ impl SwaitRecord {
         };
         let rec_name = name.clone();
         let handle = handle.clone();
-        let mut links: Vec<String> = self.inp_names.to_vec();
+        let mut links: Vec<PvString> = self.inp_names.to_vec();
         links.push(self.doln.clone());
-        links.push(String::from(&self.out));
+        links.push(PvString::from(&*self.out));
         // Stamp this refresh; a later one supersedes it (see `LinkStatusGen`).
         let token = self.link_gen.next();
         let sched = handle.clone();
@@ -561,8 +562,11 @@ impl Record for SwaitRecord {
             self.recompile();
             // Not under a put's hold, so it prints at once.
             if let Some(report) = self.bad_calc_report("swait:init_record: Illegal CALC field") {
-                let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-                report.emit(name, "");
+                let name = self
+                    .async_ctx
+                    .as_ref()
+                    .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+                report.emit(&name, "");
             }
             // C `swaitRecord.c:330`: `pwait->init = TRUE;` — and never cleared.
             self.initialized = true;
@@ -570,7 +574,7 @@ impl Record for SwaitRecord {
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (swaitRecord.c:334-373) searches every PV name and
         // seeds INAV..INLV/DOLV/OUTV. The INxN/DOLN names are swait fields
@@ -581,7 +585,7 @@ impl Record for SwaitRecord {
     }
 
     fn init_links(&mut self, common: &crate::server::record::CommonFields) {
-        self.out.set(&common.text.out);
+        self.out = common.text.out.as_bytes().into();
         self.refresh_link_status();
     }
 
@@ -669,8 +673,8 @@ impl Record for SwaitRecord {
 
         // OUTN lives in the common fields, so a runtime re-point is invisible to
         // `special()`. Catch it here — the same split calcout uses for its OUT.
-        if self.out != common.text.out {
-            self.out.set(&common.text.out);
+        if *self.out != *common.text.out.as_bytes() {
+            self.out = common.text.out.as_bytes().into();
             self.refresh_link_status();
         }
 
@@ -958,9 +962,9 @@ impl Record for SwaitRecord {
     /// (`cached_should_output`). swait has no IVOA field, so — like its C —
     /// the post is never IVOA-suppressed. Stringified so the numeric event
     /// matches a `SCAN="Event"` record's `EVNT`.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<crate::types::PvString> {
         if self.cached_should_output && self.oevt > 0 {
-            Some(self.oevt.to_string())
+            Some(self.oevt.to_string().into())
         } else {
             None
         }
@@ -973,17 +977,17 @@ impl Record for SwaitRecord {
     /// C reads `pwait->inan..inln` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 12 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "SIML" => return Some(&self.siml),
-            "SIOL" => return Some(&self.siol),
+            "SIML" => return Some(self.siml.as_bytes()),
+            "SIOL" => return Some(self.siol.as_bytes()),
             _ => {}
         }
         let [b'I', b'N', slot, b'N'] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp_names.get(slot).map(String::as_str)
+        self.inp_names.get(slot).map(PvString::as_bytes)
     }
 
     // C `swaitRecord.dbd` declares SIML/SIMM/SIOL/SIMS and no SDLY, so the
@@ -1096,7 +1100,7 @@ impl Record for SwaitRecord {
             }
             "DOLN" => {
                 if let EpicsValue::String(s) = value {
-                    self.doln = s.as_str_lossy().into_owned();
+                    self.doln = s;
                 } else {
                     return Err(CaError::TypeMismatch("DOLN".into()));
                 }
@@ -1121,11 +1125,11 @@ impl Record for SwaitRecord {
             }
             // OUTN falls through to put_common_field which mirrors to common.text.out.
             "SIML" => match value {
-                EpicsValue::String(s) => self.siml = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.siml = s,
                 _ => return Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
-                EpicsValue::String(s) => self.siol = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.siol = s,
                 _ => return Err(CaError::TypeMismatch("SIOL".into())),
             },
             "SIMM" => {
@@ -1189,7 +1193,7 @@ impl Record for SwaitRecord {
                         as i16;
                 } else if let Some(idx) = Self::inp_name_index(name) {
                     if let EpicsValue::String(s) = value {
-                        self.inp_names[idx] = s.as_str_lossy().into_owned();
+                        self.inp_names[idx] = s;
                     } else {
                         return Err(CaError::TypeMismatch(name.into()));
                     }

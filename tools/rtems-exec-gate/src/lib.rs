@@ -857,7 +857,12 @@ fn opens_inside_a_literal(lines: &[&str]) -> Vec<bool> {
                         i += 1;
                     }
                     b'"' => state = In::Str,
+                    // `r`, `br` and `cr` open a raw string; `\"` inside one
+                    // does not escape the closing quote.
                     b'r' if !b[..i]
+                        .strip_suffix(b"b")
+                        .or_else(|| b[..i].strip_suffix(b"c"))
+                        .unwrap_or(&b[..i])
                         .last()
                         .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') =>
                     {
@@ -1836,6 +1841,20 @@ mod fixtures {
         format!(
             "{head}\n#[epics_macros_rs::epics_test]\nasync fn t() {{\n    let db = r#\"\nrecord(ai, \"X\") {{\n}}\n\"#;\n    {sleep}(std::time::Duration::from_millis(1)).await;\n    {sleep}(std::time::Duration::from_millis(1)).await;\n}}\n"
         )
+    }
+
+    /// A raw byte string ending in a backslash closes at its quote, so the
+    /// runtime after it is still seen as test code.
+    #[test]
+    fn a_raw_byte_string_ending_in_a_backslash_closes() {
+        let src = concat!(
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n",
+            "        let _ = br\"a\\\";\n    }\n",
+            "    fn ctx() {\n        let _rt = tokio::runtime::",
+            "Runtime::new().unwrap();\n    }\n}\n"
+        );
+        let audit = audit_source("src/x.rs", src, false);
+        assert_eq!(audit.ungated, vec![8], "{src}");
     }
 
     /// The third spelling: an `#[epics_test]` body that sleeps on tokio has no

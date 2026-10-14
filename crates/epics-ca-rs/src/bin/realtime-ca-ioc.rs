@@ -809,8 +809,8 @@ mod ioc {
             "RTEMS:CA:OTHER",
         ] {
             let val = db.get_pv(rec).map(|v| v.to_string());
-            let sevr = db.get_pv(&format!("{rec}.SEVR")).map(|v| v.to_string());
-            let stat = db.get_pv(&format!("{rec}.STAT")).map(|v| v.to_string());
+            let sevr = db.get_pv(format!("{rec}.SEVR")).map(|v| v.to_string());
+            let stat = db.get_pv(format!("{rec}.STAT")).map(|v| v.to_string());
             println!("C6 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
         }
     }
@@ -1338,7 +1338,11 @@ mod ioc {
             if declared.is_empty() {
                 "none declared".to_string()
             } else {
-                declared.join(", ")
+                declared
+                    .iter()
+                    .map(|n| n.to_str_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             },
         );
         for name in &names {
@@ -1755,7 +1759,7 @@ mod tests {
         let recs =
             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
                 .expect("the built-in database must parse");
-        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = recs.iter().map(|r| r.name.to_str().unwrap()).collect();
         assert_eq!(
             names,
             vec!["RTEMS:AO", "RTEMS:LO", "RTEMS:MSG", "RTEMS:BO"],
@@ -1763,7 +1767,7 @@ mod tests {
         );
         for rec in &recs {
             assert!(
-                !rec.name.starts_with("RTEMS:CA:"),
+                !rec.name.starts_with(b"RTEMS:CA:"),
                 "{} is a C6 probe record; the measurement rig belongs behind \
                  `bringup-probes`, not in the default image",
                 rec.name
@@ -1834,7 +1838,7 @@ mod tests {
         );
         let recs = epics_base_rs::server::db_loader::parse_db(&full, &HashMap::new())
             .expect("demo + C6 + E8 must parse together");
-        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = recs.iter().map(|r| r.name.to_str().unwrap()).collect();
 
         for n in [
             "RTEMS:E8:WF",

@@ -32,7 +32,7 @@ fn text(db: &PvDatabase, pv: &str) -> String {
 fn no_alarm(db: &PvDatabase, rec: &str) {
     for f in ["STAT", "SEVR"] {
         assert_eq!(
-            db.get_pv(&format!("{rec}.{f}")).unwrap().to_f64(),
+            db.get_pv(format!("{rec}.{f}")).unwrap().to_f64(),
             Some(0.0),
             "{rec}.{f}"
         );

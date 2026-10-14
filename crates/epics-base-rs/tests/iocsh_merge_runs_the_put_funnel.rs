@@ -44,7 +44,7 @@ fn load(db: &Arc<PvDatabase>, dir: &std::path::Path, name: &str, body: &str) {
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let shell_db = Arc::clone(db);
     std::thread::spawn(move || {
-        IocShell::new(shell_db, bridge).execute_line(&format!("dbLoadRecords(\"{path}\")"))
+        IocShell::new(shell_db, bridge).execute_line(format!("dbLoadRecords(\"{path}\")"))
     })
     .join()
     .unwrap()

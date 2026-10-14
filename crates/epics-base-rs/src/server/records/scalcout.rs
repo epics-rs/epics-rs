@@ -51,8 +51,8 @@ pub struct ScalcoutRecord {
     pub osv: PvString,
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
-    pub out: String, // output link
-    pub wait: i16,   // wait for output completion
+    pub out: PvString, // output link
+    pub wait: i16,     // wait for output completion
     pub prec: i16,
     // MDEL / ADEL (C `sCalcoutRecord.dbd:541-550`, both DBF_DOUBLE). MDEL is
     // read on two paths: the OOPT="On Change" test
@@ -66,13 +66,13 @@ pub struct ScalcoutRecord {
     pub mdel: f64,
     pub adel: f64,
     // Input link strings (INPA..INPL)
-    pub inp_links: [String; 12],
+    pub inp_links: [PvString; 12],
     // String-input link names (INAA..INLL, C `sCalcoutRecord.dbd:151-223`,
     // DBF_INLINK). C `fetch_values` (890-941) reads each one as DBR_STRING into
     // AA..LL; the record had no such fields at all, so the twelve string inputs
     // could only ever be set by a client put and a `.INAA` put was rejected with
     // `FieldNotFound`. See [`Record::string_input_links`].
-    pub str_inp_links: [String; 12],
+    pub str_inp_links: [PvString; 12],
     // Numeric input values A-L (mapped to vars A-P, but only 12 used)
     pub num_vals: [f64; 12],
     // String input values AA-LL
@@ -195,7 +195,7 @@ pub struct ScalcoutRecord {
     out_status: i16,
     /// Async surface + generation gate for `refresh_link_status`, the shape
     /// calcout/transform use (see `link_status::post_link_status`).
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
     // A refused CALC/OCAL put's report, made by `special()` under the put's
     // hold and printed by the put's owner after it.
@@ -229,7 +229,7 @@ impl Default for ScalcoutRecord {
             osv: PvString::new(),
             ivoa: 0,
             ivov: 0.0,
-            out: String::new(),
+            out: PvString::new(),
             wait: 0,
             prec: 0,
             mdel: 0.0,
@@ -518,8 +518,11 @@ impl ScalcoutRecord {
     /// `init_record` is not under a put's hold, so it prints at once.
     fn init_report(&self, report: Option<PutReport>) {
         if let Some(report) = report {
-            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-            report.emit(name, "");
+            let name = self
+                .async_ctx
+                .as_ref()
+                .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+            report.emit(&name, "");
         }
     }
 
@@ -620,7 +623,7 @@ impl ScalcoutRecord {
     /// mirroring C `sCalcoutRecord.c::init_record` (254-288) and the
     /// `special()` re-classification (508-569). No-op without an async context.
     fn refresh_link_status(&self, posts: LinkStatusPosts) {
-        let mut links: Vec<(&'static str, String)> = Vec::with_capacity(25);
+        let mut links: Vec<(&'static str, PvString)> = Vec::with_capacity(25);
         for i in 0..12 {
             links.push((SCALCOUT_INAV_NAMES[i], self.inp_links[i].clone()));
             links.push((SCALCOUT_IAAV_NAMES[i], self.str_inp_links[i].clone()));
@@ -802,7 +805,7 @@ impl Record for ScalcoutRecord {
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (sCalcoutRecord.c:254-288) classifies all 25 links
         // before any process. Every one of them is a scalcout-owned field
@@ -1126,16 +1129,16 @@ impl Record for ScalcoutRecord {
     /// C reads `prec->inpa..inpl / inaa..inll` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 24 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match *link_field.as_bytes() {
             [b'I', b'N', b'P', slot] => {
                 let slot = usize::from(slot.checked_sub(b'A')?);
-                self.inp_links.get(slot).map(String::as_str)
+                self.inp_links.get(slot).map(PvString::as_bytes)
             }
             // INAA..INLL, the doubled-letter array/string inputs.
             [b'I', b'N', slot, tail] if slot == tail => {
                 let slot = usize::from(slot.checked_sub(b'A')?);
-                self.str_inp_links.get(slot).map(String::as_str)
+                self.str_inp_links.get(slot).map(PvString::as_bytes)
             }
             _ => None,
         }
@@ -1345,7 +1348,7 @@ impl Record for ScalcoutRecord {
             }
             "OUT" => {
                 if let EpicsValue::String(s) = value {
-                    self.out = s.as_str_lossy().into_owned();
+                    self.out = s;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch("OUT".into()))
@@ -1413,7 +1416,7 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::inp_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.inp_links[idx] = s.as_str_lossy().into_owned();
+                            self.inp_links[idx] = s;
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
@@ -1422,7 +1425,7 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::str_inp_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.str_inp_links[idx] = s.as_str_lossy().into_owned();
+                            self.str_inp_links[idx] = s;
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
@@ -1726,9 +1729,9 @@ impl Record for ScalcoutRecord {
     /// same OOPT/calc-fail/ODLY decision as the OUT write (`cached_should_output`)
     /// — the framework adds the IVOA `Don't_drive` veto. Stringified so the
     /// numeric event matches a `SCAN="Event"` record's `EVNT`.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<crate::types::PvString> {
         if self.cached_should_output && self.oevt > 0 {
-            Some(self.oevt.to_string())
+            Some(self.oevt.to_string().into())
         } else {
             None
         }
@@ -1771,7 +1774,7 @@ mod tests {
         // C-parity divergence the oracle measured (`caget SCALCOUT.INAV` → 1,
         // C → 3). The put is already refused by the framework read-only gate
         // (`is_no_mod`), matching C `S_db_noMod`; the fix is the read value.
-        let inst = RecordInstance::new("S:LS".into(), ScalcoutRecord::new());
+        let inst = RecordInstance::new("S:LS", ScalcoutRecord::new());
         for name in ["INAV", "INLV", "IAAV", "ILLV", "OUTV"] {
             assert_eq!(
                 inst.resolve_field(name),

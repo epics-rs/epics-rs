@@ -305,11 +305,15 @@ impl CommandHandler {
             };
             let entry = entry_arc.read().await;
             let (asg, asl, resolved_name) = match pvlist.match_name(&name) {
-                Some(m) => (m.asg.clone(), m.effective_asl(), Some(m.resolved_name)),
+                Some(m) => (
+                    m.asg.clone(),
+                    m.effective_asl(),
+                    Some(m.resolved_name.to_string()),
+                ),
                 None => (None, 1, None),
             };
             out.push(PvReportEntry {
-                name: entry.name.clone(),
+                name: entry.name.to_string(),
                 state: entry.state,
                 subscribers: entry.subscriber_count(),
                 events: entry.event_count,
@@ -360,7 +364,7 @@ impl CommandHandler {
         // uses so alias rewrites are honored and only global rules apply.
         let mut pruned: usize = 0;
         if let Some(upstream) = &self.upstream {
-            let cached_names: Vec<String> = self.cache.read().await.names();
+            let cached_names = self.cache.read().await.names();
             let mut acl_changed = false;
             for name in cached_names {
                 match new_arc.match_name(&name) {

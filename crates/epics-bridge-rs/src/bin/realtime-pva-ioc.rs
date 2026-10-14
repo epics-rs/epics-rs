@@ -561,8 +561,8 @@ mod ioc {
         );
         for rec in ["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2", "RTEMS:PVA:UPLNK"] {
             let val = db.get_pv(rec).map(|v| v.to_string());
-            let sevr = db.get_pv(&format!("{rec}.SEVR")).map(|v| v.to_string());
-            let stat = db.get_pv(&format!("{rec}.STAT")).map(|v| v.to_string());
+            let sevr = db.get_pv(format!("{rec}.SEVR")).map(|v| v.to_string());
+            let stat = db.get_pv(format!("{rec}.STAT")).map(|v| v.to_string());
             println!("STAGE5 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
         }
     }
@@ -1503,7 +1503,13 @@ mod tests {
         let members: Vec<(&str, &str, Option<i64>)> = grp
             .members
             .iter()
-            .map(|m| (m.field_name.as_str(), m.channel.as_str(), m.put_order))
+            .map(|m| {
+                (
+                    m.field_name.as_str(),
+                    std::str::from_utf8(&m.channel).unwrap(),
+                    m.put_order,
+                )
+            })
             .collect();
         assert_eq!(
             members,
@@ -1519,7 +1525,10 @@ mod tests {
         // an unresolvable channel is accepted by the parser and only fails at
         // group creation, on the target.
         for m in &grp.members {
-            let (rec_name, _field) = m.channel.split_once('.').expect("record.FIELD");
+            let (rec_name, _field) = std::str::from_utf8(&m.channel)
+                .unwrap()
+                .split_once('.')
+                .expect("record.FIELD");
             assert!(
                 recs.iter().any(|r| r.name == rec_name),
                 "group member {} names record {rec_name}, which the demo database does not define",
@@ -1543,7 +1552,7 @@ mod tests {
         let recs =
             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
                 .expect("the built-in database must parse");
-        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = recs.iter().map(|r| r.name.to_str().unwrap()).collect();
         assert_eq!(
             names,
             vec!["RTEMS:PVA:AO", "RTEMS:PVA:LO", "RTEMS:PVA:MSG"],
@@ -1599,7 +1608,7 @@ mod tests {
             &HashMap::new(),
         )
         .expect("the stage-5 probe database must parse");
-        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = recs.iter().map(|r| r.name.to_str().unwrap()).collect();
         assert_eq!(
             names,
             vec!["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2", "RTEMS:PVA:UPLNK"],
@@ -1664,7 +1673,7 @@ mod tests {
         assert_eq!(grp.members.len(), 20, "every member fragment merged");
         for (n, m) in grp.members.iter().enumerate() {
             assert_eq!(m.field_name, format!("f{n:02}"));
-            assert_eq!(m.channel, format!("RTEMS:PVA:B{n:02}.VAL"));
+            assert_eq!(m.channel, format!("RTEMS:PVA:B{n:02}.VAL").into_bytes());
             assert_eq!(m.put_order, Some(n as i64));
         }
 

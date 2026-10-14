@@ -50,7 +50,8 @@ pub use link::{
     pvajson_identity_key,
 };
 pub(crate) use link::{
-    DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif, json_const_value,
+    DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif,
+    json_const_value, trim_link_text,
 };
 pub(crate) use menu_choices::{EnumChoice, enum_state_choice};
 pub use menu_choices::{

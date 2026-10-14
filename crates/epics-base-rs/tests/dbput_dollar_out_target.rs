@@ -72,7 +72,7 @@ fn bytes(db: &PvDatabase, pv: &str) -> Vec<u8> {
 }
 
 fn sevr(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.SEVR")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.SEVR")).unwrap().to_f64().unwrap()
 }
 
 fn chars(s: &str) -> EpicsValue {

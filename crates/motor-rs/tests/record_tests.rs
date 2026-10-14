@@ -2152,7 +2152,7 @@ fn test_closed_loop_button_put_fires_implicit_get_info() {
     let mut rec = MotorRecord::new();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -4466,7 +4466,7 @@ fn test_rdbl_resolution_report_drives_rdbl_error() {
     use epics_base_rs::server::record::Record;
     let mut rec = MotorRecord::new();
     rec.conv.urip = true;
-    rec.links.rdbl = "ext_readback.RBV".to_string();
+    rec.links.rdbl = "ext_readback.RBV".into();
 
     rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
         &[],
@@ -4784,7 +4784,7 @@ fn test_closed_loop_db_dol_suppresses_button_dispatch() {
     // OMSL flip back to supervisory can still act on it.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4807,7 +4807,7 @@ fn test_closed_loop_constant_dol_keeps_buttons_active() {
     // loop leaves the collection block running.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "5.0".to_string(); // CONSTANT, not a DB link
+    rec.links.dol = "5.0".into(); // CONSTANT, not a DB link
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4824,7 +4824,7 @@ fn test_closed_loop_tweak_and_rlv_not_collected() {
     // bypassed else — the writes land in the fields and stay inert.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
@@ -4850,7 +4850,7 @@ fn test_closed_loop_rval_put_is_raw_struct_write() {
     // lands in the field and stays inert, in move and SET mode alike.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.conv.mres = 0.01;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
@@ -4876,7 +4876,7 @@ fn test_closed_loop_latent_tweak_skipped_on_val_pass() {
     // the DOL cascade arriving through VAL.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
     rec.ctrl.twv = 1.0;
     rec.ctrl.twf = true; // latched before the DOL pass
@@ -4899,7 +4899,7 @@ fn test_latent_jog_fires_on_no_event_pass_after_omsl_flip() {
     // JOGF being re-written.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4925,7 +4925,7 @@ fn test_latent_tweak_folds_and_moves_after_omsl_flip() {
     // the move block dispatches the combined move.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
@@ -5046,7 +5046,7 @@ fn test_sync_pv_resyncs_under_closed_loop() {
     // under closed loop.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.conv.mres = 0.01;
     rec.pos.drbv = 25.0;
     rec.pos.rbv = 25.0;
@@ -9061,7 +9061,7 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
 
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
-    let mut instance = RecordInstance::new("M1".into(), rec);
+    let mut instance = RecordInstance::new("M1", rec);
     // A record is born UDF/`STAT=UDF` (dbCommon.dbd `initial("UDF")`), and
     // clearing that on the first process IS an alarm transition. This test is
     // about a QUIESCENT cycle, so start from the already-processed state:

@@ -45,19 +45,19 @@ struct GateLset {
 
 #[async_trait::async_trait]
 impl LinkSet for GateLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, name: &str, value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, name: &[u8], value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         let v = value.to_f64().expect("tests only put doubles");
         let _ = self.entered.send(v);
-        if name == self.gated {
+        if name == self.gated.as_bytes() {
             self.release
                 .acquire()
                 .await
@@ -90,19 +90,19 @@ impl RecordingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for RecordingLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &str) -> PutAdmission {
+    fn put_admission(&self, _: &[u8]) -> PutAdmission {
         self.admission
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, _: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         self.writes
             .lock()
             .unwrap()

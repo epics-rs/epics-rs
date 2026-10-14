@@ -31,7 +31,7 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
             "simDetectorConfig portName [sizeX] [sizeY] [maxMemory]",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let size_x = match args.get(1) { Some(ArgValue::Int(n)) => *n as i32, _ => 256 };

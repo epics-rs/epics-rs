@@ -314,7 +314,7 @@ fn the_aftercalc_post_through_process_local_carries_the_previous_stamp() {
     rec.put_field("CALC", EpicsValue::String("AA:=IX;VAL+1".into()))
         .unwrap();
     rec.special("CALC", true).unwrap();
-    let mut inst = RecordInstance::new("AC".into(), rec);
+    let mut inst = RecordInstance::new("AC", rec);
     let mut aa = inst
         .add_subscriber(
             "AA",

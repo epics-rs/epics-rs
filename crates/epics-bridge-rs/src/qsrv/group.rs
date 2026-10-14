@@ -16,7 +16,7 @@ use epics_base_rs::server::database::db_access::{DbAttachment, SubscriptionActiv
 use epics_base_rs::server::pv::{MonitorEvent, SubscribeRefused};
 use epics_base_rs::server::recgbl::EventMask as DbeMask;
 use epics_base_rs::server::snapshot::PropertySupport;
-use epics_base_rs::types::DbFieldType;
+use epics_base_rs::types::{DbFieldType, RecordName};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 use epics_pva_rs::server_native::source::RemoteLog;
 use epics_pva_rs::server_native::{MonitorRing, MonitorUpdate};
@@ -606,9 +606,9 @@ fn member_slot(fields: &mut Vec<(String, FieldDesc)>, name: &str) -> usize {
 async fn lock_group_records_read(
     db: &PvDatabase,
     members: &[MemberChannel],
-) -> Vec<(String, Arc<epics_base_rs::server::record::RecordCell>)> {
+) -> Vec<(RecordName, Arc<epics_base_rs::server::record::RecordCell>)> {
     // Collect unique record names and sort for deterministic lock order.
-    let mut record_names: Vec<String> = members
+    let mut record_names: Vec<RecordName> = members
         .iter()
         .filter(|m| m.has_channel())
         .map(|m| m.record.clone())
@@ -635,8 +635,8 @@ async fn lock_group_records_read(
 /// set. Names are resolved through the alias map so the gate key
 /// matches the one a direct CA/PVA write would take in
 /// `put_record_field_from_ca` / `put_pv` / `process_record`.
-fn group_member_record_names(db: &PvDatabase, members: &[MemberChannel]) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+fn group_member_record_names(db: &PvDatabase, members: &[MemberChannel]) -> Vec<RecordName> {
+    let mut names: Vec<RecordName> = Vec::new();
     for m in members {
         if !m.has_channel() {
             continue; // Structure / Const — no backing record
@@ -843,7 +843,7 @@ impl GroupChannel {
         log: Option<(usize, &MonitorEvent)>,
     ) -> BridgeResult<PvStructure> {
         let log_of = |idx: usize| log.filter(|(at, _)| *at == idx).map(|(_, ev)| ev);
-        if !self.access.can_read(&self.def.name).await {
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
@@ -914,11 +914,11 @@ impl GroupChannel {
             // can still take its link target's lock). Once the guards below
             // exist, no member may reach for a second record's lock.
             let member_backings: HashMap<
-                &str,
+                &[u8],
                 std::collections::HashMap<String, epics_base_rs::server::database::LinkMetadata>,
             > = member_guards
                 .iter()
-                .map(|(name, rec)| (name.as_str(), self.db.resolve_link_backed_metadata(rec)))
+                .map(|(name, rec)| (&name[..], self.db.resolve_link_backed_metadata(rec)))
                 .collect();
 
             // Acquire every backing record's read guard synchronously, in the
@@ -927,13 +927,13 @@ impl GroupChannel {
             // out of its write guard for this window, so this acquisition is
             // uncontended and deadlock-free; the guards are consumed synchronously
             // by `read_member_locked` below and never held across an await.
-            let guards: Vec<(&str, epics_base_rs::server::record::RecordRef<'_>)> = member_guards
+            let guards: Vec<(&[u8], epics_base_rs::server::record::RecordRef<'_>)> = member_guards
                 .iter()
-                .map(|(name, rec)| (name.as_str(), rec.read()))
+                .map(|(name, rec)| (&name[..], rec.read()))
                 .collect();
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
-            let guard_map: HashMap<&str, &epics_base_rs::server::record::RecordInstance> =
+            let guard_map: HashMap<&[u8], &epics_base_rs::server::record::RecordInstance> =
                 guards.iter().map(|(name, g)| (*name, &**g)).collect();
             for (idx, member) in self.def.channels.iter().enumerate() {
                 // Only `proc` places no value field. A `+type:"structure"`
@@ -1019,10 +1019,9 @@ impl GroupChannel {
 
         let (record_name, field_name) = member.names();
 
-        let rec = self
-            .db
-            .get_record(record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        let rec = self.db.get_record(record_name).ok_or_else(|| {
+            BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
+        })?;
 
         // Resolved before the record's own guard: a link-backed member
         // (`CALC.A`) answers its units/precision from the LINK TARGET's
@@ -1041,9 +1040,9 @@ impl GroupChannel {
     fn read_member_locked(
         &self,
         member: &MemberChannel,
-        guard_map: &HashMap<&str, &epics_base_rs::server::record::RecordInstance>,
+        guard_map: &HashMap<&[u8], &epics_base_rs::server::record::RecordInstance>,
         backings: &HashMap<
-            &str,
+            &[u8],
             std::collections::HashMap<String, epics_base_rs::server::database::LinkMetadata>,
         >,
         log: Option<&MonitorEvent>,
@@ -1054,9 +1053,9 @@ impl GroupChannel {
 
         let (record_name, field_name) = member.names();
 
-        let instance = *guard_map
-            .get(record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        let instance = *guard_map.get(record_name).ok_or_else(|| {
+            BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
+        })?;
         // Resolved by the caller before it took any member guard — the atomic
         // path holds every member's read guard at once, so nothing here may
         // reach for a link target's lock.
@@ -1079,7 +1078,7 @@ impl GroupChannel {
     /// the member a value event `log` came from, from that log.
     fn decode_member(
         member: &MemberChannel,
-        record_name: &str,
+        record_name: &[u8],
         field_name: &str,
         instance: &epics_base_rs::server::record::RecordInstance,
         backing: epics_base_rs::server::database::LinkBacking<'_>,
@@ -1088,7 +1087,7 @@ impl GroupChannel {
         match member.def.mapping {
             FieldMapping::Scalar => {
                 let not_found = || BridgeError::FieldNotFound {
-                    record: record_name.to_string(),
+                    record: String::from_utf8_lossy(record_name).into_owned(),
                     field: field_name.to_string(),
                 };
                 let view = member.view_in(instance).ok_or_else(not_found)?;
@@ -1114,7 +1113,7 @@ impl GroupChannel {
             }
             FieldMapping::Plain => {
                 let not_found = || BridgeError::FieldNotFound {
-                    record: record_name.to_string(),
+                    record: String::from_utf8_lossy(record_name).into_owned(),
                     field: field_name.to_string(),
                 };
                 let view = member.view_in(instance).ok_or_else(not_found)?;
@@ -1148,7 +1147,7 @@ impl GroupChannel {
                         Some(snapshot)
                     })
                     .ok_or_else(|| BridgeError::FieldNotFound {
-                        record: record_name.to_string(),
+                        record: String::from_utf8_lossy(record_name).into_owned(),
                         field: field_name.to_string(),
                     })?;
                 // Same unnamed enclosing structure the descriptor
@@ -1172,7 +1171,7 @@ impl GroupChannel {
                             .or_else(|| member.read_with(instance, view))
                     })
                     .ok_or_else(|| BridgeError::FieldNotFound {
-                        record: record_name.to_string(),
+                        record: String::from_utf8_lossy(record_name).into_owned(),
                         field: field_name.to_string(),
                     })?;
                 // pvxs serves `+type:"any"` as a PVA `any` slot whose
@@ -1219,19 +1218,18 @@ impl GroupChannel {
         &self,
         member: &MemberChannel,
     ) -> BridgeResult<(NtType, ScalarType)> {
-        let record_name = member.record.as_str();
+        let record_name = &member.record[..];
 
-        let rec = self
-            .db
-            .get_record(record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        let rec = self.db.get_record(record_name).ok_or_else(|| {
+            BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
+        })?;
 
         let instance = rec.read();
         // A member whose `$` is refused never passes group creation.
         let view = member
             .view_in(&instance)
             .ok_or_else(|| BridgeError::FieldNotFound {
-                record: record_name.to_string(),
+                record: String::from_utf8_lossy(record_name).into_owned(),
                 field: member.field.clone(),
             })?;
         let resolved = member.value_with(&instance, view);
@@ -1440,7 +1438,7 @@ impl GroupChannel {
     /// which pvxs leaves on `forceProcessing`.
     fn member_process_it(
         &self,
-        record_name: &str,
+        record_name: &[u8],
         field_name: &str,
         mapping: FieldMapping,
         process: super::channel::ProcessMode,
@@ -1558,7 +1556,7 @@ impl GroupChannel {
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
         let (record_name, field_name) = member.names();
-        let pv_name = format!("{record_name}.{field_name}");
+        let pv_name = [record_name, b".", field_name.as_bytes()].concat();
         let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
@@ -1612,10 +1610,11 @@ impl GroupChannel {
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
         let (record_name, field_name) = member.names();
-        let pv_name = format!("{record_name}.{field_name}");
+        let pv_name = [record_name, b".", field_name.as_bytes()].concat();
+        let pv_name = &pv_name[..];
         let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
-            pv_name: &pv_name,
+            pv_name,
             user: self.access.creds.user.as_bytes(),
             host: &self.access.creds.host,
             peer: &self.access.creds.host,
@@ -1625,8 +1624,7 @@ impl GroupChannel {
             let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
             match process {
                 ProcessMode::Inhibit => {
-                    let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv(&pv, value).await.map_err(to_err)?;
+                    self.db.put_pv(pv_name, value).await.map_err(to_err)?;
                 }
                 ProcessMode::Passive => {
                     self.db
@@ -1635,8 +1633,7 @@ impl GroupChannel {
                         .map_err(to_err)?;
                 }
                 ProcessMode::Force => {
-                    let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv(&pv, value).await.map_err(to_err)?;
+                    self.db.put_pv(pv_name, value).await.map_err(to_err)?;
                     let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links(record_name, &mut visited)
@@ -1675,7 +1672,7 @@ impl GroupChannel {
         atomic_override: Option<bool>,
         log: &RemoteLog,
     ) -> BridgeResult<()> {
-        if !self.access.can_write(&self.def.name).await {
+        if !self.access.can_write(self.def.name.as_bytes()).await {
             // Group-level ACF gate (the per-member gate below mirrors pvxs's
             // per-field SecurityClient). Both are write-ACF denials, so both
             // carry pvxs's `doFieldPreProcessing` text (iocsource.cpp:385).
@@ -1798,7 +1795,9 @@ impl GroupChannel {
             {
                 return Err(super::put_status::links_not_supported(&format!(
                     "group {} PUT: member '{}' targets link field '{}'",
-                    self.def.name, m.def.field_name, m.def.channel
+                    self.def.name,
+                    m.def.field_name,
+                    String::from_utf8_lossy(&m.def.channel)
                 )));
             }
         }
@@ -1851,7 +1850,7 @@ impl GroupChannel {
                      user='{}' host='{}' (per-member ACF)",
                     self.def.name,
                     m.def.field_name,
-                    m.def.channel,
+                    String::from_utf8_lossy(&m.def.channel),
                     self.access.creds.user,
                     self.access.creds.host
                 )));
@@ -1939,7 +1938,9 @@ impl GroupChannel {
                                 return Err(BridgeError::PutRejected(format!(
                                     "group {} PUT: member '{}' value is not convertible \
                                      to backing field '{}'",
-                                    self.def.name, member.def.field_name, member.def.channel
+                                    self.def.name,
+                                    member.def.field_name,
+                                    String::from_utf8_lossy(&member.def.channel)
                                 )));
                             }
                         }
@@ -2063,7 +2064,9 @@ impl GroupChannel {
                                 return Err(BridgeError::PutRejected(format!(
                                     "group {} PUT: member '{}' value is not convertible \
                                      to backing field '{}'",
-                                    self.def.name, member.def.field_name, member.def.channel
+                                    self.def.name,
+                                    member.def.field_name,
+                                    String::from_utf8_lossy(&member.def.channel)
                                 )));
                             }
                         };
@@ -2111,12 +2114,12 @@ impl GroupChannel {
 }
 
 impl super::provider::Channel for GroupChannel {
-    fn channel_name(&self) -> &str {
-        &self.def.name
+    fn channel_name(&self) -> &[u8] {
+        self.def.name.as_bytes()
     }
 
     async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name).await {
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
@@ -2244,7 +2247,7 @@ impl GroupChannel {
     pub async fn create_monitor(&self) -> BridgeResult<GroupMonitor> {
         // Read enforcement: deny monitor creation when the client lacks
         // read access. start() also re-checks defensively.
-        if !self.access.can_read(&self.def.name).await {
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor create denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
@@ -2581,7 +2584,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
         // Read enforcement: refuse to spin up upstream subscriptions
         // for a client that lacks read permission on this group.
-        if !self.access.can_read(&self.def.name).await {
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
@@ -2996,7 +2999,7 @@ mod tests {
     /// through this helper keeps the C polarity in ONE place.
     async fn has_processed(db: &Arc<PvDatabase>, rec: &str) -> bool {
         use epics_base_rs::types::EpicsValue;
-        match db.get_pv(&format!("{rec}.INIT")).unwrap() {
+        match db.get_pv(format!("{rec}.INIT")).unwrap() {
             EpicsValue::Short(v) => v == 0,
             other => panic!("unexpected INIT type: {other:?}"),
         }
@@ -4632,8 +4635,8 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _: &[u8], _: &str) -> bool {
-                channel != self.0
+            async fn can_write(&self, channel: &[u8], _: &[u8], _: &str) -> bool {
+                channel != self.0.as_bytes()
             }
         }
 
@@ -5764,8 +5767,8 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _user: &[u8], _host: &str) -> bool {
-                channel != self.0
+            async fn can_write(&self, channel: &[u8], _user: &[u8], _host: &str) -> bool {
+                channel != self.0.as_bytes()
             }
         }
 
@@ -5848,8 +5851,8 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _user: &[u8], _host: &str) -> bool {
-                channel != self.0
+            async fn can_write(&self, channel: &[u8], _user: &[u8], _host: &str) -> bool {
+                channel != self.0.as_bytes()
             }
         }
 
@@ -6000,7 +6003,7 @@ mod tests {
             .unwrap();
         // The member bound the suffix once, at `finalize()`.
         assert_eq!(def.channels.len(), 1);
-        assert_eq!(def.channels[0].names(), ("FLT:wf", "VAL"));
+        assert_eq!(def.channels[0].names(), (&b"FLT:wf"[..], "VAL"));
         assert_eq!(def.channels[0].value_filters.len(), 1);
 
         let channel = GroupChannel::new(db.clone(), def);

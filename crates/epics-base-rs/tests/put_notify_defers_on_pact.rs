@@ -600,8 +600,8 @@ async fn sdly_input_record() -> PvDatabase {
         .await
         .unwrap();
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SW".to_string();
-    ai.siol = "SRC".to_string();
+    ai.siml = "SW".into();
+    ai.siol = "SRC".into();
     ai.sdly = 100.0; // async; the real timer cannot fire inside the test
     db.add_record("SIMAI", Box::new(ai)).await.unwrap();
     db
@@ -679,8 +679,8 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .await
         .unwrap();
     let mut ao = AoRecord::new(1.0);
-    ao.siml = "SW".to_string();
-    ao.siol = "SINK".to_string();
+    ao.siml = "SW".into();
+    ao.siol = "SINK".into();
     ao.sdly = 100.0;
     db.add_record("SIMAO", Box::new(ao)).await.unwrap();
 

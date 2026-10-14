@@ -30,7 +30,7 @@ fn s(v: &str) -> EpicsValue {
 }
 
 fn nord(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.NORD")).unwrap().to_f64().unwrap()
 }
 
 #[epics_macros_rs::epics_test]

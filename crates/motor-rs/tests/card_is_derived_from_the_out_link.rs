@@ -104,7 +104,7 @@ fn the_client_channel_carries_the_derived_card() {
     let mut rec = MotorRecord::new();
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    let inst = RecordInstance::new("M".to_string(), rec);
+    let inst = RecordInstance::new("M", rec);
     assert_eq!(
         inst.client_field_value("CARD"),
         Some(EpicsValue::Short(-1)),

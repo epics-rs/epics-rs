@@ -136,7 +136,7 @@ fn standalone_alias_takes_both_forms_in_both_args() {
             defs[0]
                 .aliases
                 .iter()
-                .map(|a| a.name.as_str())
+                .map(|a| a.name.to_str().unwrap())
                 .collect::<Vec<_>>(),
             ["N"],
             "{text}"

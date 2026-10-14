@@ -54,8 +54,8 @@ async fn asub_inputs_load_through_db_load_link_array_asubrecord_c_134() {
     let mut wrong = Vec::new();
     for (ch, val, ne) in expect {
         let got = (
-            db.get_pv(&format!("AS.{ch}")).ok(),
-            db.get_pv(&format!("AS.NE{ch}"))
+            db.get_pv(format!("AS.{ch}")).ok(),
+            db.get_pv(format!("AS.NE{ch}"))
                 .ok()
                 .and_then(|v| v.to_f64()),
         );

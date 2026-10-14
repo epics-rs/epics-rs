@@ -38,7 +38,7 @@ async fn inp_and_siol_read_dbr_string_like_softioc() {
     for (rec, want) in [("EB", "RUNNING"), ("EM", "two"), ("ES", "RUNNING")] {
         process(&db, rec).await;
         assert_eq!(
-            db.get_pv(&format!("{rec}.VAL")).unwrap(),
+            db.get_pv(format!("{rec}.VAL")).unwrap(),
             EpicsValue::String(want.into()),
             "{rec}"
         );

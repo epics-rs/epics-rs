@@ -8,7 +8,7 @@ use crate::server::event_queue::{
     SubscriberList, TryRecvError, no_context,
 };
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
-use crate::types::{DbFieldType, EpicsValue, WallTime};
+use crate::types::{DbFieldType, EpicsValue, RecordName, WallTime};
 
 /// Why a monitor was not installed. C `db_add_event` returns NULL for both and
 /// each caller prints its own line, so the reason is handed back, not logged.
@@ -857,7 +857,7 @@ struct PostedMeta {
 
 /// A process variable hosted by the server.
 pub struct ProcessVariable {
-    pub name: String,
+    pub name: RecordName,
     /// The stored value. A synchronous `parking_lot::RwLock` (matching the
     /// sibling `posted_meta` / `metadata` / hook locks): every access is a
     /// single-expression read-or-write with no `.await` held across the
@@ -915,9 +915,9 @@ pub struct ProcessVariable {
 }
 
 impl ProcessVariable {
-    pub fn new(name: String, initial: EpicsValue) -> Self {
+    pub fn new(name: impl Into<RecordName>, initial: EpicsValue) -> Self {
         Self {
-            name,
+            name: name.into(),
             value: parking_lot::RwLock::new(initial),
             subscribers: SubscriberList::default(),
             metadata: parking_lot::RwLock::new(PvMetadata::default()),
@@ -1635,10 +1635,7 @@ mod mask_gate_tests {
     const DBE_ALARM: u16 = 4;
 
     fn pv() -> Arc<ProcessVariable> {
-        Arc::new(ProcessVariable::new(
-            "test:pv".into(),
-            EpicsValue::Double(0.0),
-        ))
+        Arc::new(ProcessVariable::new("test:pv", EpicsValue::Double(0.0)))
     }
 
     /// A full-snapshot write must persist alarm + timestamp + userTag so
@@ -1924,7 +1921,7 @@ mod mask_gate_tests {
         use crate::server::event_queue::{event_que_size, events_per_que};
         use crate::server::recgbl::EventMask;
         let pv = Arc::new(ProcessVariable::new(
-            "coalesce:mask".into(),
+            "coalesce:mask",
             EpicsValue::Double(0.0),
         ));
         let mut reader = pv
@@ -1974,10 +1971,7 @@ mod mask_gate_tests {
     async fn r8_22_pv_burst_keeps_earlier_distinct_updates() {
         use crate::server::event_queue::{event_que_size, events_per_que};
         use std::time::Duration;
-        let pv = Arc::new(ProcessVariable::new(
-            "coalesce:pv".into(),
-            EpicsValue::Double(0.0),
-        ));
+        let pv = Arc::new(ProcessVariable::new("coalesce:pv", EpicsValue::Double(0.0)));
         let mut sub = PvSubscription::subscribe(pv.clone())
             .await
             .expect("subscribe");
@@ -2031,7 +2025,7 @@ mod metadata_tests {
     }
 
     fn pv() -> Arc<ProcessVariable> {
-        Arc::new(ProcessVariable::new("m:pv".into(), EpicsValue::Double(1.0)))
+        Arc::new(ProcessVariable::new("m:pv", EpicsValue::Double(1.0)))
     }
 
     /// `set_with_origin` tags the value event with the writer's origin,
@@ -2173,7 +2167,7 @@ mod read_hook_tests {
     use super::*;
 
     fn pv() -> Arc<ProcessVariable> {
-        Arc::new(ProcessVariable::new("g:pv".into(), EpicsValue::Double(1.0)))
+        Arc::new(ProcessVariable::new("g:pv", EpicsValue::Double(1.0)))
     }
 
     /// No hook installed (the default for every record-backed and cached
@@ -2421,7 +2415,7 @@ mod destruction_tests {
 
     #[epics_macros_rs::epics_test]
     async fn respawn_carries_the_hooks_and_metadata_onto_a_live_pv() {
-        let pv = ProcessVariable::new("D:respawn".into(), EpicsValue::Double(1.0));
+        let pv = ProcessVariable::new("D:respawn", EpicsValue::Double(1.0));
         pv.set_write_hook(Arc::new(|_v, _ctx| Box::pin(async { Ok(()) })));
         pv.set_access_hook(Arc::new(|_user, _host| AccessDecision {
             read: true,
@@ -2491,10 +2485,7 @@ mod subscription_drop_tests {
     /// teardown releases its `PvSubscription`.
     #[epics_macros_rs::epics_test]
     async fn a_subscription_dropped_on_a_bare_thread_removes_its_row() {
-        let pv = Arc::new(ProcessVariable::new(
-            "D:baredrop".into(),
-            EpicsValue::Double(0.0),
-        ));
+        let pv = Arc::new(ProcessVariable::new("D:baredrop", EpicsValue::Double(0.0)));
         let sub = PvSubscription::subscribe(pv.clone())
             .await
             .expect("first subscriber");
@@ -2528,10 +2519,7 @@ mod subscription_drop_tests {
     /// subscriber list.
     #[epics_macros_rs::epics_test]
     async fn dropping_one_subscription_leaves_its_sibling_registered() {
-        let pv = Arc::new(ProcessVariable::new(
-            "D:sibling".into(),
-            EpicsValue::Double(0.0),
-        ));
+        let pv = Arc::new(ProcessVariable::new("D:sibling", EpicsValue::Double(0.0)));
         let first = PvSubscription::subscribe(pv.clone())
             .await
             .expect("first subscriber");
@@ -2561,7 +2549,7 @@ mod subscriber_list_consumer_tests {
     const DBE_VALUE: u16 = 1;
 
     fn pv() -> Arc<ProcessVariable> {
-        Arc::new(ProcessVariable::new("P".into(), EpicsValue::Double(0.0)))
+        Arc::new(ProcessVariable::new("P", EpicsValue::Double(0.0)))
     }
 
     /// Drops every event and counts what it saw.

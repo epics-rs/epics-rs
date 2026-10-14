@@ -15,6 +15,7 @@
 #![allow(clippy::manual_async_fn)]
 #![cfg(feature = "client")]
 
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,7 +82,7 @@ fn make_leaf(
 
 #[derive(Clone)]
 struct StaticSource {
-    inner: Arc<Mutex<std::collections::HashMap<String, PvField>>>,
+    inner: Arc<Mutex<std::collections::HashMap<RecordName, PvField>>>,
 }
 
 impl StaticSource {
@@ -97,7 +98,7 @@ impl StaticSource {
         self.inner
             .lock()
             .await
-            .insert(name.to_string(), PvField::Structure(s));
+            .insert(RecordName::from(name), PvField::Structure(s));
     }
 }
 
@@ -109,21 +110,21 @@ fn nt_scalar_desc() -> FieldDesc {
 }
 
 impl ChannelSource for StaticSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let inner = self.inner.clone();
         async move { inner.lock().await.keys().cloned().collect::<Vec<_>>() }
     }
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let inner = self.inner.clone();
-        let n = name.to_string();
+        let n = RecordName::from(name);
         async move { inner.lock().await.contains_key(&n) }
     }
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let inner = self.inner.clone();
-        let n = name.to_string();
+        let n = RecordName::from(name);
         async move {
             if inner.lock().await.contains_key(&n) {
                 Some(nt_scalar_desc())
@@ -132,24 +133,24 @@ impl ChannelSource for StaticSource {
             }
         }
     }
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let inner = self.inner.clone();
-        let n = name.to_string();
+        let n = RecordName::from(name);
         async move { inner.lock().await.get(&n).cloned() }
     }
     fn put_value(
         &self,
-        _name: &str,
+        _name: &[u8],
         _value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Ok(()) }
     }
-    fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         async { false }
     }
     fn subscribe(
         &self,
-        _name: &str,
+        _name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }

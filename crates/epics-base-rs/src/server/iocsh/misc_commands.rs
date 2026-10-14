@@ -266,7 +266,7 @@ fn cmd_system() -> CommandDef {
          command interpreter for execution.",
         |args: &[ArgValue], _ctx: &CommandContext| {
             let cmd = match &args[0] {
-                ArgValue::String(s) => s.as_str(),
+                ArgValue::String(s) => s.to_os_str()?,
                 _ => return Ok(CommandOutcome::Failed),
             };
             Ok(run_system(cmd))
@@ -278,7 +278,7 @@ fn cmd_system() -> CommandDef {
 /// C's `system()` hands the string to `/bin/sh -c` on POSIX and to
 /// `cmd.exe /C` on Windows, so the argument keeps its shell grammar —
 /// `system "ls | wc -l"` is a pipeline, not an argv.
-fn run_system(cmd: &str) -> CommandOutcome {
+fn run_system(cmd: impl AsRef<std::ffi::OsStr>) -> CommandOutcome {
     #[cfg(windows)]
     let mut c = {
         let mut c = std::process::Command::new("cmd");
@@ -323,7 +323,7 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();

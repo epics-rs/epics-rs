@@ -186,7 +186,9 @@ fn find_command(
             // (`registryIocRegister.c:30-68`). An absent name is a lookup that
             // finds nothing, not an arity refusal.
             let found = match &args[0] {
-                ArgValue::String(s) => lookup(ctx, s),
+                // Every registered name is text, so a non-UTF-8 one finds
+                // nothing, as `registryFind`'s `strcmp` would.
+                ArgValue::String(s) => s.to_str().ok().and_then(|s| lookup(ctx, s)),
                 _ => None,
             };
             ctx.println(&format_entry_address(found));
@@ -364,7 +366,7 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
-        let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).expect("arguments parse");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -567,7 +569,7 @@ mod tests {
         let shell = crate::server::iocsh::IocShell::new(Arc::new(PvDatabase::new()), bridge);
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
-        let _ = shell.execute_line(&format!("registryDump > {}", path.display()));
+        let _ = shell.execute_line(format!("registryDump > {}", path.display()));
         std::mem::forget(rt);
         let out = std::fs::read_to_string(&path).unwrap();
         // Everything after the section header. `split_once`, not `split`,
@@ -599,13 +601,13 @@ mod tests {
         let cmd = reg.get("registerAllRecordDeviceDrivers").unwrap();
 
         for accepted in ["pdbbase", "0"] {
-            let args = parse_args(&[accepted.to_string()], &cmd.args).unwrap();
+            let args = parse_args(&[accepted.to_string().into()], &cmd.args).unwrap();
             assert!(
                 matches!(cmd.handler.call(&args, &ctx), Ok(CommandOutcome::Continue)),
                 "C accepts {accepted}"
             );
         }
-        let args = parse_args(&["junk".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["junk".into()], &cmd.args).unwrap();
         assert_eq!(
             cmd.handler.call(&args, &ctx).err(),
             Some("Expecting 'pdbbase' got 'junk'.".to_string())

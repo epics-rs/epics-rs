@@ -29,27 +29,27 @@ pub struct CalcRecord {
     pub alst: f64,
     pub mlst: f64,
     // Input link strings (INPA..INPU)
-    inpa: String,
-    inpb: String,
-    inpc: String,
-    inpd: String,
-    inpe: String,
-    inpf: String,
-    inpg: String,
-    inph: String,
-    inpi: String,
-    inpj: String,
-    inpk: String,
-    inpl: String,
-    inpm: String,
-    inpn: String,
-    inpo: String,
-    inpp: String,
-    inpq: String,
-    inpr: String,
-    inps: String,
-    inpt: String,
-    inpu: String,
+    inpa: PvString,
+    inpb: PvString,
+    inpc: PvString,
+    inpd: PvString,
+    inpe: PvString,
+    inpf: PvString,
+    inpg: PvString,
+    inph: PvString,
+    inpi: PvString,
+    inpj: PvString,
+    inpk: PvString,
+    inpl: PvString,
+    inpm: PvString,
+    inpn: PvString,
+    inpo: PvString,
+    inpp: PvString,
+    inpq: PvString,
+    inpr: PvString,
+    inps: PvString,
+    inpt: PvString,
+    inpu: PvString,
     /// Bit `i` set ⟺ `INP<i>` is non-empty. Written only by
     /// [`Self::set_inp_link`], the single writer of the 21 texts, so
     /// [`Record::set_input_link_slots`] answers off it without touching them.
@@ -94,7 +94,7 @@ pub struct CalcRecord {
     // C `prec->name`, handed over at creation by `set_async_context`. Only the
     // record knows it, which is why C prints its bad-CALC report from
     // `init_record`/`special` and not from `postfix()`.
-    name: Option<String>,
+    name: Option<crate::types::RecordName>,
     // The refused CALC put's report, made by `special` under the put's hold
     // and taken by the put's owner through `take_put_report`.
     put_report: Option<crate::server::recgbl::PutReport>,
@@ -117,27 +117,27 @@ impl Default for CalcRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            inpa: String::new(),
-            inpb: String::new(),
-            inpc: String::new(),
-            inpd: String::new(),
-            inpe: String::new(),
-            inpf: String::new(),
-            inpg: String::new(),
-            inph: String::new(),
-            inpi: String::new(),
-            inpj: String::new(),
-            inpk: String::new(),
-            inpl: String::new(),
-            inpm: String::new(),
-            inpn: String::new(),
-            inpo: String::new(),
-            inpp: String::new(),
-            inpq: String::new(),
-            inpr: String::new(),
-            inps: String::new(),
-            inpt: String::new(),
-            inpu: String::new(),
+            inpa: PvString::new(),
+            inpb: PvString::new(),
+            inpc: PvString::new(),
+            inpd: PvString::new(),
+            inpe: PvString::new(),
+            inpf: PvString::new(),
+            inpg: PvString::new(),
+            inph: PvString::new(),
+            inpi: PvString::new(),
+            inpj: PvString::new(),
+            inpk: PvString::new(),
+            inpl: PvString::new(),
+            inpm: PvString::new(),
+            inpn: PvString::new(),
+            inpo: PvString::new(),
+            inpp: PvString::new(),
+            inpq: PvString::new(),
+            inpr: PvString::new(),
+            inps: PvString::new(),
+            inpt: PvString::new(),
+            inpu: PvString::new(),
             inp_set: 0,
             inp_generation: 0,
             vars: [0.0; crate::calc::CALC_NARGS],
@@ -177,8 +177,11 @@ impl CalcRecord {
     fn report_bad_calc(&self, compiled: &calc_compile::CalcCompile, pmessage: &str) {
         // C `precord ? precord->name : "Unknown"`, reached here only if a
         // record compiled before `set_async_context` ran.
-        let name = self.name.as_deref().unwrap_or("Unknown");
-        compiled.report_in_expression(name, pmessage, "CALC", &self.calc);
+        let name = self
+            .name
+            .as_ref()
+            .map_or("Unknown".into(), |n| n.to_str_lossy());
+        compiled.report_in_expression(&name, pmessage, "CALC", &self.calc);
     }
 
     /// Advance LA..LU to A..U. C `calcRecord.c::monitor` (lines 417-423) does
@@ -202,34 +205,34 @@ impl CalcRecord {
         self.input_changes = changes;
     }
 
-    pub fn get_inp_link(&self, idx: usize) -> &str {
+    pub fn get_inp_link(&self, idx: usize) -> &[u8] {
         match idx {
-            0 => &self.inpa,
-            1 => &self.inpb,
-            2 => &self.inpc,
-            3 => &self.inpd,
-            4 => &self.inpe,
-            5 => &self.inpf,
-            6 => &self.inpg,
-            7 => &self.inph,
-            8 => &self.inpi,
-            9 => &self.inpj,
-            10 => &self.inpk,
-            11 => &self.inpl,
-            12 => &self.inpm,
-            13 => &self.inpn,
-            14 => &self.inpo,
-            15 => &self.inpp,
-            16 => &self.inpq,
-            17 => &self.inpr,
-            18 => &self.inps,
-            19 => &self.inpt,
-            20 => &self.inpu,
-            _ => "",
+            0 => self.inpa.as_bytes(),
+            1 => self.inpb.as_bytes(),
+            2 => self.inpc.as_bytes(),
+            3 => self.inpd.as_bytes(),
+            4 => self.inpe.as_bytes(),
+            5 => self.inpf.as_bytes(),
+            6 => self.inpg.as_bytes(),
+            7 => self.inph.as_bytes(),
+            8 => self.inpi.as_bytes(),
+            9 => self.inpj.as_bytes(),
+            10 => self.inpk.as_bytes(),
+            11 => self.inpl.as_bytes(),
+            12 => self.inpm.as_bytes(),
+            13 => self.inpn.as_bytes(),
+            14 => self.inpo.as_bytes(),
+            15 => self.inpp.as_bytes(),
+            16 => self.inpq.as_bytes(),
+            17 => self.inpr.as_bytes(),
+            18 => self.inps.as_bytes(),
+            19 => self.inpt.as_bytes(),
+            20 => self.inpu.as_bytes(),
+            _ => b"",
         }
     }
 
-    fn inp_link_mut(&mut self, idx: usize) -> Option<&mut String> {
+    fn inp_link_mut(&mut self, idx: usize) -> Option<&mut PvString> {
         match idx {
             0 => Some(&mut self.inpa),
             1 => Some(&mut self.inpb),
@@ -259,7 +262,7 @@ impl CalcRecord {
     /// The single writer of `INPA..INPU`: stores the text and keeps `inp_set`
     /// in step. A slot past `INPU` is ignored, as [`Self::get_inp_link`]
     /// ignores it on the read side.
-    pub fn set_inp_link(&mut self, slot: usize, text: impl Into<String>) {
+    pub fn set_inp_link(&mut self, slot: usize, text: impl Into<PvString>) {
         let Some(link) = self.inp_link_mut(slot) else {
             return;
         };
@@ -282,7 +285,7 @@ impl CalcRecord {
     ) -> CaResult<()> {
         match value {
             EpicsValue::String(s) => {
-                self.set_inp_link(slot, s.as_str_lossy());
+                self.set_inp_link(slot, s);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(field.into())),
@@ -290,12 +293,13 @@ impl CalcRecord {
     }
 
     /// Get input link strings for external processing.
-    pub fn input_links(&self) -> [&str; 21] {
+    pub fn input_links(&self) -> [&[u8]; 21] {
         [
             &self.inpa, &self.inpb, &self.inpc, &self.inpd, &self.inpe, &self.inpf, &self.inpg,
             &self.inph, &self.inpi, &self.inpj, &self.inpk, &self.inpl, &self.inpm, &self.inpn,
             &self.inpo, &self.inpp, &self.inpq, &self.inpr, &self.inps, &self.inpt, &self.inpu,
         ]
+        .map(PvString::as_bytes)
     }
 
     pub fn set_var(&mut self, idx: usize, val: f64) {
@@ -458,7 +462,11 @@ impl Record for CalcRecord {
 
     /// C hands the record its own name at `dbDefineRecord`; the port hands it
     /// over here. `special()` needs it to name the PV it is refusing.
-    fn set_async_context(&mut self, name: String, _db: crate::server::database::AsyncDbHandle) {
+    fn set_async_context(
+        &mut self,
+        name: crate::types::RecordName,
+        _db: crate::server::database::AsyncDbHandle,
+    ) {
         self.name = Some(name);
     }
 
@@ -527,7 +535,7 @@ impl Record for CalcRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         // INPA..INPU differ in their last byte alone, so the cycle's 21 asks
         // cost one shape test and one indexed branch instead of 21 name
         // compares.
@@ -535,27 +543,27 @@ impl Record for CalcRecord {
             return None;
         };
         Some(match slot {
-            b'A' => &self.inpa,
-            b'B' => &self.inpb,
-            b'C' => &self.inpc,
-            b'D' => &self.inpd,
-            b'E' => &self.inpe,
-            b'F' => &self.inpf,
-            b'G' => &self.inpg,
-            b'H' => &self.inph,
-            b'I' => &self.inpi,
-            b'J' => &self.inpj,
-            b'K' => &self.inpk,
-            b'L' => &self.inpl,
-            b'M' => &self.inpm,
-            b'N' => &self.inpn,
-            b'O' => &self.inpo,
-            b'P' => &self.inpp,
-            b'Q' => &self.inpq,
-            b'R' => &self.inpr,
-            b'S' => &self.inps,
-            b'T' => &self.inpt,
-            b'U' => &self.inpu,
+            b'A' => self.inpa.as_bytes(),
+            b'B' => self.inpb.as_bytes(),
+            b'C' => self.inpc.as_bytes(),
+            b'D' => self.inpd.as_bytes(),
+            b'E' => self.inpe.as_bytes(),
+            b'F' => self.inpf.as_bytes(),
+            b'G' => self.inpg.as_bytes(),
+            b'H' => self.inph.as_bytes(),
+            b'I' => self.inpi.as_bytes(),
+            b'J' => self.inpj.as_bytes(),
+            b'K' => self.inpk.as_bytes(),
+            b'L' => self.inpl.as_bytes(),
+            b'M' => self.inpm.as_bytes(),
+            b'N' => self.inpn.as_bytes(),
+            b'O' => self.inpo.as_bytes(),
+            b'P' => self.inpp.as_bytes(),
+            b'Q' => self.inpq.as_bytes(),
+            b'R' => self.inpr.as_bytes(),
+            b'S' => self.inps.as_bytes(),
+            b'T' => self.inpt.as_bytes(),
+            b'U' => self.inpu.as_bytes(),
             _ => return None,
         })
     }

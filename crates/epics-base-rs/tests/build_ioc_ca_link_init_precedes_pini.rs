@@ -13,13 +13,13 @@ struct RemoteLset;
 
 #[epics_base_rs::async_trait]
 impl LinkSet for RemoteLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        (name == "REMOTE:PV").then_some(EpicsValue::Double(7.0))
+    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        (name == b"REMOTE:PV").then_some(EpicsValue::Double(7.0))
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
 }

@@ -36,10 +36,10 @@ use crate::server::access_security::{
 #[derive(Default)]
 struct AsState {
     /// Path to the ACF file, set by `asSetFilename`. `None` until set.
-    filename: Option<String>,
+    filename: Option<Vec<u8>>,
     /// Macro substitutions applied when reading the ACF, set by
     /// `asSetSubstitutions`.
-    substitutions: Option<String>,
+    substitutions: Option<Vec<u8>>,
     /// C's `firstTime` (`asDbLib.c:113`), inverted so that `Default`
     /// carries C's initial value. `asInitCommon` flips it through an
     /// `epicsThreadOnce` at the TOP of the function (`:122`), before any
@@ -138,13 +138,13 @@ fn cmd_as_set_filename() -> CommandDef {
                 as_state().lock().unwrap().filename = None;
                 return Ok(CommandOutcome::Continue);
             };
-            let path = path.clone();
+            let path = path.as_bytes().to_vec();
             // C `asDbLib.c:79-83`: the ONLY thing this command prints, and
             // only for a path that will be resolved against the IOC's
             // working directory at `asInit` time rather than against the
             // startup script. `strchr(pacf, ':')` is C's, and it spares a
             // Windows drive letter as much as a `host:path`.
-            if !path.starts_with('/') && !path.contains(':') {
+            if !path.starts_with(b"/") && !path.contains(&b':') {
                 ctx.println("asSetFilename: Warning - relative paths won't usually work");
             }
             as_state().lock().unwrap().filename = Some(path);
@@ -171,7 +171,7 @@ fn cmd_as_set_substitutions() -> CommandDef {
                 as_state().lock().unwrap().substitutions = None;
                 return Ok(CommandOutcome::Continue);
             };
-            as_state().lock().unwrap().substitutions = Some(subs.clone());
+            as_state().lock().unwrap().substitutions = Some(subs.as_bytes().to_vec());
             Ok(CommandOutcome::Continue)
         },
     )
@@ -284,7 +284,7 @@ pub(crate) fn as_init(acf: &crate::server::access_security::AcfCell) -> AsInitOu
 /// invented a sentence C never writes.
 ///
 /// `None` is C's `S_asLib_badConfig`, already reported.
-fn as_init_file(filename: &str, substitutions: Option<&str>) -> Option<AccessSecurityConfig> {
+fn as_init_file(filename: &[u8], substitutions: Option<&[u8]>) -> Option<AccessSecurityConfig> {
     // C `asLibRoutines.c:179-182`: `fopen` failed. Straight to stderr and
     // not through errlog, as C's `fprintf(stderr, ...)` is — that is what
     // keeps `ERL_ERROR`'s escapes on the stream whether or not it is a
@@ -306,10 +306,13 @@ fn as_init_file(filename: &str, substitutions: Option<&str>) -> Option<AccessSec
     // reproducing it would mean opening the file through `libc` and closing
     // the raw fd by hand — new `unsafe` for a status the whole content has
     // already been read past. Deliberately absent.
-    let raw = match std::fs::read(filename) {
+    let read = super::registry::bytes_path(filename)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        .and_then(std::fs::read);
+    let raw = match read {
         Ok(raw) => raw,
         Err(_) => {
-            eprintln!("{}", cant_open_file(filename));
+            eprintln!("{}", cant_open_file(&String::from_utf8_lossy(filename)));
             return None;
         }
     };
@@ -320,15 +323,18 @@ fn as_init_file(filename: &str, substitutions: Option<&str>) -> Option<AccessSec
             // `c_isspace` are ASCII and C's handle has no environment
             // (`macCreateHandle(&macHandle, NULL)`, asLibRoutines.c:241).
             let latin1 = |b: &[u8]| b.iter().map(|&b| char::from(b)).collect::<String>();
-            let macros = super::commands::parse_macro_string(&latin1(subs.as_bytes()));
+            let macros = super::commands::parse_macro_string(latin1(subs).as_bytes());
             // Per line, as C `asInitFile` feeds `macExpandString` one
             // `fgets` line at a time (`asLibRoutines.c:202-219`) — a
             // quote in one ACF comment must not suppress `$(...)` on
             // the lines after it.
-            crate::server::db_loader::substitute_macros_per_line(&latin1(&raw), &macros)
-                .chars()
-                .map(|c| u8::try_from(c).expect("macLib emits only the chars it was given"))
-                .collect()
+            crate::server::db_loader::substitute_macros_per_line(
+                &latin1(&raw),
+                crate::runtime::mac_lib::MacroDefs::from_byte_map(&macros),
+            )
+            .chars()
+            .map(|c| u8::try_from(c).expect("macLib emits only the chars it was given"))
+            .collect()
         }
         _ => raw,
     };
@@ -436,7 +442,7 @@ fn cmd_aspuag() -> CommandDef {
         "aspuag [uagname] — Show members of a User Access Group (all if omitted).",
         |args: &[ArgValue], ctx: &CommandContext| {
             let filter = match &args[0] {
-                ArgValue::String(s) => Some(s.as_str()),
+                ArgValue::String(s) => Some(s.as_bytes()),
                 _ => None,
             };
             with_config(ctx, |cfg| print_groups(ctx, b"UAG", &cfg.uag, filter))
@@ -450,7 +456,7 @@ fn print_groups(
     ctx: &CommandContext,
     kind: &[u8],
     groups: &std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>,
-    filter: Option<&str>,
+    filter: Option<&[u8]>,
 ) {
     if groups.is_empty() {
         ctx.println_bytes(&[b"No ", kind, b"s"].concat());
@@ -459,7 +465,7 @@ fn print_groups(
     let mut names: Vec<_> = groups.keys().collect();
     names.sort();
     for name in names {
-        if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
+        if filter.is_some_and(|f| f != name.as_slice()) {
             continue;
         }
         let mut line = [kind, b"(", name.as_slice(), b")"].concat();
@@ -492,7 +498,7 @@ fn cmd_asphag() -> CommandDef {
         "asphag [hagname] — Show members of a Host Access Group (all if omitted).",
         |args: &[ArgValue], ctx: &CommandContext| {
             let filter = match &args[0] {
-                ArgValue::String(s) => Some(s.as_str()),
+                ArgValue::String(s) => Some(s.as_bytes()),
                 _ => None,
             };
             with_config(ctx, |cfg| print_groups(ctx, b"HAG", &cfg.hag, filter))
@@ -512,11 +518,11 @@ fn cmd_asprules() -> CommandDef {
         "asprules [asgname] — List rules of an Access Security Group (all if omitted).",
         |args: &[ArgValue], ctx: &CommandContext| {
             let filter = match &args[0] {
-                ArgValue::String(s) => Some(s.as_str()),
+                ArgValue::String(s) => Some(s.as_bytes()),
                 _ => None,
             };
             with_config(ctx, |cfg| {
-                let dump = cfg.dump_rules(filter.map(str::as_bytes));
+                let dump = cfg.dump_rules(filter);
                 println_dump(ctx, &dump)
             })
         },
@@ -554,7 +560,7 @@ fn cmd_aspmem() -> CommandDef {
             }
             // Group every record by its ASG field.
             let names = ctx.block_on(ctx.db().all_record_names());
-            let mut by_asg: std::collections::BTreeMap<String, Vec<String>> =
+            let mut by_asg: std::collections::BTreeMap<String, Vec<crate::types::RecordName>> =
                 std::collections::BTreeMap::new();
             for rec_name in &names {
                 if let Some(rec) = ctx.db().get_record(rec_name) {
@@ -566,7 +572,10 @@ fn cmd_aspmem() -> CommandDef {
                 }
             }
             for (asg, members) in &by_asg {
-                if filter.as_deref().is_some_and(|f| f != asg) {
+                if filter
+                    .as_ref()
+                    .is_some_and(|f| f.as_bytes() != asg.as_bytes())
+                {
                     continue;
                 }
                 ctx.println(&format!("ASG({asg})"));
@@ -897,12 +906,12 @@ mod tests {
             b"UAG(ops) { \"op\xff\" }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(ops) } }\n",
         )
         .unwrap();
-        let cfg = as_init_file(tmp.path().to_str().unwrap(), None).expect("C loads it");
+        let cfg = as_init_file(tmp.path().to_str().unwrap().as_bytes(), None).expect("C loads it");
         assert_eq!(cfg.uag[b"ops".as_slice()], [b"op\xff".to_vec()]);
     }
 
     /// Run one `as*` command and return `(outcome, everything it printed)`.
-    fn run_as(ctx: &CommandContext, name: &str, argv: &[String]) -> (CommandResult, String) {
+    fn run_as(ctx: &CommandContext, name: &str, argv: &[IocshString]) -> (CommandResult, String) {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get(name).unwrap();
@@ -1010,7 +1019,8 @@ mod tests {
             r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
         )
         .unwrap();
-        as_state().lock().unwrap().filename = Some(tmp.path().to_string_lossy().into());
+        as_state().lock().unwrap().filename =
+            Some(tmp.path().as_os_str().as_encoded_bytes().to_vec());
         crate::runtime::task::test_block_on(async move {
             let db = Arc::new(PvDatabase::new());
             db.add_record("rv", Box::new(AiRecord::new(5.0)))
@@ -1055,7 +1065,7 @@ mod tests {
         register(&mut reg);
         let mut words = line.split(' ');
         let cmd = reg.get(words.next().unwrap()).unwrap();
-        let argv: Vec<String> = words.map(String::from).collect();
+        let argv: Vec<IocshString> = words.map(IocshString::from).collect();
         let args = parse_args(&argv, &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -1091,7 +1101,11 @@ mod tests {
                 b"UAG(\"u\xff\") { \"$(M)\" }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(\"u\xff\") } }\n",
             )
             .unwrap();
-        let cfg = as_init_file(tmp.path().to_str().unwrap(), Some("M=\"b\u{e9}\"")).unwrap();
+        let cfg = as_init_file(
+            tmp.path().to_str().unwrap().as_bytes(),
+            Some("M=\"b\u{e9}\"".as_bytes()),
+        )
+        .unwrap();
         assert_eq!(
             cfg.uag[b"u\xff".as_slice()],
             vec!["b\u{e9}".as_bytes().to_vec()]

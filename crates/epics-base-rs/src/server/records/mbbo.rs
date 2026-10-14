@@ -41,7 +41,7 @@ pub struct MbboRecord {
     pub unsv: i16,
     pub cosv: i16,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     // State raw values ZRVL..FFVL are DBF_ULONG (mbboRecord.dbd.pod:222-342).
     pub zrvl: u32,
     pub onvl: u32,
@@ -76,8 +76,8 @@ pub struct MbboRecord {
     pub ftst: PvString,
     pub ffst: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Set by `convert()` when VAL is an illegal state (`> 15` with a
@@ -131,7 +131,7 @@ impl Default for MbboRecord {
             unsv: 0,
             cosv: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             zrvl: 0,
             onvl: 0,
             twvl: 0,
@@ -165,8 +165,8 @@ impl Default for MbboRecord {
             ftst: PvString::new(),
             ffst: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             soft_alarm: false,
@@ -320,7 +320,7 @@ macro_rules! mbb_put_field {
     // with `.as_str_lossy().into_owned()`.
     (@put $self:expr, $field:ident, String, $value:expr, $name:expr) => {
         if let EpicsValue::String(v) = $value {
-            $self.$field = v.as_str_lossy().into_owned();
+            $self.$field = v;
         } else {
             return Err(CaError::TypeMismatch($name.into()));
         }
@@ -732,11 +732,11 @@ impl Record for MbboRecord {
         crate::server::record::SecondaryTake::unguarded(u64::from(rval) | u64::from(rbv) << 1)
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }

@@ -19,36 +19,44 @@ struct Remote {
     puts: Arc<Mutex<Vec<(String, EpicsValue)>>>,
 }
 
-fn native(name: &str) -> Option<LinkDbfType> {
+fn native(name: &[u8]) -> Option<LinkDbfType> {
     match name {
-        "AO" => Some(LinkDbfType::Double),
-        "WF" => Some(LinkDbfType::Char),
+        b"AO" => Some(LinkDbfType::Double),
+        b"WF" => Some(LinkDbfType::Char),
         _ => None,
     }
 }
 
 #[epics_base_rs::async_trait]
 impl LinkSet for Remote {
-    fn is_connected(&self, name: &str) -> bool {
+    fn is_connected(&self, name: &[u8]) -> bool {
         native(name).is_some()
     }
-    fn put_admission(&self, name: &str) -> PutAdmission {
+    fn put_admission(&self, name: &[u8]) -> PutAdmission {
         match native(name) {
             Some(_) => PutAdmission::Connected,
             None => PutAdmission::Refused,
         }
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _name: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn put_value(&self, name: &str, value: EpicsValue, _op: LinkPutOp) -> Result<(), String> {
-        self.puts.lock().unwrap().push((name.to_string(), value));
+    async fn put_value(
+        &self,
+        name: &[u8],
+        value: EpicsValue,
+        _op: LinkPutOp,
+    ) -> Result<(), String> {
+        self.puts
+            .lock()
+            .unwrap()
+            .push((String::from_utf8_lossy(name).into_owned(), value));
         Ok(())
     }
-    fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, name: &[u8]) -> Option<LinkMetadata> {
         native(name).map(|t| LinkMetadata {
             dbf_type: Some(t),
             element_count: Some(1),
@@ -73,7 +81,7 @@ fn chars(s: &str) -> EpicsValue {
 }
 
 fn sevr(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.SEVR")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.SEVR")).unwrap().to_f64().unwrap()
 }
 
 #[epics_macros_rs::epics_test]

@@ -8,7 +8,7 @@ use epics_base_rs::server::record::{
     link_field_type,
 };
 use epics_base_rs::server::records::link_status::{LINK_EXT_NC, LinkStatusGen, classify_link};
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{EpicsValue, PvString};
 
 // `menu(throttleSTS)` indices (throttleRecord.dbd) — STS is set only by a
 // real link operation (`valuePut`/`valueSync`), never by the limit block.
@@ -107,11 +107,11 @@ pub struct ThrottleRecord {
     /// Delay between outputs in seconds (DLY)
     pub dly: f64,
     /// Output link (OUT)
-    pub out: String,
+    pub out: PvString,
     /// Output link valid: 0=ExtNC, 1=Ext, 2=Local, 3=Constant (OV), read-only
     pub ov: i16,
     /// Sync input link (SINP)
-    pub sinp: String,
+    pub sinp: PvString,
     /// Sync input link valid (SIV), read-only
     pub siv: i16,
     /// Sync trigger: 0=Idle, 1=Process (SYNC)
@@ -160,7 +160,7 @@ pub struct ThrottleRecord {
     /// (e.g. a `process()`-only unit test that never registers). Drives the
     /// OV/SIV link-status classification (C `init_record`/`special` →
     /// `dbNameToAddr`).
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(epics_base_rs::types::RecordName, AsyncDbHandle)>,
     /// The callback band this record's `PRIO` selects, refreshed from
     /// [`ProcessContext`](epics_base_rs::server::record::ProcessContext)
     /// before every `process()` — C reads `prec->prio` at the same point
@@ -197,9 +197,9 @@ impl Default for ThrottleRecord {
             prec: 0,
             dprec: 0,
             dly: 0.0,
-            out: String::new(),
+            out: PvString::new(),
             ov: 3, // Constant
-            sinp: String::new(),
+            sinp: PvString::new(),
             siv: 3,  // Constant
             sync: 0, // Idle
             limit_flag: false,
@@ -618,9 +618,9 @@ impl Record for ThrottleRecord {
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "DPREC" => Some(EpicsValue::Short(self.dprec)),
             "DLY" => Some(EpicsValue::Double(self.dly)),
-            "OUT" => Some(EpicsValue::String(self.out.clone().into())),
+            "OUT" => Some(EpicsValue::String(self.out.clone())),
             "OV" => Some(EpicsValue::Short(self.ov)),
-            "SINP" => Some(EpicsValue::String(self.sinp.clone().into())),
+            "SINP" => Some(EpicsValue::String(self.sinp.clone())),
             "SIV" => Some(EpicsValue::Short(self.siv)),
             "SYNC" => Some(EpicsValue::Short(self.sync)),
             _ => None,
@@ -708,14 +708,14 @@ impl Record for ThrottleRecord {
             },
             "OUT" => match value {
                 EpicsValue::String(v) => {
-                    self.out = v.as_str_lossy().into_owned();
+                    self.out = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SINP" => match value {
                 EpicsValue::String(v) => {
-                    self.sinp = v.as_str_lossy().into_owned();
+                    self.sinp = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -919,7 +919,7 @@ impl Record for ThrottleRecord {
         self.callback_priority = ctx.callback_priority;
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` classifies the OUT/SINP links into OV/SIV and
         // posts the initial status (throttleRecord.c:171-205). This is the

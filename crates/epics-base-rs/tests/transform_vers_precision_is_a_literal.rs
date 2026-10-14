@@ -19,7 +19,7 @@ use epics_base_rs::types::EpicsValue;
 
 fn transform_with_prec(prec: i16) -> RecordInstance {
     let rec = module_records::create_any("transform").expect("the test registers transform");
-    let mut inst = RecordInstance::new_boxed("T".to_string(), rec);
+    let mut inst = RecordInstance::new_boxed("T", rec);
     inst.record
         .put_field("PREC", EpicsValue::Short(prec))
         .expect("transform stores PREC");

@@ -495,11 +495,11 @@ pub fn db_load_group_startup_command() -> CommandDef {
         "dbLoadGroup <jsonFilename> [<macros>]",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let filename = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("dbLoadGroup: missing filename".into()),
             };
             let macros = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => String::new(),
             };
             let mut queue = GROUP_LOAD_REQUESTS.lock().unwrap();
@@ -1616,7 +1616,11 @@ impl IocBuild {
                         connected,
                         total,
                         link_wait_secs,
-                        unconnected = %unconnected.join(", "),
+                        unconnected = %unconnected
+                            .iter()
+                            .map(|n| n.to_str_lossy())
+                            .collect::<Vec<_>>()
+                            .join(", "),
                         "iocInit: proceeding without unconnected external links"
                     );
                 }
@@ -2554,10 +2558,11 @@ impl IocApplication {
                     // same). Reading only `Err` dropped the second kind
                     // from this summary.
                     // C runs each through `iocshCmd` (`afterIocRunning.c:49`).
+                    let shown = String::from_utf8_lossy(&line);
                     match shell.iocsh_cmd(&line) {
-                        Err(e) => errs.push(format!("{line}: {e}")),
+                        Err(e) => errs.push(format!("{shown}: {e}")),
                         Ok(iocsh::registry::CommandOutcome::Failed) => {
-                            errs.push(format!("{line}: failed"));
+                            errs.push(format!("{shown}: failed"));
                         }
                         Ok(
                             iocsh::registry::CommandOutcome::Continue
@@ -2716,11 +2721,17 @@ pub(crate) fn attach_device_support(
         // not this one.
         return false;
     }
+    // A device address is text to its support; a name's bytes reach no
+    // dset through this context.
+    let (inp, out) = (
+        instance.common.text.inp.as_str_lossy(),
+        instance.common.text.out.as_str_lossy(),
+    );
     let ctx = DeviceSupportContext {
         record_type: instance.record.record_type(),
         dtyp: &dtyp,
-        inp: &instance.common.text.inp,
-        out: &instance.common.text.out,
+        inp: &inp,
+        out: &out,
     };
     let dev_opt = resolve.and_then(|resolve| resolve(&ctx));
     let Some(dev) = dev_opt else {
@@ -2902,7 +2913,7 @@ pub(crate) fn wire_subroutine(
 /// demotion is `scanAdd`'s documented behaviour, not news.
 ///
 /// [`rec_gbl_record_error`]: crate::server::recgbl::rec_gbl_record_error
-async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, message: &str) {
+async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: &str) {
     let Some(rec_arc) = db.get_record(name) else {
         return;
     };
@@ -2923,7 +2934,7 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, message: &str) {
     }
     // C passes `-1`, for which `errSymLookup` is skipped and the slot is
     // empty (`recGbl.c:65-70`) — hence the doubled space in C's own output.
-    crate::server::recgbl::rec_gbl_record_error("", name, message);
+    crate::server::recgbl::rec_gbl_record_error("", &String::from_utf8_lossy(name), message);
 }
 
 /// Set up I/O Intr scanning for records with SCAN="I/O Intr".
@@ -2933,7 +2944,7 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, message: &str) {
 /// the other.
 pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     let all_names = db.all_record_names().await;
-    let io_intr_recs: Vec<(String, Arc<record::RecordCell>)> = {
+    let io_intr_recs: Vec<(crate::types::RecordName, Arc<record::RecordCell>)> = {
         let mut recs = Vec::new();
         for name in &all_names {
             if let Some(arc) = db.get_record(name) {
@@ -2948,7 +2959,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     // demotion runs after the loop: it takes the registration mutex and the
     // records map (`update_scan_index`), which must not be entered while this
     // loop holds a record's write guard.
-    let mut demote: Vec<(String, &'static str)> = Vec::new();
+    let mut demote: Vec<(crate::types::RecordName, &'static str)> = Vec::new();
     for (name, rec_arc) in io_intr_recs {
         let mut inst = rec_arc.write();
         // Wire poll feedback when the record is on I/O Intr scan, OR when the
@@ -3108,7 +3119,7 @@ mod io_intr_scan_add_tests {
             let mut inst = rec.write();
             inst.common.scan = ScanType::IoIntr;
         }
-        db.update_scan_index("NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0);
+        db.update_scan_index(b"NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0);
         assert_eq!(
             db.records_for_scan(ScanType::IoIntr).await,
             vec!["NODEV".to_string()],
@@ -3163,7 +3174,7 @@ mod io_intr_scan_add_tests {
             inst.common.scan = ScanType::IoIntr;
             inst.device = Some(Box::new(NoIntrDevice));
         }
-        db.update_scan_index("NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0);
+        db.update_scan_index(b"NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0);
 
         let wired = setup_io_intr(db.clone()).await;
         assert_eq!(wired, 0, "no interrupt source ⇒ nothing to wire");
@@ -3343,21 +3354,21 @@ mod tests {
         std::fs::write(&b, "{}").unwrap();
 
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\")", a.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\")", a.display()))
             .unwrap();
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\",\"M=1\")", b.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\",\"M=1\")", b.display()))
             .unwrap();
         // Re-load of the same identity nets to one entry (pvxs erases first).
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\")", a.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\")", a.display()))
             .unwrap();
 
         // Missing file: softIocPVX 1.5.3 writes `Error opening "nosuch.json"`
         // to stderr at the st.cmd line and marks the line failed.
         let err = tmpdir.path().join("err");
         assert!(matches!(
-            shell.execute_line(&format!(
+            shell.execute_line(format!(
                 "dbLoadGroup(\"/no/such/group.json\") 2> {}",
                 err.display()
             )),
@@ -3370,7 +3381,7 @@ mod tests {
 
         // `-file` removes only the matching identity (a, macros="").
         shell
-            .execute_line(&format!("dbLoadGroup(\"-{}\")", a.display()))
+            .execute_line(format!("dbLoadGroup(\"-{}\")", a.display()))
             .unwrap();
 
         let reqs = take_group_load_requests();
@@ -3380,7 +3391,7 @@ mod tests {
 
         // `-*` clears the whole queue.
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\")", b.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\")", b.display()))
             .unwrap();
         shell.execute_line("dbLoadGroup(\"-*\")").unwrap();
         assert!(
@@ -3959,7 +3970,7 @@ mod lifecycle_tests {
             let rec = db.get_record("EV").unwrap();
             rec.write().common.scan = ScanType::Event;
         }
-        db.update_scan_index("EV", ScanType::Passive, ScanType::Event, 0, 0);
+        db.update_scan_index(b"EV", ScanType::Passive, ScanType::Event, 0, 0);
 
         build_and_run_on(&db).await;
         db.post_event().await;

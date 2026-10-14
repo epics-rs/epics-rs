@@ -515,7 +515,7 @@ async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
     // `Arc<PvDatabase>` clones on top of this; teardown must release them.
     let baseline = Arc::strong_count(&db);
 
-    let mut rx = ChannelSource::subscribe(&store, "TEST:allconst")
+    let mut rx = ChannelSource::subscribe(&store, b"TEST:allconst")
         .await
         .expect("subscribe opens the all-const group monitor");
 
@@ -846,8 +846,8 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     struct DenySpecific(String);
     #[async_trait::async_trait]
     impl AccessControl for DenySpecific {
-        async fn can_write(&self, channel: &str, _: &[u8], _: &str) -> bool {
-            channel != self.0
+        async fn can_write(&self, channel: &[u8], _: &[u8], _: &str) -> bool {
+            channel != self.0.as_bytes()
         }
     }
 
@@ -1643,7 +1643,7 @@ async fn trapped_group_put_emits_per_member_astrapwrite() {
     struct TrapAll;
     #[async_trait::async_trait]
     impl AccessControl for TrapAll {
-        async fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
+        async fn write_grant(&self, _channel: &[u8], _creds: &ClientCreds) -> WriteGrant {
             WriteGrant {
                 allowed: true,
                 rule_was_trap: true,
@@ -1673,11 +1673,11 @@ async fn trapped_group_put_emits_per_member_astrapwrite() {
     let _handle = register_trap_write_listener(Arc::new(move |msg: &TrapWriteMessage<'_>| {
         if matches!(
             msg.pv_name,
-            "TEST:level.VAL" | "TEST:count.VAL" | "TEST:grp"
+            b"TEST:level.VAL" | b"TEST:count.VAL" | b"TEST:grp"
         ) {
             cap.lock().unwrap().push((
                 msg.op,
-                msg.pv_name.to_string(),
+                String::from_utf8_lossy(msg.pv_name).into_owned(),
                 msg.status.map(|s| s.to_string()),
             ));
         }
@@ -2148,7 +2148,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     // The group monitor through the provider, so it registers with the
     // provider's shared GroupPump — the as-deployed wiring.
     let group_ch = match provider
-        .create_channel_for("TEST:floodgrp", "u", "h")
+        .create_channel_for(b"TEST:floodgrp", "u", "h")
         .await
         .expect("group channel")
     {
@@ -2159,7 +2159,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     group_mon.start().await.expect("group monitor starts");
 
     let mut scalar_mon = epics_pva_rs::server::PvDatabaseSource::new(db.clone())
-        .subscribe("TEST:flood_scalar")
+        .subscribe(b"TEST:flood_scalar")
         .await
         .expect("scalar monitor");
 
@@ -2175,7 +2175,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
             while !stop.load(Ordering::Relaxed) {
                 for i in 0..20 {
                     let rec = db
-                        .get_record(&format!("TEST:fm{i:02}"))
+                        .get_record(format!("TEST:fm{i:02}"))
                         .expect("member record");
                     rec.write()
                         .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
@@ -2348,7 +2348,7 @@ async fn a_single_info_group_fragment_resolves_its_relative_channel() {
         .get_info("Q:group")
         .map(str::to_string)
         .unwrap();
-    provider.load_info_group("LZ:O", &json).expect("load");
+    provider.load_info_group(b"LZ:O", &json).expect("load");
     assert_eq!(provider.process_groups().await, 1);
 
     db.put_pv("LZ:O", EpicsValue::String("world".into()))
@@ -2410,7 +2410,7 @@ async fn a_dollar_text_member_serves_what_softiocpvx_serves() {
         .expect("load");
     assert_eq!(provider.process_groups().await, 1, "GL is not created");
 
-    let writer = BridgeChannel::new(db.clone(), "LZ:F").await.expect("LZ:F");
+    let writer = BridgeChannel::new(db.clone(), b"LZ:F").await.expect("LZ:F");
     let put = |t: &'static str| {
         let writer = &writer;
         async move {

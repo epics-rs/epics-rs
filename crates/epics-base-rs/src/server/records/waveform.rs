@@ -92,8 +92,8 @@ pub struct WaveformRecord {
     /// written only by the simulation-mode owner
     /// (`RecordInstance::rec_gbl_save_simm` / `rec_gbl_check_simm`).
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     /// SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`;
     /// aaiRecord.dbd.pod:409-415, aaoRecord.dbd.pod:442-448,
@@ -116,7 +116,7 @@ pub struct WaveformRecord {
     /// (non-constant) link (C `aaoRecord.c::fetchValue` `dbGetLink`, 366).
     /// Whether it is a constant is the framework's to say, from the link it
     /// parsed once ([`Record::pre_input_link_actions`]'s argument).
-    dol: String,
+    dol: PvString,
     /// Did `init_record` pass 1 load a constant closed-loop DOL into the
     /// buffer? C `fetchValue(prec, 1)` sets `prec->udf = FALSE` on success
     /// (aaoRecord.c:371-374); UDF lives in the common fields, which
@@ -226,8 +226,8 @@ impl Default for WaveformRecord {
             // non-subArray kinds, which never read the field.)
             malm: 1,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
             // "synchronous simulation", the default on all three sim-bearing
@@ -237,7 +237,7 @@ impl Default for WaveformRecord {
             // `DBF_INLINK` with no `initial(...)`, so both default to the
             // zero value: OMSL=supervisory (no DOL fetch), DOL=constant/empty.
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             constant_dol_loaded: false,
             dol_fetch_requested: false,
             dol_read_failed: false,
@@ -522,8 +522,8 @@ impl WaveformRecord {
     }
 
     /// The aao DOL text, and whether it is a constant.
-    pub fn set_dol(&mut self, dol: String) {
-        self.dol = dol;
+    pub fn set_dol(&mut self, dol: impl Into<PvString>) {
+        self.dol = dol.into();
     }
 
     /// Reallocate VAL buffer to match current FTVL and `val_capacity` —
@@ -1290,11 +1290,11 @@ impl Record for WaveformRecord {
         }
     }
 
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match link_field {
-            "DOL" => Some(&self.dol),
-            "SIML" => Some(&self.siml),
-            "SIOL" => Some(&self.siol),
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
             _ => None,
         }
     }
@@ -1549,14 +1549,14 @@ impl Record for WaveformRecord {
             },
             "SIML" if self.has_sim_block() => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s.as_str_lossy().into_owned();
+                    self.siml = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" if self.has_sim_block() => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s.as_str_lossy().into_owned();
+                    self.siol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -1588,7 +1588,7 @@ impl Record for WaveformRecord {
             },
             "DOL" if matches!(self.kind, ArrayKind::Aao) => match value {
                 EpicsValue::String(s) => {
-                    self.set_dol(s.as_str_lossy().into_owned());
+                    self.set_dol(s);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("DOL".into())),
@@ -1871,7 +1871,7 @@ mod array_kind_tests {
     /// hook: [`parse_link_v2`]'s classification alone (C's `dbParseLink`,
     /// `dbStaticLib.c:2346-2357`) — empty, a whole double, or bracketed is
     /// constant; `1 2 3` is a PV_LINK to a record named `1`.
-    fn dol_is_constant(dol: &str) -> bool {
+    fn dol_is_constant(dol: &PvString) -> bool {
         crate::server::recgbl::simm::is_constant(&parse_link_v2(dol))
     }
 
@@ -2817,7 +2817,7 @@ mod array_kind_tests {
         let mut rec = WaveformRecord::with_kind(ArrayKind::Waveform);
         rec.put_field("MPST", EpicsValue::Short(0)).unwrap();
         assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(0)));
-        let inst = RecordInstance::new("WF:MPST".into(), rec);
+        let inst = RecordInstance::new("WF:MPST", rec);
         let snap = inst.snapshot_for_field("MPST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(0));
         assert_eq!(
@@ -2855,7 +2855,7 @@ mod array_kind_tests {
             assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
             // OLDSIMM is special(SPC_NOMOD) and lives in the common fields
             // (the simulation owner's latch) — readable, not client-writable.
-            let mut inst = RecordInstance::new("WF:OLDSIMM".into(), rec);
+            let mut inst = RecordInstance::new("WF:OLDSIMM", rec);
             assert!(matches!(
                 inst.put_common_field("OLDSIMM", EpicsValue::Short(1)),
                 Err(crate::error::CaError::ReadOnlyField(_))
@@ -2866,7 +2866,7 @@ mod array_kind_tests {
         // SIMM snapshot carries the NO/YES menuYesNo labels on these records.
         let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
         wf.put_field("SIMM", EpicsValue::Short(1)).unwrap();
-        let inst = RecordInstance::new("WF:SIMM".into(), wf);
+        let inst = RecordInstance::new("WF:SIMM", wf);
         let snap = inst.snapshot_for_field("SIMM").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);

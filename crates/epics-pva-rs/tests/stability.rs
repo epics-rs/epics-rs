@@ -25,6 +25,7 @@
 // (5 live client↔server monitor tests gated out on the exec backend above;
 // stage 3.)
 
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,7 +51,7 @@ struct MemSource {
 struct MemSourceInner {
     state: Mutex<MemState>,
     /// Subscribers per PV — every push fans out to all of them.
-    subs: Mutex<std::collections::HashMap<String, Vec<mpsc::Sender<PvField>>>>,
+    subs: Mutex<std::collections::HashMap<RecordName, Vec<mpsc::Sender<PvField>>>>,
     /// ordered log of every `notify_monitor_start(name, start)`
     /// the server fires, so a test can assert the Executing<->Idle edges.
     /// Sync mutex because `notify_monitor_start` is a sync trait method.
@@ -58,7 +59,7 @@ struct MemSourceInner {
 }
 
 struct MemState {
-    values: std::collections::HashMap<String, PvField>,
+    values: std::collections::HashMap<RecordName, PvField>,
 }
 
 /// Fan a value out to one PV's monitor subscribers, reaping only the dead.
@@ -122,7 +123,7 @@ impl MemSource {
             .lock()
             .await
             .values
-            .insert(name.to_string(), pv);
+            .insert(RecordName::from(name), pv);
     }
 
     /// register an NTScalarArray PV holding a Double array.
@@ -133,7 +134,7 @@ impl MemSource {
             .lock()
             .await
             .values
-            .insert(name.to_string(), pv);
+            .insert(RecordName::from(name), pv);
     }
 
     /// Push a new Double-array value to an NTScalarArray PV.
@@ -144,9 +145,9 @@ impl MemSource {
             .lock()
             .await
             .values
-            .insert(name.to_string(), pv.clone());
+            .insert(RecordName::from(name), pv.clone());
         let mut subs = self.inner.subs.lock().await;
-        if let Some(list) = subs.get_mut(name) {
+        if let Some(list) = subs.get_mut(name.as_bytes()) {
             fan_out(list, &pv).await;
         }
     }
@@ -158,10 +159,10 @@ impl MemSource {
             .lock()
             .await
             .values
-            .insert(name.to_string(), pv.clone());
+            .insert(RecordName::from(name), pv.clone());
         // Notify subscribers (reap only the dead — see `fan_out`).
         let mut subs = self.inner.subs.lock().await;
-        if let Some(list) = subs.get_mut(name) {
+        if let Some(list) = subs.get_mut(name.as_bytes()) {
             fan_out(list, &pv).await;
         }
     }
@@ -198,7 +199,7 @@ fn nt_double_array_desc() -> FieldDesc {
 }
 
 impl ChannelSource for MemSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let inner = self.inner.clone();
         async move {
             inner
@@ -211,17 +212,17 @@ impl ChannelSource for MemSource {
                 .collect::<Vec<_>>()
         }
     }
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { inner.state.lock().await.values.contains_key(&name) }
     }
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             // derive the descriptor from the stored value's
             // shape so an NTScalarArray PV reports an array descriptor.
@@ -239,18 +240,18 @@ impl ChannelSource for MemSource {
             }
         }
     }
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { inner.state.lock().await.values.get(&name).cloned() }
     }
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             inner
                 .state
@@ -265,15 +266,15 @@ impl ChannelSource for MemSource {
             Ok(())
         }
     }
-    fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         async { true }
     }
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             if !inner.state.lock().await.values.contains_key(&name) {
                 return None;
@@ -285,14 +286,14 @@ impl ChannelSource for MemSource {
     }
     fn notify_monitor_start(
         &self,
-        name: &str,
+        name: &[u8],
         _ctx: &epics_pva_rs::server_native::source::ChannelContext,
         start: bool,
     ) {
         self.inner
             .monitor_starts
             .lock()
-            .push((name.to_string(), start));
+            .push((String::from_utf8_lossy(name).into_owned(), start));
     }
 }
 
@@ -2469,29 +2470,29 @@ struct GatedArraySource {
 }
 
 impl ChannelSource for GatedArraySource {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         vec!["GATED:ARR".into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let n = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let n = RecordName::from(n);
         async move { n == "GATED:ARR" }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(nt_double_array_desc())
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(make_nt_double_array(&[1.0, 2.0, 3.0]))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Ok(())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
-    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
         None
     }
-    async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {
+    async fn channel_array_init(&self, _: &[u8], _: ChannelContext) -> Result<FieldDesc, OpError> {
         Ok(FieldDesc::ScalarArray(ScalarType::Double))
     }
     async fn channel_array_get(

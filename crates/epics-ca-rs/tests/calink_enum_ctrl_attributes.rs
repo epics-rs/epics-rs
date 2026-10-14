@@ -64,7 +64,7 @@ async fn metadata_when(
     );
     let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        if let Some(md) = LinkSet::link_metadata(resolver, pv)
+        if let Some(md) = LinkSet::link_metadata(resolver, pv.as_bytes())
             && ready(&md)
         {
             return md;

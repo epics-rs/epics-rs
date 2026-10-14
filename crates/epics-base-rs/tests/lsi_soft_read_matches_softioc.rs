@@ -39,7 +39,7 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 fn text(db: &PvDatabase, rec: &str) -> String {
-    match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+    match db.get_pv(format!("{rec}.VAL")).unwrap() {
         EpicsValue::CharArray(b) => {
             String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default()).into_owned()
         }

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::server::database::{AsyncDbHandle, PostItem, PostRule};
 use crate::server::record::{LinkType, parse_link_v2};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Monotonic generation gate for spawned async link-status refreshes.
 ///
@@ -77,7 +77,7 @@ impl LinkStatusToken {
     pub fn post<P: crate::server::database::PostItem>(
         self,
         handle: &AsyncDbHandle,
-        name: &str,
+        name: &[u8],
         fields: Vec<P>,
         mask: crate::server::recgbl::EventMask,
     ) {
@@ -92,7 +92,7 @@ impl LinkStatusToken {
     pub fn post_forced(
         self,
         handle: &AsyncDbHandle,
-        name: &str,
+        name: &[u8],
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
     ) {
@@ -241,7 +241,8 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does. There is
 /// no gate to observe here because there is no way to run this against a
 /// half-built database.
-pub fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
+pub fn classify_link(handle: &AsyncDbHandle, link: impl AsRef<[u8]>) -> (i16, i16) {
+    let link = link.as_ref();
     match parse_link_v2(link).link_type() {
         // Empty / constant link: C → CON, no target type.
         LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),
@@ -295,9 +296,9 @@ pub fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
 /// alone — `sseqRecord.c:221`, `:240`, `:910`; `swaitRecord.c:527`, `:550`,
 /// `:923` — so a mask change here is only half of that family.
 pub fn post_link_status(
-    ctx: Option<&(String, AsyncDbHandle)>,
+    ctx: Option<&(crate::types::RecordName, AsyncDbHandle)>,
     generation: &LinkStatusGen,
-    links: Vec<(&'static str, String)>,
+    links: Vec<(&'static str, PvString)>,
     mask: crate::server::recgbl::EventMask,
     posts: LinkStatusPosts,
 ) {
@@ -372,8 +373,9 @@ pub const SWAIT_NO_PV: i16 = 2;
 /// record is `PV_OK`, and every name that cannot be resolved here — an unknown
 /// record, a CA/PVA target, a bare constant that is not a PV name at all —
 /// stays at the `PV_NC` C leaves it in until a search succeeds.
-pub fn classify_swait_pv(handle: &AsyncDbHandle, name: &str) -> i16 {
-    if name.trim().is_empty() {
+pub fn classify_swait_pv(handle: &AsyncDbHandle, name: impl AsRef<[u8]>) -> i16 {
+    let name = name.as_ref();
+    if crate::server::record::trim_link_text(name).is_empty() {
         return SWAIT_NO_PV;
     }
     // Same `iocInit` boundary as `classify_link`: this only ever runs against

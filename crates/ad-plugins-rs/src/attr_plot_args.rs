@@ -40,7 +40,7 @@ pub struct AttrPlotArgs {
 /// fallbacks only affect malformed calls.
 pub fn parse_attr_plot_args(args: &[ArgValue]) -> Result<AttrPlotArgs, String> {
     let port_name = match args.first() {
-        Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+        Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
         _ => return Err("NDAttrPlotConfig: portName required".into()),
     };
     let usize_arg = |i: usize, default: usize| match args.get(i) {
@@ -48,7 +48,7 @@ pub fn parse_attr_plot_args(args: &[ArgValue]) -> Result<AttrPlotArgs, String> {
         _ => default,
     };
     let in_port = match args.get(4) {
-        Some(ArgValue::String(s)) => s.clone(),
+        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
         _ => String::new(),
     };
     Ok(AttrPlotArgs {
@@ -72,14 +72,14 @@ mod tests {
         // distinct order (n_attributes/cache/blocks before in_port, queue at
         // index 6) is the parity-critical mapping this guards.
         let args = vec![
-            ArgValue::String("AP1".to_string()),
-            ArgValue::Int(10),                    // n_attributes
-            ArgValue::Int(500),                   // cache_size
-            ArgValue::Int(3),                     // n_selected_blocks
-            ArgValue::String("DET1".to_string()), // in_port
-            ArgValue::Int(0),                     // in_addr
-            ArgValue::Int(50),                    // queue_size
-            ArgValue::Int(0),                     // blocking_callbacks
+            ArgValue::String("AP1".into()),
+            ArgValue::Int(10),               // n_attributes
+            ArgValue::Int(500),              // cache_size
+            ArgValue::Int(3),                // n_selected_blocks
+            ArgValue::String("DET1".into()), // in_port
+            ArgValue::Int(0),                // in_addr
+            ArgValue::Int(50),               // queue_size
+            ArgValue::Int(0),                // blocking_callbacks
         ];
         let p = parse_attr_plot_args(&args).unwrap();
         assert_eq!(p.port_name, "AP1");
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn parse_attr_plot_args_requires_port_name() {
         assert!(parse_attr_plot_args(&[]).is_err());
-        assert!(parse_attr_plot_args(&[ArgValue::String(String::new())]).is_err());
+        assert!(parse_attr_plot_args(&[ArgValue::String(Default::default())]).is_err());
         assert!(parse_attr_plot_args(&[ArgValue::Int(1)]).is_err());
     }
 
@@ -102,7 +102,7 @@ mod tests {
         // Boundary: an explicit cache_size=0 is meaningful (unlimited) and must be
         // honoured; absent n_attributes/n_data_blocks/queue_size fall back.
         let args = vec![
-            ArgValue::String("AP2".to_string()),
+            ArgValue::String("AP2".into()),
             ArgValue::Missing, // n_attributes absent
             ArgValue::Int(0),  // cache_size = unlimited (explicit 0, not a fallback)
         ];

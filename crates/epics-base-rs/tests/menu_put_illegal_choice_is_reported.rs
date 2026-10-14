@@ -96,7 +96,7 @@ async fn dbpf_sel_selm_space_mask_prints_recgbldbaddrerror_cvt_st_menu() {
             "dbpf {rec}.{field} {text:?}"
         );
         let index = db
-            .get_pv(&format!("{rec}.{field}"))
+            .get_pv(format!("{rec}.{field}"))
             .unwrap()
             .to_f64()
             .unwrap();

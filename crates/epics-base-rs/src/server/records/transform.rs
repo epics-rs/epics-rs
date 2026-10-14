@@ -4,6 +4,7 @@ use crate::server::record::{
     ProcessOutcome, Record, parse_link_v2, parse_output_link_v2,
 };
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
 use crate::calc::{Rpcl, StringInputs, scalc_perform};
 
@@ -101,8 +102,8 @@ pub struct TransformRecord {
     cmts: [String; NUM_CHANNELS],
     /// INPA..INPP / OUTA..OUTP. Private with `inp_linked` / `out_linked`:
     /// [`Self::put_field`] is their one writer.
-    inp_links: [String; NUM_CHANNELS],
-    out_links: [String; NUM_CHANNELS],
+    inp_links: [PvString; NUM_CHANNELS],
+    out_links: [PvString; NUM_CHANNELS],
     /// Bit `i` set when `inp_links[i]` is not C's CONSTANT ([`Self::no_inlink`]).
     inp_linked: u16,
     /// Bit `i` set when `out_links[i]` is not C's CONSTANT ([`Self::no_outlink`]).
@@ -143,7 +144,7 @@ pub struct TransformRecord {
     /// calcout/scalcout/acalcout use (see `link_status::post_link_status`).
     /// sseq and swait own link-status fields too but post them from their own
     /// refresh, because their field sets are not one enum per link.
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
     /// A refused CLCx's report, made by `recompile` and printed by
     /// `init_record` or, for a put, by the put's owner after the hold.
@@ -433,7 +434,7 @@ impl TransformRecord {
     /// `transformRecord.c::init_record` (444-473) and the `special()`
     /// re-classification (709-742). No-op without an async context.
     fn refresh_link_status(&self, posts: LinkStatusPosts) {
-        let mut links: Vec<(&'static str, String)> = Vec::with_capacity(2 * NUM_CHANNELS);
+        let mut links: Vec<(&'static str, PvString)> = Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
             links.push((IAV_FIELD_NAMES[i], self.inp_links[i].clone()));
             links.push((OAV_FIELD_NAMES[i], self.out_links[i].clone()));
@@ -626,8 +627,11 @@ impl Record for TransformRecord {
                 self.recompile(i, "transform: init_record: Illegal CALC field");
                 // Not under a put's hold, so it prints at once.
                 if let Some(report) = self.put_report.take() {
-                    let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-                    report.emit(name, "");
+                    let name = self
+                        .async_ctx
+                        .as_ref()
+                        .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+                    report.emit(&name, "");
                 }
             }
         }
@@ -849,12 +853,12 @@ impl Record for TransformRecord {
     /// C reads `ptran->inpa..inpp` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 16 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp_links.get(slot).map(String::as_str)
+        self.inp_links.get(slot).map(PvString::as_bytes)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -987,7 +991,7 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::inp_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
-                    self.inp_links[idx] = s.as_str_lossy().into_owned();
+                    self.inp_links[idx] = s;
                     let parsed = parse_link_v2(&self.inp_links[idx]);
                     Self::set_linked(&mut self.inp_linked, idx, &parsed);
                     return Ok(());
@@ -998,7 +1002,7 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::out_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
-                    self.out_links[idx] = s.as_str_lossy().into_owned();
+                    self.out_links[idx] = s;
                     let parsed = parse_output_link_v2(&self.out_links[idx]);
                     Self::set_linked(&mut self.out_linked, idx, &parsed);
                     return Ok(());
@@ -1022,7 +1026,7 @@ impl Record for TransformRecord {
         Err(CaError::FieldNotFound(name.to_string()))
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (transformRecord.c:444-473) classifies all 32 links
         // before any process. Both link tables are transform-owned fields,
@@ -1320,7 +1324,7 @@ mod tests {
         // measured (`caget TRANSFORM.IAV` → 1, C → 3). The put is already
         // refused by the framework read-only gate (`is_no_mod`), matching C
         // `S_db_noMod`; the fix is the read value.
-        let inst = RecordInstance::new("T:LS".into(), TransformRecord::new());
+        let inst = RecordInstance::new("T:LS", TransformRecord::new());
         for name in ["IAV", "IPV", "IOV", "OAV", "OPV"] {
             assert_eq!(
                 inst.resolve_field(name),

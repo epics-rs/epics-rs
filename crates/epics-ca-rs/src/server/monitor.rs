@@ -603,7 +603,7 @@ mod tests {
         /// two updates into one cycle, giving a deterministic count.
         #[epics_macros_rs::epics_test]
         async fn successful_delivery_advances_posted_and_processed() {
-            let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
+            let pv = Arc::new(ProcessVariable::new("c:pv", EpicsValue::Double(0.0)));
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
             let (task, _reader) = start_circuit(&pv, false, &stats, outbox);
@@ -633,7 +633,7 @@ mod tests {
         /// gateway surfaces; both counters reading equal would hide it.
         #[epics_macros_rs::epics_test]
         async fn denied_delivery_counts_posted_not_processed() {
-            let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
+            let pv = Arc::new(ProcessVariable::new("c:pv", EpicsValue::Double(0.0)));
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
             let (task, _reader) = start_circuit(&pv, true, &stats, outbox); // read access denied

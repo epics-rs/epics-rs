@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
+use crate::types::PvString;
 use epics_macros_rs::EpicsRecord;
 
 /// Choice labels for the `seq` select-mechanism menu, in index order.
@@ -142,8 +143,8 @@ pub struct SeqRecord {
     // SELN is `DBF_USHORT` (seqRecord.dbd.pod:271): unsigned 0..65535.
     #[field(type = "UShort")]
     pub seln: u16,
-    #[field(type = "String")]
-    pub sell: String,
+    #[field(type = "PvStr", link)]
+    pub sell: PvString,
     #[field(type = "Short")]
     pub offs: i16,
     #[field(type = "Short")]
@@ -180,38 +181,38 @@ pub struct SeqRecord {
     pub dlye: f64,
     #[field(type = "Double")]
     pub dlyf: f64,
-    #[field(type = "String")]
-    pub dol0: String,
-    #[field(type = "String")]
-    pub dol1: String,
-    #[field(type = "String")]
-    pub dol2: String,
-    #[field(type = "String")]
-    pub dol3: String,
-    #[field(type = "String")]
-    pub dol4: String,
-    #[field(type = "String")]
-    pub dol5: String,
-    #[field(type = "String")]
-    pub dol6: String,
-    #[field(type = "String")]
-    pub dol7: String,
-    #[field(type = "String")]
-    pub dol8: String,
-    #[field(type = "String")]
-    pub dol9: String,
-    #[field(type = "String")]
-    pub dola: String,
-    #[field(type = "String")]
-    pub dolb: String,
-    #[field(type = "String")]
-    pub dolc: String,
-    #[field(type = "String")]
-    pub dold: String,
-    #[field(type = "String")]
-    pub dole: String,
-    #[field(type = "String")]
-    pub dolf: String,
+    #[field(type = "PvStr", link)]
+    pub dol0: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol1: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol2: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol3: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol4: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol5: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol6: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol7: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol8: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol9: PvString,
+    #[field(type = "PvStr", link)]
+    pub dola: PvString,
+    #[field(type = "PvStr", link)]
+    pub dolb: PvString,
+    #[field(type = "PvStr", link)]
+    pub dolc: PvString,
+    #[field(type = "PvStr", link)]
+    pub dold: PvString,
+    #[field(type = "PvStr", link)]
+    pub dole: PvString,
+    #[field(type = "PvStr", link)]
+    pub dolf: PvString,
     #[field(type = "Double")]
     pub do0: f64,
     #[field(type = "Double")]
@@ -244,38 +245,38 @@ pub struct SeqRecord {
     pub doe: f64,
     #[field(type = "Double")]
     pub dof: f64,
-    #[field(type = "String")]
-    pub lnk0: String,
-    #[field(type = "String")]
-    pub lnk1: String,
-    #[field(type = "String")]
-    pub lnk2: String,
-    #[field(type = "String")]
-    pub lnk3: String,
-    #[field(type = "String")]
-    pub lnk4: String,
-    #[field(type = "String")]
-    pub lnk5: String,
-    #[field(type = "String")]
-    pub lnk6: String,
-    #[field(type = "String")]
-    pub lnk7: String,
-    #[field(type = "String")]
-    pub lnk8: String,
-    #[field(type = "String")]
-    pub lnk9: String,
-    #[field(type = "String")]
-    pub lnka: String,
-    #[field(type = "String")]
-    pub lnkb: String,
-    #[field(type = "String")]
-    pub lnkc: String,
-    #[field(type = "String")]
-    pub lnkd: String,
-    #[field(type = "String")]
-    pub lnke: String,
-    #[field(type = "String")]
-    pub lnkf: String,
+    #[field(type = "PvStr", link)]
+    pub lnk0: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk1: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk2: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk3: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk4: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk5: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk6: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk7: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk8: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk9: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnka: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkb: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkc: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkd: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnke: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkf: PvString,
 }
 
 /// `seqRecord.c:279-280` `get_dol` — within each of the 16 `linkGrp`s the
@@ -302,7 +303,7 @@ impl Default for SeqRecord {
             // an unset SELN defaults to 1, not 0. Only observable when the
             // .db omits SELN and SELM is Specified/Mask (All ignores SELN).
             seln: 1,
-            sell: String::new(),
+            sell: PvString::new(),
             offs: 0,
             // C `seqRecord.dbd.pod:287` `field(SHFT,DBF_SHORT){ initial("-1") }`:
             // unset SHFT defaults to -1, so SELM=Mask shifts SELN bits LEFT by
@@ -327,22 +328,22 @@ impl Default for SeqRecord {
             dlyd: 0.0,
             dlye: 0.0,
             dlyf: 0.0,
-            dol0: String::new(),
-            dol1: String::new(),
-            dol2: String::new(),
-            dol3: String::new(),
-            dol4: String::new(),
-            dol5: String::new(),
-            dol6: String::new(),
-            dol7: String::new(),
-            dol8: String::new(),
-            dol9: String::new(),
-            dola: String::new(),
-            dolb: String::new(),
-            dolc: String::new(),
-            dold: String::new(),
-            dole: String::new(),
-            dolf: String::new(),
+            dol0: PvString::new(),
+            dol1: PvString::new(),
+            dol2: PvString::new(),
+            dol3: PvString::new(),
+            dol4: PvString::new(),
+            dol5: PvString::new(),
+            dol6: PvString::new(),
+            dol7: PvString::new(),
+            dol8: PvString::new(),
+            dol9: PvString::new(),
+            dola: PvString::new(),
+            dolb: PvString::new(),
+            dolc: PvString::new(),
+            dold: PvString::new(),
+            dole: PvString::new(),
+            dolf: PvString::new(),
             do0: 0.0,
             do1: 0.0,
             do2: 0.0,
@@ -359,22 +360,22 @@ impl Default for SeqRecord {
             dod: 0.0,
             doe: 0.0,
             dof: 0.0,
-            lnk0: String::new(),
-            lnk1: String::new(),
-            lnk2: String::new(),
-            lnk3: String::new(),
-            lnk4: String::new(),
-            lnk5: String::new(),
-            lnk6: String::new(),
-            lnk7: String::new(),
-            lnk8: String::new(),
-            lnk9: String::new(),
-            lnka: String::new(),
-            lnkb: String::new(),
-            lnkc: String::new(),
-            lnkd: String::new(),
-            lnke: String::new(),
-            lnkf: String::new(),
+            lnk0: PvString::new(),
+            lnk1: PvString::new(),
+            lnk2: PvString::new(),
+            lnk3: PvString::new(),
+            lnk4: PvString::new(),
+            lnk5: PvString::new(),
+            lnk6: PvString::new(),
+            lnk7: PvString::new(),
+            lnk8: PvString::new(),
+            lnk9: PvString::new(),
+            lnka: PvString::new(),
+            lnkb: PvString::new(),
+            lnkc: PvString::new(),
+            lnkd: PvString::new(),
+            lnke: PvString::new(),
+            lnkf: PvString::new(),
         }
     }
 }

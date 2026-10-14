@@ -2658,30 +2658,33 @@ pub(super) mod tests {
     struct GatedSource(tokio::sync::watch::Sender<bool>);
 
     impl crate::server_native::ChannelSource for GatedSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
             Vec::new()
         }
-        async fn has_pv(&self, _: &str) -> bool {
+        async fn has_pv(&self, _: &[u8]) -> bool {
             let _ = self.0.subscribe().wait_for(|open| *open).await;
             true
         }
-        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
             Some(scalar_intro())
         }
-        async fn get_value(&self, _: &str) -> Option<PvField> {
+        async fn get_value(&self, _: &[u8]) -> Option<PvField> {
             None
         }
         async fn put_value(
             &self,
-            _: &str,
+            _: &[u8],
             _: PvField,
         ) -> Result<(), crate::server_native::OpError> {
             Err("read-only".into())
         }
-        async fn is_writable(&self, _: &str) -> bool {
+        async fn is_writable(&self, _: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _: &str) -> Option<crate::server_native::MonitorStream<PvField>> {
+        async fn subscribe(
+            &self,
+            _: &[u8],
+        ) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }

@@ -38,7 +38,7 @@ pub struct StateRecord {
     /// Record name, delivered by the framework at `add_record`
     /// ([`Record::set_async_context`]); used to name the deprecation
     /// warning exactly as C does.
-    name: Option<String>,
+    name: Option<crate::types::RecordName>,
 }
 
 impl Default for StateRecord {
@@ -90,7 +90,10 @@ impl Record for StateRecord {
     /// silences it and a log listener receives it.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            let name = self.name.as_deref().unwrap_or("<unknown>");
+            let name = self
+                .name
+                .as_ref()
+                .map_or("<unknown>".into(), |n| n.to_str_lossy());
             crate::runtime::log::errlog_vprintf(format_args!(
                 "WARNING: Using deprecated record type \"state\" for record \"{name}\".\n\
                  This record type will be removed beginning with EPICS 7.1. Please replace it\n\
@@ -100,7 +103,7 @@ impl Record for StateRecord {
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, _db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, _db: AsyncDbHandle) {
         self.name = Some(name);
     }
 

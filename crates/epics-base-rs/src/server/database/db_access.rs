@@ -260,7 +260,7 @@ pub struct DbSubscription {
 
 /// The channel a subscription reads through at delivery.
 struct Channel {
-    pv_name: String,
+    pv_name: Box<[u8]>,
     /// Upper-cased.
     field: String,
     /// The GET door [`DbSubscription::recv_snapshot`] reads options through.
@@ -411,7 +411,10 @@ impl SubscriptionActivation {
 impl DbSubscription {
     /// Subscribe to a record field, refused with the reason the monitor was
     /// not installed.
-    pub async fn subscribe(db: &PvDatabase, pv_name: &str) -> Result<Self, SubscribeRefused> {
+    pub async fn subscribe(
+        db: &PvDatabase,
+        pv_name: impl AsRef<[u8]>,
+    ) -> Result<Self, SubscribeRefused> {
         Self::subscribe_filtered(db, pv_name, 0).await
     }
 
@@ -419,7 +422,7 @@ impl DbSubscription {
     /// will be silently skipped by `recv_f64`/`recv`/`try_recv_f64`.
     pub async fn subscribe_filtered(
         db: &PvDatabase,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         ignore_origin: u64,
     ) -> Result<Self, SubscribeRefused> {
         let mask = (EventMask::VALUE | EventMask::LOG).bits();
@@ -432,7 +435,7 @@ impl DbSubscription {
     /// change events separately from value events (pvxs DBE_PROPERTY).
     pub async fn subscribe_with_mask(
         db: &PvDatabase,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         ignore_origin: u64,
         mask: u16,
     ) -> Result<Self, SubscribeRefused> {
@@ -446,12 +449,12 @@ impl DbSubscription {
     /// ([`SubscriptionFilter::post_chain`](crate::server::database::filters::SubscriptionFilter::post_chain)).
     pub async fn subscribe_with_mask_and_filters(
         db: &PvDatabase,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         ignore_origin: u64,
         mask: u16,
         filters: Option<&crate::server::database::filters::FilterChain>,
     ) -> Result<Self, SubscribeRefused> {
-        let (record_name, field) = parse_pv_name(pv_name);
+        let (record_name, field) = parse_pv_name(pv_name.as_ref());
         let field = field.to_ascii_uppercase();
         let rec = db
             .get_record(record_name)
@@ -468,7 +471,7 @@ impl DbSubscription {
         };
         Ok(Self {
             channel: Box::new(Channel {
-                pv_name: pv_name.to_string(),
+                pv_name: pv_name.as_ref().into(),
                 field,
                 db: db.clone(),
             }),
@@ -676,7 +679,7 @@ impl DbSubscription {
         }
     }
 
-    pub fn pv_name(&self) -> &str {
+    pub fn pv_name(&self) -> &[u8] {
         &self.channel.pv_name
     }
 }
@@ -886,7 +889,7 @@ impl<D: EventDelivery> DbEventSource<D> {
     pub fn attach(
         &self,
         db: &PvDatabase,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         mask: u16,
         filters: Option<&crate::server::database::filters::FilterChain>,
         dollar: Option<crate::server::database::char_view::DollarView>,
@@ -902,13 +905,13 @@ impl<D: EventDelivery> DbEventSource<D> {
     pub fn attach_disabled(
         &self,
         db: &PvDatabase,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         mask: u16,
         filters: Option<&crate::server::database::filters::FilterChain>,
         dollar: Option<crate::server::database::char_view::DollarView>,
         delivery: D,
     ) -> Result<DbAttachment, SubscribeRefused> {
-        let (record_name, field) = parse_pv_name(pv_name);
+        let (record_name, field) = parse_pv_name(pv_name.as_ref());
         let field = field.to_ascii_uppercase();
         let rec = db
             .get_record(record_name)
@@ -1089,7 +1092,9 @@ impl<D: EventDelivery> DrainTask<D> {
 /// Monitor multiple PVs simultaneously. Returns the name and value of
 /// whichever PV changes first.
 pub struct DbMultiMonitor {
-    subs: Vec<DbSubscription>,
+    /// Each subscription beside the name its caller asked for, which is what
+    /// [`Self::wait_change`] answers with.
+    subs: Vec<(String, DbSubscription)>,
 }
 
 impl DbMultiMonitor {
@@ -1106,7 +1111,7 @@ impl DbMultiMonitor {
         let mut subs = Vec::new();
         for name in pv_names {
             if let Ok(sub) = DbSubscription::subscribe_filtered(db, name, ignore_origin).await {
-                subs.push(sub);
+                subs.push((name.clone(), sub));
             }
         }
         Self { subs }
@@ -1121,7 +1126,7 @@ impl DbMultiMonitor {
     /// Silently skips events matching the subscription's `ignore_origin`.
     pub async fn wait_change(&mut self) -> (String, f64) {
         loop {
-            for sub in &mut self.subs {
+            for (name, sub) in &mut self.subs {
                 match sub.try_next_event() {
                     Ok(event) => {
                         let val = event
@@ -1129,7 +1134,7 @@ impl DbMultiMonitor {
                             .as_value()
                             .and_then(EpicsValue::to_f64)
                             .unwrap_or(0.0);
-                        return (sub.channel.pv_name.clone(), val);
+                        return (name.clone(), val);
                     }
                     Err(_) => continue,
                 }
@@ -1170,6 +1175,22 @@ mod delivery_read_tests {
             std::sync::Arc::new(posted),
         );
         assert!(matches!(sub.try_recv_snapshot(), Ok(Err(GetFailed))));
+    }
+
+    /// The channel keeps the name it was opened by, as C's `dbChannel` does.
+    #[epics_macros_rs::epics_test]
+    async fn a_subscription_keeps_its_latin1_name() {
+        let db = PvDatabase::new();
+        db.add_record(
+            &b"caf\xe9"[..],
+            Box::new(crate::server::records::ai::AiRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
+        let sub = DbSubscription::subscribe(&db, b"caf\xe9.VAL")
+            .await
+            .unwrap();
+        assert_eq!(sub.pv_name(), b"caf\xe9.VAL");
     }
 }
 
@@ -1244,7 +1265,7 @@ mod tests {
     }
 
     fn post(db: &PvDatabase, i: usize, v: f64) {
-        let rec = db.get_record(&format!("EV:{i}")).unwrap();
+        let rec = db.get_record(format!("EV:{i}")).unwrap();
         let mut rec = rec.write();
         rec.record
             .put_field("VAL", crate::types::EpicsValue::Double(v))
@@ -1287,7 +1308,7 @@ mod tests {
                 source
                     .attach(
                         db,
-                        &format!("EV:{index}"),
+                        format!("EV:{index}"),
                         EventMask::VALUE.bits(),
                         None,
                         None,

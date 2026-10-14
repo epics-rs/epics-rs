@@ -140,7 +140,7 @@ async fn both_arms(
         .unwrap();
     assert_eq!(link_watch.drain(), want(expect), "link {src}");
     assert_eq!(
-        db.get_pv(&format!("{src}.SEVR")).unwrap().to_f64(),
+        db.get_pv(format!("{src}.SEVR")).unwrap().to_f64(),
         Some(0.0),
         "{src}"
     );

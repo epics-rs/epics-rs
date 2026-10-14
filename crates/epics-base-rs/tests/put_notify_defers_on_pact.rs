@@ -458,6 +458,155 @@ async fn deleting_a_record_releases_its_queued_put_notifies() {
     }
 }
 
+/// `ASY` taken by a process-notify that went async: the record's notify slot
+/// holds the wait-set and PACT is held for the device round-trip.
+async fn owned_async() -> (
+    Arc<PvDatabase>,
+    epics_base_rs::runtime::sync::oneshot::Receiver<()>,
+) {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "ASY",
+        Box::new(AsyncOnceRecord {
+            val: 5,
+            pending: true,
+            process_count: Arc::new(AtomicU32::new(0)),
+            seen_by_process: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+    )
+    .await
+    .unwrap();
+    let rx = db
+        .process_record_with_notify("ASY")
+        .await
+        .unwrap()
+        .into_handle()
+        .expect("the record went async under the notify");
+    (db, rx)
+}
+
+/// Await `rx`, failing rather than hanging; `true` when the completion fired.
+async fn ended(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>, site: &str) -> bool {
+    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .unwrap_or_else(|_| panic!("{site}: the put-notify never ended"))
+        .is_ok()
+}
+
+/// Deleting the record under its ACTIVE put-notify must end it: the record
+/// never processes again, so nothing else would. The completion arrives as a
+/// dropped sender, the error every queued one gets.
+#[epics_macros_rs::epics_test]
+async fn deleting_a_record_ends_its_active_put_notify() {
+    let (db, rx) = owned_async().await;
+    assert!(db.remove_record("ASY").await);
+    assert!(!ended(rx, "deleted").await, "the put never completed");
+}
+
+/// The same through a delayed reprocess (scalcout `ODLY`), whose continuation
+/// looks the record up by name and so cannot find a deleted one.
+#[epics_macros_rs::epics_test]
+async fn deleting_a_record_in_its_odly_window_ends_its_put_notify() {
+    use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+    let db = PvDatabase::new();
+    db.add_record("TGT1", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    let mut sc = ScalcoutRecord::default();
+    sc.put_field("CALC", EpicsValue::String("42".into()))
+        .unwrap();
+    sc.special("CALC", true).unwrap();
+    sc.oopt = 0;
+    sc.put_field("ODLY", EpicsValue::Double(0.3)).unwrap();
+    sc.put_field("OUT", EpicsValue::String("TGT1".into()))
+        .unwrap();
+    db.add_record("SC1", Box::new(sc)).await.unwrap();
+    let ProcessCompletion::Async(rx) = db.process_record_with_notify("SC1").await.unwrap() else {
+        panic!("ODLY must hold the notify");
+    };
+    assert!(db.remove_record("SC1").await);
+    assert!(!ended(rx, "ODLY").await, "the put never completed");
+}
+
+/// Deleting a record that JOINED another record's put-notify ends that
+/// notify: the deleted record will never leave, so the chain cannot settle.
+#[epics_macros_rs::epics_test]
+async fn deleting_a_joined_record_ends_the_chain_put_notify() {
+    let db = PvDatabase::new();
+    for name in ["ASY", "ASY2"] {
+        db.add_record(
+            name,
+            Box::new(AsyncOnceRecord {
+                val: 5,
+                pending: true,
+                process_count: Arc::new(AtomicU32::new(0)),
+                seen_by_process: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    db.add_record("SRC", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("SRC").unwrap();
+        let mut inst = rec.write();
+        inst.put_common_field("OUT", EpicsValue::String("ASY PP".into()))
+            .unwrap();
+    }
+    db.put_record_field_from_ca("SRC", "FLNK", EpicsValue::String("ASY2".into()))
+        .await
+        .unwrap();
+    let ProcessCompletion::Async(rx) = db.process_record_with_notify("SRC").await.unwrap() else {
+        panic!("ASY and ASY2 joined the chain and hold it");
+    };
+    // ASY2 still holds the set, so only ending it, not dropping ASY's share,
+    // answers the client.
+    assert!(db.remove_record("ASY").await);
+    assert!(!ended(rx, "joined").await, "the chain never completed");
+    db.complete_async_record("ASY2").await.unwrap();
+}
+
+/// Boundary: the completion lands before the deletion. It answers success,
+/// and the deletion finds nothing left to end.
+#[epics_macros_rs::epics_test]
+async fn a_put_notify_completed_before_deletion_stays_a_success() {
+    let (db, rx) = owned_async().await;
+    db.complete_async_record("ASY").await.unwrap();
+    assert!(db.remove_record("ASY").await);
+    assert!(ended(rx, "completed").await, "it completed first");
+}
+
+/// Boundary: the deletion lands before the completion. The late completion
+/// finds the notify already ended and does not answer it a second time.
+#[epics_macros_rs::epics_test]
+async fn a_completion_after_deletion_does_not_answer_again() {
+    let (db, rx) = owned_async().await;
+    assert!(db.remove_record("ASY").await);
+    let _ = db.complete_async_record("ASY").await;
+    assert!(
+        !ended(rx, "deleted first").await,
+        "the deletion ended it first"
+    );
+}
+
+/// Completion racing deletion ends the notify exactly once, whichever wins.
+#[epics_macros_rs::epics_test]
+async fn completion_racing_deletion_ends_the_put_notify_once() {
+    use epics_base_rs::runtime::task::{CallbackPriority, spawn_background};
+    for _ in 0..200 {
+        let (db, rx) = owned_async().await;
+        let completer = db.clone();
+        let racer = spawn_background(CallbackPriority::Low, async move {
+            let _ = completer.complete_async_record("ASY").await;
+        });
+        assert!(db.remove_record("ASY").await);
+        racer.await.unwrap();
+        ended(rx, "racing").await;
+    }
+}
+
 /// Await a deferred put's callback, failing the test rather than hanging.
 async fn expect_callback(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>, site: &str) {
     epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)

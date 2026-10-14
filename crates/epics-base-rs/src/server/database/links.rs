@@ -674,6 +674,19 @@ fn selected_links(instance: &RecordInstance, sel: SelmResult) -> SelectedLinks {
     links
 }
 
+/// `rec`'s forward links, by field.
+fn forward_links(
+    rec: &crate::server::record::RecordCell,
+) -> Vec<(&'static str, Arc<crate::server::record::ParsedLink>)> {
+    let inst = rec.read();
+    crate::server::record::declared_fields(inst.record.record_type())
+        .filter(|desc| {
+            crate::types::link_class_of(desc) == Some(crate::types::DbfLinkClass::FwdLink)
+        })
+        .filter_map(|desc| Some((desc.name, inst.stored_link_shared(desc.name)?.clone())))
+        .collect()
+}
+
 /// `dbInitLink`'s warning for a CA forward link that will never forward
 /// (`dbLink.c:137-142`); the runtime `dbAddLink` sets the flag silently.
 fn warn_ca_forward_without_proc(name: &[u8], field: &str, ca: &crate::server::record::CaLink) {
@@ -1579,7 +1592,7 @@ impl PvDatabase {
             // on the record name.
             ParsedLink::Db(db) => return Some(db.target().record.clone()),
             ParsedLink::Ca(ca) => ca.pv.as_bytes(),
-            ParsedLink::Pva(pv) => pv.as_bytes(),
+            ParsedLink::Pva(pv) => pv.name().as_bytes(),
             ParsedLink::PvaJson(j) => j.pv.as_bytes(),
             // A state link names no record, so it has no timestamp to adopt
             // — its lset implements no `getTimestampTag`.
@@ -3155,11 +3168,12 @@ impl PvDatabase {
     ///
     /// A CA link is dbCa's `scanForward` (`dbCa.c:643-648`): a plain
     /// `dbCaPutLink` of 1 when `pvlOptFWD` is set, nothing otherwise, and its
-    /// status is dropped, so it never alarms.
+    /// status is dropped, so it never alarms. A `pva` link runs the handle
+    /// its lset opened it with ([`Self::bind_external_forward`]).
     pub(crate) fn scan_forward_external_pv(
         &self,
         target: crate::server::record::ExternalForward<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), super::LinkForwardRefused> {
         use crate::server::record::ExternalForward;
         match target {
             ExternalForward::Ca { pv, fwd } => {
@@ -3168,13 +3182,7 @@ impl PvDatabase {
                 }
                 Ok(())
             }
-            ExternalForward::Pva(name) => {
-                let lsets = self.inner.link_sets.load();
-                let lset = lsets
-                    .get("pva")
-                    .ok_or_else(|| format!("no 'pva' link set registered for '{name}'"))?;
-                lset.scan_forward(name.as_bytes())
-            }
+            ExternalForward::Pva(slot) => slot.scan_forward(),
         }
     }
 
@@ -4524,25 +4532,57 @@ impl PvDatabase {
     }
 
     /// C `dbAddLink` (`dbLink.c:146-191`) for a link put: [`Self::relink`],
-    /// and a link that stays local bound as a forward ([`Self::bind_forward`]).
+    /// and a forward that stays as parsed opened: a local one bound
+    /// ([`Self::bind_forward`]), an external one given its lset's handle
+    /// ([`Self::bind_external_forward`]).
     pub(crate) fn add_link(
         &self,
         parsed: &crate::server::record::ParsedLink,
         ftype: crate::server::record::LinkFieldType,
     ) -> Option<crate::server::record::ParsedLink> {
         let next = self.relink(parsed, ftype);
-        if next.is_none() {
+        if next.is_none() && ftype == crate::server::record::LinkFieldType::Fwd {
             self.bind_forward(parsed, ftype);
+            self.bind_external_forward(parsed);
         }
         next
+    }
+
+    /// C `lset->openLink` for an external forward link: the lset's
+    /// `scanForward` handle stored in the link, so a dispatch only runs it.
+    /// The one writer of a [`ForwardSlot`](crate::server::record::ForwardSlot);
+    /// a link whose scheme has no lset yet is opened when one registers
+    /// ([`Self::bind_external_forwards`]).
+    pub(crate) fn bind_external_forward(&self, parsed: &crate::server::record::ParsedLink) {
+        use crate::server::record::ParsedLink;
+        let (key, slot) = match parsed {
+            ParsedLink::Pva(p) => (p.name(), &p.forward),
+            ParsedLink::PvaJson(j) => (j.link_identity_key(), &j.forward),
+            _ => return,
+        };
+        let Some(scheme) = parsed.required_link_set_scheme() else {
+            return;
+        };
+        if let Some(lset) = self.inner.link_sets.load().get(scheme) {
+            slot.bind(|| lset.forward_handle(key.as_bytes()));
+        }
+    }
+
+    /// [`Self::bind_external_forward`] for every forward link of every
+    /// record, when a link set registers.
+    pub(super) fn bind_external_forwards(&self) {
+        for (_, rec) in self.iterate_records() {
+            for (_, link) in forward_links(&rec) {
+                self.bind_external_forward(&link);
+            }
+        }
     }
 
     /// C `dbInitLink` for every forward link of every record, once the
     /// `iocInit` barrier is crossed ([`Self::init_record_forwards`]).
     pub(super) fn init_forward_links(&self) {
-        let cells: Vec<Arc<crate::server::record::RecordCell>> =
-            self.inner.records.read().values().cloned().collect();
-        for rec in cells {
+        // C's `iterateRecords` order, which is its warnings' order.
+        for (_, rec) in self.iterate_records() {
             self.init_record_forwards(&rec);
         }
     }
@@ -4552,21 +4592,16 @@ impl PvDatabase {
     /// failure falls through to (`dbLink.c:118-130`). After it no forward is
     /// left a DB link without a target. A record added after `iocInit` runs
     /// it for its own links only; a link already made CA stays CA and
-    /// reaches a later record through CA, as C's would.
+    /// reaches a later record through CA, as C's would. An external link is
+    /// opened by its lset ([`Self::bind_external_forward`]).
     pub(super) fn init_record_forwards(&self, rec: &crate::server::record::RecordCell) {
         use crate::server::record::{LinkFieldType, ParsedLink};
-        let links: Vec<(&'static str, Arc<ParsedLink>)> = {
-            let inst = rec.read();
-            crate::server::record::declared_fields(inst.record.record_type())
-                .filter(|desc| {
-                    crate::types::link_class_of(desc) == Some(crate::types::DbfLinkClass::FwdLink)
-                })
-                .filter_map(|desc| Some((desc.name, inst.stored_link_shared(desc.name)?.clone())))
-                .filter(|(_, link)| matches!(**link, ParsedLink::Db(_)))
-                .collect()
-        };
         let mut rewrites: Vec<(&'static str, Arc<ParsedLink>)> = Vec::new();
-        for (field, link) in links {
+        for (field, link) in forward_links(rec) {
+            if !matches!(*link, ParsedLink::Db(_)) {
+                self.bind_external_forward(&link);
+                continue;
+            }
             let Some(next) = self.relink(&link, LinkFieldType::Fwd) else {
                 self.bind_forward(&link, LinkFieldType::Fwd);
                 continue;
@@ -4632,12 +4667,10 @@ impl PvDatabase {
     /// Returns the number of links converted.
     pub async fn initialize_link_locality(&self) -> usize {
         use crate::server::record::{LinkFieldType, ParsedLink};
-        let names = self.all_record_names().await;
         let mut converted = 0usize;
-        for name in &names {
-            let Some(rec) = self.get_record(name) else {
-                continue;
-            };
+        // C's `doResolveLinks` walk (`iocInit.c:484-506`), so its warnings
+        // print in softIoc's order.
+        for (name, rec) in self.iterate_records() {
             // Decide before taking the record's write lock: the locality query
             // reads the database's record map, and nothing else in this crate
             // holds a record-instance lock across that map.
@@ -4655,7 +4688,7 @@ impl PvDatabase {
                 if let ParsedLink::Ca(ca) = &next
                     && ftype == LinkFieldType::Fwd
                 {
-                    warn_ca_forward_without_proc(name, &field, ca);
+                    warn_ca_forward_without_proc(&name, &field, ca);
                 }
                 match (&next, unserviceable) {
                     (ParsedLink::Ca(_), _) if was_db => {
@@ -5335,7 +5368,7 @@ mod nonlocal_db_link_write_tests {
         );
     }
 
-    /// A link set that records every `scan_forward` it receives so a test
+    /// A link set whose forward handles record every `scan_forward` so a test
     /// can assert a non-DB FLNK reached the external forward path
     /// (C `dbScanFwdLink` → `lset->scanForward`) instead of being dropped
     /// by the DB-only `flnk_name` filter. `connected=false` models a
@@ -5355,21 +5388,34 @@ mod nonlocal_db_link_write_tests {
         async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn scan_forward(&self, name: &[u8]) -> Result<(), String> {
-            self.forwards
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(name).into_owned());
+        fn forward_handle(&self, name: &[u8]) -> Box<dyn crate::server::database::LinkForward> {
+            Box::new(RecordedForward {
+                name: String::from_utf8_lossy(name).into_owned(),
+                forwards: self.forwards.clone(),
+                connected: self.connected,
+            })
+        }
+    }
+
+    struct RecordedForward {
+        name: String,
+        forwards: Arc<Mutex<Vec<String>>>,
+        connected: bool,
+    }
+
+    impl crate::server::database::LinkForward for RecordedForward {
+        fn scan_forward(&self) -> Result<(), crate::server::database::LinkForwardRefused> {
+            self.forwards.lock().unwrap().push(self.name.clone());
             if self.connected {
                 Ok(())
             } else {
-                Err("Disconn".into())
+                Err(crate::server::database::LinkForwardRefused)
             }
         }
     }
 
-    /// `scan_forward_external_pv` must resolve the scheme and delegate to
-    /// the registered lset's `scan_forward` — the FWD-link twin of
+    /// `scan_forward_external_pv` must run the handle the registered lset
+    /// opened the link with — the FWD-link twin of
     /// `write_external_pv` for OUT writes (C `dbScanFwdLink` →
     /// `lset->scanForward`).
     #[epics_macros_rs::epics_test]
@@ -5385,7 +5431,9 @@ mod nonlocal_db_link_write_tests {
         )
         .await;
 
-        db.scan_forward_external_pv(crate::server::record::ExternalForward::Pva("OTHER:PROC"))
+        let link = crate::server::record::ParsedLink::Pva("OTHER:PROC".into());
+        db.bind_external_forward(&link);
+        db.scan_forward_external_pv(link.external_forward().unwrap())
             .expect("a connected forward must succeed");
 
         let captured = forwards.lock().unwrap();
@@ -5394,7 +5442,7 @@ mod nonlocal_db_link_write_tests {
     }
 
     /// End-to-end: a record whose FLNK targets an external `pva://` PV
-    /// must fire the link set's `scan_forward` when it processes — the
+    /// must fire its forward handle when it processes — the
     /// non-DB FLNK dispatch the DB-only `flnk_name` filter previously
     /// dropped. C `recGblFwdLink` runs `dbScanFwdLink` for every FLNK
     /// regardless of link kind.
@@ -5418,6 +5466,8 @@ mod nonlocal_db_link_write_tests {
             inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
                 .unwrap();
         }
+        // The lset opens the link at iocInit, as C's does.
+        db.ioc_init().await;
 
         let mut visited = crate::server::database::ProcStack::new();
         db.process_record_with_links("SRC", &mut visited)
@@ -5459,6 +5509,8 @@ mod nonlocal_db_link_write_tests {
             inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
                 .unwrap();
         }
+        // The lset opens the link at iocInit, as C's does.
+        db.ioc_init().await;
 
         let mut visited = crate::server::database::ProcStack::new();
         db.process_record_with_links("SRC", &mut visited)
@@ -5478,6 +5530,75 @@ mod nonlocal_db_link_write_tests {
             crate::server::recgbl::alarm_status::LINK_ALARM
         );
         assert_eq!(inst.common.namsg, "Disconn");
+    }
+
+    /// C `dbAddLink` opens a link put at runtime (`dbLink.c:146-191`): a
+    /// `pva` FLNK written after the lset registered and after iocInit is
+    /// bound by the put itself and dispatches on the next process.
+    #[epics_macros_rs::epics_test]
+    async fn external_forward_link_added_at_runtime_dispatches() {
+        let db = PvDatabase::new();
+        let forwards = Arc::new(Mutex::new(Vec::new()));
+        db.register_link_set(
+            "pva",
+            Arc::new(ForwardingLset {
+                forwards: forwards.clone(),
+                connected: true,
+            }),
+        )
+        .await;
+        db.add_record("SRC", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        db.put_record_field_from_ca("SRC", "FLNK", EpicsValue::String("pva://TARGET".into()))
+            .await
+            .unwrap();
+
+        let mut visited = crate::server::database::ProcStack::new();
+        db.process_record_with_links("SRC", &mut visited)
+            .await
+            .unwrap();
+
+        assert_eq!(*forwards.lock().unwrap(), ["TARGET"]);
+        assert_eq!(
+            db.get_record("SRC").unwrap().read().common.nsev,
+            AlarmSeverity::NoAlarm
+        );
+    }
+
+    /// A forward whose slot no lset bound does nothing: with no `pva` lset
+    /// registered nothing opens `pva://TARGET`, and C `dbScanFwdLink` skips a
+    /// link with no `lset` (`dbLink.c:475-481`) without an alarm.
+    #[epics_macros_rs::epics_test]
+    async fn unbound_external_forward_link_is_a_silent_no_op() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+        db.get_record("SRC")
+            .unwrap()
+            .write()
+            .put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
+            .unwrap();
+        db.ioc_init().await;
+
+        let mut visited = crate::server::database::ProcStack::new();
+        db.process_record_with_links("SRC", &mut visited)
+            .await
+            .unwrap();
+
+        let rec = db.get_record("SRC").unwrap();
+        let inst = rec.read();
+        assert_eq!(
+            (inst.common.nsev, inst.common.nsta),
+            (AlarmSeverity::NoAlarm, 0)
+        );
+        assert_eq!(inst.common.namsg, "");
+        assert_eq!(
+            (inst.common.sevr, inst.common.stat),
+            (AlarmSeverity::NoAlarm, 0)
+        );
     }
 }
 
@@ -6900,9 +7021,13 @@ mod external_forward_borrow_tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    /// A `pva` lset that reads the count of `watched` as it forwards.
+    /// A `pva` lset whose forward handle reads the count of `watched` as it
+    /// forwards.
     #[derive(Default)]
-    struct CountAtForward {
+    struct CountAtForward(Arc<Counts>);
+
+    #[derive(Default)]
+    struct Counts {
         watched: Mutex<Option<Arc<ParsedLink>>>,
         seen: Mutex<Vec<usize>>,
     }
@@ -6915,9 +7040,17 @@ mod external_forward_borrow_tests {
         async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        fn scan_forward(&self, _: &[u8]) -> Result<(), String> {
-            if let Some(link) = &*self.watched.lock().unwrap() {
-                self.seen.lock().unwrap().push(Arc::strong_count(link));
+        fn forward_handle(&self, _: &[u8]) -> Box<dyn crate::server::database::LinkForward> {
+            Box::new(CountingForward(self.0.clone()))
+        }
+    }
+
+    struct CountingForward(Arc<Counts>);
+
+    impl crate::server::database::LinkForward for CountingForward {
+        fn scan_forward(&self) -> Result<(), crate::server::database::LinkForwardRefused> {
+            if let Some(link) = &*self.0.watched.lock().unwrap() {
+                self.0.seen.lock().unwrap().push(Arc::strong_count(link));
             }
             Ok(())
         }
@@ -6932,14 +7065,14 @@ mod external_forward_borrow_tests {
             .cloned()
             .unwrap();
         assert!(matches!(*link, ParsedLink::Pva(_)), "{rec}.{field}");
-        *lset.watched.lock().unwrap() = Some(link);
-        lset.seen.lock().unwrap().clear();
+        *lset.0.watched.lock().unwrap() = Some(link);
+        lset.0.seen.lock().unwrap().clear();
         db.process_record_with_links(rec, &mut ProcStack::new())
             .await
             .unwrap();
-        *lset.watched.lock().unwrap() = None;
+        *lset.0.watched.lock().unwrap() = None;
         // The record's and this test's.
-        assert_eq!(*lset.seen.lock().unwrap(), [2], "{rec}.{field}");
+        assert_eq!(*lset.0.seen.lock().unwrap(), [2], "{rec}.{field}");
     }
 
     #[epics_macros_rs::epics_test]

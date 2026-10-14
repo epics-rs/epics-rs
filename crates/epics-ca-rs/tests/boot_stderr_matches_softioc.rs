@@ -8,6 +8,24 @@
 //! iocRun: All initialization complete
 //! ```
 //!
+//! With CA forward links, [`FWD_DB`] with `EPICS_CA_ADDR_LIST=127.0.0.1`
+//! added, softIoc warns from `doResolveLinks`, in `iterateRecords` order —
+//! record types by name, each type's records in load order, each record's
+//! links in field order:
+//!
+//! ```text
+//! Starting iocInit
+//! WARNING: Forward-link uses Channel Access without pointing to PROC field
+//!     FL.FLNK => Y
+//! WARNING: Forward-link uses Channel Access without pointing to PROC field
+//!     FO.LNK2 => Z
+//! WARNING: Forward-link uses Channel Access without pointing to PROC field
+//!     FO.LNK4 => W2
+//! WARNING: Forward-link uses Channel Access without pointing to PROC field
+//!     FP.LNK1 => V
+//! iocRun: All initialization complete
+//! ```
+//!
 //! Each binary runs on the backend that boots it: `softioc-rs` on tokio,
 //! `realtime-ca-ioc` (whose argv is its st.cmd) on the exec backend.
 
@@ -19,6 +37,15 @@ use std::time::{Duration, Instant};
 
 const SOFTIOC_BOOT_STDERR: &str = "Starting iocInit\niocRun: All initialization complete\n";
 const DB: &str = "record(ai, \"X:AI\") { field(VAL, \"1\") }\n";
+const FWD_DB: &str = "record(fanout, \"FO\") { field(LNK2, \"Z CA\") field(LNK4, \"W2\") }\n\
+    record(calc, \"FL\") { field(CALC, \"VAL+1\") field(FLNK, \"Y CA\") }\n\
+    record(fanout, \"FP\") { field(LNK1, \"V\") }\n";
+const SOFTIOC_FWD_BOOT_STDERR: &str = "Starting iocInit\n\
+    WARNING: Forward-link uses Channel Access without pointing to PROC field\n    FL.FLNK => Y\n\
+    WARNING: Forward-link uses Channel Access without pointing to PROC field\n    FO.LNK2 => Z\n\
+    WARNING: Forward-link uses Channel Access without pointing to PROC field\n    FO.LNK4 => W2\n\
+    WARNING: Forward-link uses Channel Access without pointing to PROC field\n    FP.LNK1 => V\n\
+    iocRun: All initialization complete\n";
 
 use named_port::verdict as softioc_verdict;
 
@@ -34,6 +61,8 @@ fn spawn(bin: &str, args: &[&std::ffi::OsStr], dir: &std::path::Path, port: u16)
         .env("EPICS_CA_SERVER_PORT", port.to_string())
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        // Without it C's dbCa reports an empty search list once a CA link opens.
+        .env("EPICS_CA_ADDR_LIST", "127.0.0.1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(err)
@@ -125,36 +154,52 @@ fn retries_past_a_held_port<H>(
     assert_eq!(stderr, SOFTIOC_BOOT_STDERR);
 }
 
+/// `bin`'s boot stderr on `db`; `db_args` is how `bin` is handed the db.
+fn boot(bin: &str, db: &str, db_args: fn(&std::path::Path) -> Vec<std::ffi::OsString>) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.db");
+    std::fs::write(&path, db).unwrap();
+    let args = db_args(&path);
+    let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+    named_boot_stderr(bin, &args, dir.path())
+}
+
+#[cfg(tokio_backend)]
+fn softioc_rs(db: &str) -> String {
+    boot(env!("CARGO_BIN_EXE_softioc-rs"), db, |p| {
+        vec!["-d".into(), p.into()]
+    })
+}
+
+#[cfg(exec_backend)]
+fn realtime_ca_ioc(db: &str) -> String {
+    boot(env!("CARGO_BIN_EXE_realtime-ca-ioc"), db, |p| {
+        vec![p.into()]
+    })
+}
+
 #[cfg(tokio_backend)]
 #[test]
 fn softioc_rs_boot_stderr_is_softiocs() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("x.db");
-    std::fs::write(&db, DB).unwrap();
-    assert_eq!(
-        named_boot_stderr(
-            env!("CARGO_BIN_EXE_softioc-rs"),
-            &["-d".as_ref(), db.as_os_str()],
-            dir.path()
-        ),
-        SOFTIOC_BOOT_STDERR
-    );
+    assert_eq!(softioc_rs(DB), SOFTIOC_BOOT_STDERR);
+}
+
+#[cfg(tokio_backend)]
+#[test]
+fn softioc_rs_forward_link_warnings_are_softiocs() {
+    assert_eq!(softioc_rs(FWD_DB), SOFTIOC_FWD_BOOT_STDERR);
 }
 
 #[cfg(exec_backend)]
 #[test]
 fn realtime_ca_ioc_boot_stderr_is_softiocs() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("x.db");
-    std::fs::write(&db, DB).unwrap();
-    assert_eq!(
-        named_boot_stderr(
-            env!("CARGO_BIN_EXE_realtime-ca-ioc"),
-            &[db.as_os_str()],
-            dir.path()
-        ),
-        SOFTIOC_BOOT_STDERR
-    );
+    assert_eq!(realtime_ca_ioc(DB), SOFTIOC_BOOT_STDERR);
+}
+
+#[cfg(exec_backend)]
+#[test]
+fn realtime_ca_ioc_forward_link_warnings_are_softiocs() {
+    assert_eq!(realtime_ca_ioc(FWD_DB), SOFTIOC_FWD_BOOT_STDERR);
 }
 
 #[cfg(tokio_backend)]

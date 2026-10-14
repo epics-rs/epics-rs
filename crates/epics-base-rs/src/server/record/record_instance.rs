@@ -395,6 +395,13 @@ impl NotifyWaitSet {
         }
     }
 
+    /// A member was destroyed and will never leave: end the set with the
+    /// error a dropped completion gives its waiter. Takes the sender under
+    /// the lock [`Self::leave`] fires it under, so the set ends exactly once.
+    pub(crate) fn abandon(&self) {
+        drop(self.tx.lock().unwrap().take());
+    }
+
     /// True once every chain member has left (the completion has fired).
     /// Used by the put entry to decide synchronous ([`ProcessCompletion::Sync`])
     /// vs async-pending ([`ProcessCompletion::Async`]) completion.
@@ -7469,9 +7476,8 @@ impl RecordInstance {
 
     /// Take `ws` into this record's put-notify slot.
     ///
-    /// **The only writer of [`Self::notify`] that installs a set** — the other
-    /// two ([`Self::abandon_put_notify`], [`Self::release_notify`]) only clear
-    /// it. Everything that makes a record a member of a wait-set happens here,
+    /// **The only writer of [`Self::notify`] that installs a set**; every other
+    /// write only clears it. Everything that makes a record a member of a wait-set happens here,
     /// so C's `precord->ppn = ppn` and its `ellSafeAdd(&waitList, ...)`
     /// (`dbNotify.c:226-227`, `:257-258`, `:497-498`) stay the single act they
     /// are in C. Split across two call sites, they were what let a member exist
@@ -12614,7 +12620,8 @@ impl RecordInstance {
 
     /// Destroy this record: drop every field monitor and refuse every future
     /// one, drop every link target handle it holds, and drop every queued
-    /// put-notify, whose client then sees its completion dropped. The cell
+    /// put-notify and end the active one, whose clients then see their
+    /// completion dropped. The cell
     /// itself is kept by the record table, so these releases happen here or
     /// not at all. The record-backed
     /// half of the rule [`crate::server::pv::ProcessVariable::destroy`]
@@ -12628,6 +12635,9 @@ impl RecordInstance {
         self.subscribers.clear();
         self.set_subscribers_watched();
         self.notify_restart_list.clear();
+        if let Some(ws) = self.notify.take() {
+            ws.abandon();
+        }
         for entry in self.parsed_inputs.iter_mut().flatten() {
             entry.release_target();
         }

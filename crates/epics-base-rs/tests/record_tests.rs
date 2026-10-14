@@ -813,7 +813,7 @@ fn test_parse_link_v2() {
     );
     assert_eq!(
         parse_link_v2("pva://PV:NAME"),
-        ParsedLink::Pva("PV:NAME".to_string())
+        ParsedLink::Pva("PV:NAME".into())
     );
 
     // A quoted string is not a number, so C's `dbParseLink` falls through to

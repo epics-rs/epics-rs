@@ -77,7 +77,7 @@ fn an_embedded_link_arg_parses_beside_a_literal() {
     assert_eq!(
         calc.args,
         vec![
-            CalcArg::Link(Box::new(ParsedLink::Pva("record".to_string()))),
+            CalcArg::Link(Box::new(ParsedLink::Pva("record".into()))),
             CalcArg::Literal(1.5),
         ]
     );

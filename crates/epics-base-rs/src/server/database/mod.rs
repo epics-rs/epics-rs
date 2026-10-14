@@ -20,8 +20,8 @@ mod snapshot;
 pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
 pub(crate) use field_io::{PutSrc, render_for_string_target};
 pub use link_set::{
-    DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
-    LinkSetRegistry, PutAdmission, RemoteAlarm,
+    DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
+    LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission, RemoteAlarm,
 };
 pub(crate) use links::{
     ProcessTargetGate, multi_out_rows, multi_output_dispatch_owned, posts_software_event,
@@ -1986,10 +1986,14 @@ impl PvDatabase {
     /// Register a [`LinkSet`] under `scheme` (e.g. `"pva"` /
     /// `"ca"`). The lset is consulted for `ParsedLink::Pva` /
     /// `ParsedLink::Ca` link reads/writes before falling back to
-    /// the legacy [`ExternalPvResolver`]. Subsequent calls for the
-    /// same scheme replace the previous binding.
+    /// the legacy [`ExternalPvResolver`]. A later call for the same
+    /// scheme replaces it for reads and writes, but a forward link already
+    /// opened keeps the first lset's handle: its slot is set once.
     pub async fn register_link_set(&self, scheme: &str, lset: link_set::DynLinkSet) {
         self.inner.link_sets.update(|r| r.register(scheme, lset));
+        // The links already loaded are opened now, as C opens them at link
+        // init with the lset in place.
+        self.bind_external_forwards();
     }
 
     /// Look up the lset for `scheme`, if any.

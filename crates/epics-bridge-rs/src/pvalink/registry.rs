@@ -7,7 +7,9 @@
 // suite. (1 live-upstream monitor test gated out on the exec backend below;
 // §4.2, stage 3.)
 
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +20,9 @@ use tokio::sync::Notify;
 
 use super::config::{LinkDirection, ProcMode, PvaLinkConfig, SevrMode};
 use super::link::{PvaLink, PvaLinkResult};
+
+mod opener;
+pub(crate) use opener::ChannelOpener;
 
 /// Operation timeout of the IOC-wide pvalink client.
 ///
@@ -56,6 +61,45 @@ const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// handled at the getter level (see `integration.rs`), so INP links
 /// that differ only in those collapse onto one monitor subscription.
 type RegistryKey = (String, bool, usize, LinkDirection);
+
+/// A `RegistryKey` a lookup can borrow, so the lset's per-cycle lookups
+/// build no `String`. Hashes as the owned tuple does: a `String` hashes
+/// as its `str`, and a tuple hashes field by field.
+trait KeyView {
+    fn view(&self) -> (&str, bool, usize, LinkDirection);
+}
+
+impl KeyView for RegistryKey {
+    fn view(&self) -> (&str, bool, usize, LinkDirection) {
+        (&self.0, self.1, self.2, self.3)
+    }
+}
+
+impl KeyView for (&str, bool, usize, LinkDirection) {
+    fn view(&self) -> (&str, bool, usize, LinkDirection) {
+        *self
+    }
+}
+
+impl<'a> Borrow<dyn KeyView + 'a> for RegistryKey {
+    fn borrow(&self) -> &(dyn KeyView + 'a) {
+        self
+    }
+}
+
+impl PartialEq for dyn KeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.view() == other.view()
+    }
+}
+
+impl Eq for dyn KeyView + '_ {}
+
+impl Hash for dyn KeyView + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.view().hash(state)
+    }
+}
 
 /// One row of pvalink channel diagnostics — the per-channel state the
 /// `dbpvar` IOC shell command prints. Mirrors the fields pvxs `dbpvxr`
@@ -191,13 +235,12 @@ impl PvaLinkRegistry {
     /// Exact lookup for the full config's `RegistryKey`. Returns
     /// `None` when no link with that exact key has been opened.
     pub fn try_get(&self, config: &PvaLinkConfig) -> Option<Arc<PvaLink>> {
-        let key: RegistryKey = (
-            config.pv_name.clone(),
+        self.lookup((
+            &config.pv_name,
             config.pipeline,
             config.queue_size,
             config.direction,
-        );
-        self.map.read().get(&key).cloned()
+        ))
     }
 
     /// Exact INP lookup by monitor-variant identity `(pv_name,
@@ -217,13 +260,7 @@ impl PvaLinkRegistry {
         pipeline: bool,
         queue_size: usize,
     ) -> Option<Arc<PvaLink>> {
-        let key: RegistryKey = (
-            pv_name.to_string(),
-            pipeline,
-            queue_size,
-            LinkDirection::Inp,
-        );
-        self.map.read().get(&key).cloned()
+        self.lookup((pv_name, pipeline, queue_size, LinkDirection::Inp))
     }
 
     /// Exact OUT lookup — the write-direction twin of [`Self::try_get_inp`].
@@ -240,20 +277,19 @@ impl PvaLinkRegistry {
         pipeline: bool,
         queue_size: usize,
     ) -> Option<Arc<PvaLink>> {
-        let key: RegistryKey = (
-            pv_name.to_string(),
-            pipeline,
-            queue_size,
-            LinkDirection::Out,
-        );
-        self.map.read().get(&key).cloned()
+        self.lookup((pv_name, pipeline, queue_size, LinkDirection::Out))
     }
 
-    /// Get an existing link or open a new one. Concurrent calls
+    fn lookup(&self, key: (&str, bool, usize, LinkDirection)) -> Option<Arc<PvaLink>> {
+        self.map.read().get(&key as &dyn KeyView).cloned()
+    }
+
+    /// Get an existing link or open a new one; private so every open goes
+    /// through [`ChannelOpener::open`]'s `local` gate. Concurrent calls
     /// for the same key share one [`PvaLink::open`] invocation;
     /// the second caller awaits via `pending` and reads the
     /// winner's cached entry.
-    pub async fn get_or_open(&self, config: PvaLinkConfig) -> PvaLinkResult<Arc<PvaLink>> {
+    async fn get_or_open(&self, config: PvaLinkConfig) -> PvaLinkResult<Arc<PvaLink>> {
         let key: RegistryKey = (
             config.pv_name.clone(),
             config.pipeline,

@@ -1110,23 +1110,16 @@ impl BridgeProvider {
         let mut refusals = Vec::with_capacity(defs.len());
         for def in defs {
             // `resolveTriggerReferences`, before `createGroups` refuses any
-            // group (groupconfigprocessor.cpp:327-331). pvxs's prefix is over
-            // 60 bytes with the WARN escapes, so the text starts a new line
-            // (log.cpp:86-92) even where errlog strips them.
+            // group (groupconfigprocessor.cpp:327-331).
             if !def.has_triggers() {
-                use epics_base_rs::runtime::log;
-                let warn = if log::errlog_console_paints() {
-                    "\x1b[35;1mWARN\x1b[0m"
-                } else {
-                    "WARN"
-                };
-                log::errlog_vprintf(format_args!(
-                    "{} {warn} pvxs.ioc.group.processor\n     \
-                     Group {} defines no +trigger mappings.  \
-                     Default to individual/split monitor updates.\n",
-                    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.9f"),
-                    def.name
-                ));
+                crate::pvxs_log::warn(
+                    "pvxs.ioc.group.processor",
+                    format_args!(
+                        "Group {} defines no +trigger mappings.  \
+                         Default to individual/split monitor updates.",
+                        def.name
+                    ),
+                );
             }
             let field_names: std::collections::HashSet<&str> =
                 def.members.iter().map(|m| m.field_name.as_str()).collect();

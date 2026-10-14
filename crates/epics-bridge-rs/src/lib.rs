@@ -126,6 +126,9 @@ pub use error::{BridgeError, BridgeResult};
 #[cfg(any(feature = "qsrv-core", feature = "pvalink"))]
 pub mod convert;
 
+#[cfg(any(feature = "qsrv-core", feature = "pvalink"))]
+pub(crate) mod pvxs_log;
+
 #[cfg(feature = "qsrv-core")]
 pub mod qsrv;
 

@@ -341,22 +341,23 @@ impl PvaLinkConfig {
     /// ignores it (`pva_parse_string` unknown-key branch, `:189-192`),
     /// instead of being honored as a Rust extension. [`Self::parse`]
     /// remains the Rust convenience-URI path.
+    ///
+    /// `pv_name` is the channel name verbatim, as `pva_parse_string` stores
+    /// it (`:147-148`): `" "` is a name, and so is the empty one a map with no
+    /// `pv` leaves; `ChannelOpener::open` opens
+    /// nothing for it, as `pvaOpenLink` does not.
     pub fn from_jlink_options(
         pv_name: &str,
         options: &[(String, JlinkValue)],
         direction: LinkDirection,
     ) -> Result<Self, PvaLinkParseError> {
-        let pv_name = pv_name.trim();
-        if pv_name.is_empty() {
-            return Err(PvaLinkParseError::EmptyPv);
-        }
         let mut cfg = PvaLinkConfig {
             pv_name: pv_name.to_string(),
             direction,
             ..PvaLinkConfig::defaults_for(pv_name, direction)
         };
         for (key, val) in options {
-            Self::apply_jlink_option(&mut cfg, pv_name, key, val);
+            Self::apply_jlink_option(&mut cfg, key, val);
         }
         // `proc` CP/CPP imply an open monitor + INP scan-on-update.
         // Derive the scan flags from the FINAL `proc` value (pvxs builds
@@ -389,7 +390,7 @@ impl PvaLinkConfig {
     /// not pvxs JLink keys at all (`monitor`, `notify`, `scan_on_update`,
     /// `queueSize`) are likewise ignored — those exist only on the
     /// convenience-URI `Self::apply_options` path.
-    fn apply_jlink_option(cfg: &mut PvaLinkConfig, pv_name: &str, key: &str, val: &JlinkValue) {
+    fn apply_jlink_option(cfg: &mut PvaLinkConfig, key: &str, val: &JlinkValue) {
         match val {
             JlinkValue::Bool(b) => match key {
                 "proc" => cfg.proc = if *b { ProcMode::Pp } else { ProcMode::Npp },
@@ -401,14 +402,14 @@ impl PvaLinkConfig {
                 "local" => cfg.local = *b,
                 "always" => cfg.always = *b,
                 "atomic" => cfg.atomic = *b,
-                _ => warn_ignored_jlink(pv_name, key, val),
+                _ => warn_ignored_jlink(key, val),
             },
             JlinkValue::Int(n) => match key {
                 // pvxs clamps `Q < 1` to 1 (pvxs/ioc/pvalink_jlif.cpp:129-130).
                 "Q" => cfg.queue_size = if *n < 1 { 1 } else { *n as usize },
                 // pvxs clamps monorder to [-1024, 1024] (`:131-132`).
                 "monorder" => cfg.monorder = (*n).clamp(-1024, 1024) as i32,
-                _ => warn_ignored_jlink(pv_name, key, val),
+                _ => warn_ignored_jlink(key, val),
             },
             JlinkValue::Str(s) => match key {
                 "field" => cfg.field = s.clone(),
@@ -422,7 +423,7 @@ impl PvaLinkConfig {
                     "CPP" => cfg.proc = ProcMode::Cpp,
                     "PP" => cfg.proc = ProcMode::Pp,
                     "NPP" => cfg.proc = ProcMode::Npp,
-                    _ => warn_ignored_jlink(pv_name, key, val),
+                    _ => warn_ignored_jlink(key, val),
                 },
                 // pva_parse_string :172-187: NMS/MS/MSI, MSS aliased to MS.
                 "sevr" => match s.as_str() {
@@ -430,16 +431,16 @@ impl PvaLinkConfig {
                     "MS" => cfg.sevr = SevrMode::Ms,
                     "MSI" => cfg.sevr = SevrMode::Msi,
                     "MSS" => cfg.sevr = SevrMode::Ms,
-                    _ => warn_ignored_jlink(pv_name, key, val),
+                    _ => warn_ignored_jlink(key, val),
                 },
-                _ => warn_ignored_jlink(pv_name, key, val),
+                _ => warn_ignored_jlink(key, val),
             },
             JlinkValue::Null => match key {
                 // pva_parse_null :74-83.
                 "proc" => cfg.proc = ProcMode::Default,
                 "sevr" => cfg.sevr = SevrMode::Nms,
                 "local" => cfg.local = false,
-                _ => warn_ignored_jlink(pv_name, key, val),
+                _ => warn_ignored_jlink(key, val),
             },
         }
     }
@@ -638,31 +639,46 @@ fn apply_or_warn<T>(
     }
 }
 
-/// Warn that an option value could not be parsed and was ignored, leaving
-/// the field at its default. pvxs parity (`pvxs/ioc/pvalink_jlif.cpp:90-194`):
-/// each parse callback `log_warn_printf`s an unknown/unparseable key or
-/// value and returns `jlif_continue`, so one bad option never discards
-/// the rest of the link.
-/// Warn that a JLink option was ignored, rendering its JSON value KIND
-/// in the log so a kind mismatch (`pipeline:"yes"` vs `pipeline:true`)
-/// is visible. Delegates to [`warn_ignored_option`].
-fn warn_ignored_jlink(pv: &str, key: &str, val: &JlinkValue) {
-    let rendered = match val {
-        JlinkValue::Null => "null".to_string(),
-        JlinkValue::Bool(b) => b.to_string(),
-        JlinkValue::Int(n) => n.to_string(),
-        JlinkValue::Str(s) => format!("\"{s}\""),
-    };
-    warn_ignored_option(pv, key, &rendered);
+/// pvxs's line for a member its callback for that value kind does not take
+/// (`pvxs/ioc/pvalink_jlif.cpp:81/:115/:134/:168/:185/:190`); the link keeps
+/// whatever the key held before. A boolean is reported as "integer", as
+/// pvxs's `pva_parse_bool` does. Printed once, at install: softIocPVX prints
+/// it twice only because C parses the text twice, at `dbLoadRecords`
+/// (`dbPutString` → `dbParseLink`) and again at iocInit (`dbStaticLib.c:2217`).
+fn warn_ignored_jlink(key: &str, val: &JlinkValue) {
+    let warn = |message| crate::pvxs_log::warn("pvxs.ioc.link.parse", message);
+    match val {
+        JlinkValue::Null => warn(format_args!(
+            "pva link parsing unknown none depth=1 key=\"{key}\""
+        )),
+        JlinkValue::Bool(b) => warn(format_args!(
+            "pva link parsing unknown integer depth=1 key=\"{key}\" value={b}"
+        )),
+        JlinkValue::Int(n) => warn(format_args!(
+            "pva link parsing unknown integer depth=1 key=\"{key}\" value={n}"
+        )),
+        JlinkValue::Str(s) => {
+            let kind = match key {
+                "proc" => "proc",
+                "sevr" => "sevr",
+                _ => "string",
+            };
+            warn(format_args!(
+                "pva link parsing unknown {kind} depth=1 key=\"{key}\" value=\"{s}\""
+            ))
+        }
+    }
 }
 
+/// An unparseable convenience-URI option: an epics-rs extension pvxs has no
+/// parser for, so no pvxs line to match.
 fn warn_ignored_option(pv: &str, key: &str, value: &str) {
     tracing::warn!(
         target: "pvalink",
         pv = %pv,
         key = %key,
         value = %value,
-        "pvalink: ignoring unparseable option value (keeping default); \
+        "pvalink: ignoring unparseable option value; \
          remaining options on the link are still applied"
     );
 }
@@ -728,6 +744,35 @@ mod tests {
         let owned: Vec<(String, JlinkValue)> =
             opts.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         PvaLinkConfig::from_jlink_options(pv, &owned, LinkDirection::Inp).unwrap()
+    }
+
+    /// The config a loaded `{pva:{...}}` field text yields.
+    fn loaded(text: &str) -> PvaLinkConfig {
+        match epics_base_rs::server::record::parse_link_v2(text) {
+            epics_base_rs::server::record::ParsedLink::PvaJson(j) => {
+                PvaLinkConfig::from_jlink_options(&j.pv, &j.options, LinkDirection::Inp).unwrap()
+            }
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+
+    /// softIocPVX: a repeated key whose later value pvxs ignores keeps the
+    /// earlier one.
+    #[test]
+    fn jlink_repeated_key_ignored_later_value_keeps_earlier() {
+        assert_eq!(loaded(r#"{pva:{pv:"T:A",pv:3}}"#).pv_name, "T:A");
+        assert_eq!(
+            loaded(r#"{pva:{pv:"T:B",proc:"CP",proc:"XX"}}"#).proc,
+            ProcMode::Cp
+        );
+        assert_eq!(loaded(r#"{pva:{pv:"T:C",Q:3,Q:"a"}}"#).queue_size, 3);
+    }
+
+    /// yajl reads `-0` as the integer 0, which `Q` clamps to 1 (softIocPVX
+    /// `Q=1`).
+    #[test]
+    fn jlink_negative_zero_q_is_integer() {
+        assert_eq!(loaded(r#"{pva:{pv:"T:D",Q:-0}}"#).queue_size, 1);
     }
 
     #[test]

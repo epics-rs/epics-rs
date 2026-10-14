@@ -119,9 +119,23 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-base-rs", "tests/client_server.rs"),
     (
         "epics-bridge-rs",
+        "tests/connected_pva_link_lset_calls_allocate_nothing.rs",
+    ),
+    (
+        "epics-bridge-rs",
         "tests/gw_upstream_unresponsive_window.rs",
     ),
+    (
+        "epics-bridge-rs",
+        "tests/pva_forward_link_dispatch_alloc.rs",
+    ),
     ("epics-bridge-rs", "tests/pva_gateway.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/pva_link_empty_name_processes_invalid.rs",
+    ),
+    ("epics-bridge-rs", "tests/pva_link_parse_warnings.rs"),
+    ("epics-bridge-rs", "tests/pva_local_link_unfulfilled.rs"),
     (
         "epics-bridge-rs",
         "tests/qsrv_app_declares_pva_link_type.rs",

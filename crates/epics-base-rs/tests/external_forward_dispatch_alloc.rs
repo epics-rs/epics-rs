@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use epics_base_rs::server::database::{LinkSet, ProcStack, PvDatabase};
+use epics_base_rs::server::database::{
+    LinkForward, LinkForwardRefused, LinkSet, ProcStack, PvDatabase,
+};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -46,7 +48,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// A connected `pva` lset whose `scanForward` counts and allocates nothing.
+/// A connected `pva` lset whose forward handle counts and allocates nothing.
 struct Forwards(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
@@ -57,7 +59,15 @@ impl LinkSet for Forwards {
     async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    fn scan_forward(&self, _: &[u8]) -> Result<(), String> {
+    fn forward_handle(&self, _: &[u8]) -> Box<dyn LinkForward> {
+        Box::new(Forward(self.0.clone()))
+    }
+}
+
+struct Forward(Arc<AtomicUsize>);
+
+impl LinkForward for Forward {
+    fn scan_forward(&self) -> Result<(), LinkForwardRefused> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

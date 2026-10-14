@@ -42,12 +42,12 @@ pub(crate) use device_menu_registry::{
 };
 pub use link::{
     CaLink, CalcArg, CalcLink, ConstLoadError, ConstantLink, DbLink, DbLinkType, ExternalForward,
-    HwLink, HwLinkKind, JlinkValue, JsonLinkParse, LinkFieldType, LinkProcessPolicy, LinkType,
-    LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, StateLink, StatePut,
-    VxiAddr, ca_forward_flag, check_json_link_text, check_link_assignment, check_link_text,
-    declared_link_type, link_field_type, link_type_refusal, load_link_ls, out_link_discards_cp,
-    parse_c_double, parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
-    pvajson_identity_key,
+    ForwardSlot, HwLink, HwLinkKind, JlinkValue, JsonLinkParse, LinkFieldType, LinkProcessPolicy,
+    LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaChannelLink, PvaJsonLink,
+    StateLink, StatePut, VxiAddr, ca_forward_flag, check_json_link_text, check_link_assignment,
+    check_link_text, declared_link_type, link_field_type, link_type_refusal, load_link_ls,
+    out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link_field, parse_link_v2,
+    parse_output_link_v2, pvajson_identity_key, pvajson_identity_parts,
 };
 pub(crate) use link::{
     DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif,

@@ -621,8 +621,8 @@ pub enum ParsedLink {
     /// string pvalink IS the channel name: any `?`/`&` in it is link
     /// DATA, not option syntax. The structured JSON longhand with
     /// options is [`ParsedLink::PvaJson`] instead, so this variant's
-    /// `String` has exactly one meaning (a channel name) on every path.
-    Pva(String),
+    /// name has exactly one meaning (a channel name) on every path.
+    Pva(PvaChannelLink),
     /// PVA (`pvalink`) link parsed from the structured JSON longhand
     /// `{pva:{pv:"name", field:"f", proc:"CP", …}}`. Carries the options
     /// as structured JLink members so the pvalink consumer reconstructs
@@ -798,21 +798,34 @@ pub enum JlinkValue {
 pub struct PvaJsonLink {
     /// Channel name from the `pv` member.
     pub pv: String,
-    /// Non-`pv` JLink options in source order with original key case
+    /// Every member but the string `pv` name, in source order with
+    /// repeats kept (pvxs applies each as it arrives) and original key case
     /// (`field`, `proc`, `sevr`, `Q`, `pipeline`, `time`, `retry`,
     /// `local`, `atomic`, `monorder`, …) and original JSON value KIND
     /// ([`JlinkValue`]). Empty when the map carried only `pv` — in that
     /// case [`parse_link_v2`] yields a plain [`ParsedLink::Pva`] rather
-    /// than this variant.
-    pub options: Vec<(String, JlinkValue)>,
+    /// than this variant. Boxed so a forward slot fits beside it in a
+    /// 64-byte [`ParsedLink`].
+    pub options: Box<[(String, JlinkValue)]>,
     /// [`Self::link_identity_key`], made once by [`Self::new`].
     key: Box<str>,
+    /// Bound when the link is a forward link.
+    pub forward: ForwardSlot,
 }
+
+// Every link read moves and clones `ParsedLink`s; at 72 bytes dfanout paid
+// +4.6 instr/cycle in register spills (wpab2, 7f5939070).
+const _: () = assert!(std::mem::size_of::<ParsedLink>() <= 64);
 
 impl PvaJsonLink {
     pub fn new(pv: String, options: Vec<(String, JlinkValue)>) -> Self {
         let key = pvajson_identity_key(&pv, &options).into_boxed_str();
-        Self { pv, options, key }
+        Self {
+            pv,
+            options: options.into_boxed_slice(),
+            key,
+            forward: ForwardSlot::default(),
+        }
     }
 
     /// Stable per-link identity key for the base→bridge link-set
@@ -837,46 +850,117 @@ impl PvaJsonLink {
 }
 
 /// Separator byte between the bare `pv` and the encoded options in a
-/// [`pvajson_identity_key`]. ASCII Unit Separator (`\u{1f}`) — a control
-/// byte that cannot occur in a PV name or a `?key=value` user URI, so the
-/// bridge can recover the bare PV by splitting on it and never confuses an
-/// identity key for a convenience-URI query. Shared so base (the key
-/// producer) and the bridge resolver (the key consumer) cannot drift.
+/// [`pvajson_identity_key`]. ASCII Unit Separator (`\u{1f}`); a JSON string
+/// can carry it, so every field of the key is escaped (see
+/// `PVAJSON_IDENTITY_ESC`) and a raw separator in a key is always one.
+/// Shared so base (the key producer) and the bridge resolver (the key
+/// consumer) cannot drift.
 pub const PVAJSON_IDENTITY_SEP: char = '\u{1f}';
+
+/// Escape inside a [`pvajson_identity_key`] field: `ESC 0` is the escape
+/// itself, `ESC 1` the separator, and in an option key `ESC 2` is `=`.
+const PVAJSON_IDENTITY_ESC: char = '\u{1e}';
+
+fn push_identity_field(key: &mut String, field: &str, escape_eq: bool) {
+    for c in field.chars() {
+        match c {
+            PVAJSON_IDENTITY_ESC => key.push_str("\u{1e}0"),
+            PVAJSON_IDENTITY_SEP => key.push_str("\u{1e}1"),
+            '=' if escape_eq => key.push_str("\u{1e}2"),
+            c => key.push(c),
+        }
+    }
+}
+
+fn identity_field(field: &str) -> Option<Cow<'_, str>> {
+    if !field.contains(PVAJSON_IDENTITY_ESC) {
+        return Some(Cow::Borrowed(field));
+    }
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        out.push(if c != PVAJSON_IDENTITY_ESC {
+            c
+        } else {
+            match chars.next()? {
+                '0' => PVAJSON_IDENTITY_ESC,
+                '1' => PVAJSON_IDENTITY_SEP,
+                '2' => '=',
+                _ => return None,
+            }
+        });
+    }
+    Some(Cow::Owned(out))
+}
 
 /// Build the stable link-identity key for a structured pvalink from its
 /// `pv` and parsed JLink options — see [`PvaJsonLink::link_identity_key`].
 ///
 /// The encoding is INTERNAL to the base↔bridge link-set boundary and is
 /// deliberately NOT pvxs link syntax and NOT a `?key=value` user URI:
-/// the bare `pv` is the prefix up to the first [`PVAJSON_IDENTITY_SEP`],
-/// followed by the options encoded `key=kind:value` and joined by the same
-/// separator. Sorting makes the key canonical regardless of option
-/// order. A separator the resolver never lenient-parses as a query is
-/// what keeps this distinct from the convenience-URI path (so a
-/// structured option is never re-read through the URI applier).
+/// the escaped `pv`, then each option as `key=kind:value`, every one led
+/// by [`PVAJSON_IDENTITY_SEP`]. Sorting makes the key canonical regardless
+/// of option order. A link with no options whose `pv` needs no escape is
+/// keyed by the bare `pv`, the identity it shares with `pva://pv`.
 pub fn pvajson_identity_key(pv: &str, options: &[(String, JlinkValue)]) -> String {
+    let mut key = String::with_capacity(pv.len());
+    push_identity_field(&mut key, pv, false);
     if options.is_empty() {
-        return pv.to_string();
+        if key.len() != pv.len() {
+            key.push(PVAJSON_IDENTITY_SEP);
+        }
+        return key;
     }
     let mut pairs: Vec<String> = options
         .iter()
-        .map(|(k, v)| match v {
-            JlinkValue::Null => format!("{k}=n"),
-            JlinkValue::Bool(b) => format!("{k}=b:{b}"),
-            JlinkValue::Int(n) => format!("{k}=i:{n}"),
-            JlinkValue::Str(s) => format!("{k}=s:{s}"),
+        .map(|(k, v)| {
+            let mut p = String::new();
+            push_identity_field(&mut p, k, true);
+            match v {
+                JlinkValue::Null => p.push_str("=n"),
+                JlinkValue::Bool(b) => p.push_str(if *b { "=b:true" } else { "=b:false" }),
+                JlinkValue::Int(n) => p.push_str(&format!("=i:{n}")),
+                JlinkValue::Str(s) => {
+                    p.push_str("=s:");
+                    push_identity_field(&mut p, s, false);
+                }
+            }
+            p
         })
         .collect();
     pairs.sort();
-    let mut key =
-        String::with_capacity(pv.len() + 1 + pairs.iter().map(|p| p.len() + 1).sum::<usize>());
-    key.push_str(pv);
+    key.reserve(pairs.iter().map(|p| p.len() + 1).sum());
     for p in &pairs {
         key.push(PVAJSON_IDENTITY_SEP);
         key.push_str(p);
     }
     key
+}
+
+/// [`pvajson_identity_key`] read back into the `pv` and options it was made
+/// from, so a link set configures a structured link from the key every call
+/// hands it, whatever path opened the link. `None` for a key with no
+/// separator, which names a bare `pv`.
+pub fn pvajson_identity_parts(key: &str) -> Option<(Cow<'_, str>, Vec<(String, JlinkValue)>)> {
+    let (pv, rest) = key.split_once(PVAJSON_IDENTITY_SEP)?;
+    let options = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split(PVAJSON_IDENTITY_SEP)
+            .map(|p| {
+                let (k, v) = p.split_once('=')?;
+                let v = match v.split_once(':') {
+                    None if v == "n" => JlinkValue::Null,
+                    Some(("b", b)) => JlinkValue::Bool(b.parse().ok()?),
+                    Some(("i", n)) => JlinkValue::Int(n.parse().ok()?),
+                    Some(("s", s)) => JlinkValue::Str(identity_field(s)?.into_owned()),
+                    _ => return None,
+                };
+                Some((identity_field(k)?.into_owned(), v))
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    Some((identity_field(pv)?, options))
 }
 
 /// One element of a `lnkCalc` `args` array.
@@ -1371,8 +1455,120 @@ pub fn ca_forward_flag(ftype: LinkFieldType, pv: &[u8]) -> bool {
 pub enum ExternalForward<'a> {
     /// dbCa: put 1 through `pv` when `fwd` ([`CaLink::fwd`]), else nothing.
     Ca { pv: &'a [u8], fwd: bool },
-    /// The `pva` lset's `scanForward`, handed this name.
-    Pva(&'a str),
+    /// The `pva` lset's `scanForward`, through the handle the link was
+    /// opened with.
+    Pva(&'a ForwardSlot),
+}
+
+/// An external forward link's `scanForward` handle: C's `plink->lset` plus
+/// what `openLink` stored in the link, set by `PvDatabase`'s binding owner
+/// when the link is opened (lset registration, `iocInit`, `dbAddLink`) and
+/// only read by a dispatch. Empty means no lset has opened the link, which
+/// a dispatch skips: C `dbScanFwdLink` calls `scanForward` only when
+/// `plink->lset` is set (`dbLink.c:475-481`), and raises nothing.
+///
+/// Set once: C opens a link once (`DBLINK_FLAG_INITIALIZED`,
+/// `dbLink.c:96-100`), so the first bind wins, and every clone of the link
+/// shares it. It is the link's state, not its identity: two parses of one
+/// text are equal whatever is bound.
+///
+/// The cell sits behind the `Arc` so that `ParsedLink` holds no
+/// `UnsafeCell` inline: a `!Freeze` `ParsedLink` loses `noalias readonly` on
+/// every `&ParsedLink`, and dfanout's link read paid +5.9 instr/cycle in
+/// reloads across calls (wpab2, c54f1c92d).
+#[derive(Clone, Default)]
+pub struct ForwardSlot(std::sync::Arc<std::sync::OnceLock<Handle>>);
+
+type Handle = Box<dyn crate::server::database::LinkForward>;
+
+impl ForwardSlot {
+    /// Open the link with `open` unless it is open already.
+    pub(crate) fn bind(&self, open: impl FnOnce() -> Handle) {
+        self.0.get_or_init(open);
+    }
+
+    /// C `dbScanFwdLink` → `lset->scanForward(plink)`.
+    #[inline]
+    pub fn scan_forward(&self) -> Result<(), crate::server::database::LinkForwardRefused> {
+        match self.0.get() {
+            Some(handle) => handle.scan_forward(),
+            None => Ok(()),
+        }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+impl std::fmt::Debug for ForwardSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.is_bound() {
+            "ForwardSlot(bound)"
+        } else {
+            "ForwardSlot"
+        })
+    }
+}
+
+impl PartialEq for ForwardSlot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ForwardSlot {}
+
+/// [`ParsedLink::Pva`]'s channel name, and the [`ForwardSlot`] it is opened
+/// into when it is a forward link.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PvaChannelLink {
+    name: String,
+    pub forward: ForwardSlot,
+}
+
+impl PvaChannelLink {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            forward: ForwardSlot::default(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::ops::Deref for PvaChannelLink {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Display for PvaChannelLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+impl std::fmt::Debug for PvaChannelLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.name, f)
+    }
+}
+
+impl From<String> for PvaChannelLink {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
+
+impl From<&str> for PvaChannelLink {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
 }
 
 impl CaLink {
@@ -1578,7 +1774,8 @@ pub fn declared_link_type(
 /// it; whether the link FITS the record's device support is never asked there.
 ///
 /// Two failure arms, both C's: a brace-delimited link naming no registered
-/// jlink type, and a `#` form whose identifier letters name no bus.
+/// jlink type, and a `#` form whose identifier letters name no bus. A third
+/// is the port's own: `check_pva_channel_name`.
 pub fn check_link_text(
     record_type: &str,
     upper_field: &str,
@@ -1587,12 +1784,32 @@ pub fn check_link_text(
     let Some(class) = crate::types::dbf_link_class(record_type, upper_field) else {
         return Ok(());
     };
+    let ftype = LinkFieldType::for_class(class);
+    let bytes = text.as_ref();
     // Both arms read a JSON or hardware form; a record name's bytes do not
     // reach either, so the lossy view refuses what the bytes would.
-    let text = String::from_utf8_lossy(text.as_ref());
+    let text = String::from_utf8_lossy(bytes);
     let text = text.as_ref();
-    check_json_link_text(text, LinkFieldType::for_class(class))?;
-    check_hw_link_text(text)
+    check_json_link_text(text, ftype)?;
+    check_hw_link_text(text)?;
+    check_pva_channel_name(bytes, ftype)
+}
+
+/// DEVIATION, deliberate. A pva channel name holding [`PVAJSON_IDENTITY_SEP`]
+/// is refused as `S_dbLib_badField`, silently, so a name can never be read as
+/// a structured link's identity key. An empty name is taken at load and at
+/// a put, as C takes it: `pva_parse_string` stores it
+/// (`pvxs/ioc/pvalink_jlif.cpp:147-148`) and `pvaOpenLink` opens nothing
+/// (`pvxs/ioc/pvalink_lset.cpp:97-98`).
+fn check_pva_channel_name(text: &[u8], ftype: LinkFieldType) -> CaResult<()> {
+    match parse_link_field(text, ftype) {
+        ParsedLink::Pva(name) if name.contains(PVAJSON_IDENTITY_SEP) => {
+            Err(CaError::BadLink(LinkRefusal::new(LinkWhy::ValueRejected(
+                crate::server::recgbl::ReportString::new("pva"),
+            ))))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// C `dbCanSetLink` (`dbStaticLib.c:2400-2419`), the rule alone: may a link of
@@ -1860,8 +2077,8 @@ impl ParsedLink {
                 pv: ca.pv.as_bytes(),
                 fwd: ca.fwd,
             }),
-            ParsedLink::Pva(name) => Some(ExternalForward::Pva(name)),
-            ParsedLink::PvaJson(j) => Some(ExternalForward::Pva(j.link_identity_key())),
+            ParsedLink::Pva(p) => Some(ExternalForward::Pva(&p.forward)),
+            ParsedLink::PvaJson(j) => Some(ExternalForward::Pva(&j.forward)),
             _ => None,
         }
     }
@@ -1946,30 +2163,40 @@ impl ParsedLink {
     }
 }
 
-/// The two link-value shapes the pvxs JLink root callbacks accept at parse
-/// depth 0: a JSON string (channel-name shorthand) or a JSON object/map
-/// (longhand options). Every other root token — null, bool, integer, real,
-/// array — installs no channel name in pvxs, so [`classify_pva_root_value`]
-/// returns `None` for them rather than coercing the raw token into a PV
-/// name.
+/// A link value's shape at the pvxs JLink root (parse depth 0): a JSON string
+/// is the channel name, a map carries the longhand options, and a null, bool
+/// or integer is ignored, leaving the name empty
+/// (`pvxs/ioc/pvalink_jlif.cpp:69-139`). A real or an array stops the parse
+/// (`parse_double` / `parse_start_array` are NULL), so
+/// [`classify_pva_root_value`] returns `None` for them.
 enum PvaRootValue<'a> {
     /// `{ ... }` longhand options map (handed to the sub-object parser).
     Object(&'a str),
     /// `"name"` / `'name'` string shorthand — exactly one matching quote
     /// pair stripped, contents kept verbatim (no semantic-character trim).
     StringName(&'a str),
+    /// A `null`, `true`/`false` or integer token, which sets nothing.
+    Ignored,
 }
 
-/// Classify a root `pva`/`ca` link value by JSON shape. Accepts only a JSON
-/// object or a (single- or double-) quoted string; rejects bare
-/// `null`/`true`/`false`/number/array tokens the way the pvxs root JLink
-/// callbacks do — `pva_parse_string` assigns `channelName` only at depth 0
-/// while `pva_parse_null`/`bool`/`integer` ignore root-depth values
-/// (pvxs/ioc/pvalink_jlif.cpp:74-100,143-154).
+/// Classify a root `pva`/`ca` link value by JSON shape: a JSON object, a
+/// (single- or double-) quoted string, or a token the pvxs root callbacks
+/// ignore — `pva_parse_null`/`bool`/`integer` act only at depth 1
+/// (pvxs/ioc/pvalink_jlif.cpp:69-139). A real or an array is `None`.
 fn classify_pva_root_value(value: &str) -> Option<PvaRootValue<'_>> {
     let v = value.trim();
     if v.starts_with('{') {
         return Some(PvaRootValue::Object(v));
+    }
+    // A JSON integer, as yajl's grammar spells one; overflow is refused
+    // before any parse reaches here (`dbJLinkInit: parse error`).
+    let digits = v.strip_prefix('-').unwrap_or(v);
+    let integer = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && !(digits.len() > 1 && digits.starts_with('0'))
+        && v.parse::<i64>().is_ok();
+    if integer || matches!(v, "null" | "true" | "false") {
+        return Some(PvaRootValue::Ignored);
     }
     for quote in ['"', '\''] {
         if let Some(rest) = v.strip_prefix(quote) {
@@ -2469,8 +2696,12 @@ enum Jlif {
     Calc(LnkCalcParse),
     /// `lnkStateIf` fills only `parse_string` (`lnkState.c:226-232`).
     State,
-    /// A type whose callbacks the port does not model (pvxs `pva`, `ca`):
-    /// its value is only checked as JSON.
+    /// pvxs `lsetPVX` leaves `parse_double` and `parse_start_array` NULL
+    /// (`pvxs/ioc/pvalink_jlif.cpp:286-304`); every filled callback logs what
+    /// it does not know and continues.
+    Pva,
+    /// A type whose callbacks the port does not model (`ca`): its value is
+    /// only checked as JSON.
     Opaque,
 }
 
@@ -2491,18 +2722,19 @@ impl Jlif {
             })),
             ("calc", _) => Ok(Self::Calc(LnkCalcParse::new(ftype))),
             ("state", _) => Ok(Self::State),
+            ("pva", _) => Ok(Self::Pva),
             _ => Ok(Self::Opaque),
         }
     }
 
     fn null(&mut self) -> bool {
-        matches!(self, Self::Opaque)
+        matches!(self, Self::Pva | Self::Opaque)
     }
 
     fn boolean(&mut self, said: &mut Said) -> bool {
         match self {
             Self::Const(c) => c.number(said),
-            Self::Opaque => true,
+            Self::Pva | Self::Opaque => true,
             Self::Calc(_) | Self::State => false,
         }
     }
@@ -2511,7 +2743,7 @@ impl Jlif {
         match self {
             Self::Const(c) => c.number(said),
             Self::Calc(c) => c.integer(value, said),
-            Self::Opaque => true,
+            Self::Pva | Self::Opaque => true,
             Self::State => false,
         }
     }
@@ -2521,7 +2753,7 @@ impl Jlif {
             Self::Const(c) => c.number(said),
             Self::Calc(c) => c.double(value, said),
             Self::Opaque => true,
-            Self::State => false,
+            Self::Pva | Self::State => false,
         }
     }
 
@@ -2529,14 +2761,14 @@ impl Jlif {
         match self {
             Self::Const(c) => c.string(said),
             Self::Calc(c) => c.string(bytes, said),
-            Self::State | Self::Opaque => true,
+            Self::State | Self::Pva | Self::Opaque => true,
         }
     }
 
     fn start_map(&mut self, said: &mut Said) -> MapStart {
         match self {
             Self::Calc(c) => c.start_map(said),
-            Self::Opaque => MapStart::Continue,
+            Self::Pva | Self::Opaque => MapStart::Continue,
             Self::Const(_) | Self::State => MapStart::Stop,
         }
     }
@@ -2544,7 +2776,7 @@ impl Jlif {
     fn map_key(&mut self, key: &[u8], said: &mut Said) -> bool {
         match self {
             Self::Calc(c) => c.map_key(key, said),
-            Self::Opaque => true,
+            Self::Pva | Self::Opaque => true,
             Self::Const(_) | Self::State => false,
         }
     }
@@ -2552,7 +2784,7 @@ impl Jlif {
     fn end_map(&mut self, said: &mut Said) -> bool {
         match self {
             Self::Calc(c) => c.end_map(said),
-            Self::Opaque => true,
+            Self::Pva | Self::Opaque => true,
             Self::Const(_) | Self::State => false,
         }
     }
@@ -2562,7 +2794,7 @@ impl Jlif {
             Self::Const(c) => c.start_array(said),
             Self::Calc(c) => c.start_array(said),
             Self::Opaque => true,
-            Self::State => false,
+            Self::Pva | Self::State => false,
         }
     }
 
@@ -2570,7 +2802,7 @@ impl Jlif {
         match self {
             Self::Calc(c) => c.end_array(),
             Self::Const(_) | Self::Opaque => true,
-            Self::State => false,
+            Self::Pva | Self::State => false,
         }
     }
 
@@ -3085,27 +3317,33 @@ fn try_parse_json_link_body(s: &str, lookup: LinkLookup<'_>) -> Option<ParsedLin
             // through to legacy DB parsing (which would treat the raw JSON
             // text as a record name).
             let value = rest.trim_end_matches(',').trim();
-            // Classify the root value by JSON shape — only a string
-            // (channel-name shorthand) or an object/map (longhand options)
-            // is a valid pvalink root; a bare `true`/`5`/`null`/`[..]` token
-            // installs no channel name in pvxs and must NOT be coerced into a
-            // literal PV name. `?` returns `None` here so a non-string root
-            // falls through to legacy parsing instead of dialing a remote PV.
+            // Classify the root value by JSON shape. A bare `true`/`5`/
+            // `null` names no channel in pvxs, so a pva link keeps the empty
+            // name; it is never coerced into a literal PV name.
             match classify_pva_root_value(value)? {
+                PvaRootValue::Ignored if key == "ca" => None,
+                // DEVIATION at process only: softIocPVX takes the link at load
+                // and at a put, then segfaults at the record's first process
+                // (`pvaDoLocked` on the never-opened channel,
+                // `pvalink_lset.cpp:702`); the port reads it unconnected.
+                PvaRootValue::Ignored => Some(ParsedLink::Pva(String::new().into())),
                 PvaRootValue::Object(obj) => {
                     if key == "ca" {
                         // JSON CA links carry no plain-text MS modifier and
                         // ignore pvalink options; take only the PV name.
                         // Alarm policy defaults to NoMaximize.
                         Some(ParsedLink::Ca(CaLink::new(
-                            extract_pv_and_opts_from_subobject(obj)?.0,
+                            extract_pv_and_opts_from_subobject(obj)?.0?,
                         )))
                     } else {
                         // PVA longhand: keep the options as structured JLink
                         // members.
+                        // A map with no `pv` leaves pvxs's name empty, as
+                        // `pv:""` does (`pvalink_jlif.cpp:147-148`).
                         let (pv, options) = extract_pv_and_opts_from_subobject(obj)?;
+                        let pv = pv.unwrap_or_default();
                         if options.is_empty() {
-                            Some(ParsedLink::Pva(pv))
+                            Some(ParsedLink::Pva(pv.into()))
                         } else {
                             Some(ParsedLink::PvaJson(PvaJsonLink::new(pv, options)))
                         }
@@ -3117,13 +3355,10 @@ fn try_parse_json_link_body(s: &str, lookup: LinkLookup<'_>) -> Option<ParsedLin
                     // string pvalink as the channel name in full). It is still a
                     // yajl string, so its escapes are decoded by the one owner.
                     let name = decode_json_string(name.trim());
-                    if name.is_empty() {
-                        return None;
-                    }
                     if key == "ca" {
                         Some(ParsedLink::Ca(CaLink::new(name)))
                     } else {
-                        Some(ParsedLink::Pva(name))
+                        Some(ParsedLink::Pva(name.into()))
                     }
                 }
             }
@@ -3243,9 +3478,9 @@ fn json_calc_arg(v: &serde_json::Value, lookup: LinkLookup<'_>) -> Option<CalcAr
 }
 
 /// Extract the `pv` name and all other key-value options from a
-/// JSON-ish sub-object body. Returns `(pv_name, options)` where
-/// `options` is every non-`pv` key as a structured `(key, value)` pair
-/// in source order (empty when there are no extra options). Runs on text that
+/// JSON-ish sub-object body. Returns `(pv_name, options)`, the name `None`
+/// when the map has no string `pv` member, where `options` is every other depth-1 member as a structured `(key, value)`
+/// pair in source order, repeats kept (empty when there are none). Runs on text that
 /// has already been through [`crate::json5::relaxed_to_strict`], so every key
 /// is quoted and every string carries strict-JSON escapes.
 ///
@@ -3261,71 +3496,86 @@ fn json_calc_arg(v: &serde_json::Value, lookup: LinkLookup<'_>) -> Option<CalcAr
 /// (pvxs/ioc/pvalink_jlif.cpp:286-300), so flattening a bare `pipeline:true` and
 /// a quoted `pipeline:"yes"` to the same text would let Rust honor an
 /// option pvxs ignores.
-fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String, JlinkValue)>)> {
-    let body = body.trim_start_matches('{').trim_end_matches('}').trim();
-    let mut pv: Option<String> = None;
-    let mut opts: Vec<(String, JlinkValue)> = Vec::new();
-    for entry in body.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        // split_once splits at the FIRST ':' — PV names like "REC:AI"
-        // have ':' inside the quoted value, but since we split on the
-        // key separator `:` first (before the opening `"`) the colon
-        // inside the quoted value survives (it's the second or later
-        // colon in the entry string).
-        let (k, v) = entry.split_once(':')?;
-        let k_raw = k.trim().trim_matches('"');
-        // Trim only the trailing entry comma + whitespace. DO NOT strip
-        // the value's quotes here — quote presence is what distinguishes
-        // a JSON string from a bare bool/integer/null, the distinction
-        // pvxs dispatches on (pvxs/ioc/pvalink_jlif.cpp:286-300).
-        let v_trimmed = v.trim().trim_matches(',').trim();
-        if v_trimmed.is_empty() {
-            continue;
-        }
-        if k_raw.eq_ignore_ascii_case("pv") {
-            // `pv` is always the channel-name string: dequoted AND decoded by
-            // the one JSON-string owner (yajl hands the jlif a decoded string).
-            let name = decode_json_string_token(v_trimmed).unwrap_or_else(|| v_trimmed.to_string());
-            if !name.is_empty() {
-                pv = Some(name);
-            }
-        } else if let Some(val) = classify_jlink_value(v_trimmed) {
-            // Preserve original key case (case-sensitive for keys like
-            // `Q`) AND the JSON value KIND.
-            opts.push((k_raw.to_string(), val));
-        }
+fn extract_pv_and_opts_from_subobject(
+    body: &str,
+) -> Option<(Option<String>, Vec<(String, JlinkValue)>)> {
+    use crate::server::db_convert_json::{Parser, Status};
+
+    // yajl's member walk, not a map: pvxs applies each member as it arrives,
+    // so a repeated key the later value does not fit keeps the earlier one.
+    let mut parser = Parser::new(PvaMembers::default());
+    let txt = body.as_bytes();
+    let mut status = parser.parse(txt);
+    if status == Status::Ok {
+        status = parser.finish();
     }
-    Some((pv?, opts))
+    if status != Status::Ok {
+        return None;
+    }
+    let PvaMembers { pv, opts, .. } = parser.ctx;
+    Some((pv, opts))
 }
 
-/// Classify a raw JLink option value token into its JSON value KIND,
-/// preserving the bool/integer/string distinction pvxs dispatches on
-/// (pvxs `ioc/pvalink_jlif.cpp:286-300`). A quoted token is a string —
-/// the dialect's single-quoted spelling is already a double-quoted one by
-/// the time it gets here; the bare
-/// literals `true`/`false`/`null` are the JSON keywords (yajl is
-/// case-sensitive, so only lowercase); a bare integer is an integer.
-/// Anything else bare — a float (which pvxs's `NULL` real callback slot
-/// rejects) or an unquoted word — is kept as a string so the consumer's
-/// per-option validation decides, matching the previous lenient
-/// tokenizer that treated every bare value as text.
-fn classify_jlink_value(raw: &str) -> Option<JlinkValue> {
-    let t = raw.trim();
-    if let Some(decoded) = decode_json_string_token(t) {
-        return Some(JlinkValue::Str(decoded));
+/// pvxs's `lsetPVX` callbacks (`pvalink_jlif.cpp:69-220`) as a recorder:
+/// every member at `parseDepth == 1` in source order, duplicates kept, with
+/// a string `pv` taken as the name (`:143-148`). `parse_double` and
+/// `parse_start_array` are NULL there, so a float or an array stops the
+/// parse.
+#[derive(Default)]
+struct PvaMembers {
+    depth: u32,
+    key: Option<String>,
+    pv: Option<String>,
+    opts: Vec<(String, JlinkValue)>,
+}
+
+impl PvaMembers {
+    fn member(&mut self, value: JlinkValue) -> bool {
+        if self.depth == 1
+            && let Some(key) = self.key.take()
+        {
+            match value {
+                JlinkValue::Str(name) if key == "pv" => self.pv = Some(name),
+                value => self.opts.push((key, value)),
+            }
+        }
+        true
     }
-    match t {
-        "" => None,
-        "true" => Some(JlinkValue::Bool(true)),
-        "false" => Some(JlinkValue::Bool(false)),
-        "null" => Some(JlinkValue::Null),
-        _ => match t.parse::<i64>() {
-            Ok(n) => Some(JlinkValue::Int(n)),
-            Err(_) => Some(JlinkValue::Str(t.to_string())),
-        },
+}
+
+impl crate::server::db_convert_json::Callbacks for PvaMembers {
+    fn null(&mut self) -> bool {
+        self.member(JlinkValue::Null)
+    }
+    fn boolean(&mut self, value: bool) -> bool {
+        self.member(JlinkValue::Bool(value))
+    }
+    fn integer(&mut self, value: i64) -> bool {
+        self.member(JlinkValue::Int(value))
+    }
+    fn double(&mut self, _value: f64) -> bool {
+        false
+    }
+    fn string(&mut self, bytes: &[u8]) -> bool {
+        self.member(JlinkValue::Str(String::from_utf8_lossy(bytes).into_owned()))
+    }
+    fn start_map(&mut self) -> bool {
+        self.key = None;
+        self.depth += 1;
+        true
+    }
+    fn start_array(&mut self) -> bool {
+        false
+    }
+    fn map_key(&mut self, key: &[u8]) -> bool {
+        if self.depth == 1 {
+            self.key = Some(String::from_utf8_lossy(key).into_owned());
+        }
+        true
+    }
+    fn end_map(&mut self) -> bool {
+        self.depth -= 1;
+        true
     }
 }
 
@@ -3892,7 +4142,7 @@ fn parse_name_link(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
     }
     if let Some(rest) = s.strip_prefix(b"pva://") {
         // PVA names are text until the PVA name layer.
-        return ParsedLink::Pva(String::from_utf8_lossy(rest).into_owned());
+        return ParsedLink::Pva(String::from_utf8_lossy(rest).into_owned().into());
     }
 
     // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
@@ -4080,7 +4330,7 @@ mod json_link_tests {
     fn json_pva_link() {
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "FOO:bar" }}"#),
-            ParsedLink::Pva("FOO:bar".to_string())
+            ParsedLink::Pva("FOO:bar".into())
         );
     }
 
@@ -4102,7 +4352,7 @@ mod json_link_tests {
     fn json_pva_link_string_shorthand() {
         assert_eq!(
             parse_link_v2(r#"{pva: "TARGET:AI"}"#),
-            ParsedLink::Pva("TARGET:AI".to_string())
+            ParsedLink::Pva("TARGET:AI".into())
         );
     }
 
@@ -4118,7 +4368,7 @@ mod json_link_tests {
     fn json_pva_link_string_shorthand_single_quotes() {
         assert_eq!(
             parse_link_v2(r#"{pva: 'invalid:pv:name'}"#),
-            ParsedLink::Pva("invalid:pv:name".to_string())
+            ParsedLink::Pva("invalid:pv:name".into())
         );
     }
 
@@ -4154,7 +4404,7 @@ mod json_link_tests {
             other => panic!("expected PvaJson, got {other:?}"),
         };
         assert_eq!(
-            j.options,
+            j.options.to_vec(),
             vec![
                 ("pipeline".to_string(), JlinkValue::Bool(true)),
                 ("retry".to_string(), JlinkValue::Bool(false)),
@@ -4166,43 +4416,95 @@ mod json_link_tests {
         );
     }
 
-    /// pvxs installs root JLink callbacks only for the JSON string (channel
-    /// shorthand) and map (longhand) cases; `pva_parse_null`/`bool`/`integer`
-    /// ignore root-depth values (pvxs/ioc/pvalink_jlif.cpp:74-100,143-154). A bare
-    /// `true`/`5`/`null`/`[..]` root therefore installs no channel name and
-    /// must NOT become an external PVA/CA link to a literal token. The old
-    /// `value.starts_with('{')` heuristic accepted every non-`{` token as a
-    /// PV name after trimming quotes, dialing channels named `"true"`/`"5"`/
-    /// `"null"`/`"[1,2]"`.
+    /// A `,` or `:` inside a string is the name's, and a nested map is a
+    /// `parseDepth` 2 value pvxs ignores, `pv` inside it included
+    /// (`pvalink_jlif.cpp:143-148`); `pv` matches case-sensitively.
     #[test]
-    fn json_pva_link_root_nonstring_rejected() {
+    fn json_pva_link_longhand_reads_strings_and_nesting_as_json() {
+        let link = parse_link_v2(
+            r#"{pva: {pv: "A,B:C", zzz: {pv: "D", Q: 3}, field: {x: "y,z"}, PV: "E", Q: 7}}"#,
+        );
+        assert_eq!(
+            link,
+            ParsedLink::PvaJson(PvaJsonLink::new(
+                "A,B:C".to_string(),
+                vec![
+                    ("PV".to_string(), JlinkValue::Str("E".to_string())),
+                    ("Q".to_string(), JlinkValue::Int(7)),
+                ],
+            ))
+        );
+        assert_eq!(
+            parse_link_v2(r#"{pva: {pv: "A,B"}}"#),
+            ParsedLink::Pva("A,B".into())
+        );
+    }
+
+    /// Every member reaches the lset in order, a repeated key included, so a
+    /// later value pvxs ignores leaves the earlier one standing.
+    #[test]
+    fn json_pva_link_longhand_keeps_repeated_members_in_order() {
+        let opts = |text: &str| match parse_link_v2(text) {
+            ParsedLink::PvaJson(j) => (j.pv, j.options.into_vec()),
+            other => panic!("{text}: {other:?}"),
+        };
+        let s = |v: &str| JlinkValue::Str(v.to_string());
+        assert_eq!(
+            opts(r#"{pva: {pv: "T:A", pv: 3}}"#),
+            (
+                "T:A".to_string(),
+                vec![("pv".to_string(), JlinkValue::Int(3))]
+            )
+        );
+        assert_eq!(
+            opts(r#"{pva: {pv: "T:B", proc: "CP", proc: "XX"}}"#),
+            (
+                "T:B".to_string(),
+                vec![("proc".to_string(), s("CP")), ("proc".to_string(), s("XX"))]
+            )
+        );
+        assert_eq!(
+            opts(r#"{pva: {pv: "T:C", Q: 3, Q: "a"}}"#),
+            (
+                "T:C".to_string(),
+                vec![
+                    ("Q".to_string(), JlinkValue::Int(3)),
+                    ("Q".to_string(), s("a"))
+                ]
+            )
+        );
+    }
+
+    /// pvxs's root JLink callbacks take a JSON string as the channel name and
+    /// a map as the longhand; `pva_parse_null`/`bool`/`integer` ignore a
+    /// root-depth value (pvxs/ioc/pvalink_jlif.cpp:69-139), so the link keeps
+    /// the empty name, never one spelled after the token. softIocPVX takes
+    /// it at load and at a put and segfaults at the record's first process
+    /// (`pvalink_lset.cpp:702`); the port reads it unconnected. A real or an
+    /// array stops the parse.
+    #[test]
+    fn json_pva_link_root_nonstring_is_the_empty_name() {
         // Accepted roots: string shorthand and object longhand.
         assert_eq!(
             parse_link_v2(r#"{pva: "TARGET"}"#),
-            ParsedLink::Pva("TARGET".to_string())
+            ParsedLink::Pva("TARGET".into())
         );
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "TARGET" }}"#),
-            ParsedLink::Pva("TARGET".to_string())
+            ParsedLink::Pva("TARGET".into())
         );
 
-        // Rejected roots: a non-string, non-object value builds no link at
-        // all. It used to fall through to legacy parsing, which is how it
-        // came out as a PV-name link named after the JSON text; brace text
-        // no longer reaches that arm (`parse_json_link`), so the field is
-        // refused instead.
         for src in [
             r#"{pva: true}"#,
             r#"{pva: false}"#,
             r#"{pva: 5}"#,
+            r#"{pva: -0}"#,
             r#"{pva: null}"#,
-            r#"{pva: [1,2]}"#,
         ] {
-            assert_eq!(
-                parse_link_v2(src),
-                ParsedLink::None,
-                "non-string pva root must not become any link: {src}"
-            );
+            assert_eq!(parse_link_v2(src), ParsedLink::Pva("".into()), "{src}");
+        }
+        for src in [r#"{pva: [1,2]}"#, r#"{pva: 1.5}"#, r#"{pva: 05}"#] {
+            assert_eq!(parse_link_v2(src), ParsedLink::None, "{src}");
         }
 
         // Same defect family on the `ca` key: a bare token must not become a
@@ -4495,14 +4797,14 @@ mod json_link_tests {
         else {
             panic!("a single-quoted pv name must parse");
         };
-        assert_eq!(pv, "REC:AI.VAL");
+        assert_eq!(&*pv, "REC:AI.VAL");
         // The shorthand spelling too, where the whole value is the name.
         let JsonLinkParse::Parsed(ParsedLink::Pva(pv)) =
             parse_json_link(r"{pva: 'REC:AI.VAL'}", LinkFieldType::In)
         else {
             panic!("the single-quoted shorthand must parse");
         };
-        assert_eq!(pv, "REC:AI.VAL");
+        assert_eq!(&*pv, "REC:AI.VAL");
     }
 
     /// BOUNDARY: a comment BEFORE the link-type key. The key reader splits on
@@ -4755,7 +5057,7 @@ mod json_link_tests {
         );
         // Options preserved in source order with original key case.
         assert_eq!(
-            j.options,
+            j.options.to_vec(),
             vec![
                 (
                     "field".to_string(),
@@ -4777,7 +5079,7 @@ mod json_link_tests {
     fn json_pva_string_shorthand_keeps_query_chars_verbatim() {
         assert_eq!(
             parse_link_v2(r#"{pva: "TARGET:AI?field=x"}"#),
-            ParsedLink::Pva("TARGET:AI?field=x".to_string())
+            ParsedLink::Pva("TARGET:AI?field=x".into())
         );
     }
 
@@ -4787,7 +5089,7 @@ mod json_link_tests {
     fn pva_scheme_keeps_query_chars_verbatim() {
         assert_eq!(
             parse_link_v2("pva://TARGET:AI?field=x"),
-            ParsedLink::Pva("TARGET:AI?field=x".to_string())
+            ParsedLink::Pva("TARGET:AI?field=x".into())
         );
     }
 
@@ -4805,6 +5107,45 @@ mod json_link_tests {
         assert_eq!(key.as_ref(), b"pva://TARGET:AI\x1fproc=s:CP");
         assert_eq!(link.link_type(), LinkType::Ca);
         assert!(link.is_writable_out_link());
+    }
+
+    #[test]
+    fn pva_json_identity_key_reads_back_into_its_options() {
+        let options = vec![
+            ("Q".to_string(), JlinkValue::Int(-7)),
+            ("field".to_string(), JlinkValue::Str("a=b:c".into())),
+            ("proc".to_string(), JlinkValue::Null),
+            ("retry".to_string(), JlinkValue::Bool(true)),
+        ];
+        let key = pvajson_identity_key("PV:A", &options);
+        assert_eq!(pvajson_identity_parts(&key), Some(("PV:A".into(), options)));
+        assert_eq!(pvajson_identity_parts("PV:A"), None);
+    }
+
+    /// Every field a JSON string can fill round-trips, whatever it carries:
+    /// a separator or escape in the `pv`, a key or a Str value, and `=` in a
+    /// key, with or without options.
+    #[test]
+    fn pva_json_identity_key_round_trips_a_separator_in_any_field() {
+        let options = vec![
+            ("a=b\u{1f}".to_string(), JlinkValue::Int(1)),
+            (
+                "field".to_string(),
+                JlinkValue::Str("x\u{1f}y=z\u{1e}0".into()),
+            ),
+        ];
+        for pv in ["P\u{1f}V", "P\u{1e}1V", "PV"] {
+            let key = pvajson_identity_key(pv, &options);
+            assert_eq!(
+                pvajson_identity_parts(&key),
+                Some((pv.into(), options.clone()))
+            );
+        }
+        let key = pvajson_identity_key("P\u{1f}V", &[]);
+        assert_eq!(
+            pvajson_identity_parts(&key),
+            Some(("P\u{1f}V".into(), vec![]))
+        );
     }
 
     /// Two structured links to the SAME PV differing only by options get
@@ -4843,7 +5184,7 @@ mod json_link_tests {
     fn br_r10_json_pva_bare_pv_unchanged() {
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "FOO:bar" }}"#),
-            ParsedLink::Pva("FOO:bar".to_string())
+            ParsedLink::Pva("FOO:bar".into())
         );
     }
 

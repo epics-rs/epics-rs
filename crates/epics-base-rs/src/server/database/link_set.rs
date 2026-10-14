@@ -48,6 +48,32 @@
 
 use std::sync::Arc;
 
+/// An external forward link's `scanForward`, opened once by
+/// [`LinkSet::forward_handle`] and held by the link's parse.
+///
+/// Runs on the record-processing thread with the record held: it MUST NOT
+/// block, allocate or resolve a name. pvxs `pvaScanForward`
+/// (`pvxs/ioc/pvalink_lset.cpp:672-688`): a forward is never deferred and
+/// carries no value; a non-retry link that is not connected triggers
+/// nothing and returns [`LinkForwardRefused`], which the caller raises as
+/// LINK/INVALID "Disconn" (`:677-680`).
+pub trait LinkForward: Send + Sync {
+    fn scan_forward(&self) -> Result<(), LinkForwardRefused>;
+}
+
+/// The forward was not staged; the source record takes LINK/INVALID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkForwardRefused;
+
+/// [`LinkSet::forward_handle`]'s default.
+struct NoForward;
+
+impl LinkForward for NoForward {
+    fn scan_forward(&self) -> Result<(), LinkForwardRefused> {
+        Ok(())
+    }
+}
+
 use crate::types::EpicsValue;
 
 /// DBF field type a link's value maps to — the Rust counterpart of
@@ -493,29 +519,17 @@ pub trait LinkSet: Send + Sync {
         Err("link set is read-only".into())
     }
 
-    /// Fire `name`'s forward link (FLNK): trigger the remote target to
-    /// process, transferring no value.
+    /// Open `name` as a forward link: the handle its `scanForward` runs
+    /// through, C `lset->openLink` at `dbInitLink`/`dbAddLink` time, so a
+    /// dispatch resolves nothing (`dbLink.c:475`, `scanForward(plink)`).
     ///
-    /// The lset counterpart of C `dbScanFwdLink` → `lset->scanForward`
-    /// (`dbLink.c:475`), realised by the pvalink lset as `pvaScanForward`
-    /// (`pvxs/ioc/pvalink_lset.cpp:672-688`). A forward link is never
-    /// deferred ("FWD_LINK is never deferred, and always results in a
-    /// Put") and carries no staged value: it forces the remote record to
-    /// process when the source record fires its FLNK.
-    ///
-    /// The lset applies the same non-retry validity gate pvxs does
-    /// (`pvxs/ioc/pvalink_lset.cpp:677`): on a non-retry link that is not currently
-    /// connected it performs NO trigger and returns `Err`, so the caller
-    /// raises LINK/INVALID on the owning record — pvxs calls
-    /// `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` there.
-    ///
-    /// Default impl: `Ok(())` no-op. A read-only or DB-local lset
-    /// forwards nothing through this hook — a DB FLNK target is processed
-    /// directly by the database's `scanOnce` path (the DB lset's
-    /// `scanForward`), not through an external link set.
-    fn scan_forward(&self, name: &[u8]) -> Result<(), String> {
+    /// Called off the cycle path only, by the database's binding owner
+    /// (`PvDatabase::bind_external_forward`). Default: a handle that
+    /// forwards nothing — a read-only or DB-local lset has no
+    /// `scanForward`.
+    fn forward_handle(&self, name: &[u8]) -> Box<dyn LinkForward> {
         let _ = name;
-        Ok(())
+        Box::new(NoForward)
     }
 
     /// Flush any OUT-link writes the lset has queued but not yet sent —

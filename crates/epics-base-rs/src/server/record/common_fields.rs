@@ -95,44 +95,39 @@ pub struct CommonText {
 }
 
 /// Common fields shared by all records.
+///
+/// `repr(C)`, fields no process cycle reads first, so that the ones an
+/// unmonitored cycle does read (from `disv` on, in the order it reads them)
+/// sit on the fewest cache lines at the tail, next to [`RecordInstance`]'s
+/// own hot fields.
+///
+/// [`RecordInstance`]: super::RecordInstance
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct CommonFields {
-    // Alarm state (current/result)
-    pub sevr: AlarmSeverity,
-    pub stat: u16,
-    /// Alarm message string (current). Mirrors epics-base PR #568:
-    /// records may attach a human-readable explanation alongside
-    /// `stat`/`sevr`. Empty means "no message". Transferred from
-    /// `namsg` by `rec_gbl_reset_alarms`.
-    pub amsg: SparseText,
-    // New alarm state (pending, transferred by rec_gbl_reset_alarms)
-    pub nsev: AlarmSeverity,
-    pub nsta: u16,
-    /// Pending alarm message — set during process(), transferred to
-    /// `amsg` by `rec_gbl_reset_alarms` (epics-base PR #566).
-    pub namsg: SparseText,
+    /// The strings no process cycle reads, off the record's cycle lines.
+    pub text: Box<CommonText>,
+    pub bkpt: BkptFlag,
+    /// Time-tag — C `dbCommon.dbd.pod` `field(UTAG,DBF_UINT64)`. A
+    /// 64-bit user/hardware tag set alongside `time` by
+    /// `recGblGetTimeStampSimm` via `dbGetTimeStampTag`. Zero when no
+    /// time-tag source is configured.
+    pub utag: u64,
+    // Alarm hysteresis (analog records)
+    pub hyst: f64,
+    // Scan
+    pub scan: ScanType,
+    // SSCN's dbd default is the out-of-range sentinel 65535 ("use SCAN"),
+    // unrepresentable in `ScanType`; see [`SimModeScan`].
+    pub sscn: SimModeScan,
     // Alarm acknowledgement
     pub acks: AlarmSeverity,
-    pub ackt: bool,
-    /// `UDF` (`DBF_UCHAR` in `dbCommon.dbd`) — "value undefined". C models it
-    /// as one `epicsUInt8` that is BOTH the predicate (`if (prec->udf)`) and
-    /// the served byte: `caput UDF 255` stores 255 and `caget` renders it
-    /// signed `DBR_CHAR` (-1). Modeled as the raw `u8` so the byte round-trips
-    /// on records that do not re-derive it; every predicate reader tests
-    /// `!= 0`, and the record-facing [`crate::server::record::ProcessContext::udf`] boundary keeps the
-    /// `bool` view.
-    pub udf: u8,
     /// `UDFS` (`DBF_MENU menu(menuAlarmSevr)`) — the severity raised for a UDF
     /// record. Holds the **raw stored ordinal** (see [`AnalogAlarmConfig`]): C
     /// stores `(epicsEnum16)` verbatim on a numeric put, so an out-of-range
     /// `UDFS` round-trips (`caput REC.UDFS 4` → `4`); the alarm meaning is
     /// `AlarmSeverity::from_u16(udfs as u16)`.
     pub udfs: i16,
-    // Scan
-    pub scan: ScanType,
-    // SSCN's dbd default is the out-of-range sentinel 65535 ("use SCAN"),
-    // unrepresentable in `ScanType`; see [`SimModeScan`].
-    pub sscn: SimModeScan,
     /// `OLDSIMM` (`DBF_MENU menu(menuSimm)`, `special(SPC_NOMOD)`) — the
     /// PREVIOUS simulation mode, the latch C's `recGblSaveSimm`
     /// (`recGbl.c:421-425`) writes and `recGblCheckSimm` (`recGbl.c:427-437`)
@@ -152,14 +147,64 @@ pub struct CommonFields {
     /// so any out-of-range ordinal simply matches no lifecycle pass — read a
     /// choice with `PiniMode::from_u16(pini as u16)`.
     pub pini: i16,
+    // Phase/priority/event
+    pub phas: i16,
+    pub prio: i16,
+    pub ackt: bool,
+    /// Access security level. C `dbCommon.ASL`
+    /// (0 or 1, default 0). Compared against `RULE(N, …)` levels
+    /// in [`crate::server::access_security::AccessSecurityConfig::check_access_method`] —
+    /// a rule with `RULE(M, …)` only applies when `ASL ≤ M`. The
+    /// earlier code hard-coded ASL=0 at every ACF call site
+    /// (CA tcp.rs, PVA native_source GET/PUT/MONITOR), so every
+    /// `RULE(N>0, WRITE)` was always considered "applicable" and
+    /// the per-record ASL gate was silently inert.
+    pub asl: u8,
+    // DISP — disable putfield from CA. `DBF_UCHAR` in `dbCommon.dbd`: C
+    // stores the raw put byte and serves it SIGNED as `DBR_CHAR`
+    // (`caput DISP 255` → `caget` = -1). Raw `u8` like [`Self::tpro`];
+    // consumers test `!= 0`.
+    pub disp: u8,
+    // PROC — force-processing field. `DBF_UCHAR` in `dbCommon.dbd`
+    // (`field(PROC,DBF_UCHAR){ pp(TRUE) }`): C's `dbPut` stores the raw put
+    // byte in `prec->proc` and never resets it (retained across processing),
+    // serving it back SIGNED as `DBR_CHAR` (`caput PROC 255` → `caget` = -1).
+    // Raw `u8` like [`Self::disp`]/[`Self::rpro`]; the `pp(TRUE)` reprocess is
+    // orthogonal and driven by the put-path force-process intercept.
+    pub proc_field: u8,
+    // Read every process cycle from here on.
+    // Disable support
+    pub disv: i16,
+    pub disa: i16,
+    /// `DISS` (`DBF_MENU menu(menuAlarmSevr)`) — the severity a disabled record
+    /// takes. Holds the **raw stored ordinal** (see [`AnalogAlarmConfig`]).
+    pub diss: i16,
+    // Lock count (re-entrance counter)
+    pub lcnt: i16,
+    // New alarm state (pending, transferred by rec_gbl_reset_alarms)
+    pub nsev: AlarmSeverity,
+    pub nsta: u16,
+    // Alarm state (current/result)
+    pub sevr: AlarmSeverity,
+    pub stat: u16,
+    pub tse: i16,
+    // Process control
+    pub putf: bool,
     /// `TPRO` (`DBF_UCHAR` in `dbCommon.dbd`) — trace-processing flag. C
     /// stores the raw put byte and serves it as SIGNED `DBR_CHAR`
     /// (`caput TPRO 255` → `caget` = -1). Modeled as the raw `u8`, like
     /// [`Self::disp`], so the byte round-trips; consumers test `!= 0`.
     pub tpro: u8,
-    pub bkpt: BkptFlag,
-    /// The strings no process cycle reads, off the record's cycle lines.
-    pub text: Box<CommonText>,
+    // RPRO — reprocess flag. `DBF_UCHAR`, raw-byte readback like DISP/TPRO.
+    pub rpro: u8,
+    /// `UDF` (`DBF_UCHAR` in `dbCommon.dbd`) — "value undefined". C models it
+    /// as one `epicsUInt8` that is BOTH the predicate (`if (prec->udf)`) and
+    /// the served byte: `caput UDF 255` stores 255 and `caget` renders it
+    /// signed `DBR_CHAR` (-1). Modeled as the raw `u8` so the byte round-trips
+    /// on records that do not re-derive it; every predicate reader tests
+    /// `!= 0`, and the record-facing [`crate::server::record::ProcessContext::udf`] boundary keeps the
+    /// `bool` view.
+    pub udf: u8,
     // Device
     /// `DTYP` and the soft-channel class it names, taken together — see
     /// [`Dtyp`](crate::server::device_support::Dtyp).
@@ -170,52 +215,16 @@ pub struct CommonFields {
     /// cycle's stamp began, before any device-supplied time. The AFTC filter
     /// measures its gap from here.
     pub time_last: TimeLast,
-    pub tse: i16,
-    /// Time-tag — C `dbCommon.dbd.pod` `field(UTAG,DBF_UINT64)`. A
-    /// 64-bit user/hardware tag set alongside `time` by
-    /// `recGblGetTimeStampSimm` via `dbGetTimeStampTag`. Zero when no
-    /// time-tag source is configured.
-    pub utag: u64,
     // Analog alarm config (Some for analog record types)
     pub analog_alarm: Option<AnalogAlarmConfig>,
-    /// Access security level. C `dbCommon.ASL`
-    /// (0 or 1, default 0). Compared against `RULE(N, …)` levels
-    /// in [`crate::server::access_security::AccessSecurityConfig::check_access_method`] —
-    /// a rule with `RULE(M, …)` only applies when `ASL ≤ M`. The
-    /// earlier code hard-coded ASL=0 at every ACF call site
-    /// (CA tcp.rs, PVA native_source GET/PUT/MONITOR), so every
-    /// `RULE(N>0, WRITE)` was always considered "applicable" and
-    /// the per-record ASL gate was silently inert.
-    pub asl: u8,
-    // Phase/priority/event
-    pub phas: i16,
-    pub prio: i16,
-    // Disable support
-    pub disv: i16,
-    pub disa: i16,
-    /// `DISS` (`DBF_MENU menu(menuAlarmSevr)`) — the severity a disabled record
-    /// takes. Holds the **raw stored ordinal** (see [`AnalogAlarmConfig`]).
-    pub diss: i16,
-    // Alarm hysteresis (analog records)
-    pub hyst: f64,
-    // Lock count (re-entrance counter)
-    pub lcnt: i16,
-    // DISP — disable putfield from CA. `DBF_UCHAR` in `dbCommon.dbd`: C
-    // stores the raw put byte and serves it SIGNED as `DBR_CHAR`
-    // (`caput DISP 255` → `caget` = -1). Raw `u8` like [`Self::tpro`];
-    // consumers test `!= 0`.
-    pub disp: u8,
-    // Process control
-    pub putf: bool,
-    // RPRO — reprocess flag. `DBF_UCHAR`, raw-byte readback like DISP/TPRO.
-    pub rpro: u8,
-    // PROC — force-processing field. `DBF_UCHAR` in `dbCommon.dbd`
-    // (`field(PROC,DBF_UCHAR){ pp(TRUE) }`): C's `dbPut` stores the raw put
-    // byte in `prec->proc` and never resets it (retained across processing),
-    // serving it back SIGNED as `DBR_CHAR` (`caput PROC 255` → `caget` = -1).
-    // Raw `u8` like [`Self::disp`]/[`Self::rpro`]; the `pp(TRUE)` reprocess is
-    // orthogonal and driven by the put-path force-process intercept.
-    pub proc_field: u8,
+    /// Pending alarm message — set during process(), transferred to
+    /// `amsg` by `rec_gbl_reset_alarms` (epics-base PR #566).
+    pub namsg: SparseText,
+    /// Alarm message string (current). Mirrors epics-base PR #568:
+    /// records may attach a human-readable explanation alongside
+    /// `stat`/`sevr`. Empty means "no message". Transferred from
+    /// `namsg` by `rec_gbl_reset_alarms`.
+    pub amsg: SparseText,
     /// MLST/ALST for a record type that carries no cell of its own: the value
     /// its last `DBE_VALUE` / `DBE_LOG` post carried, 0 until one does.
     pub mlst: f64,

@@ -1224,17 +1224,28 @@ mod link_cache {
     /// The parse is shared so a swap under the hold is two pointer moves:
     /// the new `Arc` is built before the hold and the old one is dropped
     /// after it.
+    ///
+    /// `out` is what the link keeps beyond its parse: nothing, except OUT's
+    /// [`OutTargetSlot`], so the four other entries stay 16 bytes and share
+    /// a cache line.
     #[derive(Debug)]
-    pub struct LinkCache {
+    pub struct LinkCache<T = ()> {
         facts: LinkFacts,
         parse: Arc<ParsedLink>,
+        out: T,
     }
 
-    // SAFETY: `facts.target` is the only field that is not `Send + Sync`, and
-    // it is dereferenced only by the frame of the set that owns this record,
-    // under that set's hold; see `OutTarget`.
-    unsafe impl Send for LinkCache {}
-    unsafe impl Sync for LinkCache {}
+    /// The OUT entry, which also keeps the frame's copy of its lent target.
+    pub type OutLinkCache = LinkCache<OutTargetSlot>;
+
+    /// [`OutLinkCache`]'s target copy, emptied by every swap of the parse.
+    #[derive(Debug, Default)]
+    pub struct OutTargetSlot(Option<OutTarget>);
+
+    // SAFETY: the `OutTarget` is dereferenced only by the frame of the set
+    // that owns this record, under that set's hold; see `OutTarget`.
+    unsafe impl Send for OutTargetSlot {}
+    unsafe impl Sync for OutTargetSlot {}
 
     /// What the process cycle asks of the link on every pass, copied from
     /// the parse whenever one is installed so the cycle answers from the
@@ -1245,7 +1256,6 @@ mod link_cache {
         writable_out: bool,
         gate: Option<ProcessTargetGate>,
         switch: MonitorSwitch,
-        target: Option<OutTarget>,
     }
 
     impl LinkFacts {
@@ -1259,7 +1269,6 @@ mod link_cache {
                 writable_out: link.is_writable_out_link(),
                 gate,
                 switch: link.monitor_switch().unwrap_or_default(),
-                target: None,
             }
         }
     }
@@ -1342,12 +1351,13 @@ mod link_cache {
         }
     }
 
-    impl LinkCache {
+    impl<T: Default> LinkCache<T> {
         pub(super) fn none() -> Self {
             let parse = SHARED[NONE].clone();
             LinkCache {
                 facts: LinkFacts::of(&parse),
                 parse,
+                out: T::default(),
             }
         }
 
@@ -1380,21 +1390,24 @@ mod link_cache {
             self.facts.switch
         }
 
+        /// The swap empties `out` with the facts: the old parse, and the
+        /// entry it lent, leave with `link`.
+        pub(super) fn swap(&mut self, link: &mut Arc<ParsedLink>) {
+            std::mem::swap(&mut self.parse, link);
+            self.facts = LinkFacts::of(&self.parse);
+            self.out = T::default();
+        }
+    }
+
+    impl OutLinkCache {
         pub(crate) fn out_target(&self) -> Option<OutTarget> {
-            self.facts.target
+            self.out.0
         }
 
         /// Store the frame's copy of the lent OUT target, under the write
         /// guard, from the entry `DbLink::lend_out_addr` lent.
         pub(crate) fn set_out_target(&mut self, target: Option<OutTarget>) {
-            self.facts.target = target;
-        }
-
-        /// The swap empties the target with the facts: the old parse, and
-        /// the entry it lent, leave with `link`.
-        pub(super) fn swap(&mut self, link: &mut Arc<ParsedLink>) {
-            std::mem::swap(&mut self.parse, link);
-            self.facts = LinkFacts::of(&self.parse);
+            self.out.0 = target;
         }
     }
 
@@ -1605,7 +1618,7 @@ mod link_cache {
         }
     }
 
-    impl std::ops::Deref for LinkCache {
+    impl<T> std::ops::Deref for LinkCache<T> {
         type Target = ParsedLink;
 
         fn deref(&self) -> &ParsedLink {
@@ -2056,11 +2069,11 @@ mod link_cache {
     }
 }
 
-pub use link_cache::LinkCache;
 pub(crate) use link_cache::{
     CycleLink, CycleLinkSlots, LinkRow, LinkSlots, NewDset, OutTarget, PreparedCommonLink,
     PreparedLink, PreparedLinks,
 };
+pub use link_cache::{LinkCache, OutLinkCache};
 
 /// How one process cycle of one record instance runs, resolved from the
 /// instance's own link kinds and device type (where [`ProcessPlan`] holds what
@@ -2345,32 +2358,26 @@ pub struct RecordCell {
     /// First, and `repr(C)` keeps it there: `run_process_frame` reaches the
     /// instance through the cell pointer, and at any other offset every
     /// borrow pays a `lea` (+6 instr/cycle when a `RecordDesc` resize moved
-    /// it to 0x40). The other fields are in rustc's own release order.
+    /// it to 0x40). The cell's own fields a process cycle reads follow it
+    /// directly, continuing the instance's hot tail; the rest come last.
     data: LockSetGuarded<RecordInstance>,
-    /// C `dbCommon::rdes` — the record type's description, reachable without
-    /// a borrow of the record because a cell's type never changes. What a
-    /// link target's field address ([`FieldAddr`]) is resolved against.
-    rdes: RecordDesc,
-    /// C `dbCommon::name`, fixed at construction like `rdes`, so a message
-    /// naming the record is built with no borrow of it held.
-    name: std::sync::Arc<str>,
-    /// [`Record::field_slot`] for each entry of `rdes.fields`, asked once
-    /// here so a link resolving its target's address needs no lock.
-    slots: Box<[Option<super::record_trait::FieldSlot>]>,
-    /// Beside each `slots` entry, what [`PutAddr::resolve_in`] needs of the
-    /// record for a put, asked once here with the instance owned.
-    put_facts: Box<[PutFacts]>,
-    /// [`Record::field_slot`] of each [`Record::multi_input_links`] value
-    /// field, by the link's index — C's `&prec->a + i`, the address the
-    /// fetch stores through ([`Record::put_slot_f64`]) when the type hands
-    /// one out.
-    multi_input_val_slots: Box<[Option<super::record_trait::FieldSlot>]>,
+    /// C `dbCommon::lset` (`dbLockPvt.h:52`). Born pointing at the bootstrap
+    /// set — C's null `lset` before `dbLockInitRecords`, made lockable — and
+    /// moved onto a set of its own by the registry, which adopts this very
+    /// cell for the record's name so that the record and the registry can
+    /// never hold two answers to "which set is this record in". A lock-set
+    /// MERGE moves the set the cell points at, never the cell.
+    lock_record: std::sync::Arc<crate::server::database::LockRecord>,
     /// `RefCell`-style borrow state of `data`: `0` free, `n > 0` that many
     /// shared borrows, `-1` one exclusive borrow. Touched only by the thread
     /// holding the record's lock set, which is why plain loads and stores
     /// (no read-modify-write) are enough — the atomic is for `Sync`, not for
     /// contention, and there is none.
     borrow: std::sync::atomic::AtomicIsize,
+    /// The type-static answers a process cycle tests — see [`ProcessPlan`].
+    /// Fixed by the type, like `rdes`, so it is reachable without a borrow
+    /// of the record.
+    plan: ProcessPlan,
     /// Which published `cp_links` map `PvDatabase::sources_cp_edges` was resolved
     /// from, or 0 before it ever was.
     ///
@@ -2383,36 +2390,9 @@ pub struct RecordCell {
     /// revision on every edit, so a record that has heard the answer once may
     /// keep it until it does.
     cp_edges_revision: std::sync::atomic::AtomicU64,
-    /// C `dbRecordNode::order` (`dbStaticLib.c:1704`) — this record's place in
-    /// the database load sequence: the scan index's secondary sort key, and
-    /// the order every whole-database walk visits.
-    ///
-    /// Here by the rule above: every reader of it — the scan-index insert,
-    /// `all_record_names`, the PINI sweep — needs it *before* it takes the
-    /// record's lock set, and what it used to reach for instead was a
-    /// name-keyed copy-on-write map beside the records. That map was cloned
-    /// once per record added, which made `dbLoadRecords` quadratic. On the
-    /// cell the sequence is born with the node, cannot go missing from it, and
-    /// dies with it.
-    load_order: u64,
-    /// This record's slot in the database's record table, given at
-    /// registration; `None` for a cell no database registered.
-    index: Option<crate::server::database::RecordIdx>,
-    /// C `dbCommon::lset` (`dbLockPvt.h:52`). Born pointing at the bootstrap
-    /// set — C's null `lset` before `dbLockInitRecords`, made lockable — and
-    /// moved onto a set of its own by the registry, which adopts this very
-    /// cell for the record's name so that the record and the registry can
-    /// never hold two answers to "which set is this record in". A lock-set
-    /// MERGE moves the set the cell points at, never the cell.
-    lock_record: std::sync::Arc<crate::server::database::LockRecord>,
-    /// The record's `BKPT` byte, shared with `data.common.bkpt` — reachable
-    /// here without the lock set, as C reads `precord->bkpt` (see
-    /// [`BkptFlag`]).
-    bkpt: BkptFlag,
-    /// The type-static answers a process cycle tests — see [`ProcessPlan`].
-    /// Fixed by the type, like `rdes`, so it is reachable without a borrow
-    /// of the record.
-    plan: ProcessPlan,
+    /// C `dbCommon::name`, fixed at construction like `rdes`, so a message
+    /// naming the record is built with no borrow of it held.
+    name: std::sync::Arc<str>,
     /// The cached answer, valid only while [`Self::cp_edges_revision`] still
     /// matches the registry's.
     cp_edges: std::sync::atomic::AtomicBool,
@@ -2428,6 +2408,40 @@ pub struct RecordCell {
     /// answer is the record's own, and the owed-ness cannot name a record
     /// that does not exist.
     init_owed: std::sync::atomic::AtomicBool,
+    /// This record's slot in the database's record table, given at
+    /// registration; `None` for a cell no database registered.
+    index: Option<crate::server::database::RecordIdx>,
+    /// C `dbCommon::rdes` — the record type's description, reachable without
+    /// a borrow of the record because a cell's type never changes. What a
+    /// link target's field address ([`FieldAddr`]) is resolved against.
+    rdes: RecordDesc,
+    /// [`Record::field_slot`] for each entry of `rdes.fields`, asked once
+    /// here so a link resolving its target's address needs no lock.
+    slots: Box<[Option<super::record_trait::FieldSlot>]>,
+    /// Beside each `slots` entry, what [`PutAddr::resolve_in`] needs of the
+    /// record for a put, asked once here with the instance owned.
+    put_facts: Box<[PutFacts]>,
+    /// [`Record::field_slot`] of each [`Record::multi_input_links`] value
+    /// field, by the link's index — C's `&prec->a + i`, the address the
+    /// fetch stores through ([`Record::put_slot_f64`]) when the type hands
+    /// one out.
+    multi_input_val_slots: Box<[Option<super::record_trait::FieldSlot>]>,
+    /// C `dbRecordNode::order` (`dbStaticLib.c:1704`) — this record's place in
+    /// the database load sequence: the scan index's secondary sort key, and
+    /// the order every whole-database walk visits.
+    ///
+    /// Here by the rule above: every reader of it — the scan-index insert,
+    /// `all_record_names`, the PINI sweep — needs it *before* it takes the
+    /// record's lock set, and what it used to reach for instead was a
+    /// name-keyed copy-on-write map beside the records. That map was cloned
+    /// once per record added, which made `dbLoadRecords` quadratic. On the
+    /// cell the sequence is born with the node, cannot go missing from it, and
+    /// dies with it.
+    load_order: u64,
+    /// The record's `BKPT` byte, shared with `data.common.bkpt` — reachable
+    /// here without the lock set, as C reads `precord->bkpt` (see
+    /// [`BkptFlag`]).
+    bkpt: BkptFlag,
     /// Bit `i`: the `i`th [`FieldDesc::runtime_typed`] field of `rdes.fields`
     /// is served as `DBF_STRING` (`cvt_dbaddr` from `FTVL`, `FTA`...). Those
     /// selectors are `SPC_NOMOD`, so the fact is settled where they can still
@@ -4532,23 +4546,14 @@ impl FieldRead {
 }
 
 /// A type-erased record instance stored in the database.
+///
+/// `repr(C)`, fields no process cycle reads first: from `subscribers` on, the
+/// fields an unmonitored cycle reads follow in the order it reads them, so that
+/// with [`RecordCell`]'s own hot fields right behind they fill the fewest
+/// contiguous cache lines. `subscribers` leads that run because only its
+/// length, at its end, is read with no monitor attached.
+#[repr(C)]
 pub struct RecordInstance {
-    pub name: String,
-    pub record: Box<dyn Record>,
-    pub common: CommonFields,
-    /// Every monitor on the record in attach order — C's `mlis`, which
-    /// `db_post_events` walks matching the field. Two sit inline; a third
-    /// grows the buffer under the hold at attach, never on a post.
-    pub(crate) subscribers: smallvec::SmallVec<[FieldSubscriber; 2]>,
-    /// Terminal destruction marker, the [`crate::server::pv::ProcessVariable`]
-    /// flag's counterpart for a record-backed channel. Set once by
-    /// [`Self::destroy`], whose only caller is
-    /// [`crate::server::database::PvDatabase::remove_record`], so *removed
-    /// from the database* and *destroyed* are one event for both target
-    /// kinds and a server can sweep them with one uniform test.
-    destroyed: bool,
-    // Link parse cache
-    pub parsed_inp: LinkCache,
     /// The parsed form of each [`Record::multi_input_links`] slot the record
     /// has wired, validated against the text the record holds NOW on every
     /// read — see [`ParsedInputLink::validated`], the one writer. The record's
@@ -4557,24 +4562,8 @@ pub struct RecordInstance {
     /// holds for every entry by construction. C parses a link once at
     /// `dbInitLink`; the port parsed every set `INPA`..`INPL` on every cycle.
     pub(crate) parsed_inputs: Vec<Option<ParsedInputLink>>,
-    /// SIMM as it stood before this cycle's SIML read (`rec_gbl_get_simm`), for
-    /// an output's stamp, which C takes before `writeValue` reads SIML. `None`
-    /// while no SIML read has run since the SIML was last put.
-    pub(crate) simm_before_siml_read: Option<i16>,
-    pub parsed_out: LinkCache,
-    pub parsed_flnk: LinkCache,
-    pub parsed_sdis: LinkCache,
-    pub parsed_tsel: LinkCache,
     /// Every other link field's parse — see [`Self::record_link`].
     link_slots: LinkSlots,
-    /// The [`CycleLink`]s' slots in `link_slots` — see [`Self::cycle_link`].
-    cycle_links: CycleLinkSlots,
-    /// `(OMSL, OIF)` menu indices, 0 for a type without the field; settled at
-    /// construction and by the two put funnels, so the cycle's closed-loop
-    /// DOL test reads no field by name.
-    dol_mode: (i16, i16),
-    /// `SELM` menu index (sel), kept the same way for the NVL gate.
-    selm: i16,
     /// The rows of `link_slots` the multi-output dispatch reads by index
     /// ([`crate::server::database::multi_out_rows`]): the output row, and
     /// seq's DOL row.
@@ -4585,19 +4574,51 @@ pub struct RecordInstance {
     pub dpvt: crate::server::device_support::Dpvt,
     // Subroutine (for sub records)
     pub subroutine: Option<Arc<SubroutineFn>>,
+    /// Generation counter for ReprocessAfter timer cancellation.
+    /// Bumped each process cycle. Spawned timers check this to avoid
+    /// stale re-processes from accumulated timers.
+    pub reprocess_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Generation counter for the monitor watchdog
+    /// ([`Record::watchdog_interval`] / [`Record::watchdog_fire`]), bumped by
+    /// each `PvDatabase::arm_watchdog` so a re-arm supersedes the tick already
+    /// in flight — C `callbackRequestDelayed` replacing an outstanding delayed
+    /// callback. Deliberately NOT `reprocess_generation`: C's histogram wdog is
+    /// its own `epicsCallback`, independent of the record's SDLY/async
+    /// re-entry, so an SDLY defer must not cancel the watchdog nor vice versa.
+    pub watchdog_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The fields no process cycle reads; see [`RecordCold`].
+    cold: Box<RecordCold>,
+    /// Test knob: run every cycle as [`CyclePlan::General`], the reference a
+    /// plain arm is compared against.
+    #[cfg(test)]
+    pub(crate) plan_forced_general: bool,
+    #[cfg(test)]
+    ran_arm: CyclePlan,
+    /// The [`CycleLink`]s' slots in `link_slots` — see [`Self::cycle_link`].
+    cycle_links: CycleLinkSlots,
+    /// `SELM` menu index (sel), kept the same way for the NVL gate.
+    selm: i16,
     /// What this record's dset `init_record` did; written only by
     /// [`crate::server::device_support::init_device_support`].
     pub(crate) dset_init: crate::server::device_support::DsetInit,
-    /// PACT (C `precord->pact`) — the re-entrancy guard, and the record's
-    /// "busy" state for every put that lands on it.
-    ///
-    /// PRIVATE by construction: entered through [`RecordInstance::enter_pact`]
-    /// and released ONLY through [`RecordInstance::leave_pact`], which hands
-    /// back the [`PactExit`] that routes the release to the cycle tail where
-    /// queued put-notifies are restarted. A `pact.store(false)` open-coded at
-    /// a release site is what skipped that tail on the ODLY/SDLY paths; it is
-    /// no longer expressible.
-    pact: AtomicBool,
+    /// C `prec->simpvt`: the callback a simulating record allocates the first
+    /// time it defers on `SDLY >= 0` (`aiRecord.c:501-504`, one per SIMM
+    /// type) and never frees. Only `dbpr` reads it.
+    pub(crate) simpvt: bool,
+    /// One-shot "skip the registered subroutine this cycle" signal for aSub
+    /// `LFLG=READ`. The async processing path resolves the `SUBL` link before
+    /// taking this lock; when the resolved name is bad (C `fetch_values` ->
+    /// `S_db_BadSub`) or the link read failed, C `process` runs `do_sub` only
+    /// on `!status`, so the subroutine is skipped. Set by the resolution
+    /// apply, consumed (and cleared) by [`Self::run_registered_subroutine`];
+    /// `false` for every record without a pending bad re-resolution.
+    suppress_subroutine_run: bool,
+    /// Every monitor on the record in attach order — C's `mlis`, which
+    /// `db_post_events` walks matching the field. Two sit inline; a third
+    /// grows the buffer under the hold at attach, never on a post.
+    pub(crate) subscribers: smallvec::SmallVec<[FieldSubscriber; 2]>,
+    pub common: CommonFields,
+    pub record: Box<dyn Record>,
     // Put-notify wait-set this record currently belongs to (C
     // `precord->ppn`). Set when the record joins an active put-notify
     // (originating put target, or a FLNK/OUT PP target via `dbNotifyAdd`);
@@ -4625,6 +4646,57 @@ pub struct RecordInstance {
     /// [`Self::take_next_notify_restart`], which pops only onto a record no
     /// put-notify owns.
     notify_restart_list: std::collections::VecDeque<DeferredNotify>,
+    pub name: String,
+    /// What this record's TYPE can reach in a process cycle, settled once at
+    /// construction. See [`ProcessPlan`].
+    /// C's `UDF_ALARM` guard for this type, or `None` for a type whose C
+    /// support has no such line (`swait`, `waveform` proper). See
+    /// [`UdfAlarm`]. Read by [`Self::evaluate_alarms`] under the lock, which
+    /// is why it lives here and not on the cell's [`ProcessPlan`].
+    udf_alarm: Option<UdfAlarm>,
+    /// The plan resolved at `cycle_plan.0`; stale when that is not `plan_rev`.
+    cycle_plan: (u32, CyclePlan, CycleFacts),
+    /// Revision of everything [`CyclePlan`] was resolved from. Bumped only by
+    /// [`Self::invalidate_plan`].
+    plan_rev: u32,
+    /// SIMM as it stood before this cycle's SIML read (`rec_gbl_get_simm`), for
+    /// an output's stamp, which C takes before `writeValue` reads SIML. `None`
+    /// while no SIML read has run since the SIML was last put.
+    pub(crate) simm_before_siml_read: Option<i16>,
+    /// `(OMSL, OIF)` menu indices, 0 for a type without the field; settled at
+    /// construction and by the two put funnels, so the cycle's closed-loop
+    /// DOL test reads no field by name.
+    dol_mode: (i16, i16),
+    /// Terminal destruction marker, the [`crate::server::pv::ProcessVariable`]
+    /// flag's counterpart for a record-backed channel. Set once by
+    /// [`Self::destroy`], whose only caller is
+    /// [`crate::server::database::PvDatabase::remove_record`], so *removed
+    /// from the database* and *destroyed* are one event for both target
+    /// kinds and a server can sweep them with one uniform test.
+    destroyed: bool,
+    /// PACT (C `precord->pact`) — the re-entrancy guard, and the record's
+    /// "busy" state for every put that lands on it.
+    ///
+    /// PRIVATE by construction: entered through [`RecordInstance::enter_pact`]
+    /// and released ONLY through [`RecordInstance::leave_pact`], which hands
+    /// back the [`PactExit`] that routes the release to the cycle tail where
+    /// queued put-notifies are restarted. A `pact.store(false)` open-coded at
+    /// a release site is what skipped that tail on the ODLY/SDLY paths; it is
+    /// no longer expressible.
+    pact: AtomicBool,
+    /// Set by `check_deadband_ext` for waveform/aai/aao when their
+    /// content hash changed this cycle (C `monitor()` On Change mode,
+    /// waveformRecord.c:310-319). The snapshot builders read it to post
+    /// `HASH` with a literal `DBE_VALUE` event, independent of the VAL
+    /// post mask. False for every record without the MPST/APST/HASH
+    /// mechanism.
+    pub(crate) array_hash_changed: bool,
+    pub parsed_sdis: LinkCache,
+    // Link parse cache
+    pub parsed_inp: LinkCache,
+    pub parsed_out: OutLinkCache,
+    pub parsed_tsel: LinkCache,
+    pub parsed_flnk: LinkCache,
     /// The value of each subscribed field as ALREADY PUBLISHED to that
     /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
     /// change-detection loop in every snapshot builder posts a field only
@@ -4660,60 +4732,9 @@ pub struct RecordInstance {
     last_posted: PostedLog,
     /// Owner of every `last_posted` entry's `posted`; see [`PostedSet`].
     posted: PostedSet,
-    /// What this record's TYPE can reach in a process cycle, settled once at
-    /// construction. See [`ProcessPlan`].
-    /// C's `UDF_ALARM` guard for this type, or `None` for a type whose C
-    /// support has no such line (`swait`, `waveform` proper). See
-    /// [`UdfAlarm`]. Read by [`Self::evaluate_alarms`] under the lock, which
-    /// is why it lives here and not on the cell's [`ProcessPlan`].
-    udf_alarm: Option<UdfAlarm>,
     /// What this record's TYPE answers to `monitor()`'s type-static
     /// questions, settled once at construction. See [`MonitorPlan`].
     monitor_plan: MonitorPlan,
-    /// Set by `check_deadband_ext` for waveform/aai/aao when their
-    /// content hash changed this cycle (C `monitor()` On Change mode,
-    /// waveformRecord.c:310-319). The snapshot builders read it to post
-    /// `HASH` with a literal `DBE_VALUE` event, independent of the VAL
-    /// post mask. False for every record without the MPST/APST/HASH
-    /// mechanism.
-    pub(crate) array_hash_changed: bool,
-    /// C `prec->simpvt`: the callback a simulating record allocates the first
-    /// time it defers on `SDLY >= 0` (`aiRecord.c:501-504`, one per SIMM
-    /// type) and never frees. Only `dbpr` reads it.
-    pub(crate) simpvt: bool,
-    /// One-shot "skip the registered subroutine this cycle" signal for aSub
-    /// `LFLG=READ`. The async processing path resolves the `SUBL` link before
-    /// taking this lock; when the resolved name is bad (C `fetch_values` ->
-    /// `S_db_BadSub`) or the link read failed, C `process` runs `do_sub` only
-    /// on `!status`, so the subroutine is skipped. Set by the resolution
-    /// apply, consumed (and cleared) by [`Self::run_registered_subroutine`];
-    /// `false` for every record without a pending bad re-resolution.
-    suppress_subroutine_run: bool,
-    /// Generation counter for ReprocessAfter timer cancellation.
-    /// Bumped each process cycle. Spawned timers check this to avoid
-    /// stale re-processes from accumulated timers.
-    pub reprocess_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Generation counter for the monitor watchdog
-    /// ([`Record::watchdog_interval`] / [`Record::watchdog_fire`]), bumped by
-    /// each `PvDatabase::arm_watchdog` so a re-arm supersedes the tick already
-    /// in flight — C `callbackRequestDelayed` replacing an outstanding delayed
-    /// callback. Deliberately NOT `reprocess_generation`: C's histogram wdog is
-    /// its own `epicsCallback`, independent of the record's SDLY/async
-    /// re-entry, so an SDLY defer must not cancel the watchdog nor vice versa.
-    pub watchdog_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Revision of everything [`CyclePlan`] was resolved from. Bumped only by
-    /// [`Self::invalidate_plan`].
-    plan_rev: u32,
-    /// The plan resolved at `cycle_plan.0`; stale when that is not `plan_rev`.
-    cycle_plan: (u32, CyclePlan, CycleFacts),
-    /// Test knob: run every cycle as [`CyclePlan::General`], the reference a
-    /// plain arm is compared against.
-    #[cfg(test)]
-    pub(crate) plan_forced_general: bool,
-    #[cfg(test)]
-    ran_arm: CyclePlan,
-    /// The fields no process cycle reads; see [`RecordCold`].
-    cold: Box<RecordCold>,
 }
 
 /// [`RecordInstance`]'s fields no process cycle reads, behind one pointer so
@@ -5543,15 +5564,14 @@ impl RecordInstance {
     /// [`Self::install_link_cache`] handing the old parse back in `link`, so
     /// a caller under the hold can drop it after.
     fn swap_link_cache(&mut self, field: &str, link: &mut Arc<ParsedLink>) -> bool {
-        let slot = match field {
-            "INP" => &mut self.parsed_inp,
-            "OUT" => &mut self.parsed_out,
-            "TSEL" => &mut self.parsed_tsel,
-            "SDIS" => &mut self.parsed_sdis,
-            "FLNK" => &mut self.parsed_flnk,
+        match field {
+            "INP" => self.parsed_inp.swap(link),
+            "OUT" => self.parsed_out.swap(link),
+            "TSEL" => self.parsed_tsel.swap(link),
+            "SDIS" => self.parsed_sdis.swap(link),
+            "FLNK" => self.parsed_flnk.swap(link),
             _ => return false,
-        };
-        slot.swap(link);
+        }
         self.invalidate_plan();
         true
     }
@@ -6156,15 +6176,14 @@ impl RecordInstance {
         if let Some(link) = self.declared_record_link(field) {
             return Some(link);
         }
-        let cache = match field {
-            "INP" => &self.parsed_inp,
-            "OUT" => &self.parsed_out,
-            "TSEL" => &self.parsed_tsel,
-            "SDIS" => &self.parsed_sdis,
-            "FLNK" => &self.parsed_flnk,
-            _ => return None,
-        };
-        Some(cache.shared())
+        match field {
+            "INP" => Some(self.parsed_inp.shared()),
+            "OUT" => Some(self.parsed_out.shared()),
+            "TSEL" => Some(self.parsed_tsel.shared()),
+            "SDIS" => Some(self.parsed_sdis.shared()),
+            "FLNK" => Some(self.parsed_flnk.shared()),
+            _ => None,
+        }
     }
 
     /// [`Self::record_link`] for a field the type may not declare: `None`
@@ -12414,6 +12433,163 @@ mod record_cell_layout_tests {
     fn data_stays_first_when_the_instance_changes_size() {
         assert_eq!(std::mem::offset_of!(super::RecordCell, data), 0);
     }
+
+    use super::{CommonFields, RecordCell, RecordInstance};
+
+    fn size_of_field<T, F>(_: fn(&T) -> &F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn align_of_field<T, F>(_: fn(&T) -> &F) -> usize {
+        std::mem::align_of::<F>()
+    }
+
+    /// `$t`'s fields in declared order, as (name, offset, size, align). The
+    /// pattern has no `..`, so a field added to `$t` and not listed here
+    /// breaks the build.
+    macro_rules! layout {
+        ($t:ident { $($f:ident),+ $(,)? }) => {{
+            let _ = |v: &$t| {
+                let $t { $($f: _),+ } = v;
+            };
+            let fields = [$((
+                stringify!($f),
+                std::mem::offset_of!($t, $f),
+                size_of_field(|v: &$t| &v.$f),
+                align_of_field(|v: &$t| &v.$f),
+            )),+];
+            (stringify!($t), std::mem::size_of::<$t>(), std::mem::align_of::<$t>(), fields)
+        }};
+    }
+
+    /// The fields sit at their listed positions with nothing between them but
+    /// the padding the next one's alignment needs.
+    fn packed_in_order<const N: usize>(
+        (ty, size, align, fields): (&str, usize, usize, [(&str, usize, usize, usize); N]),
+    ) {
+        let mut end = 0;
+        for (f, at, fsize, falign) in fields {
+            assert!(
+                at >= end && at - end < falign,
+                "{ty}.{f} at {at} does not follow the field before it (ending at {end})"
+            );
+            end = at + fsize;
+        }
+        assert!(
+            size - end < align,
+            "{ty} has {} bytes after its last field",
+            size - end
+        );
+    }
+
+    /// The fields an unmonitored cycle reads, in the order it reads them,
+    /// fill one run: CommonFields' tail, inside RecordInstance's tail, which
+    /// RecordCell's own read fields continue. Every field of the three types
+    /// is listed in declared order, the cold ones on the far side of the run;
+    /// a field added, moved or planted in the run fails the build or here.
+    #[test]
+    fn the_cycle_read_fields_stay_one_run() {
+        packed_in_order(layout!(CommonFields {
+            text,
+            bkpt,
+            utag,
+            hyst,
+            scan,
+            sscn,
+            acks,
+            udfs,
+            oldsimm,
+            pini,
+            phas,
+            prio,
+            ackt,
+            asl,
+            disp,
+            proc_field,
+            // Read every process cycle from here on.
+            disv,
+            disa,
+            diss,
+            lcnt,
+            nsev,
+            nsta,
+            sevr,
+            stat,
+            tse,
+            putf,
+            tpro,
+            rpro,
+            udf,
+            dtyp,
+            time,
+            time_last,
+            analog_alarm,
+            namsg,
+            amsg,
+            mlst,
+            alst,
+        }));
+        packed_in_order(layout!(RecordInstance {
+            parsed_inputs,
+            link_slots,
+            link_rows,
+            device,
+            dpvt,
+            subroutine,
+            reprocess_generation,
+            watchdog_generation,
+            cold,
+            plan_forced_general,
+            ran_arm,
+            cycle_links,
+            selm,
+            dset_init,
+            simpvt,
+            suppress_subroutine_run,
+            // Read every process cycle from here on.
+            subscribers,
+            common,
+            record,
+            notify,
+            notify_restart_list,
+            name,
+            udf_alarm,
+            cycle_plan,
+            plan_rev,
+            simm_before_siml_read,
+            dol_mode,
+            destroyed,
+            pact,
+            array_hash_changed,
+            parsed_sdis,
+            parsed_inp,
+            parsed_out,
+            parsed_tsel,
+            parsed_flnk,
+            last_posted,
+            posted,
+            monitor_plan,
+        }));
+        packed_in_order(layout!(RecordCell {
+            data,
+            lock_record,
+            borrow,
+            plan,
+            cp_edges_revision,
+            name,
+            cp_edges,
+            // Not read by a process cycle from here on.
+            init_owed,
+            index,
+            rdes,
+            slots,
+            put_facts,
+            multi_input_val_slots,
+            load_order,
+            bkpt,
+            string_typed,
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -16422,16 +16598,21 @@ mod link_cache_fact_tests {
             for field in ["OUT", "SDIS", "FLNK"] {
                 assert!(inst.set_link_cache(field, parse.clone()));
             }
-            for cache in [&inst.parsed_out, &inst.parsed_sdis, &inst.parsed_flnk] {
+            let facts = |constant: bool, writable_out: bool, link: &ParsedLink| {
                 assert_eq!(
-                    cache.is_constant(),
-                    crate::server::recgbl::simm::is_constant(cache.link()),
+                    constant,
+                    crate::server::recgbl::simm::is_constant(link),
                     "{text:?}"
                 );
-                assert_eq!(
+                assert_eq!(writable_out, link.is_writable_out_link(), "{text:?}");
+            };
+            let out = &inst.parsed_out;
+            facts(out.is_constant(), out.is_writable_out_link(), out.link());
+            for cache in [&inst.parsed_sdis, &inst.parsed_flnk] {
+                facts(
+                    cache.is_constant(),
                     cache.is_writable_out_link(),
-                    cache.link().is_writable_out_link(),
-                    "{text:?}"
+                    cache.link(),
                 );
             }
         }

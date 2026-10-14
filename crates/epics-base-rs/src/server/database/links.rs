@@ -471,7 +471,7 @@ impl OutLinkWrite {
     #[inline(always)]
     pub(crate) fn capture(
         value: Option<EpicsValue>,
-        cache: &mut crate::server::record::record_instance::LinkCache,
+        cache: &mut crate::server::record::record_instance::OutLinkCache,
         db: &PvDatabase,
         held: &super::SetGuard,
     ) -> Option<(Self, EpicsValue)> {
@@ -481,7 +481,7 @@ impl OutLinkWrite {
 
     #[inline(always)]
     fn of(
-        cache: &mut crate::server::record::record_instance::LinkCache,
+        cache: &mut crate::server::record::record_instance::OutLinkCache,
         db: &PvDatabase,
         held: &super::SetGuard,
     ) -> Self {
@@ -512,7 +512,7 @@ impl OutLinkWrite {
     #[cold]
     #[inline(never)]
     fn refresh(
-        cache: &mut crate::server::record::record_instance::LinkCache,
+        cache: &mut crate::server::record::record_instance::OutLinkCache,
         db: &PvDatabase,
         held: &super::SetGuard,
     ) -> Option<crate::server::record::record_instance::OutTarget> {

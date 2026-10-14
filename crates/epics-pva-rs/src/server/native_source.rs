@@ -420,8 +420,116 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
 
 /// Fill every leaf `snap` serves into `v`, a tree of `NtShape::of(snap)`.
 fn fill_nt(v: &mut PvField, snap: &Snapshot) {
-    fill_nt_meta(v, NtShape::of(snap), snap);
-    fill_nt_event(v, &LogLeaves::of_snapshot(snap));
+    let layout = NtLayout::new(NtShape::of(snap));
+    fill_nt_meta(v, layout.shape, snap);
+    fill_nt_event(v, &layout.event, &LogLeaves::of_snapshot(snap));
+}
+
+/// An [`NtShape`] with the positions of the leaves an event assigns, resolved
+/// from its descriptor when the layout is built. pvxs flattens dotted member
+/// names into offsets when a type is built (`type.cpp:270-277`) and still looks
+/// each one up per assignment (`data.cpp:833`); here the per-event fill only
+/// indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NtLayout {
+    shape: NtShape,
+    event: EventLeaves,
+}
+
+impl NtLayout {
+    fn new(shape: NtShape) -> Self {
+        Self {
+            shape,
+            event: EventLeaves::of(&shape.desc()),
+        }
+    }
+}
+
+/// Where a tree of one descriptor keeps each event leaf; `None` for a leaf the
+/// descriptor does not declare, pvxs's `if(auto x = node["…"])` no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EventLeaves {
+    /// `value`, or `value.index` on an NTEnum.
+    value: Option<LeafAt>,
+    severity: Option<LeafAt>,
+    status: Option<LeafAt>,
+    message: Option<LeafAt>,
+    seconds: Option<LeafAt>,
+    nanoseconds: Option<LeafAt>,
+    user_tag: Option<LeafAt>,
+}
+
+impl EventLeaves {
+    fn of(desc: &FieldDesc) -> Self {
+        let value = match LeafAt::resolve(desc, "value.index") {
+            Some(at) => Some(at),
+            None => LeafAt::resolve(desc, "value"),
+        };
+        Self {
+            value,
+            severity: LeafAt::resolve(desc, "alarm.severity"),
+            status: LeafAt::resolve(desc, "alarm.status"),
+            message: LeafAt::resolve(desc, "alarm.message"),
+            seconds: LeafAt::resolve(desc, "timeStamp.secondsPastEpoch"),
+            nanoseconds: LeafAt::resolve(desc, "timeStamp.nanoseconds"),
+            user_tag: LeafAt::resolve(desc, "timeStamp.userTag"),
+        }
+    }
+}
+
+/// A leaf one or two members below the root, by member index. Valid for a
+/// tree built from the descriptor it was resolved against:
+/// [`default_value_for`](crate::pvdata::encode::default_value_for) keeps the
+/// descriptor's member order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeafAt {
+    top: usize,
+    sub: Option<usize>,
+}
+
+impl LeafAt {
+    fn resolve(desc: &FieldDesc, path: &str) -> Option<Self> {
+        fn index(desc: &FieldDesc, name: &str) -> Option<(usize, FieldDesc)> {
+            let FieldDesc::Structure { fields, .. } = desc else {
+                return None;
+            };
+            fields
+                .into_iter()
+                .enumerate()
+                .find(|(_, (n, _))| n == name)
+                .map(|(i, (_, d))| (i, d.clone()))
+        }
+        let (top, rest) = match path.split_once('.') {
+            Some((top, rest)) => (top, Some(rest)),
+            None => (path, None),
+        };
+        let (top, child) = index(desc, top)?;
+        let sub = match rest {
+            Some(name) => Some(index(&child, name)?.0),
+            None => None,
+        };
+        Some(Self { top, sub })
+    }
+
+    fn get(self, v: &mut PvField) -> Option<&mut PvField> {
+        let PvField::Structure(s) = v else {
+            return None;
+        };
+        let top = &mut s.fields.get_mut(self.top)?.1;
+        match self.sub {
+            None => Some(top),
+            Some(i) => match top {
+                PvField::Structure(s) => s.fields.get_mut(i).map(|(_, v)| v),
+                _ => None,
+            },
+        }
+    }
+
+    fn set_scalar(at: Option<Self>, v: &mut PvField, val: ScalarValue) {
+        if let Some(PvField::Scalar(slot)) = at.and_then(|at| at.get(v)) {
+            *slot = val;
+        }
+    }
 }
 
 /// The leaves a log carries: the value, alarm and time `dbGet` reads off a
@@ -469,19 +577,19 @@ impl<'a> LogLeaves<'a> {
 /// `UpdateType::Value | Alarm` (`iocsource.cpp:338-358`): value, alarm and
 /// timeStamp, nothing a metadata read supplies. Each is written into the
 /// leaf `v` already holds, so a scalar event allocates nothing.
-fn fill_nt_event(v: &mut PvField, log: &LogLeaves) {
+fn fill_nt_event(v: &mut PvField, at: &EventLeaves, log: &LogLeaves) {
     match log.value {
         EpicsValue::Enum(index) => {
-            set_scalar(v, "value.index", ScalarValue::Int(i32::from(*index)))
+            LeafAt::set_scalar(at.value, v, ScalarValue::Int(i32::from(*index)))
         }
-        other => set_leaf(
-            v,
-            "value",
-            crate::leaf_convert::epics_value_to_pv_leaf(other),
-        ),
+        other => {
+            if let Some(slot) = at.value.and_then(|at| at.get(v)) {
+                *slot = crate::leaf_convert::epics_value_to_pv_leaf(other);
+            }
+        }
     }
-    fill_alarm(v, log.stat, log.sevr, log.amsg);
-    fill_timestamp(v, log.time, log.utag);
+    fill_alarm(v, at, log.stat, log.sevr, log.amsg);
+    fill_timestamp(v, at, log.time, log.utag);
 }
 
 /// The leaves a metadata read assigns — `getProperties` under
@@ -632,13 +740,6 @@ fn set_leaf(v: &mut PvField, path: &str, val: PvField) {
     }
 }
 
-/// [`set_leaf`] for a scalar leaf, written into the scalar `v` holds.
-fn set_scalar(v: &mut PvField, path: &str, val: ScalarValue) {
-    if let Some(PvField::Scalar(slot)) = leaf_mut(v, path) {
-        *slot = val;
-    }
-}
-
 /// Assign a stored `f64` metadata limit at `path`, coerced to the type the
 /// DESCRIPTOR declared for that leaf.
 ///
@@ -776,17 +877,13 @@ fn timestamp_desc() -> FieldDesc {
     }
 }
 
-fn fill_alarm(v: &mut PvField, stat: u16, sevr: u16, amsg: &str) {
-    set_scalar(v, "alarm.severity", ScalarValue::Int(sevr as i32));
+fn fill_alarm(v: &mut PvField, at: &EventLeaves, stat: u16, sevr: u16, amsg: &str) {
+    LeafAt::set_scalar(at.severity, v, ScalarValue::Int(sevr as i32));
     // pvxs `iocsource.cpp:187-223`: PVA `alarm.status` carries the alarm
     // *class* (NONE/DEVICE/DRIVER/RECORD/DB/UNDEFINED, 0–6), not the raw
     // EPICS condition code. Map before emitting so native clients never
     // see e.g. `LINK_ALARM = 14` in a field whose NT contract is 0–6.
-    set_scalar(
-        v,
-        "alarm.status",
-        ScalarValue::Int(alarm_status_class(stat)),
-    );
+    LeafAt::set_scalar(at.status, v, ScalarValue::Int(alarm_status_class(stat)));
     // pvxs `iocsource.cpp:230-236`, exactly:
     //     if((options & DBR_AMSG) && meta.amsg[0])
     //         node["alarm.message"] = meta.amsg;
@@ -807,7 +904,7 @@ fn fill_alarm(v: &mut PvField, stat: u16, sevr: u16, amsg: &str) {
     };
     // Into the leaf's own buffer, which keeps the longest message it held —
     // C's `amsg` is a fixed 40 bytes.
-    if let Some(PvField::Scalar(ScalarValue::String(s))) = leaf_mut(v, "alarm.message") {
+    if let Some(PvField::Scalar(ScalarValue::String(s))) = at.message.and_then(|at| at.get(v)) {
         let mut buf = std::mem::take(s).into_bytes();
         buf.clear();
         buf.extend_from_slice(message.as_bytes());
@@ -844,7 +941,7 @@ fn alarm_status_class(condition: u16) -> i32 {
     }
 }
 
-fn fill_timestamp(v: &mut PvField, time: WallTime, utag: i32) {
+fn fill_timestamp(v: &mut PvField, at: &EventLeaves, time: WallTime, utag: i32) {
     // pvxs `iocsource.cpp:240-248`: `timeStamp` carries the record's
     // acquisition time and userTag, NOT the serialization wall-clock.
     // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
@@ -856,17 +953,13 @@ fn fill_timestamp(v: &mut PvField, time: WallTime, utag: i32) {
     // overwrote the acquisition time with serialization time and zeroed
     // the userTag on every record-backed GET/MONITOR.
     let dur = time.since_unix_epoch();
-    set_scalar(
+    LeafAt::set_scalar(at.seconds, v, ScalarValue::Long(dur.as_secs() as i64));
+    LeafAt::set_scalar(
+        at.nanoseconds,
         v,
-        "timeStamp.secondsPastEpoch",
-        ScalarValue::Long(dur.as_secs() as i64),
-    );
-    set_scalar(
-        v,
-        "timeStamp.nanoseconds",
         ScalarValue::Int(dur.subsec_nanos() as i32),
     );
-    set_scalar(v, "timeStamp.userTag", ScalarValue::Int(utag));
+    LeafAt::set_scalar(at.user_tag, v, ScalarValue::Int(utag));
 }
 
 /// The leaves one QSRV read assigns into its `cloneEmpty()` — the exact set
@@ -1670,10 +1763,15 @@ impl ChannelSource for PvDatabaseSource {
                         },
                         || {
                             let mut meta = door.read()?;
+                            let mut layout = None;
                             Some(move |ev| {
-                                plain_record_field(&mut meta, shaped(ev), door.nsec_mask, || {
-                                    door.read()
-                                })
+                                plain_record_field(
+                                    &mut meta,
+                                    &mut layout,
+                                    shaped(ev),
+                                    door.nsec_mask,
+                                    || door.read(),
+                                )
                             })
                         },
                     )
@@ -1870,7 +1968,7 @@ struct PostRing {
     /// Bumped by every [`Self::set_meta`]; a slot carries the generation it
     /// was last given.
     meta_gen: u64,
-    shape: Option<NtShape>,
+    layout: Option<NtLayout>,
     slots: Vec<(Arc<PvField>, u64)>,
     next: usize,
     cap: usize,
@@ -1885,7 +1983,7 @@ impl PostRing {
             ),
             meta,
             meta_gen: 1,
-            shape: None,
+            layout: None,
             slots: Vec::new(),
             next: 0,
             cap: (queue_limit as usize).saturating_add(1),
@@ -1912,11 +2010,14 @@ impl PostRing {
 
     fn post(&mut self, ev: &LogLeaves) -> crate::server_native::PostValue {
         let shape = NtShape::new(ev.value, self.meta.properties);
-        if self.shape != Some(shape) {
-            self.slots.clear();
-            self.next = 0;
-            self.shape = Some(shape);
-        }
+        let layout = match self.layout {
+            Some(layout) if layout.shape == shape => layout,
+            _ => {
+                self.slots.clear();
+                self.next = 0;
+                *self.layout.insert(NtLayout::new(shape))
+            }
+        };
         let n = self.slots.len();
         let free = (0..n)
             .map(|k| (self.next + k) % n)
@@ -1929,7 +2030,7 @@ impl PostRing {
                 n
             }
             // Only a consumer holding more posts than it negotiated gets here.
-            None => return fresh_tree(shape, &self.meta, ev).into(),
+            None => return fresh_tree(&layout, &self.meta, ev).into(),
         };
         let (slot, slot_gen) = &mut self.slots[i];
         let v = Arc::get_mut(slot).expect("a free slot is unshared");
@@ -1937,7 +2038,7 @@ impl PostRing {
             fill_nt_meta(v, shape, &self.meta);
             *slot_gen = self.meta_gen;
         }
-        fill_nt_event(v, ev);
+        fill_nt_event(v, &layout.event, ev);
         self.next = i + 1;
         Arc::clone(slot).into()
     }
@@ -1945,10 +2046,10 @@ impl PostRing {
 
 /// A tree of `shape` holding `meta`'s metadata and `ev`'s value, alarm and
 /// time.
-fn fresh_tree(shape: NtShape, meta: &Snapshot, ev: &LogLeaves) -> PvField {
-    let mut v = crate::pvdata::encode::default_value_for(&shape.desc());
-    fill_nt_meta(&mut v, shape, meta);
-    fill_nt_event(&mut v, ev);
+fn fresh_tree(layout: &NtLayout, meta: &Snapshot, ev: &LogLeaves) -> PvField {
+    let mut v = crate::pvdata::encode::default_value_for(&layout.shape.desc());
+    fill_nt_meta(&mut v, layout.shape, meta);
+    fill_nt_event(&mut v, &layout.event, ev);
     v
 }
 
@@ -2083,6 +2184,7 @@ fn marked_update(
 /// yields the whole value, its metadata from the last read.
 fn plain_record_field(
     meta: &mut Snapshot,
+    layout: &mut Option<NtLayout>,
     ev: MonitorEvent,
     nsec_mask: u64,
     mut read_meta: impl FnMut() -> Option<Snapshot>,
@@ -2097,8 +2199,12 @@ fn plain_record_field(
     let mut held = None;
     let value = logged_value(&ev, &mut held, &mut read_meta)?;
     let shape = NtShape::new(value, meta.properties);
+    let layout = match *layout {
+        Some(layout) if layout.shape == shape => layout,
+        _ => *layout.insert(NtLayout::new(shape)),
+    };
     Some(fresh_tree(
-        shape,
+        &layout,
         meta,
         &LogLeaves::of_event(&ev, value, nsec_mask),
     ))
@@ -3361,8 +3467,47 @@ mod tests {
         // A tree that held "HIHI" and is filled in place again with NO_ALARM
         // serves "", not the old message's bytes.
         let mut v = snapshot_to_pv_field(&snap);
-        fill_nt_event(&mut v, &LogLeaves::of_snapshot(&ok));
+        let layout = NtLayout::new(NtShape::of(&ok));
+        fill_nt_event(&mut v, &layout.event, &LogLeaves::of_snapshot(&ok));
         assert_eq!(v, snapshot_to_pv_field(&ok));
+    }
+
+    /// Every event leaf resolves, on every NT shape, to the member the dotted
+    /// path names in a tree built from that shape.
+    #[test]
+    fn event_leaves_resolve_to_the_named_member() {
+        let values = [
+            EpicsValue::Double(1.0),
+            EpicsValue::Enum(1),
+            EpicsValue::String(PvString::from("s")),
+            EpicsValue::DoubleArray(vec![1.0, 2.0].into()),
+        ];
+        for value in &values {
+            for properties in [PropertySupport::NONE, PropertySupport::NUMERIC] {
+                let shape = NtShape::new(value, properties);
+                let layout = NtLayout::new(shape);
+                let mut tree = crate::pvdata::encode::default_value_for(&shape.desc());
+                let value_path = match value {
+                    EpicsValue::Enum(_) => "value.index",
+                    _ => "value",
+                };
+                let at = layout.event;
+                for (at, path) in [
+                    (at.value, value_path),
+                    (at.severity, "alarm.severity"),
+                    (at.status, "alarm.status"),
+                    (at.message, "alarm.message"),
+                    (at.seconds, "timeStamp.secondsPastEpoch"),
+                    (at.nanoseconds, "timeStamp.nanoseconds"),
+                    (at.user_tag, "timeStamp.userTag"),
+                ] {
+                    let at = at.unwrap_or_else(|| panic!("{shape:?}: {path} unresolved"));
+                    let by_index: *const PvField = at.get(&mut tree).expect(path);
+                    let by_name: *const PvField = leaf_mut(&mut tree, path).expect(path);
+                    assert_eq!(by_index, by_name, "{shape:?}: {path}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5665,6 +5810,57 @@ ASG(DEFAULT) {
                 .any(|m| m == "value"),
             "the positive control: a marking event still comes through"
         );
+    }
+
+    /// Value pairs whose second post changes the NT shape.
+    fn shape_changes() -> [(EpicsValue, EpicsValue); 2] {
+        [
+            (EpicsValue::Double(1.0), EpicsValue::Enum(2)),
+            (EpicsValue::Enum(1), EpicsValue::Double(5.0)),
+        ]
+    }
+
+    /// A shape change between two posts on one `PostRing` serves the tree a
+    /// fresh ring serves for the second post — the new shape's tree, filled
+    /// through its own member indices. A scalar slot takes any scalar, so a
+    /// value check alone passes a stale layout.
+    #[test]
+    fn post_ring_serves_the_new_shape_across_a_shape_change() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        let snap = |v: &EpicsValue| Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
+        for (first, second) in shape_changes() {
+            let mut ring = PostRing::new(4, snap(&first));
+            ring.post(&LogLeaves::of_snapshot(&snap(&first)));
+            let served = ring
+                .post(&LogLeaves::of_snapshot(&snap(&second)))
+                .into_owned();
+            let fresh = PostRing::new(4, snap(&first))
+                .post(&LogLeaves::of_snapshot(&snap(&second)))
+                .into_owned();
+            assert_eq!(served, fresh, "{first:?} then {second:?}");
+        }
+    }
+
+    /// The same for the plain record transform, which keeps its layout
+    /// across events.
+    #[test]
+    fn plain_record_field_serves_the_new_shape_across_a_shape_change() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::snapshot::Snapshot;
+        let snap = |v: &EpicsValue| Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
+        let ev = |v: &EpicsValue| {
+            epics_base_rs::server::pv::MonitorEvent::read_log(&mut snap(v), EventMask::VALUE)
+        };
+        for (first, second) in shape_changes() {
+            let mut meta = snap(&first);
+            let mut layout = None;
+            plain_record_field(&mut meta, &mut layout, ev(&first), 0, || None)
+                .expect("a value post yields a value");
+            let served = plain_record_field(&mut meta, &mut layout, ev(&second), 0, || None);
+            let fresh = plain_record_field(&mut snap(&first), &mut None, ev(&second), 0, || None);
+            assert!(served.is_some(), "a value post yields a value");
+            assert_eq!(served, fresh, "{first:?} then {second:?}");
+        }
     }
 
     /// A record monitor with nothing posted yet reports `Empty` (park), and

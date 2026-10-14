@@ -1926,7 +1926,12 @@ impl MonitorPipelineCredit<'_> {
         let Some(w) = self.window else {
             return true;
         };
-        w.load(std::sync::atomic::Ordering::Relaxed) > 0
+        let ok = w.load(std::sync::atomic::Ordering::Relaxed) > 0;
+        #[cfg(test)]
+        if !ok {
+            self.ack_after_window_read();
+        }
+        ok
     }
 
     /// Register for the next ACK refill, BEFORE the caller reads the window.
@@ -1948,6 +1953,20 @@ impl MonitorPipelineCredit<'_> {
         Some(notified)
     }
 
+    /// Test seam on every empty-window read: lands the ACK a test queued for
+    /// this PV, the race a refill armed after the read loses.
+    #[cfg(test)]
+    fn ack_after_window_read(&self) {
+        let (Some(w), Some(n)) = (self.window, self.window_notify) else {
+            return;
+        };
+        let mut slot = ACK_AFTER_WINDOW_READ.lock().unwrap();
+        if let Some((_, count)) = slot.take_if(|(name, _)| *name == self.pv_name) {
+            drop(slot);
+            refill_monitor_window(w, n, count);
+        }
+    }
+
     /// Consume one credit for the DATA frame about to be sent and fire the LOW
     /// watermark on the above→below crossing. A no-op for a non-pipeline
     /// monitor (`window` is `None`).
@@ -1956,7 +1975,9 @@ impl MonitorPipelineCredit<'_> {
     /// filter gates (a held or filtered event produces no wire frame, so it
     /// must not consume a slot) and only under [`Self::available`] — this is
     /// the ONLY site that decrements the window (the ACK path only adds), so
-    /// the credit checked in the emit gate is still there.
+    /// the credit checked in the emit gate is still there. A frame a finished
+    /// monitor sends without credit finds the window at 0 and leaves it, and
+    /// the watermark, alone: pvxs `if(window) { window--; ... }`.
     fn take(&self) {
         use std::sync::atomic::Ordering;
         let Some(w) = self.window else {
@@ -1968,9 +1989,12 @@ impl MonitorPipelineCredit<'_> {
         // four billion credits at exactly the moment the window is empty.
         // Same shape `epics-ca-rs` uses to drain `pending_frames`
         // (`client/transport.rs`).
-        w.update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        if w.update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             cur.saturating_sub(1)
-        });
+        }) == 0
+        {
+            return;
+        }
         // LOW fires when consuming this credit drained the
         // window to `<= low` (pvxs `onLowMark`).
         // `cross_watermark` checks-and-marks the above→below crossing AND
@@ -1995,6 +2019,38 @@ impl MonitorPipelineCredit<'_> {
         }
     }
 }
+
+/// A MONITOR ACK's `count` added to the window, waking a credit-parked
+/// monitor when the window was empty. Returns the window now.
+fn refill_monitor_window(
+    w: &std::sync::atomic::AtomicU32,
+    n: &tokio::sync::Notify,
+    count: u32,
+) -> u32 {
+    let mut prev = w.load(std::sync::atomic::Ordering::Relaxed);
+    let w_now = loop {
+        let next = prev.saturating_add(count);
+        match w.compare_exchange_weak(
+            prev,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break next,
+            Err(observed) => prev = observed,
+        }
+    };
+    if prev == 0 {
+        n.notify_waiters();
+    }
+    w_now
+}
+
+/// The ACK a test lands between the emit gate's window read and the park,
+/// for the monitor on the named PV; taken by the first pass that reaches it.
+#[cfg(test)]
+static ACK_AFTER_WINDOW_READ: std::sync::Mutex<Option<(&'static str, u32)>> =
+    std::sync::Mutex::new(None);
 
 /// Await a pipeline-credit refill. Only ever polled from the emit loop's
 /// credit arm, which runs solely when the window is exhausted — and an
@@ -2075,7 +2131,7 @@ impl Drop for WatermarkWithdrawOnDrop {
 /// This used to be a task of its own, watching the same
 /// `tokio::sync::watch` the subscriber loop already watches. It is now
 /// owned by that loop: the loop reads the executing state once per
-/// iteration and wakes on every edge (its `exec_rx.changed()` arm), so it
+/// iteration and wakes on every edge (its `exec.edge()` arm), so it
 /// is already at the exact observation points the driver task duplicated —
 /// the extra task bought a second observer, not a second observation.
 ///
@@ -2094,6 +2150,52 @@ impl Drop for WatermarkWithdrawOnDrop {
 /// subscriptions along with the op (STOP=disable, teardown=remove), so no
 /// final edge is owed after the loop exits — the driver task did not apply
 /// one either; it simply ended when the watch sender dropped.
+/// A monitor op's Executing state, with one waiter for its next edge that
+/// stays registered across the subscriber loop's parks.
+///
+/// pvxs wakes the reply path once per burst (`maybeReply` tests and sets
+/// `scheduled`, `servermon.cpp:79-86`). A `watch::Receiver::changed()` built
+/// inside the loop's `select!` registered and dropped a waiter on every pass,
+/// several times per posted update; this one is re-armed only when an edge
+/// fires.
+struct ExecWatch {
+    state: tokio::sync::watch::Receiver<bool>,
+    edge: std::pin::Pin<Box<dyn std::future::Future<Output = ExecEdge> + Send>>,
+}
+
+type ExecEdge = (
+    Result<(), tokio::sync::watch::error::RecvError>,
+    tokio::sync::watch::Receiver<bool>,
+);
+
+impl ExecWatch {
+    fn new(rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self {
+            state: rx.clone(),
+            edge: Self::arm(rx),
+        }
+    }
+
+    fn arm(
+        mut rx: tokio::sync::watch::Receiver<bool>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ExecEdge> + Send>> {
+        Box::pin(async move { (rx.changed().await, rx) })
+    }
+
+    fn executing(&self) -> bool {
+        *self.state.borrow()
+    }
+
+    /// The next Executing edge; `false` once the op's `MonitorStartControl`
+    /// (the sender) is gone. Cancel-safe: dropped unfinished, the waiter
+    /// stays armed for the next call.
+    async fn edge(&mut self) -> bool {
+        let (r, rx) = self.edge.as_mut().await;
+        self.edge = Self::arm(rx);
+        r.is_ok()
+    }
+}
+
 struct MonitorGateDriver {
     gate: Option<crate::server_native::source::MonitorGate>,
     /// Last state handed to the gate; `None` until the unconditional first
@@ -2629,7 +2731,7 @@ fn spawn_monitor_subscriber(
                 ByteOrder::Little
             }
         };
-        let mut exec_rx = loop_exec_rx;
+        let mut exec = ExecWatch::new(loop_exec_rx);
         let queue_limit = queue_depth.max(1);
 
         // Version capture must precede the check (an older-or-equal captured
@@ -2709,7 +2811,33 @@ fn spawn_monitor_subscriber(
                 std::collections::VecDeque::new();
             let mut source_open = true;
             loop {
-                let executing = *exec_rx.borrow_and_update();
+                let executing = exec.executing();
+                // The cooked seed occupies one FIFO slot until the consumer
+                // emits it, so while it is pending the raw backlog is bounded
+                // to queue_limit-1 — keeping the total (seed + raw) at
+                // queueSize, matching the decoded path where the seed IS
+                // pending[0]. Once the seed is emitted the raw bound relaxes
+                // to queue_limit.
+                //
+                // Exception at queue_limit == 1: the `.max(1)` floor keeps one
+                // raw slot even while the seed is pending, so the seed plus one
+                // raw event briefly coexist (a transient +1 that relaxes the
+                // moment the seed emits). The raw seed is a decoded snapshot and
+                // cannot coalesce into a raw event, so unlike the decoded path it
+                // cannot share pending[0]. This is not client-reachable — a
+                // client queueSize < 2 is rejected at INIT, so queue_limit == 1
+                // requires a non-default monitor_queue_depth == 1.
+                let raw_cap = queue_limit
+                    .saturating_sub(seed_cooked.is_some() as usize)
+                    .max(1);
+                let squash = |old, new| coalesce_raw_monitor_event(&intro_clone, old, new);
+                while source_open {
+                    match rx_raw.try_recv() {
+                        Ok(e) => push_squash_monitor(&mut pending, e, raw_cap, &mon_stat, squash),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => source_open = false,
+                    }
+                }
                 let has_work = seed_cooked.is_some() || !pending.is_empty();
                 // Executing-gated terminal FINISH (see the decoded path): an
                 // Idle/never-STARTed monitor holds the backlog and the finish
@@ -2719,50 +2847,7 @@ fn spawn_monitor_subscriber(
                 if !source_open && executing && !has_work {
                     break;
                 }
-                tokio::select! {
-                    biased;
-                    r = rx_raw.recv(), if source_open => {
-                        match r {
-                            Some(ev) => {
-                                // The cooked seed occupies one FIFO slot until the
-                                // consumer emits it, so while it is pending the raw
-                                // backlog is bounded to queue_limit-1 — keeping the
-                                // total (seed + raw) at queueSize, matching the decoded
-                                // path where the seed IS pending[0]. Once the seed is
-                                // emitted the raw bound relaxes to queue_limit.
-                                //
-                                // Exception at queue_limit == 1: the `.max(1)` floor
-                                // keeps one raw slot even while the seed is pending, so
-                                // the seed plus one raw event briefly coexist (a
-                                // transient +1 that relaxes the moment the seed emits).
-                                // The raw seed is a decoded snapshot and cannot coalesce
-                                // into a raw event, so unlike the decoded path it cannot
-                                // share pending[0]. This is not client-reachable — a
-                                // client queueSize < 2 is rejected at INIT, so
-                                // queue_limit == 1 requires a non-default
-                                // monitor_queue_depth == 1.
-                                let raw_cap = queue_limit
-                                    .saturating_sub(seed_cooked.is_some() as usize)
-                                    .max(1);
-                                let squash = |old, new| {
-                                    coalesce_raw_monitor_event(&intro_clone, old, new)
-                                };
-                                push_squash_monitor(&mut pending, ev, raw_cap, &mon_stat, squash);
-                                while let Ok(e) = rx_raw.try_recv() {
-                                    push_squash_monitor(&mut pending, e, raw_cap, &mon_stat, squash);
-                                }
-                            }
-                            None => source_open = false,
-                        }
-                    }
-                    // The op's `MonitorStartControl` owns the sender: a
-                    // closed watch is ready forever, so stay and this spins.
-                    r = exec_rx.changed() => {
-                        if r.is_err() {
-                            return;
-                        }
-                    }
-                    _ = std::future::ready(()), if executing && has_work => {
+                if executing && has_work {
                         if let Some(initial) = seed_cooked.take() {
                             // Per-event ACL recheck on policy reload — the seed is
                             // emitted through the same gate as every backlog event
@@ -2835,7 +2920,17 @@ fn spawn_monitor_subscriber(
                         if tx_clone.send(payload).await.is_err() {
                             return;
                         }
-                    }
+                    continue;
+                }
+                tokio::select! {
+                    biased;
+                    r = rx_raw.recv(), if source_open => match r {
+                        Some(ev) => push_squash_monitor(&mut pending, ev, raw_cap, &mon_stat, squash),
+                        None => source_open = false,
+                    },
+                    open = exec.edge() => if !open {
+                        return;
+                    },
                 }
             }
             let finish = build_monitor_finish(ioid, order_now());
@@ -2867,14 +2962,10 @@ fn spawn_monitor_subscriber(
         // Owned by this loop rather than a task of its own; the
         // unconditional first application happens here, where the spawn
         // used to be, so a STOP that fired before the subscription opened
-        // is still not missed. `borrow` (not `borrow_and_update`) leaves the
-        // loop's own seen-state alone, so an edge landing between here and
-        // the first iteration is still delivered to `exec_rx.changed()`.
+        // is still not missed; an edge landing between here and the first
+        // iteration is still delivered to `exec.edge()`.
         let mut gate_driver = MonitorGateDriver::new(seed_on_start);
-        // Bound to a local so the watch `Ref` is dropped before the await —
-        // it is not `Send`, and this future is spawned.
-        let executing_now = *exec_rx.borrow();
-        gate_driver.apply(executing_now).await;
+        gate_driver.apply(exec.executing()).await;
         let mut frame_size = 0;
         let wm_levels = wm_levels_init;
         let credit = MonitorPipelineCredit {
@@ -2934,61 +3025,52 @@ fn spawn_monitor_subscriber(
         }
 
         let mut source_open = true;
+        // The previous pass sent a frame and did not park: pvxs `doReply`
+        // re-dispatching itself rather than waiting for `maybeReply`.
+        let mut chained = false;
         loop {
-            let executing = *exec_rx.borrow_and_update();
+            let executing = exec.executing();
             // Apply this op's gate from the state we just read. The
-            // `exec_rx.changed()` arm below wakes the loop on every edge, so
-            // this reaches the source's suspend/resume as promptly as the
-            // driver task did — including while the loop is parked waiting
-            // for an update that a suspended upstream will never send.
+            // `exec.edge()` arm below wakes the loop on every edge, so this
+            // reaches the source's suspend/resume as promptly as the driver
+            // task did — including while the loop is parked waiting for an
+            // update that a suspended upstream will never send.
             gate_driver.apply(executing).await;
-            // The terminal FINISH is Executing-gated, exactly like every DATA
-            // frame: pvxs holds both the backlog and the finish until the client
-            // is Executing (servermon.cpp:82,142-154). Break — and so send the
-            // post-loop FINISH — only once the source is closed AND we are
-            // Executing AND the backlog has drained. An Idle or never-STARTed
+            while source_open {
+                match rx.try_recv() {
+                    Ok(e) => {
+                        pending.push(e);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => source_open = false,
+                }
+            }
+            // The terminal FINISH is the last queue entry once the source has
+            // closed (pvxs posts an empty `Value`), gated like every DATA frame:
+            // pvxs holds the backlog and the finish until the client is
+            // Executing (servermon.cpp:82,142-154). An Idle or never-STARTed
             // monitor whose PV closes therefore accrues the finish instead of
             // emitting FINISH and abandoning `pending`; a later START flushes the
             // backlog then finishes. Teardown (DESTROY / disconnect) still aborts
             // the task via `monitor_abort` while it waits for that START.
-            if !source_open && executing && pending.is_empty() {
-                break;
-            }
-            // Arm the credit-refill waiter BEFORE reading the window (see
-            // `arm_refill`: the ACK's `notify_waiters()` leaves no permit, so
-            // registering after the read could lose the wake-up).
-            let refill = credit.arm_refill();
+            let finished = !source_open;
             // pvxs `maybeReply`/`doReply`: an exhausted pipeline window
-            // suppresses the REPLY only (`servermon.cpp:79-83,143`). It must
-            // not suppress the DRAIN — `doPost` keeps squashing into the
-            // negotiated queue while the client owes ACKs. So this is an emit
-            // GATE, not an await inside the arm: `rx.recv()` stays polled and
-            // a stalled pipelined client coalesces at `limit` instead of
-            // making the port buffer `channel_capacity + limit` distinct
-            // updates and deliver them all on resume.
-            let has_credit = credit.available();
-            tokio::select! {
-                biased;
-                r = rx.recv(), if source_open => {
-                    match r {
-                        Some(ev) => {
-                            pending.push(ev);
-                            while let Ok(e) = rx.try_recv() {
-                                pending.push(e);
-                            }
-                        }
-                        None => source_open = false,
-                    }
+            // suppresses the REPLY only (`servermon.cpp:79-83,143`), never the
+            // drain above, so a stalled pipelined client coalesces at `limit`.
+            // Starting a reply takes credit; once finished, a reply already in
+            // progress sends the rest of the queue and the FINISH without it
+            // (`servermon.cpp:143,212`).
+            let free = finished && chained;
+            let mut refill = None;
+            if executing && (finished || !pending.is_empty()) {
+                if !free && !credit.available() {
+                    // Armed before the window is read again (see `arm_refill`).
+                    refill = credit.arm_refill();
                 }
-                // Closed: the op is gone (see the raw loop's arm).
-                r = exec_rx.changed() => {
-                    if r.is_err() {
-                        return;
+                if free || credit.available() {
+                    if pending.is_empty() {
+                        break;
                     }
-                }
-                // Re-evaluate the gate when an ACK refills the window.
-                _ = wait_credit_refill(refill), if !has_credit => {}
-                _ = std::future::ready(()), if executing && has_credit && !pending.is_empty() => {
                     let QueuedUpdate {
                         update: value,
                         changed,
@@ -3036,9 +3118,10 @@ fn spawn_monitor_subscriber(
                     // Pipeline window: consume one credit AFTER the pause/filter
                     // gates (pvxs `servermon.cpp:192`) — a held or filtered event
                     // produces no wire frame, so it must not consume a slot. The
-                    // credit was checked by the arm's `has_credit` gate and this
-                    // is the only decrementer, so it is still there. No-op for a
-                    // non-pipeline monitor.
+                    // credit was checked by `credit.available()` above and this
+                    // is the only decrementer, so it is still there — unless the
+                    // frame goes `free` (see `take`). No-op for a non-pipeline
+                    // monitor.
                     credit.take();
                     // A source that declares its marked leaves frames exactly
                     // those (pvxs `to_wire_valid(R, ent, &pvMask)`); one that
@@ -3058,7 +3141,23 @@ fn spawn_monitor_subscriber(
                     if tx_clone.send(payload).await.is_err() {
                         return;
                     }
+                    chained = true;
+                    continue;
                 }
+            }
+            chained = false;
+            tokio::select! {
+                biased;
+                r = rx.recv(), if source_open => match r {
+                    Some(ev) => {
+                        pending.push(ev);
+                    }
+                    None => source_open = false,
+                },
+                open = exec.edge() => if !open {
+                    return;
+                },
+                _ = wait_credit_refill(refill) => {}
             }
         }
         // Source closed — emit MONITOR FINISH (pvxs servermon.cpp:148-178).
@@ -8371,22 +8470,7 @@ async fn handle_op(
                         // is strictly safer than wrapping and keeps the
                         // stored window and the watermark decision derived
                         // from one number.
-                        let mut prev = w.load(std::sync::atomic::Ordering::Relaxed);
-                        let w_now = loop {
-                            let next = prev.saturating_add(ack_count);
-                            match w.compare_exchange_weak(
-                                prev,
-                                next,
-                                std::sync::atomic::Ordering::Relaxed,
-                                std::sync::atomic::Ordering::Relaxed,
-                            ) {
-                                Ok(_) => break next,
-                                Err(observed) => prev = observed,
-                            }
-                        };
-                        if prev == 0 {
-                            n.notify_waiters();
-                        }
+                        let w_now = refill_monitor_window(w, n, ack_count);
                         // HIGH fires once per crossing: the refilled
                         // window stands above `high`. `cross_watermark`
                         // both checks-and-marks the crossing and mints the
@@ -13935,6 +14019,493 @@ mod tests {
         );
     }
 
+    /// Raw fast path, Executing: a burst that arrives while a send is
+    /// blocked is squashed to queueSize before the next emit (pvxs `doPost`
+    /// coalescing at `limit`), not forwarded event by event. The loop's
+    /// `try_recv` drain is the only place that happens once the send
+    /// returns.
+    #[epics_macros_rs::epics_test]
+    async fn pvx61_raw_burst_behind_blocked_send_squashes_to_queue_size() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (9u32, 711u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, raw_tx) = pvx61_raw_channels(sid, &intro);
+        // One slot: the seed fills it, so the send of post 1 blocks.
+        let (tx, mut rx) = test_srv_tx(1);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+
+        for (frame, what) in [
+            (pvx61_init_frame(sid, ioid, 2, order), "MONITOR INIT"),
+            (pvx61_ctrl_frame(sid, ioid, 0x44, order), "MONITOR START"),
+        ] {
+            pvx61_drive(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                &config,
+                &mut encode_cache,
+                peer,
+                &cred,
+                &discard_mon_fin(),
+            )
+            .await
+            .expect(what);
+            if what == "MONITOR INIT" {
+                let _ = rx.recv().await.expect("INIT introspection reply");
+            }
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+        for i in 1..=6 {
+            raw_tx
+                .send(pvx61_raw_event(i, order))
+                .await
+                .expect("raw event queued");
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(15)).await;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+
+        let mut seq = Vec::new();
+        while let Ok(Some(buf)) =
+            epics_base_rs::runtime::task::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            if let Some(a) = pvx61_decode_data_a(&buf, &intro, order) {
+                seq.push(a);
+            }
+        }
+        assert_eq!(
+            seq,
+            vec![0, 1, 2, 6],
+            "posts 2..6 queued behind the blocked send squash to queueSize=2"
+        );
+    }
+
+    /// A decoded-path source over a plain channel: unlike a `SharedPV`
+    /// ring it does not squash, so the subscriber's own queue is the only
+    /// bound (the PVA gateway fanout and the service framework serve this
+    /// shape).
+    #[cfg(test)]
+    struct ChanSeedSource {
+        intro: FieldDesc,
+        seed: PvField,
+        rx: std::sync::Mutex<Option<MonitorStream<PvField>>>,
+    }
+
+    #[cfg(test)]
+    impl crate::server_native::source::ChannelSource for ChanSeedSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, name: &str) -> bool {
+            name == "dut"
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(self.seed.clone())
+        }
+        async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+            self.rx.lock().unwrap().take()
+        }
+    }
+
+    /// The decoded counterpart of
+    /// `pvx61_raw_burst_behind_blocked_send_squashes_to_queue_size`: the
+    /// `try_recv` drain at the top of the decoded loop squashes a burst
+    /// from a non-squashing source to queueSize.
+    #[epics_macros_rs::epics_test]
+    async fn pvx61_decoded_burst_behind_blocked_send_squashes_to_queue_size() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (9u32, 712u32);
+        let intro = three_field_intro();
+        let (post, updates) = mpsc::channel::<PvField>(64);
+        let source: DynSource = Arc::new(ChanSeedSource {
+            intro: intro.clone(),
+            seed: three_field_value(0, 0, 0),
+            rx: std::sync::Mutex::new(Some(updates.into())),
+        });
+        let mut channels = ChannelTable::new();
+        channels.insert(
+            sid,
+            ChannelState::new(ChannelOpen {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(std::sync::Arc::new(intro.clone())),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
+            }),
+        );
+        // One slot: the seed fills it, so the send of post 1 blocks.
+        let (tx, mut rx) = test_srv_tx(1);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 2, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+        for i in 1..=6 {
+            post.send(three_field_value(i, 0, 0))
+                .await
+                .expect("update queued");
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(15)).await;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+
+        let mut seq = Vec::new();
+        while let Ok(Some(buf)) =
+            epics_base_rs::runtime::task::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            if let Some(a) = pvx61_decode_data_a(&buf, &intro, order) {
+                seq.push(a);
+            }
+        }
+        assert_eq!(
+            seq,
+            vec![0, 1, 2, 6],
+            "posts 2..6 queued behind the blocked send squash to queueSize=2"
+        );
+    }
+
+    /// pvxs `doReply` (`servermon.cpp:143,212`): a finished monitor still
+    /// needs credit to START a reply, but once one is sent the rest of the
+    /// queue and the FINISH go without credit.
+    #[epics_macros_rs::epics_test]
+    async fn pipeline_finished_monitor_drains_without_credit_once_replying() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (9u32, 714u32);
+        let intro = three_field_intro();
+        let (post, updates) = mpsc::channel::<PvField>(64);
+        let source: DynSource = Arc::new(ChanSeedSource {
+            intro: intro.clone(),
+            seed: three_field_value(0, 0, 0),
+            rx: std::sync::Mutex::new(Some(updates.into())),
+        });
+        let mut channels = ChannelTable::new();
+        channels.insert(
+            sid,
+            ChannelState::new(ChannelOpen {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(std::sync::Arc::new(intro.clone())),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
+            }),
+        );
+        let (tx, mut rx) = test_srv_tx(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+        let op_frame = |tail: &[u8]| {
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.extend_from_slice(tail);
+            synth_frame(Command::Monitor, order, payload)
+        };
+
+        // pipeline=true, queueSize=4, nack rider 1: the seed takes the only
+        // credit.
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(4)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init = vec![0x88];
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init);
+        init.put_u32(1, order);
+        let mut ack = vec![0x80];
+        ack.put_u32(1, order);
+        for frame in [op_frame(&init), op_frame(&[0x44])] {
+            pvx61_drive(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                &config,
+                &mut encode_cache,
+                peer,
+                &cred,
+                &discard_mon_fin(),
+            )
+            .await
+            .expect("MONITOR op ok");
+        }
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+        for i in 1..=2 {
+            post.send(three_field_value(i, 0, 0))
+                .await
+                .expect("update queued");
+        }
+        drop(post);
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+        let before = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            before,
+            vec![0],
+            "a finished monitor with an empty window waits for credit"
+        );
+
+        pvx61_drive(
+            &op_frame(&ack),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR ACK ok");
+        let mut data = Vec::new();
+        let mut finished = false;
+        while let Ok(Some(buf)) =
+            epics_base_rs::runtime::task::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            if let Some(a) = pvx61_decode_data_a(&buf, &intro, order) {
+                data.push(a);
+            } else if pvx61_is_finish(&buf, order) {
+                finished = true;
+            }
+        }
+        assert_eq!(
+            (data, finished),
+            (vec![1, 2], true),
+            "one ACK starts the reply; the rest and FINISH follow without credit"
+        );
+    }
+
+    /// An ACK landing between the emit gate's window read and the park still
+    /// wakes the credit-parked monitor: the refill is armed before the read.
+    #[epics_macros_rs::epics_test]
+    async fn pipeline_ack_between_window_read_and_park_wakes_the_monitor() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (9u32, 716u32);
+        let intro = three_field_intro();
+        let (post, updates) = mpsc::channel::<PvField>(64);
+        let source: DynSource = Arc::new(ChanSeedSource {
+            intro: intro.clone(),
+            seed: three_field_value(0, 0, 0),
+            rx: std::sync::Mutex::new(Some(updates.into())),
+        });
+        let mut channels = ChannelTable::new();
+        channels.insert(
+            sid,
+            ChannelState::new(ChannelOpen {
+                name: "lateack".into(),
+                cid: 0,
+                sid,
+                introspection: Some(std::sync::Arc::new(intro.clone())),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
+            }),
+        );
+        let (tx, mut rx) = test_srv_tx(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+        let op_frame = |tail: &[u8]| {
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.extend_from_slice(tail);
+            synth_frame(Command::Monitor, order, payload)
+        };
+
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(4)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init = vec![0x88];
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init);
+        init.put_u32(1, order);
+        for frame in [op_frame(&init), op_frame(&[0x44])] {
+            pvx61_drive(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                &config,
+                &mut encode_cache,
+                peer,
+                &cred,
+                &discard_mon_fin(),
+            )
+            .await
+            .expect("MONITOR op ok");
+        }
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+        assert_eq!(pvx61_drain_data_a(&mut rx, &intro, order), vec![0]);
+
+        *ACK_AFTER_WINDOW_READ.lock().unwrap() = Some(("lateack", 1));
+        post.send(three_field_value(1, 0, 0))
+            .await
+            .expect("update queued");
+        let buf = epics_base_rs::runtime::task::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the ACK in the window wakes the parked monitor")
+            .expect("reply channel open");
+        assert!(
+            ACK_AFTER_WINDOW_READ.lock().unwrap().is_none(),
+            "the ACK landed after the window read"
+        );
+        assert_eq!(pvx61_decode_data_a(&buf, &intro, order), Some(1));
+        drop(post);
+    }
+
+    /// pvxs `maybeReply` (`servermon.cpp:82`): a FINISH alone in the queue
+    /// starts a reply, so it waits for credit like a DATA frame. The seed takes
+    /// the only credit and the source closes with nothing posted.
+    #[epics_macros_rs::epics_test]
+    async fn pipeline_lone_finish_waits_for_credit() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (9u32, 715u32);
+        let intro = three_field_intro();
+        let (post, updates) = mpsc::channel::<PvField>(64);
+        let source: DynSource = Arc::new(ChanSeedSource {
+            intro: intro.clone(),
+            seed: three_field_value(0, 0, 0),
+            rx: std::sync::Mutex::new(Some(updates.into())),
+        });
+        let mut channels = ChannelTable::new();
+        channels.insert(
+            sid,
+            ChannelState::new(ChannelOpen {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(std::sync::Arc::new(intro.clone())),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
+            }),
+        );
+        let (tx, mut rx) = test_srv_tx(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+        let op_frame = |tail: &[u8]| {
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.extend_from_slice(tail);
+            synth_frame(Command::Monitor, order, payload)
+        };
+
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(4)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init = vec![0x88];
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init);
+        init.put_u32(1, order);
+        let mut ack = vec![0x80];
+        ack.put_u32(1, order);
+        for frame in [op_frame(&init), op_frame(&[0x44])] {
+            pvx61_drive(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                &config,
+                &mut encode_cache,
+                peer,
+                &cred,
+                &discard_mon_fin(),
+            )
+            .await
+            .expect("MONITOR op ok");
+        }
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+        drop(post);
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
+        let mut before = Vec::new();
+        while let Ok(buf) = rx.try_recv() {
+            before.push((
+                pvx61_decode_data_a(&buf, &intro, order),
+                pvx61_is_finish(&buf, order),
+            ));
+        }
+        assert_eq!(
+            before,
+            vec![(Some(0), false)],
+            "the seed only: the FINISH waits for the ACK"
+        );
+
+        pvx61_drive(
+            &op_frame(&ack),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR ACK ok");
+        let buf = epics_base_rs::runtime::task::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("FINISH after the ACK")
+            .expect("reply channel open");
+        assert!(pvx61_is_finish(&buf, order), "the ACK releases the FINISH");
+    }
+
     /// Raw-seeded source whose ACL gate can be flipped from permissive to
     /// deny mid-window (the test holds the ACF cell + version counter), to
     /// exercise the raw seed's per-event ACL recheck.
@@ -14238,6 +14809,76 @@ mod tests {
             seq.is_empty(),
             "an ACL-denied monitor emits no DATA frame; got {seq:?}"
         );
+    }
+
+    /// A subscriber parked on an empty pipeline window is woken by the
+    /// MONITOR ACK alone: with no post behind it, only the armed refill
+    /// waiter can make it send the seed. Both backends — the thread
+    /// backend runs the same subscriber loop.
+    #[epics_macros_rs::epics_test]
+    async fn pipeline_ack_alone_wakes_a_credit_parked_subscriber() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (2u32, 713u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, _pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = test_srv_tx(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+
+        // pipeline=true with no 0x80 nack rider: the window starts at 0.
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(2)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init = Vec::new();
+        init.put_u32(sid, order);
+        init.put_u32(ioid, order);
+        init.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init);
+        let mut ack = Vec::new();
+        ack.put_u32(sid, order);
+        ack.put_u32(ioid, order);
+        ack.put_u8(0x80);
+        ack.put_u32(1, order);
+        let frames = [
+            synth_frame(Command::Monitor, order, init),
+            pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            synth_frame(Command::Monitor, order, ack),
+        ];
+        for (i, frame) in frames.iter().enumerate() {
+            if i == 2 {
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
+                assert!(
+                    rx.try_recv().is_err(),
+                    "an empty window sends nothing before the ACK"
+                );
+            }
+            pvx61_drive(
+                frame,
+                &tx,
+                &mut channels,
+                order,
+                &config,
+                &mut encode_cache,
+                peer,
+                &cred,
+                &discard_mon_fin(),
+            )
+            .await
+            .expect("MONITOR op ok");
+            if i == 0 {
+                let _ = rx.recv().await.expect("INIT introspection reply");
+            }
+        }
+        let seed = epics_base_rs::runtime::task::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the ACK wakes the parked subscriber")
+            .expect("writer open");
+        assert_eq!(pvx61_decode_data_a(&seed, &intro, order), Some(0));
     }
 
     #[cfg(tokio_backend)]
@@ -21500,6 +22141,29 @@ mod tests {
         channels
     }
 
+    /// An `ExecWatch::edge` wait dropped after it registered (the subscriber
+    /// loop woken by its ring instead) still sees the next edge, and a gone
+    /// sender ends it.
+    #[epics_macros_rs::epics_test]
+    async fn exec_watch_edge_survives_a_dropped_wait() {
+        use std::future::Future;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut exec = ExecWatch::new(rx);
+        {
+            let mut wait = Box::pin(exec.edge());
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(pending, "no edge yet");
+        }
+        tx.send(true).expect("receiver alive");
+        assert!(exec.edge().await);
+        assert!(exec.executing());
+        drop(tx);
+        assert!(!exec.edge().await);
+    }
+
     /// Per-op MONITOR gate wiring: `MonitorStartControl::set` publishes each
     /// Executing<->Idle edge to the per-op gate driver, which calls
     /// `MonitorGate::set_active` accordingly. Drives START -> STOP -> START
@@ -21530,20 +22194,19 @@ mod tests {
             }
         });
 
-        let (exec_tx, mut exec_rx) = tokio::sync::watch::channel(false);
+        let (exec_tx, exec_rx) = tokio::sync::watch::channel(false);
         // Stand-in for the subscriber loop, reduced to the two things that
         // matter here: it reads the executing state and applies the gate once
         // per iteration, and it wakes on every watch edge. The production
-        // loop does exactly this (`let executing = *exec_rx.borrow_and_update()`
-        // then `gate_driver.apply(executing).await`, with an
-        // `exec_rx.changed()` select arm); `bfr12_gate_reaches_a_parked_monitor`
+        // loop does exactly this (`gate_driver.apply(exec.executing()).await`
+        // with an `exec.edge()` select arm); `bfr12_gate_reaches_a_parked_monitor`
         // covers the same path end to end through a real MONITOR.
         let mut gate_driver = MonitorGateDriver::new(Some(gate));
+        let mut exec = ExecWatch::new(exec_rx);
         crate::test_reactor().spawn(async move {
             loop {
-                let executing = *exec_rx.borrow_and_update();
-                gate_driver.apply(executing).await;
-                if exec_rx.changed().await.is_err() {
+                gate_driver.apply(exec.executing()).await;
+                if !exec.edge().await {
                     return;
                 }
             }

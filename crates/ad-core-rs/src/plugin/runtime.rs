@@ -471,10 +471,13 @@ impl SortBuffer {
     }
 
     /// Drain the buffer head-first while either the next expected uniqueId is
-    /// contiguous OR the head element has aged past `sort_time` seconds.
-    /// Port of C++ `sortingTask` loop (NDPluginDriver.cpp:619-670).
-    fn drain_ready(&mut self, sort_time: f64) -> Vec<(i32, Vec<Arc<NDArray>>)> {
-        let now = std::time::Instant::now();
+    /// contiguous OR the head element has aged past `sort_time` seconds at
+    /// `now`. Port of C++ `sortingTask` loop (NDPluginDriver.cpp:619-670).
+    fn drain_ready(
+        &mut self,
+        sort_time: f64,
+        now: std::time::Instant,
+    ) -> Vec<(i32, Vec<Arc<NDArray>>)> {
         let mut out = Vec::new();
         while let Some((&head_id, entry)) = self.entries.iter().next() {
             let delta = now.duration_since(entry.inserted).as_secs_f64();
@@ -622,7 +625,10 @@ impl SharedProcessorInner {
         // After emitting in-order arrays, the sort buffer head may now be
         // contiguous — release any newly-ready run (C++ sortingTask).
         if self.sort_mode != 0 {
-            for (_id, mut bucket) in self.sort_buffer.drain_ready(self.sort_time) {
+            for (_id, mut bucket) in self
+                .sort_buffer
+                .drain_ready(self.sort_time, std::time::Instant::now())
+            {
                 ready.append(&mut bucket);
             }
         }
@@ -784,7 +790,9 @@ impl SharedProcessorInner {
     /// Flush the sort buffer head-first while contiguous or stale (C++
     /// sortingTask periodic tick). Does NOT drain non-contiguous fresh arrays.
     fn tick_sort_buffer(&mut self) -> ProcessOutput {
-        let entries = self.sort_buffer.drain_ready(self.sort_time);
+        let entries = self
+            .sort_buffer
+            .drain_ready(self.sort_time, std::time::Instant::now());
         self.emit_drained(entries)
     }
 
@@ -4027,7 +4035,7 @@ mod tests {
         buf.insert(5, vec![make_test_array(5)], 10); // gap: 3,4 missing
 
         // sort_time large → only contiguity drives release.
-        let drained = buf.drain_ready(100.0);
+        let drained = buf.drain_ready(100.0, std::time::Instant::now());
         let ids: Vec<i32> = drained.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![1, 2], "contiguous run released; id=5 held by gap");
         assert_eq!(buf.len(), 1);
@@ -4041,9 +4049,35 @@ mod tests {
         buf.insert(5, vec![make_test_array(5)], 10); // out of order
         std::thread::sleep(std::time::Duration::from_millis(30));
         // sort_time=0.01s → head aged past deadline → released.
-        let drained = buf.drain_ready(0.01);
+        let drained = buf.drain_ready(0.01, std::time::Instant::now());
         let ids: Vec<i32> = drained.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![5], "stale head released via deadline");
+    }
+
+    /// C sortingTask releases a head only once `deltaTime > sortTime`
+    /// (NDPluginDriver.cpp:662): held at and before the deadline, released
+    /// the instant after it, whatever fraction of it has passed.
+    #[test]
+    fn sort_buffer_releases_a_head_only_past_sort_time() {
+        const SORT_TIME: f64 = 1.0;
+        let mut buf = SortBuffer::new();
+        buf.note_emitted(1);
+        buf.insert(5, vec![make_test_array(5)], 10);
+        let inserted = buf.entries[&5].inserted;
+        let deadline = std::time::Duration::from_secs_f64(SORT_TIME);
+        for held in [deadline / 2, deadline - deadline / 100, deadline] {
+            assert!(
+                buf.drain_ready(SORT_TIME, inserted + held).is_empty(),
+                "held at {held:?} of {deadline:?}"
+            );
+        }
+        let past = inserted + deadline + std::time::Duration::from_nanos(1);
+        let ids: Vec<i32> = buf
+            .drain_ready(SORT_TIME, past)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ids, vec![5], "released once past the deadline");
     }
 
     #[test]

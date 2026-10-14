@@ -100,7 +100,8 @@ default-filter = """
   binary(differential_libca) |
   binary(wire_golden_pvxs) |
   binary(wire_golden_ext) |
-  binary(interop_pvxs)
+  binary(interop_pvxs) |
+  binary(discovery_mdns)
 """
 
 # CI profile: friendlier output + retries for the genuinely flaky

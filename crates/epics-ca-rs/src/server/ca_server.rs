@@ -1368,15 +1368,19 @@ impl CaServer {
 
         // mDNS announce: held for the lifetime of run(). Drops when
         // the function returns, deregistering us from the network.
+        // The announced port is the UDP search port: a client adds the
+        // discovered address to its SEARCH destinations, so a TCP port
+        // announced here is searched on a socket nothing listens on
+        // whenever the two differ (`port(0)`, or a split configuration).
         #[cfg(feature = "discovery")]
         let _mdns = if let Some(ref instance) = self.mdns_instance {
             match crate::discovery::MdnsBackend::announce_helper(
                 instance,
-                tcp_port,
+                port,
                 self.mdns_txt.clone(),
             ) {
                 Ok(announcer) => {
-                    tracing::info!(instance = %instance, port = tcp_port,
+                    tracing::info!(instance = %instance, port,
                         "mDNS announce active");
                     metrics::counter!("ca_server_mdns_announces_total").increment(1);
                     Some(announcer)
@@ -1403,9 +1407,10 @@ impl CaServer {
         let _dns_updater = if let Some(ref reg) = self.dns_update {
             // The configured port may differ from the actual listening
             // port (e.g. when binding 0 for ephemeral). Patch the
-            // registration with `tcp_port` before sending.
+            // registration with the UDP search `port` before sending: a
+            // client searches the SRV port (see the mDNS announce above).
             let mut reg = reg.clone();
-            reg.port = tcp_port;
+            reg.port = port;
             match crate::discovery::DnsUpdater::register(reg).await {
                 Ok(updater) => {
                     tracing::info!("RFC 2136 dynamic DNS registration active");

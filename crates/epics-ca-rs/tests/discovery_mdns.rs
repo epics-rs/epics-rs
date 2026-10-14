@@ -24,10 +24,12 @@ use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::discovery::DiscoveryConfig;
 use epics_ca_rs::server::CaServer;
 
-/// Smoke test that may be flaky on hosts without working multicast
-/// (some CI containers) — annotated `#[ignore]` so it's opt-in via
-/// `cargo test -- --ignored`. Real LAN hosts run it cleanly.
-#[ignore]
+/// Opt-in: it needs the `discovery` feature, an up non-loopback IPv4
+/// interface that carries multicast, and UDP 5353 open to `mdns-sd`'s
+/// sockets on this host. It fails by timing out (60 s) where that is missing,
+/// so it is not in the default loop; `--profile interop --run-ignored all
+/// --features discovery` runs it.
+#[ignore = "needs --features discovery and a multicast-capable non-loopback IPv4 interface; run with --profile interop --run-ignored all"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mdns_server_announce_to_client_discover() {
     // Build an IOC with a unique mDNS instance name to avoid colliding

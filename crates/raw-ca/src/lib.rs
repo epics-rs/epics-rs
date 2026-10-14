@@ -120,6 +120,9 @@ impl Circuit {
     pub fn new(sock: TcpStream) -> Self {
         sock.set_read_timeout(Some(READ_TIMEOUT))
             .expect("set read timeout");
+        // libca sets it too (`tcpiiu.cpp:734`). Without it a request sent
+        // behind an unanswered one waits for the server's delayed ACK.
+        sock.set_nodelay(true).expect("set TCP_NODELAY");
         Self {
             sock,
             pending: VecDeque::new(),
@@ -128,6 +131,11 @@ impl Circuit {
 
     pub fn send(&mut self, frame: &[u8]) {
         self.sock.write_all(frame).expect("write frame");
+    }
+
+    /// The underlying socket, for a test that inspects the connection itself.
+    pub fn stream(&self) -> &TcpStream {
+        &self.sock
     }
 
     /// The peer address the server sees, which RSRV's console lines name.

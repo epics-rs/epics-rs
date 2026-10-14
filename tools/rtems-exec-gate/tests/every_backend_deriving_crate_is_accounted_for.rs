@@ -196,6 +196,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/softioc_a_ca_put_never_waits_on_the_console.rs",
     ),
     ("epics-ca-rs", "tests/softioc_db_channel_create_line.rs"),
+    (
+        "epics-ca-rs",
+        "tests/the_ca_servers_set_tcp_nodelay_on_the_accepted_socket.rs",
+    ),
     ("epics-ca-rs", "tests/tls_end_to_end.rs"),
     (
         "epics-ca-rs",

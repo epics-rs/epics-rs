@@ -101,6 +101,8 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
 
     let mut mon = Reaped(
         Command::new(env!("CARGO_BIN_EXE_camonitor-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .arg("TST:AI")
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
@@ -117,7 +119,10 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     // Wait for the first monitor event itself, then take the IOC away
     // under it.
     assert!(
-        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("TST:AI")),
+        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| {
+            t.lines()
+                .any(|l| l.contains("TST:AI") && !l.contains("Not connected"))
+        }),
         "no first monitor line within 10s; stdout: {:?}",
         out_lines.text()
     );

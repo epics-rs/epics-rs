@@ -32,8 +32,9 @@ async fn caput_dash_s_prints_both_readbacks_as_long_strings() {
     let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
 
+    let bound = fact_budget::FACT_BUDGET.as_secs().to_string();
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
-        .args(["-w", "2", "-S", "R922:LSTR", "hello"])
+        .args(["-w", &bound, "-S", "R922:LSTR", "hello"])
         .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CA_SERVER_PORT", port.to_string())

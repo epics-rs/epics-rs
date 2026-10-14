@@ -23,6 +23,8 @@ async fn caput(port: u16, args: &[&str]) -> (String, String) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_caput-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .args(&args)
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
@@ -67,7 +69,11 @@ async fn caput_prints_the_old_and_new_lines_c_caput_prints_for_a_string_put() {
             .lines()
             .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
             .collect();
-        assert_eq!(lines, ["Old : LO 77", new], "caput LO {token}: {out:?}");
+        assert_eq!(
+            lines,
+            ["Old : LO 77", new],
+            "caput LO {token}: {out:?} {err:?}"
+        );
         if refused {
             assert!(
                 err.contains("Warning: \"Channel write request failed\""),

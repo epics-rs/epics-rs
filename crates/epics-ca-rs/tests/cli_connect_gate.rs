@@ -102,7 +102,8 @@ async fn caget_names_the_single_missing_pv() {
 #[tokio::test(flavor = "multi_thread")]
 async fn caget_still_prints_every_value_when_all_connect() {
     let port = server_with_ai("R916:GET:OK", 7.25).await;
-    let out = run_tool(CAGET, port, &["-w", "2", "R916:GET:OK"]).await;
+    let bound = fact_budget::FACT_BUDGET.as_secs().to_string();
+    let out = run_tool(CAGET, port, &["-w", &bound, "R916:GET:OK"]).await;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

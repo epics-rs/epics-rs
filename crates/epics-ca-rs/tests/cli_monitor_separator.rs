@@ -41,6 +41,8 @@ async fn first_line(port: u16, args: &[&str]) -> String {
     let port_env = port.to_string();
     tokio::task::spawn_blocking(move || {
         let mut child = Command::new(env!("CARGO_BIN_EXE_camonitor-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .args(&args)
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")

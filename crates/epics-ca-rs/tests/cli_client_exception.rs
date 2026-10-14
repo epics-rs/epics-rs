@@ -49,6 +49,8 @@ async fn caput(port: u16, args: &[&str]) -> (String, String, i32) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_caput-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .args(&args)
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
@@ -88,7 +90,10 @@ async fn a_server_rejected_put_prints_the_client_exception_block() {
 
     // C's exit status and stdout are unchanged by the rejection: the plain
     // write has no completion status for the tool to look at.
-    assert_eq!(code, 0, "C exits 0 (caput.c:558-577 never sees the error)");
+    assert_eq!(
+        code, 0,
+        "C exits 0 (caput.c:558-577 never sees the error); stderr {err:?}"
+    );
     assert!(out.contains("Old : "), "{out:?}");
     assert!(out.contains("New : "), "{out:?}");
 
@@ -142,7 +147,7 @@ async fn an_accepted_put_prints_no_block() {
     let port = server_with_longout("TST:LO2", 200).await;
 
     let (out, err, code) = caput(port, &["TST:LO2", "7"]).await;
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "stderr {err:?}");
     assert!(out.contains("New : "), "{out:?}");
     assert!(
         !err.contains("CA.Client.Exception"),

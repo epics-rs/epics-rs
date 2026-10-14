@@ -3706,8 +3706,8 @@ const WRITER_PASS_FRAMES: usize = 64;
 
 /// Byte budget for one connection's writer queue — the port of pvxs
 /// `tcp_tx_limit`. Producers acquire `clamp(len, 1..=limit)` permits
-/// before a frame may enter the queue; the writer task releases the
-/// same amount after the frame is written (or the connection dies).
+/// before a frame may enter the queue, and the frame carries them
+/// ([`TxBytes`]) until the writer task has written it.
 /// The clamp keeps a frame larger than the whole limit admissible —
 /// it charges the full budget and travels alone, exactly how pvxs
 /// admits one oversized monitor reply before suspending the rest.
@@ -3747,20 +3747,23 @@ impl TxBudget {
     /// Take `len` bytes of budget, waiting while the queue is full.
     /// `Err` means the budget was closed — the writer task is gone and
     /// the frame can never be written.
-    async fn acquire(&self, len: usize) -> Result<(), ()> {
-        match self.sem.clone().acquire_many_owned(self.charge(len)).await {
-            Ok(permits) => {
-                permits.forget();
-                Ok(())
-            }
-            Err(_closed) => Err(()),
-        }
-    }
-
-    fn release(&self, len: usize) {
-        self.sem.add_permits(self.charge(len) as usize);
+    async fn acquire(&self, len: usize) -> Result<TxBytes, ()> {
+        self.sem
+            .clone()
+            .acquire_many_owned(self.charge(len))
+            .await
+            .map(TxBytes)
+            .map_err(|_closed| ())
     }
 }
+
+/// Bytes of [`TxBudget`] held for one frame, from the producer's reservation
+/// until the writer has written it ([`WriteBatch::write_to`]); dropping them
+/// anywhere, a cancelled producer included, returns them once.
+struct TxBytes(tokio::sync::OwnedSemaphorePermit);
+
+/// A frame in a writer queue and the [`TxBytes`] it holds.
+struct Queued(Vec<u8>, TxBytes);
 
 /// Closes the budget when the writer task's future is dropped — whether
 /// the loop broke on a write error/timeout or `AbortOnDrop` cancelled it
@@ -3812,25 +3815,25 @@ enum TxSink {
 
 /// An entry in the writer's `rx`.
 enum Outbound {
-    Frame(Vec<u8>),
+    Frame(Queued),
     /// A MONITOR INIT reply and the subscriber it opens
     /// ([`SrvTx::send_hosting`]).
-    Hosting(Vec<u8>, HostedSubscriber),
+    Hosting(Queued, HostedSubscriber),
 }
 
 #[cfg(test)]
 impl Outbound {
-    /// The frame, dropping any subscriber it carries.
+    /// The frame, dropping its bytes and any subscriber it carries.
     fn into_frame(self) -> Vec<u8> {
         match self {
-            Self::Frame(frame) | Self::Hosting(frame, _) => frame,
+            Self::Frame(Queued(frame, _)) | Self::Hosting(Queued(frame, _), _) => frame,
         }
     }
 }
 
 impl SrvTx {
-    /// Build the writer-queue pair, the budget handle the writer task
-    /// releases into, and the set of MONITOR subscribers the writer runs.
+    /// Build the writer-queue pair, the budget the writer task closes when
+    /// it ends, and the set of MONITOR subscribers the writer runs.
     fn channel(
         depth: usize,
         tx_limit_bytes: usize,
@@ -3892,8 +3895,8 @@ impl SrvTx {
         let task: HostedSubscriber = Box::pin(Contained(Some(Box::pin(async move {
             let _ = task.await;
         }))));
-        if let Ok(permit) = self.reserve_rx(frame.len()).await {
-            permit.send(Outbound::Hosting(frame, task));
+        if let Ok(slot) = self.reserve_rx(frame.len()).await {
+            slot.send(frame, |queued| Outbound::Hosting(queued, task));
         }
         (HostedAbort(abort), ret)
     }
@@ -3912,28 +3915,17 @@ impl SrvTx {
     /// A hosted producer takes no queue slot: its frames are written
     /// before the writer polls anything else, so they never accumulate.
     async fn reserve(&self, len: usize) -> Result<TxPermit<'_>, ()> {
-        let slot = match self.sink {
-            TxSink::Hosted => {
-                self.budget.acquire(len).await?;
-                TxSlot::Hosted(&self.host)
-            }
-            TxSink::Writer => TxSlot::Writer(self.reserve_rx(len).await?),
-        };
-        Ok(TxPermit {
-            slot: Some(slot),
-            budget: self.budget.clone(),
-            len,
+        Ok(match self.sink {
+            TxSink::Hosted => TxPermit::Hosted(&self.host, self.budget.acquire(len).await?),
+            TxSink::Writer => TxPermit::Writer(self.reserve_rx(len).await?),
         })
     }
 
     /// Both bounds for a `len`-byte entry in `rx`: the bytes, then a slot.
-    async fn reserve_rx(&self, len: usize) -> Result<tokio::sync::mpsc::Permit<'_, Outbound>, ()> {
-        self.budget.acquire(len).await?;
-        self.tx.reserve().await.map_err(|_closed| {
-            // The frame can never enter the queue; hand its budget back so
-            // any producer racing the shutdown is not stuck short.
-            self.budget.release(len);
-        })
+    async fn reserve_rx(&self, len: usize) -> Result<RxSlot<'_>, ()> {
+        let bytes = self.budget.acquire(len).await?;
+        let permit = self.tx.reserve().await.map_err(|_closed| ())?;
+        Ok(RxSlot { bytes, permit })
     }
 
     async fn send(&self, buf: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
@@ -4008,15 +4000,15 @@ impl Drop for HostedAbort {
 /// The frames hosted subscribers queued while the writer polled them.
 #[derive(Default)]
 struct HostQueue {
-    frames: std::sync::Mutex<VecDeque<Vec<u8>>>,
+    frames: std::sync::Mutex<VecDeque<Queued>>,
 }
 
 impl HostQueue {
-    fn frames(&self) -> std::sync::MutexGuard<'_, VecDeque<Vec<u8>>> {
+    fn frames(&self) -> std::sync::MutexGuard<'_, VecDeque<Queued>> {
         self.frames.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn push(&self, frame: Vec<u8>) {
+    fn push(&self, frame: Queued) {
         self.frames().push_back(frame);
     }
 }
@@ -4026,12 +4018,12 @@ impl HostQueue {
 struct SubscriberSet {
     host: Arc<HostQueue>,
     live: futures_util::stream::FuturesUnordered<HostedSubscriber>,
-    ready: VecDeque<Vec<u8>>,
+    ready: VecDeque<Queued>,
 }
 
 impl SubscriberSet {
     /// The next frame a subscriber queued, if any.
-    fn take_frame(&mut self) -> Option<Vec<u8>> {
+    fn take_frame(&mut self) -> Option<Queued> {
         self.ready.pop_front()
     }
 
@@ -4172,13 +4164,13 @@ impl WriterQueues {
     }
 }
 
-/// The frames of one write, back to back, and each one's length: the budget
-/// charge is per frame (`TxBudget::charge` clamps each one), so it is
-/// returned per frame once the batch has left.
+/// The frames of one write, back to back, each one's length, and the
+/// [`TxBudget`] bytes they hold until [`Self::write_to`] has written them.
 #[derive(Default)]
 struct WriteBatch {
     bytes: Vec<u8>,
     lens: Vec<usize>,
+    held: Option<TxBytes>,
 }
 
 impl WriteBatch {
@@ -4187,7 +4179,25 @@ impl WriteBatch {
         self.lens.clear();
     }
 
-    fn push(&mut self, frame: Vec<u8>) {
+    /// Write the frames to `w` within `send_tmo`; once they have left for
+    /// the socket buffer, and not before, return their bytes.
+    async fn write_to(
+        &mut self,
+        w: &mut (impl tokio::io::AsyncWrite + Unpin),
+        send_tmo: Duration,
+    ) -> Result<std::io::Result<()>, epics_base_rs::runtime::task::Elapsed> {
+        let res = epics_base_rs::runtime::task::timeout(send_tmo, w.write_all(&self.bytes)).await;
+        if matches!(res, Ok(Ok(()))) {
+            self.held = None;
+        }
+        res
+    }
+
+    fn push(&mut self, Queued(frame, bytes): Queued) {
+        match &mut self.held {
+            Some(held) => held.0.merge(bytes.0),
+            None => self.held = Some(bytes),
+        }
         self.lens.push(frame.len());
         if self.bytes.is_empty() {
             self.bytes = frame;
@@ -4209,38 +4219,32 @@ impl WriteBatch {
     }
 }
 
-/// Both writer bounds — one queue slot and `len` bytes of [`TxBudget`] —
-/// held for a frame that has not been pushed yet ([`SrvTx::reserve`]).
-///
-/// Consuming it with [`Self::send`] is infallible and synchronous. Dropping
-/// it unused (the producer was cancelled while still holding the
-/// reservation) returns the byte budget; the queue slot is returned by the
-/// inner `Permit`'s own `Drop`.
-struct TxPermit<'a> {
-    slot: Option<TxSlot<'a>>,
-    budget: TxBudget,
-    len: usize,
+/// One `rx` slot and the bytes of the entry that will fill it
+/// ([`SrvTx::reserve_rx`]). Dropping it unused returns both.
+struct RxSlot<'a> {
+    bytes: TxBytes,
+    permit: tokio::sync::mpsc::Permit<'a, Outbound>,
 }
 
-enum TxSlot<'a> {
-    Writer(tokio::sync::mpsc::Permit<'a, Outbound>),
-    Hosted(&'a HostQueue),
-}
-
-impl TxPermit<'_> {
-    fn send(mut self, buf: Vec<u8>) {
-        match self.slot.take() {
-            Some(TxSlot::Writer(permit)) => permit.send(Outbound::Frame(buf)),
-            Some(TxSlot::Hosted(host)) => host.push(buf),
-            None => {}
-        }
+impl RxSlot<'_> {
+    fn send(self, frame: Vec<u8>, entry: impl FnOnce(Queued) -> Outbound) {
+        self.permit.send(entry(Queued(frame, self.bytes)));
     }
 }
 
-impl Drop for TxPermit<'_> {
-    fn drop(&mut self) {
-        if self.slot.take().is_some() {
-            self.budget.release(self.len);
+/// Both writer bounds held for a frame that has not been pushed yet
+/// ([`SrvTx::reserve`]). Consuming it with [`Self::send`] is infallible and
+/// synchronous; dropping it unused returns them.
+enum TxPermit<'a> {
+    Writer(RxSlot<'a>),
+    Hosted(&'a HostQueue, TxBytes),
+}
+
+impl TxPermit<'_> {
+    fn send(self, buf: Vec<u8>) {
+        match self {
+            Self::Writer(slot) => slot.send(buf, Outbound::Frame),
+            Self::Hosted(host, bytes) => host.push(Queued(buf, bytes)),
         }
     }
 }
@@ -4488,7 +4492,7 @@ pub(super) async fn handle_connection_io(
         // Dropping this guard — loop break OR abort at the `recv` await —
         // closes the byte budget so producers parked in `TxBudget::acquire`
         // fail instead of waiting on a writer that no longer exists.
-        let _budget_guard = TxBudgetCloseGuard(writer_budget.clone());
+        let _budget_guard = TxBudgetCloseGuard(writer_budget);
         let mut batch = WriteBatch::default();
         // The inactivity deadline, in pvxs's place rather than in the
         // protocol loop: libevent runs a bufferevent's read timeout
@@ -4552,20 +4556,10 @@ pub(super) async fn handle_connection_io(
                 if batch.lens.is_empty() {
                     break;
                 }
-                match epics_base_rs::runtime::task::timeout(
-                    send_tmo,
-                    writer_raw.write_all(&batch.bytes),
-                )
-                .await
-                {
+                match batch.write_to(&mut writer_raw, send_tmo).await {
                     Ok(Ok(())) => {
                         // bytes_out counter for PvaServer::report().
                         peer_entry_writer.touch_tx(batch.bytes.len());
-                        // The frames left the queue for the socket buffer;
-                        // return their bytes to the TX budget.
-                        for len in &batch.lens {
-                            writer_budget.release(*len);
-                        }
                     }
                     Ok(Err(e)) => {
                         debug!(peer = ?writer_peer, error = %e, "writer task: TCP write failed, dropping connection");
@@ -9872,8 +9866,8 @@ impl TestRx {
 
     fn take(&self, item: Outbound) -> Vec<u8> {
         match item {
-            Outbound::Frame(frame) => frame,
-            Outbound::Hosting(frame, task) => {
+            Outbound::Frame(Queued(frame, _)) => frame,
+            Outbound::Hosting(Queued(frame, _), task) => {
                 let _ = self.adopt.send(task);
                 frame
             }
@@ -26016,7 +26010,7 @@ mod tx_byte_budget_tests {
     /// release must re-admit it.
     #[epics_macros_rs::epics_test]
     async fn bytes_not_frames_bound_the_writer_queue() {
-        let (tx, mut rx, budget, _subscribers) = SrvTx::channel(1024, 1024);
+        let (tx, mut rx, _budget, _subscribers) = SrvTx::channel(1024, 1024);
         tx.send(vec![0u8; 1024])
             .await
             .expect("the first frame exactly fills the byte budget");
@@ -26026,13 +26020,8 @@ mod tx_byte_budget_tests {
                 .is_none(),
             "1023 frame slots are free; only the byte budget can be parking this send"
         );
-        // Act as the writer task: drain one frame, return its bytes.
-        let frame = rx
-            .recv()
-            .await
-            .map(Outbound::into_frame)
-            .expect("the queued frame");
-        budget.release(frame.len());
+        // Act as the writer task: write one frame, dropping its bytes.
+        drop(rx.recv().await.expect("the queued frame"));
         tx.send(vec![0u8; 1])
             .await
             .expect("the released budget must re-admit the parked size");
@@ -26044,7 +26033,7 @@ mod tx_byte_budget_tests {
     /// would park it forever.
     #[epics_macros_rs::epics_test]
     async fn an_oversized_frame_is_admitted_alone() {
-        let (tx, mut rx, budget, _subscribers) = SrvTx::channel(1024, 8);
+        let (tx, mut rx, _budget, _subscribers) = SrvTx::channel(1024, 8);
         tx.send(vec![0u8; 100])
             .await
             .expect("a frame larger than the whole limit must still be admitted");
@@ -26054,15 +26043,104 @@ mod tx_byte_budget_tests {
                 .is_none(),
             "the oversized frame holds the entire budget until written"
         );
-        let frame = rx
-            .recv()
-            .await
-            .map(Outbound::into_frame)
-            .expect("the oversized frame");
-        budget.release(frame.len());
+        drop(rx.recv().await.expect("the oversized frame"));
         tx.send(vec![0u8; 1])
             .await
             .expect("releasing the oversized frame frees the whole budget");
+    }
+
+    /// A producer cancelled after it took its bytes and while it waits for
+    /// a queue slot gives the bytes back. Revert-verify: forgetting the
+    /// permits at acquire leaks them, and the budget shrinks per cancel.
+    #[epics_macros_rs::epics_test]
+    async fn a_reservation_cancelled_before_its_slot_returns_its_bytes() {
+        let (tx, _rx, budget, _subscribers) = SrvTx::channel(1, 1024);
+        tx.send(vec![0u8; 8]).await.expect("fill the only slot");
+        let mut parked = Box::pin(tx.send(vec![0u8; 100]));
+        assert!(
+            futures_util::future::poll_immediate(parked.as_mut())
+                .await
+                .is_none(),
+            "the sender must hold its bytes and wait for the slot"
+        );
+        assert_eq!(budget.sem.available_permits(), 1024 - 8 - 100);
+        drop(parked);
+        assert_eq!(budget.sem.available_permits(), 1024 - 8);
+    }
+
+    /// A hosted subscriber's frame holds its bytes until the writer has
+    /// written it, as an `rx` frame does. Revert-verify: returning them at
+    /// the push (`N4`) returns them twice, once more from the writer, and the
+    /// budget grows past `tcp_tx_limit` on every update.
+    #[epics_macros_rs::epics_test]
+    async fn a_hosted_frame_holds_its_bytes_until_written() {
+        let (tx, rx, budget, subscribers) = SrvTx::channel(4, 1024);
+        let mut queues = WriterQueues { rx, subscribers };
+        let (_abort, ()) = tx
+            .send_hosting(b"i".to_vec(), |tx| {
+                let task = async move {
+                    let _ = tx.send(vec![0u8; 10]).await;
+                    std::future::pending::<()>().await
+                };
+                (task, ())
+            })
+            .await;
+        let mut batch = WriteBatch::default();
+        let first = queues.rx.try_recv().ok();
+        queues.fill(first, &mut batch).await;
+        assert_eq!(
+            batch.frames().len(),
+            2,
+            "the INIT reply and the hosted frame"
+        );
+        assert_eq!(budget.sem.available_permits(), 1024 - 1 - 10);
+    }
+
+    /// Frames from `rx` and a hosted subscriber hold their bytes while the
+    /// writer's `write_all` waits on a full socket, and return all of them
+    /// once it completes. Revert-verify: returning them before the write, not
+    /// at all, or only one frame's of a batch leaves the budget wrong at one
+    /// of the two checks.
+    #[epics_macros_rs::epics_test]
+    async fn a_batch_holds_its_bytes_through_the_write() {
+        use tokio::io::AsyncReadExt;
+        const LIMIT: usize = 1024;
+        let (tx, rx, budget, subscribers) = SrvTx::channel(8, LIMIT);
+        let mut queues = WriterQueues { rx, subscribers };
+        let (_abort, ()) = tx
+            .send_hosting(vec![1u8; 30], |tx| {
+                let task = async move {
+                    let _ = tx.send(vec![2u8; 50]).await;
+                    let _ = tx.send(vec![3u8; 70]).await;
+                    std::future::pending::<()>().await
+                };
+                (task, ())
+            })
+            .await;
+        tx.send(vec![4u8; 40]).await.expect("an rx frame");
+        let sent = 30 + 50 + 70 + 40;
+
+        let mut batch = WriteBatch::default();
+        let first = queues.rx.try_recv().ok();
+        queues.fill(first, &mut batch).await;
+        assert_eq!(batch.frames().len(), 4);
+        assert_eq!(budget.sem.available_permits(), LIMIT - sent);
+
+        // A socket that takes 16 bytes until the peer reads.
+        let (mut sock, mut peer) = tokio::io::duplex(16);
+        let mut write = Box::pin(batch.write_to(&mut sock, Duration::from_secs(10)));
+        assert!(
+            futures_util::future::poll_immediate(write.as_mut())
+                .await
+                .is_none(),
+            "the write must wait on the full socket"
+        );
+        assert_eq!(budget.sem.available_permits(), LIMIT - sent);
+        let mut wire = vec![0u8; sent];
+        let (done, read) = tokio::join!(write, peer.read_exact(&mut wire));
+        assert!(matches!(done, Ok(Ok(()))));
+        read.expect("the peer reads every frame");
+        assert_eq!(budget.sem.available_permits(), LIMIT);
     }
 
     /// The writer-death path: closing the budget (what
@@ -26402,7 +26480,10 @@ mod hosted_subscriber_tests {
             std::task::Poll::Ready(())
         })
         .await;
-        assert_eq!(queues.subscribers.take_frame(), Some(b"s".to_vec()));
+        assert_eq!(
+            queues.subscribers.take_frame().map(|q| q.0),
+            Some(b"s".to_vec())
+        );
     }
 
     /// Two subscribers on one writer, the first `doomed`: once
@@ -26435,7 +26516,10 @@ mod hosted_subscriber_tests {
         go.try_send(()).expect("the live subscriber has room");
         std::future::poll_fn(|cx| queues.subscribers.poll_drive(cx)).await;
         assert_eq!(queues.subscribers.live.len(), 1);
-        assert_eq!(queues.subscribers.take_frame(), Some(b"s".to_vec()));
+        assert_eq!(
+            queues.subscribers.take_frame().map(|q| q.0),
+            Some(b"s".to_vec())
+        );
     }
 
     /// A hosted future that panics ends alone. Revert-verify: polling it

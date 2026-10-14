@@ -87,10 +87,20 @@ pub const ATTEMPTS: usize = 16;
 /// taken by somebody else — see the crate docs. Panics with the whole
 /// candidate list when [`ATTEMPTS`] have been lost, because at that point the
 /// number is not the problem.
-pub fn on_a_named_port<T>(mut attempt: impl FnMut(u16) -> Option<T>) -> T {
+pub fn on_a_named_port<T>(attempt: impl FnMut(u16) -> Option<T>) -> T {
+    on_a_named_port_from(free_for_tcp_and_udp, attempt)
+}
+
+/// [`on_a_named_port`] with the candidate drawn by `pick`, for a subject
+/// that needs more of the number than the same value free on TCP and UDP
+/// (see [`free_tcp_with_udp_successor`]).
+pub fn on_a_named_port_from<T>(
+    mut pick: impl FnMut() -> u16,
+    mut attempt: impl FnMut(u16) -> Option<T>,
+) -> T {
     let mut tried = Vec::with_capacity(ATTEMPTS);
     for _ in 0..ATTEMPTS {
-        let port = free_for_tcp_and_udp();
+        let port = pick();
         tried.push(port);
         if let Some(won) = attempt(port) {
             return won;
@@ -121,9 +131,58 @@ pub fn free_for_tcp_and_udp() -> u16 {
     panic!("no port was free for both TCP and UDP after 64 attempts");
 }
 
+/// A port number free on TCP whose successor is free on UDP: a PVA server
+/// started with only `EPICS_PVAS_SERVER_PORT` searches on `port + 1`
+/// whatever `EPICS_PVAS_BROADCAST_PORT` says. A hint, as
+/// [`free_for_tcp_and_udp`] is.
+pub fn free_tcp_with_udp_successor() -> u16 {
+    for _ in 0..64 {
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
+        let port = tcp.local_addr().expect("read the ephemeral port").port();
+        if port < u16::MAX && UdpSocket::bind(("0.0.0.0", port + 1)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no TCP port with a free UDP successor after 64 attempts");
+}
+
+/// Whether another socket holds `port` on TCP now: the kernel's own answer,
+/// which is the evidence a test needs before it calls a missing bind a lost
+/// race and not a regression.
+pub fn tcp_port_is_held(port: u16) -> bool {
+    matches!(
+        TcpListener::bind(("127.0.0.1", port)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
+/// [`tcp_port_is_held`] for UDP, on every interface as a PVA search socket
+/// binds it.
+pub fn udp_port_is_held(port: u16) -> bool {
+    matches!(
+        UdpSocket::bind(("0.0.0.0", port)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The held/free boundary: a bound socket reads held, the number it
+    /// leaves behind reads free.
+    #[test]
+    fn a_bound_port_reads_held_and_a_released_one_free() {
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let (t, u) = (
+            tcp.local_addr().unwrap().port(),
+            udp.local_addr().unwrap().port(),
+        );
+        assert!(tcp_port_is_held(t) && udp_port_is_held(u));
+        drop((tcp, udp));
+        assert!(!tcp_port_is_held(t) && !udp_port_is_held(u));
+    }
 
     /// The winning attempt's value comes back, and no further candidate is
     /// burned after it.

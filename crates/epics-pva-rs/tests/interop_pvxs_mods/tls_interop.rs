@@ -182,12 +182,6 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
 
     let cfg = PvaServerConfig {
         tcp_port: 0,
-        udp_port: {
-            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let p = s.local_addr().unwrap().port();
-            drop(s);
-            p
-        },
         tls: Some(Arc::new(tls_cfg)),
         ..PvaServerConfig::isolated()
     };

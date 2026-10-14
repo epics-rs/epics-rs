@@ -1060,6 +1060,7 @@ dependencies = [
  "epics-oracle-rs",
  "epics-pva-rs",
  "epics-rtems-boot",
+ "named-port",
  "parking_lot",
  "regex",
  "rtems-exec-gate",

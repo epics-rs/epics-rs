@@ -43,12 +43,6 @@ async fn interop_type_cache_emit_pvxget_accepts_backrefs() {
     let cfg = epics_pva_rs::server_native::PvaServerConfig {
         emit_type_cache: true,
         tcp_port: 0,
-        udp_port: {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        },
         ..epics_pva_rs::server_native::PvaServerConfig::isolated()
     };
     let server = PvaServer::start(Arc::new(source), cfg).expect("server start");

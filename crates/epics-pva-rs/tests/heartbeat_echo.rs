@@ -69,12 +69,6 @@ fn isolated_cfg() -> PvaServerConfig {
     PvaServerConfig {
         wire_byte_order: ByteOrder::Little,
         tcp_port: 0,
-        udp_port: {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        },
         ..PvaServerConfig::isolated()
     }
 }

@@ -23,23 +23,14 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// A port number nothing on the box holds for UDP or for TCP.
-fn port_free_for_udp_and_tcp() -> u16 {
-    loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            return port;
-        }
-    }
-}
-
 struct Ioc {
     child: Child,
     stdin: ChildStdin,
     lines: mpsc::Receiver<String>,
     /// What it printed up to `iocRun: All initialization complete`.
     boot: Vec<String>,
+    /// Every line read since, for the console verdict on its port.
+    heard: Vec<String>,
 }
 
 impl Ioc {
@@ -82,6 +73,7 @@ impl Ioc {
                     stdin,
                     lines,
                     boot,
+                    heard: Vec::new(),
                 };
             }
         }
@@ -97,6 +89,7 @@ impl Ioc {
             .lines
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         {
+            self.heard.push(line.clone());
             if done(&line) {
                 return Some(line);
             }
@@ -104,8 +97,24 @@ impl Ioc {
         None
     }
 
+    /// Whether the console says `port` belonged to somebody else. The report
+    /// follows `iocRun`, so this reads what has arrived by now.
+    fn lost_its_port(&mut self, port: u16) -> bool {
+        while let Ok(line) = self.lines.try_recv() {
+            self.heard.push(line);
+        }
+        let console = self
+            .boot
+            .iter()
+            .chain(&self.heard)
+            .cloned()
+            .collect::<Vec<_>>();
+        named_port::verdict::rs_ioc_port_was_taken(&console.join("\n"), port)
+    }
+
     fn cmd(&mut self, line: &str) {
-        writeln!(self.stdin, "{line}").unwrap();
+        // A child that exited on a lost port has closed its stdin.
+        let _ = writeln!(self.stdin, "{line}");
     }
 
     /// `dbpf`, with its echo consumed so a later `dbgf` reads its own line.
@@ -114,14 +123,18 @@ impl Ioc {
         assert!(self.until(|l| l.contains("DBF_")).is_some(), "dbpf {pv}");
     }
 
-    /// The `dbgf` value of `pv`, after everything printed before it.
-    fn dbgf(&mut self, pv: &str) -> String {
+    /// The `dbgf` value of `pv`, after everything printed before it; `None`
+    /// when the IOC is gone or silent.
+    fn try_dbgf(&mut self, pv: &str) -> Option<String> {
         self.cmd(&format!("dbgf {pv}"));
-        let line = self
-            .until(|l| l.contains("DBF_"))
-            .unwrap_or_else(|| panic!("no dbgf reply for {pv}"));
+        let line = self.until(|l| l.contains("DBF_"))?;
         let value = line.split_once(':').unwrap().1;
-        value.trim().trim_matches('"').trim().to_string()
+        Some(value.trim().trim_matches('"').trim().to_string())
+    }
+
+    fn dbgf(&mut self, pv: &str) -> String {
+        self.try_dbgf(pv)
+            .unwrap_or_else(|| panic!("no dbgf reply for {pv}"))
     }
 }
 
@@ -150,15 +163,22 @@ fn ca_forward_links_process_the_remote_record_once_per_source_process() {
     )
     .unwrap();
 
-    let a_port = port_free_for_udp_and_tcp();
-    let mut a = Ioc::start(&tgt, a_port, "127.0.0.1");
+    named_port::on_a_named_port(|a_port| forward_links_on(&tgt, &src, a_port));
+}
+
+/// One run with `a_port` as the target IOC's CA port, `None` when either IOC's
+/// console says its number belonged to somebody else. B's port comes from a
+/// dropped probe too; it is judged where the forwards are awaited, so a B
+/// that lost it earlier fails the run instead of retrying.
+fn forward_links_on(tgt: &std::path::Path, src: &std::path::Path, a_port: u16) -> Option<()> {
+    let mut a = Ioc::start(tgt, a_port, "127.0.0.1");
     let b_port = loop {
-        let p = port_free_for_udp_and_tcp();
+        let p = named_port::free_for_tcp_and_udp();
         if p != a_port {
             break p;
         }
     };
-    let mut b = Ioc::start(&src, b_port, &format!("127.0.0.1:{a_port}"));
+    let mut b = Ioc::start(src, b_port, &format!("127.0.0.1:{a_port}"));
     // softIoc's iocInit, for LNK2 and LNK4; ERL_WARNING is uncoloured on a
     // pipe.
     let warning = "WARNING: Forward-link uses Channel Access without pointing to PROC field";
@@ -196,10 +216,23 @@ fn ca_forward_links_process_the_remote_record_once_per_source_process() {
         b.dbpf("FO.PROC", "1");
         b.dbpf("FL.PROC", "1");
         std::thread::sleep(Duration::from_millis(300));
-        if ["X", "Y", "W"].iter().all(|r| a.dbgf(r) != "0") {
+        let answered = ["X", "Y", "W"]
+            .iter()
+            .map(|r| a.try_dbgf(r))
+            .collect::<Vec<_>>();
+        if answered
+            .iter()
+            .all(|v| v.as_deref().is_some_and(|v| v != "0"))
+        {
             break;
         }
-        assert!(Instant::now() < deadline, "CA forward links never fired");
+        if a.lost_its_port(a_port) || b.lost_its_port(b_port) {
+            return None;
+        }
+        assert!(
+            answered.iter().all(Option::is_some) && Instant::now() < deadline,
+            "CA forward links never fired"
+        );
     }
     let (x0, y0): (f64, f64) = (a.dbgf("X").parse().unwrap(), a.dbgf("Y").parse().unwrap());
     let w0: f64 = a.dbgf("W").parse().unwrap();
@@ -237,4 +270,5 @@ fn ca_forward_links_process_the_remote_record_once_per_source_process() {
     assert_eq!(b.dbgf("FR.SEVR"), "NO_ALARM");
     b.cmd("exit");
     a.cmd("exit");
+    Some(())
 }

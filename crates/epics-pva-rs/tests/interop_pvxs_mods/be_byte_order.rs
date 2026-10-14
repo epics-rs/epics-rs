@@ -67,12 +67,6 @@ async fn interop_be_a_rust_server_emits_be_to_pvxget() {
         // The remaining fields come from the isolated() defaults —
         // ephemeral TCP port, ephemeral UDP, beacon off.
         tcp_port: 0,
-        udp_port: {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        },
         ..epics_pva_rs::server_native::PvaServerConfig::isolated()
     };
     let server = PvaServer::start(Arc::new(source), cfg).expect("server start");

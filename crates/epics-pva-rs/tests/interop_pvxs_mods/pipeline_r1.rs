@@ -52,14 +52,15 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
     let stderr_path = dir.path().join("ioc.stderr");
     let stdout_path = dir.path().join("ioc.stdout");
 
-    let port = pick_localhost_port();
-
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let logs = super::interop_helpers::PvxsLogs {
         out: stdout_path.clone(),
         err: stderr_path.clone(),
     };
     let build = || {
+        // Fresh per attempt: a retry after `port_collision` must not name the
+        // number that was just lost.
+        let port = pick_localhost_port();
+        let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let ca = named_port::free_for_tcp_and_udp();
         let mut cmd = pvxs_command(&ioc_bin);
         cmd.arg("-D")
@@ -85,11 +86,11 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
             .env("PVXS_LOG", "pvxs.tcp.*=DEBUG");
         (cmd, server_addr)
     };
-    let _ioc =
+    let (_ioc, server_addr) =
         match super::interop_helpers::start_pvxs(&logs, build, super::interop_helpers::ioc_ready) {
-            Ok((ioc, _)) => ioc,
+            Ok(up) => up,
             Err(text) => panic!(
-                "softIocPVX did not come up on {server_addr}. A spawned IOC that \
+                "softIocPVX did not come up. A spawned IOC that \
              never comes up is a broken reference, not a missing one.\n{text}"
             ),
         };

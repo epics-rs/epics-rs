@@ -8,7 +8,7 @@
 
 use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{
-    PVXGET, SOFT_IOC_PVX, pick_localhost_port, pvxs_command, require_pvxs, spawn_soft_ioc_pvx,
+    PVXGET, SOFT_IOC_PVX, pvxs_command, require_pvxs, spawn_soft_ioc_pvx,
 };
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -106,10 +106,9 @@ async fn the_search_answers_the_record_and_field_prefix_as_softiocpvx() {
         .expect("write db");
     let (_ioc, c_tcp) = spawn_soft_ioc_pvx(&ioc_bin, &db_path, dir.path());
 
-    let rs_tcp = pick_localhost_port();
     // SAFETY: nextest runs this test alone in its process.
     unsafe {
-        std::env::set_var("EPICS_PVAS_SERVER_PORT", rs_tcp.to_string());
+        std::env::set_var("EPICS_PVAS_SERVER_PORT", "0");
         std::env::set_var("EPICS_PVAS_BROADCAST_PORT", "0");
     }
     let db = Arc::new(PvDatabase::new());
@@ -131,9 +130,14 @@ async fn the_search_answers_the_record_and_field_prefix_as_softiocpvx() {
     );
     let (tx, mut rx) = watch::channel(None);
     let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
-    while rx.borrow_and_update().is_none() {
+    // The kernel picks the port and the server reports it: no number is
+    // guessed, so none can be taken first.
+    let rs_tcp = loop {
+        if let Some(h) = rx.borrow_and_update().clone() {
+            break h.report().tcp_port;
+        }
         rx.changed().await.expect("server reports its ports");
-    }
+    };
     let ioc_text = || {
         ["ioc.out", "ioc.err"]
             .map(|f| std::fs::read_to_string(dir.path().join(f)).unwrap_or_default())

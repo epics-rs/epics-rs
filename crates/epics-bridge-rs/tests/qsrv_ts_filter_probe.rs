@@ -17,7 +17,6 @@
 #![cfg(feature = "qsrv")]
 #![cfg(tokio_backend)]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,16 +33,6 @@ const GROUP: &str = r#"{"G": {
     "c": {"+channel": "T.VAL{\"ts\":{\"num\":\"ts\"}}", "+type": "any"},
     "d": {"+channel": "T.VAL{\"ts\":{\"num\":\"dbl\"}}", "+type": "scalar"}
 }}"#;
-
-fn free_port(udp: bool) -> u16 {
-    if udp {
-        let s = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        s.local_addr().unwrap().port()
-    } else {
-        let s = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        s.local_addr().unwrap().port()
-    }
-}
 
 fn value_at<'a>(name: &str, value: &'a PvField, path: &str) -> &'a PvField {
     path.split('.')
@@ -74,12 +63,7 @@ async fn a_ts_value_mode_serves_its_probe_type_and_options() {
     provider.load_group_config(GROUP).expect("load group");
     assert_eq!(provider.process_groups().await, 1);
 
-    let cfg = PvaServerConfig {
-        tcp_port: free_port(false),
-        udp_port: free_port(true),
-        ..PvaServerConfig::isolated()
-    };
-    let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, cfg.tcp_port));
+    let cfg = PvaServerConfig::isolated();
     let store = QsrvPvStore::new(
         epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
         provider,
@@ -92,7 +76,8 @@ async fn a_ts_value_mode_serves_its_probe_type_and_options() {
     }
     .install_channel_sources(&db, &composite)
     .expect("qsrv sources mount");
-    let _server = PvaServer::start(composite, cfg).expect("qsrv server starts");
+    let server = PvaServer::start(composite, cfg).expect("qsrv server starts");
+    let addr = server.tcp_addr();
     let client = PvaClient::builder()
         .server_addr(addr)
         .timeout(Duration::from_secs(5))

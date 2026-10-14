@@ -13,14 +13,14 @@
 //! ```
 #![cfg(all(feature = "qsrv-bin", tokio_backend, unix))]
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServer;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
+
+mod qsrv_named_ports;
 
 /// `(value, alarm.severity)` of `pv`'s NTScalar.
 async fn value_and_severity(client: &PvaClient, pv: &str) -> Option<(f64, i32)> {
@@ -54,48 +54,32 @@ async fn qsrv_rs_resolves_a_ca_link_as_soft_ioc() {
         "record(ai, \"DST\") { field(INP, \"SRC\") field(SCAN, \"1 second\") }\n",
     )
     .unwrap();
-    let pva_port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_qsrv-rs"))
-        .arg("--db-file")
-        .arg(&db)
-        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{ca_port}"))
-        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_PVAS_SERVER_PORT", pva_port.to_string())
-        .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn qsrv-rs");
-    let mut boot = String::new();
-    for line in BufReader::new(child.stderr.take().unwrap()).lines() {
-        let line = line.expect("stderr");
-        boot.push_str(&line);
-        boot.push('\n');
-        if line.starts_with("iocRun: ") {
-            break;
-        }
-    }
-
-    let client = PvaClient::builder()
-        .server_addr(std::net::SocketAddr::from(([127, 0, 0, 1], pva_port)))
-        .timeout(Duration::from_secs(2))
-        .build();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut got = None;
-    while Instant::now() < deadline {
-        got = value_and_severity(&client, "DST").await;
-        if got == Some((5.0, 0)) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    assert_eq!(got, Some((5.0, 0)), "boot:\n{boot}");
+    let got = qsrv_named_ports::on_a_qsrv_port(
+        &db,
+        |tcp| {
+            vec![
+                ("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{ca_port}")),
+                ("EPICS_CA_AUTO_ADDR_LIST", "NO".into()),
+                ("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1".into()),
+                ("EPICS_PVAS_SERVER_PORT", tcp.to_string()),
+                ("EPICS_PVA_AUTO_ADDR_LIST", "NO".into()),
+            ]
+        },
+        |tcp| async move {
+            let client = PvaClient::builder()
+                .server_addr(std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
+                .timeout(Duration::from_secs(2))
+                .build();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let got @ Some((5.0, 0)) = value_and_severity(&client, "DST").await {
+                    return got;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            None
+        },
+    )
+    .await;
+    assert_eq!(got, (5.0, 0));
 }

@@ -37,22 +37,19 @@ fn run_pva_ioc_serves_on_the_pvas_env_ports() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("e2e.db");
     std::fs::write(&db, "record(ai, \"E2E:X\") { field(VAL, \"4.5\") }\n").unwrap();
-    let free_tcp = || {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
-    let (tcp, cas) = (free_tcp(), free_tcp());
-    let udp = std::net::UdpSocket::bind("0.0.0.0:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    named_port::on_a_named_port(|tcp| serves_on_the_env_ports(&db, tcp));
+}
+
+/// One run with `tcp` as the PVA server port and a fresh UDP search port;
+/// `None` when it failed and the kernel says one of them is held.
+fn serves_on_the_env_ports(db: &std::path::Path, tcp: u16) -> Option<()> {
+    let (udp, cas) = (
+        named_port::free_for_tcp_and_udp(),
+        named_port::free_for_tcp_and_udp(),
+    );
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["ioc_child", "--exact", "--nocapture"])
-        .env(CHILD, &db)
+        .env(CHILD, db)
         .env("EPICS_PVAS_SERVER_PORT", tcp.to_string())
         .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
         // `IocRunConfig::port`, the port `run_pva_ioc` used to bind.
@@ -120,6 +117,16 @@ fn run_pva_ioc_serves_on_the_pvas_env_ports() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let served = got
+        .iter()
+        .all(|v| v.as_deref().is_some_and(|v| v.contains("4.5")))
+        && status.is_some_and(|s| s.success());
+    // The child is gone, so a port still held belongs to someone else. The
+    // child prints nothing about a failed bind (no tracing subscriber), so
+    // its console cannot be the evidence.
+    if !served && (named_port::tcp_port_is_held(tcp) || named_port::udp_port_is_held(udp)) {
+        return None;
+    }
     for v in &got {
         assert!(
             v.as_deref().is_some_and(|v| v.contains("4.5")),
@@ -130,6 +137,7 @@ fn run_pva_ioc_serves_on_the_pvas_env_ports() {
         status.is_some_and(|s| s.success()),
         "the REPL did not end on `exit`: {status:?}\n{log}"
     );
+    Some(())
 }
 
 /// A search port that cannot be bound stops the PVA server, not the IOC:

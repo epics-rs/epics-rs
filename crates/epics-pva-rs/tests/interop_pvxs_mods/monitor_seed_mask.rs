@@ -10,8 +10,7 @@
 #![cfg(tokio_backend)]
 
 use super::interop_helpers::{
-    DropChild, PVXMONITOR, SOFT_IOC_PVX, pick_localhost_port, pvxs_command, require_pvxs,
-    rerun_pvxs, spawn_soft_ioc_pvx,
+    DropChild, PVXMONITOR, SOFT_IOC_PVX, pvxs_command, require_pvxs, rerun_pvxs, spawn_soft_ioc_pvx,
 };
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -124,10 +123,9 @@ async fn start(ioc_bin: &Path) -> Servers {
         .expect("write db");
     let (_ioc, c_tcp) = spawn_soft_ioc_pvx(ioc_bin, &db_path, dir.path());
 
-    let rs_tcp = pick_localhost_port();
     // SAFETY: nextest runs this test alone in its process.
     unsafe {
-        std::env::set_var("EPICS_PVAS_SERVER_PORT", rs_tcp.to_string());
+        std::env::set_var("EPICS_PVAS_SERVER_PORT", "0");
         std::env::set_var("EPICS_PVAS_BROADCAST_PORT", "0");
     }
     let db = Arc::new(PvDatabase::new());
@@ -145,9 +143,13 @@ async fn start(ioc_bin: &Path) -> Servers {
     let run = tokio::spawn(async move {
         let _ = server.run_reporting(Some(tx)).await;
     });
-    while rx.borrow_and_update().is_none() {
+    // The kernel picks the port and the server reports it.
+    let rs_tcp = loop {
+        if let Some(h) = rx.borrow_and_update().clone() {
+            break h.report().tcp_port;
+        }
         rx.changed().await.expect("server reports its ports");
-    }
+    };
 
     Servers {
         dir,

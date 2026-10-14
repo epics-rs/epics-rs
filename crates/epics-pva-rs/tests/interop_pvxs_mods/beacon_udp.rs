@@ -84,18 +84,11 @@ async fn beacon_a_attempt(
     // any socket the server binds can take it.
     let beacon_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let beacon_port = beacon_sock.local_addr().unwrap().port();
-    let udp_port = {
-        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let p = s.local_addr().unwrap().port();
-        drop(s);
-        p
-    };
 
     let source = SharedSource::new();
     // Empty source — beacon emission is independent of hosted PVs.
     let cfg = PvaServerConfig {
         tcp_port: 0,
-        udp_port,
         beacon_destinations: vec![
             format!("127.0.0.1:{beacon_port}")
                 .parse::<std::net::SocketAddr>()

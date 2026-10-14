@@ -85,6 +85,25 @@ pub fn rs_ioc_port_was_taken(console: &str, port: u16) -> bool {
     })
 }
 
+/// `qsrv-rs`'s report that the port it was given belonged to somebody else.
+///
+/// A taken TCP port is not fatal there: the server warns
+/// `Server unable to bind port {tcp}, falling back to …` (runtime.rs:871)
+/// and serves on another, which a client dialling `tcp` never finds. A taken
+/// UDP search port ends the process with the only line it prints,
+/// `AsyncUdpV4: failed to bind any interface`, which names no number and
+/// is printed for any per-interface error (EADDRNOTAVAIL too). It counts
+/// only with `udp_held`, the kernel's answer for `tcp + 1` after the child
+/// has exited. Both follow `iocRun`, so a test judges the console after
+/// its attempt.
+pub fn qsrv_rs_port_was_taken(console: &str, tcp: u16, udp_held: bool) -> bool {
+    let fell_back = format!("Server unable to bind port {tcp},");
+    console.lines().any(|l| {
+        l.contains(&fell_back)
+            || (udp_held && l.contains("AsyncUdpV4: failed to bind any interface"))
+    })
+}
+
 /// realtime-ca-ioc's stderr, verbatim, when `local_addr` fails after a good
 /// bind: measured on Linux 6.14 / glibc 2.39 (thread-backend build, port
 /// [`LOCAL_ADDR_FAILED_PORT`]) under [`crate::getsockname_einval_shim`],
@@ -104,6 +123,23 @@ pub const LOCAL_ADDR_FAILED_PORT: u16 = 32961;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qsrv_rs_names_a_stolen_port_only_by_its_own_two_lines() {
+        let fell_back = " WARN epics_pva_rs::server_native::runtime: Server unable to bind \
+                         port 38017, falling back to 127.0.0.1:43637\n";
+        assert!(qsrv_rs_port_was_taken(fell_back, 38017, false));
+        assert!(!qsrv_rs_port_was_taken(fell_back, 3801, false));
+        const UDP_LINE: &str = "qsrv-rs: invalid value: invalid value: I/O error: AsyncUdpV4: \
+             failed to bind any interface\n";
+        assert!(qsrv_rs_port_was_taken(UDP_LINE, 1, true));
+        assert!(!qsrv_rs_port_was_taken(UDP_LINE, 1, false));
+        assert!(!qsrv_rs_port_was_taken(
+            "Starting iocInit\niocRun: All initialization complete\n",
+            38017,
+            true
+        ));
+    }
 
     #[test]
     fn a_local_addr_failure_is_not_a_stolen_port() {

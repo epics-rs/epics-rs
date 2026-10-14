@@ -320,6 +320,8 @@ rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 # IOC on a port nothing else took, which `gw_upstream_unresponsive_window`
 # used to re-implement.
 epics-oracle-rs = { path = "../epics-oracle-rs" }
+# Dev-only and path-only: the retry rule for a test that must name a port.
+named-port = { path = "../named-port" }
 serial_test = "3"
 tempfile = "3"
 tracing-subscriber = "0.3"

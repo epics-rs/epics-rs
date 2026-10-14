@@ -11,16 +11,75 @@
 #![cfg(tokio_backend)]
 
 use super::interop_helpers::PvxsOutput;
-use super::interop_helpers::{PVXGET, pick_localhost_port, pvxs_command, require_pvxs};
+use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
+use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::server::PvaServer;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-fn free_udp_port() -> u16 {
-    let s = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind 0");
-    s.local_addr().unwrap().port()
+/// Start the server on `tcp`/`udp` from the environment. `None` when it did
+/// not bind them and one of the two is held by another socket.
+async fn serve_on(tcp: u16, udp: u16) -> Option<tokio::task::JoinHandle<CaResult<()>>> {
+    // SAFETY: nextest runs this test alone in its process.
+    unsafe {
+        std::env::set_var("EPICS_PVAS_SERVER_PORT", tcp.to_string());
+        std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string());
+    }
+    let db = Arc::new(PvDatabase::new());
+    db.add_pv("PORTS:X", EpicsValue::Double(4.5)).await.unwrap();
+    let server = PvaServer::from_parts(
+        db,
+        None,
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    );
+    let (tx, mut rx) = watch::channel(None);
+    let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
+    // `None`: the server ended before it bound, which is how a held search
+    // port reads (the start fails and the sender is dropped).
+    let report = loop {
+        if let Some(h) = rx.borrow_and_update().clone() {
+            break Some(h.report());
+        }
+        if rx.changed().await.is_err() {
+            break None;
+        }
+    };
+    let Some(report) = report else {
+        let _ = run.await;
+        return held_port_or_panic(tcp, udp, "the server did not start");
+    };
+    if (report.tcp_port, report.udp_port) == (tcp, udp) {
+        return Some(run);
+    }
+    run.abort();
+    let _ = run.await;
+    // Only a number the server did not bind can be somebody else's. A
+    // missed number that nobody holds means the environment was not read.
+    let (tcp_missed, udp_missed) = (report.tcp_port != tcp, report.udp_port != udp);
+    assert!(
+        (tcp_missed && named_port::tcp_port_is_held(tcp))
+            || (udp_missed && named_port::udp_port_is_held(udp)),
+        "the server ignored the environment: it bound {report:?}, not tcp {tcp} / \
+         udp {udp}, and the number it missed is not held"
+    );
+    None
+}
+
+/// `None` (retry) only when the kernel says `tcp` or `udp` is held.
+fn held_port_or_panic(
+    tcp: u16,
+    udp: u16,
+    what: &str,
+) -> Option<tokio::task::JoinHandle<CaResult<()>>> {
+    assert!(
+        named_port::tcp_port_is_held(tcp) || named_port::udp_port_is_held(udp),
+        "{what}, and neither tcp {tcp} nor udp {udp} is held"
+    );
+    None
 }
 
 fn pvxget(pvxget: &std::path::Path, env: &[(&str, String)]) -> std::process::Output {
@@ -41,31 +100,19 @@ async fn pvxget_reaches_the_server_on_each_env_port() {
     let Some(bin) = require_pvxs(PVXGET) else {
         return;
     };
-    let (tcp, udp) = (pick_localhost_port(), free_udp_port());
-    // SAFETY: nextest runs this test alone in its process.
-    unsafe {
-        std::env::set_var("EPICS_PVAS_SERVER_PORT", tcp.to_string());
-        std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string());
-    }
-    let db = Arc::new(PvDatabase::new());
-    db.add_pv("PORTS:X", EpicsValue::Double(4.5)).await.unwrap();
-    let server = PvaServer::from_parts(
-        db,
-        None,
-        epics_base_rs::server::access_security::new_acf_cell(None),
-        None,
-        None,
-    );
-    let (tx, mut rx) = watch::channel(None);
-    let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
-    let report = loop {
-        if let Some(h) = rx.borrow_and_update().clone() {
-            break h.report();
-        }
-        rx.changed().await.expect("server reports its ports");
-    };
-    assert_eq!((report.tcp_port, report.udp_port), (tcp, udp));
-
+    // The named numbers are the subject: the server must bind exactly the
+    // two the environment gives it. A server that did not, while the kernel
+    // says somebody else holds one of them, lost a race; a free number it
+    // still did not bind is a regression and fails below.
+    let (tcp, udp, run) = tokio::task::block_in_place(|| {
+        let handle = tokio::runtime::Handle::current();
+        named_port::on_a_named_port(|tcp| {
+            let udp = named_port::free_for_tcp_and_udp();
+            handle
+                .block_on(serve_on(tcp, udp))
+                .map(|run| (tcp, udp, run))
+        })
+    });
     let (reached, missed) = tokio::task::spawn_blocking(move || {
         let reached = [
             pvxget(

@@ -49,11 +49,13 @@ difference is either invisible to a client or is an improvement:
   list before any UDP bind, and a held broadcast-address socket drops its
   interface whole (`:703`), both as in C.
 - **Fanout options on a chosen UDP port.** pvxs sets `SO_REUSEADDR` and
-  `SO_REUSEPORT` before every collector bind, port 0 included. Linux then may
+  `SO_REUSEPORT` before every collector bind, port 0 included, and rsrv before
+  every search responder bind (`caservertask.c:628`, `:698`). Linux then may
   hand `bind(0)` a number that another same-user fanout socket holds, and the
   two share unicasts at random. On a number it picks, epics-rs binds first and
   sets the options after, so a later fanout socket can still co-bind but the
-  pick is never a stranger's. A configured number is unchanged.
+  pick is never a stranger's; a stranger on that number at a later interface
+  restarts the set, at most 16 times. A configured number is unchanged.
 
 Each one carries its reasoning in a comment at the site, not in a list here.
 Find them with `deliberate deviation` or `deliberate divergence`.

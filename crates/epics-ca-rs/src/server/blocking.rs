@@ -825,8 +825,8 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
 /// `epicsSocketEnableAddressUseForDatagramFanout` (`caservertask.c:629`).
 /// An ephemeral (`0`) port is left bare: the flags would let the kernel
 /// join this socket to an unrelated reuse group and load-balance SEARCHes
-/// away from it, so the async responder (`udp::bind_responder_socket`) and
-/// C's PORT_ANY sockets both leave them off there.
+/// away from it. (The async responder sets them after its bind instead,
+/// `epics_base_rs::net::bind_fanout`.)
 pub fn bind_udp_search(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     bind_udp_search_socket(addr)
 }

@@ -331,19 +331,23 @@ pub fn store_vecs<S: Simd, T: LaneVec, const N: usize>(v: [S::u8s; N], out: &mut
     }
 }
 
-#[cfg(test)]
 /// Every level this machine can run, so a kernel is checked on each
 /// lowering and not only on the one `level()` picks.
-pub(crate) fn levels() -> Vec<Level> {
+pub fn levels() -> Vec<Level> {
     let top = level();
-    let mut out = vec![top];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        out.extend(top.as_avx2().map(Level::Avx2));
-        out.extend(top.as_sse4_2().map(Level::Sse4_2));
-        out.extend(top.as_sse2().map(Level::Sse2));
-    }
-    out
+    let lowered = [
+        top.as_avx2().map(Level::Avx2),
+        top.as_sse4_2().map(Level::Sse4_2),
+        top.as_sse2().map(Level::Sse2),
+    ];
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let lowered: [Option<Level>; 0] = [];
+    [Some(top), Some(Level::baseline())]
+        .into_iter()
+        .chain(lowered)
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]

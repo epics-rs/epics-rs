@@ -229,14 +229,13 @@ impl AsyncUdpV4 {
                 broadcast,
                 false,
             )?);
-            push_bcast_rx(
-                &mut sockets,
+            sockets.extend(bind_bcast_rx(
                 &info,
                 port,
                 port_use,
                 PortOrigin::Configured,
                 broadcast,
-            )?;
+            )?);
         }
         if sockets.is_empty() {
             return Err(io::Error::new(
@@ -394,15 +393,15 @@ impl AsyncUdpV4 {
                 );
                 last_drop = Some((info.ip, e));
             };
-            if let Err(e) = push_bcast_rx(
-                &mut sockets,
+            match bind_bcast_rx(
                 first_info,
                 chosen_port,
                 port_use,
                 PortOrigin::Chosen,
                 broadcast,
             ) {
-                drop_nic(first_info, e);
+                Ok(rx) => sockets.extend(rx),
+                Err(e) => drop_nic(first_info, e),
             }
             for info in iter {
                 // The caller's role, not the number: an `Exclusive` bundle's
@@ -419,14 +418,14 @@ impl AsyncUdpV4 {
                 )
                 .and_then(|nic| {
                     sockets.push(nic);
-                    push_bcast_rx(
-                        &mut sockets,
+                    sockets.extend(bind_bcast_rx(
                         info,
                         chosen_port,
                         port_use,
                         PortOrigin::Chosen,
                         broadcast,
-                    )
+                    )?);
+                    Ok(())
                 });
                 if let Err(e) = bound {
                     drop_nic(info, e);
@@ -1381,26 +1380,34 @@ fn select_ifaces(map: &IfaceMap, only: Option<&[Ipv4Addr]>) -> Vec<IfaceInfo> {
 /// Loopback has no broadcast. A failure is the caller's: pvxs's broadcast
 /// listener rides the collector's one wildcard socket, whose failed bind
 /// throws (`udp_collector.cpp:151`).
-#[cfg_attr(target_os = "windows", allow(unused_variables))]
-fn push_bcast_rx(
-    sockets: &mut Vec<NicSocket>,
+#[cfg(not(target_os = "windows"))]
+fn bind_bcast_rx(
     info: &IfaceInfo,
     port: u16,
     port_use: PortUse,
     origin: PortOrigin,
     broadcast: bool,
-) -> io::Result<()> {
-    #[cfg(not(target_os = "windows"))]
-    if let Some(bcast) = info.broadcast {
-        if !info.ip.is_loopback() && !bcast.is_unspecified() {
-            #[cfg(test)]
-            tests::BEFORE_BCAST_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bcast, port)));
-            sockets.push(bind_one_at(
-                info, bcast, port, port_use, origin, broadcast, true,
-            )?);
-        }
+) -> io::Result<Option<NicSocket>> {
+    let Some(bcast) = info.broadcast else {
+        return Ok(None);
+    };
+    if info.ip.is_loopback() || bcast.is_unspecified() {
+        return Ok(None);
     }
-    Ok(())
+    #[cfg(test)]
+    tests::BEFORE_BCAST_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bcast, port)));
+    bind_one_at(info, bcast, port, port_use, origin, broadcast, true).map(Some)
+}
+
+#[cfg(target_os = "windows")]
+fn bind_bcast_rx(
+    _info: &IfaceInfo,
+    _port: u16,
+    _port_use: PortUse,
+    _origin: PortOrigin,
+    _broadcast: bool,
+) -> io::Result<Option<NicSocket>> {
+    Ok(None)
 }
 
 /// Bind to an arbitrary IPv4 address while keeping the NIC metadata
@@ -1512,7 +1519,7 @@ mod tests {
     type BcastHook = Box<dyn FnMut(Ipv4Addr, u16)>;
 
     thread_local! {
-        /// Called with each broadcast address and port `push_bcast_rx` is
+        /// Called with each broadcast address and port `bind_bcast_rx` is
         /// about to bind.
         pub(super) static BEFORE_BCAST_BIND: std::cell::RefCell<Option<BcastHook>> =
             const { std::cell::RefCell::new(None) };

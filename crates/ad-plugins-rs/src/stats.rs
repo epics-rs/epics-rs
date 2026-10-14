@@ -2351,15 +2351,8 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn wide_and_float_kernels_match_the_lane_passes_on_every_level() {
-        use fearless_simd::{Level, dispatch};
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        use fearless_simd::dispatch;
+        let levels = ad_core_rs::simd::levels();
         fn same<T: StatsElem + std::fmt::Debug>(what: &str, got: Range<T>, want: Range<T>) {
             let bits = |x: T| format!("{x:?}");
             assert_eq!(bits(got.min), bits(want.min), "{what} min");

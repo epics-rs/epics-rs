@@ -627,15 +627,7 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn transpose_lanes_match_the_per_pixel_mapping_on_every_level() {
-        use fearless_simd::Level;
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        let levels = ad_core_rs::simd::levels();
         let modes = [
             (NDColorMode::Mono, 1),
             (NDColorMode::RGB1, 3),

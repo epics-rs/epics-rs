@@ -1050,9 +1050,38 @@ mod tests {
         /// A same-user, options-first socket co-binds the collector's number
         /// (a pvxs or softIoc process whose `bind(0)` was handed it) and takes
         /// the datagram, as the kernel's reuse hash does about half the time.
+        #[cfg(target_os = "linux")]
         TakenByStranger,
         /// Sent to a number nobody listens on.
+        #[cfg(target_os = "linux")]
         Misdirected,
+    }
+
+    impl Fate {
+        /// The stranger co-bound on the collector's `port`, if any, and the
+        /// number the datagram is sent to.
+        fn stage(self, port: u16) -> (Option<std::net::UdpSocket>, u16) {
+            match self {
+                Fate::Deliver => (None, port),
+                #[cfg(target_os = "linux")]
+                Fate::TakenByStranger => {
+                    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+                    s.set_reuse_address(true).unwrap();
+                    s.set_reuse_port(true).unwrap();
+                    s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())
+                        .expect("co-bind the collector's number");
+                    let s: std::net::UdpSocket = s.into();
+                    s.set_nonblocking(true).unwrap();
+                    (Some(s), port)
+                }
+                #[cfg(target_os = "linux")]
+                Fate::Misdirected => {
+                    // A number that is free now: bind, read, release.
+                    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                    (None, probe.local_addr().unwrap().port())
+                }
+            }
+        }
     }
 
     enum Attempt {
@@ -1072,26 +1101,7 @@ mod tests {
         let mut rx = collector
             .add_listener(&ep("0.0.0.0:0"))
             .expect("wildcard listener");
-        let mut stranger = None;
-        if let Fate::TakenByStranger = fate {
-            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-            s.set_reuse_address(true).unwrap();
-            #[cfg(unix)]
-            s.set_reuse_port(true).unwrap();
-            s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())
-                .expect("co-bind the collector's number");
-            let s: std::net::UdpSocket = s.into();
-            s.set_nonblocking(true).unwrap();
-            stranger = Some(s);
-        }
-        let target = match fate {
-            Fate::Misdirected => {
-                // A number that is free now: bind, read, release.
-                let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-                probe.local_addr().unwrap().port()
-            }
-            _ => port,
-        };
+        let (stranger, target) = fate.stage(port);
         // Send from fresh source ports until the stranger's share of the
         // reuse hash takes one, so the loss is not left to chance.
         let mut sent = 0;

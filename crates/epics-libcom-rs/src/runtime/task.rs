@@ -1430,13 +1430,12 @@ impl StackSpec {
     pub fn bytes(self) -> usize {
         match self {
             Self::Class(class) => class.bytes(),
-            Self::Bytes(_) if self.refused() => pthread_default_stack_bytes(),
-            Self::Bytes(n) => n,
+            Self::Bytes(n) => pthread_refused_stack(n).unwrap_or(n),
         }
     }
 
     fn refused(self) -> bool {
-        matches!(self, Self::Bytes(n) if n < PTHREAD_STACK_MIN)
+        matches!(self, Self::Bytes(n) if pthread_refused_stack(n).is_some())
     }
 }
 
@@ -1472,9 +1471,21 @@ fn pthread_default_stack_bytes() -> usize {
     }
 }
 
+/// The stack a thread asking for `n` bytes gets instead, when
+/// `pthread_attr_setstacksize` refuses `n` (below `PTHREAD_STACK_MIN`).
+#[cfg(unix)]
+fn pthread_refused_stack(n: usize) -> Option<usize> {
+    // libc gives rtems a minimum of 0: nothing is refused there.
+    match libc::PTHREAD_STACK_MIN {
+        0 => None,
+        min => (n < min).then(pthread_default_stack_bytes),
+    }
+}
+
+/// No pthread attr off unix, so no size is refused.
 #[cfg(not(unix))]
-fn pthread_default_stack_bytes() -> usize {
-    PTHREAD_STACK_MIN
+fn pthread_refused_stack(_n: usize) -> Option<usize> {
+    None
 }
 
 impl From<StackSizeClass> for StackSpec {
@@ -1504,11 +1515,6 @@ pub fn current_thread_stack_bytes() -> Option<usize> {
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     None
 }
-
-#[cfg(unix)]
-const PTHREAD_STACK_MIN: usize = libc::PTHREAD_STACK_MIN;
-#[cfg(not(unix))]
-const PTHREAD_STACK_MIN: usize = 0;
 
 /// Outcome of a best-effort OS-scheduler priority change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

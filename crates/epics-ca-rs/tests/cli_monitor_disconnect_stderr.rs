@@ -198,43 +198,43 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
     // deterministic contract; the resolved name must show up within the
     // attempt budget (a cache-bypass regression — the pre-R18-19 port —
     // prints the dotted IP on EVERY pass and fails all attempts).
-    const ATTEMPTS: usize = 5;
-    #[cfg_attr(windows, allow(unused_variables, unused_mut))]
-    let mut resolver_won = false;
+    // The resolved loopback name is a `/etc/hosts` guarantee on unix: there
+    // `getnameinfo` returns `localhost`, so pin that exact name. Windows has
+    // no such alias — `getnameinfo` resolves 127.0.0.1 to the machine's own
+    // (runner-varying) name, so the per-pass shape assert is the whole
+    // R18-19 contract there and one pass suffices.
+    #[cfg(windows)]
+    disconnect_pass(0);
     #[cfg(unix)]
-    let mut last_stderr = String::new();
-    for attempt in 0..ATTEMPTS {
-        // Attempt 0 runs the raw race — the fast path a real disconnect hits.
-        // Later attempts widen the resolver's window stepwise: on macOS the
-        // lookup is an mDNSResponder IPC round-trip that can lose a ~30 ms
-        // connect-to-kill window on every pass (it lost 15 straight on a
-        // loaded CI runner), while a cache-bypass regression stays dotted-IP
-        // at ANY width and still fails every attempt.
-        let grace = Duration::from_millis(250 * attempt as u64);
-        let (stdout, stderr) = run_disconnect_scenario(grace);
-        assert_disconnect_contract(&stdout, &stderr);
-        // The resolved loopback name is a `/etc/hosts` guarantee on unix:
-        // there `getnameinfo` returns `localhost`, so pin that exact name.
-        // Windows has no such alias — `getnameinfo` resolves 127.0.0.1 to the
-        // machine's own (runner-varying) name, so the per-pass shape assert
-        // above is the whole R18-19 contract there and one pass suffices.
-        #[cfg(unix)]
-        {
+    {
+        const ATTEMPTS: usize = 5;
+        let mut last_stderr = String::new();
+        for attempt in 0..ATTEMPTS {
+            let stderr = disconnect_pass(attempt);
             if stderr.contains("    Context: \"localhost:") {
-                resolver_won = true;
-                break;
+                return;
             }
             last_stderr = stderr;
         }
-        #[cfg(windows)]
-        break;
+        panic!(
+            "the exception context never showed the resolved peer name in \
+             {ATTEMPTS} passes — C's `tcpiiu::getHostName` yields it once its \
+             async engine has answered, so a warmed loopback circuit must \
+             resolve within the attempt budget; last stderr: {last_stderr:?}"
+        );
     }
-    #[cfg(unix)]
-    assert!(
-        resolver_won,
-        "the exception context never showed the resolved peer name in \
-         {ATTEMPTS} passes — C's `tcpiiu::getHostName` yields it once its \
-         async engine has answered, so a warmed loopback circuit must \
-         resolve within the attempt budget; last stderr: {last_stderr:?}"
-    );
+}
+
+/// One disconnect scenario held to the deterministic contract; its stderr.
+fn disconnect_pass(attempt: usize) -> String {
+    // Attempt 0 runs the raw race — the fast path a real disconnect hits.
+    // Later attempts widen the resolver's window stepwise: on macOS the
+    // lookup is an mDNSResponder IPC round-trip that can lose a ~30 ms
+    // connect-to-kill window on every pass (it lost 15 straight on a
+    // loaded CI runner), while a cache-bypass regression stays dotted-IP
+    // at ANY width and still fails every attempt.
+    let grace = Duration::from_millis(250 * attempt as u64);
+    let (stdout, stderr) = run_disconnect_scenario(grace);
+    assert_disconnect_contract(&stdout, &stderr);
+    stderr
 }

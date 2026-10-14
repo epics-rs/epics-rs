@@ -2336,15 +2336,8 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn bitshuffle_kernels_match_the_scalar_loops_on_every_level() {
-        use fearless_simd::{Level, dispatch};
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        use fearless_simd::dispatch;
+        let levels = ad_core_rs::simd::levels();
         for elem_size in [1usize, 2, 4, 8] {
             for size in [8usize, 16, 24, 64, 128, 136, 520, 1024, 1032] {
                 let nbyte = size * elem_size;

@@ -37,13 +37,15 @@
 //! socket-per-NIC mapping (e.g. for diagnostics or NS-driven response
 //! correlation).
 
-// RTEMS-EXEC-MODEL-ALLOW(23): every test binds tokio::net UDP sockets, which
+// RTEMS-EXEC-MODEL-ALLOW(26): every test binds tokio::net UDP sockets, which
 // need a reactor the exec backend does not start; on the exec backend these
 // still run on the tokio driver `#[tokio::test]` builds, and pass. b3ab3ab8
 // added the three bundle-port tests without touching the count; all 17 were
-// re-run under `EPICS_RS_BUILD_EXEC_BACKEND=thread` before this bump. Each
-// keeps its own attribute rather than sharing a helper, so the count tracks
-// the test count and the next addition fails closed.
+// re-run under `EPICS_RS_BUILD_EXEC_BACKEND=thread` before this bump. The
+// three fanout-holder tests do not build there: `net::async_udp_v4` is itself
+// `#[cfg(tokio_backend)]`. Each keeps its own attribute rather than sharing
+// a helper, so the count tracks the test count and the next addition fails
+// closed.
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -354,6 +356,7 @@ impl AsyncUdpV4 {
         // Every attempt is kept until the end: an attempt still holding its
         // colliding port is what stops the next `bind(0)` handing the same
         // number straight back.
+        let origin = PortOrigin::Chosen;
         let mut attempts: Vec<(Vec<NicSocket>, usize)> = Vec::new();
         let mut last_drop: Option<(Ipv4Addr, io::Error)> = None;
 
@@ -365,7 +368,7 @@ impl AsyncUdpV4 {
                 first_info.ip,
                 0,
                 port_use,
-                PortOrigin::Chosen,
+                origin,
                 broadcast,
                 false,
             )?;
@@ -393,13 +396,7 @@ impl AsyncUdpV4 {
                 );
                 last_drop = Some((info.ip, e));
             };
-            match bind_bcast_rx(
-                first_info,
-                chosen_port,
-                port_use,
-                PortOrigin::Chosen,
-                broadcast,
-            ) {
+            match bind_bcast_rx(first_info, chosen_port, port_use, origin, broadcast) {
                 Ok(rx) => sockets.extend(rx),
                 Err(e) => drop_nic(first_info, e),
             }
@@ -412,7 +409,7 @@ impl AsyncUdpV4 {
                     info.ip,
                     chosen_port,
                     port_use,
-                    PortOrigin::Chosen,
+                    origin,
                     broadcast,
                     false,
                 )
@@ -422,7 +419,7 @@ impl AsyncUdpV4 {
                         info,
                         chosen_port,
                         port_use,
-                        PortOrigin::Chosen,
+                        origin,
                         broadcast,
                     )?);
                     Ok(())
@@ -435,7 +432,7 @@ impl AsyncUdpV4 {
                 return Ok(Self {
                     sockets,
                     port_use,
-                    origin: PortOrigin::Chosen,
+                    origin,
                 });
             }
             attempts.push((sockets, dropped));
@@ -488,7 +485,7 @@ impl AsyncUdpV4 {
         Ok(Self {
             sockets,
             port_use,
-            origin: PortOrigin::Chosen,
+            origin,
         })
     }
 
@@ -1613,6 +1610,74 @@ mod tests {
     #[tokio::test]
     async fn a_held_broadcast_address_on_a_later_nic_retries_the_bundle() {
         held_broadcast_retries_the_bundle(2);
+    }
+
+    /// Holds `at(bcast, port)` with the fanout flags when the bundle is about
+    /// to bind its `n`th broadcast address; returns the ports seen and leaves
+    /// the hook set.
+    fn fanout_hold_at(
+        n: usize,
+        at: impl Fn(Ipv4Addr, u16) -> SocketAddr + 'static,
+    ) -> std::rc::Rc<std::cell::RefCell<Vec<u16>>> {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let mut held = Vec::new();
+        BEFORE_BCAST_BIND.set(Some(Box::new(move |bcast, port| {
+            log.borrow_mut().push(port);
+            if log.borrow().len() == n {
+                let addr = at(bcast, port);
+                let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+                s.set_reuse_address(true).unwrap();
+                #[cfg(unix)]
+                s.set_reuse_port(true).unwrap();
+                s.bind(&addr.into())
+                    .unwrap_or_else(|e| panic!("fanout holder on {addr}: {e}"));
+                held.push(s);
+            }
+        })));
+        seen
+    }
+
+    /// A shared bundle's later binds are on the number it chose, so a fanout
+    /// holder there is `EADDRINUSE` and moves the bundle, never a group the
+    /// bundle silently joins.
+    fn fanout_holder_moves_a_shared_bundle(
+        n: usize,
+        at: impl Fn(Ipv4Addr, u16) -> SocketAddr + 'static,
+    ) {
+        assert!(
+            bcast_nics().len() >= n,
+            "this host has {} broadcast-capable NIC(s), {n} needed; the run cannot be made here",
+            bcast_nics().len()
+        );
+        let seen = fanout_hold_at(n, at);
+        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Shared, true);
+        BEFORE_BCAST_BIND.take();
+        let sock = sock.expect("bundle");
+        let held_port = seen.borrow()[n - 1];
+        let port = sock.ifaces()[0].sock.local_addr().unwrap().port();
+        assert_ne!(port, held_port, "the bundle joined a fanout holder's group");
+    }
+
+    #[tokio::test]
+    async fn a_fanout_holder_on_the_first_broadcast_address_moves_a_shared_bundle() {
+        fanout_holder_moves_a_shared_bundle(1, |bcast, port| (bcast, port).into());
+    }
+
+    #[tokio::test]
+    async fn a_fanout_holder_on_a_later_broadcast_address_moves_a_shared_bundle() {
+        fanout_holder_moves_a_shared_bundle(2, |bcast, port| (bcast, port).into());
+    }
+
+    /// Held on the second NIC's unicast address, which the bundle binds after
+    /// the first NIC's broadcast address.
+    #[tokio::test]
+    async fn a_fanout_holder_on_a_later_nic_moves_a_shared_bundle() {
+        let map = IfaceMap::new().expect("iface map");
+        let mut ifaces = select_ifaces(&map, None);
+        ifaces.sort_by_key(|i| !i.up_non_loopback);
+        let second = ifaces.get(1).expect("a second NIC").ip;
+        fanout_holder_moves_a_shared_bundle(1, move |_, port| (second, port).into());
     }
 
     /// A subnet-broadcast datagram reaches an ephemeral bundle as it reaches

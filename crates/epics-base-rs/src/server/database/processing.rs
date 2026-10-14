@@ -303,13 +303,59 @@ impl crate::runtime::background::CallbackBody for ProcessReentry {
 /// the port thread once the driver write ran, which re-enters the record's
 /// `process()` on a callback band to end the cycle (devAsynFloat64.c:351).
 ///
-/// A preallocated cell the device support builds once from a
-/// [`WriteDoneSource`] and requests per write; the outcome rides in it to the
-/// completing pass, as C's `pPvt->result.status` does.
+/// One per record, built at `add_loaded_record` as C's `processCallback` sits
+/// in `devPvt` from init, so no put allocates; requested per write, with the
+/// outcome riding in it to the completing pass as `pPvt->result.status` does.
 #[derive(Clone)]
 pub struct WriteDone(Arc<crate::runtime::background::CallbackCell<WriteReentry>>);
 
 impl WriteDone {
+    /// The cell for record `name` of `db`, on the band `prio` selects.
+    pub fn new(db: &PvDatabase, name: RecordName, prio: i16) -> Self {
+        Self::with_db(Arc::downgrade(&db.inner), name, prio)
+    }
+
+    /// A cell no database owns, whose completion runs nothing: the
+    /// `RecordInstance` default until `add_loaded_record` installs its own.
+    pub(crate) fn detached(prio: i16) -> Self {
+        Self::with_db(std::sync::Weak::new(), RecordName::from(&b""[..]), prio)
+    }
+
+    fn with_db(db: std::sync::Weak<super::PvDatabaseInner>, name: RecordName, prio: i16) -> Self {
+        WriteDone(crate::runtime::background::CallbackCell::new(
+            WriteReentry {
+                db,
+                name,
+                band: std::sync::atomic::AtomicU8::new(band_index(prio)),
+                outcome: std::sync::Mutex::new(None),
+            },
+        ))
+    }
+
+    /// The record's band, read without the record lock as C's
+    /// `callbackRequestProcessCallback` reads `pr->prio` on the port thread.
+    pub fn priority(&self) -> crate::runtime::task::CallbackPriority {
+        use crate::runtime::task::CallbackPriority;
+        match self
+            .0
+            .body()
+            .band
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1 => CallbackPriority::Medium,
+            2 => CallbackPriority::High,
+            _ => CallbackPriority::Low,
+        }
+    }
+
+    /// Only `RecordInstance::set_prio` stores here, beside `common.prio`.
+    pub(crate) fn set_prio(&self, prio: i16) {
+        self.0
+            .body()
+            .band
+            .store(band_index(prio), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Hand the write's outcome to the record and queue the completing pass on
     /// `priority`. `Err` is a full band, which C's caller ignores as well.
     pub fn complete(
@@ -326,35 +372,32 @@ impl WriteDone {
 /// is given to answer [`WriteStart::Pending`](crate::server::device_support::WriteStart::Pending):
 /// the record's [`WriteDone`] and the band its `PRIO` selects.
 pub struct WriteDoneSource<'a> {
-    db: &'a PvDatabase,
-    name: &'a [u8],
-    priority: crate::runtime::task::CallbackPriority,
+    done: &'a WriteDone,
 }
 
 impl<'a> WriteDoneSource<'a> {
-    pub fn new(
-        db: &'a PvDatabase,
-        name: &'a [u8],
-        priority: crate::runtime::task::CallbackPriority,
-    ) -> Self {
-        Self { db, name, priority }
+    pub fn new(done: &'a WriteDone) -> Self {
+        Self { done }
     }
 
     /// The record's band, C `pr->prio`.
     pub fn priority(&self) -> crate::runtime::task::CallbackPriority {
-        self.priority
+        self.done.priority()
     }
 
-    /// A new completion cell for this record. Allocates: build it once and keep
-    /// it, as C keeps `processCallback` in the record's `devPvt`.
+    /// The record's completion cell; a reference count, never an allocation.
     pub fn write_done(&self) -> WriteDone {
-        WriteDone(crate::runtime::background::CallbackCell::new(
-            WriteReentry {
-                db: Arc::downgrade(&self.db.inner),
-                name: RecordName::from(self.name),
-                outcome: std::sync::Mutex::new(None),
-            },
-        ))
+        self.done.clone()
+    }
+}
+
+/// `PRIO` as the band index [`WriteDone::priority`] decodes, folded as
+/// [`crate::runtime::task::CallbackPriority::from_record_prio`] folds it.
+fn band_index(prio: i16) -> u8 {
+    match crate::runtime::task::CallbackPriority::from_record_prio(prio) {
+        crate::runtime::task::CallbackPriority::Low => 0,
+        crate::runtime::task::CallbackPriority::Medium => 1,
+        crate::runtime::task::CallbackPriority::High => 2,
     }
 }
 
@@ -362,6 +405,7 @@ impl<'a> WriteDoneSource<'a> {
 struct WriteReentry {
     db: std::sync::Weak<super::PvDatabaseInner>,
     name: RecordName,
+    band: std::sync::atomic::AtomicU8,
     outcome: std::sync::Mutex<Option<CaResult<()>>>,
 }
 
@@ -6828,11 +6872,7 @@ impl PvDatabase {
                             if let Some(mut dev) = instance.device.take() {
                                 // Try async write_begin() first
                                 use crate::server::device_support::WriteStart;
-                                let done = WriteDoneSource::new(
-                                    self,
-                                    &instance.name,
-                                    instance.common.callback_priority(),
-                                );
+                                let done = WriteDoneSource::new(&instance.write_done);
                                 match dev.write_begin(&mut *instance.record, &done) {
                                     Ok(WriteStart::Pending) => {
                                         // Async write submitted -- set PACT, return early.
@@ -10653,4 +10693,36 @@ pub(super) enum ForwardLink {
     Flnk,
     /// Link `i` of the output row (fanout `LNKn`).
     Row(usize),
+}
+
+#[cfg(test)]
+mod write_done_prio_tests {
+    use crate::runtime::task::CallbackPriority;
+    use crate::server::database::{PvDatabase, RecordLoad};
+    use crate::server::records::ao::AoRecord;
+    use crate::types::EpicsValue;
+
+    /// The cell starts on the loaded `PRIO`, and a `PRIO` put reaches it while
+    /// another holder has the record lock, as the port thread reads `pr->prio`.
+    #[epics_macros_rs::epics_test]
+    async fn a_prio_put_is_visible_through_the_write_done_without_the_record_lock() {
+        let db = PvDatabase::new();
+        let load = RecordLoad::from_common_fields(vec![(
+            "PRIO".into(),
+            EpicsValue::String("MEDIUM".into()),
+        )]);
+        db.add_loaded_record("P:AO", Box::new(AoRecord::new(0.0)), load)
+            .await
+            .unwrap();
+        let rec = db.get_record("P:AO").unwrap();
+        let cell = rec.read().write_done.clone();
+        assert_eq!(cell.priority(), CallbackPriority::Medium);
+
+        db.put_pv("P:AO.PRIO", EpicsValue::String("HIGH".into()))
+            .await
+            .unwrap();
+        let held = rec.write();
+        assert_eq!(held.common.prio, 2);
+        assert_eq!(cell.priority(), CallbackPriority::High);
+    }
 }

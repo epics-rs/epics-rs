@@ -6947,11 +6947,8 @@ mod tests {
             ads.init(&mut rec).unwrap();
 
             let db = epics_base_rs::server::database::PvDatabase::new();
-            let source = WriteDoneSource::new(
-                &db,
-                b"TEST:WRITEALLOC",
-                epics_libcom_rs::runtime::task::CallbackPriority::Low,
-            );
+            let cell = WriteDone::new(&db, "TEST:WRITEALLOC".into(), 0);
+            let source = WriteDoneSource::new(&cell);
             let mut put = || {
                 let before = thread_allocs();
                 let start = ads.write_begin(&mut rec, &source).unwrap();
@@ -6970,7 +6967,11 @@ mod tests {
                     .unwrap();
                 allocs
             };
-            put();
+            assert_eq!(
+                put(),
+                0,
+                "the record's cell is built at add_record, not by a put"
+            );
             assert_eq!(put(), 0, "a put after the first allocates nothing");
         });
     }

@@ -72,7 +72,7 @@ async fn completes_on(prio: i16) -> Vec<String> {
     {
         let rec = db.get_record("AO").unwrap();
         let mut inst = rec.write();
-        inst.common.prio = prio;
+        inst.set_prio(prio);
         inst.common.udf = 0;
         inst.common.dtyp = "Submits".into();
         inst.device = Some(Box::new(Submits(Arc::clone(&pending))));

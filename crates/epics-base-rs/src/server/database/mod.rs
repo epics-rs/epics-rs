@@ -3356,6 +3356,10 @@ impl PvDatabase {
                 .insert(name.clone(), empty_links);
         }
 
+        // After the load, so the cell starts on the loaded `PRIO`.
+        instance.write_done =
+            crate::server::database::WriteDone::new(self, name.clone(), instance.common.prio);
+
         // C `doInitRecord0` (`iocInit.c:530-536`) binds the dset and only then
         // calls `init_record(pass 0)`. Both lines are here, in that order,
         // because every `<rec>Record.c init_record` opens by testing the dset

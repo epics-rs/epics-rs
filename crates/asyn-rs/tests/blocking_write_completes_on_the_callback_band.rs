@@ -63,7 +63,7 @@ fn threads_of_this_process() -> usize {
 }
 
 async fn put(db: &PvDatabase, prio: i16, value: f64) {
-    db.get_record("BLK:AO").unwrap().write().common.prio = prio;
+    db.get_record("BLK:AO").unwrap().write().set_prio(prio);
     db.put_record_field_from_ca_no_notify("BLK:AO", "VAL", EpicsValue::Double(value))
         .await
         .unwrap();

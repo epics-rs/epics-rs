@@ -9492,7 +9492,7 @@ record(lso, "SOD") { field(SIZV, "128") }
                 let mut w = rec.write();
                 w.common.scan = scan;
                 w.common.text.evnt = evnt.into();
-                w.common.prio = prio;
+                w.set_prio(prio);
             }
             db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
         }

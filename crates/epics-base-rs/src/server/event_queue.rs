@@ -93,7 +93,7 @@
 //!   entry from behind the ring's head; the entries ahead of it move up one
 //!   place, so the ring stays contiguous. C has one reader per queue.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::runtime::sync::Arc;
@@ -187,10 +187,8 @@ impl FlowCtrl {
         self.on.load(Ordering::Acquire)
     }
 
-    fn ppendsem(&self) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
-        self.ppendsem
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn ppendsem(&self) -> parking_lot::MutexGuard<'_, Option<std::task::Waker>> {
+        self.ppendsem.lock()
     }
 }
 
@@ -487,6 +485,10 @@ struct QueInner {
     quota: usize,
     size: usize,
     replace_threshold: usize,
+    /// Subscriptions whose producer is gone and whose end is not reported
+    /// yet: [`Self::take_ended`] scans the slab only while this is nonzero,
+    /// not on every empty poll.
+    unreported_ends: usize,
 }
 
 impl QueInner {
@@ -541,24 +543,38 @@ impl QueInner {
     /// `evSubscrip` under `LOCKEVQUE`, but it runs no destructor).
     fn free_slot(&mut self, id: AttachId, retired: &mut Retired) {
         let sub = self.subs[usize::from(id.slot())].take();
+        if sub
+            .as_ref()
+            .is_some_and(|s| s.producer_gone() && !s.end_reported)
+        {
+            self.unreported_ends -= 1;
+        }
         retired.retire_sub(sub);
         self.free.push(id.slot());
         self.quota -= EVENT_ENTRIES;
     }
 
-    /// Take the ring's head entry, whoever it belongs to. The log is moved
-    /// out; nothing is freed here.
-    fn pop(&mut self, retired: &mut Retired) -> Option<(AttachId, PostLog, bool)> {
+    /// Retire the ring's head entry, whoever it belongs to: the slot it
+    /// sits in, its monitor, and whether it is to be delivered. The entry
+    /// is left in that slot for the caller to take before it lets go of
+    /// `self`, so its log moves once, straight into what the caller builds.
+    fn advance(&mut self, retired: &mut Retired) -> Option<(usize, AttachId, bool)> {
         if self.used == 0 {
             return None;
         }
-        let Entry { id, log } = self.ring[self.getix].take().expect("occupied");
+        let at = self.getix;
+        let id = self.ring[at].as_ref().expect("occupied").id;
         self.getix = self.ix(1);
         self.used -= 1;
         let live = self.release(id, retired);
         // C's drain loop ends at `EVENTQEMPTY`.
         self.draining = self.used > 0;
-        Some((id, log, live))
+        Some((at, id, live))
+    }
+
+    /// The log of the entry [`Self::advance`] retired from slot `at`.
+    fn take_log(&mut self, at: usize) -> PostLog {
+        self.ring[at].take().expect("occupied").log
     }
 
     /// C `event_read`'s `evque[getix]`: the ring's oldest live entry, if the
@@ -569,16 +585,18 @@ impl QueInner {
             return None;
         }
         self.draining = true;
-        while let Some((id, log, live)) = self.pop(retired) {
+        while let Some((at, id, live)) = self.advance(retired) {
             if !live {
+                self.ring[at] = None;
                 continue;
             }
             let sub = self.sub(id).expect("a delivered entry's slot is attached");
+            let (sid, context) = (sub.sid, sub.context.clone());
             return Some(CircuitEvent::Event {
                 id,
-                sid: sub.sid,
-                context: sub.context.clone(),
-                event: MonitorEvent::of_log(log),
+                sid,
+                context,
+                event: MonitorEvent::of_log(self.take_log(at)),
                 // C `eventsRemaining`: the next ring slot, a cancelled
                 // monitor's entry included (`dbEvent.c:965`).
                 remaining: self.used > 0,
@@ -597,7 +615,8 @@ impl QueInner {
             if self.sub(head).is_some_and(|s| !s.reader_gone()) {
                 break;
             }
-            self.pop(retired);
+            let (at, _, _) = self.advance(retired).expect("used > 0");
+            self.ring[at] = None;
         }
         let k =
             (0..self.used).find(|&k| self.ring[self.ix(k)].as_ref().is_some_and(|e| e.id == id))?;
@@ -613,22 +632,39 @@ impl QueInner {
                 }
             }
         }
-        let (taken, log, live) = self.pop(retired)?;
+        let (at, taken, live) = self.advance(retired)?;
         debug_assert!(taken == id && live);
-        Some(log)
+        Some(self.take_log(at))
     }
 
     /// A monitor whose producer is gone and whose entries are all delivered,
     /// reported to the circuit consumer once — the end of stream
     /// [`EventReader::recv`] answers with `None`.
     fn take_ended(&mut self) -> Option<CircuitEvent> {
+        if self.unreported_ends == 0 {
+            return None;
+        }
         let sub = self
             .subs
             .iter_mut()
             .flatten()
             .find(|s| s.producer_gone() && !s.end_reported && s.npend == 0)?;
         sub.end_reported = true;
-        Some(CircuitEvent::Ended(sub.id))
+        let id = sub.id;
+        self.unreported_ends -= 1;
+        Some(CircuitEvent::Ended(id))
+    }
+
+    /// Subscription `id`'s producer row is gone; `false` if it is detached.
+    fn close_producer(&mut self, id: AttachId) -> bool {
+        let Some(sub) = self.sub_mut(id) else {
+            return false;
+        };
+        if !sub.producer_gone() {
+            sub.gone |= SubQ::PRODUCER_GONE;
+            self.unreported_ends += 1;
+        }
+        true
     }
 
     /// C `db_add_event`'s attach test (`dbEvent.c:451-457`): take this queue if
@@ -683,14 +719,43 @@ mod retiring {
     /// their slots and a parked waker replaced. Either can own user state
     /// whose drop takes this lock again, so it is dropped only by
     /// [`QueGuard`], after the lock.
-    pub(super) struct Retired {
+    ///
+    /// Nothing is displaced on almost every lock, so that case must be one
+    /// inline null test: an inline `Vec<SubQ>`, or a plain `Option<Box<_>>`,
+    /// left the drop an out-of-line glue call with a full prologue. The
+    /// `ManuallyDrop` has no glue; [`Drop`] below empties it.
+    pub(super) struct Retired(std::mem::ManuallyDrop<Option<Box<Displaced>>>);
+
+    impl Drop for Retired {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some(displaced) = self.0.take() {
+                release(displaced);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release(displaced: Box<Displaced>) {
+        drop(displaced);
+    }
+
+    #[derive(Default)]
+    struct Displaced {
         subs: Vec<SubQ>,
         waker: Option<std::task::Waker>,
     }
 
     impl Retired {
+        fn displaced(&mut self) -> &mut Displaced {
+            self.0.get_or_insert_default()
+        }
+
         pub(super) fn retire_sub(&mut self, sub: Option<SubQ>) {
-            self.subs.extend(sub);
+            if let Some(sub) = sub {
+                self.displaced().subs.push(sub);
+            }
         }
     }
 
@@ -698,7 +763,7 @@ mod retiring {
     pub(super) struct QueGuard<'a> {
         // Fields drop in declaration order: the lock is released before
         // `retired` drops.
-        q: std::sync::MutexGuard<'a, QueInner>,
+        q: parking_lot::MutexGuard<'a, QueInner>,
         retired: Retired,
         flow: &'a FlowCtrl,
     }
@@ -716,7 +781,9 @@ mod retiring {
         pub(super) fn park(mut self, cx: &std::task::Context<'_>) {
             let mut parked = self.flow.ppendsem();
             if !parked.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-                self.retired.waker = parked.replace(cx.waker().clone());
+                if let Some(old) = parked.replace(cx.waker().clone()) {
+                    self.retired.displaced().waker = Some(old);
+                }
             }
         }
     }
@@ -741,10 +808,7 @@ mod retiring {
         pub(super) fn lock_retiring(&self) -> QueGuard<'_> {
             QueGuard {
                 q: self.lock(),
-                retired: Retired {
-                    subs: Vec::new(),
-                    waker: None,
-                },
+                retired: Retired(std::mem::ManuallyDrop::new(None)),
                 flow: &self.flow,
             }
         }
@@ -774,14 +838,13 @@ impl EvQue {
                 quota: 0,
                 size,
                 replace_threshold,
+                unreported_ends: 0,
             }),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, QueInner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> parking_lot::MutexGuard<'_, QueInner> {
+        self.inner.lock()
     }
 
     /// C `epicsEventSignal(ppendsem)`: wake the consumer parked on this
@@ -929,8 +992,11 @@ impl EvQue {
         let mut guard = self.lock_retiring();
         let flow_on = self.flow.is_on();
         let (q, retired) = guard.parts();
-        if let Some(step) = q.take_oldest(flow_on, retired).or_else(|| q.take_ended()) {
-            return Poll::Ready(step);
+        if let Some(event) = q.take_oldest(flow_on, retired) {
+            return Poll::Ready(event);
+        }
+        if let Some(ended) = q.take_ended() {
+            return Poll::Ready(ended);
         }
         guard.park(cx);
         Poll::Pending
@@ -971,14 +1037,9 @@ impl EvQue {
     /// The producer row for `id` is gone: no more posts, but what is already
     /// queued is still delivered.
     fn close_producer(&self, id: AttachId) {
-        {
-            let mut q = self.lock();
-            let Some(sub) = q.sub_mut(id) else {
-                return;
-            };
-            sub.gone |= SubQ::PRODUCER_GONE;
+        if self.lock().close_producer(id) {
+            self.wake_readers();
         }
-        self.wake_readers();
     }
 
     /// C `db_cancel_event` (`dbEvent.c:601-640`): the reader for `id` is gone.
@@ -1147,10 +1208,7 @@ impl EventUser {
         kind: LogKind,
         context: &DeliveryContext,
     ) -> (Arc<EvQue>, AttachId) {
-        let mut chain = self
-            .ques
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut chain = self.ques.lock();
         let ques = &mut chain.ques;
         let generation = AttachId::next_generation();
         for que in ques.iter() {
@@ -1179,13 +1237,11 @@ impl EventUser {
     /// [`EventReader::recv`] calls on the same queues would take entries out
     /// of that order.
     pub fn poll_next(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<CircuitEvent> {
-        let mut chain = self
-            .ques
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut chain = self.ques.lock();
         let n = chain.ques.len();
         for step in 0..n {
-            let at = (chain.reading + step) % n;
+            // `reading < n`: no divide per poll.
+            let at = wrap(chain.reading + step, n);
             if let std::task::Poll::Ready(event) = chain.ques[at].poll_oldest(cx) {
                 chain.reading = at;
                 return std::task::Poll::Ready(event);
@@ -1200,10 +1256,7 @@ impl EventUser {
     /// [`CircuitEvent::Ended`]: the row outlives that report until the
     /// monitor's [`EventReader`] drops.
     pub fn context(&self, id: AttachId) -> Option<DeliveryContext> {
-        let chain = self
-            .ques
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let chain = self.ques.lock();
         chain.ques.iter().find_map(|que| {
             // Queues chained before and after `configure_events_per_que`
             // can differ in slot count.
@@ -1225,10 +1278,7 @@ impl EventUser {
     /// reader on this circuit; C posts `ppendsem` for the same reason.
     pub fn flow_ctrl_off(&self) {
         self.flow.on.store(false, Ordering::Release);
-        let chain = self
-            .ques
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let chain = self.ques.lock();
         for que in chain.ques.iter() {
             que.wake_readers();
         }
@@ -2547,7 +2597,7 @@ mod tests {
 
     impl std::task::Wake for HeldAtWake {
         fn wake(self: Arc<Self>) {
-            let held = self.0.ppendsem.try_lock().is_err();
+            let held = self.0.ppendsem.try_lock().is_none();
             self.1.store(held, Ordering::SeqCst);
         }
     }
@@ -2779,6 +2829,50 @@ mod tests {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             assert!(reader.poll_recv(&mut cx).is_pending());
         });
+    }
+
+    /// Records whether the queue lock was held when it was woken or dropped.
+    struct HeldAtDrop(Arc<EvQue>, Arc<std::sync::atomic::AtomicBool>);
+
+    impl HeldAtDrop {
+        fn record(&self) {
+            self.1
+                .store(self.0.inner.try_lock().is_none(), Ordering::SeqCst);
+        }
+    }
+
+    impl std::task::Wake for HeldAtDrop {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+    }
+
+    impl Drop for HeldAtDrop {
+        fn drop(&mut self) {
+            self.record();
+        }
+    }
+
+    /// The fast form of the test above: the displaced waker drops with the
+    /// queue lock free, so a drop under it fails instead of deadlocking.
+    #[test]
+    fn a_displaced_waker_drops_with_the_queue_unlocked() {
+        let user = EventUser::new();
+        let (_sink, mut reader) = attach(&user, 1, LogKind::Val);
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let first = std::task::Waker::from(Arc::new(HeldAtDrop(reader.queue(), held.clone())));
+        assert!(
+            reader
+                .poll_recv(&mut std::task::Context::from_waker(&first))
+                .is_pending()
+        );
+        drop(first);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(reader.poll_recv(&mut cx).is_pending());
+        assert!(
+            !held.load(Ordering::SeqCst),
+            "displaced waker dropped under the lock"
+        );
     }
 
     #[test]
@@ -3084,6 +3178,13 @@ mod tests {
         user.poll_next(&mut std::task::Context::from_waker(std::task::Waker::noop()))
     }
 
+    fn circuit_now_with(
+        user: &EventUser,
+        waker: &std::task::Waker,
+    ) -> std::task::Poll<CircuitEvent> {
+        user.poll_next(&mut std::task::Context::from_waker(waker))
+    }
+
     fn circuit_event(user: &EventUser) -> (u32, i32) {
         match circuit_now(user) {
             std::task::Poll::Ready(CircuitEvent::Event { sid, event, .. }) => (sid, val(&event)),
@@ -3142,6 +3243,41 @@ mod tests {
         assert!(circuit_now(&user).is_pending());
     }
 
+    /// What a lock displaces is released once the lock is let go, not
+    /// leaked: a freed slot's context, whether the drain of its last entry or
+    /// its reader's drop freed it, and a parked waker the next park replaced.
+    #[epics_macros_rs::epics_test]
+    async fn a_displaced_context_or_waker_is_released() {
+        let user = EventUser::new();
+        let ctx: DeliveryContext = Arc::new(7u32);
+        // Freed by the drain of its last entry.
+        let (a, ra) = attach_with(&user, 1, LogKind::Val, &ctx);
+        a.post(ev(10));
+        drop(ra);
+        drop(a);
+        assert!(circuit_now(&user).is_pending());
+        assert_eq!(
+            Arc::strong_count(&ctx),
+            1,
+            "a drained slot kept its context"
+        );
+        // Freed by its reader's drop with nothing queued.
+        let (b, rb) = attach_with(&user, 2, LogKind::Val, &ctx);
+        drop(rb);
+        drop(b);
+        assert_eq!(
+            Arc::strong_count(&ctx),
+            1,
+            "a cancelled slot kept its context"
+        );
+        // A parked waker replaced by the next park.
+        let (counter, waker) = count_waker();
+        assert!(circuit_now_with(&user, &waker).is_pending());
+        drop(waker);
+        assert!(circuit_now(&user).is_pending());
+        assert_eq!(Arc::strong_count(&counter), 1, "a displaced waker leaked");
+    }
+
     /// A monitor whose producer went away is reported ended once, after the
     /// entries it had queued.
     #[epics_macros_rs::epics_test]
@@ -3156,6 +3292,97 @@ mod tests {
             std::task::Poll::Ready(CircuitEvent::Ended(id)) if id == ra.id()
         ));
         assert!(circuit_now(&user).is_pending());
+    }
+
+    /// `unreported_ends` counts exactly the monitors `take_ended` would find,
+    /// on every path a slot can leave by: reported, freed by its reader's
+    /// drop with nothing queued, or freed by the drain of its last entry.
+    #[epics_macros_rs::epics_test]
+    async fn unreported_ends_counts_every_ended_slot_once() {
+        fn check(que: &EvQue) -> usize {
+            let q = que.lock();
+            let scanned = q
+                .subs
+                .iter()
+                .flatten()
+                .filter(|s| s.producer_gone() && !s.end_reported)
+                .count();
+            assert_eq!(q.unreported_ends, scanned);
+            scanned
+        }
+        let user = EventUser::new();
+        // Reported after its backlog.
+        let (a, ra) = attach(&user, 1, LogKind::Val);
+        let que = ra.queue();
+        a.post(ev(10));
+        drop(a);
+        assert_eq!(check(&que), 1);
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert!(matches!(
+            circuit_now(&user),
+            std::task::Poll::Ready(CircuitEvent::Ended(_))
+        ));
+        assert_eq!(check(&que), 0);
+        drop(ra);
+        // Freed by the reader's drop with nothing queued.
+        let (b, rb) = attach(&user, 2, LogKind::Val);
+        drop(b);
+        assert_eq!(check(&que), 1);
+        drop(rb);
+        assert_eq!(check(&que), 0);
+        // Freed by the drain of its last entry, never reported.
+        let (c, rc) = attach(&user, 3, LogKind::Val);
+        c.post(ev(30));
+        drop(c);
+        drop(rc);
+        assert_eq!(check(&que), 1);
+        assert!(circuit_now(&user).is_pending());
+        assert_eq!(check(&que), 0);
+        // Reader first, entry queued: the producer's close still counts.
+        let (d, rd) = attach(&user, 4, LogKind::Val);
+        d.post(ev(40));
+        drop(rd);
+        drop(d);
+        assert_eq!(check(&que), 1);
+        assert!(circuit_now(&user).is_pending());
+        assert_eq!(check(&que), 0);
+        assert_eq!(que.quota(), 0);
+    }
+
+    /// [`QueInner::advance`] leaves the retired entry in its slot for the
+    /// caller: every path out of the head — delivered to the circuit, dropped
+    /// for a cancelled reader, taken by a monitor's own reader — empties that
+    /// slot, so the ring holds exactly `used` entries.
+    #[epics_macros_rs::epics_test]
+    async fn every_retired_head_slot_is_emptied() {
+        fn occupied(que: &EvQue) -> (usize, usize) {
+            let q = que.lock();
+            (q.ring.iter().filter(|e| e.is_some()).count(), q.used)
+        }
+        let user = EventUser::new();
+        let (a, ra) = attach(&user, 1, LogKind::Val);
+        let (b, rb) = attach(&user, 2, LogKind::Val);
+        let (c, mut rc) = attach(&user, 3, LogKind::Val);
+        let que = ra.queue();
+        b.post(ev(20));
+        a.post(ev(10));
+        c.post(ev(30));
+        a.post(ev(11));
+        drop(rb);
+        // A cancelled head entry dropped on the way to a monitor's own take.
+        assert_eq!(val(&rc.try_recv().unwrap()), 30);
+        assert_eq!(occupied(&que), (2, 2));
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert_eq!(occupied(&que), (1, 1));
+        b.post(ev(21));
+        let (d, rd) = attach(&user, 4, LogKind::Val);
+        d.post(ev(40));
+        drop(rd);
+        // A cancelled entry behind a live one, dropped on the circuit's drain.
+        assert_eq!(circuit_event(&user), (1, 11));
+        assert!(circuit_now(&user).is_pending());
+        assert_eq!(occupied(&que), (0, 0));
+        drop((a, c, d, ra, rc));
     }
 
     /// Boundary: the entry a monitor's attach queued first (C
@@ -3444,6 +3671,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<AttachId>(), 8);
     }
 
+    /// An empty [`Retired`] — every lock that displaced nothing — is one
+    /// pointer, so its drop is a null test, not a call.
+    #[test]
+    fn an_empty_retired_is_one_pointer() {
+        assert_eq!(std::mem::size_of::<Retired>(), 8);
+    }
+
     fn free_slots(sink: &EventSink) -> usize {
         sink.que.lock().free.len()
     }
@@ -3481,7 +3715,7 @@ mod tests {
     }
 
     fn free_slots_of(user: &EventUser) -> usize {
-        user.ques.lock().unwrap().ques[0].lock().free.len()
+        user.ques.lock().ques[0].lock().free.len()
     }
 
     /// `dbel` reads each monitor's own slot on a shared queue.

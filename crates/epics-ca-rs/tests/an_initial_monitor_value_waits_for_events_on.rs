@@ -8,11 +8,6 @@
 //! sees exactly one, carrying the value at the add. The wire shape here is
 //! that run.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): measured, not argued — the site is the async
-// loop's runtime, which its `cfg(tokio_backend)` test keeps off the exec
-// backend; the blocking loop's case runs and passes under
-// `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(tokio_backend)]

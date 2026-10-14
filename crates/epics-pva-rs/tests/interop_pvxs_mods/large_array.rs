@@ -64,9 +64,7 @@ fn build_large_array_pv() -> SharedPV {
 /// numeric tokens in the output as a rough sanity bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
 
     let src = SharedSource::new();
     src.add("L:DBL", build_large_array_pv());
@@ -138,11 +136,7 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
 /// in `client_native/server_conn.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
     let ready = super::interop_helpers::ReadyFile::new("large_arr_ready");

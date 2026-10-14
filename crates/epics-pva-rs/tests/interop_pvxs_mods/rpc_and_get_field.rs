@@ -35,9 +35,7 @@ fn env_key() -> &'static str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_rpc_pvxcall_against_rust_server() {
-    let Some(pvxcall) = require_pvxs("pvxcall") else {
-        return;
-    };
+    let pvxcall = require_pvxs("pvxcall");
 
     // RPC handler that echoes the input "x" arg back as
     // `Structure { value: Scalar<Int>(x * 2) }`.
@@ -139,9 +137,7 @@ async fn interop_rpc_pvxcall_against_rust_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_get_field_pvxinfo_against_rust_server() {
-    let Some(pvxinfo) = require_pvxs("pvxinfo") else {
-        return;
-    };
+    let pvxinfo = require_pvxs("pvxinfo");
 
     let pv = SharedPV::new();
     pv.open(

@@ -38,9 +38,7 @@ fn pvxs_lib_dir_str() -> std::ffi::OsString {
 /// Direction A: pvxput → Rust SharedPV → readback via Rust SharedPV::current().
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_put_a_pvxput_writes_into_rust_server() {
-    let Some(pvxput) = require_pvxs(PVXPUT) else {
-        return;
-    };
+    let pvxput = require_pvxs(PVXPUT);
 
     // Captures the Rust server's debug output for the failure message
     // below. This test only decorates a panic with it, so losing the
@@ -164,15 +162,9 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
 /// --writable) → readback via pvxget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_put_b_rust_client_writes_into_pvxs_server() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
     // Build reverse_server (re-uses batch-1 helper compile pipeline).
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
     let ready = super::interop_helpers::ReadyFile::new("rev_ready_w");

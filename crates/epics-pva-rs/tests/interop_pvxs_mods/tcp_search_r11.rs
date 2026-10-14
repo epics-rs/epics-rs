@@ -244,9 +244,7 @@ async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
 
     // Rust server hosting a PV with a known value.
     let pv = SharedPV::new();

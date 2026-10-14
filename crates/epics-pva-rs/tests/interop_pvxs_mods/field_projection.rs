@@ -38,9 +38,7 @@ fn env_key() -> &'static str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_field_projection_a_pvxget_field_filter_against_rust_server() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
 
     let source = SharedSource::new();
     for b in complex_pv_matrix() {

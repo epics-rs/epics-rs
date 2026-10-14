@@ -49,9 +49,7 @@ fn env_key() -> &'static str {
 #[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_monitor_a_pvxmonitor_streams_from_rust_server() {
-    let Some(pvxmonitor) = require_pvxs(PVXMONITOR) else {
-        return;
-    };
+    let pvxmonitor = require_pvxs(PVXMONITOR);
 
     let pv = SharedPV::new();
     pv.open(
@@ -159,14 +157,8 @@ async fn interop_monitor_a_pvxmonitor_streams_from_rust_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
-    let Some(pvxput) = require_pvxs(PVXPUT) else {
-        return;
-    };
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    let pvxput = require_pvxs(PVXPUT);
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
     let ready = super::interop_helpers::ReadyFile::new("mon_b_ready");

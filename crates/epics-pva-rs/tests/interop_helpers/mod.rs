@@ -20,9 +20,8 @@ use std::process::{Child, Command, Stdio};
 /// hard-coded `/Users/<name>/codes/pvxs`; on a machine where the checkout
 /// lives anywhere else every interop test silently reported SKIP — which
 /// nextest prints as a pass. Resolution failure is now fatal, matching the
-/// parity guards; a resolved tree whose binaries are simply not built still
-/// skips, because that is an absent build artifact rather than a
-/// misconfigured path (see `require_pvxs`).
+/// parity guards, and so is a resolved tree whose binaries are not built
+/// (see `require_pvxs`).
 fn pvxs_home() -> PathBuf {
     epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Pvxs)
 }
@@ -133,69 +132,17 @@ pub fn locate_pvxs(name: &str) -> Option<PathBuf> {
         })
 }
 
-/// Skip the test with a SKIP-prefixed stderr line if the named
-/// binary cannot be found.
-pub fn require_pvxs(name: &str) -> Option<PathBuf> {
-    match locate_pvxs(name) {
-        Some(p) => Some(p),
-        None => {
-            eprintln!(
-                "SKIP: pvxs binary `{name}` not found under {:?} or on PATH; \
-                 build pvxs in `{:?}` to enable this interop test.",
-                pvxs_bin_dir(),
-                pvxs_home(),
-            );
-            None
-        }
-    }
-}
-
-/// Skip the test with a SKIP-prefixed stderr line when the pvxs build
-/// this suite resolves has no TLS support.
-///
-/// pvxs master still links without OpenSSL, so a host can have every
-/// binary an interop test needs and still be unable to speak TLS. Until
-/// this was asked up front the absence only surfaced later — as a TLS
-/// port that never opened, or a handshake that timed out — and those
-/// look exactly like our own client or config being wrong, so the tests
-/// returned early and reported green over both. Answering it here is
-/// what lets every path after the gate fail instead of skip.
-///
-/// `pvxinfo -D` on a TLS-enabled build lists `EPICS_PVA_TLS_KEYCHAIN`
-/// (the variable is dumped even when it is unset); a build without
-/// OpenSSL has no TLS entry at all. The probe deliberately runs the same
-/// tree [`locate_pvxs`] resolves, not [`pvxs_tls_home`], so it describes
-/// the binaries the caller will actually spawn.
-pub fn require_pvxs_tls() -> bool {
-    let Some(pvxinfo) = locate_pvxs("pvxinfo") else {
-        eprintln!(
-            "SKIP: pvxs binary `pvxinfo` not found under {:?} or on PATH, so \
-             this host cannot be probed for TLS support.",
+/// Resolve the named pvxs binary, failing the test when it cannot be found:
+/// an early return would score as a pass.
+pub fn require_pvxs(name: &str) -> PathBuf {
+    locate_pvxs(name).unwrap_or_else(|| {
+        panic!(
+            "pvxs binary `{name}` not found under {:?} or on PATH; \
+             build pvxs in `{:?}` to run this interop test.",
             pvxs_bin_dir(),
-        );
-        return false;
-    };
-    let out = match pvxs_command(&pvxinfo)
-        .arg("-D")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .pvxs_output()
-    {
-        Ok(out) => out,
-        Err(e) => panic!("`pvxinfo` at {} would not run: {e}", pvxinfo.display()),
-    };
-    let dump =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    if dump.contains("EPICS_PVA_TLS_KEYCHAIN") {
-        return true;
-    }
-    eprintln!(
-        "SKIP: the pvxs build at {:?} has no TLS support (`pvxinfo -D` does \
-         not mention EPICS_PVA_TLS_KEYCHAIN); rebuild pvxs against OpenSSL, \
-         or point PVXS_HOME at a build that has it, to run this test.",
-        pvxs_home(),
-    );
-    false
+            pvxs_home(),
+        )
+    })
 }
 
 /// How many times a pvxs process is started before its failure stands.
@@ -720,28 +667,20 @@ fn cpp_compiler() -> String {
 
 /// The one gate for "this host has no C++ compiler".
 ///
-/// An absent `c++` is a third-party PREREQUISITE, not an artefact of ours, so
-/// it is the single case in this file that stays a visible skip; everything
-/// past this gate — a helper source that is missing, a compile that fails, a
-/// library that is not built — is our own tree being broken and panics. That
-/// split is why [`cpp_helper`] returns a `PathBuf` and not an `Option`: a
-/// return type that could mean "no compiler" would also be readable as "the
-/// build failed", and a skip reports as a pass.
-///
-/// Shaped like [`require_pvxs`]: `None` prints its own reason, so a caller's
-/// bare `return` is still a visible skip.
-pub fn require_cxx() -> Option<String> {
+/// An absent `c++` fails the test like everything past this gate — a helper
+/// source that is missing, a compile that fails, a library that is not
+/// built — because a skip reports as a pass. It returns the driver so a
+/// caller cannot read "no compiler" and "the build failed" as the same
+/// `None`.
+pub fn require_cxx() -> String {
     let driver = cpp_compiler();
-    match Command::new(&driver).arg("--version").output() {
-        Ok(_) => Some(driver),
-        Err(e) => {
-            eprintln!(
-                "SKIP: no C++ compiler: `{driver}` would not run ({e}); set $CXX \
-                 or install one to enable the pvxs interop helpers."
-            );
-            None
-        }
+    if let Err(e) = Command::new(&driver).arg("--version").output() {
+        panic!(
+            "no C++ compiler: `{driver}` would not run ({e}); set $CXX \
+             or install one to run the pvxs interop helpers."
+        );
     }
+    driver
 }
 
 /// base ships `include/compiler/clang` and `include/compiler/gcc`, and the

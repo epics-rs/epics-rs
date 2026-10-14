@@ -97,9 +97,7 @@ fn pvxget(pvxget: &std::path::Path, env: &[(&str, String)]) -> std::process::Out
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pvxget_reaches_the_server_on_each_env_port() {
-    let Some(bin) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let bin = require_pvxs(PVXGET);
     // The named numbers are the subject: the server must bind exactly the
     // two the environment gives it. A server that did not, while the kernel
     // says somebody else holds one of them, lost a race; a free number it

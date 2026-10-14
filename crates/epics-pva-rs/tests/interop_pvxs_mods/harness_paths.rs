@@ -21,11 +21,7 @@ use super::interop_helpers::{ReadyFile, helper_out_dir, require_cxx};
 /// checkout, every worktree and every concurrent test process on the host.
 #[test]
 fn a_built_helper_is_published_inside_this_checkout() {
-    // The one absent-prerequisite skip: without a compiler there is nothing to
-    // publish. Everything past it is our own tree.
-    if require_cxx().is_none() {
-        return;
-    }
+    require_cxx();
     let out = super::interop_helpers::cpp_helper("reverse_server");
     assert!(
         out.starts_with(helper_out_dir()),

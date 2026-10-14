@@ -1,9 +1,8 @@
 //! PVA interop: Rust ↔ pvxs (`$PVXS_HOME`) `pvget`/`pvput`/`pvmonitor`.
 //!
 //! Opt-in via `cargo nextest run --profile interop`. Each test
-//! shells out to a pvxs CLI binary; missing binaries → skip with a
-//! SKIP-prefixed stderr line so a host without pvxs installed isn't
-//! a hard fail.
+//! shells out to a pvxs CLI binary; a missing binary fails the test,
+//! because an early return would score as a pass.
 //!
 //! Targets the gaps that pure Rust↔Rust tests can't catch:
 //!

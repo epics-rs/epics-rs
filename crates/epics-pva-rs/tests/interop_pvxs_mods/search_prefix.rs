@@ -96,9 +96,7 @@ fn classes(pvxget: &Path, tcp: u16) -> Vec<Answer> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_search_answers_the_record_and_field_prefix_as_softiocpvx() {
-    let (Some(ioc_bin), Some(pvxget)) = (require_pvxs(SOFT_IOC_PVX), require_pvxs(PVXGET)) else {
-        return;
-    };
+    let (ioc_bin, pvxget) = (require_pvxs(SOFT_IOC_PVX), require_pvxs(PVXGET));
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("t.db");
     std::fs::File::create(&db_path)

@@ -6,7 +6,7 @@
 //! (`PVXS_TLS_HOME`, or a `pvxs-tls` sibling — see
 //! `interop_helpers::pvxs_tls_home`). We prefer that build when present; if
 //! neither install exposes the `EPICS_PVA_TLS_KEYCHAIN` env var
-//! in `pvxinfo -D` output, the test SKIPs cleanly.
+//! in `pvxinfo -D` output, the test fails.
 //!
 //! When pvxs DOES have TLS:
 //! - Generate a self-signed cert + private key via `rcgen`.
@@ -26,7 +26,16 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn locate_tls_binary(name: &str) -> Option<PathBuf> {
+fn locate_tls_binary(name: &str) -> PathBuf {
+    find_tls_binary(name).unwrap_or_else(|| {
+        panic!(
+            "TLS-enabled pvxs binary `{name}` not found (set PVXS_TLS_HOME, or keep the \
+             worktree as a `pvxs-tls` sibling)"
+        )
+    })
+}
+
+fn find_tls_binary(name: &str) -> Option<PathBuf> {
     if let Some(root) = super::interop_helpers::pvxs_tls_home() {
         let p = root
             .join("bin")
@@ -49,10 +58,7 @@ fn locate_tls_binary(name: &str) -> Option<PathBuf> {
 /// second reading turned a broken tree into a skip, which reports as a pass
 /// and verifies nothing.
 fn pvxs_has_tls() -> bool {
-    let Some(pvxinfo) = locate_tls_binary("pvxinfo") else {
-        // Absent prerequisite: no pvxs to probe.
-        return false;
-    };
+    let pvxinfo = locate_tls_binary("pvxinfo");
     let mut cmd = pvxs_command(&pvxinfo);
     cmd.arg("-D").stdout(Stdio::piped()).stderr(Stdio::piped());
     // Located, so a refusal to run is a broken checkout, not a missing one.
@@ -66,19 +72,13 @@ fn pvxs_has_tls() -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
-    if !pvxs_has_tls() {
-        eprintln!(
-            "SKIP: no TLS-enabled pvxs found (set PVXS_TLS_HOME, or keep the \
-             worktree as a `pvxs-tls` sibling). \
-             Rust-side TLS is covered by tests/tls.rs; rebuild pvxs on the `origin/tls` \
-             branch with libevent+OpenSSL to enable this interop test."
-        );
-        return;
-    }
-    let Some(pvxget) = locate_tls_binary("pvxget") else {
-        eprintln!("SKIP: pvxget not found");
-        return;
-    };
+    assert!(
+        pvxs_has_tls(),
+        "the located pvxs has no TLS support (`pvxinfo -D` lacks EPICS_PVA_TLS_KEYCHAIN); \
+         rebuild pvxs on the `origin/tls` branch with libevent+OpenSSL, or set PVXS_TLS_HOME. \
+         Rust-side TLS is covered by tests/tls.rs"
+    );
+    let pvxget = locate_tls_binary("pvxget");
 
     // CA cert + leaf cert signed by CA. pvxs's TLS client refuses
     // a bare self-signed leaf ("invalid cert chain"); both sides
@@ -140,10 +140,7 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
             "openssl pkcs12 -export failed: {}",
             String::from_utf8_lossy(&o.stderr)
         ),
-        Err(e) => {
-            eprintln!("SKIP: openssl CLI not available: {e}");
-            return;
-        }
+        Err(e) => panic!("openssl CLI not available: {e}"),
     }
 
     // Build Rust TlsServerConfig from the in-memory cert/key.

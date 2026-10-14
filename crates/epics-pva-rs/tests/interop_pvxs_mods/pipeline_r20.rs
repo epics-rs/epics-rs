@@ -27,11 +27,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     use epics_pva_rs::server_native::{SharedPV, SharedSource};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("r20_typed_monitor");
 
     // Capture the server's debug output for the discriminating assertion

@@ -101,7 +101,12 @@ default-filter = """
   binary(wire_golden_pvxs) |
   binary(wire_golden_ext) |
   binary(interop_pvxs) |
-  binary(discovery_mdns)
+  binary(discovery_mdns) |
+  binary(stress_load) |
+  binary(calink_rights_match_softioc) |
+  binary(gw_upstream_unresponsive_window) |
+  (package(c-ca-tools) & test(=tests::a_held_udp_port_spends_the_candidate)) |
+  (package(epics-pva-rs) & test(/^auth::tls::tests::(pkcs12_loads_leaf_and_key_with_password|pkcs12_wrong_password_is_rejected|pkcs12_with_ca_chain_splits_leaf_from_ca|pkcs12_pbes2_openssl3_default_loads_leaf_and_key|pkcs12_pbes2_with_ca_chain_splits_leaf_from_ca|pkcs12_pbes2_wrong_password_is_rejected|server_config_loads_from_pkcs12_env|server_default_requests_client_cert|server_config_inline_keychain_password_splits_at_semicolon|server_config_inline_keychain_password_beats_env_fallback|server_config_pkcs12_wrong_password_env_errors|server_honors_pvas_only_tls_options_require|server_falls_back_to_shared_pva_keychain)$/))
 """
 
 # CI profile: friendlier output + retries for the genuinely flaky
@@ -143,6 +148,11 @@ default-filter = """
 # whole arrangement was built to stop. A CI job left on the default profile
 # fails on `reference.rs`'s panic instead, which is how linux-rt and
 # rtems-exec-model were caught.
+#
+# One rule, not a list: a test binary that reads a reference tree is named
+# `reference_*`, and `binary(/^reference_/)` excludes them all. The
+# `epics-base-rs` test `reference_consumers_are_named_reference` fails a
+# top-level test file that calls the resolver under any other name.
 [profile.ci]
 fail-fast = false
 retries = 2
@@ -158,7 +168,7 @@ default-filter = """
     binary(wire_golden_pvxs) |
     binary(wire_golden_ext) |
     binary(interop_pvxs) |
-    binary(reference_trees) |
+    binary(/^reference_/) |
     package(epics-oracle-rs) |
     (binary(rt_priority_default) & test(=the_default_gets_fifo_where_the_process_may_have_it)) |
     (package(epics-libcom-rs) & test(=runtime::task::tests::an_above_99_priority_is_refused_by_the_fifo_scheduler)) |

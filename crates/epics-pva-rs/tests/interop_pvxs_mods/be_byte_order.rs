@@ -51,9 +51,7 @@ fn env_key() -> &'static str {
 /// Direction A: Rust server emits BE wire, pvxget (LE client) reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_be_a_rust_server_emits_be_to_pvxget() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
     let pvs = complex_pv_matrix();
 
     let source = SharedSource::new();
@@ -148,11 +146,7 @@ async fn interop_be_a_rust_server_emits_be_to_pvxget() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_be_b_rust_client_decodes_pvxs_be_server() {
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("be_reverse_server");
 
     let ready = super::interop_helpers::ReadyFile::new("be_rev_ready");

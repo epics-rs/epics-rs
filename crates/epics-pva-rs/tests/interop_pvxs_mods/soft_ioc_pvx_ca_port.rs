@@ -12,9 +12,7 @@ use super::interop_helpers::{
 
 #[test]
 fn a_held_ca_port_is_rerun_on_a_fresh_one() {
-    let Some(ioc_bin) = require_pvxs(SOFT_IOC_PVX) else {
-        return;
-    };
+    let ioc_bin = require_pvxs(SOFT_IOC_PVX);
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("t.db");
     std::fs::write(&db, "record(ai, \"CAP:AI\") {}\n").expect("write db");

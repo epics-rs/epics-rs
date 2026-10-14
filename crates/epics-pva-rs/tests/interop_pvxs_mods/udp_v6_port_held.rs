@@ -89,9 +89,7 @@ fn rs_start(port: u16, v6: bool) -> Result<PvaServer, PvaError> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_search_port_held_on_v6_only_refuses_the_v6_start_as_softiocpvx() {
-    let Some(ioc) = require_pvxs(SOFT_IOC_PVX) else {
-        return;
-    };
+    let ioc = require_pvxs(SOFT_IOC_PVX);
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("t.db");
     std::fs::write(&db, "record(ai, \"X\") {}\n").expect("write db");

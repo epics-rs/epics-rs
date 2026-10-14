@@ -36,9 +36,7 @@ fn env_key() -> &'static str {
 #[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_beacon_a_pvxlist_discovers_rust_server() {
-    let Some(pvxlist) = require_pvxs("pvxlist") else {
-        return;
-    };
+    let pvxlist = require_pvxs("pvxlist");
 
     // pvxlist must bind the beacon port itself, so it is picked by binding
     // and releasing; another bind can take it in between, and pvxlist then
@@ -150,30 +148,18 @@ async fn beacon_a_attempt(
 /// Rust server), so this test cannot use 127.0.0.1 for beacons.
 /// Instead pick a non-loopback NIC address from the host and use
 /// that as both pvxs's beacon destination and the bind target the
-/// Rust client picks up. SKIPs cleanly when the host has no
+/// Rust client picks up. Fails when the host has no
 /// suitable non-loopback IPv4.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
-    let Some(softioc) = super::interop_helpers::locate_pvxs(super::interop_helpers::SOFT_IOC_PVX)
-    else {
-        eprintln!("SKIP: softIocPVX not found");
-        return;
-    };
+    let softioc = super::interop_helpers::require_pvxs(super::interop_helpers::SOFT_IOC_PVX);
     let dbd_path = super::interop_helpers::pvxs_dbd_dir().join("softIocPVX.dbd");
-    if !dbd_path.is_file() {
-        eprintln!("SKIP: softIocPVX.dbd missing");
-        return;
-    }
+    assert!(dbd_path.is_file(), "softIocPVX.dbd missing: {dbd_path:?}");
 
     // Find a non-loopback IPv4 we can bind on (matches what
     // `bind_non_loopback` enumerates).
-    let local_v4 = match local_non_loopback_v4() {
-        Some(a) => a,
-        None => {
-            eprintln!("SKIP: no non-loopback IPv4 on this host");
-            return;
-        }
-    };
+    let local_v4 = local_non_loopback_v4()
+        .expect("no non-loopback IPv4 on this host; the pvxs beacon test needs one");
 
     // Pick an ephemeral UDP port to act as the agreed beacon /
     // search broadcast port between pvxs and the Rust client.

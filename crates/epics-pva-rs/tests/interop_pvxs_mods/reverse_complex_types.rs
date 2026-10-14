@@ -55,11 +55,7 @@ fn extract_value(decoded: &PvField, path: &str) -> Option<PvField> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_reverse_complex_types_rust_client_decodes_pvxs() {
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
     let ready = super::interop_helpers::ReadyFile::new("reverse_ready");

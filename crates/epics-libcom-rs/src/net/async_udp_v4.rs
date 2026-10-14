@@ -1934,16 +1934,14 @@ mod tests {
         // Add a real external NIC (bindable, but outside the loopback
         // bundle). An empty list is now the host's answer and nothing else
         // — a failed enumeration errors out of `IfaceMap::new` instead of
-        // arriving here as "no NIC" — so the skip states a host fact.
-        let Some(nic) = IfaceMap::new()
+        // arriving here as "no NIC" — so an empty list is a host without one,
+        // which fails this test rather than skipping it.
+        let nic = IfaceMap::new()
             .expect("getifaddrs must succeed on the host")
             .up_non_loopback()
             .into_iter()
             .next()
-        else {
-            eprintln!("skipping: no external NIC here, so the add branch has no input");
-            return;
-        };
+            .expect("this test needs an up, non-loopback IPv4 interface");
         assert!(
             sock.ensure_iface_socket(nic.ip, 0, true)
                 .expect("bind external NIC"),

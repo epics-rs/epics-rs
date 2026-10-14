@@ -94,6 +94,30 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
+      # The search_udp v6 tests use `::1` and `ensure_iface_socket` needs an up
+      # non-loopback IPv4 interface; each fails, not skips, without them.
+      # Every hosted image has both, so this only turns an image change into
+      # one clear error. Per-OS commands, same two facts.
+      - name: Test prerequisites (::1, external NIC) - Linux
+        if: runner.os == 'Linux'
+        run: |
+          python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          ip -4 -o addr show scope global up | grep -q .
+
+      - name: Test prerequisites (::1, external NIC) - macOS
+        if: runner.os == 'macOS'
+        run: |
+          python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          ifconfig | grep 'inet ' | grep -qv '127\.0\.0\.1'
+
+      - name: Test prerequisites (::1, external NIC) - Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          if ($LASTEXITCODE -ne 0) { throw "::1 is not usable" }
+          if (-not (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' })) { throw "no non-loopback IPv4 interface" }
+
       # Compiles libs, bins, AND test targets — the surest catch for
       # platform-specific source that isn't `#[cfg]`-gated.
       - name: Build (workspace + tests)

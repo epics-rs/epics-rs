@@ -894,13 +894,12 @@ mod tests {
             return;
         }
 
-        if unsafe { libc::geteuid() } == 0 {
-            println!(
-                "skipped: running as root, which bypasses RLIMIT_NPROC \
-                 (CAP_SYS_RESOURCE), so thread creation cannot be made to fail"
-            );
-            return;
-        }
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "must not run as root: root bypasses RLIMIT_NPROC (CAP_SYS_RESOURCE), \
+             so thread creation cannot be made to fail"
+        );
 
         let out =
             std::process::Command::new(std::env::current_exe().expect("the test binary path"))

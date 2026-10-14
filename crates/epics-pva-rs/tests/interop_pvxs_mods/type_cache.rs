@@ -30,9 +30,7 @@ use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_type_cache_emit_pvxget_accepts_backrefs() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
     let pvs = complex_pv_matrix();
 
     let source = SharedSource::new();

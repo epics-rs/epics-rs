@@ -18,9 +18,8 @@
 //! `--test-threads=1` is recommended because both sides shell out to
 //! `caget`/`caput`, which scan `EPICS_CA_ADDR_LIST`.
 //!
-//! Skipping logic: each test calls `require_libca()` first, which
-//! returns `false` if `softIoc` / `caget` / `caput` aren't on PATH —
-//! the test then becomes a noisy no-op rather than a hard failure.
+//! Each test calls `libca_paths()` first, which panics if `softIoc` /
+//! `caget` / `caput` aren't on PATH: an early return would score as a pass.
 //!
 //! Tokio backend only: the Rust half of each differential pair is the
 //! in-process async `CaServer`, served from the tokio runtime the test
@@ -32,11 +31,9 @@ use std::process::{Command, Stdio};
 
 use serial_test::serial;
 
-fn libca_paths() -> Option<(String, String, String)> {
-    let softioc = which("softIoc")?;
-    let caget = which("caget")?;
-    let caput = which("caput")?;
-    Some((softioc, caget, caput))
+fn libca_paths() -> (String, String, String) {
+    let need = |name| which(name).unwrap_or_else(|| panic!("`{name}` not found on PATH"));
+    (need("softIoc"), need("caget"), need("caput"))
 }
 
 fn which(name: &str) -> Option<String> {
@@ -51,7 +48,7 @@ fn which(name: &str) -> Option<String> {
 /// Run caget against the given port and return the parsed value as
 /// a string (everything after the first whitespace).
 fn run_caget(port: u16, pv: &str) -> Option<String> {
-    let (_, caget, _) = libca_paths()?;
+    let (_, caget, _) = libca_paths();
     let out = Command::new(&caget)
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
@@ -80,10 +77,7 @@ fn run_caget(port: u16, pv: &str) -> Option<String> {
 
 /// Run caput against the given port. Returns success.
 fn run_caput(port: u16, pv: &str, value: &str) -> bool {
-    let (_, _, caput) = libca_paths().unwrap_or_default();
-    if caput.is_empty() {
-        return false;
-    }
+    let (_, _, caput) = libca_paths();
     Command::new(&caput)
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
@@ -104,10 +98,7 @@ fn run_caput(port: u16, pv: &str, value: &str) -> bool {
 #[serial]
 #[allow(clippy::approx_constant)]
 async fn caget_double_matches_libca() {
-    let Some(_) = libca_paths() else {
-        eprintln!("skipping: libca not on PATH");
-        return;
-    };
+    libca_paths();
     // Rust side
     let server = epics_ca_rs::server::CaServer::builder()
         .port(0)
@@ -141,10 +132,7 @@ async fn caget_double_matches_libca() {
 #[ignore = "differential libca; run with --include-ignored"]
 #[serial]
 async fn caput_then_caget_matches_libca() {
-    let Some(_) = libca_paths() else {
-        eprintln!("skipping: libca not on PATH");
-        return;
-    };
+    libca_paths();
     let server = epics_ca_rs::server::CaServer::builder()
         .port(0)
         .pv("DIFF:WRITE", epics_base_rs::types::EpicsValue::Double(0.0))

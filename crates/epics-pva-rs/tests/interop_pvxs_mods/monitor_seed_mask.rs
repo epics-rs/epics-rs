@@ -162,10 +162,7 @@ async fn start(ioc_bin: &Path) -> Servers {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_update_carries_the_leaves_its_dbe_assigns_as_softiocpvx() {
-    let (Some(ioc_bin), Some(pvxmonitor)) = (require_pvxs(SOFT_IOC_PVX), require_pvxs(PVXMONITOR))
-    else {
-        return;
-    };
+    let (ioc_bin, pvxmonitor) = (require_pvxs(SOFT_IOC_PVX), require_pvxs(PVXMONITOR));
     let servers = start(&ioc_bin).await;
     let (dir, c_tcp, rs_tcp) = (&servers.dir, servers.c_tcp, servers.rs_tcp);
     let path = dir.path().to_path_buf();
@@ -239,9 +236,7 @@ async fn after_resume(tcp: u16) -> Vec<f64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resumed_monitor_gets_the_current_value_again_as_softiocpvx() {
-    let Some(ioc_bin) = require_pvxs(SOFT_IOC_PVX) else {
-        return;
-    };
+    let ioc_bin = require_pvxs(SOFT_IOC_PVX);
     let servers = start(&ioc_bin).await;
     let c = after_resume(servers.c_tcp).await;
     let rs = after_resume(servers.rs_tcp).await;

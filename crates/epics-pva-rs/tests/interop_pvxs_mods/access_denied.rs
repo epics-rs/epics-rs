@@ -29,9 +29,7 @@ fn env_key() -> &'static str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_access_denied_a_pvxput_to_rejecting_handler_fails() {
-    let Some(pvxput) = require_pvxs(PVXPUT) else {
-        return;
-    };
+    let pvxput = require_pvxs(PVXPUT);
 
     let pv = SharedPV::new();
     pv.open(

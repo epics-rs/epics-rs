@@ -6,7 +6,7 @@
 //! signed by the same CA, and the client presents one. The
 //! pvxs flag is `EPICS_PVA_TLS_OPTIONS=client_cert=require`.
 //!
-//! SKIPs if the TLS-enabled pvxs build is not present.
+//! Fails if the TLS-enabled pvxs build is not present.
 
 #![cfg(tokio_backend)]
 
@@ -16,22 +16,21 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn locate_tls_binary(name: &str) -> Option<PathBuf> {
-    super::interop_helpers::pvxs_tls_home().and_then(|r| {
-        let p = r
-            .join("bin")
-            .join(super::interop_helpers::pvxs_arch())
-            .join(name);
-        p.is_file().then_some(p)
-    })
+fn locate_tls_binary(name: &str) -> PathBuf {
+    super::interop_helpers::pvxs_tls_home()
+        .and_then(|r| {
+            let p = r
+                .join("bin")
+                .join(super::interop_helpers::pvxs_arch())
+                .join(name);
+            p.is_file().then_some(p)
+        })
+        .unwrap_or_else(|| panic!("no TLS-enabled pvxs `{name}` (set PVXS_TLS_HOME; see batch 12)"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
-    let Some(pvxget) = locate_tls_binary("pvxget") else {
-        eprintln!("SKIP: no TLS-enabled pvxs (set PVXS_TLS_HOME; see batch 12)");
-        return;
-    };
+    let pvxget = locate_tls_binary("pvxget");
 
     // CA + leaf (used by both server and client cert chains).
     let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
@@ -87,10 +86,7 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
             "openssl pkcs12 -export failed: {}",
             String::from_utf8_lossy(&o.stderr)
         ),
-        Err(e) => {
-            eprintln!("SKIP: openssl cli: {e}");
-            return;
-        }
+        Err(e) => panic!("openssl cli not available: {e}"),
     }
 
     // Rust server: TLS + require client cert (the mtls part).

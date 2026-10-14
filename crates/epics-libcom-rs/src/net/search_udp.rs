@@ -1138,17 +1138,11 @@ mod tests {
 
     // ── IPv6 ────────────────────────────────────────────────────────────
 
-    /// A machine with no IPv6 stack is a normal machine, and a CI runner is
-    /// often one. Every v6 case below skips on that machine rather than
-    /// failing, so the suite asserts about v6 exactly where v6 exists.
-    fn bind_v6_or_skip() -> Option<SearchUdpSocketV6> {
-        match SearchUdpSocketV6::bind_search("test-PVAC-UDP6", ThreadPriority::Medium) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("skipping: no usable IPv6 stack here ({e})");
-                None
-            }
-        }
+    /// The v6 cases need an IPv6 stack and a routable `::1`; a host without
+    /// them fails here, because an early return would score as a pass.
+    fn bind_v6() -> SearchUdpSocketV6 {
+        SearchUdpSocketV6::bind_search("test-PVAC-UDP6", ThreadPriority::Medium)
+            .expect("these tests need an IPv6 stack (and `::1` on loopback)")
     }
 
     /// The v6 counterpart of [`binds_and_reports_a_local_address`], and the
@@ -1156,9 +1150,7 @@ mod tests {
     /// used to be "no socket exists", by construction.
     #[epics_macros_rs::epics_test]
     async fn v6_binds_and_reports_a_local_address() {
-        let Some(sock) = bind_v6_or_skip() else {
-            return;
-        };
+        let sock = bind_v6();
         let addrs = sock.local_addrs();
         assert!(!addrs.is_empty(), "a bound v6 SEARCH socket has an address");
         for a in &addrs {
@@ -1171,19 +1163,13 @@ mod tests {
     /// selected — the reactor on one arm, the shared pump thread on the other.
     #[epics_macros_rs::epics_test]
     async fn v6_round_trips_a_datagram_to_itself() {
-        let Some(sock) = bind_v6_or_skip() else {
-            return;
-        };
+        let sock = bind_v6();
         let port = sock.local_addrs()[0].port();
         let dest = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
 
-        if let Err(e) = sock.send_to(b"PVA-SEARCH6", dest).await {
-            // A v6 socket can bind while `::1` is unroutable (a container with
-            // IPv6 compiled in and no loopback route). That is the same "no
-            // usable v6 here" condition the binder reports, one step later.
-            eprintln!("skipping: v6 loopback is not routable here ({e})");
-            return;
-        }
+        sock.send_to(b"PVA-SEARCH6", dest)
+            .await
+            .expect("`::1` must be routable on this host");
         let mut buf = [0u8; 64];
         let dg =
             crate::runtime::task::timeout(std::time::Duration::from_secs(5), sock.recv(&mut buf))
@@ -1220,9 +1206,7 @@ mod tests {
         const PORTS: usize = 8;
         let mut held = None;
         for attempt in 1..=PORTS {
-            let Some(v6) = bind_v6_or_skip() else {
-                return;
-            };
+            let v6 = bind_v6();
             let port = v6.local_addrs()[0].port();
             match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
                 Ok(v4) => {

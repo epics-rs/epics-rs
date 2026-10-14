@@ -317,6 +317,7 @@ async fn rights_after_an_unresponsive_window(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns the EPICS base softIoc from $EPICS_BASE; runs in --profile interop"]
 async fn a_write_right_is_held_through_an_unresponsive_window() {
     let granted = (true, true);
     let acf = "ASG(DEFAULT) {\n RULE(1, READ)\n RULE(1, WRITE)\n}\n";
@@ -325,6 +326,7 @@ async fn a_write_right_is_held_through_an_unresponsive_window() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns the EPICS base softIoc from $EPICS_BASE; runs in --profile interop"]
 async fn a_read_only_right_is_held_through_an_unresponsive_window() {
     let read_only = (true, false);
     let acf = "ASG(DEFAULT) {\n RULE(1, READ)\n}\n";
@@ -336,6 +338,7 @@ async fn a_read_only_right_is_held_through_an_unresponsive_window() {
 /// window, and rsrv's ACCESS_RIGHTS waits in the frozen proxy until the
 /// circuit recovers, ahead of anything that revives the PV.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns the EPICS base softIoc from $EPICS_BASE; runs in --profile interop"]
 async fn a_rights_change_inside_an_unresponsive_window_is_applied_after_it() {
     let acf = "ASG(DEFAULT) {\n INPA(\"GW:gate\")\n RULE(1, READ)\n \
                RULE(1, WRITE) {\n  CALC(\"A=1\")\n }\n}\n";

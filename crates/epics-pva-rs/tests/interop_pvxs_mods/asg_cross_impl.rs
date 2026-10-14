@@ -42,9 +42,7 @@ fn env_key() -> &'static str {
 async fn interop_asg_denied_put_via_real_acf() {
     use epics_base_rs::server::access_security::{AccessGate, parse_acf};
 
-    let Some(pvxput) = require_pvxs(PVXPUT) else {
-        return;
-    };
+    let pvxput = require_pvxs(PVXPUT);
 
     // ACF that denies WRITE entirely (only RULE(0, READ) — no
     // RULE(N, WRITE) clause means WRITE is implicitly denied).

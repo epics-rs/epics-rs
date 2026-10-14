@@ -1,18 +1,15 @@
 //! Shared helpers for CA interop and soak tests.
 //!
 //! These tests exercise epics-ca-rs against the reference EPICS C
-//! implementation (`softIoc`, `caget`, `caput`, `camonitor`). They are
-//! gated on the C tools being available so that CI environments without
-//! a full EPICS install can still run the rest of the suite.
+//! implementation (`softIoc`, `caget`, `caput`, `camonitor`). They need
+//! the C tools on `PATH` and fail, not skip, when one is absent.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Returns true when the named binary resolves on PATH or in the local
-/// EPICS install. Used by interop tests to early-exit on hosts that
-/// lack a C reference implementation.
+/// Returns true when the named binary resolves on PATH.
 pub fn have_tool(name: &str) -> bool {
     Command::new("which")
         .arg(name)
@@ -23,15 +20,14 @@ pub fn have_tool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Skip the test (printed to stderr) when a required C tool is missing.
-/// Returns `true` when the test should proceed.
-pub fn require_tool(name: &str) -> bool {
-    if have_tool(name) {
-        true
-    } else {
-        eprintln!("SKIP: `{name}` not found on PATH; install EPICS base to run this test");
-        false
-    }
+/// Fail the test when a required C tool is missing. A returned skip is a
+/// pass to nextest, so an absent prerequisite must not be representable as
+/// one.
+pub fn require_tool(name: &str) {
+    assert!(
+        have_tool(name),
+        "`{name}` not found on PATH; install EPICS base to run this test"
+    );
 }
 
 /// Collects a child's stream line-by-line on a background thread so tests
@@ -248,10 +244,9 @@ fn softioc_on(db_path: &Path, acf_path: Option<&Path>, port: u16) -> Option<Mana
 /// for the rule, and [`softioc_verdict::PORT_WAS_TAKEN`] and
 /// [`softioc_verdict::NO_TCP_SERVER`] for the evidence this one retries on.
 ///
-/// Panics instead of reporting an absence. The absent-prerequisite skip is
-/// owned by [`require_tool`] at the call site, so by the time this runs
-/// `softIoc` has already been located on `PATH` and every remaining failure
-/// is the located binary refusing to start. An `Option` return meant both
+/// Panics instead of reporting an absence. [`require_tool`] at the call site
+/// fails the test when `softIoc` is not on `PATH`, so by the time this runs
+/// every failure is the located binary refusing to start. An `Option` return meant both
 /// things at once, and every caller spelled the `None` arm as an early
 /// return, which nextest scores as a pass — see `epics-base-rs`
 /// `src/reference.rs:80-96`. It names no install directory at all — this
@@ -327,10 +322,9 @@ mod tests {
     /// `softIoc` while leaving TCP free: the spawn spends the candidate
     /// instead of waiting out the budget on a suspended IOC.
     #[test]
+    #[ignore = "needs softIoc on PATH (EPICS base); runs in --profile interop"]
     fn a_held_udp_port_spends_the_candidate() {
-        if !require_tool("softIoc") {
-            return;
-        }
+        require_tool("softIoc");
         let port = named_port::free_for_tcp_and_udp();
         let _held = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("hold the UDP port");
         let db = db_file("record(ai, \"T:AI\") {}\n");

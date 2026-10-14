@@ -29,6 +29,16 @@ jobs:
         toolchain: 1.99.0
         components: rustfmt, clippy
     - uses: taiki-e/install-action@nextest
+    # The asyn-rs serial tests open a pty, the search_udp v6 tests use `::1`,
+    # and `ensure_iface_socket` needs a non-loopback IPv4 NIC; each fails,
+    # not skips, without them. ubuntu-latest has all three, so this step only
+    # turns a runner-image change into one clear error instead of many test
+    # failures.
+    - name: Test prerequisites (pty, ::1, external NIC)
+      run: |
+        python3 -c 'import os; os.close(os.openpty()[0])'
+        python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+        ip -4 -o addr show scope global up | grep -q .
     - name: Format
       run: cargo fmt --all -- --check
     # Cargo registry + target cache. Placed after the toolchain step
@@ -104,6 +114,16 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         key: all-features
+    # The asyn-rs serial tests open a pty, the search_udp v6 tests use `::1`,
+    # and `ensure_iface_socket` needs a non-loopback IPv4 NIC; each fails,
+    # not skips, without them. ubuntu-latest has all three, so this step only
+    # turns a runner-image change into one clear error instead of many test
+    # failures.
+    - name: Test prerequisites (pty, ::1, external NIC)
+      run: |
+        python3 -c 'import os; os.close(os.openpty()[0])'
+        python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+        ip -4 -o addr show scope global up | grep -q .
     # epics-oracle-rs boots the compiled C `softIoc` for ground truth and fails
     # loudly (by design) without the C EPICS tree, which no runner has.
     - name: Every feature-gated test, compiled and run
@@ -178,6 +198,16 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         key: exec-backend
+    # The asyn-rs serial tests open a pty, the search_udp v6 tests use `::1`,
+    # and `ensure_iface_socket` needs a non-loopback IPv4 NIC; each fails,
+    # not skips, without them. ubuntu-latest has all three, so this step only
+    # turns a runner-image change into one clear error instead of many test
+    # failures.
+    - name: Test prerequisites (pty, ::1, external NIC)
+      run: |
+        python3 -c 'import os; os.close(os.openpty()[0])'
+        python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+        ip -4 -o addr show scope global up | grep -q .
     - name: The exec backend is what this job actually built
       run: cargo nextest run --profile ci --workspace -E 'binary(rtems_exec_model_gate)'
     - name: Workspace on the exec backend

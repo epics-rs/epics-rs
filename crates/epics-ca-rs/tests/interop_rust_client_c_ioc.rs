@@ -53,9 +53,7 @@ fn set_client_env(addr_list: &str, port: u16) {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn rust_client_can_caget_from_softioc() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc(TEST_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
@@ -78,9 +76,7 @@ async fn rust_client_can_caget_from_softioc() {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn rust_client_can_caput_to_softioc() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc(TEST_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
@@ -108,9 +104,7 @@ async fn rust_client_can_caput_to_softioc() {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn rust_client_monitors_softioc_changes() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc(TEST_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
@@ -157,9 +151,7 @@ async fn rust_client_monitors_softioc_changes() {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn rust_client_handles_softioc_restart() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
 
     // First IOC instance.
     let ioc1 = spawn_softioc(TEST_DB);
@@ -229,9 +221,7 @@ fn signal(pid: u32, sig: &str) {
 /// and what the receiver is told after `Connected` on recovery.
 async fn rights_survive_an_unresponsive_circuit(acf: &str) {
     use epics_ca_rs::client::ConnectionEvent;
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc_with_acf("record(ao, \"RIGHTS:PV\") {}\n", acf);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
     // The echo watchdog arms after EPICS_CA_CONN_TMO of silence.

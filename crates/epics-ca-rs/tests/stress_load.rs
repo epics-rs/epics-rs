@@ -46,9 +46,7 @@ fn set_client_env(addr_list: &str, port: u16) {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn many_concurrent_channels_connect() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
@@ -75,9 +73,7 @@ async fn many_concurrent_channels_connect() {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn rapid_create_drop_cycles() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
@@ -102,9 +98,7 @@ async fn rapid_create_drop_cycles() {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn burst_of_writes_completes() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
@@ -133,9 +127,7 @@ async fn burst_of_writes_completes() {
 #[serial]
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn monitor_keeps_up_with_high_update_rate() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 

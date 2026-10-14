@@ -96,10 +96,9 @@ impl LinkHolder {
 /// it. Both counts are softIoc's own, read off a C link-holder beside the
 /// port's on the same server.
 #[test]
+#[ignore = "needs softIoc on PATH (EPICS base); runs in --profile interop"]
 fn a_read_only_connect_processes_the_cp_holder_as_softioc_does() {
-    if !require_tool("softIoc") {
-        return;
-    }
+    require_tool("softIoc");
     let server = spawn_softioc_with_acf(
         "record(ao, \"SRC\") { field(VAL, \"5\") field(PINI, \"YES\") field(ASG, \"OPEN\") }\n\
          record(calc, \"UP\") { field(INPA, \"SRC CP\") field(CALC, \"A\") }\n\

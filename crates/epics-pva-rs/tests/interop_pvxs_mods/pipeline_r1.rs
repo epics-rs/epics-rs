@@ -11,9 +11,8 @@
 //! `record._options.pipeline`. We use that log line as the
 //! authoritative wire-level signal.
 //!
-//! Skip behaviour: if `softIocPVX` is not present under
-//! the resolved pvxs tree's `bin/<arch>/`, the test prints a SKIP line and
-//! returns OK so a CI host without pvxs built doesn't fail.
+//! If `softIocPVX` is not present under the resolved pvxs tree's
+//! `bin/<arch>/`, the test fails.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
@@ -35,14 +34,9 @@ record(calc, "R1:CNT") {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
-    let Some(ioc_bin) = require_pvxs(SOFT_IOC_PVX) else {
-        return;
-    };
+    let ioc_bin = require_pvxs(SOFT_IOC_PVX);
     let dbd = pvxs_dbd_dir().join("softIocPVX.dbd");
-    if !dbd.is_file() {
-        eprintln!("SKIP: dbd file missing: {dbd:?}");
-        return;
-    }
+    assert!(dbd.is_file(), "dbd file missing: {dbd:?}");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("counter.db");

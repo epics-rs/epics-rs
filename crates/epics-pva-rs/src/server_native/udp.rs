@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::net::{
-    AsyncUdpV4, IfaceMap, PortUse, bind_loopback_mcast, enable_so_rxq_ovfl_for_socket,
+    AsyncUdpV4, IfaceMap, PortOrigin, PortUse, bind_loopback_mcast, enable_so_rxq_ovfl_for_socket,
     recv_from_with_drop_count_socket,
 };
 use tracing::{debug, warn};
@@ -105,20 +105,21 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
 /// * **Read back, never probed.** The socket that reports the port is the
 ///   socket the responder serves on, so nothing can take it in between.
 ///   (This matters more for PVA than for CA: the search socket sets
-///   `SO_REUSEPORT`, so a *collision does not fail* — a second server binds
-///   the same port silently and the two answer searches at random. There is
-///   no error to detect after the fact, which is exactly why the number must
-///   never be guessed.)
+///   `SO_REUSEPORT` on every port, 0 included, as pvxs `UDPCollector` does
+///   (`udp_collector.cpp:136`), so on a given number a *collision does not
+///   fail* — a second server binds the same port silently and the two answer
+///   searches at random. There is no error to detect after the fact, which is
+///   exactly why the number must never be guessed.)
 ///
 /// With `v6`, the v6 SEARCH socket is bound here too, on the same number, so
 /// a start either holds both families or fails — pvxs binds its `[::]`
 /// listener on the number the v4 one read back and throws out of the
 /// `Server` constructor when it cannot (`server.cpp:421-426`,
 /// `udp_collector.cpp:151`). v4 goes first: its ephemeral pick must come from
-/// the kernel, since a guessed number under the bundle's reuse flags would
-/// co-bind silently, while the v6 socket of an ephemeral number carries no
-/// reuse flag and so reports a holder as `EADDRINUSE`. On that error the
-/// pair is dropped and the kernel asked again, which pvxs does not do.
+/// the kernel, since a guessed number under the reuse flags would co-bind
+/// silently. A v6 holder without reuse flags is still `EADDRINUSE`; on that
+/// error the pair is dropped and the kernel asked again, which pvxs does not
+/// do.
 pub(crate) fn bind_udp(
     port: u16,
     interfaces: &[Ipv4Addr],
@@ -126,7 +127,6 @@ pub(crate) fn bind_udp(
     v6: bool,
 ) -> PvaResult<UdpBind> {
     const EPHEMERAL_TRIES: usize = 32;
-    let port_use = PortUse::from_caller(port);
     let mut tries = 1;
     let (mut sock, port, v6) = loop {
         let (sock, bound) = bind_udp_v4(port, interfaces)?;
@@ -135,7 +135,12 @@ pub(crate) fn bind_udp(
         }
         #[cfg(test)]
         tests::BEFORE_V6_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bound)));
-        match bind_search_v6(bound, port_use) {
+        let origin = if port == 0 {
+            PortOrigin::Chosen
+        } else {
+            PortOrigin::Configured
+        };
+        match bind_search_v6(bound, origin) {
             Ok(v6) => break (sock, bound, Some(v6)),
             Err(e)
                 if port == 0
@@ -184,21 +189,18 @@ pub(crate) struct UdpBind {
 }
 
 /// `[::]:port` with `IPV6_V6ONLY`, so it and the v4 bundle stay disjoint
-/// lanes whatever the platform default, under `port_use`'s reuse set: a
-/// restart picks a configured number up without TIME_WAIT and a second PVA
-/// process co-binds it, while a kernel-chosen number is owned outright.
-fn bind_search_v6(port: u16, port_use: PortUse) -> std::io::Result<std::net::UdpSocket> {
+/// lanes whatever the platform default, with fanout on every port as the v4
+/// bundle and pvxs's `[::]` collector (`udp_collector.cpp:136`). `origin` is
+/// the v4 bundle's: a number it picked is picked for v6 too.
+fn bind_search_v6(port: u16, origin: PortOrigin) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     if let Err(e) = sock.set_only_v6(true) {
         debug!("v6 responder: set_only_v6 failed: {e}");
     }
-    if let Err(e) = port_use.apply_reuse(&sock) {
-        debug!("v6 responder: reuse options failed: {e}");
-    }
     sock.set_nonblocking(true)?;
     let bind_addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
-    sock.bind(&bind_addr.into())?;
+    PortUse::Shared.bind(&sock, bind_addr, origin)?;
     Ok(sock.into())
 }
 
@@ -215,14 +217,14 @@ fn bind_udp_v4(port: u16, interfaces: &[Ipv4Addr]) -> PvaResult<(AsyncUdpV4, u16
         // Ephemeral: every NIC socket must land on the SAME kernel-assigned
         // port (see the doc comment) — `bind(0, ..)` per NIC would not.
         if interfaces.is_empty() {
-            AsyncUdpV4::bind_ephemeral_same_port(true)
+            AsyncUdpV4::bind_ephemeral_same_port(PortUse::Shared, true)
         } else {
-            AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, true)
+            AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, PortUse::Shared, true)
         }
     } else if interfaces.is_empty() {
-        AsyncUdpV4::bind(port, true)
+        AsyncUdpV4::bind(port, PortUse::Shared, true)
     } else {
-        AsyncUdpV4::bind_on_interfaces(interfaces, port, true)
+        AsyncUdpV4::bind_on_interfaces(interfaces, port, PortUse::Shared, true)
     }
     .map_err(PvaError::Io)?;
 
@@ -1525,16 +1527,60 @@ mod tests {
     /// start fails, as softIocPVX's does.
     #[epics_macros_rs::epics_test]
     async fn a_configured_number_held_on_v6_fails_the_bind() {
-        let holder = try_v6_holder(0).unwrap();
-        let port = holder.local_addr().unwrap().as_socket().unwrap().port();
-        let tried = hold_v6_for(0);
-        let err = super::bind_udp(port, &[Ipv4Addr::LOCALHOST], &[], true).err();
-        BEFORE_V6_BIND.take();
+        // The number is free on v6 only; a stranger holding it on v4 fails the
+        // v4 bind before the v6 one is tried, so the test takes another.
+        let mut tries = 0;
+        let (port, tried, err) = loop {
+            tries += 1;
+            let holder = try_v6_holder(0).unwrap();
+            let port = holder.local_addr().unwrap().as_socket().unwrap().port();
+            let tried = hold_v6_for(0);
+            let err = super::bind_udp(port, &[Ipv4Addr::LOCALHOST], &[], true).err();
+            BEFORE_V6_BIND.take();
+            if !tried.borrow().is_empty() {
+                break (port, tried, err);
+            }
+            assert!(tries < 5, "v4 bind of {port} failed {tries} times: {err:?}");
+        };
         assert!(
             matches!(&err, Some(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse),
             "{err:?}"
         );
         assert_eq!(*tried.borrow(), [port]);
+    }
+
+    /// A pvxs client given this server's ephemeral number as
+    /// `EPICS_PVA_BROADCAST_PORT` binds its beacon receiver on the wildcard
+    /// there with fanout (`client.cpp:641-642`, `udp_collector.cpp:136`); an
+    /// exclusive responder makes that bind `EADDRINUSE`.
+    #[epics_macros_rs::epics_test]
+    async fn an_ephemeral_responder_lets_a_fanout_listener_co_bind() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let bound = super::bind_udp(0, &[], &[], true).expect("bind");
+        let wildcard = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bound.port),
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), bound.port),
+        ];
+        // Each NIC's own address too: Linux lets a v4 wildcard co-bind with
+        // exclusive per-NIC sockets, so only the exact address shows the option.
+        let per_nic = bound
+            .v4
+            .ifaces()
+            .iter()
+            .map(|n| n.sock.local_addr().unwrap());
+        // Held to the end, so each bind joins the ones before it.
+        let mut held = Vec::new();
+        for addr in wildcard.into_iter().chain(per_nic) {
+            let s =
+                Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            if addr.is_ipv6() {
+                s.set_only_v6(true).unwrap();
+            }
+            PortUse::Shared
+                .bind(&s, addr, PortOrigin::Configured)
+                .unwrap_or_else(|e| panic!("fanout listener on {addr}: {e}"));
+            held.push(s);
+        }
     }
     use super::*;
     use crate::server_native::MonitorStream;
@@ -1761,7 +1807,8 @@ mod tests {
         }
 
         let source: DynSource = Arc::new(EmptySource);
-        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let socket =
+            Arc::new(AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind per-NIC"));
 
         // Bind the lo_mcast send/receive socket on an ephemeral port. It
         // joins 224.0.0.128 with IP_MULTICAST_LOOP=1, so it receives its
@@ -1879,7 +1926,8 @@ mod tests {
         }
 
         let source: DynSource = Arc::new(EmptySource);
-        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let socket =
+            Arc::new(AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind per-NIC"));
         // lo_mcast is joined to the forward group with IP_MULTICAST_LOOP=1,
         // so it would see any re-forward itself — no co-bound observer (and
         // no Windows-absent SO_REUSEPORT) required.
@@ -1972,7 +2020,8 @@ mod tests {
         }
 
         let source: DynSource = Arc::new(PresentSource);
-        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let socket =
+            Arc::new(AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind per-NIC"));
         // Bind a sniffer socket to the loopback NIC's own port so it
         // would catch any reply the responder tries to send back.
         // We use the NIC bundle's own addr as the simulated requester.
@@ -2066,7 +2115,8 @@ mod tests {
         }
 
         let source: DynSource = Arc::new(PresentSource);
-        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let socket =
+            Arc::new(AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind per-NIC"));
         // lo_mcast joins the forward group with IP_MULTICAST_LOOP=1, so it
         // catches any re-forward itself — no co-bound observer (and no
         // Windows-absent SO_REUSEPORT) required.
@@ -2300,7 +2350,8 @@ mod tests {
         // UDP search path: a broadcast SEARCH naming `server` must
         // produce no reply on the sniffer socket.
         let source: DynSource = Arc::new(server_src);
-        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let socket =
+            Arc::new(AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind per-NIC"));
         let sniffer = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("sniffer bind");

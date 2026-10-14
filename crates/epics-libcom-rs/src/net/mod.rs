@@ -43,6 +43,7 @@ use std::net::Ipv4Addr;
 
 #[cfg(tokio_backend)]
 pub mod async_udp_v4;
+pub mod fanout;
 #[cfg(not(epics_embedded_target))]
 pub mod iface_map;
 pub mod iface_v4;
@@ -65,12 +66,13 @@ pub mod search_udp;
 /// it.
 pub const ORIGIN_TAG_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
 
+pub use fanout::{PortOrigin, PortUse, bind_fanout};
 pub use iface_v4::{IfaceV4, broadcast_addrs, local_addr};
 pub use search_udp::{SearchDatagram, SearchUdpSocket, SearchUdpSocketV6};
 
 #[cfg(tokio_backend)]
 pub use async_udp_v4::{
-    AsyncUdpV4, PortUse, RecvMeta, enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket,
+    AsyncUdpV4, RecvMeta, enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket,
 };
 #[cfg(not(epics_embedded_target))]
 pub use iface_map::{IfaceInfo, IfaceMap};

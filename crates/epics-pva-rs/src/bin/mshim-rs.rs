@@ -35,7 +35,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 
 use clap::Parser;
-use epics_base_rs::net::IfaceMap;
+use epics_base_rs::net::{IfaceMap, PortOrigin, PortUse};
 use epics_pva_rs::cli;
 #[cfg(tokio_backend)]
 use epics_pva_rs::server_native::udp::ForwardableDatagram;
@@ -142,11 +142,6 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
 
 fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    {
-        let _ = sock.set_reuse_port(true);
-    }
     sock.set_broadcast(true)?;
     sock.set_nonblocking(true)?;
     // Multicast groups must bind 0.0.0.0; unicast/broadcast bind to
@@ -156,7 +151,7 @@ fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     } else {
         SocketAddr::new(ep.ip, ep.port)
     };
-    sock.bind(&bind_addr.into())?;
+    PortUse::Shared.bind(&sock, bind_addr, PortOrigin::Configured)?;
     if let IpAddr::V4(v4) = ep.ip
         && v4.is_multicast()
     {

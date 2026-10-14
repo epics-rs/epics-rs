@@ -40,16 +40,17 @@
 // redundant, and kept only so the census marker's count stays the reviewable
 // number it was; §4.2 UDP search, stage 3.)
 
-// RTEMS-EXEC-MODEL-ALLOW(4): this file does not build on the exec backend at
+// RTEMS-EXEC-MODEL-ALLOW(5): this file does not build on the exec backend at
 // all — `client_native/mod.rs` declares it `#[cfg(tokio_backend)]` because its
 // `UdpSocket::readable` waits need a reactor the exec backend has not got. The
-// four are counted, not run.
+// five are counted, not run.
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use epics_base_rs::net::{PortOrigin, PortUse};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -282,13 +283,9 @@ impl CollectorState {
         let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
         // `epicsSocketEnableAddressUseForDatagramFanout` (pvxs
-        // `udp_collector.cpp:136`): SO_REUSEADDR (+ SO_REUSEPORT on unix) so
-        // this wildcard listener can coexist with a co-located server's UDP
+        // `udp_collector.cpp:136`), applied at the bind below, so this
+        // wildcard listener can coexist with a co-located server's UDP
         // responder and with sibling collectors on the same port.
-        sock.set_reuse_address(true)?;
-        #[cfg(unix)]
-        sock.set_reuse_port(true)?;
-
         if is_v6 {
             // Keep the v6 collector v6-only; the v4 collector owns v4.
             sock.set_only_v6(true)?;
@@ -308,7 +305,7 @@ impl CollectorState {
         } else {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
         };
-        sock.bind(&bind_addr.into())?;
+        PortUse::Shared.bind(&sock, bind_addr, PortOrigin::Configured)?;
 
         let std_sock: std::net::UdpSocket = sock.into();
         let tokio_sock = UdpSocket::from_std(std_sock)?;
@@ -1067,6 +1064,33 @@ mod tests {
             "original destination must be recovered from ancillary data"
         );
         assert_eq!(got.src.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    /// A port-0 collector binds before its fanout options, so it never lands
+    /// on a number a same-user fanout socket holds and loses its datagrams to
+    /// that socket's reuse group (`epics_base_rs::net::bind_fanout`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_port_0_collector_never_takes_a_strangers_number() {
+        let mut theirs = HashSet::new();
+        let mut held = Vec::new();
+        for _ in 0..2000 {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(true).unwrap();
+            s.set_reuse_port(true).unwrap();
+            s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())
+                .unwrap();
+            theirs.insert(s.local_addr().unwrap().as_socket().unwrap().port());
+            held.push(s);
+        }
+        let mgr = UdpManager::new();
+        for _ in 0..200 {
+            let c = mgr
+                .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
+                .expect("bind collector");
+            let port = c.local_addr().unwrap().port();
+            assert!(!theirs.contains(&port), "collector on {port}, a stranger's");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

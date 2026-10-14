@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::net::AsyncUdpV4;
+use epics_base_rs::net::{AsyncUdpV4, PortUse};
 // The seam, not `tokio::time`: `exec_backend` is selected on a host build by
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and this module is compiled into one
 // — its gate is `not(epics_embedded_target)`, which is a different question.
@@ -99,9 +99,10 @@ pub fn build_search_targets(extra: &[SocketAddr]) -> Vec<SocketAddr> {
 
 /// Bind a per-NIC UDP socket bundle suitable for SEARCH: every NIC
 /// shares one ephemeral port so embedded `response_port` works
-/// regardless of which NIC delivers the IOC's reply.
+/// regardless of which NIC delivers the IOC's reply. `Exclusive`: pvxs binds
+/// its search socket with no reuse options (`client.cpp:578-590`).
 fn bind_broadcast_socket() -> PvaResult<AsyncUdpV4> {
-    AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
+    AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, true).map_err(PvaError::Io)
 }
 
 /// Send a SEARCH for `pv_name` and wait for a SEARCH_RESPONSE.

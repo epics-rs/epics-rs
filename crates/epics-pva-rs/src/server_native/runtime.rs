@@ -1,6 +1,6 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-// RTEMS-EXEC-MODEL-ALLOW(17): this file does not build on the exec backend -
+// RTEMS-EXEC-MODEL-ALLOW(16): this file does not build on the exec backend -
 // server_native/mod.rs declares it under #[cfg(tokio_backend)] mod runtime;.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -1336,59 +1336,9 @@ mod tcp_fallback_tests {
         drop(server);
     }
 
-    /// Boundary — an *ephemeral* `udp_port`. `bind_udp` stamps the kernel's
-    /// answer back onto `config.udp_port`, so by the time the v6 companion is
-    /// spawned the number looks exactly like a configured one. Setting
-    /// SO_REUSEADDR on it lets a stranger co-bind `[::]:port` — measured on
-    /// Linux, SO_REUSEADDR on both sides is enough to share a wildcard UDP
-    /// port — and take a share of this server's v6 SEARCHes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_ephemeral_v6_responder_port_cannot_be_co_bound() {
-        use crate::nt::typed::TypedNT;
-        use socket2::{Domain, Protocol, Socket, Type};
-        use std::net::{Ipv6Addr, SocketAddrV6};
-
-        let pv = crate::server_native::SharedPV::new();
-        pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();
-        let source = Arc::new(SharedSource::new());
-        source.add("V6:EPHEMERAL:PV", pv);
-
-        let config = PvaServerConfig {
-            tcp_port: 0,
-            udp_port: 0,
-            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            auto_beacon: false,
-            beacon_destinations: Vec::new(),
-            enable_ipv6_udp: true,
-            ..Default::default()
-        };
-        let server = PvaServer::start(source, config).expect("v6 udp server must start");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let report = server.report();
-        assert!(report.udp_v6_alive, "the v6 responder must be running");
-        assert_ne!(report.udp_port, 0, "the bound port must be reported");
-
-        let intruder = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
-        intruder.set_only_v6(true).expect("v6 only");
-        // Asks for everything a sharer could ask for, so the refusal is the
-        // responder's exclusive bind and not the intruder's own half-set.
-        intruder.set_reuse_address(true).expect("reuse addr");
-        #[cfg(unix)]
-        intruder.set_reuse_port(true).expect("reuse port");
-        let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, report.udp_port, 0, 0);
-        assert!(
-            intruder.bind(&addr.into()).is_err(),
-            "the v6 responder's ephemeral port {} must be exclusively owned; a \
-             second socket co-binding it would steal half the v6 SEARCHes",
-            report.udp_port
-        );
-        drop(server);
-    }
-
     /// Boundary — a *configured* `udp_port` keeps SO_REUSEADDR, so two PVA
     /// processes on one host can still both answer v6 SEARCHes on the
-    /// well-known port. This is what stops the fix above from being applied
-    /// to every v6 responder.
+    /// well-known port.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_configured_v6_responder_port_still_allows_co_bind() {
         use crate::nt::typed::TypedNT;

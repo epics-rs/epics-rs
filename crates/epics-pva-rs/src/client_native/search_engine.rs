@@ -4922,7 +4922,13 @@ mod tests {
 
         // Sniffer on loopback ephemeral. The engine will be told
         // about it via `extra_targets`.
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()
@@ -5101,7 +5107,13 @@ mod tests {
             // this test's poke before `hurry_up()` asks for it.
             ("EPICS_PVA_BROADCAST_PORT", &beacon_port),
         ]);
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()
@@ -5204,7 +5216,13 @@ mod tests {
             // engine on the 200 ms cadence and collapse the gaps measured here.
             ("EPICS_PVA_BROADCAST_PORT", &beacon_port),
         ]);
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()

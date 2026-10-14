@@ -258,7 +258,7 @@ impl SearchUdpSocketV6 {
 #[cfg(tokio_backend)]
 mod sys {
     use super::{SearchDatagram, SocketAddr, io};
-    use crate::net::async_udp_v4::AsyncUdpV4;
+    use crate::net::async_udp_v4::{AsyncUdpV4, PortUse};
 
     pub(super) struct Sock(AsyncUdpV4);
 
@@ -277,7 +277,8 @@ mod sys {
             // The exec arm has one port by construction; binding the bundle
             // this way makes `local_addrs().first()` a fact about the socket
             // on both arms rather than about which NIC happens to be first.
-            AsyncUdpV4::bind_ephemeral_same_port(broadcast).map(Self)
+            // No reuse options, as pvxs `searchTx4` and libca `udpiiu`.
+            AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, broadcast).map(Self)
         }
 
         pub(super) fn bind_beacon(
@@ -292,7 +293,8 @@ mod sys {
             // listener there would take half its inbound SEARCHes through the
             // kernel's REUSEPORT balancing. Beacons arrive on NIC subnet
             // broadcasts, never on the loopback address, so nothing is lost.
-            AsyncUdpV4::bind_non_loopback(port, true).map(Self)
+            // Fanout on any port, as a pvxs `UDPCollector`.
+            AsyncUdpV4::bind_non_loopback(port, PortUse::Shared, true).map(Self)
         }
 
         pub(super) fn join_multicast_v4(
@@ -397,10 +399,11 @@ mod sys {
         ) -> io::Result<Self> {
             let _ = (pump_name, pump_priority);
             let sock = new_v6_socket()?;
-            sock.set_reuse_address(true)?;
-            #[cfg(unix)]
-            sock.set_reuse_port(true)?;
-            sock.bind(&v6_bind_addr(port).into())?;
+            crate::net::fanout::PortUse::Shared.bind(
+                &sock,
+                v6_bind_addr(port),
+                crate::net::fanout::PortOrigin::Configured,
+            )?;
             Self::adopt(sock)
         }
 
@@ -474,6 +477,8 @@ mod sys {
 #[cfg(exec_backend)]
 mod sys {
     use super::{Ipv4Addr, SearchDatagram, SocketAddr, io};
+    #[cfg(unix)]
+    use crate::net::fanout::{PortOrigin, bind_fanout};
     use crate::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
     use std::net::UdpSocket;
     use std::sync::Arc;
@@ -775,11 +780,11 @@ mod sys {
     }
 
     /// An `AF_INET6` datagram socket bound to `[::]:port`, with `IPV6_V6ONLY`
-    /// — and, for a shared listener, `SO_REUSEADDR`/`SO_REUSEPORT` — set
-    /// **before** the bind, which is the only point at which they take effect.
+    /// set **before** the bind, which is the only point at which it takes
+    /// effect, and for a shared listener the reuse options ordered by
+    /// [`bind_fanout`].
     ///
-    /// Hand-rolled for that ordering, the same reason and the same sequence as
-    /// [`bind_shared_port`]. `IPV6_V6ONLY` is not optional here: without it a
+    /// Hand-rolled for that ordering, the same reason as [`bind_shared_port`]. `IPV6_V6ONLY` is not optional here: without it a
     /// dual-stack bind would take the v4-mapped copy of traffic the v4 SEARCH
     /// socket is already receiving, and the engine would see every reply twice.
     #[cfg(unix)]
@@ -794,26 +799,30 @@ mod sys {
         // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned.
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
         set_int_opt(&socket, sockopt::IPPROTO_IPV6, sockopt::IPV6_V6ONLY, 1)?;
-        if share {
-            set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-            set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
-        }
         // Zeroed rather than field-by-field: `sin6_len` exists on the BSD
         // targets and not on Linux, and all-zero is valid for both.
         // SAFETY: `sockaddr_in6` is plain-old-data.
         let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
         sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
         sin6.sin6_port = port.to_be();
-        // SAFETY: `sin6` is fully initialized and the length is exact.
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                std::ptr::addr_of!(sin6).cast(),
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )
+        let bind = || {
+            // SAFETY: `sin6` is fully initialized and the length is exact.
+            let rc = unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sin6).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        if share {
+            bind_fanout(port, PortOrigin::Configured, || set_fanout(&socket), bind)?;
+        } else {
+            bind()?;
         }
         Ok(socket)
     }
@@ -919,10 +928,9 @@ mod sys {
     /// Bind the wildcard address on a well-known port that a server on this
     /// host already holds.
     ///
-    /// Hand-rolled because `SO_REUSEADDR`/`SO_REUSEPORT` have to be set
-    /// *before* the bind and `std::net::UdpSocket::bind` binds as it
-    /// constructs. Same sequence, and the same reason, as the blocking CA
-    /// server's `bind_udp_search_socket`.
+    /// Hand-rolled because on a configured number `SO_REUSEADDR`/`SO_REUSEPORT`
+    /// have to be set *before* the bind ([`bind_fanout`]) and
+    /// `std::net::UdpSocket::bind` binds as it constructs.
     #[cfg(unix)]
     fn bind_shared_port(port: u16) -> io::Result<UdpSocket> {
         use std::os::fd::FromRawFd;
@@ -934,26 +942,39 @@ mod sys {
         // Owned immediately, so every early return below closes it via `Drop`.
         // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned.
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-        set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-        set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
         // Zeroed rather than field-by-field: `sin_len` exists on the BSD
         // targets and not on Linux, and all-zero is valid for both.
         // SAFETY: `sockaddr_in` is plain-old-data.
         let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         sin.sin_family = libc::AF_INET as libc::sa_family_t;
         sin.sin_port = port.to_be();
-        // SAFETY: `sin` is fully initialized and the length is exact.
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                std::ptr::addr_of!(sin).cast(),
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        bind_fanout(
+            port,
+            PortOrigin::Configured,
+            || set_fanout(&socket),
+            || {
+                // SAFETY: `sin` is fully initialized and the length is exact.
+                let rc = unsafe {
+                    libc::bind(
+                        fd,
+                        std::ptr::addr_of!(sin).cast(),
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            },
+        )?;
         Ok(socket)
+    }
+
+    /// `SO_REUSEADDR` + `SO_REUSEPORT`, both or the error.
+    #[cfg(unix)]
+    fn set_fanout(socket: &UdpSocket) -> io::Result<()> {
+        set_int_opt(socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+        set_int_opt(socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)
     }
 
     #[cfg(not(unix))]
@@ -1060,6 +1081,34 @@ mod tests {
             "a beacon listener must bind the port it was given; got {:?}",
             beacon.local_addrs()
         );
+    }
+
+    /// The search socket sets no reuse option, as pvxs `searchTx4` and libca
+    /// `udpiiu`: a fanout socket cannot join its port and take its replies.
+    #[epics_macros_rs::epics_test]
+    async fn a_fanout_socket_cannot_join_the_search_port() {
+        let sock = bind();
+        let addrs: Vec<SocketAddr> = sock
+            .local_addrs()
+            .into_iter()
+            .filter(|a| a.is_ipv4())
+            .collect();
+        assert!(!addrs.is_empty(), "an IPv4 SEARCH address");
+        for addr in addrs {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            assert!(
+                s.bind(&addr.into()).is_err(),
+                "a fanout socket joined {addr}"
+            );
+        }
     }
 
     /// Round-trip one datagram through the arm this build selected — the

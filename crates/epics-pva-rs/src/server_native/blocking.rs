@@ -161,6 +161,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use epics_base_rs::net::{PortOrigin, bind_fanout};
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::blocking_io::{
     DEFAULT_READ_CHUNK, is_socket_timeout, spawn_reader_pump, spawn_writer_pump,
@@ -1096,14 +1098,16 @@ const UDP_RECV_BUF: usize = 64 * 1024;
 /// is one of the three crates that do not cross to RTEMS (`mod.rs`) — the
 /// same reason CA's blocking driver hand-rolls its bind.
 ///
-/// `SO_REUSEADDR` + `SO_REUSEPORT` are set **before** bind for a well-known
-/// port so several PVA processes can share the search port, which is what
-/// pvxs does (`epicsSocketEnableAddressUseForDatagramFanout`, and see
-/// `udp_collector.cpp:140-151` for why the bind is wildcard rather than to the
-/// multicast address). An **ephemeral** port (`0`) is deliberately left bare:
-/// with the flags on, the kernel may join this socket to an unrelated reuse
-/// group and load-balance SEARCHes away from it — and because reuse means a
-/// collision does *not* fail, there would be no error to detect afterwards.
+/// `SO_REUSEADDR` + `SO_REUSEPORT` are set on every port, 0 included, as pvxs
+/// does for every `UDPCollector` socket
+/// (`epicsSocketEnableAddressUseForDatagramFanout`, `udp_collector.cpp:136`;
+/// see `:140-151` for why the bind is wildcard rather than to the multicast
+/// address) — after the bind on 0
+/// ([`epics_base_rs::net::bind_fanout`]). A pvxs client told an
+/// ephemeral port as its broadcast port binds its beacon receiver there with
+/// fanout, which a bare socket refuses. The cost pvxs accepts too: on a
+/// configured number a collision does *not* fail, so there is no error to
+/// detect afterwards.
 ///
 /// Nor is there a message to read. CA announces the same situation — a
 /// `cas WARNING: ... two or more servers share the same UDP port` from
@@ -1181,10 +1185,6 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     // Take ownership immediately so every early return closes the fd via Drop.
     // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned above.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-    if addr.port() != 0 {
-        set_reuse_opt(fd, libc::SO_REUSEADDR)?;
-        set_reuse_opt(fd, libc::SO_REUSEPORT)?;
-    }
     // Build sockaddr_in via zeroed to avoid touching platform-specific fields
     // (`sin_len`/`sin_zero`); s_addr and sin_port are network byte order.
     // SAFETY: `sockaddr_in` is a plain-old-data C struct; all-zero is a valid
@@ -1195,17 +1195,28 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     sin.sin_addr = libc::in_addr {
         s_addr: u32::from(*addr.ip()).to_be(),
     };
-    // SAFETY: `sin` is a fully-initialized sockaddr_in; the length is exact.
-    let rc = unsafe {
-        libc::bind(
-            fd,
-            &sin as *const libc::sockaddr_in as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    bind_fanout(
+        addr.port(),
+        PortOrigin::Configured,
+        || {
+            set_reuse_opt(fd, libc::SO_REUSEADDR)?;
+            set_reuse_opt(fd, libc::SO_REUSEPORT)
+        },
+        || {
+            // SAFETY: `sin` is a fully-initialized sockaddr_in; the length is exact.
+            let rc = unsafe {
+                libc::bind(
+                    fd,
+                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        },
+    )?;
     Ok(socket)
 }
 
@@ -3393,23 +3404,16 @@ pub(super) mod tests {
         stop_and_join(&server, accept);
     }
 
-    /// An ephemeral search port is bound *bare* — no `SO_REUSEADDR`/
-    /// `SO_REUSEPORT` — so a second bind on that number fails loudly instead
-    /// of silently joining a reuse group and load-balancing SEARCHes away.
-    /// That silent sharing is exactly the failure this rule prevents: with
-    /// the flags on there is no error to detect afterwards, and unlike CA
-    /// there is no `cas WARNING` printed either — nothing would report it.
+    /// An ephemeral search port takes a fanout co-bind, as a pvxs client's
+    /// beacon receiver on that port needs (`client.cpp:641-642`).
     #[test]
-    fn an_ephemeral_search_port_is_not_silently_shared() {
+    fn an_ephemeral_search_port_takes_a_fanout_co_bind() {
         let first = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("first bind");
         let port = first.local_addr().expect("addr").port();
         assert_ne!(port, 0, "an ephemeral bind resolves the port");
 
-        let second = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-        assert!(
-            second.is_err(),
-            "a second bind on an ephemeral port must fail, not silently share it"
-        );
+        bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+            .expect("a fanout bind on the ephemeral port");
     }
 
     /// The RTEMS driver's socket handles must be SHARED, never duplicated.

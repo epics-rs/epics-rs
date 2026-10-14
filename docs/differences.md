@@ -26,6 +26,12 @@ difference is either invisible to a client or is an improvement:
   linearly. epics-rs maps it onto a POSIX band offset, which keeps IOC threads
   correctly ordered against the high-priority libbsd network threads — the
   linear map does not.
+- **Fanout options on a chosen UDP port.** pvxs sets `SO_REUSEADDR` and
+  `SO_REUSEPORT` before every collector bind, port 0 included. Linux then may
+  hand `bind(0)` a number that another same-user fanout socket holds, and the
+  two share unicasts at random. On a number it picks, epics-rs binds first and
+  sets the options after, so a later fanout socket can still co-bind but the
+  pick is never a stranger's. A configured number is unchanged.
 
 Each one carries its reasoning in a comment at the site, not in a list here.
 Find them with `deliberate deviation` or `deliberate divergence`.

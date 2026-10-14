@@ -2991,7 +2991,13 @@ mod tests {
         // `AsyncUdpV4` directly, which is why these two tests stay
         // `tokio_backend`.
         use epics_base_rs::net::AsyncUdpV4;
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()
@@ -3100,7 +3106,13 @@ mod tests {
         // `AsyncUdpV4` directly, which is why these two tests stay
         // `tokio_backend`.
         use epics_base_rs::net::AsyncUdpV4;
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()

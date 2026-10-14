@@ -36,6 +36,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
+use super::fanout::{PortOrigin, PortUse};
+
 // The group literal itself is wire data, not a socket, and lives in
 // [`super::ORIGIN_TAG_MCAST_GROUP`] so RTEMS builds — which drop this
 // module — can still name it.
@@ -62,7 +64,8 @@ pub use super::ORIGIN_TAG_MCAST_GROUP;
 pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
-    // Same SO_REUSE* policy as the per-NIC bundle: required so a PVA
+    // Same SO_REUSE* policy as the per-NIC bundle, applied at the bind
+    // below: required so a PVA
     // server and client on the same host can both join the group.
     //
     // On every platform, Windows included: this is the socket pvxs builds
@@ -74,15 +77,11 @@ pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
     // Applying it here would stop a second local PVA process from joining
     // the ORIGIN_TAG channel on Windows.)
     //
-    // Set unconditionally, including for an ephemeral port — unlike the
-    // unicast sockets in `async_udp_v4`. Co-binding *is* the purpose of
-    // this helper (one listener takes an ephemeral port and publishes it,
-    // the others join that same port), and multicast group traffic is
-    // delivered to every joined socket rather than load-balanced across the
-    // reuse group, so sharing costs nothing here.
-    sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    sock.set_reuse_port(true)?;
+    // Set on an ephemeral port too: co-binding *is* the purpose of this
+    // helper (one listener takes an ephemeral port and publishes it, the
+    // others join that same port). On 0 they go on after the bind, so the
+    // first listener cannot land in a stranger's reuse group; see
+    // `PortUse::bind`.
 
     // Linux: don't let mcast packets that arrive on a different NIC
     // bleed into this socket. Mirrors libcom 51191e6155 — the kernel
@@ -94,7 +93,7 @@ pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
 
     sock.set_nonblocking(true)?;
     let bind_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
-    sock.bind(&bind_addr.into())?;
+    PortUse::Shared.bind(&sock, bind_addr, PortOrigin::Configured)?;
 
     // Receive side: join 224.0.0.128 on the loopback interface so the
     // kernel delivers forwarded packets to us.

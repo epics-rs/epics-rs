@@ -214,6 +214,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/the_ca_servers_set_tcp_nodelay_on_the_accepted_socket.rs",
     ),
     ("epics-ca-rs", "tests/tls_end_to_end.rs"),
+    ("epics-libcom-rs", "src/net/loopback_mcast.rs"),
     (
         "epics-ca-rs",
         "tests/zero_length_array_write_is_not_a_short_frame.rs",

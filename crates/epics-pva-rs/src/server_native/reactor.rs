@@ -86,7 +86,7 @@
 // -E 'test(/server_native::reactor::/)'`, 7/7).
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -96,7 +96,9 @@ use epics_base_rs::runtime::readiness::Poller;
 use epics_base_rs::runtime::task::{Reactor, TaskAbortHandle, enter_ioc_thread};
 use tracing::{debug, warn};
 
-use super::blocking::{PVA_SERVER_PRIORITY, handle_udp_search_blocking, tx_limit_bytes};
+use super::blocking::{
+    PVA_SERVER_PRIORITY, SearchSocket, handle_udp_search_blocking, tx_limit_bytes,
+};
 use super::config::PvaServerConfig;
 use super::peers::{PeerEntry, PeerRegistry};
 use super::search_engine::random_guid;
@@ -406,7 +408,7 @@ impl ReactorPvaServer {
     /// Blocks the calling thread and takes it to the UDP band, which is below
     /// the accept loop's — give it a *different* thread from
     /// [`serve`](Self::serve).
-    pub fn serve_udp_search(&self, socket: UdpSocket) -> PvaResult<()> {
+    pub fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()> {
         handle_udp_search_blocking(
             socket,
             &self.source,

@@ -139,11 +139,13 @@
 //!
 //! # Not here
 //!
-//! Beacons, the per-NIC send bundle, and the loopback-multicast ORIGIN_TAG
-//! forwarding channel: all three need the interface enumerator and the socket
-//! options that do not cross to RTEMS. A client that unicasts or broadcasts a
-//! SEARCH to this server's port is answered; one that relies on being told we
-//! exist is not, yet.
+//! Beacons and the per-NIC send bundle need the interface enumerator, and the
+//! loopback-multicast ORIGIN_TAG channel needs socket options, that do not
+//! cross to RTEMS or VxWorks (no `socket2` there), so an embedded build has no
+//! ORIGIN_TAG: every datagram is `Direct`. A client that unicasts or broadcasts
+//! a SEARCH to this server's port is answered; one that relies on being told we
+//! exist is not, yet. The hosted build joins the group on its one search socket
+//! ([`bind_udp_search`]).
 
 // RTEMS-EXEC-MODEL-ALLOW(18): checked - all 18 run and pass in the
 // exec-backend suite. The two inactivity-deadline tests were added to the
@@ -178,6 +180,8 @@ use super::peers::{ConnSlot, PeerEntry, PeerRegistry};
 use super::search_engine::{
     Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
 };
+#[cfg(not(epics_embedded_target))]
+use super::search_engine::{local_v4_addrs, route_search_socket_datagram};
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, TX_LIMIT_FALLBACK, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
@@ -829,7 +833,7 @@ impl BlockingPvaServer {
     /// listener. The caller then knows the search port is owned before any
     /// thread exists, and for an ephemeral port can read the number back off
     /// the socket it still holds.
-    pub fn serve_udp_search(&self, socket: UdpSocket) -> PvaResult<()> {
+    pub fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()> {
         handle_udp_search_blocking(
             socket,
             &self.source,
@@ -1115,8 +1119,40 @@ const UDP_RECV_BUF: usize = 64 * 1024;
 /// silently shared search port is invisible to the process that shared it.
 /// The only positive evidence of exclusive ownership is a client-side
 /// listing (`pvxlist`) that sees exactly the expected server.
-pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<UdpSocket> {
-    bind_udp_search_socket(addr)
+pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<SearchSocket> {
+    let socket = bind_udp_search_socket(addr)?;
+    // pvxs's `UDPCollector` is one wildcard socket that is also the ORIGIN_TAG
+    // channel (`udp_collector.cpp:124-151`). A second wildcard socket on this
+    // port would share its reuse group and take about half the unicast SEARCHes,
+    // so the search socket itself joins the group. A socket bound to one
+    // address cannot receive the group's datagrams, so it does not.
+    #[cfg(not(epics_embedded_target))]
+    let origin_tag = addr.ip().is_unspecified();
+    #[cfg(epics_embedded_target)]
+    let origin_tag = false;
+    #[cfg(not(epics_embedded_target))]
+    if origin_tag {
+        epics_base_rs::net::enable_loopback_mcast(socket2::SockRef::from(&socket));
+        #[cfg(target_os = "linux")]
+        enable_recv_pktinfo(&socket)?;
+    }
+    Ok(SearchSocket { socket, origin_tag })
+}
+
+/// The socket [`bind_udp_search`] bound, and whether it is also the pvxs
+/// ORIGIN_TAG channel: joined to `224.0.0.128` on loopback, so a unicast SEARCH
+/// is forwarded to the group and every local PVA server answers it, as in the
+/// tokio backend. Not on an embedded target, whose build has no `socket2`.
+pub struct SearchSocket {
+    socket: UdpSocket,
+    origin_tag: bool,
+}
+
+impl SearchSocket {
+    /// The bound address, the port to read back when 0 was asked for.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
 }
 
 /// `SO_SNDBUF × TCP_TX_LIMIT_MULT` for an accepted socket — the byte cap
@@ -1185,6 +1221,12 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     // Take ownership immediately so every early return closes the fd via Drop.
     // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned above.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+    // The wildcard socket is the ORIGIN_TAG channel: it takes only the group it
+    // joins, from the first datagram on.
+    #[cfg(not(epics_embedded_target))]
+    if addr.ip().is_unspecified() {
+        epics_base_rs::net::deny_unjoined_multicast(socket2::SockRef::from(&socket));
+    }
     // Build sockaddr_in via zeroed to avoid touching platform-specific fields
     // (`sin_len`/`sin_zero`); s_addr and sin_port are network byte order.
     // SAFETY: `sockaddr_in` is a plain-old-data C struct; all-zero is a valid
@@ -1227,6 +1269,180 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     UdpSocket::bind(addr)
 }
 
+/// Ask for each datagram's destination address and arrival interface, which
+/// [`recv_search_datagram`] reads (pvxs `sock.enable_IP_PKTINFO()`).
+#[cfg(target_os = "linux")]
+fn enable_recv_pktinfo(socket: &UdpSocket) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let on: libc::c_int = 1;
+    // SAFETY: `on` outlives the call and the length is its size.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Receive one datagram, and whether it came in on loopback addressed to the
+/// ORIGIN_TAG group: the only way pvxs honours a tag (`origin = Forwarded` at
+/// `udp_collector.cpp:278`; any other `CMD_ORIGIN_TAG` is ignored, `:522`).
+///
+/// Linux reads it from the `IP_PKTINFO` that [`bind_udp_search`] enabled. A
+/// platform without that receive path cannot tell, and reports every datagram
+/// as having come through the group, so a tag sent to the unicast port is
+/// honoured there.
+fn recv_search_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    origin_tag: bool,
+) -> io::Result<(usize, SocketAddr, bool)> {
+    #[cfg(target_os = "linux")]
+    if origin_tag {
+        return recv_with_pktinfo(socket, buf);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = origin_tag;
+    let (len, src) = socket.recv_from(buf)?;
+    Ok((len, src, true))
+}
+
+#[cfg(target_os = "linux")]
+fn recv_with_pktinfo(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, bool)> {
+    use std::mem::{size_of, zeroed};
+    use std::os::fd::AsRawFd;
+    use std::sync::OnceLock;
+
+    static LOOPBACK_IFINDEX: OnceLock<u32> = OnceLock::new();
+    // SAFETY: `c"lo"` is NUL-terminated.
+    let lo = *LOOPBACK_IFINDEX.get_or_init(|| unsafe { libc::if_nametoindex(c"lo".as_ptr()) });
+
+    // SAFETY: every pointer handed to `recvmsg` points at a local that outlives
+    // the call, `control` is `CMSG_SPACE` of the one `in_pktinfo` expected and
+    // 8-aligned for `cmsghdr`, and the cmsg walk stays inside `msg_controllen`.
+    unsafe {
+        let mut addr: libc::sockaddr_in = zeroed();
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let cmsg_space = libc::CMSG_SPACE(size_of::<libc::in_pktinfo>() as u32) as usize;
+        let mut control = vec![0u64; cmsg_space.div_ceil(size_of::<u64>())];
+        let mut msg: libc::msghdr = zeroed();
+        msg.msg_name = &mut addr as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_space as _;
+        let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut via_group = false;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_PKTINFO {
+                let info = std::ptr::read(libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo);
+                let dst = Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr));
+                via_group = lo != 0
+                    && info.ipi_ifindex as u32 == lo
+                    && dst == epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP;
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+        let src = SocketAddr::from((
+            Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+            u16::from_be(addr.sin_port),
+        ));
+        Ok((n as usize, src, via_group))
+    }
+}
+
+/// Send a SEARCH reply from `socket`, with `iface_ip` as its source address
+/// when the decode named one (`udp_collector.cpp:514-518` pins a tagged
+/// SEARCH's reply to the tag's address). One wildcard socket has no per-NIC
+/// socket to pin with, so the source goes in an `IP_PKTINFO` control message.
+///
+/// Only Linux does this. Elsewhere the OS picks the source from the route to
+/// `dest`, which differs from the tag's address only for a multi-homed host
+/// replying to a peer that its routing table reaches through another NIC.
+fn send_search_reply(
+    socket: &UdpSocket,
+    bytes: &[u8],
+    dest: SocketAddr,
+    iface_ip: Option<Ipv4Addr>,
+) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    if let (Some(src), SocketAddr::V4(dest)) = (iface_ip, dest) {
+        return send_from_v4(socket, bytes, dest, src);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = iface_ip;
+    socket.send_to(bytes, dest)
+}
+
+#[cfg(target_os = "linux")]
+fn send_from_v4(
+    socket: &UdpSocket,
+    bytes: &[u8],
+    dest: SocketAddrV4,
+    src: Ipv4Addr,
+) -> io::Result<usize> {
+    use std::mem::{size_of, zeroed};
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: every pointer handed to `sendmsg` points at a local that
+    // outlives the call, and `cmsg_space` is the `CMSG_SPACE` of the one
+    // `in_pktinfo` this fills.
+    unsafe {
+        let mut addr: libc::sockaddr_in = zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = dest.port().to_be();
+        addr.sin_addr.s_addr = u32::from(*dest.ip()).to_be();
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        let cmsg_space = libc::CMSG_SPACE(size_of::<libc::in_pktinfo>() as u32) as usize;
+        // u64 elements give the control buffer the alignment `cmsghdr` needs.
+        let mut control = vec![0u64; cmsg_space.div_ceil(size_of::<u64>())];
+        let mut msg: libc::msghdr = zeroed();
+        msg.msg_name = &mut addr as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_space as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::IPPROTO_IP;
+        (*cmsg).cmsg_type = libc::IP_PKTINFO;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as _;
+        let info = libc::in_pktinfo {
+            ipi_ifindex: 0,
+            ipi_spec_dst: libc::in_addr {
+                s_addr: u32::from(src).to_be(),
+            },
+            ipi_addr: libc::in_addr { s_addr: 0 },
+        };
+        std::ptr::write(libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo, info);
+        let n = libc::sendmsg(socket.as_raw_fd(), &msg, 0);
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
 /// Answer UDP SEARCHes on one socket until `shutdown` is set.
 ///
 /// The decode is [`process_search_datagram`] — the same function the hosted
@@ -1235,31 +1451,57 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
 /// `MustReply`-with-no-matches reply that lets `pvlist` see this server at all.
 /// This loop owns only the socket: recv, filter, decode, send.
 ///
-/// Three arguments the hosted responder computes per NIC are fixed here, and
-/// each is a *structural* consequence of having one wildcard socket and no
-/// interface enumerator, not a simplification:
+/// Two arguments the hosted responder computes per NIC are fixed here, because
+/// there is one wildcard socket and not a bundle:
 ///
-/// * `reply_iface_ip = UNSPECIFIED` — there is no per-NIC bundle to pin a
-///   reply to, so the decode resolves `iface_hint` to `None` and the OS routes.
-/// * `origin = Direct` — datagrams arrive on the search socket itself, never
-///   peeled out of an ORIGIN_TAG prefix.
-/// * `origin_tag_forwarding = false` — no loopback multicast socket is bound,
-///   so no forward can be emitted.
+/// * `reply_iface_ip` — `UNSPECIFIED` for what arrives on the socket, so the
+///   decode resolves `iface_hint` to `None` and the OS routes. For a datagram
+///   peeled out of an ORIGIN_TAG prefix it is the tag's address, and the reply
+///   leaves with that source address ([`send_search_reply`]).
+/// * `origin` — `Direct` for what arrives on the socket, `FromOriginTag` for a
+///   datagram peeled out of an ORIGIN_TAG prefix. A [`SearchSocket`] is joined
+///   to the group, so it receives the tagged copies of its own forwards.
 pub(super) fn handle_udp_search_blocking(
-    socket: UdpSocket,
+    socket: SearchSocket,
     source: &DynSource,
     config: &PvaServerConfig,
     tcp_port: u16,
     shutdown: &AtomicBool,
 ) -> PvaResult<()> {
+    // The origin-locality set of a tagged datagram (pvxs `ifinfo.byAddr`),
+    // taken once like the hosted responder's.
+    #[cfg(not(epics_embedded_target))]
+    let local_v4 = if socket.origin_tag {
+        local_v4_addrs()
+    } else {
+        Default::default()
+    };
+    #[cfg(epics_embedded_target)]
+    let local_v4 = Default::default();
+    answer_udp_search(socket, source, config, tcp_port, shutdown, local_v4)
+}
+
+/// [`handle_udp_search_blocking`] with the local address set given, so a test
+/// can name an address no interface enumeration would return.
+fn answer_udp_search(
+    socket: SearchSocket,
+    source: &DynSource,
+    config: &PvaServerConfig,
+    tcp_port: u16,
+    shutdown: &AtomicBool,
+    local_v4: std::collections::HashSet<Ipv4Addr>,
+) -> PvaResult<()> {
+    let SearchSocket { socket, origin_tag } = socket;
     socket
         .set_read_timeout(Some(UDP_STOP_TICK))
         .map_err(PvaError::Io)?;
     let _ = enter_ioc_thread(PVA_UDP_PRIORITY);
     let mut buf = vec![0u8; UDP_RECV_BUF];
+    #[cfg(epics_embedded_target)]
+    let _ = &local_v4;
 
     while !shutdown.load(Ordering::Acquire) {
-        let (len, src) = match socket.recv_from(&mut buf) {
+        let (len, src, via_group) = match recv_search_datagram(&socket, &mut buf, origin_tag) {
             Ok(v) => v,
             // The stop tick fired; nothing arrived. Re-check the flag.
             Err(ref e) if is_socket_timeout(e.kind()) => continue,
@@ -1281,17 +1523,32 @@ pub(super) fn handle_udp_search_blocking(
             continue;
         }
 
+        #[cfg(not(epics_embedded_target))]
+        let routed = if origin_tag {
+            route_search_socket_datagram(&buf[..len], &local_v4, via_group)
+        } else {
+            Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct))
+        };
+        // An embedded build has no ORIGIN_TAG, so nothing asks where it arrived.
+        #[cfg(epics_embedded_target)]
+        let _ = via_group;
+        #[cfg(epics_embedded_target)]
+        let routed = Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct));
+        let Some((frame, reply_iface_ip, origin)) = routed else {
+            continue;
+        };
+
         // The decode's only suspension point is the source name lookup. On
         // RTEMS `block_on_sync` parks this thread; on a host test it does the
         // same, since this loop owns its thread outright.
         let outputs = match block_on_sync(process_search_datagram(
             source,
-            false,
+            origin_tag,
             config.udp_port,
-            &buf[..len],
+            frame,
             src,
-            Ipv4Addr::UNSPECIFIED,
-            Origin::Direct,
+            reply_iface_ip,
+            origin,
             tcp_port,
             config.guid,
             "tcp",
@@ -1307,20 +1564,22 @@ pub(super) fn handle_udp_search_blocking(
 
         for out in outputs {
             match out {
-                SearchOutput::Reply { dest, bytes, .. } => {
-                    // `iface_hint` is `None` by construction here (see the
-                    // `reply_iface_ip` note above), so there is no NIC to pin
-                    // and nothing to branch on.
-                    if let Err(e) = socket.send_to(&bytes, dest) {
+                SearchOutput::Reply {
+                    dest,
+                    bytes,
+                    iface_hint,
+                } => {
+                    if let Err(e) = send_search_reply(&socket, &bytes, dest, iface_hint) {
                         debug!(%dest, error = %e, "blocking UDP SEARCH reply send failed");
                     }
                 }
-                // Unreachable while `origin_tag_forwarding` is false, which
-                // this responder passes unconditionally. Logged rather than
-                // silently dropped, as the hosted dispatcher does for its own
-                // unreachable arm.
-                SearchOutput::OriginTagForward { dest, .. } => {
-                    warn!(%dest, "blocking UDP responder produced an ORIGIN_TAG forward with no loopback multicast socket bound");
+                // Produced only for `origin_tag`, and then the socket is a
+                // member of the group, so the send loops back into this
+                // responder and every local peer.
+                SearchOutput::OriginTagForward { dest, bytes } => {
+                    if let Err(e) = socket.send_to(&bytes, dest) {
+                        debug!(%dest, error = %e, "blocking UDP ORIGIN_TAG forward failed");
+                    }
                 }
             }
         }
@@ -3107,6 +3366,360 @@ pub(super) mod tests {
         )
         .expect("UDP responder thread spawned");
         (server, search_addr, accept, udp)
+    }
+
+    /// Start the responder on a socket the test bound, with `config` stamped
+    /// with the port that socket holds — the number a forward is addressed to.
+    #[allow(clippy::type_complexity)]
+    fn start_udp_responder_on(
+        socket: SearchSocket,
+        mut config: PvaServerConfig,
+    ) -> (
+        Arc<BlockingPvaServer>,
+        thread::JoinHandle<()>,
+        thread::JoinHandle<()>,
+    ) {
+        config.udp_port = socket.local_addr().expect("search addr").port();
+        let (server, accept) = start_server(config);
+        let responding = server.clone();
+        let udp = spawn_dedicated_thread(
+            "test-PVAS-udp".into(),
+            PVA_UDP_PRIORITY,
+            StackSizeClass::Medium,
+            move || {
+                responding.serve_udp_search(socket).expect("UDP responder");
+            },
+        )
+        .expect("UDP responder thread spawned");
+        (server, accept, udp)
+    }
+
+    /// [`start_udp_responder_on`] with the local address set the responder
+    /// checks a tag against given, not enumerated.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::type_complexity)]
+    fn start_udp_responder_with_locals(
+        socket: SearchSocket,
+        mut config: PvaServerConfig,
+        locals: &[Ipv4Addr],
+    ) -> (
+        Arc<BlockingPvaServer>,
+        thread::JoinHandle<()>,
+        thread::JoinHandle<()>,
+    ) {
+        config.udp_port = socket.local_addr().expect("search addr").port();
+        let (server, accept) = start_server(config);
+        let responding = server.clone();
+        let locals: std::collections::HashSet<Ipv4Addr> = locals.iter().copied().collect();
+        let udp = spawn_dedicated_thread(
+            "test-PVAS-udp".into(),
+            PVA_UDP_PRIORITY,
+            StackSizeClass::Medium,
+            move || {
+                answer_udp_search(
+                    socket,
+                    &responding.source,
+                    &responding.config,
+                    responding.tcp_port,
+                    &responding.shutdown,
+                    locals,
+                )
+                .expect("UDP responder");
+            },
+        )
+        .expect("UDP responder thread spawned");
+        (server, accept, udp)
+    }
+
+    fn wildcard_search_socket() -> (SearchSocket, u16) {
+        let socket = bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+            .expect("bind the wildcard search socket");
+        let port = socket.local_addr().expect("search addr").port();
+        (socket, port)
+    }
+
+    /// The ORIGIN_TAG channel is joined when `bind_udp_search` returns, as
+    /// pvxs's `UDPCollector` is in the `Server` constructor: a SEARCH sent to
+    /// the group before the responder thread first runs is still answered.
+    #[test]
+    fn the_origin_tag_group_is_joined_when_the_bind_returns() {
+        let (socket, port) = wildcard_search_socket();
+        // Another process on the host may hold the group and make a wildcard
+        // socket receive it anyway; this socket's own membership is what the
+        // kernel option below shows.
+        #[cfg(target_os = "linux")]
+        assert!(
+            !socket2::SockRef::from(&socket.socket)
+                .multicast_all_v4()
+                .expect("IP_MULTICAST_ALL"),
+            "the search socket must take only the groups it joined"
+        );
+        let client = SearchClient::new();
+        socket2::SockRef::from(&client.0)
+            .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+            .expect("requester multicast interface");
+        let codec = PvaCodec { big_endian: false };
+        client.send(
+            &codec.build_search(3, 9, "dut", [127, 0, 0, 1], client.port(), false),
+            SocketAddr::from((epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, port)),
+        );
+
+        let (server, accept, udp) = start_udp_responder_on(socket, isolated_config());
+        let reply = client.recv();
+        let header = PvaHeader::decode(&mut Cursor::new(&reply)).expect("reply header");
+        assert_eq!(header.command, Command::SearchResponse.code());
+        stop_all(&server, accept, udp);
+    }
+
+    /// A unicast-flagged SEARCH is forwarded to the group and answered from
+    /// the copy that loops back, as the hosted responder's is.
+    #[test]
+    fn a_unicast_search_is_forwarded_through_the_group_and_answered() {
+        let (socket, port) = wildcard_search_socket();
+        let (server, accept, udp) = start_udp_responder_on(socket, isolated_config());
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+        client.send(
+            &codec.build_search(5, 11, "dut", [127, 0, 0, 1], client.port(), true),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        );
+        let reply = client.recv();
+        let golden = build_search_response_proto(
+            server.guid(),
+            5,
+            server.tcp_port(),
+            &[11],
+            ByteOrder::Little,
+            "tcp",
+        );
+        assert_eq!(reply, golden);
+        stop_all(&server, accept, udp);
+    }
+
+    /// Two servers on one port: the one the kernel hands the unicast datagram
+    /// forwards it to the group, so both answer. Without the forward only the
+    /// recipient replies, and a client of the other server never hears it.
+    #[test]
+    fn a_unicast_search_reaches_every_server_sharing_the_port() {
+        let (first, port) = wildcard_search_socket();
+        let second = bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+            .expect("bind the second search socket on the shared port");
+        let (server_a, accept_a, udp_a) = start_udp_responder_on(first, isolated_config());
+        let (server_b, accept_b, udp_b) = start_udp_responder_on(second, isolated_config());
+        assert_ne!(server_a.guid(), server_b.guid());
+
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+        client.send(
+            &codec.build_search(7, 13, "dut", [127, 0, 0, 1], client.port(), true),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        );
+        let golden = |server: &BlockingPvaServer| {
+            build_search_response_proto(
+                server.guid(),
+                7,
+                server.tcp_port(),
+                &[13],
+                ByteOrder::Little,
+                "tcp",
+            )
+        };
+        let mut replies = [client.recv(), client.recv()];
+        let mut expected = [golden(&server_a), golden(&server_b)];
+        replies.sort();
+        expected.sort();
+        assert_eq!(replies, expected);
+        stop_all(&server_a, accept_a, udp_a);
+        stop_all(&server_b, accept_b, udp_b);
+    }
+
+    /// A requester that sends to the group over loopback, as a forwarding
+    /// peer does.
+    fn group_client() -> SearchClient {
+        let client = SearchClient::new();
+        socket2::SockRef::from(&client.0)
+            .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+            .expect("requester multicast interface");
+        client
+    }
+
+    /// Send a SEARCH carrying `reply_addr`, behind a tag naming `origin`, to
+    /// the group of a fresh wildcard responder; the reply, if any, goes to
+    /// the returned client.
+    fn tagged_search_via_group(
+        origin: Ipv4Addr,
+        reply_addr: [u8; 4],
+        seq: u32,
+        id: u32,
+    ) -> (
+        SearchClient,
+        Arc<BlockingPvaServer>,
+        thread::JoinHandle<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let (socket, port) = wildcard_search_socket();
+        let (server, accept, udp) = start_udp_responder_on(socket, isolated_config());
+        let client = group_client();
+        let codec = PvaCodec { big_endian: false };
+        let mut datagram = PvaCodec::build_origin_tag_prefix(origin).to_vec();
+        datagram.extend_from_slice(&codec.build_search(
+            seq,
+            id,
+            "dut",
+            reply_addr,
+            client.port(),
+            false,
+        ));
+        client.send(
+            &datagram,
+            SocketAddr::from((epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, port)),
+        );
+        (client, server, accept, udp)
+    }
+
+    /// A tag naming a local address is peeled and the SEARCH answered.
+    #[test]
+    fn a_tag_naming_a_local_address_is_answered() {
+        let (client, server, accept, udp) =
+            tagged_search_via_group(Ipv4Addr::LOCALHOST, [127, 0, 0, 1], 8, 14);
+        let reply = client.recv();
+        let header = PvaHeader::decode(&mut Cursor::new(&reply)).expect("reply header");
+        assert_eq!(header.command, Command::SearchResponse.code());
+        stop_all(&server, accept, udp);
+    }
+
+    /// A forwarded SEARCH that asks for the reply to go to its sender can
+    /// never be answered, and pvxs ignores it (`udp_collector.cpp:367-371`).
+    #[test]
+    fn a_tagged_search_with_a_wildcard_reply_address_gets_no_reply() {
+        let (client, server, accept, udp) =
+            tagged_search_via_group(Ipv4Addr::LOCALHOST, [0, 0, 0, 0], 9, 15);
+        client.expect_silence();
+        stop_all(&server, accept, udp);
+    }
+
+    /// pvxs honours a tag only on a packet that arrived on loopback addressed
+    /// to the group (`udp_collector.cpp:278`, `:522`); the same tagged SEARCH
+    /// sent to the unicast port is ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tagged_search_sent_to_the_unicast_port_gets_no_reply() {
+        let (socket, port) = wildcard_search_socket();
+        let (server, accept, udp) = start_udp_responder_on(socket, isolated_config());
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+        let mut datagram = PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+        datagram.extend_from_slice(&codec.build_search(
+            11,
+            17,
+            "dut",
+            [127, 0, 0, 1],
+            client.port(),
+            false,
+        ));
+        client.send(&datagram, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        client.expect_silence();
+        stop_all(&server, accept, udp);
+    }
+
+    /// The reply to a tagged SEARCH leaves with the tag's address as its
+    /// source (`udp_collector.cpp:514-518`). `127.0.0.2` is local to every
+    /// Linux host and is not what the route to `127.0.0.1` would pick.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_reply_to_a_tagged_search_comes_from_the_tag_address() {
+        let tag = Ipv4Addr::new(127, 0, 0, 2);
+        let (socket, port) = wildcard_search_socket();
+        let (server, accept, udp) =
+            start_udp_responder_with_locals(socket, isolated_config(), &[tag]);
+        let client = group_client();
+        let codec = PvaCodec { big_endian: false };
+        let mut datagram = PvaCodec::build_origin_tag_prefix(tag).to_vec();
+        datagram.extend_from_slice(&codec.build_search(
+            12,
+            18,
+            "dut",
+            [127, 0, 0, 1],
+            client.port(),
+            false,
+        ));
+        client.send(
+            &datagram,
+            SocketAddr::from((epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, port)),
+        );
+        let mut buf = [0u8; 1500];
+        let (_, from) = client.0.recv_from(&mut buf).expect("SEARCH_RESPONSE");
+        assert_eq!(from.ip(), IpAddr::from(tag));
+        stop_all(&server, accept, udp);
+    }
+
+    /// A tag naming an address that is not one of ours was forwarded by
+    /// something else (`udp_collector.cpp:527-533`).
+    #[test]
+    fn a_tagged_search_naming_a_non_local_origin_gets_no_reply() {
+        let (client, server, accept, udp) =
+            tagged_search_via_group(Ipv4Addr::new(203, 0, 113, 7), [127, 0, 0, 1], 10, 16);
+        client.expect_silence();
+        stop_all(&server, accept, udp);
+    }
+
+    /// A pinned reply leaves with the pinned source address, an unpinned one
+    /// with whatever the route gives; `127.0.0.2` is not what the route to
+    /// `127.0.0.1` picks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pinned_search_reply_carries_the_pinned_source_address() {
+        let sender = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("sender bind");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client bind");
+        client
+            .set_read_timeout(Some(RETIRE_BOUND))
+            .expect("client read timeout");
+        let to = client.local_addr().expect("client addr");
+        let mut buf = [0u8; 8];
+
+        send_search_reply(&sender, b"pinned", to, Some(Ipv4Addr::new(127, 0, 0, 2)))
+            .expect("pinned send");
+        let (n, from) = client.recv_from(&mut buf).expect("pinned reply");
+        assert_eq!(&buf[..n], b"pinned");
+        assert_eq!(from.ip(), IpAddr::from(Ipv4Addr::new(127, 0, 0, 2)));
+
+        send_search_reply(&sender, b"routed", to, None).expect("unpinned send");
+        let (n, from) = client.recv_from(&mut buf).expect("unpinned reply");
+        assert_eq!(&buf[..n], b"routed");
+        assert_eq!(from.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+    }
+
+    /// A socket bound to one address cannot receive the group, so it does not
+    /// forward: a unicast-flagged SEARCH is answered directly, not lost to a
+    /// forward nobody receives.
+    #[test]
+    fn a_socket_bound_to_one_address_answers_a_unicast_search_directly() {
+        let (server, search_addr, accept, udp) = start_udp_responder(isolated_config());
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+        client.send(
+            &codec.build_search(6, 12, "dut", [127, 0, 0, 1], client.port(), true),
+            search_addr,
+        );
+        let reply = client.recv();
+        let header = PvaHeader::decode(&mut Cursor::new(&reply)).expect("reply header");
+        assert_eq!(header.command, Command::SearchResponse.code());
+        stop_all(&server, accept, udp);
+    }
+
+    /// pvxs throws out of the `Server` constructor when the collector cannot
+    /// bind (`udp_collector.cpp:151`). A stranger on 127.0.0.2:P without reuse
+    /// flags refuses the wildcard bind on P.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_origin_tag_bind_fails_the_start() {
+        let holder = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).expect("holder");
+        let port = holder.local_addr().expect("holder addr").port();
+        let err = bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).err();
+        assert!(
+            matches!(&err, Some(e) if e.kind() == io::ErrorKind::AddrInUse),
+            "{err:?}"
+        );
     }
 
     fn stop_all(

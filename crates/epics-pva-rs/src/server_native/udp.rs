@@ -18,7 +18,6 @@ use epics_base_rs::net::{
 };
 use tracing::{debug, warn};
 
-use crate::codec::PvaCodec;
 use crate::config::Endpoint;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
@@ -43,7 +42,8 @@ use super::search::{SearchRequest, build_search_response_proto, parse_search_req
 // resolving, including this module's own tests.
 pub use super::search_engine::random_guid;
 pub(crate) use super::search_engine::{
-    Origin, SearchOutput, filter_inbound, process_search_datagram, search_matched_cids,
+    LoopbackClass, Origin, SearchOutput, classify_loopback_datagram, filter_inbound,
+    local_v4_addrs, process_search_datagram, search_matched_cids,
 };
 
 /// PR #205 IPv6 Stage 5: bind a v6-only ephemeral UDP socket used to
@@ -1109,102 +1109,6 @@ fn build_beacon(
     out
 }
 
-/// Classification of a datagram arriving on the loopback `CMD_ORIGIN_TAG`
-/// multicast socket, mirroring pvxs `udp_collector.cpp::process_one`,
-/// which inspects the FIRST PVA header and routes by command *before*
-/// any SEARCH matching:
-///
-/// - a malformed `CMD_ORIGIN_TAG` is dropped (`:501-506`);
-/// - a valid tag whose origin is wildcard or a local interface address
-///   is processed as `OriginTag` (`:508-525`);
-/// - a tag carrying a non-local origin is warned and dropped (`:527-533`);
-/// - a bare (unprefixed) `CMD_SEARCH` is tolerated and processed as
-///   `Forwarded` (`:401-404`).
-///
-/// The prior
-/// `try_peel_origin_tag(raw) == None` branch collapsed "malformed tag"
-/// and "bare SEARCH" into a single `Origin::Forwarded` path. Because
-/// `process_search_datagram` then drains the datagram header-by-header, a
-/// `[malformed ORIGIN_TAG][valid SEARCH]` packet skipped the bad tag and
-/// still reached the SEARCH matcher — pvxs stops at the malformed tag.
-#[derive(Debug, PartialEq, Eq)]
-enum LoopbackClass<'a> {
-    /// First message is a valid `CMD_ORIGIN_TAG`; process `inner` as
-    /// `Origin::FromOriginTag` with the reply pinned to `reply_iface_ip`
-    /// (the `UNSPECIFIED` sentinel when the tag carried the wildcard
-    /// origin, leaving the reply NIC to OS routing).
-    OriginTag {
-        reply_iface_ip: Ipv4Addr,
-        inner: &'a [u8],
-    },
-    /// First message is a bare `CMD_SEARCH` with no tag; process the
-    /// whole datagram as `Origin::Forwarded`.
-    BareSearch,
-    /// Malformed tag, non-local origin tag, or any non-SEARCH first
-    /// header — dropped like pvxs.
-    Drop,
-}
-
-/// Snapshot the host's IPv4 interface addresses for the loopback
-/// origin-locality check (pvxs caches the same set as `ifinfo.byAddr`).
-/// Taken once at responder startup like the beacon destinations — a NIC
-/// added later needs a server restart to be recognised.
-fn local_v4_addrs() -> HashSet<Ipv4Addr> {
-    let mut set = HashSet::new();
-    if let Ok(ifaces) = if_addrs::get_if_addrs() {
-        for iface in ifaces {
-            if let if_addrs::IfAddr::V4(v4) = iface.addr {
-                set.insert(v4.ip);
-            }
-        }
-    }
-    set
-}
-
-/// Classify a loopback `CMD_ORIGIN_TAG` socket datagram by its first PVA
-/// header. See [`LoopbackClass`] for the pvxs parity rules this enforces.
-fn classify_loopback_datagram<'a>(
-    raw: &'a [u8],
-    local_v4: &HashSet<Ipv4Addr>,
-) -> LoopbackClass<'a> {
-    // pvxs reads exactly one header before its command switch and drops
-    // any control or segmented UDP datagram up front
-    // (`udp_collector.cpp:332-340`).
-    let Ok(header) = PvaHeader::decode(&mut Cursor::new(raw)) else {
-        return LoopbackClass::Drop;
-    };
-    if header.flags.is_control() || !header.flags.unsegmented() {
-        return LoopbackClass::Drop;
-    }
-    if header.command == Command::OriginTag.code() {
-        match PvaCodec::try_peel_origin_tag(raw) {
-            // Wildcard origin (0.0.0.0 / ::): valid forward, no per-NIC
-            // info — accept and leave the reply NIC to OS routing.
-            Some((None, inner)) => LoopbackClass::OriginTag {
-                reply_iface_ip: Ipv4Addr::UNSPECIFIED,
-                inner,
-            },
-            // Concrete origin: accept only when it names one of our own
-            // interface addresses (pvxs `ifinfo.byAddr.find(originaddr)`).
-            Some((Some(v4), inner)) if local_v4.contains(&v4) => LoopbackClass::OriginTag {
-                reply_iface_ip: v4,
-                inner,
-            },
-            // Concrete but non-local origin (spoofed/foreign tag): drop.
-            Some((Some(_), _)) => LoopbackClass::Drop,
-            // Malformed tag (too short, payload_length < 16, truncated):
-            // drop — do NOT fall back to a bare forwarded SEARCH.
-            None => LoopbackClass::Drop,
-        }
-    } else if header.command == Command::Search.code() {
-        LoopbackClass::BareSearch
-    } else {
-        // Any other first header (BEACON, etc.) is not part of the
-        // loopback SEARCH-forwarding contract — drop.
-        LoopbackClass::Drop
-    }
-}
-
 /// A decoded BEACON, holding only the fields the multicast shim
 /// re-emits. pvxs forwards a beacon by writing guid, a zeroed
 /// flags/seq/change word, the (resolved) server address + TCP port, the
@@ -1453,6 +1357,7 @@ fn rebuild_beacon_forward(b: &BeaconForward, source: SocketAddr) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use crate::codec::PvaCodec;
     thread_local! {
         /// Called with each number `bind_udp` is about to bind on v6.
         pub(super) static BEFORE_V6_BIND: std::cell::RefCell<Option<Box<dyn FnMut(u16)>>> =
@@ -1712,6 +1617,41 @@ mod tests {
         )
         .await;
         dispatch_search_outputs(socket, lo_mcast, outputs).await;
+    }
+
+    /// A reply carrying an `iface_hint` leaves from that NIC's socket, not
+    /// from whichever one `send_to` picks for the destination. The bundle
+    /// holds two loopback addresses that are not enumerated NICs, so the
+    /// source address the requester sees names the socket used.
+    #[cfg(tokio_backend)]
+    #[epics_macros_rs::epics_test]
+    async fn a_reply_with_an_iface_hint_leaves_from_that_nics_socket() {
+        let first = Ipv4Addr::new(127, 0, 0, 2);
+        let second = Ipv4Addr::new(127, 0, 0, 3);
+        let bundle = AsyncUdpV4::bind_on_interfaces(&[first, second], 0, PortUse::Shared, false)
+            .expect("bundle on two loopback addresses");
+        let requester = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("requester bind");
+        let dest = requester.local_addr().unwrap();
+        let reply = |iface_hint| SearchOutput::Reply {
+            dest,
+            iface_hint,
+            bytes: vec![1, 2, 3],
+        };
+        let mut buf = [0u8; 8];
+
+        dispatch_search_outputs(&bundle, None, vec![reply(Some(second))]).await;
+        let (_, from) = requester.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from.ip(), IpAddr::V4(second));
+
+        dispatch_search_outputs(&bundle, None, vec![reply(None)]).await;
+        let (_, from) = requester.recv_from(&mut buf).await.unwrap();
+        assert_eq!(
+            from.ip(),
+            IpAddr::V4(first),
+            "no hint: the bundle's own pick, the first loopback socket"
+        );
     }
 
     /// Stage B's point, stated as a test: the decode half runs with **no
@@ -2255,148 +2195,6 @@ mod tests {
         assert!(
             reforward.is_err(),
             "Forwarded origin must NOT re-forward, but lo_mcast got {reforward:?}"
-        );
-    }
-
-    // `classify_loopback_datagram` must route a loopback datagram by its
-    // first PVA header exactly like pvxs `udp_collector.cpp::process_one`
-    // — a malformed/non-local CMD_ORIGIN_TAG is dropped, a valid tag is
-    // peeled, and only a genuinely untagged CMD_SEARCH enters the
-    // `Forwarded` path. The prior code collapsed every
-    // `try_peel_origin_tag == None` reason (including a malformed tag) into
-    // `Forwarded`, so a `[malformed ORIGIN_TAG][valid SEARCH]` packet
-    // skipped the bad tag and still reached the SEARCH matcher.
-
-    /// Build a `CMD_ORIGIN_TAG` header (little-endian application frame)
-    /// declaring `payload_len` payload bytes. Used to forge malformed
-    /// tags whose declared length differs from the bytes that follow.
-    fn origin_tag_header(payload_len: u32) -> [u8; PvaHeader::SIZE] {
-        PvaHeader::application(
-            false,
-            ByteOrder::Little,
-            Command::OriginTag.code(),
-            payload_len,
-        )
-        .encode()
-    }
-
-    fn valid_search_bytes() -> Vec<u8> {
-        PvaCodec { big_endian: false }.build_search(7, 42, "MY:PV", [127, 0, 0, 1], 9999, false)
-    }
-
-    #[test]
-    fn classify_bare_unprefixed_search_is_forwarded() {
-        let local = HashSet::new();
-        let search = valid_search_bytes();
-        assert_eq!(
-            classify_loopback_datagram(&search, &local),
-            LoopbackClass::BareSearch,
-            "an untagged CMD_SEARCH on the loopback socket must be Forwarded"
-        );
-    }
-
-    #[test]
-    fn classify_valid_wildcard_origin_tag_peels_to_unspecified() {
-        let local = HashSet::new();
-        let mut dg = PvaCodec::build_origin_tag_prefix(Ipv4Addr::UNSPECIFIED).to_vec();
-        let search = valid_search_bytes();
-        dg.extend_from_slice(&search);
-        assert_eq!(
-            classify_loopback_datagram(&dg, &local),
-            LoopbackClass::OriginTag {
-                reply_iface_ip: Ipv4Addr::UNSPECIFIED,
-                inner: &search,
-            },
-            "wildcard-origin tag must peel with the UNSPECIFIED reply sentinel"
-        );
-    }
-
-    #[test]
-    fn classify_valid_local_origin_tag_peels_to_iface_ip() {
-        let iface = Ipv4Addr::new(192, 168, 99, 10);
-        let local: HashSet<Ipv4Addr> = [iface].into_iter().collect();
-        let mut dg = PvaCodec::build_origin_tag_prefix(iface).to_vec();
-        let search = valid_search_bytes();
-        dg.extend_from_slice(&search);
-        assert_eq!(
-            classify_loopback_datagram(&dg, &local),
-            LoopbackClass::OriginTag {
-                reply_iface_ip: iface,
-                inner: &search,
-            },
-            "a tag whose origin is one of our interfaces must peel and pin that NIC"
-        );
-    }
-
-    #[test]
-    fn classify_non_local_origin_tag_is_dropped() {
-        // Origin is a concrete address that is NOT in our interface set.
-        let local: HashSet<Ipv4Addr> = [Ipv4Addr::new(192, 168, 99, 10)].into_iter().collect();
-        let foreign = Ipv4Addr::new(203, 0, 113, 7);
-        let mut dg = PvaCodec::build_origin_tag_prefix(foreign).to_vec();
-        dg.extend_from_slice(&valid_search_bytes());
-        assert_eq!(
-            classify_loopback_datagram(&dg, &local),
-            LoopbackClass::Drop,
-            "a tag whose origin is not a local interface must be dropped (pvxs warns + ignores)"
-        );
-    }
-
-    #[test]
-    fn classify_malformed_origin_tag_with_trailing_search_is_dropped() {
-        // First header claims CMD_ORIGIN_TAG with payload_length=8 (< the
-        // 16-byte minimum), then 8 junk bytes, then a fully valid SEARCH.
-        // The old code took the `None => Forwarded` branch and the
-        // header-by-header scanner then skipped the bad tag and answered
-        // the SEARCH. pvxs stops at the malformed tag.
-        let mut dg = origin_tag_header(8).to_vec();
-        dg.extend_from_slice(&[0u8; 8]);
-        dg.extend_from_slice(&valid_search_bytes());
-        let local = HashSet::new();
-        assert_eq!(
-            classify_loopback_datagram(&dg, &local),
-            LoopbackClass::Drop,
-            "a malformed ORIGIN_TAG must drop the whole datagram, not expose the inner SEARCH"
-        );
-    }
-
-    #[test]
-    fn classify_truncated_origin_tag_is_dropped() {
-        // Header declares a 16-byte origin payload but only 10 bytes
-        // follow, so the datagram is shorter than the declared tag.
-        let mut dg = origin_tag_header(16).to_vec();
-        dg.extend_from_slice(&[0u8; 10]);
-        let local = HashSet::new();
-        assert_eq!(
-            classify_loopback_datagram(&dg, &local),
-            LoopbackClass::Drop,
-            "a truncated ORIGIN_TAG must be dropped"
-        );
-    }
-
-    #[test]
-    fn classify_short_and_non_search_first_header_are_dropped() {
-        let local = HashSet::new();
-        // Too short to even decode a header.
-        assert_eq!(
-            classify_loopback_datagram(&[], &local),
-            LoopbackClass::Drop,
-            "empty datagram must be dropped"
-        );
-        assert_eq!(
-            classify_loopback_datagram(&[0xCA, 0x02, 0x00], &local),
-            LoopbackClass::Drop,
-            "sub-header datagram must be dropped"
-        );
-        // A first header that is neither SEARCH nor ORIGIN_TAG (here
-        // SEARCH_RESPONSE) is not part of the forwarding contract.
-        let other =
-            PvaHeader::application(true, ByteOrder::Little, Command::SearchResponse.code(), 0)
-                .encode();
-        assert_eq!(
-            classify_loopback_datagram(&other, &local),
-            LoopbackClass::Drop,
-            "a non-SEARCH, non-ORIGIN_TAG first header must be dropped"
         );
     }
 

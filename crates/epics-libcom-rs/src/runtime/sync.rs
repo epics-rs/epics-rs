@@ -88,6 +88,63 @@ pub type PriorityInheritanceMutex<T> = epics_mutex::MovableEpicsMutex<T>;
 /// which of the two to use. Its lock and guard are the bare backend's.
 pub type PinnedPriorityInheritanceMutex<T> = epics_mutex::PinnedEpicsMutex<T>;
 
+/// One table, so the variants, [`CMutex::ALL`] and the C sites cannot drift.
+macro_rules! c_mutexes {
+    ($($(#[$doc:meta])* $variant:ident => $name:literal, $file:literal, [$($line:literal),+];)+) => {
+        /// The C `epicsMutexCreate` a [`PriorityInheritanceMutex`] stands
+        /// for. `new` takes one, so a listed lock without a C counterpart
+        /// does not compile; a lock C does not list is an
+        /// [`UnlistedPriorityInheritanceMutex`].
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum CMutex {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl CMutex {
+            pub const ALL: &'static [CMutex] = &[$(CMutex::$variant,)+];
+
+            /// The C variable the mutex is stored in, `Class::member` for a
+            /// class member.
+            pub fn c_name(self) -> &'static str {
+                match self {
+                    $(CMutex::$variant => $name,)+
+                }
+            }
+
+            /// The C file, relative to the EPICS base tree.
+            pub fn c_file(self) -> &'static str {
+                match self {
+                    $(CMutex::$variant => $file,)+
+                }
+            }
+
+            /// The lines in [`c_file`](Self::c_file) that create it.
+            pub fn c_lines(self) -> &'static [u32] {
+                match self {
+                    $(CMutex::$variant => &[$($line),+],)+
+                }
+            }
+        }
+    };
+}
+
+c_mutexes! {
+    LockSet => "ls->lock", "modules/database/src/ioc/db/dbLock.c", [86];
+    /// An event, I/O Intr and periodic list's lock.
+    ScanList => "scan_list", "modules/database/src/ioc/db/dbScan.c", [527, 604, 908];
+    ScanEvent => "event_lock", "modules/database/src/ioc/db/dbScan.c", [469];
+    PvdBucket => "pbucket->lock", "modules/database/src/ioc/dbStatic/dbPvdLib.c", [119];
+    /// An `epicsMutex` class member.
+    TimerQueue => "timerQueue::mutex", "modules/libcom/src/timer/timerPrivate.h", [115];
+    ErrlogMsgQueue => "msgQueueLock", "modules/libcom/src/error/errlog.c", [588];
+    GeneralTimeList => "timeListLock", "modules/libcom/src/osi/epicsGeneralTime.c", [91];
+    TaskwdTasks => "tLock", "modules/libcom/src/taskwd/taskwd.c", [149];
+    TaskwdMonitors => "mLock", "modules/libcom/src/taskwd/taskwd.c", [150];
+    EvUserLock => "evUser->lock", "modules/database/src/ioc/db/dbEvent.c", [317];
+    /// The first queue's, then each added queue's.
+    EvQueWriteLock => "writelock", "modules/database/src/ioc/db/dbEvent.c", [310, 414];
+}
+
 /// The guard `PriorityInheritanceMutex::lock` hands out, nameable so a
 /// caller can *store* one — the per-record write gate
 /// (`server::database::record_lock`) holds a `'static` guard in a struct
@@ -106,6 +163,40 @@ pub type PriorityInheritanceMutexGuard<'a, T> = pi_mutex::PiMutexGuard<'a, T>;
 /// `!Send` for the same reason.
 #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
 pub type PriorityInheritanceMutexGuard<'a, T> = parking_lot::MutexGuard<'a, T>;
+
+/// A priority-inheritance lock that is **not** on `epicsMutexShowAll`'s list,
+/// for a lock C does not build with `epicsMutexCreate`: an `epicsEvent`'s
+/// mutex (`posix/osdEvent.c:54`), an `epicsSpin` (`epicsRingBytesLocked`), or
+/// a lock C has no counterpart for at all. Listing one would print an entry no
+/// C IOC prints; [`PriorityInheritanceMutex`] is for the locks C lists.
+///
+/// Same backend, same guard and same PI arms as the listed type, so moving a
+/// lock between the two changes what the list shows and nothing else.
+pub struct UnlistedPriorityInheritanceMutex<T>(MutexBackend<T>);
+
+impl<T> UnlistedPriorityInheritanceMutex<T> {
+    pub fn new(value: T) -> Self {
+        Self(MutexBackend::new(value))
+    }
+
+    #[inline]
+    pub fn lock(&self) -> PriorityInheritanceMutexGuard<'_, T> {
+        self.0.lock()
+    }
+
+    #[inline]
+    pub fn try_lock(&self) -> Option<PriorityInheritanceMutexGuard<'_, T>> {
+        self.0.try_lock()
+    }
+}
+
+/// `parking_lot::Mutex` has `Debug`; see `PiMutex`'s `Debug` for why every
+/// arm must.
+impl<T: std::fmt::Debug> std::fmt::Debug for UnlistedPriorityInheritanceMutex<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// Diagnostic — `true` when the PI variant is active in this build.
 ///
@@ -488,6 +579,7 @@ mod epics_mutex {
     /// pointer; `backend` is dereferenced only under the list lock.
     struct Entry {
         id: u64,
+        c_mutex: super::CMutex,
         file: &'static str,
         line: u32,
         addr: usize,
@@ -516,10 +608,12 @@ mod epics_mutex {
         list: &mut Vec<Entry>,
         backend: &MutexBackend<T>,
         site: &'static Location<'static>,
+        c_mutex: super::CMutex,
     ) -> u64 {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         list.push(Entry {
             id,
+            c_mutex,
             file: site.file(),
             line: site.line(),
             addr: backend as *const MutexBackend<T> as usize,
@@ -549,9 +643,9 @@ mod epics_mutex {
     impl<T: Send + 'static> MovableEpicsMutex<T> {
         /// C `epicsMutexCreate()` — `epicsMutexOsiCreate(__FILE__, __LINE__)`.
         #[track_caller]
-        pub fn new(value: T) -> Self {
+        pub fn new(value: T, c_mutex: super::CMutex) -> Self {
             let inner = Arc::new(MutexBackend::new(value));
-            let id = register(&mut lock(), &inner, Location::caller());
+            let id = register(&mut lock(), &inner, Location::caller(), c_mutex);
             Self { inner, id }
         }
     }
@@ -627,10 +721,10 @@ mod epics_mutex {
 
         /// C `ellAdd`. Idempotent, because a second entry would outlive the
         /// one `Drop` removes.
-        pub fn register(self: Pin<&Self>) {
+        pub fn register(self: Pin<&Self>, c_mutex: super::CMutex) {
             let mut list = lock();
             if self.id.load(Ordering::Relaxed) == 0 {
-                let id = register(&mut list, &self.backend, self.site);
+                let id = register(&mut list, &self.backend, self.site, c_mutex);
                 self.id.store(id, Ordering::Relaxed);
             }
         }
@@ -686,6 +780,7 @@ mod epics_mutex {
     /// One row of C's `epicsMutexShow` (`epicsMutex.cpp:118-127`).
     #[derive(Clone, Debug)]
     pub struct MutexInfo {
+        c_mutex: super::CMutex,
         addr: usize,
         osd_addr: usize,
         file: &'static str,
@@ -693,6 +788,11 @@ mod epics_mutex {
     }
 
     impl MutexInfo {
+        /// The C lock this entry stands for.
+        pub fn c_mutex(&self) -> super::CMutex {
+            self.c_mutex
+        }
+
         /// C prints the node address as the mutex's identity; this is that
         /// address, and it is stable for the mutex's whole life.
         pub fn addr(&self) -> usize {
@@ -755,6 +855,7 @@ mod epics_mutex {
                 continue;
             }
             shown.push(MutexInfo {
+                c_mutex: entry.c_mutex,
                 addr: entry.addr,
                 osd_addr: entry.osd_addr,
                 file: entry.file,
@@ -854,7 +955,7 @@ impl StartWait {
 /// mutex over the state, and a **separate** event the worker sleeps on —
 /// `msgQueueLock` beside `waitForWork` (`errlog.c:93-95`), the `onceQ` ring's
 /// spinlock beside `onceSem` (`dbScan.c:65-68`), the timer queue's mutex
-/// beside its event (`timerPrivate.h:115,188`). A Rust port reaches for
+/// beside its event (`timerPrivate.h:115,161`). A Rust port reaches for
 /// `Mutex` + `Condvar` instead, which fuses them, and the fusion is what
 /// costs the priority-inheritance property: a `Condvar` can only wait on the
 /// `std::sync::Mutex` it is paired with, so every requester of the facility —
@@ -1176,7 +1277,7 @@ mod tests {
     #[test]
     fn an_entry_lasts_exactly_as_long_as_its_mutex() {
         let expected_line = line!() + 1;
-        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(5);
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(5, CMutex::LockSet);
         let addr = find_entry(&m).expect("registered at construction").addr();
 
         let entry = find_entry(&m).unwrap();
@@ -1209,14 +1310,15 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0, CMutex::LockSet);
         let addr = m.registered_addr();
         let stop = Arc::new(AtomicBool::new(false));
         let noise = {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    let other: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+                    let other: PriorityInheritanceMutex<i32> =
+                        PriorityInheritanceMutex::new(0, CMutex::LockSet);
                     let _held = other.lock();
                 }
             })
@@ -1240,11 +1342,12 @@ mod tests {
     /// entry and keeps the ones it could not take.
     #[test]
     fn only_locked_keeps_exactly_the_held_mutexes() {
-        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0, CMutex::LockSet);
         let addr = m.registered_addr();
         // A second, never-held mutex, so "the filter excludes something" is a
         // property of this test and not of whatever else the process created.
-        let other: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let other: PriorityInheritanceMutex<i32> =
+            PriorityInheritanceMutex::new(0, CMutex::LockSet);
         let other_addr = other.registered_addr();
 
         let free = mutex_report(true);
@@ -1285,7 +1388,7 @@ mod tests {
     /// registry of addresses of the values themselves would dangle here.
     #[test]
     fn the_registered_address_survives_moving_the_mutex() {
-        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(1);
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(1, CMutex::LockSet);
         let addr = m.registered_addr();
         let moved = Box::new(m);
         assert_eq!(moved.registered_addr(), addr);
@@ -1311,7 +1414,7 @@ mod tests {
         let addr = m.registered_addr();
         assert_eq!(rows_at(addr), 0, "listed before it was pinned");
 
-        m.as_ref().register();
+        m.as_ref().register(CMutex::LockSet);
         let entry = mutex_report(false)
             .shown
             .into_iter()
@@ -1332,8 +1435,8 @@ mod tests {
     fn registering_a_pinned_mutex_twice_lists_it_once() {
         let m = Box::pin(PinnedPriorityInheritanceMutex::new(0));
         let addr = m.registered_addr();
-        m.as_ref().register();
-        m.as_ref().register();
+        m.as_ref().register(CMutex::LockSet);
+        m.as_ref().register(CMutex::LockSet);
         assert_eq!(rows_at(addr), 1);
         drop(m);
         assert_eq!(rows_at(addr), 0);
@@ -1343,7 +1446,7 @@ mod tests {
     /// only above level 0.
     #[test]
     fn show_lines_adds_the_osd_line_only_above_level_zero() {
-        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0, CMutex::LockSet);
         let entry = find_entry(&m).unwrap();
 
         let plain = entry.show_lines(0);
@@ -1386,7 +1489,7 @@ mod tests {
     /// confirms the type is constructible and the lock guard derefs.
     #[test]
     fn pi_mutex_lock_unlock() {
-        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(42);
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(42, CMutex::LockSet);
         {
             let g = m.lock();
             assert_eq!(*g, 42);
@@ -1438,7 +1541,7 @@ mod tests {
     #[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
     #[test]
     fn the_pthread_object_does_not_move_with_the_mutex() {
-        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(7);
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(7, CMutex::LockSet);
         let before = m.raw_addr();
         let moved = Box::new(m);
         assert_eq!(
@@ -1459,7 +1562,8 @@ mod tests {
         const THREADS: u64 = 8;
         const PER_THREAD: u64 = 10_000;
 
-        let m: Arc<PriorityInheritanceMutex<u64>> = Arc::new(PriorityInheritanceMutex::new(0));
+        let m: Arc<PriorityInheritanceMutex<u64>> =
+            Arc::new(PriorityInheritanceMutex::new(0, CMutex::LockSet));
         let workers: Vec<_> = (0..THREADS)
             .map(|_| {
                 let m = Arc::clone(&m);

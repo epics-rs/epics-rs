@@ -53,10 +53,13 @@ impl ScanBucket {
         Self {
             revision: std::sync::atomic::AtomicU64::new(0),
             overruns: std::sync::atomic::AtomicU64::new(0),
-            entries: crate::runtime::sync::PriorityInheritanceMutex::new(Bucket {
-                keys: BTreeSet::new(),
-                ordered: None,
-            }),
+            entries: crate::runtime::sync::PriorityInheritanceMutex::new(
+                Bucket {
+                    keys: BTreeSet::new(),
+                    ordered: None,
+                },
+                crate::runtime::sync::CMutex::ScanList,
+            ),
         }
     }
 
@@ -820,7 +823,10 @@ impl EventTable {
     fn new() -> Self {
         Self {
             numbered: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
-            created: crate::runtime::sync::PriorityInheritanceMutex::new(Vec::new()),
+            created: crate::runtime::sync::PriorityInheritanceMutex::new(
+                Vec::new(),
+                crate::runtime::sync::CMutex::ScanEvent,
+            ),
             built: std::sync::atomic::AtomicBool::new(false),
         }
     }

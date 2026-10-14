@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::runtime::sync::{Event, EventWaiter, PriorityInheritanceMutex};
+use crate::runtime::sync::{CMutex, Event, EventWaiter, PriorityInheritanceMutex};
 
 /// True when no `tracing` subscriber would take an event — i.e. when
 /// everything this module emits is being discarded.
@@ -984,21 +984,24 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
     ERRLOG.get_or_init(|| {
         let (buf_size, max_msg_size) = errlog_clamp_sizes(bufsize, max_msg_size);
         let errlog: &'static Errlog = Box::leak(Box::new(Errlog {
-            queue: PriorityInheritanceMutex::new(ErrlogQueue {
-                buf_size,
-                max_msg_size,
-                // C `errlogInitPvt` `calloc`s both once (`errlog.c:592-593`);
-                // nothing on the posting path allocates after this.
-                log: ErrlogBuf::new(buf_size),
-                print: ErrlogBuf::new(buf_size),
-                n_lost: 0,
-                at_exit: false,
-                stopped: false,
-                // C `errlogInitPvt`: `pvt.toConsole = TRUE`.
-                to_console: true,
-                flush_seq: 0,
-                flushers: Vec::new(),
-            }),
+            queue: PriorityInheritanceMutex::new(
+                ErrlogQueue {
+                    buf_size,
+                    max_msg_size,
+                    // C `errlogInitPvt` `calloc`s both once (`errlog.c:592-593`);
+                    // nothing on the posting path allocates after this.
+                    log: ErrlogBuf::new(buf_size),
+                    print: ErrlogBuf::new(buf_size),
+                    n_lost: 0,
+                    at_exit: false,
+                    stopped: false,
+                    // C `errlogInitPvt`: `pvt.toConsole = TRUE`.
+                    to_console: true,
+                    flush_seq: 0,
+                    flushers: Vec::new(),
+                },
+                CMutex::ErrlogMsgQueue,
+            ),
             work: Event::new(),
             exited: Event::new(),
             listeners: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(Vec::new())),

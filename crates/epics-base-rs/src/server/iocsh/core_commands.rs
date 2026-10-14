@@ -1722,7 +1722,10 @@ mod tests {
     fn epics_mutex_show_all_prints_the_count_the_protocol_and_the_rows() {
         let ctx = make_ctx();
         let gate: crate::runtime::sync::PriorityInheritanceMutex<()> =
-            crate::runtime::sync::PriorityInheritanceMutex::new(());
+            crate::runtime::sync::PriorityInheritanceMutex::new(
+                (),
+                crate::runtime::sync::CMutex::LockSet,
+            );
 
         let (out, err, failed) = run_split(&ctx, "epicsMutexShowAll", &["0", "0"]);
         assert!(!failed);
@@ -1749,7 +1752,10 @@ mod tests {
     fn a_level_above_zero_adds_the_osd_line_under_every_row() {
         let ctx = make_ctx();
         let gate: crate::runtime::sync::PriorityInheritanceMutex<()> =
-            crate::runtime::sync::PriorityInheritanceMutex::new(());
+            crate::runtime::sync::PriorityInheritanceMutex::new(
+                (),
+                crate::runtime::sync::CMutex::LockSet,
+            );
 
         let (plain, _, _) = run_split(&ctx, "epicsMutexShowAll", &["0", "0"]);
         for level in ["1", "-1"] {
@@ -1778,7 +1784,10 @@ mod tests {
     fn only_locked_filters_the_rows_but_not_the_count() {
         let ctx = make_ctx();
         let gate: crate::runtime::sync::PriorityInheritanceMutex<()> =
-            crate::runtime::sync::PriorityInheritanceMutex::new(());
+            crate::runtime::sync::PriorityInheritanceMutex::new(
+                (),
+                crate::runtime::sync::CMutex::LockSet,
+            );
 
         let (idle, _, _) = run_split(&ctx, "epicsMutexShowAll", &["1", "0"]);
         let total = crate::runtime::sync::mutex_report(false).total;

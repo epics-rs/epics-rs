@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use crate::runtime::sync::PriorityInheritanceMutex;
+use crate::runtime::sync::{CMutex, PriorityInheritanceMutex};
 use crate::walltime::WallTime;
 use std::time::SystemTime;
 
@@ -111,8 +111,9 @@ impl GeneralTimeInner {
 /// `get()` (C does the same, `:119-136`) — so the holder can be a provider
 /// doing real work while a High-band record waits behind it. That is the
 /// convergence point priority inheritance exists for.
-static GENERAL_TIME: LazyLock<PriorityInheritanceMutex<GeneralTimeInner>> =
-    LazyLock::new(|| PriorityInheritanceMutex::new(GeneralTimeInner::new()));
+static GENERAL_TIME: LazyLock<PriorityInheritanceMutex<GeneralTimeInner>> = LazyLock::new(|| {
+    PriorityInheritanceMutex::new(GeneralTimeInner::new(), CMutex::GeneralTimeList)
+});
 
 static ERROR_COUNTS: AtomicU64 = AtomicU64::new(0);
 

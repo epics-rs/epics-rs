@@ -72,8 +72,11 @@ pub struct GroupPvDef {
     /// a `!Send` guard across it would not have compiled at the
     /// connection-task spawn site. See `record_lock.rs`'s module doc for the
     /// L33 → L1 → L46 acquisition order this lock heads.
+    ///
+    /// Unlisted: pvxs has no per-group lock (`ioc/group.h:78` is the one
+    /// `groupMapMutex`), so `epicsMutexShowAll` has no entry for it.
     pub atomic_write_lock:
-        std::sync::Arc<epics_base_rs::runtime::sync::PriorityInheritanceMutex<()>>,
+        std::sync::Arc<epics_base_rs::runtime::sync::UnlistedPriorityInheritanceMutex<()>>,
     /// One bound [`MemberChannel`] per entry of [`Self::members`], in the
     /// same order — the port's `Group::fields` (`ioc/group.h:44`).
     ///
@@ -735,7 +738,7 @@ fn raw_to_group_def(
         atomic_is_set,
         members,
         atomic_write_lock: std::sync::Arc::new(
-            epics_base_rs::runtime::sync::PriorityInheritanceMutex::new(()),
+            epics_base_rs::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
         ),
         // Bound by the `finalize()` below, once `members` is settled.
         channels: std::sync::Arc::new(Vec::new()),
@@ -1100,6 +1103,23 @@ fn const_from_array(items: &[serde_json::Value]) -> Result<epics_pva_rs::pvdata:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pvxs lists no lock per group, so a parsed group adds no entry to
+    /// `epicsMutexShowAll`'s list.
+    #[test]
+    fn a_group_puts_nothing_on_the_mutex_list() {
+        let groups = parse_group_config(
+            r#"{"G:list": {"+atomic": true, "v": {"+type": "scalar", "+channel": "R:ai"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        let listed: Vec<_> = epics_base_rs::runtime::sync::mutex_report(false)
+            .shown
+            .into_iter()
+            .filter(|e| e.file() == file!())
+            .collect();
+        assert!(listed.is_empty(), "{listed:?}");
+    }
 
     #[test]
     fn parse_basic_group() {

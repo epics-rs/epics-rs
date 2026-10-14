@@ -4072,7 +4072,7 @@ mod tests {
     impl ExternalLockHolder {
         /// Returns once the lock is genuinely held — no sleep-and-hope.
         fn take(
-            lock: Arc<epics_base_rs::runtime::sync::PriorityInheritanceMutex<()>>,
+            lock: Arc<epics_base_rs::runtime::sync::UnlistedPriorityInheritanceMutex<()>>,
         ) -> ExternalLockHolder {
             let (release, release_rx) = std::sync::mpsc::channel();
             let (held, held_rx) = std::sync::mpsc::channel();

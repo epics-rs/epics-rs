@@ -146,8 +146,8 @@
 //! What the gate *is* — a blocking priority-inheritance mutex
 //! ----------------------------------------------------------
 //! The gate is a [`crate::runtime::sync::PriorityInheritanceMutex`], the
-//! same primitive L46 (`registration_mutex`), L8a (`simple_pvs`) and L8b
-//! (one `scan_index` bucket) already use, and [`PvDatabase::lock_record`] /
+//! same primitive L8a (`simple_pvs`) and L8b (one `scan_index` bucket)
+//! already use, and [`PvDatabase::lock_record`] /
 //! [`PvDatabase::lock_records`] are plain synchronous `fn`s returning RAII
 //! guards. This is the parity shape rather than a Rust-side invention: the
 //! `ls->lock` C's `dbScanLock` takes is a plain `epicsMutex` (`dbLock.c:86`),
@@ -219,17 +219,18 @@
 //! > them while holding one that appears later:**
 //! >
 //! > 0. **L33** — `epics-bridge-rs`' `GroupPvDef::atomic_write_lock`, the
-//! >    QSRV per-group atomic-PUT gate (`PriorityInheritanceMutex`). Outside
+//! >    QSRV per-group atomic-PUT gate (`UnlistedPriorityInheritanceMutex`). Outside
 //! >    this crate, and only the atomic group PUT takes it — see the L33
 //! >    section below.
 //! > 1. **L1** — the per-record advisory gate ([`PvDatabase::lock_record`] /
 //! >    [`PvDatabase::lock_records`]), *this* module
 //! >    (`PriorityInheritanceMutex`).
 //! > 2. **L46** — `PvDatabaseInner::registration_mutex`
-//! >    (`PriorityInheritanceMutex`).
+//! >    (`UnlistedPriorityInheritanceMutex`).
 //! > 3. the leaves, none of which is ever held while another lock is taken:
-//! >    **L8a** `simple_pvs`, **L8b** one `scan_index` bucket and **L7**
-//! >    `ProcessVariable::subscribers` (all `PriorityInheritanceMutex`), plus
+//! >    **L8a** `simple_pvs`, **L8b** one `scan_index` bucket (both
+//! >    `PriorityInheritanceMutex`) and **L7** `ProcessVariable::subscribers`
+//! >    (`SubscriberList`), plus
 //! >    the `records` map and `aliases` (each a `RecursiveReadLock`, whose
 //! >    readers never queue behind a waiting writer, so a reader under L1
 //! >    cannot be wedged by a writer that is itself waiting for L1; and
@@ -356,7 +357,7 @@ use crate::server::record::RecordCell;
 use crate::server::record::record_instance::{HeldMut, RecordRef};
 
 use crate::runtime::sync::{
-    MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard, mutex_report,
+    CMutex, MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard, mutex_report,
 };
 
 use super::PvDatabase;
@@ -577,7 +578,7 @@ const FIRST_SET_ID: u64 = 2;
 
 /// Mint one set. Every `LockSet` in the process comes from here.
 fn new_set(id: u64) -> Set {
-    let lock = PriorityInheritanceMutex::new(());
+    let lock = PriorityInheritanceMutex::new((), CMutex::LockSet);
     // The mutex names its own row, so no two sets can be confused for each
     // other and nothing has to be serialised against the process mutex list.
     let mutex_addr = lock.registered_addr();
@@ -2352,7 +2353,8 @@ mod tests {
         for name in ["MS:1", "MS:2", "MS:3"] {
             drop(db.lock_record(name));
         }
-        let decoy: PriorityInheritanceMutex<()> = PriorityInheritanceMutex::new(());
+        let decoy: PriorityInheritanceMutex<()> =
+            PriorityInheritanceMutex::new((), CMutex::LockSet);
 
         let mut claimed = std::collections::HashSet::new();
         for set in db.lock_set_report().active {

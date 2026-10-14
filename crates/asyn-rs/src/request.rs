@@ -521,6 +521,7 @@ fn queue_timer() -> &'static QueueTimer {
         QueueTimer {
             slots: epics_libcom_rs::runtime::sync::PriorityInheritanceMutex::new(
                 TimerSlots::default(),
+                epics_libcom_rs::runtime::sync::CMutex::TimerQueue,
             ),
             wake: epics_libcom_rs::runtime::sync::Event::new(),
         }

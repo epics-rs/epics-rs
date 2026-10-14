@@ -14,10 +14,11 @@
 //! (`dbScan.c:718-719`).
 //!
 //! The Rust port keeps that exact shape — and C's split of primitives with
-//! it: the ring is guarded by a [`PriorityInheritanceMutex`] because C guards
+//! it: the ring is guarded by an [`UnlistedPriorityInheritanceMutex`] because C guards
 //! it with a PI primitive (`epicsRingBytesLockedCreate`,
 //! `epicsRingBytes.c:58-65`, over `epicsSpin`, which is a
-//! `PTHREAD_PRIO_INHERIT` mutex on Linux, `osdSpin.c:126`), and the worker
+//! `PTHREAD_PRIO_INHERIT` mutex on Linux, `osdSpin.c:126`, and is not on
+//! `epicsMutexShowAll`'s list), and the worker
 //! sleeps on a separate [`Event`] because C signals a separate `onceSem`. A
 //! `Mutex` + `Condvar` would fuse the two and leave every requester — a scan
 //! thread, a device callback — blocking on a non-PI lock held by this
@@ -39,7 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use super::facility::{run_facility_loop, run_isolated};
-use crate::runtime::sync::{Event, PriorityInheritanceMutex};
+use crate::runtime::sync::{Event, UnlistedPriorityInheritanceMutex};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// A queued "process this record" tail. C stores `{prec, cb, usr}`
@@ -76,11 +77,14 @@ struct OnceState {
 
 struct Inner {
     capacity: usize,
-    state: PriorityInheritanceMutex<OnceState>,
+    /// C `onceQ`, an `epicsRingBytesLocked` (`dbScan.c:778`) whose lock is an
+    /// `epicsSpin`, so it is not on `epicsMutexShowAll`'s list.
+    state: UnlistedPriorityInheritanceMutex<OnceState>,
     /// The drain thread, started on the first request rather than at
     /// construction — see [`Inner::ensure_worker`]. PI for the same reason
-    /// `state` is: every request passes through it.
-    worker: PriorityInheritanceMutex<Option<JoinHandle<()>>>,
+    /// `state` is: every request passes through it. C starts its thread in
+    /// `scanInit`, so there is no lock to list.
+    worker: UnlistedPriorityInheritanceMutex<Option<JoinHandle<()>>>,
 }
 
 impl Inner {
@@ -357,7 +361,7 @@ impl ScanOnceQueue {
     pub fn with_capacity(capacity: usize) -> Self {
         let inner = Arc::new(Inner {
             capacity: capacity.max(1),
-            state: PriorityInheritanceMutex::new(OnceState {
+            state: UnlistedPriorityInheritanceMutex::new(OnceState {
                 queue: VecDeque::new(),
                 high_water: 0,
                 overflows: 0,
@@ -365,7 +369,7 @@ impl ScanOnceQueue {
                 shutdown: false,
                 wake: Arc::new(Event::new()),
             }),
-            worker: PriorityInheritanceMutex::new(None),
+            worker: UnlistedPriorityInheritanceMutex::new(None),
         });
         ScanOnceQueue { inner }
     }
@@ -479,6 +483,22 @@ mod tests {
         assert_eq!(scan_once_priority().value(), 70);
         set_periodic_scan_band_count(DEFAULT_PERIODIC_SCAN_BAND_COUNT);
         assert_eq!(scan_once_priority().value(), 67);
+    }
+
+    /// C lists no lock of scanOnce's: `onceQ`'s is an `epicsSpin` and
+    /// `onceSem` is an event. Holds after the worker has started too.
+    #[test]
+    fn scan_once_puts_nothing_on_the_mutex_list() {
+        let q = ScanOnceQueue::new();
+        let (tx, rx) = mpsc::channel();
+        q.scan_once(Box::new(move || tx.send(()).unwrap())).unwrap();
+        rx.recv_timeout(T).unwrap();
+        let listed: Vec<_> = crate::runtime::sync::mutex_report(false)
+            .shown
+            .into_iter()
+            .filter(|e| e.file().ends_with("scan_once.rs"))
+            .collect();
+        assert!(listed.is_empty(), "{listed:?}");
     }
 
     /// Boundary: a queued tail that panics. `dbProcess` runs inside it, so

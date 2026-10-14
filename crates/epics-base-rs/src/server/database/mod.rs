@@ -816,7 +816,10 @@ struct PvDatabaseInner {
     /// Acquired ONLY through [`PvDatabase::lock_registration`], never
     /// directly — that funnel is what turns a re-entrant take into a named
     /// panic instead of a parked thread. See [`RegistrationGate`].
-    registration_mutex: crate::runtime::sync::PriorityInheritanceMutex<()>,
+    ///
+    /// Unlisted: C has no such gate (its record load is single-threaded), so
+    /// `epicsMutexShowAll` has no entry for it.
+    registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex<()>,
     /// The IOC lifecycle phase — the port's `iocInit` boundary. See
     /// [`DbInitPhase`], [`PvDatabase::begin_load`],
     /// [`PvDatabase::schedule_record_init`] and [`PvDatabase::ioc_init`].
@@ -950,7 +953,8 @@ struct PvDatabaseInner {
     /// on the search side, so a reader takes no lock. Writers serialise on
     /// [`Self::record_attributes_write`].
     record_attributes: ArcSwap<RecordAttributes>,
-    record_attributes_write: crate::runtime::sync::PriorityInheritanceMutex<()>,
+    /// Unlisted: C's `attributeList` is written without a lock.
+    record_attributes_write: crate::runtime::sync::UnlistedPriorityInheritanceMutex<()>,
     /// Subroutine functions by name, retained at runtime so the processing
     /// path can re-resolve an aSub's subroutine when its name changes
     /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
@@ -1518,7 +1522,10 @@ impl PvDatabase {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PvDatabaseInner {
-                simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(HashMap::new()),
+                simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(
+                    HashMap::new(),
+                    crate::runtime::sync::CMutex::PvdBucket,
+                ),
                 simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
                 pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
                 external_resolver: ArcSwapOption::empty(),
@@ -1535,7 +1542,7 @@ impl PvDatabase {
                 cp_links: SnapshotCell::new(CpRegistry::default()),
                 external_cp_links: SnapshotCell::new(CpRegistry::default()),
                 aliases: RecursiveReadLock::new(HashMap::new()),
-                registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
+                registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 record_init_waiting: std::sync::Mutex::new(HashMap::new()),
                 empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
@@ -1545,7 +1552,8 @@ impl PvDatabase {
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
                 record_attributes: ArcSwap::from_pointee(seeded_record_attributes()),
-                record_attributes_write: crate::runtime::sync::PriorityInheritanceMutex::new(()),
+                record_attributes_write:
+                    crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
                 subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
                 device_support_resolver: ArcSwapOption::empty(),
                 breaktable_registry: SnapshotCell::new(
@@ -4314,6 +4322,26 @@ mod channel_view_door_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C lists one lock of what `PvDatabase` holds directly, `dbPvd`'s
+    /// (`dbPvdLib.c:119`): the registration gate and the attribute writer
+    /// have no C mutex, so every entry this file creates is `simple_pvs`'.
+    #[test]
+    fn the_database_lists_only_its_dbpvd_lock() {
+        let db = PvDatabase::new();
+        let shown = crate::runtime::sync::mutex_report(false).shown;
+        let pvd = db.inner.simple_pvs.registered_addr();
+        let pvd_line = shown
+            .iter()
+            .find(|e| e.addr() == pvd)
+            .expect("simple_pvs is listed")
+            .line();
+        let extra: Vec<_> = shown
+            .iter()
+            .filter(|e| e.file() == file!() && e.line() != pvd_line)
+            .collect();
+        assert!(extra.is_empty(), "{extra:?}");
+    }
 
     /// C `recGblGetTimeStampSimm` (recGbl.c:310-343) maps TSE values
     /// to epicsTime sources via the constants in `epicsTime.h:102-104`.

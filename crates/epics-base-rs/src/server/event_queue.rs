@@ -94,8 +94,8 @@
 //!   place, so the ring stays contiguous. C has one reader per queue.
 
 use crate::runtime::sync::{
-    PinnedPriorityInheritanceMutex, PriorityInheritanceMutex as Mutex,
-    PriorityInheritanceMutexGuard,
+    CMutex, PinnedPriorityInheritanceMutex, PriorityInheritanceMutex as Mutex,
+    PriorityInheritanceMutexGuard, UnlistedPriorityInheritanceMutex,
 };
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -184,17 +184,17 @@ struct FlowCtrl {
     /// touching several queues wakes the consumer once, and a wake moves the
     /// waker out rather than freeing a list.
     ///
-    /// Never registered: C's `ppendsem` is an `epicsEvent` (`dbEvent.c:314`),
-    /// whose mutex is `osdPosixMutexInit`'s (`posix/osdEvent.c:54`) and is
-    /// not on `epicsMutexShowAll`'s list.
-    ppendsem: PinnedPriorityInheritanceMutex<Option<std::task::Waker>>,
+    /// Unlisted: C's `ppendsem` is an `epicsEvent` (`dbEvent.c:314`), whose
+    /// mutex is `osdPosixMutexInit`'s (`posix/osdEvent.c:54`) and is not on
+    /// `epicsMutexShowAll`'s list.
+    ppendsem: UnlistedPriorityInheritanceMutex<Option<std::task::Waker>>,
 }
 
 impl FlowCtrl {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             on: AtomicBool::new(false),
-            ppendsem: PinnedPriorityInheritanceMutex::new(None),
+            ppendsem: UnlistedPriorityInheritanceMutex::new(None),
         })
     }
 
@@ -874,7 +874,7 @@ impl EvQue {
             }),
         });
         // SAFETY: nothing moves `inner` out of a pinned `EvQue`.
-        unsafe { que.as_ref().map_unchecked(|q| &q.inner) }.register();
+        unsafe { que.as_ref().map_unchecked(|q| &q.inner) }.register(CMutex::EvQueWriteLock);
         que
     }
 
@@ -1226,10 +1226,13 @@ impl EventUser {
     pub fn new() -> Self {
         let flow = FlowCtrl::new();
         Self {
-            ques: Mutex::new(QueChain {
-                ques: vec![EvQue::new(flow.clone())],
-                reading: 0,
-            }),
+            ques: Mutex::new(
+                QueChain {
+                    ques: vec![EvQue::new(flow.clone())],
+                    reading: 0,
+                },
+                CMutex::EvUserLock,
+            ),
             flow,
         }
     }
@@ -2666,24 +2669,24 @@ mod tests {
         assert!(circuit_now(&user).is_pending());
     }
 
-    /// The queue lock is on `epicsMutexShowAll`'s list for as long as the
-    /// queue lives, and `ppendsem`, an event in C, never is.
+    /// The queue lock is on `epicsMutexShowAll`'s list, as C's `writelock`,
+    /// for as long as the queue lives. `ppendsem`, an event in C, is an
+    /// unlisted type and cannot be.
     #[test]
-    fn the_queue_lock_is_listed_and_ppendsem_is_not() {
+    fn the_queue_lock_is_listed_as_its_writelock() {
         let listed = |addr: usize| {
             crate::runtime::sync::mutex_report(false)
                 .shown
                 .iter()
-                .any(|e| e.addr() == addr)
+                .find(|e| e.addr() == addr)
+                .map(|e| e.c_mutex())
         };
         let user = EventUser::new();
         let (sink, reader) = attach(&user, 1, LogKind::Val);
         let que = reader.queue().inner.registered_addr();
-        let flow = user.flow.ppendsem.registered_addr();
-        assert!(listed(que), "the queue lock is not listed");
-        assert!(!listed(flow), "ppendsem is listed; C's is an epicsEvent");
+        assert_eq!(listed(que), Some(CMutex::EvQueWriteLock));
         drop((sink, reader, user));
-        assert!(!listed(que), "a dropped lock is still listed");
+        assert_eq!(listed(que), None, "a dropped lock is still listed");
     }
 
     /// Records whether `ppendsem` was held when it was woken.

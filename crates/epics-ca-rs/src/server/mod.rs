@@ -396,16 +396,16 @@ pub(crate) fn casr_addrs(server: &CaServer) -> CaResult<iocsh::CasrAddrs> {
 ///
 /// The broadcast responder address for one interface, under the same
 /// gate `bind_udp_responders` binds the socket with — C
-/// `caservertask.c:671,728` skips it on Windows, and there is no
+/// `caservertask.c:671,728` skips it on Windows and Cygwin, and there is no
 /// broadcast address for a wildcard or loopback interface.
 #[cfg(tokio_backend)]
 fn bcast_responder_addr(ip: std::net::Ipv4Addr, port: u16) -> Option<std::net::SocketAddr> {
-    #[cfg(any(windows, target_os = "windows"))]
+    #[cfg(not(ca_udp_bcast))]
     {
         let _ = (ip, port);
         None
     }
-    #[cfg(not(any(windows, target_os = "windows")))]
+    #[cfg(ca_udp_bcast)]
     {
         addr_list::broadcast_for_ip(ip).map(|b| std::net::SocketAddr::from((b, port)))
     }

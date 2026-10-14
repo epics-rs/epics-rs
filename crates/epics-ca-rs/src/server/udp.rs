@@ -83,8 +83,8 @@ pub struct BoundResponder {
     /// Primary socket, bound to the interface entry's address.
     socket: Arc<UdpSocket>,
     /// Secondary socket bound to the interface's broadcast address —
-    /// see the comment in [`bind_udp_responders`]. `None` on Windows
-    /// and for wildcard interfaces.
+    /// see the comment in [`bind_udp_responders`]. `None` without
+    /// `ca_udp_bcast` (Windows, Cygwin) and for wildcard interfaces.
     bcast: Option<Arc<UdpSocket>>,
 }
 
@@ -257,8 +257,9 @@ pub async fn run_udp_search_responder(
 
 /// What `rsrv_init` prints when an interface bound to a specific address has
 /// no broadcast address (`caservertask.c:683-685`); `ifaceName` is the TCP
-/// address `a.b.c.d:port` (`:615`).
-#[cfg(tokio_backend)]
+/// address `a.b.c.d:port` (`:615`). Not without `ca_udp_bcast`, which opens no broadcast
+/// socket.
+#[cfg(all(tokio_backend, ca_udp_bcast))]
 fn missing_broadcast_warning(
     bind_ip: Ipv4Addr,
     tcp_port: u16,
@@ -274,8 +275,9 @@ fn missing_broadcast_warning(
 
 /// `tryBind`'s line for a bind error other than `EADDRINUSE`
 /// (`caservertask.c:138-139`): `CAS: %s bind ERL_ERROR: %s`, the text being
-/// `epicsSocketConvertErrnoToString`, which is `strerror` alone.
-#[cfg(tokio_backend)]
+/// `epicsSocketConvertErrnoToString`, which is `strerror` alone. Its only
+/// caller is the broadcast socket, which only `ca_udp_bcast` opens.
+#[cfg(all(tokio_backend, ca_udp_bcast))]
 fn try_bind_error_line(name: &str, e: &std::io::Error) -> String {
     let os = e
         .get_ref()
@@ -300,10 +302,9 @@ fn bind_single_responder(
     // The port the primary actually took — identical to `port`, except
     // for an ephemeral (0) request, where the kernel chose it. The only
     // consumer of the resolved port is the broadcast secondary responder
-    // below, which exists on non-Windows only (Windows has no secondary
-    // socket), so resolve it under the same gate — otherwise the binding
-    // is unused on Windows.
-    #[cfg(not(any(windows, target_os = "windows")))]
+    // below, which exists only under `ca_udp_bcast`, so resolve it under
+    // the same gate — otherwise the binding is unused without it.
+    #[cfg(ca_udp_bcast)]
     let port = socket.local_addr()?.port();
     // Join each multicast group on this
     // responder's own socket via `IP_ADD_MEMBERSHIP` with
@@ -355,15 +356,15 @@ fn bind_single_responder(
     //
     // On Windows the kernel behaviour differs (a specific-IP-bound
     // socket receives broadcasts), so C `caservertask.c:671, 728`
-    // guards the secondary socket with `#if !(_WIN32 || __CYGWIN__)`.
-    // Mirror that gate.
+    // guards the secondary socket with `#if !(_WIN32 || __CYGWIN__)`,
+    // which is `ca_udp_bcast` (build.rs).
     let bcast: Option<Arc<UdpSocket>> = {
-        #[cfg(any(windows, target_os = "windows"))]
+        #[cfg(not(ca_udp_bcast))]
         {
-            let _ = broadcast_of;
+            let _ = (broadcast_of, tcp_port);
             None
         }
-        #[cfg(not(any(windows, target_os = "windows")))]
+        #[cfg(ca_udp_bcast)]
         {
             let found = broadcast_of(bind_ip);
             if let Some(w) = missing_broadcast_warning(bind_ip, tcp_port, found) {
@@ -1350,6 +1351,7 @@ mod responder_bind_tests {
 
     /// A held broadcast-address socket drops the interface whole, as `tryBind`
     /// on `udpbcast` failing with EADDRINUSE does (`caservertask.c:703`).
+    #[cfg(ca_udp_bcast)]
     #[test]
     fn a_held_broadcast_socket_drops_the_interface() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1375,6 +1377,7 @@ mod responder_bind_tests {
     /// A broadcast-socket bind error other than EADDRINUSE is `tryBind`'s
     /// print-and-suspend path (`caservertask.c:135-141`); here the start
     /// returns the error, and the line is C's.
+    #[cfg(ca_udp_bcast)]
     #[test]
     fn a_broadcast_bind_error_other_than_addr_in_use_fails_the_start() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1400,6 +1403,7 @@ mod responder_bind_tests {
         }
     }
 
+    #[cfg(ca_udp_bcast)]
     #[test]
     fn an_interface_without_a_broadcast_address_is_warned_about_as_c_does() {
         let ip = Ipv4Addr::new(192, 0, 2, 1);

@@ -71,12 +71,16 @@ fn skip_restart_and_missing_broadcast_lines_are_rsrvs() {
         "stderr lacks the restart warning:\n{stderr}"
     );
 
-    let no_bcast = format!(
-        "Warning: Can't find broadcast address of interface 127.0.0.2:{bound}\n         \
-         Name lookup may not work on this interface\n"
-    );
-    assert!(
-        stderr.contains(&no_bcast),
-        "stderr lacks the missing-broadcast warning:\n{stderr}"
-    );
+    // Without the broadcast socket there is nothing to warn about.
+    #[cfg(ca_udp_bcast)]
+    {
+        let no_bcast = format!(
+            "Warning: Can't find broadcast address of interface 127.0.0.2:{bound}\n         \
+             Name lookup may not work on this interface\n"
+        );
+        assert!(
+            stderr.contains(&no_bcast),
+            "stderr lacks the missing-broadcast warning:\n{stderr}"
+        );
+    }
 }

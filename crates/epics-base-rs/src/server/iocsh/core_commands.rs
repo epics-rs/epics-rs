@@ -1334,7 +1334,8 @@ mod tests {
     }
 
     /// The three parts of C's `epicsThreadShowAll`, and which stream each
-    /// lands on.
+    /// lands on. Unix only: the OSSPRI it expects is `pthread_getschedparam`'s.
+    #[cfg(unix)]
     #[test]
     fn epics_thread_show_all_prints_the_header_the_rows_and_a_stderr_trailer() {
         let ctx = make_ctx();

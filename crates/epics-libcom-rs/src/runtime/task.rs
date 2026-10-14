@@ -1441,16 +1441,18 @@ impl StackSpec {
 }
 
 /// C's `checkStatusOnce(status, message)` line (`osdThread.c:116-118`), which
-/// C writes to stderr: `"%s error %s\n"` with `strerror(status)`.
-fn check_status_once_line(message: &str, status: i32) -> String {
+/// C writes to stderr: `"%s error %s\n"` with `strerror(status)`. Every status
+/// the port reports is EINVAL, so the errno stays behind this one cfg boundary.
+fn einval_status_line(message: &str) -> String {
     #[cfg(unix)]
     // SAFETY: `strerror` returns a NUL-terminated string that stays valid
     // until the next `strerror` call; it is copied out at once.
-    let text = unsafe { std::ffi::CStr::from_ptr(libc::strerror(status)) }
+    let text = unsafe { std::ffi::CStr::from_ptr(libc::strerror(libc::EINVAL)) }
         .to_string_lossy()
         .into_owned();
+    // The MSVC and MinGW CRTs' `strerror(EINVAL)`.
     #[cfg(not(unix))]
-    let text = std::io::Error::from_raw_os_error(status).to_string();
+    let text = "Invalid argument";
     format!("{message} error {text}")
 }
 
@@ -2713,11 +2715,8 @@ fn fifo_attr_refusal(priority: ThreadPriority) -> Option<std::io::Error> {
     if nominal.contains(&oss) {
         return None;
     }
-    eprintln!(
-        "{}",
-        check_status_once_line("pthread_attr_setschedparam", libc::EINVAL)
-    );
-    eprintln!("{}", check_status_once_line("pthread_create", libc::EINVAL));
+    eprintln!("{}", einval_status_line("pthread_attr_setschedparam"));
+    eprintln!("{}", einval_status_line("pthread_create"));
     Some(std::io::Error::from_raw_os_error(libc::EINVAL))
 }
 
@@ -3337,10 +3336,7 @@ impl MandatoryThread {
     {
         let priority = self.priority;
         if stack.refused() {
-            eprintln!(
-                "{}",
-                check_status_once_line("pthread_attr_setstacksize", libc::EINVAL)
-            );
+            eprintln!("{}", einval_status_line("pthread_attr_setstacksize"));
         }
         if let Some(refused) = fifo_attr_refusal(priority) {
             return Err(refused);
@@ -4242,13 +4238,10 @@ mod tests {
     #[test]
     fn an_above_99_priority_is_kept_without_rt() {
         assert_eq!(
-            check_status_once_line("pthread_attr_setschedparam", libc::EINVAL),
+            einval_status_line("pthread_attr_setschedparam"),
             ABOVE_99_LINES[0]
         );
-        assert_eq!(
-            check_status_once_line("pthread_create", libc::EINVAL),
-            ABOVE_99_LINES[1]
-        );
+        assert_eq!(einval_status_line("pthread_create"), ABOVE_99_LINES[1]);
         let Some((stdout, printed)) = above_99_run(
             "runtime::task::tests::an_above_99_priority_is_kept_without_rt",
             "NO",
@@ -4408,10 +4401,7 @@ mod tests {
 
         // glibc's `strerror(EINVAL)`.
         let line = "pthread_attr_setstacksize error Invalid argument";
-        assert_eq!(
-            check_status_once_line("pthread_attr_setstacksize", libc::EINVAL),
-            line
-        );
+        assert_eq!(einval_status_line("pthread_attr_setstacksize"), line);
 
         if let Some(bytes) = std::env::var_os(CHILD) {
             let bytes: usize = bytes.to_str().unwrap().parse().unwrap();

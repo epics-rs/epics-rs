@@ -26,6 +26,10 @@
 //!
 //! Measured against `softIoc` R7.0.10 on the same command file: all eight
 //! stderr lines byte-identical, in order, for `A+`, `@@@`, `(A` and `""`.
+//!
+//! Unix only: the stdout capture redirects fd 1 with `libc::dup2`.
+
+#![cfg(unix)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -1029,7 +1029,7 @@ impl MonitorFinishGuard {
     /// `OpState::monitor_abort` that cancels this very task — so an await
     /// between the signal and the push would let the removal destroy the
     /// FINISH frame it was sent to announce.
-    async fn reply(mut self, tx: &ChannelTx, buf: Vec<u8>) {
+    async fn reply(&mut self, tx: &ChannelTx, buf: Vec<u8>) {
         let permit = tx.reserve(buf.len()).await;
         if let Some(fin) = self.fin.take() {
             let _ = self.tx.send(fin);
@@ -1710,11 +1710,11 @@ struct OpState {
     /// For MONITOR ops: true once the subscriber task has been spawned.
     /// Subsequent START/pipeline-ack messages are no-ops.
     monitor_started: bool,
-    /// Abort guard for the spawned MONITOR subscriber. Drop semantics
-    /// (via `AbortOnDrop`) ensure the task is cancelled when the op is
-    /// removed from the channel map (DestroyRequest), when the channel
-    /// itself is removed (DestroyChannel), or when the connection ends.
-    monitor_abort: Option<Arc<AbortOnDrop>>,
+    /// Abort guard for the MONITOR subscriber hosted on the writer task.
+    /// Dropping it ends the subscriber when the op is removed from the
+    /// channel map (DestroyRequest), when the channel itself is removed
+    /// (DestroyChannel), or when the connection ends.
+    monitor_abort: Option<Arc<HostedAbort>>,
     /// Field mask derived from the client's pvRequest at INIT time.
     /// Drives the changed-bitset and partial-value encoding so the
     /// server only emits what was requested. For a PUT_GET op this is
@@ -2647,16 +2647,16 @@ struct MonitorSubscriberArgs {
 ///
 /// Executing state is read from the op's `monitor_exec` watch (set by
 /// [`MonitorStartControl`] on every START/STOP edge). Teardown: the returned
-/// `TaskHandle` is wrapped in the op's `monitor_abort` `AbortOnDrop`; dropping
-/// the `OpState` (DESTROY / channel destroy / disconnect — including
-/// DESTROY-before-START and never-START) aborts the task, dropping `rx` and the
-/// source subscription handle, releasing the upstream. The `MonitorFinishGuard`
-/// installed as the first task statement reports terminal removal on every exit.
-fn spawn_monitor_subscriber(
-    reactor: &epics_base_rs::runtime::task::Reactor,
+/// subscriber runs on the connection's writer task
+/// ([`SrvTx::send_hosting`]), and the op's `monitor_abort` [`HostedAbort`]
+/// ends it; dropping the `OpState` (DESTROY / channel destroy / disconnect —
+/// including DESTROY-before-START and never-START) drops the future, `rx` and
+/// the source subscription handle, releasing the upstream. The `MonitorFinishGuard` installed as the first
+/// statement reports terminal removal on every exit.
+fn monitor_subscriber(
     args: MonitorSubscriberArgs,
 ) -> (
-    epics_base_rs::runtime::task::TaskHandle<()>,
+    impl std::future::Future<Output = ()> + Send + 'static,
     Arc<MonitorStartControl>,
 ) {
     let MonitorSubscriberArgs {
@@ -2719,135 +2719,145 @@ fn spawn_monitor_subscriber(
     // loop now owns directly.
     let loop_exec_rx = monitor_exec_rx;
 
-    let join = reactor.spawn(async move {
-        let fin_guard = MonitorFinishGuard::new(mon_fin_tx, mon_fin);
-        // In the report for as long as this task runs.
-        let mon_report = tx_clone.monitor_stat(ioid);
-        let mon_stat = mon_report.stat();
-        let order_now = || {
-            if out_order_mon.load(std::sync::atomic::Ordering::Relaxed) {
-                ByteOrder::Big
+    let task = async move {
+        let mut fin_guard = MonitorFinishGuard::new(mon_fin_tx, mon_fin);
+        let err_tx = tx_clone.clone();
+        let err_order = out_order_mon.clone();
+        let err_pv = pv_name.clone();
+        let fin = &mut fin_guard;
+        // A panic out of the source ends this op alone, as pvxs catches an
+        // `onSubscribe` throw for its op (`servermon.cpp:594-600`): the guard
+        // outlives the body so the error FINISH keeps the `reply` order.
+        let body = async move {
+            // In the report for as long as this task runs.
+            let mon_report = tx_clone.monitor_stat(ioid);
+            let mon_stat = mon_report.stat();
+            let order_now = || {
+                if out_order_mon.load(std::sync::atomic::Ordering::Relaxed) {
+                    ByteOrder::Big
+                } else {
+                    ByteOrder::Little
+                }
+            };
+            let mut exec = ExecWatch::new(loop_exec_rx);
+            let queue_limit = queue_depth.max(1);
+
+            // Version capture must precede the check (an older-or-equal captured
+            // version => loop re-checks on the next event after a reload).
+            let mon_acl_version_at_subscribe_cell = Arc::new(std::sync::atomic::AtomicU64::new(
+                src.access_gate().acl_version(),
+            ));
+            let mon_checked = src
+                .access_gate()
+                .check_with_roles(
+                    &pv_name,
+                    &mon_ctx.creds.host,
+                    &mon_ctx.creds.account,
+                    &mon_ctx.creds.roles,
+                    &mon_ctx.creds.method,
+                    &mon_ctx.creds.authority,
+                )
+                .await;
+
+            // ---------------- RAW FAST PATH ----------------
+            let raw_seed = if raw_path_eligible {
+                src.subscribe_raw_seeded(
+                    mon_checked.clone(),
+                    mon_ctx.clone(),
+                    monitor_options.clone(),
+                )
+                .await
             } else {
-                ByteOrder::Little
-            }
-        };
-        let mut exec = ExecWatch::new(loop_exec_rx);
-        let queue_limit = queue_depth.max(1);
-
-        // Version capture must precede the check (an older-or-equal captured
-        // version => loop re-checks on the next event after a reload).
-        let mon_acl_version_at_subscribe_cell = Arc::new(std::sync::atomic::AtomicU64::new(
-            src.access_gate().acl_version(),
-        ));
-        let mon_checked = src
-            .access_gate()
-            .check_with_roles(
-                &pv_name,
-                &mon_ctx.creds.host,
-                &mon_ctx.creds.account,
-                &mon_ctx.creds.roles,
-                &mon_ctx.creds.method,
-                &mon_ctx.creds.authority,
-            )
-            .await;
-
-        // ---------------- RAW FAST PATH ----------------
-        let raw_seed = if raw_path_eligible {
-            src.subscribe_raw_seeded(
-                mon_checked.clone(),
-                mon_ctx.clone(),
-                monitor_options.clone(),
-            )
-            .await
-        } else {
-            None
-        };
-        // Emit whatever the source recorded while opening the subscription
-        // (pvxs `singlesource.cpp:129` — `record._options.DBE` selecting an
-        // empty mask), whether or not it produced a seed. pvxs logs from
-        // inside `onSubscribe`, i.e. before its `connect()` INIT reply; here
-        // the INIT reply is enqueued by the read loop that spawned this task,
-        // so the frame follows that reply. Same ioid, level and text — only
-        // the position relative to the INIT reply differs.
-        flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
-        if let Some(seed_raw) = raw_seed {
-            let crate::server_native::source::SubscriptionSeed {
-                initial: seed_raw_initial,
-                updates: mut rx_raw,
-                // raw fast path is the fanout gateway, gated per (name, ctx) via
-                // `notify_monitor_start`, not per op — no per-op gate.
-                on_start: _,
-            } = seed_raw;
-            // Revalidate ACL before seeding (a reload between subscribe and here
-            // could flip to NoAccess). Unlike the source-close FINISH in the loop
-            // below, this ACL-deny FINISH is deliberately NOT Executing-gated: an
-            // access revocation is a security event that closes the monitor
-            // promptly even while Idle (approved INIT-surfacing shift + pvxs
-            // prompt-close-on-revocation), whereas a lifecycle source-close holds
-            // backlog+finish until START. Do NOT "align" this to hold — that would
-            // keep an ACL-revoked subscription alive.
-            let live_v0 = src.access_gate().acl_version();
-            if live_v0
-                != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)
-            {
-                if src
-                    .revalidate_read(&pv_name, mon_ctx.clone())
-                    .await
-                    .is_none()
+                None
+            };
+            // Emit whatever the source recorded while opening the subscription
+            // (pvxs `singlesource.cpp:129` — `record._options.DBE` selecting an
+            // empty mask), whether or not it produced a seed. pvxs logs from
+            // inside `onSubscribe`, i.e. before its `connect()` INIT reply; here
+            // the INIT reply is enqueued by the read loop that spawned this task,
+            // so the frame follows that reply. Same ioid, level and text — only
+            // the position relative to the INIT reply differs.
+            flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
+            if let Some(seed_raw) = raw_seed {
+                let crate::server_native::source::SubscriptionSeed {
+                    initial: seed_raw_initial,
+                    updates: mut rx_raw,
+                    // raw fast path is the fanout gateway, gated per (name, ctx) via
+                    // `notify_monitor_start`, not per op — no per-op gate.
+                    on_start: _,
+                } = seed_raw;
+                // Revalidate ACL before seeding (a reload between subscribe and here
+                // could flip to NoAccess). Unlike the source-close FINISH in the loop
+                // below, this ACL-deny FINISH is deliberately NOT Executing-gated: an
+                // access revocation is a security event that closes the monitor
+                // promptly even while Idle (approved INIT-surfacing shift + pvxs
+                // prompt-close-on-revocation), whereas a lifecycle source-close holds
+                // backlog+finish until START. Do NOT "align" this to hold — that would
+                // keep an ACL-revoked subscription alive.
+                let live_v0 = src.access_gate().acl_version();
+                if live_v0
+                    != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)
                 {
-                    let finish = build_monitor_finish(ioid, order_now());
-                    fin_guard.reply(&tx_clone, finish).await;
-                    return;
-                }
-                mon_acl_version_at_subscribe_cell
-                    .store(live_v0, std::sync::atomic::Ordering::Release);
-            }
-            // The connect-time seed (a decoded snapshot, emitted cooked)
-            // and the accrued raw window are both Executing-gated; the seed is
-            // emitted first, ahead of the backlog.
-            let mut seed_cooked: Option<crate::server_native::source::SourceRead> =
-                seed_raw_initial;
-            let mut pending: std::collections::VecDeque<crate::server_native::RawMonitorEvent> =
-                std::collections::VecDeque::new();
-            let mut source_open = true;
-            loop {
-                let executing = exec.executing();
-                // The cooked seed occupies one FIFO slot until the consumer
-                // emits it, so while it is pending the raw backlog is bounded
-                // to queue_limit-1 — keeping the total (seed + raw) at
-                // queueSize, matching the decoded path where the seed IS
-                // pending[0]. Once the seed is emitted the raw bound relaxes
-                // to queue_limit.
-                //
-                // Exception at queue_limit == 1: the `.max(1)` floor keeps one
-                // raw slot even while the seed is pending, so the seed plus one
-                // raw event briefly coexist (a transient +1 that relaxes the
-                // moment the seed emits). The raw seed is a decoded snapshot and
-                // cannot coalesce into a raw event, so unlike the decoded path it
-                // cannot share pending[0]. This is not client-reachable — a
-                // client queueSize < 2 is rejected at INIT, so queue_limit == 1
-                // requires a non-default monitor_queue_depth == 1.
-                let raw_cap = queue_limit
-                    .saturating_sub(seed_cooked.is_some() as usize)
-                    .max(1);
-                let squash = |old, new| coalesce_raw_monitor_event(&intro_clone, old, new);
-                while source_open {
-                    match rx_raw.try_recv() {
-                        Ok(e) => push_squash_monitor(&mut pending, e, raw_cap, &mon_stat, squash),
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => source_open = false,
+                    if src
+                        .revalidate_read(&pv_name, mon_ctx.clone())
+                        .await
+                        .is_none()
+                    {
+                        let finish = build_monitor_finish(ioid, order_now());
+                        fin.reply(&tx_clone, finish).await;
+                        return;
                     }
+                    mon_acl_version_at_subscribe_cell
+                        .store(live_v0, std::sync::atomic::Ordering::Release);
                 }
-                let has_work = seed_cooked.is_some() || !pending.is_empty();
-                // Executing-gated terminal FINISH (see the decoded path): an
-                // Idle/never-STARTed monitor holds the backlog and the finish
-                // until a later START rather than emitting FINISH on source-close,
-                // matching pvxs servermon.cpp:82,142-154. Teardown still aborts
-                // the waiting task.
-                if !source_open && executing && !has_work {
-                    break;
-                }
-                if executing && has_work {
+                // The connect-time seed (a decoded snapshot, emitted cooked)
+                // and the accrued raw window are both Executing-gated; the seed is
+                // emitted first, ahead of the backlog.
+                let mut seed_cooked: Option<crate::server_native::source::SourceRead> =
+                    seed_raw_initial;
+                let mut pending: std::collections::VecDeque<crate::server_native::RawMonitorEvent> =
+                    std::collections::VecDeque::new();
+                let mut source_open = true;
+                loop {
+                    let executing = exec.executing();
+                    // The cooked seed occupies one FIFO slot until the consumer
+                    // emits it, so while it is pending the raw backlog is bounded
+                    // to queue_limit-1 — keeping the total (seed + raw) at
+                    // queueSize, matching the decoded path where the seed IS
+                    // pending[0]. Once the seed is emitted the raw bound relaxes
+                    // to queue_limit.
+                    //
+                    // Exception at queue_limit == 1: the `.max(1)` floor keeps one
+                    // raw slot even while the seed is pending, so the seed plus one
+                    // raw event briefly coexist (a transient +1 that relaxes the
+                    // moment the seed emits). The raw seed is a decoded snapshot and
+                    // cannot coalesce into a raw event, so unlike the decoded path it
+                    // cannot share pending[0]. This is not client-reachable — a
+                    // client queueSize < 2 is rejected at INIT, so queue_limit == 1
+                    // requires a non-default monitor_queue_depth == 1.
+                    let raw_cap = queue_limit
+                        .saturating_sub(seed_cooked.is_some() as usize)
+                        .max(1);
+                    let squash = |old, new| coalesce_raw_monitor_event(&intro_clone, old, new);
+                    while source_open {
+                        match rx_raw.try_recv() {
+                            Ok(e) => {
+                                push_squash_monitor(&mut pending, e, raw_cap, &mon_stat, squash)
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => source_open = false,
+                        }
+                    }
+                    let has_work = seed_cooked.is_some() || !pending.is_empty();
+                    // Executing-gated terminal FINISH (see the decoded path): an
+                    // Idle/never-STARTed monitor holds the backlog and the finish
+                    // until a later START rather than emitting FINISH on source-close,
+                    // matching pvxs servermon.cpp:82,142-154. Teardown still aborts
+                    // the waiting task.
+                    if !source_open && executing && !has_work {
+                        break;
+                    }
+                    if executing && has_work {
                         if let Some(initial) = seed_cooked.take() {
                             // Per-event ACL recheck on policy reload — the seed is
                             // emitted through the same gate as every backlog event
@@ -2860,9 +2870,13 @@ fn spawn_monitor_subscriber(
                                 != mon_acl_version_at_subscribe_cell
                                     .load(std::sync::atomic::Ordering::Acquire)
                             {
-                                if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
+                                if src
+                                    .revalidate_read(&pv_name, mon_ctx.clone())
+                                    .await
+                                    .is_none()
+                                {
                                     let finish = build_monitor_finish(ioid, order_now());
-                                    fin_guard.reply(&tx_clone, finish).await;
+                                    fin.reply(&tx_clone, finish).await;
                                     return;
                                 }
                                 mon_acl_version_at_subscribe_cell
@@ -2886,10 +2900,12 @@ fn spawn_monitor_subscriber(
                             }
                             continue;
                         }
-                        let ev = pending.pop_front().expect("has_work && no seed => pending non-empty");
+                        let ev = pending
+                            .pop_front()
+                            .expect("has_work && no seed => pending non-empty");
                         if ev.type_changed {
                             let finish = build_monitor_finish(ioid, order_now());
-                            fin_guard.reply(&tx_clone, finish).await;
+                            fin.reply(&tx_clone, finish).await;
                             return;
                         }
                         let live_v = src.access_gate().acl_version();
@@ -2897,15 +2913,20 @@ fn spawn_monitor_subscriber(
                             != mon_acl_version_at_subscribe_cell
                                 .load(std::sync::atomic::Ordering::Acquire)
                         {
-                            if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
                                 let finish = build_monitor_finish(ioid, order_now());
-                                fin_guard.reply(&tx_clone, finish).await;
+                                fin.reply(&tx_clone, finish).await;
                                 return;
                             }
                             mon_acl_version_at_subscribe_cell
                                 .store(live_v, std::sync::atomic::Ordering::Release);
                         }
-                        let payload = match raw_monitor_frame(ioid, &intro_clone, &ev, order_now()) {
+                        let payload = match raw_monitor_frame(ioid, &intro_clone, &ev, order_now())
+                        {
                             RawMonitorFrame::Forward(p) => p,
                             RawMonitorFrame::Terminate { frame, reason } => {
                                 debug!(
@@ -2920,252 +2941,287 @@ fn spawn_monitor_subscriber(
                         if tx_clone.send(payload).await.is_err() {
                             return;
                         }
-                    continue;
+                        continue;
+                    }
+                    tokio::select! {
+                        biased;
+                        r = rx_raw.recv(), if source_open => match r {
+                            Some(ev) => push_squash_monitor(&mut pending, ev, raw_cap, &mon_stat, squash),
+                            None => source_open = false,
+                        },
+                        open = exec.edge() => if !open {
+                            return;
+                        },
+                    }
                 }
+                let finish = build_monitor_finish(ioid, order_now());
+                fin.reply(&tx_clone, finish).await;
+                return;
+            }
+
+            // ---------------- DECODED PATH ----------------
+            let seed = src
+                .subscribe_seeded(
+                    mon_checked.clone(),
+                    mon_ctx.clone(),
+                    monitor_options.clone(),
+                )
+                .await;
+            // Same source-diagnostic drain as the raw path above: the source may
+            // have recorded a `record._options` warning while opening this
+            // subscription, and it must reach the client even when the
+            // subscription itself failed to open.
+            flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
+            let Some(seed) = seed else {
+                return;
+            };
+            let crate::server_native::source::SubscriptionSeed {
+                initial: seed_initial,
+                updates: mut rx,
+                on_start: seed_on_start,
+            } = seed;
+            // Owned by this loop rather than a task of its own; the
+            // unconditional first application happens here, where the spawn
+            // used to be, so a STOP that fired before the subscription opened
+            // is still not missed; an edge landing between here and the first
+            // iteration is still delivered to `exec.edge()`.
+            let mut gate_driver = MonitorGateDriver::new(seed_on_start);
+            gate_driver.apply(exec.executing()).await;
+            let mut frame_size = 0;
+            let wm_levels = wm_levels_init;
+            let credit = MonitorPipelineCredit {
+                window: window.as_ref(),
+                window_notify: window_notify.as_ref(),
+                wm_levels,
+                wm_seq: &wm_seq,
+                monitor_op_id,
+                src: &src,
+                pv_name: &pv_name,
+                mon_ctx: &mon_ctx,
+            };
+            let _wm_withdraw_guard = wm_levels.is_some().then(|| {
+                let mut ctx = mon_ctx.clone();
+                ctx.pv_request = None;
+                WatermarkWithdrawOnDrop {
+                    src: src.clone(),
+                    pv_name: pv_name.clone(),
+                    ctx,
+                    op_id: monitor_op_id,
+                }
+            });
+            {
+                // ACL-deny FINISH is prompt (not Executing-gated) — see the raw path's
+                // pre-loop revalidate: a security revocation closes the monitor even
+                // while Idle, unlike the lifecycle source-close FINISH which holds
+                // backlog+finish until START.
+                let live_v0 = src.access_gate().acl_version();
+                if live_v0
+                    != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    if src
+                        .revalidate_read(&pv_name, mon_ctx.clone())
+                        .await
+                        .is_none()
+                    {
+                        let finish = build_monitor_finish(ioid, order_now());
+                        fin.reply(&tx_clone, finish).await;
+                        return;
+                    }
+                    mon_acl_version_at_subscribe_cell
+                        .store(live_v0, std::sync::atomic::Ordering::Release);
+                }
+            }
+            // Bounded FIFO, owned by [`MonitorQueue`] (pvxs `doPost`): the
+            // connect-time seed is `pending[0]` (the consumer emits it first at
+            // START, ahead of the accrued backlog) rather than an unconditional
+            // pre-loop send. The seed is pushed RAW — the consumer runs the
+            // `_filter` chain on every pending item (so the seed is filtered
+            // exactly once, like epics-base `dbChannelRunPreChain`; a gating filter
+            // that drops it suppresses the initial frame, a transform mismatch
+            // tears the monitor down with an error).
+            let mut pending =
+                MonitorQueue::new(queue_limit, &intro_clone, &mask_clone, mon_stat.clone());
+            if let Some(initial) = seed_initial {
+                pending.seed(initial);
+            }
+
+            let mut source_open = true;
+            // The previous pass sent a frame and did not park: pvxs `doReply`
+            // re-dispatching itself rather than waiting for `maybeReply`.
+            let mut chained = false;
+            loop {
+                let executing = exec.executing();
+                // Apply this op's gate from the state we just read. The
+                // `exec.edge()` arm below wakes the loop on every edge, so this
+                // reaches the source's suspend/resume as promptly as the driver
+                // task did — including while the loop is parked waiting for an
+                // update that a suspended upstream will never send.
+                gate_driver.apply(executing).await;
+                while source_open {
+                    match rx.try_recv() {
+                        Ok(e) => {
+                            pending.push(e);
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => source_open = false,
+                    }
+                }
+                // The terminal FINISH is the last queue entry once the source has
+                // closed (pvxs posts an empty `Value`), gated like every DATA frame:
+                // pvxs holds the backlog and the finish until the client is
+                // Executing (servermon.cpp:82,142-154). An Idle or never-STARTed
+                // monitor whose PV closes therefore accrues the finish instead of
+                // emitting FINISH and abandoning `pending`; a later START flushes the
+                // backlog then finishes. Teardown (DESTROY / disconnect) still aborts
+                // the task via `monitor_abort` while it waits for that START.
+                let finished = !source_open;
+                // pvxs `maybeReply`/`doReply`: an exhausted pipeline window
+                // suppresses the REPLY only (`servermon.cpp:79-83,143`), never the
+                // drain above, so a stalled pipelined client coalesces at `limit`.
+                // Starting a reply takes credit; once finished, a reply already in
+                // progress sends the rest of the queue and the FINISH without it
+                // (`servermon.cpp:143,212`).
+                let free = finished && chained;
+                let mut refill = None;
+                if executing && (finished || !pending.is_empty()) {
+                    if !free && !credit.available() {
+                        // Armed before the window is read again (see `arm_refill`).
+                        refill = credit.arm_refill();
+                    }
+                    if free || credit.available() {
+                        if pending.is_empty() {
+                            break;
+                        }
+                        let QueuedUpdate {
+                            update: value,
+                            changed,
+                        } = pending.pop().expect("guarded non-empty");
+                        // Subscription boundary (upstream descriptor change): emit
+                        // MONITOR FINISH and end — the decoded counterpart of the raw
+                        // path's `type_changed` branch.
+                        if value.type_changed {
+                            let finish = build_monitor_finish(ioid, order_now());
+                            fin.reply(&tx_clone, finish).await;
+                            return;
+                        }
+                        // Per-event ACL recheck on policy reload, routed through
+                        // `revalidate_read` for composite-source correctness.
+                        let live_v = src.access_gate().acl_version();
+                        if live_v
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
+                                let finish = build_monitor_finish(ioid, order_now());
+                                fin.reply(&tx_clone, finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v, std::sync::atomic::Ordering::Release);
+                        }
+                        let value = value.value;
+                        // Server-side channel filters: skip when the chain drops this
+                        // event (no wire frame => no credit consumed).
+                        let value = match apply_monitor_filter_chain(&filters, &value, &intro_clone)
+                        {
+                            MonitorFilterOutcome::Pass => value,
+                            MonitorFilterOutcome::Drop => continue,
+                            MonitorFilterOutcome::Transformed(tv) => tv.into(),
+                            MonitorFilterOutcome::DescriptorMismatch => {
+                                let err = build_monitor_error(
+                                    ioid,
+                                    "server-side filter transform does not fit the monitor descriptor",
+                                    order_now(),
+                                );
+                                fin.reply(&tx_clone, err).await;
+                                return;
+                            }
+                        };
+                        // Pipeline window: consume one credit AFTER the pause/filter
+                        // gates (pvxs `servermon.cpp:192`) — a held or filtered event
+                        // produces no wire frame, so it must not consume a slot. The
+                        // credit was checked by `credit.available()` above and this
+                        // is the only decrementer, so it is still there — unless the
+                        // frame goes `free` (see `take`). No-op for a non-pipeline
+                        // monitor.
+                        credit.take();
+                        // A source that declares its marked leaves frames exactly
+                        // those (pvxs `to_wire_valid(R, ent, &pvMask)`); one that
+                        // declares none posts a wholly-changed value, which is
+                        // pvxs's fully-marked `Value` — the full request mask.
+                        // There is no third form: the port does not reconstruct a
+                        // marked set by diffing snapshots, which pvxs never does.
+                        // `changed` is that bitset, computed at enqueue.
+                        let payload = build_monitor_payload(
+                            ioid,
+                            &intro_clone,
+                            &value,
+                            &changed,
+                            order_now(),
+                            &mut frame_size,
+                        );
+                        if tx_clone.send(payload).await.is_err() {
+                            return;
+                        }
+                        chained = true;
+                        continue;
+                    }
+                }
+                chained = false;
                 tokio::select! {
                     biased;
-                    r = rx_raw.recv(), if source_open => match r {
-                        Some(ev) => push_squash_monitor(&mut pending, ev, raw_cap, &mon_stat, squash),
+                    r = rx.recv(), if source_open => match r {
+                        Some(ev) => {
+                            pending.push(ev);
+                        }
                         None => source_open = false,
                     },
                     open = exec.edge() => if !open {
                         return;
                     },
+                    _ = wait_credit_refill(refill) => {}
                 }
             }
+            // Source closed — emit MONITOR FINISH (pvxs servermon.cpp:148-178).
             let finish = build_monitor_finish(ioid, order_now());
-            fin_guard.reply(&tx_clone, finish).await;
-            return;
-        }
-
-        // ---------------- DECODED PATH ----------------
-        let seed = src
-            .subscribe_seeded(
-                mon_checked.clone(),
-                mon_ctx.clone(),
-                monitor_options.clone(),
-            )
-            .await;
-        // Same source-diagnostic drain as the raw path above: the source may
-        // have recorded a `record._options` warning while opening this
-        // subscription, and it must reach the client even when the
-        // subscription itself failed to open.
-        flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
-        let Some(seed) = seed else {
-            return;
+            fin.reply(&tx_clone, finish).await;
         };
-        let crate::server_native::source::SubscriptionSeed {
-            initial: seed_initial,
-            updates: mut rx,
-            on_start: seed_on_start,
-        } = seed;
-        // Owned by this loop rather than a task of its own; the
-        // unconditional first application happens here, where the spawn
-        // used to be, so a STOP that fired before the subscription opened
-        // is still not missed; an edge landing between here and the first
-        // iteration is still delivered to `exec.edge()`.
-        let mut gate_driver = MonitorGateDriver::new(seed_on_start);
-        gate_driver.apply(exec.executing()).await;
-        let mut frame_size = 0;
-        let wm_levels = wm_levels_init;
-        let credit = MonitorPipelineCredit {
-            window: window.as_ref(),
-            window_notify: window_notify.as_ref(),
-            wm_levels,
-            wm_seq: &wm_seq,
-            monitor_op_id,
-            src: &src,
-            pv_name: &pv_name,
-            mon_ctx: &mon_ctx,
-        };
-        let _wm_withdraw_guard = wm_levels.is_some().then(|| {
-            let mut ctx = mon_ctx.clone();
-            ctx.pv_request = None;
-            WatermarkWithdrawOnDrop {
-                src: src.clone(),
-                pv_name: pv_name.clone(),
-                ctx,
-                op_id: monitor_op_id,
-            }
-        });
+        use futures_util::future::FutureExt;
+        if std::panic::AssertUnwindSafe(body)
+            .catch_unwind()
+            .await
+            .is_err()
         {
-            // ACL-deny FINISH is prompt (not Executing-gated) — see the raw path's
-            // pre-loop revalidate: a security revocation closes the monitor even
-            // while Idle, unlike the lifecycle source-close FINISH which holds
-            // backlog+finish until START.
-            let live_v0 = src.access_gate().acl_version();
-            if live_v0
-                != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)
-            {
-                if src
-                    .revalidate_read(&pv_name, mon_ctx.clone())
-                    .await
-                    .is_none()
-                {
-                    let finish = build_monitor_finish(ioid, order_now());
-                    fin_guard.reply(&tx_clone, finish).await;
-                    return;
-                }
-                mon_acl_version_at_subscribe_cell
-                    .store(live_v0, std::sync::atomic::Ordering::Release);
-            }
+            error!(pv = %err_pv, ioid, "MONITOR source panicked; ending the op");
+            let order = if err_order.load(std::sync::atomic::Ordering::Relaxed) {
+                ByteOrder::Big
+            } else {
+                ByteOrder::Little
+            };
+            let err = build_monitor_error(ioid, "source handler panicked", order);
+            fin_guard.reply(&err_tx, err).await;
         }
-        // Bounded FIFO, owned by [`MonitorQueue`] (pvxs `doPost`): the
-        // connect-time seed is `pending[0]` (the consumer emits it first at
-        // START, ahead of the accrued backlog) rather than an unconditional
-        // pre-loop send. The seed is pushed RAW — the consumer runs the
-        // `_filter` chain on every pending item (so the seed is filtered
-        // exactly once, like epics-base `dbChannelRunPreChain`; a gating filter
-        // that drops it suppresses the initial frame, a transform mismatch
-        // tears the monitor down with an error).
-        let mut pending =
-            MonitorQueue::new(queue_limit, &intro_clone, &mask_clone, mon_stat.clone());
-        if let Some(initial) = seed_initial {
-            pending.seed(initial);
-        }
+    };
 
-        let mut source_open = true;
-        // The previous pass sent a frame and did not park: pvxs `doReply`
-        // re-dispatching itself rather than waiting for `maybeReply`.
-        let mut chained = false;
-        loop {
-            let executing = exec.executing();
-            // Apply this op's gate from the state we just read. The
-            // `exec.edge()` arm below wakes the loop on every edge, so this
-            // reaches the source's suspend/resume as promptly as the driver
-            // task did — including while the loop is parked waiting for an
-            // update that a suspended upstream will never send.
-            gate_driver.apply(executing).await;
-            while source_open {
-                match rx.try_recv() {
-                    Ok(e) => {
-                        pending.push(e);
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => source_open = false,
-                }
-            }
-            // The terminal FINISH is the last queue entry once the source has
-            // closed (pvxs posts an empty `Value`), gated like every DATA frame:
-            // pvxs holds the backlog and the finish until the client is
-            // Executing (servermon.cpp:82,142-154). An Idle or never-STARTed
-            // monitor whose PV closes therefore accrues the finish instead of
-            // emitting FINISH and abandoning `pending`; a later START flushes the
-            // backlog then finishes. Teardown (DESTROY / disconnect) still aborts
-            // the task via `monitor_abort` while it waits for that START.
-            let finished = !source_open;
-            // pvxs `maybeReply`/`doReply`: an exhausted pipeline window
-            // suppresses the REPLY only (`servermon.cpp:79-83,143`), never the
-            // drain above, so a stalled pipelined client coalesces at `limit`.
-            // Starting a reply takes credit; once finished, a reply already in
-            // progress sends the rest of the queue and the FINISH without it
-            // (`servermon.cpp:143,212`).
-            let free = finished && chained;
-            let mut refill = None;
-            if executing && (finished || !pending.is_empty()) {
-                if !free && !credit.available() {
-                    // Armed before the window is read again (see `arm_refill`).
-                    refill = credit.arm_refill();
-                }
-                if free || credit.available() {
-                    if pending.is_empty() {
-                        break;
-                    }
-                    let QueuedUpdate {
-                        update: value,
-                        changed,
-                    } = pending.pop().expect("guarded non-empty");
-                    // Subscription boundary (upstream descriptor change): emit
-                    // MONITOR FINISH and end — the decoded counterpart of the raw
-                    // path's `type_changed` branch.
-                    if value.type_changed {
-                        let finish = build_monitor_finish(ioid, order_now());
-                        fin_guard.reply(&tx_clone, finish).await;
-                        return;
-                    }
-                    // Per-event ACL recheck on policy reload, routed through
-                    // `revalidate_read` for composite-source correctness.
-                    let live_v = src.access_gate().acl_version();
-                    if live_v
-                        != mon_acl_version_at_subscribe_cell
-                            .load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
-                            let finish = build_monitor_finish(ioid, order_now());
-                            fin_guard.reply(&tx_clone, finish).await;
-                            return;
-                        }
-                        mon_acl_version_at_subscribe_cell
-                            .store(live_v, std::sync::atomic::Ordering::Release);
-                    }
-                    let value = value.value;
-                    // Server-side channel filters: skip when the chain drops this
-                    // event (no wire frame => no credit consumed).
-                    let value = match apply_monitor_filter_chain(&filters, &value, &intro_clone) {
-                        MonitorFilterOutcome::Pass => value,
-                        MonitorFilterOutcome::Drop => continue,
-                        MonitorFilterOutcome::Transformed(tv) => tv.into(),
-                        MonitorFilterOutcome::DescriptorMismatch => {
-                            let err = build_monitor_error(
-                                ioid,
-                                "server-side filter transform does not fit the monitor descriptor",
-                                order_now(),
-                            );
-                            fin_guard.reply(&tx_clone, err).await;
-                            return;
-                        }
-                    };
-                    // Pipeline window: consume one credit AFTER the pause/filter
-                    // gates (pvxs `servermon.cpp:192`) — a held or filtered event
-                    // produces no wire frame, so it must not consume a slot. The
-                    // credit was checked by `credit.available()` above and this
-                    // is the only decrementer, so it is still there — unless the
-                    // frame goes `free` (see `take`). No-op for a non-pipeline
-                    // monitor.
-                    credit.take();
-                    // A source that declares its marked leaves frames exactly
-                    // those (pvxs `to_wire_valid(R, ent, &pvMask)`); one that
-                    // declares none posts a wholly-changed value, which is
-                    // pvxs's fully-marked `Value` — the full request mask.
-                    // There is no third form: the port does not reconstruct a
-                    // marked set by diffing snapshots, which pvxs never does.
-                    // `changed` is that bitset, computed at enqueue.
-                    let payload = build_monitor_payload(
-                        ioid,
-                        &intro_clone,
-                        &value,
-                        &changed,
-                        order_now(),
-                        &mut frame_size,
-                    );
-                    if tx_clone.send(payload).await.is_err() {
-                        return;
-                    }
-                    chained = true;
-                    continue;
-                }
-            }
-            chained = false;
-            tokio::select! {
-                biased;
-                r = rx.recv(), if source_open => match r {
-                    Some(ev) => {
-                        pending.push(ev);
-                    }
-                    None => source_open = false,
-                },
-                open = exec.edge() => if !open {
-                    return;
-                },
-                _ = wait_credit_refill(refill) => {}
-            }
-        }
-        // Source closed — emit MONITOR FINISH (pvxs servermon.cpp:148-178).
-        let finish = build_monitor_finish(ioid, order_now());
-        fin_guard.reply(&tx_clone, finish).await;
-    });
+    (task, start_ctl)
+}
 
-    (join, start_ctl)
+/// [`monitor_subscriber`] on a task of its own, for tests that drive one
+/// subscriber without a connection writer.
+#[cfg(test)]
+fn spawn_monitor_subscriber(
+    reactor: &epics_base_rs::runtime::task::Reactor,
+    args: MonitorSubscriberArgs,
+) -> (
+    epics_base_rs::runtime::task::TaskHandle<()>,
+    Arc<MonitorStartControl>,
+) {
+    let (task, start_ctl) = monitor_subscriber(args);
+    (reactor.spawn(task), start_ctl)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3642,6 +3698,12 @@ pub(super) const TX_LIMIT_FALLBACK: usize = TCP_TX_LIMIT_MULT * 256 * 1024;
 /// written on its own, uncopied.
 const WRITER_COALESCE_BYTES: usize = 64 * 1024;
 
+/// `rx` entries the writer takes per write before it polls the MONITOR
+/// subscribers it hosts: a client streaming requests keeps `rx` non-empty,
+/// and draining it first held every monitor update back for as long as the
+/// stream lasted.
+const WRITER_PASS_FRAMES: usize = 64;
+
 /// Byte budget for one connection's writer queue — the port of pvxs
 /// `tcp_tx_limit`. Producers acquire `clamp(len, 1..=limit)` permits
 /// before a frame may enter the queue; the writer task releases the
@@ -3731,27 +3793,109 @@ impl Drop for TxBudgetCloseGuard {
 /// down.
 #[derive(Clone)]
 struct SrvTx {
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<Outbound>,
     budget: TxBudget,
+    host: Arc<HostQueue>,
+    sink: TxSink,
+}
+
+/// Where a [`SrvTx`]'s frames go.
+#[derive(Clone, Copy)]
+enum TxSink {
+    /// The writer's `rx`, whose push wakes the writer.
+    Writer,
+    /// The [`HostQueue`]: the producer is a subscriber the writer is
+    /// polling right now, and the writer takes the frame when that poll
+    /// returns.
+    Hosted,
+}
+
+/// An entry in the writer's `rx`.
+enum Outbound {
+    Frame(Vec<u8>),
+    /// A MONITOR INIT reply and the subscriber it opens
+    /// ([`SrvTx::send_hosting`]).
+    Hosting(Vec<u8>, HostedSubscriber),
+}
+
+#[cfg(test)]
+impl Outbound {
+    /// The frame, dropping any subscriber it carries.
+    fn into_frame(self) -> Vec<u8> {
+        match self {
+            Self::Frame(frame) | Self::Hosting(frame, _) => frame,
+        }
+    }
 }
 
 impl SrvTx {
-    /// Build the writer-queue pair plus the budget handle the writer
-    /// task releases into.
+    /// Build the writer-queue pair, the budget handle the writer task
+    /// releases into, and the set of MONITOR subscribers the writer runs.
     fn channel(
         depth: usize,
         tx_limit_bytes: usize,
-    ) -> (Self, tokio::sync::mpsc::Receiver<Vec<u8>>, TxBudget) {
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<Outbound>,
+        TxBudget,
+        SubscriberSet,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel(depth);
         let budget = TxBudget::new(tx_limit_bytes);
+        let host = Arc::new(HostQueue::default());
         (
             Self {
                 tx,
                 budget: budget.clone(),
+                host: host.clone(),
+                sink: TxSink::Writer,
             },
             rx,
             budget,
+            SubscriberSet {
+                host,
+                live: futures_util::stream::FuturesUnordered::new(),
+                ready: VecDeque::new(),
+            },
         )
+    }
+
+    /// Queue `frame`, a MONITOR INIT reply, and run the subscriber `make`
+    /// builds on this connection's writer task, as pvxs runs `doReply` on
+    /// the connection's own loop (`servermon.cpp:102`): a post then wakes the
+    /// one task that encodes and writes, not a task per subscription that
+    /// hands each frame to the writer. Dropping the returned guard ends the
+    /// subscriber; so does the writer ending.
+    ///
+    /// The subscriber rides `rx` with the reply and the writer adopts it as
+    /// it takes the reply, so nothing the subscriber emits (a subscribe-time
+    /// CMD_MESSAGE, an access-denied FINISH) can reach the wire ahead of it.
+    /// With the writer gone the subscriber is dropped unstarted, which runs
+    /// its finish guard as an abort would.
+    ///
+    /// `make` gets the writer handle the subscriber must emit through. Its
+    /// frames bypass `rx`: a push there would wake the writer task from
+    /// inside its own poll and run it a second time per post.
+    async fn send_hosting<F, R>(
+        &self,
+        frame: Vec<u8>,
+        make: impl FnOnce(SrvTx) -> (F, R),
+    ) -> (HostedAbort, R)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (task, ret) = make(SrvTx {
+            sink: TxSink::Hosted,
+            ..self.clone()
+        });
+        let (task, abort) = futures_util::future::abortable(task);
+        let task: HostedSubscriber = Box::pin(Contained(Some(Box::pin(async move {
+            let _ = task.await;
+        }))));
+        if let Ok(permit) = self.reserve_rx(frame.len()).await {
+            permit.send(Outbound::Hosting(frame, task));
+        }
+        (HostedAbort(abort), ret)
     }
 
     /// Take both bounds for a frame of `len` bytes up front and hand back
@@ -3764,21 +3908,32 @@ impl SrvTx {
     /// [`ExecFinishGuard::reply`]). Awaiting `send` instead puts an await —
     /// therefore a cancellation point — after the signal, where the owner
     /// has already dropped the task's `AbortOnDrop`.
+    ///
+    /// A hosted producer takes no queue slot: its frames are written
+    /// before the writer polls anything else, so they never accumulate.
     async fn reserve(&self, len: usize) -> Result<TxPermit<'_>, ()> {
-        self.budget.acquire(len).await?;
-        match self.tx.reserve().await {
-            Ok(permit) => Ok(TxPermit {
-                permit: Some(permit),
-                budget: self.budget.clone(),
-                len,
-            }),
-            Err(_closed) => {
-                // The frame can never enter the queue; hand its budget back
-                // so any producer racing the shutdown is not stuck short.
-                self.budget.release(len);
-                Err(())
+        let slot = match self.sink {
+            TxSink::Hosted => {
+                self.budget.acquire(len).await?;
+                TxSlot::Hosted(&self.host)
             }
-        }
+            TxSink::Writer => TxSlot::Writer(self.reserve_rx(len).await?),
+        };
+        Ok(TxPermit {
+            slot: Some(slot),
+            budget: self.budget.clone(),
+            len,
+        })
+    }
+
+    /// Both bounds for a `len`-byte entry in `rx`: the bytes, then a slot.
+    async fn reserve_rx(&self, len: usize) -> Result<tokio::sync::mpsc::Permit<'_, Outbound>, ()> {
+        self.budget.acquire(len).await?;
+        self.tx.reserve().await.map_err(|_closed| {
+            // The frame can never enter the queue; hand its budget back so
+            // any producer racing the shutdown is not stuck short.
+            self.budget.release(len);
+        })
     }
 
     async fn send(&self, buf: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
@@ -3805,6 +3960,255 @@ impl SrvTx {
     }
 }
 
+type HostedSubscriber = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// A hosted subscriber polled and dropped under `catch_unwind`: a panic in
+/// it, in what it drops as it ends, or in its drop when the writer exits,
+/// must end that subscriber alone, not unwind into the writer and every op
+/// on the connection.
+struct Contained(Option<HostedSubscriber>);
+
+impl std::future::Future for Contained {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let Some(task) = self.0.as_mut() else {
+            return std::task::Poll::Ready(());
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.as_mut().poll(cx)))
+            .unwrap_or_else(|_| {
+                error!("hosted subscriber panicked");
+                std::task::Poll::Ready(())
+            })
+    }
+}
+
+impl Drop for Contained {
+    fn drop(&mut self) {
+        let task = self.0.take();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(task))).is_err() {
+            error!("hosted subscriber panicked in its drop");
+        }
+    }
+}
+
+/// Ends a subscriber hosted by [`SrvTx::send_hosting`] when dropped.
+#[derive(Debug)]
+struct HostedAbort(futures_util::future::AbortHandle);
+
+impl Drop for HostedAbort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The frames hosted subscribers queued while the writer polled them.
+#[derive(Default)]
+struct HostQueue {
+    frames: std::sync::Mutex<VecDeque<Vec<u8>>>,
+}
+
+impl HostQueue {
+    fn frames(&self) -> std::sync::MutexGuard<'_, VecDeque<Vec<u8>>> {
+        self.frames.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn push(&self, frame: Vec<u8>) {
+        self.frames().push_back(frame);
+    }
+}
+
+/// The MONITOR subscribers a connection's writer task runs, and the frames
+/// they produced that the writer has not taken yet.
+struct SubscriberSet {
+    host: Arc<HostQueue>,
+    live: futures_util::stream::FuturesUnordered<HostedSubscriber>,
+    ready: VecDeque<Vec<u8>>,
+}
+
+impl SubscriberSet {
+    /// The next frame a subscriber queued, if any.
+    fn take_frame(&mut self) -> Option<Vec<u8>> {
+        self.ready.pop_front()
+    }
+
+    /// Run `task` from the next poll on.
+    fn adopt(&mut self, task: HostedSubscriber) {
+        self.live.push(task);
+    }
+
+    /// Poll every woken subscriber until none is ready and take the frames
+    /// they queued. Ready when one ended or a frame is queued, so the writer
+    /// then sends the frames ([`Self::take_frame`]) in one write.
+    fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use futures_util::StreamExt;
+        let progressed = poll_unbudgeted(cx, |cx| {
+            let mut progressed = false;
+            while let std::task::Poll::Ready(Some(())) = self.live.poll_next_unpin(cx) {
+                progressed = true;
+            }
+            std::task::Poll::Ready(progressed)
+        }) == std::task::Poll::Ready(true);
+        {
+            let mut frames = self.host.frames();
+            if self.ready.is_empty() {
+                std::mem::swap(&mut self.ready, &mut frames);
+            } else {
+                self.ready.append(&mut frames);
+            }
+        }
+        if progressed || !self.ready.is_empty() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// [`Self::poll_drive`] as a cancel-safe future.
+    async fn drive(&mut self) {
+        std::future::poll_fn(|cx| self.poll_drive(cx)).await
+    }
+
+    /// Drive every subscriber `adopt` hands over until every [`SrvTx`] is
+    /// gone and no subscriber is left, forwarding frames to `out`: the
+    /// subscriber half of the writer stand-in for tests that build an
+    /// [`SrvTx`] without a connection ([`TestRx`]). Holds `out` weakly so
+    /// `rx` still closes when the last `SrvTx` does.
+    #[cfg(test)]
+    async fn run(
+        mut self,
+        mut adopt: tokio::sync::mpsc::UnboundedReceiver<HostedSubscriber>,
+        out: tokio::sync::mpsc::WeakSender<Outbound>,
+    ) {
+        while Arc::strong_count(&self.host) > 1 || !self.live.is_empty() {
+            tokio::select! {
+                Some(task) = adopt.recv() => self.adopt(task),
+                _ = self.drive() => {}
+                // Nothing wakes this loop when the last `SrvTx` drops.
+                _ = epics_base_rs::runtime::task::sleep(Duration::from_millis(20)) => {}
+            }
+            while let Some(frame) = self.take_frame() {
+                let Some(out) = out.upgrade() else { return };
+                if out.send(Outbound::Frame(frame)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Poll `f` outside the calling task's tokio coop budget. A hosted subscriber
+/// spends the writer's budget, and once a flood has drained it the
+/// subscriber's source `recv` returns Pending with its wake deferred until the
+/// worker runs out of other work, which a flooded worker does not.
+#[cfg(tokio_backend)]
+fn poll_unbudgeted<T>(
+    cx: &mut std::task::Context<'_>,
+    f: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<T>,
+) -> std::task::Poll<T> {
+    use std::future::Future;
+    std::pin::pin!(tokio::task::unconstrained(std::future::poll_fn(f))).poll(cx)
+}
+
+#[cfg(exec_backend)]
+fn poll_unbudgeted<T>(
+    cx: &mut std::task::Context<'_>,
+    mut f: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<T>,
+) -> std::task::Poll<T> {
+    f(cx)
+}
+
+/// The writer task's inputs: `rx`, and the MONITOR subscribers it adopted
+/// from `rx`.
+struct WriterQueues {
+    rx: tokio::sync::mpsc::Receiver<Outbound>,
+    subscribers: SubscriberSet,
+}
+
+impl WriterQueues {
+    /// Fill `batch` for one write: `first` and at most
+    /// [`WRITER_PASS_FRAMES`] entries from `rx` in all, then — the
+    /// subscribers polled once those are taken — the frames the subscribers
+    /// queued. Each half stops at [`WRITER_COALESCE_BYTES`] of its own, so a
+    /// busy `rx` cannot crowd the subscribers out of a write.
+    ///
+    /// A subscriber is adopted as its INIT reply is taken and polled before
+    /// the subscribers' frames are, so its first frames follow that reply in
+    /// the same write and never precede it.
+    async fn fill(&mut self, mut first: Option<Outbound>, batch: &mut WriteBatch) {
+        let mut taken = 0;
+        while taken < WRITER_PASS_FRAMES && batch.bytes.len() < WRITER_COALESCE_BYTES {
+            let Some(next) = first.take().or_else(|| self.rx.try_recv().ok()) else {
+                break;
+            };
+            taken += 1;
+            match next {
+                Outbound::Frame(frame) => batch.push(frame),
+                Outbound::Hosting(frame, task) => {
+                    batch.push(frame);
+                    self.subscribers.adopt(task);
+                }
+            }
+        }
+        // With nothing taken there is nothing new to adopt, and the
+        // `select!` polls before the writer waits.
+        if taken > 0 {
+            std::future::poll_fn(|cx| {
+                let _ = self.subscribers.poll_drive(cx);
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        let rx_bytes = batch.bytes.len();
+        while batch.bytes.len() - rx_bytes < WRITER_COALESCE_BYTES {
+            let Some(frame) = self.subscribers.take_frame() else {
+                break;
+            };
+            batch.push(frame);
+        }
+    }
+}
+
+/// The frames of one write, back to back, and each one's length: the budget
+/// charge is per frame (`TxBudget::charge` clamps each one), so it is
+/// returned per frame once the batch has left.
+#[derive(Default)]
+struct WriteBatch {
+    bytes: Vec<u8>,
+    lens: Vec<usize>,
+}
+
+impl WriteBatch {
+    fn reset(&mut self) {
+        self.bytes = Vec::new();
+        self.lens.clear();
+    }
+
+    fn push(&mut self, frame: Vec<u8>) {
+        self.lens.push(frame.len());
+        if self.bytes.is_empty() {
+            self.bytes = frame;
+        } else {
+            self.bytes.extend_from_slice(&frame);
+        }
+    }
+
+    #[cfg(test)]
+    fn frames(&self) -> Vec<Vec<u8>> {
+        let mut at = 0;
+        self.lens
+            .iter()
+            .map(|len| {
+                at += len;
+                self.bytes[at - len..at].to_vec()
+            })
+            .collect()
+    }
+}
+
 /// Both writer bounds — one queue slot and `len` bytes of [`TxBudget`] —
 /// held for a frame that has not been pushed yet ([`SrvTx::reserve`]).
 ///
@@ -3813,22 +4217,29 @@ impl SrvTx {
 /// reservation) returns the byte budget; the queue slot is returned by the
 /// inner `Permit`'s own `Drop`.
 struct TxPermit<'a> {
-    permit: Option<tokio::sync::mpsc::Permit<'a, Vec<u8>>>,
+    slot: Option<TxSlot<'a>>,
     budget: TxBudget,
     len: usize,
 }
 
+enum TxSlot<'a> {
+    Writer(tokio::sync::mpsc::Permit<'a, Outbound>),
+    Hosted(&'a HostQueue),
+}
+
 impl TxPermit<'_> {
     fn send(mut self, buf: Vec<u8>) {
-        if let Some(permit) = self.permit.take() {
-            permit.send(buf);
+        match self.slot.take() {
+            Some(TxSlot::Writer(permit)) => permit.send(Outbound::Frame(buf)),
+            Some(TxSlot::Hosted(host)) => host.push(buf),
+            None => {}
         }
     }
 }
 
 impl Drop for TxPermit<'_> {
     fn drop(&mut self) {
-        if self.permit.take().is_some() {
+        if self.slot.take().is_some() {
             self.budget.release(self.len);
         }
     }
@@ -3876,6 +4287,22 @@ impl ChannelTx {
             permit: self.tx.reserve(len).await?,
             stat: self.stat.clone(),
         })
+    }
+
+    /// [`SrvTx::send_hosting`] for a subscriber emitting on this channel;
+    /// `frame` counts against the channel as [`Self::send`]'s does.
+    async fn send_hosting<F, R>(
+        &self,
+        frame: Vec<u8>,
+        make: impl FnOnce(ChannelTx) -> (F, R),
+    ) -> (HostedAbort, R)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.stat.add_tx(frame.len());
+        self.tx
+            .send_hosting(frame, |tx| make(ChannelTx::new(tx, self.stat.clone())))
+            .await
     }
 
     /// Register MONITOR `ioid` in this channel's report.
@@ -4050,7 +4477,9 @@ pub(super) async fn handle_connection_io(
     //    fails fast. Mirrors the parallel guard in `epics-ca-rs`'s
     //    server-side dispatch wrap (the CA G1 audit fix).
     let send_tmo = config.send_timeout;
-    let (tx, mut rx, writer_budget) = SrvTx::channel(config.write_queue_depth, tx_limit_bytes);
+    let (tx, rx, writer_budget, subscribers) =
+        SrvTx::channel(config.write_queue_depth, tx_limit_bytes);
+    let mut queues = WriterQueues { rx, subscribers };
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
     let last_rx_writer = last_rx.clone();
@@ -4060,10 +4489,7 @@ pub(super) async fn handle_connection_io(
         // closes the byte budget so producers parked in `TxBudget::acquire`
         // fail instead of waiting on a writer that no longer exists.
         let _budget_guard = TxBudgetCloseGuard(writer_budget.clone());
-        // Lengths of the frames in the batch being written: the budget
-        // charge is per frame (`TxBudget::charge` clamps each one), so
-        // it is returned per frame, once the batch has left.
-        let mut frame_lens: Vec<usize> = Vec::new();
+        let mut batch = WriteBatch::default();
         // The inactivity deadline, in pvxs's place rather than in the
         // protocol loop: libevent runs a bufferevent's read timeout
         // (`serverconn.cpp:84-85`, `tcpTimeout` = 40 s) from the I/O layer,
@@ -4088,9 +4514,14 @@ pub(super) async fn handle_connection_io(
         // connection is the timer-wheel churn `read_frame`'s per-read
         // `timeout()` wrapper was removed to avoid.
         let mut idle_deadline = std::pin::pin!(epics_base_rs::runtime::task::sleep(idle_timeout));
-        loop {
-            let next = tokio::select! {
-                v = rx.recv() => v,
+        'writer: loop {
+            let mut first = tokio::select! {
+                biased;
+                v = queues.rx.recv() => match v {
+                    Some(item) => Some(item),
+                    None => break,
+                },
+                _ = queues.subscribers.drive() => None,
                 _ = idle_deadline.as_mut() => {
                     let silent = Duration::from_nanos(
                         now_nanos().saturating_sub(last_rx_writer.load(Ordering::Relaxed)),
@@ -4113,37 +4544,41 @@ pub(super) async fn handle_connection_io(
                     continue;
                 }
             };
-            let Some(mut batch) = next else { break };
-            frame_lens.clear();
-            frame_lens.push(batch.len());
-            while batch.len() < WRITER_COALESCE_BYTES {
-                let Ok(frame) = rx.try_recv() else { break };
-                frame_lens.push(frame.len());
-                batch.extend_from_slice(&frame);
-            }
-            match epics_base_rs::runtime::task::timeout(send_tmo, writer_raw.write_all(&batch))
+            // Both queues are emptied before the next `select!`, which only
+            // wakes for `rx` and the subscribers.
+            loop {
+                batch.reset();
+                queues.fill(first.take(), &mut batch).await;
+                if batch.lens.is_empty() {
+                    break;
+                }
+                match epics_base_rs::runtime::task::timeout(
+                    send_tmo,
+                    writer_raw.write_all(&batch.bytes),
+                )
                 .await
-            {
-                Ok(Ok(())) => {
-                    // bytes_out counter for PvaServer::report().
-                    peer_entry_writer.touch_tx(batch.len());
-                    // The frames left the queue for the socket buffer;
-                    // return their bytes to the TX budget.
-                    for len in &frame_lens {
-                        writer_budget.release(*len);
+                {
+                    Ok(Ok(())) => {
+                        // bytes_out counter for PvaServer::report().
+                        peer_entry_writer.touch_tx(batch.bytes.len());
+                        // The frames left the queue for the socket buffer;
+                        // return their bytes to the TX budget.
+                        for len in &batch.lens {
+                            writer_budget.release(*len);
+                        }
                     }
-                }
-                Ok(Err(e)) => {
-                    debug!(peer = ?writer_peer, error = %e, "writer task: TCP write failed, dropping connection");
-                    break;
-                }
-                Err(_) => {
-                    warn!(
-                        peer = ?writer_peer,
-                        timeout_secs = send_tmo.as_secs_f64(),
-                        "writer task: send timeout (stuck client?), dropping connection"
-                    );
-                    break;
+                    Ok(Err(e)) => {
+                        debug!(peer = ?writer_peer, error = %e, "writer task: TCP write failed, dropping connection");
+                        break 'writer;
+                    }
+                    Err(_) => {
+                        warn!(
+                            peer = ?writer_peer,
+                            timeout_secs = send_tmo.as_secs_f64(),
+                            "writer task: send timeout (stuck client?), dropping connection"
+                        );
+                        break 'writer;
+                    }
                 }
             }
         }
@@ -7832,14 +8267,13 @@ async fn handle_op(
             },
         );
 
-        // Subscribe + spawn the MONITOR subscriber at INIT (pvxs
-        // `onSubscribe` registers the upstream at INIT, servermon.cpp:591), so
-        // posts arriving in the INIT->START window are accrued into the op's
-        // bounded FIFO rather than lost. The task stays Idle (emits nothing)
-        // until the first MONITOR START flips its `monitor_exec` watch. Install
-        // the abort guard + start-control in the SAME synchronous step as the
-        // spawn (teardown invariant: task-spawned <=> abort-installed), so a
-        // DESTROY-before-START always tears the upstream down.
+        // Subscribe at INIT (pvxs `onSubscribe` registers the upstream at
+        // INIT, servermon.cpp:591), so posts arriving in the INIT->START window
+        // are accrued into the op's bounded FIFO rather than lost. The
+        // subscriber stays Idle (emits nothing) until the first MONITOR START
+        // flips its `monitor_exec` watch; it is hosted with the INIT reply
+        // below.
+        let mut hosted = None;
         if kind == OpKind::Monitor {
             let pv_name = ch.name.clone();
             // Per-op squash threshold: the negotiated limit resolved at INIT
@@ -7887,14 +8321,7 @@ async fn handle_op(
                     out_order: out_order.clone(),
                 }
             });
-            if let Some(args) = args {
-                let (join, start_ctl) = spawn_monitor_subscriber(reactor, args);
-                if let Some(s) = ch.op_mut(&ioid) {
-                    s.monitor_started = true;
-                    s.monitor_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-                    s.monitor_start_ctl = Some(start_ctl);
-                }
-            }
+            hosted = args;
         }
 
         // Build INIT response: ioid + subcmd + status + introspection
@@ -7949,7 +8376,27 @@ async fn handle_op(
         buf.extend_from_slice(&payload);
         // Attribute the op INIT reply to the channel (pvxs
         // `chan->statTx += enqueueTxBody(cmd)`, serverget.cpp:124).
-        let _ = chan_tx.send(buf).await;
+        match hosted {
+            // The subscriber rides `rx` behind its INIT reply. Install the abort
+            // guard + start-control in the same synchronous step as the
+            // hand-off (teardown invariant: task-hosted <=> abort-installed),
+            // so a DESTROY-before-START always tears the upstream down.
+            Some(args) => {
+                let (abort, start_ctl) = chan_tx
+                    .send_hosting(buf, |tx| {
+                        monitor_subscriber(MonitorSubscriberArgs { tx, ..args })
+                    })
+                    .await;
+                if let Some(s) = ch.op_mut(&ioid) {
+                    s.monitor_started = true;
+                    s.monitor_abort = Some(Arc::new(abort));
+                    s.monitor_start_ctl = Some(start_ctl);
+                }
+            }
+            None => {
+                let _ = chan_tx.send(buf).await;
+            }
+        }
         return Ok(());
     }
 
@@ -9395,9 +9842,57 @@ fn now_nanos() -> u64 {
 /// `cfg(test)` item wherever it sits, so this file's layout is not
 /// constrained by them any more.
 #[cfg(test)]
-fn test_srv_tx(depth: usize) -> (SrvTx, tokio::sync::mpsc::Receiver<Vec<u8>>) {
-    let (tx, rx, _budget) = SrvTx::channel(depth, TxBudget::MAX_CHARGE);
+fn test_srv_tx(depth: usize) -> (SrvTx, TestRx) {
+    let (tx, rx, _budget, subscribers) = SrvTx::channel(depth, TxBudget::MAX_CHARGE);
+    let rx = TestRx::new(rx, subscribers, &tx);
     (tx, rx)
+}
+
+/// The writer's `rx` for a test with no connection: a frame stays queued
+/// until the test takes it, as with the writer, and a subscriber is handed
+/// to a background [`SubscriberSet::run`] as its INIT reply is taken, whose
+/// frames then queue behind it.
+#[cfg(test)]
+struct TestRx {
+    rx: tokio::sync::mpsc::Receiver<Outbound>,
+    adopt: tokio::sync::mpsc::UnboundedSender<HostedSubscriber>,
+}
+
+#[cfg(test)]
+impl TestRx {
+    fn new(
+        rx: tokio::sync::mpsc::Receiver<Outbound>,
+        subscribers: SubscriberSet,
+        tx: &SrvTx,
+    ) -> Self {
+        let (adopt, adopted) = tokio::sync::mpsc::unbounded_channel();
+        crate::test_reactor().spawn(subscribers.run(adopted, tx.tx.downgrade()));
+        Self { rx, adopt }
+    }
+
+    fn take(&self, item: Outbound) -> Vec<u8> {
+        match item {
+            Outbound::Frame(frame) => frame,
+            Outbound::Hosting(frame, task) => {
+                let _ = self.adopt.send(task);
+                frame
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rx.len()
+    }
+
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        let item = self.rx.recv().await?;
+        Some(self.take(item))
+    }
+
+    fn try_recv(&mut self) -> Result<Vec<u8>, tokio::sync::mpsc::error::TryRecvError> {
+        let item = self.rx.try_recv()?;
+        Ok(self.take(item))
+    }
 }
 
 /// A fixed-order outbound cell for `handle_op` calls in tests that do not
@@ -13187,11 +13682,7 @@ mod tests {
     /// field-`a` sequence of the DATA frames (INIT reply + FINISH are
     /// filtered out).
     #[cfg(test)]
-    fn pvx61_drain_data_a(
-        rx: &mut mpsc::Receiver<Vec<u8>>,
-        intro: &FieldDesc,
-        order: ByteOrder,
-    ) -> Vec<i32> {
+    fn pvx61_drain_data_a(rx: &mut TestRx, intro: &FieldDesc, order: ByteOrder) -> Vec<i32> {
         let mut out = Vec::new();
         while let Ok(buf) = rx.try_recv() {
             if let Some(a) = pvx61_decode_data_a(&buf, intro, order) {
@@ -16318,15 +16809,6 @@ mod tests {
         );
     }
 
-    // Reactor-dependent, and specifically tokio-shaped: it stands a task up
-    // with a bare `tokio::spawn` so it can hand `AbortOnDrop` a raw
-    // `tokio::task::AbortHandle`, and it reads the outcome through tokio's
-    // `JoinError::is_cancelled`. Under `exec_backend` the `runtime::task`
-    // seam's `TaskAbortHandle` is a *different* type with a different join
-    // error, so the fixture does not even typecheck there — and the production
-    // sites it stands in for (`finish_exec_data_task`, `monitor_abort`) take
-    // their handle from the seam and do compile on both backends.
-    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn cancel_request_pauses_monitor_without_aborting() {
         // cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
@@ -16338,14 +16820,23 @@ mod tests {
         let sid: u32 = 7;
         let ioid: u32 = 99;
 
-        // Stand up a fake OpState whose `monitor_abort` points at a real
-        // task we can observe NOT being cancelled.
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
-        let abort = Arc::new(AbortOnDrop(task.abort_handle()));
+        // Stand up a fake OpState whose `monitor_abort` guards a hosted
+        // subscriber we can observe NOT being ended: it holds `alive` until
+        // it is dropped.
+        let (alive, mut ended) = tokio::sync::oneshot::channel::<()>();
+        let (host, mut wire) = test_srv_tx(1);
+        let (abort, ()) = host
+            .send_hosting(Vec::new(), |_| {
+                let task = async move {
+                    let _alive = alive;
+                    std::future::pending::<()>().await
+                };
+                (task, ())
+            })
+            .await;
+        // Taking the entry is what starts the subscriber, as in the writer.
+        wire.recv().await.expect("the hosting entry");
+        let abort = Arc::new(abort);
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
@@ -16426,23 +16917,32 @@ mod tests {
         drop(abort);
         // The task must NOT have been aborted yet — the OpState in
         // `channels` still holds an Arc to the abort guard.
-        let join_attempt = tokio::time::timeout(
+        let join_attempt = epics_base_rs::runtime::task::timeout(
             Duration::from_millis(50),
             &mut Box::pin(async {
                 // Probe: confirm task is still pending by sleeping briefly.
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
             }),
         )
         .await;
         assert!(join_attempt.is_ok(), "probe should not time out");
 
-        // Now drop the OpState (simulating DESTROY); the task must abort.
-        drop(channels);
-        let join = tokio::time::timeout(Duration::from_millis(500), task).await;
-        let outcome = join.expect("aborted task should finish quickly");
         assert!(
-            outcome.unwrap_err().is_cancelled(),
-            "task should abort only on DESTROY (OpState drop), not on cancel"
+            matches!(
+                ended.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the subscriber outlives CANCEL"
+        );
+
+        // Now drop the OpState (simulating DESTROY); the subscriber must end.
+        drop(channels);
+        let outcome = epics_base_rs::runtime::task::timeout(Duration::from_millis(500), ended)
+            .await
+            .expect("an ended subscriber is dropped quickly");
+        assert!(
+            outcome.is_err(),
+            "the subscriber ends only on DESTROY (OpState drop), not on cancel"
         );
     }
 
@@ -22704,7 +23204,7 @@ mod tests {
     async fn monitor_finish_signal_waits_for_the_writer_reservation() {
         use std::future::Future;
 
-        let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
+        let (srv_tx, mut wire_rx, _budget, _subscribers) = SrvTx::channel(1, 1 << 20);
         let chan_tx = ChannelTx::new(
             srv_tx,
             crate::server_native::peers::ChannelStat::new(String::new()),
@@ -22713,7 +23213,7 @@ mod tests {
         chan_tx.send(vec![0u8]).await.expect("first frame fits");
 
         let (tx, mut rx) = mpsc::unbounded_channel::<MonitorFinished>();
-        let guard = MonitorFinishGuard::new(
+        let mut guard = MonitorFinishGuard::new(
             tx,
             MonitorFinished {
                 sid: 3,
@@ -22722,26 +23222,35 @@ mod tests {
             },
         );
 
-        let mut reply = std::pin::pin!(guard.reply(&chan_tx, vec![1u8]));
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(
-            reply.as_mut().poll(&mut cx).is_pending(),
-            "the writer queue is full, so the frame cannot have been enqueued"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "no signal may be queued while the frame is still unreservable — \
-             the owner would answer it by aborting this task mid-send"
-        );
+        {
+            let mut reply = std::pin::pin!(guard.reply(&chan_tx, vec![1u8]));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                reply.as_mut().poll(&mut cx).is_pending(),
+                "the writer queue is full, so the frame cannot have been enqueued"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "no signal may be queued while the frame is still unreservable — \
+                 the owner would answer it by aborting this task mid-send"
+            );
 
-        // Free the slot: the signal and the frame both go out, once each.
-        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
-        reply.await;
+            // Free the slot: the signal and the frame both go out, once each.
+            assert_eq!(
+                wire_rx.recv().await.map(Outbound::into_frame).as_deref(),
+                Some(&[0u8][..])
+            );
+            reply.await;
+        }
+        drop(guard);
         let got = rx
             .try_recv()
             .expect("the removal signal rides out with the frame");
         assert_eq!((got.sid, got.ioid, got.op_id), (3, 11, 77));
-        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[1u8][..]));
+        assert_eq!(
+            wire_rx.recv().await.map(Outbound::into_frame).as_deref(),
+            Some(&[1u8][..])
+        );
         assert!(
             rx.try_recv().is_err(),
             "the guard signals exactly once, not again from Drop"
@@ -22835,7 +23344,7 @@ mod tests {
     #[test]
     fn monitor_finish_signals_the_owner_before_queuing_its_frame() {
         struct Observe {
-            frames: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+            frames: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Outbound>>,
             frame_at_wake: parking_lot::Mutex<Option<bool>>,
         }
         impl std::task::Wake for Observe {
@@ -22848,7 +23357,8 @@ mod tests {
             }
         }
 
-        let (tx, frames) = test_srv_tx(4);
+        // No executor here, so no subscriber host: this test hosts none.
+        let (tx, frames, _budget, _subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
         let tx = ChannelTx::new(
             tx,
             crate::server_native::peers::ChannelStat::new(String::new()),
@@ -22870,8 +23380,8 @@ mod tests {
             ioid: 2,
             op_id: 3,
         };
-        let reply = MonitorFinishGuard::new(fin_tx, fin)
-            .reply(&tx, build_monitor_finish(2, ByteOrder::Little));
+        let mut guard = MonitorFinishGuard::new(fin_tx, fin);
+        let reply = guard.reply(&tx, build_monitor_finish(2, ByteOrder::Little));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(std::pin::pin!(reply).poll(&mut cx).is_ready());
 
@@ -25094,7 +25604,7 @@ mod bfr15_tests {
     async fn exec_finish_signal_waits_for_the_writer_reservation() {
         use std::future::Future;
 
-        let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
+        let (srv_tx, mut wire_rx, _budget, _subscribers) = SrvTx::channel(1, 1 << 20);
         let chan_tx = ChannelTx::new(
             srv_tx,
             crate::server_native::peers::ChannelStat::new(String::new()),
@@ -25127,7 +25637,10 @@ mod bfr15_tests {
         );
 
         // Free the slot: the signal and the frame both go out, once each.
-        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
+        assert_eq!(
+            wire_rx.recv().await.map(Outbound::into_frame).as_deref(),
+            Some(&[0u8][..])
+        );
         reply.await;
         let fin = fin_rx
             .try_recv()
@@ -25136,7 +25649,10 @@ mod bfr15_tests {
             (fin.sid, fin.ioid, fin.op_id, fin.success),
             (1, 500, 7, true)
         );
-        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[1u8][..]));
+        assert_eq!(
+            wire_rx.recv().await.map(Outbound::into_frame).as_deref(),
+            Some(&[1u8][..])
+        );
         assert!(
             fin_rx.try_recv().is_err(),
             "the guard signals exactly once, not again from Drop"
@@ -25167,7 +25683,7 @@ mod bfr15_tests {
     async fn exec_reply_frame_survives_an_abort_racing_its_signal() {
         let (sid, ioid) = (5u32, 77u32);
 
-        let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
+        let (srv_tx, mut wire_rx, _budget, _subscribers) = SrvTx::channel(1, 1 << 20);
         let chan_tx = ChannelTx::new(
             srv_tx,
             crate::server_native::peers::ChannelStat::new(String::new()),
@@ -25239,11 +25755,14 @@ mod bfr15_tests {
 
         // Free the slot. Whatever the owner just did, the client is owed its
         // reply: pre-fix the task was aborted mid-`send` and this times out.
-        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
+        assert_eq!(
+            wire_rx.recv().await.map(Outbound::into_frame).as_deref(),
+            Some(&[0u8][..])
+        );
         let frame = tokio::time::timeout(Duration::from_secs(5), wire_rx.recv())
             .await
             .expect("the reply frame must survive an abort racing its own signal");
-        assert_eq!(frame.as_deref(), Some(&[1u8][..]));
+        assert_eq!(frame.map(Outbound::into_frame).as_deref(), Some(&[1u8][..]));
 
         if !signalled_before_reserving {
             fin_rx
@@ -25497,7 +26016,7 @@ mod tx_byte_budget_tests {
     /// release must re-admit it.
     #[epics_macros_rs::epics_test]
     async fn bytes_not_frames_bound_the_writer_queue() {
-        let (tx, mut rx, budget) = SrvTx::channel(1024, 1024);
+        let (tx, mut rx, budget, _subscribers) = SrvTx::channel(1024, 1024);
         tx.send(vec![0u8; 1024])
             .await
             .expect("the first frame exactly fills the byte budget");
@@ -25508,7 +26027,11 @@ mod tx_byte_budget_tests {
             "1023 frame slots are free; only the byte budget can be parking this send"
         );
         // Act as the writer task: drain one frame, return its bytes.
-        let frame = rx.recv().await.expect("the queued frame");
+        let frame = rx
+            .recv()
+            .await
+            .map(Outbound::into_frame)
+            .expect("the queued frame");
         budget.release(frame.len());
         tx.send(vec![0u8; 1])
             .await
@@ -25521,7 +26044,7 @@ mod tx_byte_budget_tests {
     /// would park it forever.
     #[epics_macros_rs::epics_test]
     async fn an_oversized_frame_is_admitted_alone() {
-        let (tx, mut rx, budget) = SrvTx::channel(1024, 8);
+        let (tx, mut rx, budget, _subscribers) = SrvTx::channel(1024, 8);
         tx.send(vec![0u8; 100])
             .await
             .expect("a frame larger than the whole limit must still be admitted");
@@ -25531,7 +26054,11 @@ mod tx_byte_budget_tests {
                 .is_none(),
             "the oversized frame holds the entire budget until written"
         );
-        let frame = rx.recv().await.expect("the oversized frame");
+        let frame = rx
+            .recv()
+            .await
+            .map(Outbound::into_frame)
+            .expect("the oversized frame");
         budget.release(frame.len());
         tx.send(vec![0u8; 1])
             .await
@@ -25544,7 +26071,7 @@ mod tx_byte_budget_tests {
     /// mpsc receiver closing alone cannot reach it there.
     #[epics_macros_rs::epics_test]
     async fn a_closed_budget_fails_parked_senders() {
-        let (tx, _rx, budget) = SrvTx::channel(1024, 8);
+        let (tx, _rx, budget, _subscribers) = SrvTx::channel(1024, 8);
         tx.send(vec![0u8; 8]).await.expect("fill the budget");
         let mut parked = std::pin::pin!(tx.send(vec![0u8; 1]));
         assert!(
@@ -25561,5 +26088,427 @@ mod tx_byte_budget_tests {
             Some(Ok(())) => panic!("a closed budget must not admit new frames"),
             None => panic!("closing the budget must wake and fail the parked sender"),
         }
+    }
+}
+
+/// MONITOR subscribers hosted on the writer task, driven end to end through a
+/// real connection on the blocking driver so both backends run them.
+#[cfg(test)]
+mod hosted_subscriber_tests {
+    use std::io::{Cursor, Read, Write};
+    use std::net::{Ipv4Addr, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread};
+
+    use crate::codec::PvaCodec;
+    use crate::proto::{ByteOrder, Command, PvaHeader};
+    use crate::pv_request::build_pv_request_value_only;
+    use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::blocking::BlockingPvaServer;
+    use crate::server_native::blocking::tests::{harness_reactor, isolated_config};
+    use crate::server_native::source::{ChannelSource, DynSource, MonitorStream, OpError};
+
+    fn nt_scalar(v: f64) -> PvField {
+        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(v))));
+        PvField::Structure(s)
+    }
+
+    /// Serve `source` on the blocking driver; the guard shuts it down.
+    struct Served(Arc<BlockingPvaServer>);
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
+    fn serve(source: DynSource) -> (Served, TcpStream) {
+        let server = Arc::new(
+            BlockingPvaServer::bind((Ipv4Addr::LOCALHOST, 0), source, isolated_config())
+                .expect("bind"),
+        );
+        let serving = server.clone();
+        spawn_dedicated_thread(
+            "test-PVAS-accept".into(),
+            super::super::blocking::PVA_SERVER_PRIORITY,
+            StackSizeClass::Medium,
+            move || serving.serve(&harness_reactor()),
+        )
+        .expect("accept thread");
+        let stream = TcpStream::connect(server.local_addr().expect("addr")).expect("connect");
+        stream.set_nodelay(true).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        (Served(server), stream)
+    }
+
+    fn read_frame(stream: &mut TcpStream) -> (PvaHeader, Vec<u8>) {
+        let mut hdr = [0u8; PvaHeader::SIZE];
+        stream.read_exact(&mut hdr).expect("read frame header");
+        let hdr = PvaHeader::decode(&mut Cursor::new(&hdr[..])).expect("decode header");
+        let mut body = Vec::new();
+        if !hdr.flags.is_control() {
+            body.resize(hdr.payload_length as usize, 0);
+            stream.read_exact(&mut body).expect("read frame body");
+        }
+        (hdr, body)
+    }
+
+    fn u32_at(hdr: &PvaHeader, body: &[u8], at: usize) -> u32 {
+        let b: [u8; 4] = body[at..at + 4].try_into().unwrap();
+        match hdr.flags.byte_order() {
+            ByteOrder::Big => u32::from_be_bytes(b),
+            ByteOrder::Little => u32::from_le_bytes(b),
+        }
+    }
+
+    /// CREATE_CHANNEL `dut`; returns its sid.
+    fn create_channel(stream: &mut TcpStream) -> u32 {
+        stream
+            .write_all(&PvaCodec::new().build_create_channel(1, "dut"))
+            .unwrap();
+        loop {
+            let (hdr, body) = read_frame(stream);
+            if hdr.command == Command::CreateChannel.code() && !hdr.flags.is_control() {
+                return u32_at(&hdr, &body, 4);
+            }
+        }
+    }
+
+    /// `(command, ioid, subcmd, status ok)` of an op reply.
+    fn op_reply(hdr: &PvaHeader, body: &[u8]) -> (u8, u32, u8, bool) {
+        (
+            hdr.command,
+            u32_at(hdr, body, 0),
+            body[4],
+            body.get(5) == Some(&0xFF),
+        )
+    }
+
+    /// `dut`, an NTScalar double, with `subscribe` supplied by `S`.
+    trait Subscribe: Send + Sync + 'static {
+        fn subscribe(&self) -> Option<MonitorStream<PvField>>;
+    }
+
+    struct Dut<S>(S);
+
+    impl<S: Subscribe> ChannelSource for Dut<S> {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            n == "dut"
+        }
+        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+            Some(FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
+            })
+        }
+        async fn get_value(&self, _: &str) -> Option<PvField> {
+            Some(nt_scalar(1.0))
+        }
+        async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+            Err("read-only".into())
+        }
+        async fn is_writable(&self, _: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+            self.0.subscribe()
+        }
+    }
+
+    struct Panics;
+
+    impl Subscribe for Panics {
+        fn subscribe(&self) -> Option<MonitorStream<PvField>> {
+            panic!("source subscribe panicked");
+        }
+    }
+
+    /// pvxs catches an `onSubscribe` throw for its op alone
+    /// (`servermon.cpp:594-600`): the MONITOR ends with an error FINISH and
+    /// the connection serves the GET after it.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes under
+    // EPICS_RS_BUILD_EXEC_BACKEND=thread. The driver's threads take their
+    // runtime from this one (see `blocking::tests::start_server`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subscribe_panic_ends_the_monitor_and_spares_the_connection() {
+        let (_served, mut stream) = serve(Arc::new(Dut(Panics)));
+        let sid = create_channel(&mut stream);
+        let codec = PvaCodec::new();
+        let req = build_pv_request_value_only(false);
+        let mut out = codec.build_monitor_init(sid, 1, &req, None);
+        out.extend(codec.build_get_init(sid, 2, &req));
+        out.extend(codec.build_get(sid, 2));
+        stream.write_all(&out).unwrap();
+
+        let (mon, get) = (Command::Monitor.code(), Command::Get.code());
+        let mut replies = Vec::new();
+        while replies.len() < 4 {
+            let (hdr, body) = read_frame(&mut stream);
+            if hdr.command == mon || hdr.command == get {
+                replies.push(op_reply(&hdr, &body));
+            }
+        }
+        for want in [
+            (mon, 1, 0x08, true),
+            (mon, 1, 0x10, false),
+            (get, 2, 0x08, true),
+            (get, 2, 0x00, true),
+        ] {
+            assert!(replies.contains(&want), "{want:?} not in {replies:?}");
+        }
+    }
+
+    /// A hosted subscriber's first frame follows its INIT reply in the same
+    /// write. Revert-verify: writing the subscribers' frames ahead of the
+    /// `rx` frames in [`WriterQueues::fill`] (`subs_first`) fails it.
+    #[epics_macros_rs::epics_test]
+    async fn a_hosted_subscribers_first_frame_follows_its_init_reply() {
+        use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
+
+        let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
+        let mut queues = WriterQueues { rx, subscribers };
+        let (_abort, ()) = tx
+            .send_hosting(b"init".to_vec(), |tx| {
+                let task = async move {
+                    let _ = tx.send(b"subscribe-time".to_vec()).await;
+                    std::future::pending::<()>().await
+                };
+                (task, ())
+            })
+            .await;
+        let first = queues.rx.recv().await;
+        let mut batch = WriteBatch::default();
+        queues.fill(first, &mut batch).await;
+        assert_eq!(
+            batch.frames(),
+            [b"init".to_vec(), b"subscribe-time".to_vec()]
+        );
+    }
+
+    /// The longest run of `rx` frames (`frame`, tagged `r`) the writer puts
+    /// on the wire between two frames of a subscriber that is always ready.
+    async fn longest_rx_run(frame: Vec<u8>) -> usize {
+        use super::{SrvTx, TxBudget, WRITER_PASS_FRAMES, WriteBatch, WriterQueues};
+
+        /// Pending once, waking itself: a subscriber that is always ready.
+        struct YieldOnce(bool);
+        impl std::future::Future for YieldOnce {
+            type Output = ();
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                if std::mem::replace(&mut self.0, true) {
+                    return std::task::Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+
+        const QUEUED: usize = 8 * WRITER_PASS_FRAMES;
+        let (tx, rx, _budget, subscribers) = SrvTx::channel(QUEUED + 1, TxBudget::MAX_CHARGE);
+        let mut queues = WriterQueues { rx, subscribers };
+        let (_abort, ()) = tx
+            .send_hosting(b"i".to_vec(), |tx| {
+                let task = async move {
+                    while tx.send(b"s".to_vec()).await.is_ok() {
+                        YieldOnce(false).await;
+                    }
+                };
+                (task, ())
+            })
+            .await;
+        for _ in 0..QUEUED {
+            tx.send(frame.clone())
+                .await
+                .expect("the writer queue has room");
+        }
+
+        let is_rx = |f: &Vec<u8>| f.first() == Some(&b'r');
+        let mut wire = Vec::new();
+        let mut batch = WriteBatch::default();
+        while wire.iter().filter(|f| is_rx(f)).count() < QUEUED {
+            batch.reset();
+            let first = queues.rx.try_recv().ok();
+            queues.fill(first, &mut batch).await;
+            wire.extend(batch.frames());
+        }
+        wire.split(|f| f == b"s")
+            .map(|run| run.iter().filter(|f| is_rx(f)).count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// With `rx` and a subscriber both always ready, the writer takes at
+    /// most [`WRITER_PASS_FRAMES`] `rx` entries between subscriber polls.
+    /// Revert-verify: draining `rx` before polling (the pre-fix writer) puts
+    /// every queued frame ahead of the subscriber's second one.
+    #[epics_macros_rs::epics_test]
+    async fn the_writer_polls_its_subscribers_every_pass_frames() {
+        assert_eq!(
+            longest_rx_run(b"r".to_vec()).await,
+            super::WRITER_PASS_FRAMES
+        );
+    }
+
+    /// A subscriber whose source has a value still yields its frame on a
+    /// writer pass that already spent the task's coop budget. Revert-verify:
+    /// polling `live` inside the budget leaves the source `recv` Pending with
+    /// its wake deferred until the worker parks.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_spent_coop_budget_does_not_stall_the_subscribers() {
+        use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
+
+        let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
+        let mut queues = WriterQueues { rx, subscribers };
+        let (src_tx, mut src) = tokio::sync::mpsc::channel::<()>(1);
+        let (_abort, ()) = tx
+            .send_hosting(b"i".to_vec(), |tx| {
+                let task = async move {
+                    while src.recv().await.is_some() {
+                        if tx.send(b"s".to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                (task, ())
+            })
+            .await;
+        let mut batch = WriteBatch::default();
+        let first = queues.rx.try_recv().ok();
+        queues.fill(first, &mut batch).await;
+        assert_eq!(batch.frames(), [b"i".to_vec()]);
+
+        src_tx.try_send(()).expect("the source has room");
+        let (fill_tx, mut fill) = tokio::sync::mpsc::unbounded_channel::<()>();
+        for _ in 0..1024 {
+            fill_tx.send(()).unwrap();
+        }
+        std::future::poll_fn(|cx| {
+            while fill.poll_recv(cx).is_ready() {}
+            assert!(!fill.is_empty(), "the coop budget is spent");
+            let _ = queues.subscribers.poll_drive(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(queues.subscribers.take_frame(), Some(b"s".to_vec()));
+    }
+
+    /// Two subscribers on one writer, the first `doomed`: once
+    /// [`WriterQueues::fill`] adopted both, `end` ends the first, and the
+    /// second must still be live and emitting.
+    async fn one_subscriber_panics<F>(doomed: F, end: impl FnOnce(super::HostedAbort))
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
+
+        let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
+        let mut queues = WriterQueues { rx, subscribers };
+        let (doomed, ()) = tx.send_hosting(b"d".to_vec(), |_| (doomed, ())).await;
+        let (go, mut went) = tokio::sync::mpsc::channel::<()>(1);
+        let (_live, ()) = tx
+            .send_hosting(b"l".to_vec(), |tx| {
+                let task = async move {
+                    while went.recv().await.is_some() {
+                        let _ = tx.send(b"s".to_vec()).await;
+                    }
+                };
+                (task, ())
+            })
+            .await;
+        let mut batch = WriteBatch::default();
+        let first = queues.rx.try_recv().ok();
+        queues.fill(first, &mut batch).await;
+        end(doomed);
+        go.try_send(()).expect("the live subscriber has room");
+        std::future::poll_fn(|cx| queues.subscribers.poll_drive(cx)).await;
+        assert_eq!(queues.subscribers.live.len(), 1);
+        assert_eq!(queues.subscribers.take_frame(), Some(b"s".to_vec()));
+    }
+
+    /// A hosted future that panics ends alone. Revert-verify: polling it
+    /// outside `catch_unwind` in [`super::Contained`] unwinds out of `fill`.
+    #[epics_macros_rs::epics_test]
+    async fn a_hosted_panic_ends_that_subscriber_alone() {
+        one_subscriber_panics(async { panic!("hosted subscriber panicked") }, drop).await;
+    }
+
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("subscriber drop panicked");
+        }
+    }
+
+    /// A subscriber whose drop panics when its [`super::HostedAbort`] ends
+    /// it ends alone. Revert-verify: polling it
+    /// outside `catch_unwind` in [`super::Contained`], where the abort
+    /// drops it, unwinds out of `poll_drive`.
+    #[epics_macros_rs::epics_test]
+    async fn a_panic_in_an_ended_subscribers_drop_ends_it_alone() {
+        let doomed = async {
+            let _owned = PanicOnDrop;
+            std::future::pending::<()>().await
+        };
+        one_subscriber_panics(doomed, drop).await;
+    }
+
+    /// When the writer exits, a subscriber whose drop panics does not stop
+    /// the others' drops, which run their finish guards. Revert-verify:
+    /// dropping it outside `catch_unwind` in [`super::Contained`] unwinds out
+    /// of the `SubscriberSet` drop.
+    #[epics_macros_rs::epics_test]
+    async fn a_panic_in_a_subscribers_drop_at_writer_exit_spares_the_rest() {
+        use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
+
+        let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
+        let mut queues = WriterQueues { rx, subscribers };
+        let (alive, ended) = std::sync::mpsc::channel::<()>();
+        let mut aborts = Vec::new();
+        for _ in 0..2 {
+            let alive = alive.clone();
+            let (abort, ()) = tx
+                .send_hosting(Vec::new(), |_| {
+                    let task = async move {
+                        let _alive = alive;
+                        let _owned = PanicOnDrop;
+                        std::future::pending::<()>().await
+                    };
+                    (task, ())
+                })
+                .await;
+            aborts.push(abort);
+        }
+        drop(alive);
+        let mut batch = WriteBatch::default();
+        let first = queues.rx.try_recv().ok();
+        queues.fill(first, &mut batch).await;
+        assert_eq!(queues.subscribers.live.len(), 2);
+        drop(queues);
+        assert!(ended.recv().is_err(), "every subscriber was dropped");
+    }
+
+    /// `rx` frames that fill [`WRITER_COALESCE_BYTES`] before
+    /// [`WRITER_PASS_FRAMES`] end the pass there, and the subscriber's frame
+    /// still goes in the same write. Revert-verify: one byte limit for the
+    /// whole write leaves no room for it, and `rx` runs on unbroken.
+    #[epics_macros_rs::epics_test]
+    async fn a_full_rx_half_leaves_room_for_the_subscribers() {
+        let mut frame = vec![0u8; super::WRITER_COALESCE_BYTES / 8];
+        frame[0] = b'r';
+        assert_eq!(longest_rx_run(frame).await, 8);
     }
 }

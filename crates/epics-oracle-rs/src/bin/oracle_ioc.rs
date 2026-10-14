@@ -157,10 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // C iocInit owns scanInit/initialProcess — neither server scans. The
     // harness compares against a C softIoc whose iocInit runs
-    // initialProcess and scanRun, so the Rust IOC runs its `iocRun` (PINI
-    // pass + scan-%g threads) itself, before serving either protocol.
+    // initialProcess and scanRun, so the Rust IOC runs its `iocRun` itself,
+    // before serving either protocol.
     let db = Arc::clone(ioc.database());
-    let _scan_owner = ioc.run().await;
+    ioc.run().await;
 
     if args.pva {
         return serve_pva(db).await;

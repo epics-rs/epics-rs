@@ -41,7 +41,7 @@ async fn every_pause_and_run_runs_its_pini_passes() {
     assert_eq!(ioc_pause(), -1, "a built IOC is not running");
     assert_eq!(steps(), [0.0; 4], "a refused iocPause runs no pass");
 
-    let _scan = ioc.run().await.expect("a built IOC runs");
+    assert!(ioc.run().await, "a built IOC runs");
     assert_eq!(steps(), [0.0, 0.0, 1.0, 2.0]);
     assert_eq!(ioc_run(), -1, "a running IOC is not paused");
     assert_eq!(
@@ -71,13 +71,13 @@ async fn a_rebuild_runs_its_passes_on_the_new_database_only() {
     };
     let first = build().await;
     let old = std::sync::Arc::clone(first.database());
-    drop(first.run().await.expect("a built IOC runs"));
+    assert!(first.run().await, "a built IOC runs");
     assert_eq!(steps(&old), [0.0, 0.0, 1.0, 2.0]);
     assert_eq!(ioc_shutdown(), 0);
 
     let second = build().await;
     let new = std::sync::Arc::clone(second.database());
-    let _scan = second.run().await.expect("a rebuilt IOC runs");
+    assert!(second.run().await, "a rebuilt IOC runs");
     assert_eq!(ioc_pause(), 0);
     assert_eq!(ioc_run(), 0);
 

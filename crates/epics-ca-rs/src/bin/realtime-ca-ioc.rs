@@ -1157,14 +1157,14 @@ mod ioc {
         //      had NO scan start at all (the scheduler lived only in the
         //      hosted async CA server's run loop, which this blocking
         //      target never runs), so every periodic `SCAN` field and
-        //      every `PINI=YES` record was silently dead here. PINI=YES ran
-        //      inside `build_ioc`; `run` is `iocRun` with PINI=RUN/RUNNING,
-        //      and its `ScanOwner` runs the `scan-%g` threads on a dedicated
-        //      owner thread (exec-backend safe: a parked detached task would
-        //      be dropped by the executor). Held to the end of `main`: this
-        //      IOC scans for as long as it serves.
-        let _scan_owner = block_on_sync(ioc.run())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        //      every `PINI=YES` record was silently dead here. PINI=YES and
+        //      the `scan-%g` threads start inside `build_ioc`; `run` is
+        //      `iocRun`, whose `scanRun` lets them scan, with PINI=RUN/RUNNING.
+        if !block_on_sync(ioc.run())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
+        {
+            return ExitCode::FAILURE;
+        }
 
         // (3) The CA front-end. UDP search port and TCP port are the same
         //     value, as under a C IOC (caservertask.c:492-500). No ACF is

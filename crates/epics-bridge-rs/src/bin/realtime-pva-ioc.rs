@@ -681,6 +681,52 @@ mod ioc {
         // (1) C `callbackInit` (callback.c:286). Idempotent.
         background_init();
 
+        // (1b-rig) PARALLEL SCAN HELPERS, under `bringup-probes` only
+        //      (measurement rig, not IOC content — same rule as the probe
+        //      databases). Before the build, whose `scanInit` sizes the pools
+        //      from these stores, as C's does at `iocInit`. `scanParallelThreads` and `scanRateThreads`
+        //      are iocsh commands and this target has no iocsh, so the boot
+        //      command line is the only configuration surface an image has:
+        //
+        //        BENCH_SCAN_HELPERS=2 BENCH_SCAN_RESERVE=1
+        //        BENCH_SCAN_RATE_HELPERS=6:1,3:2
+        //
+        //      The dedicated form takes the period's INDEX rather than its
+        //      `menuScan` choice, because `rtems_init.c` splits the command
+        //      line on whitespace and every periodic choice string has a
+        //      space in it. Indices run slowest-first, as `papPeriodic` does:
+        //      on the stock menu 0 is `10 second` and 6 is `.1 second`.
+        #[cfg(feature = "bringup-probes")]
+        {
+            let count = std::env::var("BENCH_SCAN_HELPERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok());
+            if let Some(count) = count {
+                let reserve = std::env::var("BENCH_SCAN_RESERVE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .unwrap_or(0);
+                epics_base_rs::server::scan::set_parallel_threads(count, reserve);
+                println!("SCANRIG pool count={count} reserve={reserve}");
+            }
+            if let Ok(spec) = std::env::var("BENCH_SCAN_RATE_HELPERS") {
+                for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+                    match item.trim().split_once(':') {
+                        Some((ind, n)) => {
+                            match (ind.trim().parse::<usize>(), n.trim().parse::<i32>()) {
+                                (Ok(ind), Ok(n)) => {
+                                    epics_base_rs::server::scan::set_rate_threads(ind, n);
+                                    println!("SCANRIG rate ind={ind} count={n}");
+                                }
+                                _ => println!("SCANRIG rate spec '{item}' is not <ind>:<count>"),
+                            }
+                        }
+                        None => println!("SCANRIG rate spec '{item}' is not <ind>:<count>"),
+                    }
+                }
+            }
+        }
+
         // (2) The database — every boot argument that was not an
         //     `epicsEnvSet` is a file to load, split by suffix below.
         let (db_files, group_files) = split_load_args(&boot_args);
@@ -742,70 +788,15 @@ mod ioc {
         }
         let link_count = resolver.as_ref().map_or(0, |r| r.link_count());
 
-        // (2b) Periodic scan + PINI. C `iocInit` owns `scanInit` (`dbScan.c`)
-        //      independent of any network server; without this step every
-        //      periodic `SCAN` field in the database is silently dead on
-        //      the PVA-only target (found by the §8 load probe, whose
-        //      self-counting members never counted — the scheduler used to
-        //      be driven only by the CA server's run loop, a server this
-        //      binary does not have). `ScanOwner` is the core-owned form of
-        //      the dedicated scan-owner thread this binary first proved on
-        //      target: a thread (not `runtime::task::spawn`) because on the
-        //      exec backend a task parked on a forever-pending future with
-        //      its waker registered nowhere is dropped by the executor,
-        //      taking the `ScanStopGuard` — and every `scan-%g` thread —
-        //      with it. Redundant starts stay parked non-owners
-        //      (`ScanControl::try_claim`), so exactly one set of `scan-%g`
-        //      threads exists no matter how many entry points start one.
-        //      Held to the end of `main`: this IOC scans for as long as it
-        //      serves.
-        // (2b-rig) PARALLEL SCAN HELPERS, under `bringup-probes` only
-        //      (measurement rig, not IOC content — same rule as the probe
-        //      databases above). `scanParallelThreads` and `scanRateThreads`
-        //      are iocsh commands and this target has no iocsh, so the boot
-        //      command line is the only configuration surface an image has:
-        //
-        //        BENCH_SCAN_HELPERS=2 BENCH_SCAN_RESERVE=1
-        //        BENCH_SCAN_RATE_HELPERS=6:1,3:2
-        //
-        //      The dedicated form takes the period's INDEX rather than its
-        //      `menuScan` choice, because `rtems_init.c` splits the command
-        //      line on whitespace and every periodic choice string has a
-        //      space in it. Indices run slowest-first, as `papPeriodic` does:
-        //      on the stock menu 0 is `10 second` and 6 is `.1 second`.
-        #[cfg(feature = "bringup-probes")]
+        // (2d) C `iocRun`: `scanRun` opens the gate the scan threads the
+        //      build started (C `scanInit`) wait on. C `iocInit` owns both,
+        //      independent of any network server; the `ScanOwner` the build
+        //      handed to the lifecycle keeps them alive until `iocShutdown`.
+        if !block_on_sync(ioc.run())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
         {
-            let count = std::env::var("BENCH_SCAN_HELPERS")
-                .ok()
-                .and_then(|v| v.trim().parse::<i32>().ok());
-            if let Some(count) = count {
-                let reserve = std::env::var("BENCH_SCAN_RESERVE")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<i32>().ok())
-                    .unwrap_or(0);
-                epics_base_rs::server::scan::set_parallel_threads(count, reserve);
-                println!("SCANRIG pool count={count} reserve={reserve}");
-            }
-            if let Ok(spec) = std::env::var("BENCH_SCAN_RATE_HELPERS") {
-                for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
-                    match item.trim().split_once(':') {
-                        Some((ind, n)) => {
-                            match (ind.trim().parse::<usize>(), n.trim().parse::<i32>()) {
-                                (Ok(ind), Ok(n)) => {
-                                    epics_base_rs::server::scan::set_rate_threads(ind, n);
-                                    println!("SCANRIG rate ind={ind} count={n}");
-                                }
-                                _ => println!("SCANRIG rate spec '{item}' is not <ind>:<count>"),
-                            }
-                        }
-                        None => println!("SCANRIG rate spec '{item}' is not <ind>:<count>"),
-                    }
-                }
-            }
+            return ExitCode::FAILURE;
         }
-
-        let _scan_owner = block_on_sync(ioc.run())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
 
         // (3) The PVA front-end. `bind` consumes the config, so the two ports
         //     are read off it first.

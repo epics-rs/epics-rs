@@ -68,14 +68,15 @@ struct OnceState {
     /// next overflow should log.
     new_overflow: bool,
     shutdown: bool,
+    /// C `onceSem` (`dbScan.c:68`), the worker's wake-up event. One per
+    /// worker, as C's `scanInit` creates one per `onceTask`: an [`Event`]
+    /// binds its first waiter for good, so a restarted worker needs its own.
+    wake: Arc<Event>,
 }
 
 struct Inner {
     capacity: usize,
     state: PriorityInheritanceMutex<OnceState>,
-    /// C `onceSem` (`dbScan.c:68`), the worker's wake-up event — a separate
-    /// primitive, which is what leaves `state` free to be the PI one.
-    wake: Event,
     /// The drain thread, started on the first request rather than at
     /// construction — see [`Inner::ensure_worker`]. PI for the same reason
     /// `state` is: every request passes through it.
@@ -96,9 +97,15 @@ impl Inner {
     /// [`set_periodic_scan_band_count`].
     fn ensure_worker(self: &Arc<Self>) {
         let mut worker = self.worker.lock();
-        if worker.is_some() {
-            return;
-        }
+        // A stop in progress: the request is dropped, and a worker started now
+        // would see the flag and exit, leaving a dead handle in the slot.
+        let wake = {
+            let st = self.state.lock();
+            if worker.is_some() || st.shutdown {
+                return;
+            }
+            Arc::clone(&st.wake)
+        };
         let worker_inner = Arc::clone(self);
         // Losing this thread stops every FLNK/scanOnce tail in the IOC while
         // records still accept writes — the same silent half-IOC whether the
@@ -129,11 +136,22 @@ impl Inner {
                 );
                 run_facility_loop(
                     FACILITY,
-                    || once_loop(&worker_inner),
+                    || once_loop(&worker_inner, &wake),
                     || worker_inner.state.lock().shutdown = true,
                 );
             }),
         );
+    }
+
+    /// Flag the worker to exit once the queue is empty, and release it
+    /// whether or not it is parked.
+    fn shut_down(&self) {
+        let wake = {
+            let mut st = self.state.lock();
+            st.shutdown = true;
+            Arc::clone(&st.wake)
+        };
+        wake.wake();
     }
 
     /// Port of `scanOnceCallback` (`dbScan.c:670-694`).
@@ -168,10 +186,11 @@ impl Inner {
             st.high_water = st.high_water.max(st.queue.len());
             Ok(())
         };
+        let wake = Arc::clone(&st.wake);
         drop(st);
         // dbScan.c:691 — `epicsEventSignal(onceSem)` is issued unconditionally,
         // outside the push success/failure branch.
-        self.wake.signal();
+        wake.signal();
         result
     }
 
@@ -242,8 +261,8 @@ fn scan_once_priority() -> ThreadPriority {
 
 /// Port of `onceTask` (`dbScan.c:696-726`): wait on the wake event, drain the
 /// ring, run each queued tail.
-fn once_loop(inner: &Inner) {
-    let parked = inner.wake.waiter();
+fn once_loop(inner: &Inner, wake: &Event) {
+    let parked = wake.waiter();
     loop {
         let next = {
             let mut st = inner.state.lock();
@@ -344,8 +363,8 @@ impl ScanOnceQueue {
                 overflows: 0,
                 new_overflow: true,
                 shutdown: false,
+                wake: Arc::new(Event::new()),
             }),
-            wake: Event::new(),
             worker: PriorityInheritanceMutex::new(None),
         });
         ScanOnceQueue { inner }
@@ -390,6 +409,27 @@ impl ScanOnceQueue {
     pub fn stats(&self, reset: bool) -> ScanOnceQueueStats {
         self.inner.stats(reset)
     }
+
+    /// C `scanStop`'s last step (`dbScan.c:178-180`): the worker drains what
+    /// is queued, exits and is joined. The next request starts a new one, as
+    /// C's next `scanInit` creates a new `onceTask`.
+    pub fn stop(&self) {
+        self.inner.shut_down();
+        // Not held across the join: a tail the worker is still running may
+        // request another `scanOnce`, which takes this lock.
+        let worker = self.inner.worker.lock().take();
+        if let Some(w) = worker {
+            // Called from a tail on the worker itself: it exits once this
+            // returns and the queue is empty, so the flag stays set.
+            if w.thread().id() == std::thread::current().id() {
+                return;
+            }
+            let _ = w.join();
+        }
+        let mut st = self.inner.state.lock();
+        st.shutdown = false;
+        st.wake = Arc::new(Event::new());
+    }
 }
 
 impl Default for ScanOnceQueue {
@@ -400,11 +440,7 @@ impl Default for ScanOnceQueue {
 
 impl Drop for ScanOnceQueue {
     fn drop(&mut self) {
-        {
-            let mut st = self.inner.state.lock();
-            st.shutdown = true;
-        }
-        self.inner.wake.wake();
+        self.inner.shut_down();
         let worker = self.inner.worker.lock().take();
         if let Some(w) = worker {
             let _ = w.join();
@@ -498,6 +534,48 @@ mod tests {
         assert_eq!(q.overflow_count(), 2);
 
         gate_tx.send(()).unwrap(); // release the worker so it can drain.
+    }
+
+    /// C `scanStop` (`dbScan.c:178-180`): the tails queued before the stop
+    /// have run when it returns, and the next request starts a new worker,
+    /// as the next `scanInit` creates a new `onceTask`.
+    #[test]
+    fn stop_runs_the_queued_tails_joins_and_the_next_request_restarts() {
+        let q = ScanOnceQueue::new();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        q.scan_once(Box::new(move || gate_rx.recv().unwrap()))
+            .unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        q.scan_once(Box::new(move || r.store(true, Ordering::SeqCst)))
+            .unwrap();
+        gate_tx.send(()).unwrap();
+        q.stop();
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "stop returned before the queue drained"
+        );
+        assert!(q.inner.worker.lock().is_none(), "the worker was not joined");
+
+        let (tx, rx) = mpsc::channel();
+        q.scan_once(Box::new(move || tx.send(7u32).unwrap()))
+            .unwrap();
+        assert_eq!(rx.recv_timeout(T).unwrap(), 7);
+    }
+
+    /// Boundary: a tail on the worker ends the IOC. The stop cannot join its
+    /// caller, so it returns and the worker exits after the tail.
+    #[test]
+    fn stop_from_a_tail_on_the_worker_returns() {
+        let q = Arc::new(ScanOnceQueue::new());
+        let (tx, rx) = mpsc::channel();
+        let me = Arc::clone(&q);
+        q.scan_once(Box::new(move || {
+            me.stop();
+            tx.send(()).unwrap();
+        }))
+        .unwrap();
+        rx.recv_timeout(T).expect("stop on the worker returned");
     }
 
     #[test]

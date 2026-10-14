@@ -129,7 +129,7 @@ record(mbbi, "RIG:MBBI") {
         .build_ioc()
         .await?;
     let db = ioc.database().clone();
-    let _scan = ioc.run().await;
+    ioc.run().await;
     let server = CaServer::from_parts(
         db,
         port,

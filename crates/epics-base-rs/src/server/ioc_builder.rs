@@ -538,10 +538,10 @@ impl BareIoc {
         self.autosave_config.as_ref()
     }
 
-    /// C `iocRun` (`iocInit.c:246-276`); the scan owner it returns is held
-    /// for as long as the IOC scans. `None` when `iocRun` refused, which it
-    /// has already reported.
-    pub async fn run(self) -> Option<crate::server::scan::ScanOwner> {
+    /// C `iocRun` (`iocInit.c:246-276`): opens the scan gate the build's
+    /// scan threads wait on, which `iocShutdown` closes. False when `iocRun`
+    /// refused, which it has already reported.
+    pub async fn run(self) -> bool {
         crate::server::ioc_app::run_built(&self.db).await
     }
 }

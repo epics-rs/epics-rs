@@ -370,6 +370,39 @@ fn await_startup_script_phase() {
     }
 }
 
+/// Whether an [`IocShell::run_repl`] is reading stdin. C has one `iocsh(NULL)`
+/// per process (`softMain.cpp:250`); here a protocol runner's shell can be
+/// started by an `iocInit` typed at the prompt of the shell already reading,
+/// and the second reader joins the first instead of racing it for stdin.
+static INTERACTIVE_SHELL: (Mutex<bool>, std::sync::Condvar) =
+    (Mutex::new(false), std::sync::Condvar::new());
+
+/// The claim on stdin, released however the REPL ends.
+struct InteractiveShell;
+
+impl InteractiveShell {
+    /// `None` when another REPL holds stdin; this one has then waited for it
+    /// to end.
+    fn claim_or_wait() -> Option<Self> {
+        let mut reading = INTERACTIVE_SHELL.0.lock().unwrap();
+        if !*reading {
+            *reading = true;
+            return Some(Self);
+        }
+        while *reading {
+            reading = INTERACTIVE_SHELL.1.wait(reading).unwrap();
+        }
+        None
+    }
+}
+
+impl Drop for InteractiveShell {
+    fn drop(&mut self) {
+        *INTERACTIVE_SHELL.0.lock().unwrap() = false;
+        INTERACTIVE_SHELL.1.notify_all();
+    }
+}
+
 /// C's one iocsh command table — `iocshCommandHead`, the single list
 /// `iocshRegister` writes and every `iocshBody` reads (`iocsh.cpp:78-86`,
 /// `:684-700`, `:1290-1302`).
@@ -1141,6 +1174,11 @@ impl IocShell {
         // [`STARTUP_SCRIPT_PHASE`] for why that ordering has to be waited for
         // rather than assumed here.
         await_startup_script_phase();
+        // The shell already reading stdin ends the process's interactive
+        // session; this one ends with it, its commands on the shared table.
+        let Some(_stdin) = InteractiveShell::claim_or_wait() else {
+            return Ok(());
+        };
         // C `iocsh.cpp:1045-1050` sets `scope.interactive` from
         // `pathname == NULL` — reading stdin, terminal or not — so the
         // piped path below is the interactive scope too.
@@ -1952,6 +1990,34 @@ fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
 mod tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
+
+    /// One `iocsh(NULL)` per process: a second REPL waits for the one holding
+    /// stdin and ends with it rather than reading alongside it.
+    #[test]
+    fn a_second_interactive_shell_waits_for_the_first_and_ends_with_it() {
+        let first = InteractiveShell::claim_or_wait().expect("stdin is free");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            tx.send(InteractiveShell::claim_or_wait().is_some())
+                .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the second shell returned while the first still reads"
+        );
+        drop(first);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(false),
+            "the second shell ends with the first and never claims stdin"
+        );
+        second.join().unwrap();
+        assert!(
+            InteractiveShell::claim_or_wait().is_some(),
+            "stdin is free again"
+        );
+    }
 
     /// `#-` silent comments are not echoed; plain `#` comments and
     /// commands are. Boundary cases: leading whitespace before `#-`, a

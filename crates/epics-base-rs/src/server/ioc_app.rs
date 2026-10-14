@@ -275,8 +275,8 @@ fn set_ioc_state(state: IocState) {
     lifecycle().state = state;
 }
 
-/// Hand the scan owner to the lifecycle — called once, at the `iocRun`
-/// point, by the build path that created it.
+/// Hand the scan owner to the lifecycle — called once per build, by
+/// [`initial_process`].
 fn adopt_scan_owner(owner: crate::server::scan::ScanOwner) {
     // Replacing an existing owner drops the old one (joining its thread)
     // AFTER the lock is released, so a second `run` in one process cannot
@@ -397,13 +397,16 @@ pub fn ioc_shutdown() -> i32 {
     init_hook_announce(InitHookState::AtShutdown);
 
     // Dropping the owner is C's `scanStop`: it trips the facility to
-    // `ctlExit` and joins the owner thread. Taken out from under the lock
+    // `ctlExit` and joins the owner thread, which joins the scan threads. Taken out from under the lock
     // first so the join happens with the lifecycle unlocked.
     let owner = lifecycle().scan.take();
     drop(owner);
+    // The rest of `scanStop` (`dbScan.c:178-180`): the `scanOnce` worker
+    // drains its queue and is joined.
+    crate::runtime::task::background_scan_once_stop();
     let db = lifecycle().db.take();
-    // A build that never reached `iocRun` has no owner to drop, so the
-    // facility is stopped here rather than by the drop above.
+    // A parked owner — the database was claimed by another start — trips
+    // nothing on drop, so the published database's facility stops here.
     if let Some(db) = &db {
         db.scan_control().stop();
     }
@@ -655,12 +658,12 @@ impl IocInitDecision {
         }
     }
 
-    /// C's other arm. `iocInit()` is never called, so there is no server to
+    /// C's other arm. `iocInit()` is not called, so there is no server to
     /// hand anything to and the protocol runner is NOT invoked — that is
     /// the whole content of the difference, and passing a runner a flag to
     /// obey would put it back in the hands of the caller who cannot see
     /// this decision. The process goes straight to C's tail
-    /// (`softMain.cpp:247-268`).
+    /// (`softMain.cpp:247-268`), whose prompt may still type `iocInit`.
     pub fn skip(interactive: bool) -> Self {
         Self {
             run: false,
@@ -807,8 +810,10 @@ fn run_startup_phase(
 ///
 /// Nothing here starts a server, and that is the point — RSRV is started by
 /// `iocRun` (`rsrv_run`, `caservertask.c`), so a C `softIoc` on this arm has
-/// no listener and answers no search. The protocol runner is therefore not
-/// called at all rather than being handed a flag it might not obey.
+/// no listener and answers no search until the prompt types `iocInit`. That
+/// line performs the build this `run` left armed, which starts the protocol
+/// runner as the script's `iocInit` does; the runner's own shell joins this
+/// one (`IocShell::run_repl`), and the server ends with it.
 ///
 /// Free rather than a method for the same reason [`run_startup_phase`] is:
 /// the application struct has already been taken apart by here.
@@ -1234,12 +1239,15 @@ pub(crate) async fn init_links(db: &PvDatabase) {
     db.setup_external_link_opens().await;
 }
 
-/// C `initialProcess()` (`iocInit.c:194-195`, `:653-657`): the PINI=YES
-/// pass, the last record work of `iocBuild_2`, and the registration of
-/// `piniProcessHook` (`:630-651`), which runs the RUN, RUNNING, PAUSE and
-/// PAUSED passes from every `iocRun` and `iocPause` after it. Completion is
-/// published so the scan owner started later skips its own pass, as C runs
-/// it once.
+/// C `scanInit` and `initialProcess()` (`iocInit.c:186`, `:194-195`,
+/// `:653-657`): the PINI=YES pass, the last record work of `iocBuild_2`, the
+/// registration of `piniProcessHook` (`:630-651`), which runs the RUN,
+/// RUNNING, PAUSE and PAUSED passes from every `iocRun` and `iocPause` after
+/// it, and the scan threads, which scan nothing until `iocRun`'s `scanRun`
+/// opens the database's gate. Every build path publishes its database here,
+/// so every `iocRun` has threads to release.
+///
+/// Must run inside the runtime the scan threads drive records on.
 pub(crate) fn initial_process(db: &Arc<PvDatabase>) {
     // C's `initHookRegister` ignores a function already registered, so a
     // rebuild after `iocShutdown` still has one hook.
@@ -1249,6 +1257,10 @@ pub(crate) fn initial_process(db: &Arc<PvDatabase>) {
     drop(previous);
     db.pini_pass(crate::server::record::PiniMode::Yes);
     db.mark_pini_done();
+    // After PINI is published, so the owner skips its own pass.
+    adopt_scan_owner(crate::server::scan::ScanOwner::start_running(Arc::clone(
+        db,
+    )));
 }
 
 /// C `piniProcessHook` (`iocInit.c:630-651`), over the database the current
@@ -1270,28 +1282,30 @@ fn pini_process_hook(state: InitHookState) {
 
 /// C `iocRun` over an IOC whose build ran [`initial_process`] — the one
 /// run body for [`IocApplication`] and
-/// [`BareIoc`](crate::server::ioc_builder::BareIoc). `None` when `iocRun`
-/// refused, which it has already reported; nothing is started then.
-pub(crate) async fn run_built(db: &Arc<PvDatabase>) -> Option<crate::server::scan::ScanOwner> {
+/// [`BareIoc`](crate::server::ioc_builder::BareIoc). False when `iocRun`
+/// refused, which it has already reported.
+pub(crate) async fn run_built(db: &Arc<PvDatabase>) -> bool {
     // C `iocInit` is `iocBuild() || iocRun()` (iocInit.c:107-110): the same
-    // `iocRun` the shell's runs, with the owner its `scanRun` starts. The
-    // owner skips PINI=YES, which `initial_process` published.
-    let running = ioc_run_begin()?;
-    let owner = crate::server::scan::ScanOwner::start_running(Arc::clone(db));
+    // `iocRun` the shell's runs.
+    let Some(running) = ioc_run_begin() else {
+        return false;
+    };
     // C `dbCaRun` (`iocInit.c:260`): the CP/CPP links' connect-time
     // process, after `scanRun` and before the `iocRun` line.
     db.process_cp_links_on_connect().await;
     running.finish();
-    Some(owner)
+    true
 }
 
-/// The bare shell's build: `close_record_load` is its record work, run
-/// inside [`BareBuild`]. False when `iocBuild_1` refused.
-pub(crate) fn build_without_application(close_record_load: impl FnOnce()) -> bool {
+/// C `iocBuild` for the bare shell's `iocBuild`/`iocInit`: the record-load
+/// close, then [`initial_process`], inside [`BareBuild`]. False when
+/// `iocBuild_1` refused.
+pub(crate) async fn build_without_application(db: &Arc<PvDatabase>) -> bool {
     let Some(build) = BareBuild::begin() else {
         return false;
     };
-    close_record_load();
+    db.ioc_init().await;
+    initial_process(db);
     build.finish();
     true
 }
@@ -1720,14 +1734,8 @@ impl BuiltIoc {
             protocol,
         } = self;
 
-        // Handed to the lifecycle rather than held in a local: `iocShutdown`
-        // is what stops the scan threads now, and `run` reaches it through
-        // the `epicsAtExit` registration below on every exit path — which
-        // the local could only do by returning from this function.
         // `perform_build` left the IOC built, so this `iocRun` cannot refuse.
-        if let Some(owner) = run_built(&db).await {
-            adopt_scan_owner(owner);
-        }
+        run_built(&db).await;
 
         // H3: drain `after_init_hooks` HERE — a guaranteed drain
         // point inside `run`. These were previously moved into
@@ -2448,6 +2456,9 @@ impl IocApplication {
                 if let Some(decision) = decision
                     && !decision.run
                 {
+                    // Still armed: an `iocInit` typed at the tail's prompt is
+                    // C's same `iocInit()`, and starts RSRV through this build.
+                    put_lifecycle(IocLifecycle::Armed(build));
                     return run_uninitialized_tail(db, bridge, acf, decision.interactive).await;
                 }
                 match build.perform_build().await? {
@@ -3802,18 +3813,18 @@ mod lifecycle_tests {
         assert_eq!(get_ioc_state(), IocState::Void);
     }
 
-    /// The bare bring-up without its scan owner thread: `iocBuild_1`,
-    /// `iocBuild_3`, then the `ioc_run` the shell's command calls. Returns
-    /// the database the build published, whose cell the lifecycle drives.
-    fn build_and_run() -> Arc<PvDatabase> {
+    /// The bare bring-up: `iocBuild_1`, `iocBuild_3`, then the `ioc_run` the
+    /// shell's command calls. Returns the database the build published,
+    /// whose cell the lifecycle drives.
+    async fn build_and_run() -> Arc<PvDatabase> {
         let db = Arc::new(PvDatabase::new());
-        build_and_run_on(&db);
+        build_and_run_on(&db).await;
         db
     }
 
     /// [`build_and_run`] over a database the test already loaded.
-    fn build_and_run_on(db: &Arc<PvDatabase>) {
-        assert!(build_without_application(|| initial_process(db)));
+    async fn build_and_run_on(db: &Arc<PvDatabase>) {
+        assert!(build_without_application(db).await);
         assert_eq!(get_ioc_state(), IocState::Built);
         assert_eq!(ioc_run(), 0);
     }
@@ -3821,9 +3832,9 @@ mod lifecycle_tests {
     /// BOUNDARY: `iocBuild_1` from anything but `iocVoid` refuses and moves
     /// nothing (`iocInit.c:116-121`), so a second bring-up in one process
     /// cannot say `Starting iocInit` twice.
-    #[test]
-    fn a_second_bare_build_is_refused() {
-        build_and_run();
+    #[epics_macros_rs::epics_test]
+    async fn a_second_bare_build_is_refused() {
+        build_and_run().await;
         assert!(BareBuild::begin().is_none());
         assert_eq!(get_ioc_state(), IocState::Running);
     }
@@ -3839,9 +3850,9 @@ mod lifecycle_tests {
     }
 
     /// The full walk, and the scan gate at each stop.
-    #[test]
-    fn the_lifecycle_walks_void_running_paused_running_void() {
-        let db = build_and_run();
+    #[epics_macros_rs::epics_test]
+    async fn the_lifecycle_walks_void_running_paused_running_void() {
+        let db = build_and_run().await;
         let scan_ctl = || db.scan_control().ctl();
         assert_eq!(get_ioc_state(), IocState::Running);
         assert_eq!(scan_ctl(), ScanCtl::Run);
@@ -3866,9 +3877,9 @@ mod lifecycle_tests {
     /// BOUNDARY: the illegal repeat of each transition. C answers a second
     /// `iocPause` with "IOC not running" and a second `iocRun` with "IOC
     /// not paused", both -1, and neither moves the state.
-    #[test]
-    fn a_repeated_transition_is_refused_from_its_own_end_state() {
-        build_and_run();
+    #[epics_macros_rs::epics_test]
+    async fn a_repeated_transition_is_refused_from_its_own_end_state() {
+        build_and_run().await;
         assert_eq!(ioc_run(), -1, "already running");
         assert_eq!(get_ioc_state(), IocState::Running);
 
@@ -3880,8 +3891,8 @@ mod lifecycle_tests {
     /// `iocShutdown` lets go of the database `initialProcess` published, so
     /// the next build's `initial_process` is not handed the old one's
     /// leftovers and the old one's records are freed.
-    #[test]
-    fn shutdown_releases_the_published_database() {
+    #[epics_macros_rs::epics_test]
+    async fn shutdown_releases_the_published_database() {
         let build = BareBuild::begin().expect("void");
         let db = Arc::new(PvDatabase::new());
         initial_process(&db);
@@ -3889,17 +3900,19 @@ mod lifecycle_tests {
         assert_eq!(ioc_run(), 0);
         let published = Arc::downgrade(&db);
         drop(db);
-        assert_eq!(published.strong_count(), 1, "the lifecycle holds it");
+        assert!(published.strong_count() > 0, "the lifecycle holds it");
 
         assert_eq!(ioc_shutdown(), 0);
+        // No wait: the `scan-%g` threads holding it are joined, as C's
+        // `scanStop` joins them (`dbScan.c:173-176`).
         assert_eq!(published.strong_count(), 0);
     }
 
     /// BOUNDARY: `iocShutdown` from `iocPaused`. C shuts down from any
     /// non-void state, not only from running.
-    #[test]
-    fn a_paused_ioc_can_be_shut_down() {
-        build_and_run();
+    #[epics_macros_rs::epics_test]
+    async fn a_paused_ioc_can_be_shut_down() {
+        build_and_run().await;
         assert_eq!(ioc_pause(), 0);
         assert_eq!(ioc_shutdown(), 0);
         assert_eq!(get_ioc_state(), IocState::Void);
@@ -3948,7 +3961,7 @@ mod lifecycle_tests {
         }
         db.update_scan_index("EV", ScanType::Passive, ScanType::Event, 0, 0);
 
-        build_and_run_on(&db);
+        build_and_run_on(&db).await;
         db.post_event().await;
         let while_running = runs.load(Ordering::SeqCst);
         assert_eq!(while_running, 1, "a running IOC processes its Event list");

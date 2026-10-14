@@ -193,9 +193,9 @@ async fn main() -> ExitCode {
     // the PVA front-end scans. One core-owned scan owner covers whichever
     // subset of the two servers is enabled; `ScanControl::try_claim` keeps
     // any redundant start parked, so the shared database never
-    // double-scans. Held to process end.
+    // double-scans.
     let db = ioc.database().clone();
-    let _scan_owner = ioc.run().await;
+    ioc.run().await;
 
     // Flag > EPICS environment > compiled default. `CaServer::from_parts`
     // takes a literal port, so its fallback is resolved here;

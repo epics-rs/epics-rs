@@ -577,6 +577,14 @@ pub fn background_scan_once_start() {
     background().scan_once().start();
 }
 
+/// Stop and join the `scanOnce` worker — the end of C `scanStop`
+/// (`dbScan.c:178-180`). A process that never built the executor has none.
+pub fn background_scan_once_stop() {
+    if let Some(exec) = BACKGROUND.get() {
+        exec.scan_once().stop();
+    }
+}
+
 /// Ring statistics for the `scanOnce` facility, or `None` before the
 /// background executor exists — C `scanOnceQueueStatus` (`dbScan.c:734-757`)
 /// and its `if (!onceQ) return -1` guard.

@@ -6003,14 +6003,11 @@ fn cmd_ioc_init() -> CommandDef {
             // binary and every bare `PvDatabase` shell reaches here. C has no
             // such shell — `iocInit()` is `iocBuild() || iocRun()` for
             // everyone (`iocInit.c:111-113`) — so this arm runs the same two
-            // halves over the same state cell, and the record-load close is
-            // what it contributes to the build. A link that forward-references
+            // halves over the same state cell. A link that forward-references
             // a record loaded by a LATER `dbLoadRecords` in the same `st.cmd`
-            // must still classify as a local PV (R18-92), which is what that
-            // close runs.
-            if !crate::server::ioc_app::build_without_application(|| {
-                ctx.block_on(async { ctx.db().ioc_init().await });
-            }) {
+            // must still classify as a local PV (R18-92), which the build's
+            // record-load close runs.
+            if !ctx.block_on(crate::server::ioc_app::build_without_application(ctx.db())) {
                 return Ok(CommandOutcome::Failed);
             }
             if crate::server::ioc_app::ioc_run() == 0 {
@@ -15542,5 +15539,32 @@ Total 3 records, 2 aliases
             assert_eq!(got, want, "line {}", n + 1);
         }
         assert_eq!(mask(&out).lines().count(), mask(want).lines().count());
+    }
+
+    /// The bare shell's `iocInit` — every `CaServerBuilder` binary and a
+    /// piped `softioc-rs` — scans as C's does: `iocBuild` starts the scan
+    /// threads (`iocInit.c:186`) and `iocRun` lets them run (`:259`). It
+    /// used to build with no scan owner, so nothing periodic ever processed.
+    #[test]
+    fn a_bare_shell_ioc_init_starts_periodic_scanning() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("per.db");
+        std::fs::write(
+            &path,
+            "record(calc, \"PER\") { field(SCAN, \".1 second\") field(CALC, \"VAL+1\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        let (_, failed) = run_cmd_outcome(&ctx, "iocInit", &[]);
+        assert!(!failed, "a void IOC builds and runs");
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let per = db.get_record("PER").unwrap().read().record.get_field("VAL");
+        assert!(
+            matches!(per, Some(EpicsValue::Double(v)) if v >= 5.0),
+            "a running IOC ticks .1 second: {per:?}"
+        );
+        assert_eq!(crate::server::ioc_app::ioc_shutdown(), 0);
     }
 }

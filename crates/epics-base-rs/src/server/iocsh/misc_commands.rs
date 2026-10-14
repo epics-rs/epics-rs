@@ -64,12 +64,9 @@ fn cmd_ioc_build() -> CommandDef {
                 }
                 // No `IocApplication` lifecycle to drive — a bare
                 // `PvDatabase` shell or a `CaServerBuilder` binary. C runs
-                // `iocBuild_1` for those too, so this arm does, and the
-                // record-load close is this shell's contribution to it.
+                // `iocBuild` for those too, so this arm does.
                 ShellTransition::NotOurs => {
-                    if crate::server::ioc_app::build_without_application(|| {
-                        ctx.block_on(async { ctx.db().ioc_init().await });
-                    }) {
+                    if ctx.block_on(crate::server::ioc_app::build_without_application(ctx.db())) {
                         Ok(CommandOutcome::Continue)
                     } else {
                         Ok(CommandOutcome::Failed)
@@ -384,7 +381,7 @@ mod tests {
         assert!(run(&ctx, "iocRun", &[]).1, "iocRun from iocVoid fails");
         assert!(run(&ctx, "iocPause", &[]).1, "iocPause from iocVoid fails");
 
-        assert!(build_without_application(|| {}));
+        assert!(ctx.block_on(build_without_application(ctx.db())));
         assert_eq!(ioc_run(), 0);
         assert!(!run(&ctx, "iocPause", &[]).1, "a running IOC pauses");
         assert_eq!(get_ioc_state(), IocState::Paused);

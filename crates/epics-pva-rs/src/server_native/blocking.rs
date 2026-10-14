@@ -147,10 +147,11 @@
 //! exist is not, yet. The hosted build joins the group on its one search socket
 //! ([`bind_udp_search`]).
 
-// RTEMS-EXEC-MODEL-ALLOW(18): checked - all 18 run and pass in the
-// exec-backend suite. The two inactivity-deadline tests were added to the
+// RTEMS-EXEC-MODEL-ALLOW(20): checked - all 20 run and pass in the
+// exec-backend suite. The three inactivity-deadline tests were added to the
 // count after running them there: the deadline they exercise lives in the
-// writer task, which is the same task on both backends. `harness_reactor`'s `new_multi_thread` builder used to be
+// writer task, which is the same task on both backends. So was the
+// read-stall watchdog test, whose ticker is on the same `LivenessClock`. `harness_reactor`'s `new_multi_thread` builder used to be
 // counted as a 17th; it sits under `#[cfg(tokio_backend)]`, so the guard now
 // accounts for it by its own gate and it must not be counted here too.
 use std::collections::HashMap;
@@ -185,6 +186,7 @@ use super::search_engine::{local_v4_addrs, route_search_socket_datagram};
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, TX_LIMIT_FALLBACK, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
+use crate::liveness_clock::LivenessClock;
 
 /// The EPICS priority every PVA server thread runs at.
 ///
@@ -1015,6 +1017,7 @@ impl BlockingPvaServer {
             channel_invalidator: invalidator,
             tx_limit_bytes: tx_limit_bytes(&stream),
             writer_reactor: self.writer_reactor(reactor),
+            liveness_clock: LivenessClock::System,
         };
         let conn_reactor = reactor.clone();
         conn_worker.run_detached(format!("PVA connection {peer}"), move || {
@@ -1827,6 +1830,17 @@ pub(super) mod tests {
             panic!("no {command:?} frame arrived within 32 frames");
         }
 
+        /// Read frames until one carries `command` as a control message.
+        fn read_until_control(&mut self, command: crate::proto::ControlCommand) {
+            for _ in 0..32 {
+                let (header, _) = self.read_frame();
+                if header.flags.is_control() && header.command == command.code() {
+                    return;
+                }
+            }
+            panic!("no {command:?} control frame arrived within 32 frames");
+        }
+
         pub(crate) fn close(&self) {
             let _ = self.0.shutdown(Shutdown::Both);
         }
@@ -1853,11 +1867,26 @@ pub(super) mod tests {
         /// tests drive it as that loop does — one registry, N connections,
         /// `stop`.
         fn start(config: PvaServerConfig, registry: Arc<ConnRegistry>) -> Harness {
+            Self::start_with_clock(
+                config,
+                registry,
+                LivenessClock::System,
+                test_source(),
+                PeerEntry::new(false),
+            )
+        }
+
+        fn start_with_clock(
+            config: PvaServerConfig,
+            registry: Arc<ConnRegistry>,
+            liveness_clock: LivenessClock,
+            source: DynSource,
+            peer_entry: Arc<PeerEntry>,
+        ) -> Harness {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
             let addr = listener.local_addr().expect("local addr");
             let client = TestClient::connect(addr);
             let (server_sock, peer) = listener.accept().expect("accept");
-            let source = test_source();
             let (lease, reader_worker, writer_worker) = lease_pumps();
             let conn = tokio::spawn(async move {
                 // Hold the set's lease until the connection — and the two pump
@@ -1875,11 +1904,12 @@ pub(super) mod tests {
                     source,
                     config,
                     ConnInit {
-                        peer_entry: PeerEntry::new(false),
+                        peer_entry,
                         x509_identity: None,
                         channel_invalidator: ChannelInvalidator::new(),
                         tx_limit_bytes: TX_LIMIT_FALLBACK,
                         writer_reactor: crate::test_reactor(),
+                        liveness_clock,
                     },
                     &registry,
                 )
@@ -2195,6 +2225,7 @@ pub(super) mod tests {
                 channel_invalidator: ChannelInvalidator::new(),
                 tx_limit_bytes: TX_LIMIT_FALLBACK,
                 writer_reactor: crate::test_reactor(),
+                liveness_clock: LivenessClock::System,
             },
             &ConnRegistry::new(),
         )
@@ -2532,17 +2563,45 @@ pub(super) mod tests {
     /// a dead peer, and, with the period set anywhere near the timeout,
     /// early on a live one.
     ///
-    /// Ten deadlines' worth of connection at half the period, so a deadline
-    /// that failed to re-arm — or re-armed without subtracting the silence
-    /// already served — ends the connection here.
+    /// On a [`ManualClock`]: the peer talks every half period, each frame
+    /// is known to be stamped once its echo comes back, and each expiry is
+    /// known to be evaluated once its re-arm is recorded. Nothing here
+    /// waits on the wall clock, so load cannot stretch the peer's silence.
+    /// Every re-arm must land one period after the last frame, which is
+    /// what a deadline that re-armed for the full period would miss.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_peer_that_keeps_sending_outlives_the_re_armed_deadline() {
+        use crate::liveness_clock::ManualClock;
+        const IDLE: Duration = Duration::from_millis(200);
         let order = ByteOrder::Little;
         let config = PvaServerConfig {
-            idle_timeout: Duration::from_millis(200),
+            idle_timeout: IDLE,
             ..isolated_config()
         };
-        let mut h = Harness::start(config, Arc::new(ConnRegistry::new()));
+        let clock = Arc::new(ManualClock::default());
+        let mut h = Harness::start_with_clock(
+            config,
+            Arc::new(ConnRegistry::new()),
+            LivenessClock::Manual(clock.clone()),
+            test_source(),
+            PeerEntry::new(false),
+        );
+        let armed = |n: usize| {
+            let clock = clock.clone();
+            async move {
+                tokio::time::timeout(RETIRE_BOUND, async {
+                    loop {
+                        let armed = clock.armed();
+                        if armed.len() >= n {
+                            return armed[n - 1];
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("deadline #{n} was never armed"))
+            }
+        };
 
         let mut echo = Vec::new();
         PvaHeader::control(
@@ -2552,21 +2611,248 @@ pub(super) mod tests {
             0,
         )
         .write_into(&mut echo);
+        // Each expiry arms exactly one deadline, so the count is known
+        // without reading it back while the writer may be re-arming.
+        let mut deadlines = 1;
+        let mut due = armed(deadlines).await;
+        assert_eq!(due, IDLE, "the first deadline is one period from the start");
+        let mut now = Duration::ZERO;
+        let mut last_frame = Duration::ZERO;
         for _ in 0..10 {
+            now += IDLE / 2;
+            clock.advance(IDLE / 2);
+            if now >= due {
+                deadlines += 1;
+                due = armed(deadlines).await;
+                assert_eq!(
+                    due,
+                    last_frame + IDLE,
+                    "at {now:?} the deadline re-armed for the full period instead of \
+                     what was owed since the frame at {last_frame:?}"
+                );
+            }
             h.client.send(&echo);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            h.client
+                .read_until_control(crate::proto::ControlCommand::EchoResponse);
+            last_frame = now;
         }
-
         assert!(
             !h.conn
                 .as_ref()
                 .expect("connection task present")
                 .is_finished(),
-            "a peer sending every 100 ms must not be reaped by a 200 ms deadline"
+            "a peer sending every half period must not be reaped"
         );
-        // The hangup below is the connection's own end-of-life path
-        // (`Protocol("client closed")`), as in every other Harness test.
+
+        // A full period of silence after the last frame is reaped at the
+        // deadline the last re-arm set.
+        clock.advance(IDLE);
+        let result = h.wait_retired(RETIRE_BOUND).await;
+        assert!(
+            result.is_ok(),
+            "reaping a silent peer is a deliberate close, not an I/O failure: {result:?}"
+        );
+    }
+
+    /// Every `has_pv` waits until the gate opens.
+    struct GatedSource(tokio::sync::watch::Sender<bool>);
+
+    impl crate::server_native::ChannelSource for GatedSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            Vec::new()
+        }
+        async fn has_pv(&self, _: &str) -> bool {
+            let _ = self.0.subscribe().wait_for(|open| *open).await;
+            true
+        }
+        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+            Some(scalar_intro())
+        }
+        async fn get_value(&self, _: &str) -> Option<PvField> {
+            None
+        }
+        async fn put_value(
+            &self,
+            _: &str,
+            _: PvField,
+        ) -> Result<(), crate::server_native::OpError> {
+            Err("read-only".into())
+        }
+        async fn is_writable(&self, _: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _: &str) -> Option<crate::server_native::MonitorStream<PvField>> {
+            None
+        }
+    }
+
+    /// A CREATE_CHANNEL resolver pause is the read loop's own silence, so
+    /// when reads resume `last_rx` restarts: the deadline that falls after
+    /// the resume is owed one period from the resume, not from the last
+    /// frame before a pause longer than the period. On a [`ManualClock`],
+    /// as above; the pause is known to hold once the server has consumed
+    /// the one frame that cannot be queued, and known over once that
+    /// frame's reply arrives, which the read loop writes after the resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolver_pause_restarts_the_idle_deadline_on_resume() {
+        use super::super::tcp::{CREATE_CHANNEL_QUEUE_DEPTH, CREATE_CHANNEL_RESOLVE_CONCURRENCY};
+        use crate::liveness_clock::ManualClock;
+        const IDLE: Duration = Duration::from_millis(200);
+        // Every worker held in `has_pv` and the queue full: the next frame
+        // decoded waits for queue space, and no frame after it is read.
+        const FRAMES: usize = CREATE_CHANNEL_RESOLVE_CONCURRENCY + CREATE_CHANNEL_QUEUE_DEPTH + 1;
+        let order = ByteOrder::Little;
+        let config = PvaServerConfig {
+            idle_timeout: IDLE,
+            ..isolated_config()
+        };
+        let clock = Arc::new(ManualClock::default());
+        let gate = tokio::sync::watch::Sender::new(false);
+        let peer = PeerEntry::new(false);
+        let mut h = Harness::start_with_clock(
+            config,
+            Arc::new(ConnRegistry::new()),
+            LivenessClock::Manual(clock.clone()),
+            Arc::new(GatedSource(gate.clone())),
+            peer.clone(),
+        );
+        let within = |what: String, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + RETIRE_BOUND;
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let armed = |n: usize| {
+            within(format!("deadline #{n} was never armed"), &|| {
+                clock.armed().len() >= n
+            });
+            clock.armed()[n - 1]
+        };
+
+        assert_eq!(armed(1), IDLE);
+        let frames: Vec<Vec<u8>> = (0..FRAMES as u32)
+            .map(|cid| {
+                app_frame(
+                    Command::CreateChannel,
+                    order,
+                    create_channel_payload(cid, &format!("G:{cid:03}"), order),
+                )
+            })
+            .collect();
+        h.client.send(&frames.concat());
+        let consumed = frames.iter().map(Vec::len).sum::<usize>() as u64;
+        within("the pausing frame was never read".into(), &|| {
+            peer.bytes_in.load(Ordering::Relaxed) == consumed
+        });
+
+        // A pause three periods long: the deadline that falls inside it
+        // does not reap, and re-arms.
+        let resume = 3 * IDLE;
+        clock.advance(resume);
+        let in_pause = armed(2);
+        assert!(in_pause > resume, "{in_pause:?}");
+        gate.send_replace(true);
+        for _ in 0..FRAMES {
+            h.client.read_until(Command::CreateChannel);
+        }
+
+        clock.advance(in_pause - resume);
+        assert_eq!(
+            armed(3),
+            resume + IDLE,
+            "the deadline after the resume counted the pause as peer silence"
+        );
         let _ = h.finish().await;
+    }
+
+    /// The read-stall watchdog MUST NOT close a connection while its reads
+    /// are paused for a resolver pause, and MUST close a silent peer
+    /// `op_timeout` after reads resume — not before, and not a tick later
+    /// than that. On a [`ManualClock`], as above; a tick is known evaluated
+    /// once the ticker arms a deadline past the clock, and `idle_timeout`
+    /// is set past every advance so only this watchdog can close. `op_timeout`
+    /// is long in wall time because it is also the socket's `SO_RCVTIMEO`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_read_stall_watchdog_skips_a_resolver_pause_and_closes_at_op_timeout() {
+        use super::super::tcp::{CREATE_CHANNEL_QUEUE_DEPTH, CREATE_CHANNEL_RESOLVE_CONCURRENCY};
+        use crate::liveness_clock::ManualClock;
+        // Ticks every 15 s, so the close falls exactly on a tick.
+        const OP: Duration = Duration::from_secs(3600);
+        const FRAMES: usize = CREATE_CHANNEL_RESOLVE_CONCURRENCY + CREATE_CHANNEL_QUEUE_DEPTH + 1;
+        let order = ByteOrder::Little;
+        let config = PvaServerConfig {
+            op_timeout: OP,
+            idle_timeout: 100 * OP,
+            ..isolated_config()
+        };
+        let clock = Arc::new(ManualClock::default());
+        let gate = tokio::sync::watch::Sender::new(false);
+        let peer = PeerEntry::new(false);
+        let mut h = Harness::start_with_clock(
+            config,
+            Arc::new(ConnRegistry::new()),
+            LivenessClock::Manual(clock.clone()),
+            Arc::new(GatedSource(gate.clone())),
+            peer.clone(),
+        );
+        let within = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + RETIRE_BOUND;
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let open = |h: &Harness| !h.conn.as_ref().expect("connection task").is_finished();
+        // Advance to `to` and wait until every tick up to it is evaluated,
+        // or the connection has closed on one of them.
+        let advance_to = |h: &Harness, now: &mut Duration, to: Duration| {
+            clock.advance(to - *now);
+            *now = to;
+            within("the watchdog never caught up with the clock", &|| {
+                !open(h) || clock.ticks().iter().any(|&at| at > to)
+            });
+        };
+
+        let frames: Vec<Vec<u8>> = (0..FRAMES as u32)
+            .map(|cid| {
+                app_frame(
+                    Command::CreateChannel,
+                    order,
+                    create_channel_payload(cid, &format!("G:{cid:03}"), order),
+                )
+            })
+            .collect();
+        h.client.send(&frames.concat());
+        let consumed = frames.iter().map(Vec::len).sum::<usize>() as u64;
+        within("the pausing frame was never read", &|| {
+            peer.bytes_in.load(Ordering::Relaxed) == consumed
+        });
+
+        let mut now = Duration::ZERO;
+        let resume = 50 * OP;
+        advance_to(&h, &mut now, resume);
+        assert!(
+            open(&h),
+            "the watchdog closed the connection during the resolver pause"
+        );
+
+        gate.send_replace(true);
+        for _ in 0..FRAMES {
+            h.client.read_until(Command::CreateChannel);
+        }
+        advance_to(&h, &mut now, resume + OP - Duration::from_secs(1));
+        assert!(
+            open(&h),
+            "the watchdog closed the connection before op_timeout of silence after the resume"
+        );
+
+        clock.advance(Duration::from_secs(1));
+        let result = h.wait_retired(RETIRE_BOUND).await;
+        assert!(
+            matches!(result, Err(PvaError::Timeout)),
+            "the watchdog did not close the connection at op_timeout: {result:?}"
+        );
     }
 
     /// §4.2b without a seventh `select!` arm: a writer that ends wakes the

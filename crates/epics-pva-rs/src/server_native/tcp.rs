@@ -47,6 +47,7 @@ use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 
 use super::config::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
+use crate::liveness_clock::LivenessClock;
 
 // The accept loop moved to `super::accept` (RTEMS phase 6 item 7 stage A);
 // these re-exports keep `server_native::tcp::run_tcp_server*` resolving for
@@ -4385,7 +4386,7 @@ struct CreateChannelRequest {
 /// worker tasks, so the read loop stops reading the socket while this
 /// queue is full — the same bound, one queue deeper. Any finite depth
 /// gives the bound; the value trades reply latency against queued memory.
-const CREATE_CHANNEL_QUEUE_DEPTH: usize = 64;
+pub(super) const CREATE_CHANNEL_QUEUE_DEPTH: usize = 64;
 
 /// Resolver workers per connection: the most CREATE_CHANNEL names one
 /// connection can have inside the source (`has_pv` … `get_introspection`)
@@ -4396,7 +4397,7 @@ const CREATE_CHANNEL_QUEUE_DEPTH: usize = 64;
 /// connection, which pvxs never does. Finite so that the in-flight work a
 /// peer can hold open is `CREATE_CHANNEL_RESOLVE_CONCURRENCY +
 /// CREATE_CHANNEL_QUEUE_DEPTH` names, not one per frame it manages to send.
-const CREATE_CHANNEL_RESOLVE_CONCURRENCY: usize = 16;
+pub(super) const CREATE_CHANNEL_RESOLVE_CONCURRENCY: usize = 16;
 
 /// Per-connection context the accept loop establishes before handing the
 /// split stream to [`handle_connection_io`]: the peer's report entry, the
@@ -4426,6 +4427,9 @@ pub(super) struct ConnInit {
     /// task queued ahead of it — pvxs writes on `PVXTCP` while `qsrvSingle`
     /// produces.
     pub(super) writer_reactor: epics_base_rs::runtime::task::Reactor,
+    /// What the peer-silence watchdogs read time from: the `last_rx` stamps
+    /// and the inactivity deadline.
+    pub(super) liveness_clock: LivenessClock,
 }
 
 pub(super) async fn handle_connection_io(
@@ -4443,6 +4447,7 @@ pub(super) async fn handle_connection_io(
         channel_invalidator,
         tx_limit_bytes,
         writer_reactor,
+        liveness_clock,
     } = init;
     let op_timeout = config.op_timeout;
     let idle_timeout = config.idle_timeout;
@@ -4459,7 +4464,9 @@ pub(super) async fn handle_connection_io(
     // that would have noticed. The client side never had this defect; its
     // heartbeat is a separate task reading a shared `last_rx`
     // (`client_native::server_conn`), which is the split restored here.
-    let last_rx = Arc::new(std::sync::atomic::AtomicU64::new(now_nanos()));
+    let last_rx = Arc::new(std::sync::atomic::AtomicU64::new(
+        liveness_clock.now_nanos(),
+    ));
     // Set while the read loop is deliberately not reading (a CREATE_CHANNEL
     // resolver pause). Peer silence during such a pause is this loop's
     // doing, not the peer's, and neither watchdog has ever counted it.
@@ -4488,6 +4495,7 @@ pub(super) async fn handle_connection_io(
     let peer_entry_writer = peer_entry.clone();
     let last_rx_writer = last_rx.clone();
     let reads_paused_writer = reads_paused.clone();
+    let writer_clock = liveness_clock.clone();
     let writer_task = writer_reactor.spawn(async move {
         // Dropping this guard — loop break OR abort at the `recv` await —
         // closes the byte budget so producers parked in `TxBudget::acquire`
@@ -4517,7 +4525,7 @@ pub(super) async fn handle_connection_io(
         // loop pass would arm a timer per frame written, which on a busy
         // connection is the timer-wheel churn `read_frame`'s per-read
         // `timeout()` wrapper was removed to avoid.
-        let mut idle_deadline = std::pin::pin!(epics_base_rs::runtime::task::sleep(idle_timeout));
+        let mut idle_deadline = std::pin::pin!(writer_clock.sleep(idle_timeout));
         'writer: loop {
             let mut first = tokio::select! {
                 biased;
@@ -4528,7 +4536,9 @@ pub(super) async fn handle_connection_io(
                 _ = queues.subscribers.drive() => None,
                 _ = idle_deadline.as_mut() => {
                     let silent = Duration::from_nanos(
-                        now_nanos().saturating_sub(last_rx_writer.load(Ordering::Relaxed)),
+                        writer_clock
+                            .now_nanos()
+                            .saturating_sub(last_rx_writer.load(Ordering::Relaxed)),
                     );
                     // A CREATE_CHANNEL resolver pause is the read loop's own
                     // choice, so it does not count as peer silence; re-arm on
@@ -4544,7 +4554,7 @@ pub(super) async fn handle_connection_io(
                     let owed = idle_timeout
                         .saturating_sub(silent)
                         .max(Duration::from_millis(50));
-                    idle_deadline.set(epics_base_rs::runtime::task::sleep(owed));
+                    idle_deadline.set(writer_clock.sleep(owed));
                     continue;
                 }
             };
@@ -4626,9 +4636,9 @@ pub(super) async fn handle_connection_io(
     // it must keep watching after `hb_stopped`, or a connection whose
     // writer has gone and whose peer then wedges mid-frame would never be
     // reclaimed.
-    let mut op_deadline_tick = epics_base_rs::runtime::task::interval(
-        (op_timeout / 2).clamp(Duration::from_millis(100), Duration::from_secs(15)),
-    );
+    // On `liveness_clock`, as the `last_rx` stamps it compares are.
+    let mut op_deadline_tick = liveness_clock
+        .interval((op_timeout / 2).clamp(Duration::from_millis(100), Duration::from_secs(15)));
     op_deadline_tick.tick().await;
     // Latched when the writer channel closes, so the probe cannot spin
     // against a writer that is gone while the loop unwinds. Peer silence no
@@ -5156,7 +5166,7 @@ pub(super) async fn handle_connection_io(
                 if pending_creates.is_empty() {
                     // Reads resume. The pause was this loop's choice, not
                     // peer silence, so the watchdog clocks restart here.
-                    last_rx.store(now_nanos(), Ordering::Relaxed);
+                    last_rx.store(liveness_clock.now_nanos(), Ordering::Relaxed);
                 }
                 continue;
             }
@@ -5222,7 +5232,9 @@ pub(super) async fn handle_connection_io(
                 // sent no complete frame for `op_timeout` while the loop
                 // was reading — a wedged or byte-trickling circuit, never
                 // a resolver pause.
-                let elapsed = now_nanos().saturating_sub(last_rx.load(Ordering::Relaxed));
+                let elapsed = liveness_clock
+                    .now_nanos()
+                    .saturating_sub(last_rx.load(Ordering::Relaxed));
                 if pending_creates.is_empty() && Duration::from_nanos(elapsed) >= op_timeout {
                     return Err(PvaError::Timeout);
                 }
@@ -5241,7 +5253,7 @@ pub(super) async fn handle_connection_io(
         // bytes_in counter (header + payload). Drives
         // PvaServer::report() throughput diagnostics.
         peer_entry.touch_rx(PvaHeader::SIZE + frame.payload.len());
-        last_rx.store(now_nanos(), Ordering::Relaxed);
+        last_rx.store(liveness_clock.now_nanos(), Ordering::Relaxed);
         if frame.header.flags.is_control() {
             // A peer may re-negotiate the connection byte order mid-stream
             // with another SET_BYTE_ORDER control frame. pvxs latches
@@ -9818,14 +9830,6 @@ fn build_monitor_error(ioid: u32, msg: &str, order: ByteOrder) -> Vec<u8> {
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
     buf
-}
-
-fn now_nanos() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// Test-only writer-queue pair with an effectively unlimited byte

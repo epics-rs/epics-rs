@@ -105,6 +105,7 @@ use super::search_engine::random_guid;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
 use crate::error::PvaResult;
+use crate::liveness_clock::LivenessClock;
 
 /// The live connections — see the module doc's invariant.
 ///
@@ -523,6 +524,7 @@ impl ReactorPvaServer {
             channel_invalidator: self.channel_invalidator.clone(),
             tx_limit_bytes: tx_limit,
             writer_reactor: self.writer_reactor(reactor),
+            liveness_clock: LivenessClock::System,
         };
         let conn_reactor = reactor.clone();
         let id = slot.id();

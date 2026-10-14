@@ -33,6 +33,7 @@ use super::peers::ConnSlot;
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
+use crate::liveness_clock::LivenessClock;
 
 /// Run the TCP listener forever. Backwards-compat wrapper that
 /// drops per-peer stats — equivalent to calling
@@ -321,6 +322,7 @@ pub async fn run_tcp_server_on_listener(
                                             channel_invalidator: conn_invalidator,
                                             tx_limit_bytes,
                                             writer_reactor,
+                                            liveness_clock: LivenessClock::System,
                                         },
                                     )
                                     .await
@@ -356,6 +358,7 @@ pub async fn run_tcp_server_on_listener(
                                     channel_invalidator: conn_invalidator,
                                     tx_limit_bytes,
                                     writer_reactor,
+                                    liveness_clock: LivenessClock::System,
                                 },
                             )
                             .await

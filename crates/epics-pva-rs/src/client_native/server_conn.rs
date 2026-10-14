@@ -38,12 +38,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // without that zero meaning anything. Both remaining uses sit inside `cfg`
 // blocks that the target does not compile, so they name the type by full path
 // and the module resolves cleanly.
-use epics_base_rs::runtime::task::{interval, timeout};
+use epics_base_rs::runtime::task::timeout;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::error::{PvaError, PvaResult};
+use crate::liveness_clock::LivenessClock;
 use crate::proto::{
     ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PvaHeader, ReadExt, Status,
     WriteExt, decode_string, encode_string_into,
@@ -160,6 +161,8 @@ pub struct ServerConn {
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
     last_rx_nanos: Arc<AtomicU64>,
+    /// What `last_rx_nanos` and the heartbeat read time from.
+    liveness_clock: LivenessClock,
     /// total bytes read off / written to this connection's
     /// socket, for `PvaClient::report`. Shared with the reader/writer
     /// tasks.
@@ -522,9 +525,32 @@ impl ServerConn {
         host: &[u8],
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
+        Self::connect_on(reactor, target, user, host, conn, LivenessClock::System).await
+    }
+
+    /// [`Self::connect`] with the heartbeat and `last_rx` on `liveness_clock`.
+    async fn connect_on(
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        target: SocketAddr,
+        user: &[u8],
+        host: &[u8],
+        conn: ConnConfig,
+        liveness_clock: LivenessClock,
+    ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_pva(target, conn.op_timeout, conn.tcp_timeout).await?;
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
-        Self::run_handshake_and_spawn(reactor, target, reader, writer, None, user, host, conn).await
+        Self::run_handshake_and_spawn(
+            reactor,
+            target,
+            reader,
+            writer,
+            None,
+            user,
+            host,
+            conn,
+            liveness_clock,
+        )
+        .await
     }
 
     /// Open a plain TCP connection driven by **two blocking threads** instead of
@@ -556,7 +582,18 @@ impl ServerConn {
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout).await?;
-        Self::run_handshake_and_spawn(reactor, target, reader, writer, None, user, host, conn).await
+        Self::run_handshake_and_spawn(
+            reactor,
+            target,
+            reader,
+            writer,
+            None,
+            user,
+            host,
+            conn,
+            LivenessClock::System,
+        )
+        .await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
@@ -613,6 +650,7 @@ impl ServerConn {
             user,
             host,
             conn,
+            LivenessClock::System,
         )
         .await
     }
@@ -620,7 +658,7 @@ impl ServerConn {
     /// Internal: takes already-split read/write halves, runs the handshake,
     /// then spawns the reader/writer/heartbeat tasks. Used by both
     /// [`Self::connect`] and [`Self::connect_tls`].
-    #[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
+    #[allow(clippy::too_many_arguments)] // the `reactor` and the liveness clock are the 8th and 9th
     async fn run_handshake_and_spawn(
         reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
@@ -630,6 +668,7 @@ impl ServerConn {
         user: &[u8],
         host: &[u8],
         conn: ConnConfig,
+        liveness_clock: LivenessClock,
     ) -> PvaResult<Arc<Self>> {
         let ConnConfig {
             op_timeout,
@@ -672,7 +711,7 @@ impl ServerConn {
         // many readers.
         let out_order = Arc::new(AtomicBool::new(byte_order.is_big()));
         let alive = Arc::new(AtomicBool::new(true));
-        let last_rx_nanos = Arc::new(AtomicU64::new(now_nanos()));
+        let last_rx_nanos = Arc::new(AtomicU64::new(liveness_clock.now_nanos()));
         let bytes_rx = Arc::new(AtomicU64::new(0));
         let bytes_tx = Arc::new(AtomicU64::new(0));
         let by_ioid: Arc<DashMap<u32, IoidSlot>> = Arc::new(DashMap::new());
@@ -720,6 +759,7 @@ impl ServerConn {
         let cancel_reader = cancel.clone();
         let alive_reader = alive.clone();
         let last_rx_reader = last_rx_nanos.clone();
+        let reader_clock = liveness_clock.clone();
         let bytes_rx_reader = bytes_rx.clone();
         let by_ioid_reader = by_ioid.clone();
         let by_cid_reader = by_cid.clone();
@@ -769,7 +809,7 @@ impl ServerConn {
                                 cancel_reader.cancel();
                                 return;
                             }
-                            last_rx_reader.store(now_nanos(), Ordering::SeqCst);
+                            last_rx_reader.store(reader_clock.now_nanos(), Ordering::SeqCst);
                             // count bytes read off the socket.
                             bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
                             // Peek the header once we have 8 bytes — when
@@ -988,6 +1028,7 @@ impl ServerConn {
         let cancel_hb = cancel.clone();
         let alive_hb = alive.clone();
         let last_rx_hb = last_rx_nanos.clone();
+        let hb_clock = liveness_clock.clone();
         let writer_tx_hb = writer_tx.clone();
         let out_order_hb = out_order.clone();
         reactor.spawn(async move {
@@ -997,7 +1038,7 @@ impl ServerConn {
                 tcp_timeout.as_secs_f64(),
             ));
             let hb_timeout = tcp_timeout;
-            let mut tick = interval(hb_interval);
+            let mut tick = hb_clock.interval(hb_interval);
             tick.tick().await; // skip first immediate tick
             loop {
                 tokio::select! {
@@ -1005,7 +1046,7 @@ impl ServerConn {
                     _ = tick.tick() => {
                         // Liveness check: are we receiving anything?
                         let last = last_rx_hb.load(Ordering::SeqCst);
-                        let elapsed = now_nanos().saturating_sub(last);
+                        let elapsed = hb_clock.now_nanos().saturating_sub(last);
                         if elapsed > hb_timeout.as_nanos() as u64 {
                             warn!("PVA connection idle > {hb_timeout:?}, closing");
                             break;
@@ -1050,6 +1091,7 @@ impl ServerConn {
             cancel,
             alive,
             last_rx_nanos,
+            liveness_clock,
             bytes_rx,
             bytes_tx,
             by_ioid,
@@ -1352,7 +1394,7 @@ impl ServerConn {
     /// Time elapsed since the last incoming byte.
     pub fn idle_for(&self) -> Duration {
         let last = self.last_rx_nanos.load(Ordering::SeqCst);
-        let now = now_nanos();
+        let now = self.liveness_clock.now_nanos();
         Duration::from_nanos(now.saturating_sub(last))
     }
 }
@@ -1394,14 +1436,6 @@ pub(super) fn select_client_auth(auth_methods: &[String]) -> &'static str {
     } else {
         "anonymous"
     }
-}
-
-fn now_nanos() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 pub(super) async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
@@ -2946,9 +2980,8 @@ mod tests {
     ///
     /// Setup: a mock server completes the PVA handshake then goes silent.
     /// With `tcp_timeout = 500ms` the heartbeat declares the connection dead
-    /// well within 4 seconds. Before the fix the heartbeat read from
-    /// `EPICS_PVA_CONN_TMO` (default → 40 s) so the connection would still
-    /// be alive at the 4 s deadline.
+    /// at its first tick. Before the fix the heartbeat read from
+    /// `EPICS_PVA_CONN_TMO` (default → 40 s) so that tick would probe instead.
     ///
     /// pvxs upstream:
     ///   - inactivity timeout = `tcpTimeout`     (clientconn.cpp:71-72)
@@ -3030,11 +3063,13 @@ mod tests {
         // Short tcp_timeout so the heartbeat fires quickly:
         //   hb_interval = max(1, min(15, 0.5 * 3/8)) = 1 s
         //   hb_timeout  = 0.5 s
-        // Connection must be declared dead at the first heartbeat tick (~1 s).
+        // On a ManualClock the first tick (1 s) must close the link; with
+        // the env default (40 s) it would probe and arm the second tick.
         let tcp_timeout = Duration::from_millis(500);
         let op_timeout = Duration::from_secs(2);
+        let clock = Arc::new(crate::liveness_clock::ManualClock::default());
 
-        let conn = ServerConn::connect(
+        let conn = ServerConn::connect_on(
             &crate::test_reactor(),
             addr,
             b"testuser",
@@ -3044,29 +3079,38 @@ mod tests {
                 tcp_timeout,
                 max_message_size: None,
             },
+            LivenessClock::Manual(clock.clone()),
         )
         .await
         .expect("handshake must succeed");
 
         assert!(conn.is_alive(), "connection must be alive after handshake");
 
-        // Wait for the heartbeat to declare the connection dead.
-        // Deadline = 4 s; before the fix hb_timeout = 40 s (env default)
-        // so this assertion would still be true at 4 s and the timeout
-        // would fire, causing the test to fail.
-        let deadline = Duration::from_secs(4);
-        tokio::time::timeout(deadline, async {
-            loop {
-                if !conn.is_alive() {
-                    break;
+        // Armed: the skipped immediate tick, then tick 1.
+        let armed = |n: usize| {
+            let clock = clock.clone();
+            async move {
+                while clock.ticks().len() < n {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), armed(2))
+            .await
+            .expect("the first heartbeat tick was never armed");
+        clock.advance(Duration::from_secs(1));
+        // Tick 1 either closes the link or arms tick 2; nothing else moves.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while conn.is_alive() && clock.ticks().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("connection must be declared dead within 4 s (tcp_timeout=500ms)");
-
-        assert!(!conn.is_alive());
+        .expect("tick 1 was never evaluated");
+        assert!(
+            !conn.is_alive(),
+            "a link silent for 1 s outlived tcp_timeout = {tcp_timeout:?}"
+        );
     }
 
     /// The client heartbeat must use an
@@ -3076,8 +3120,13 @@ mod tests {
     /// Rust client alive past several heartbeat intervals; before the fix
     /// the control probe drew no reply, `last_rx` went stale, and the
     /// connection was torn down despite a healthy server.
-    #[tokio::test]
+    ///
+    /// On a [`ManualClock`]: each tick is known to be evaluated once the
+    /// next one is armed, and each probe known answered once `idle_for`
+    /// reads zero, so load cannot stretch the silence the heartbeat sees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pva_rs_71_app_echo_keeps_pvxs_link_alive() {
+        use crate::liveness_clock::ManualClock;
         use crate::proto::encode_size_into;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3087,10 +3136,13 @@ mod tests {
             .await
             .expect("bind mock server");
         let addr = listener.local_addr().expect("mock server addr");
+        let answer = Arc::new(AtomicBool::new(true));
+        let answer_server = answer.clone();
 
         // pvxs-shaped server: complete the handshake, then drain control
         // frames and reply ONLY to application CMD_ECHO with a
-        // server-direction CMD_ECHO (serverconn.cpp:166-178).
+        // server-direction CMD_ECHO (serverconn.cpp:166-178), while
+        // `answer` holds.
         tokio::spawn(async move {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
@@ -3117,9 +3169,15 @@ mod tests {
                 return;
             }
 
-            // Drain the client's CONNECTION_VALIDATION reply.
-            let mut drain = [0u8; 512];
-            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut drain)).await;
+            // The client's CONNECTION_VALIDATION reply.
+            let mut hdr = [0u8; 8];
+            if sock.read_exact(&mut hdr).await.is_err() {
+                return;
+            }
+            let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+            if sock.read_exact(&mut vec![0u8; len]).await.is_err() {
+                return;
+            }
 
             // CONNECTION_VALIDATED (Status::ok()).
             let mut vd = Vec::new();
@@ -3130,11 +3188,8 @@ mod tests {
                 return;
             }
 
-            // Echo pump.
-            let mut hdr = [0u8; 8];
-            while let Ok(Ok(_)) =
-                tokio::time::timeout(Duration::from_secs(6), sock.read_exact(&mut hdr)).await
-            {
+            // Echo pump, until the client hangs up.
+            while sock.read_exact(&mut hdr).await.is_ok() {
                 let payload_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
                 if payload_len > 0 {
                     let mut body = vec![0u8; payload_len];
@@ -3145,7 +3200,10 @@ mod tests {
                 let is_control = hdr[2] & HeaderFlags::CONTROL != 0;
                 // A control EchoRequest (the pre-fix probe) is drained with
                 // no reply, exactly like pvxs.
-                if !is_control && hdr[3] == Command::Echo.code() {
+                if !is_control
+                    && hdr[3] == Command::Echo.code()
+                    && answer_server.load(Ordering::SeqCst)
+                {
                     let mut reply = Vec::with_capacity(8);
                     PvaHeader::application(true, order, Command::Echo.code(), 0)
                         .write_into(&mut reply);
@@ -3157,11 +3215,10 @@ mod tests {
         });
 
         // tcp_timeout = 2 s → hb_interval = max(1, 2×3/8) = 1 s,
-        // hb_timeout = 2 s. With application echo answered each interval,
-        // `last_rx` is refreshed ~every 1 s and the link survives. Without
-        // the fix (control probe, no reply) `last_rx` would go stale and
-        // the heartbeat declares the connection dead at ~3 s.
-        let conn = ServerConn::connect(
+        // hb_timeout = 2 s.
+        const HB: Duration = Duration::from_secs(1);
+        let clock = Arc::new(ManualClock::default());
+        let conn = ServerConn::connect_on(
             &crate::test_reactor(),
             addr,
             b"testuser",
@@ -3171,19 +3228,55 @@ mod tests {
                 tcp_timeout: Duration::from_secs(2),
                 max_message_size: None,
             },
+            LivenessClock::Manual(clock.clone()),
         )
         .await
         .expect("handshake must succeed");
-
         assert!(conn.is_alive(), "connection must be alive after handshake");
 
-        // Past three heartbeat intervals (3 s): the pre-fix control probe
-        // would have torn the link down by now.
-        tokio::time::sleep(Duration::from_millis(3500)).await;
-        assert!(
-            conn.is_alive(),
-            "application-echo heartbeat must keep the pvxs-shaped link alive"
-        );
+        // A bound on the event, not a margin on the deadline: the clock
+        // does not move while it runs.
+        async fn within(what: &str, mut done: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+        }
+        // The immediate first tick is skipped, so tick `n` (at n·HB) is
+        // armed `n + 1`th; it has been evaluated once tick `n + 1` is armed.
+        let evaluated = |n: usize| clock.ticks().len() >= n + 2;
+
+        within("the first heartbeat tick was never armed", || evaluated(0)).await;
+        for n in 1..=10 {
+            clock.advance(HB);
+            within(&format!("tick {n} was never evaluated"), || evaluated(n)).await;
+            within(&format!("the probe of tick {n} was never answered"), || {
+                conn.idle_for() == Duration::ZERO
+            })
+            .await;
+            assert!(conn.is_alive(), "tick {n} closed an answered link");
+        }
+
+        // Silence from here: the probes at +1 s and +2 s still find the
+        // link within tcp_timeout, the one at +3 s does not.
+        answer.store(false, Ordering::SeqCst);
+        for n in 11..=12 {
+            clock.advance(HB);
+            within(&format!("tick {n} was never evaluated"), || evaluated(n)).await;
+            assert!(
+                conn.is_alive(),
+                "tick {n} closed a link silent for only {:?}",
+                conn.idle_for()
+            );
+        }
+        clock.advance(HB);
+        within("a link silent past tcp_timeout was never closed", || {
+            !conn.is_alive()
+        })
+        .await;
     }
 
     /// [`ServerConn::connect_blocking`] completes the same handshake as

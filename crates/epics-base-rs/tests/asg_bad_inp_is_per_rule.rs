@@ -21,20 +21,15 @@
 //! poisoning rules that never read it.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::access_security::{
-    AccessGate, AccessLevel, AsgAslResolver, AsgInputs, InpReading, InpResolver, new_acf_cell,
-    parse_acf,
+    AccessGate, AccessLevel, AcfCell, AsgAslResolver, new_acf_cell_watching, parse_acf,
 };
-use epics_base_rs::server::record::AlarmSeverity;
-
-/// A delivered reading with no alarm.
-fn ok(value: f64) -> InpReading {
-    InpReading {
-        value,
-        severity: AlarmSeverity::NoAlarm,
-    }
-}
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::types::EpicsValue;
 
 /// `gate:enable` resolves to 1; `typo:pv` does not exist. The WRITE rule reads
 /// only A, the READ rule reads only B.
@@ -46,17 +41,32 @@ ASG(RW) {
 }
 "#;
 
-/// Resolve `gate:enable` and nothing else — `typo:pv` is the bad input.
-fn one_bad_link() -> InpResolver {
-    Arc::new(|link: String| Box::pin(async move { (link == "gate:enable").then_some(ok(1.0)) }))
+/// `acf` served over a database holding `gate:enable` at `value` and no
+/// `typo:pv`, once the `INP*` watcher has delivered what exists.
+async fn served(acf: &str, asg: &[u8], value: f64) -> (Arc<PvDatabase>, AcfCell) {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("gate:enable", Box::new(AiRecord::new(value)))
+        .await
+        .unwrap();
+    // Processed, so it is not UDF.
+    db.put_record_field_from_ca("gate:enable", "VAL", EpicsValue::Double(value))
+        .await
+        .unwrap();
+    let cell = new_acf_cell_watching(Some(parse_acf(acf).unwrap()), &db);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cell.load_full().unwrap().asg[asg].inp_bad() != 0b10 {
+        assert!(Instant::now() < deadline, "gate:enable never delivered");
+        sleep(Duration::from_millis(10)).await;
+    }
+    (db, cell)
 }
 
 /// The finding's own trigger, through the async gate.
 #[epics_macros_rs::epics_test]
 async fn a_bad_inp_no_rule_reads_does_not_disable_the_rule() {
-    let cell = new_acf_cell(Some(parse_acf(ACF).unwrap()));
+    let (_db, cell) = served(ACF, b"RW", 1.0).await;
     let asg: AsgAslResolver = Arc::new(|_n| Box::pin(async { ("RW".to_string(), 0u8) }));
-    let gate = AccessGate::required(cell, asg).with_inp_resolver(one_bad_link());
+    let gate = AccessGate::required(cell, asg);
 
     assert!(
         gate.check("x", "h", "u", "ca", "").await.allows_write(),
@@ -76,9 +86,9 @@ ASG(RW) {
     RULE(1, WRITE) { CALC("B=1") }
 }
 "#;
-    let cell = new_acf_cell(Some(parse_acf(acf).unwrap()));
+    let (_db, cell) = served(acf, b"RW", 1.0).await;
     let asg: AsgAslResolver = Arc::new(|_n| Box::pin(async { ("RW".to_string(), 0u8) }));
-    let gate = AccessGate::required(cell, asg).with_inp_resolver(one_bad_link());
+    let gate = AccessGate::required(cell, asg);
 
     assert!(
         !gate.check("x", "h", "u", "ca", "").await.allows_write(),
@@ -90,25 +100,20 @@ ASG(RW) {
 /// Two rules, one bad input, opposite dependencies — the discrimination the
 /// group-wide abort could not express. `A=1` grants, `B=1` does not, in the
 /// same evaluation.
-#[test]
-fn one_bad_input_splits_the_rules_that_read_it_from_the_rest() {
-    let cfg = parse_acf(
-        r#"
+#[epics_macros_rs::epics_test]
+async fn one_bad_input_splits_the_rules_that_read_it_from_the_rest() {
+    let acf = r#"
 ASG(SPLIT) {
     INPA("gate:enable")
     INPB("typo:pv")
     RULE(0, READ)  { CALC("A=1") }
     RULE(1, WRITE) { CALC("B=1") }
 }
-"#,
-    )
-    .unwrap();
-
-    let mut inputs = AsgInputs::for_group(cfg.asg.get(b"SPLIT".as_slice()));
-    inputs.record(0, ok(1.0)); // gate:enable = 1; typo:pv never delivers
-    assert_eq!(inputs.bad, 0b10, "only INPB is marked bad");
-
-    let (level, _) = cfg.compute_for_name("SPLIT", "h", "u", &[], 0, "ca", "", Some(&inputs));
+"#;
+    // gate:enable = 1; typo:pv never delivers, so only INPB is bad.
+    let (_db, cell) = served(acf, b"SPLIT", 1.0).await;
+    let cfg = cell.load_full().unwrap();
+    let (level, _) = cfg.compute_for_name("SPLIT", "h", "u", &[], 0, "ca", "");
     assert_eq!(
         level,
         AccessLevel::Read,
@@ -140,11 +145,11 @@ ASG(G) {
 
 /// A bad input cannot rescue a rule either: the intersection gates BEFORE the
 /// band test, so a rule whose CALC would be false is still just false.
-#[test]
-fn a_good_input_that_evaluates_false_still_denies() {
-    let cfg = parse_acf(ACF).unwrap();
-    let mut inputs = AsgInputs::for_group(cfg.asg.get(b"RW".as_slice()));
-    inputs.record(0, ok(0.0)); // gate:enable = 0; typo:pv never delivers
-    let (level, _) = cfg.compute_for_name("RW", "h", "u", &[], 0, "ca", "", Some(&inputs));
+#[epics_macros_rs::epics_test]
+async fn a_good_input_that_evaluates_false_still_denies() {
+    // gate:enable = 0; typo:pv never delivers.
+    let (_db, cell) = served(ACF, b"RW", 0.0).await;
+    let cfg = cell.load_full().unwrap();
+    let (level, _) = cfg.compute_for_name("RW", "h", "u", &[], 0, "ca", "");
     assert_eq!(level, AccessLevel::NoAccess, "A=1 is false when A is 0");
 }

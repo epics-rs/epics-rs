@@ -741,7 +741,10 @@ impl CaServer {
                 .map_err(|e| CaError::Io(std::io::Error::other(e)))?
                 .map_err(CaError::Io)?;
         let parsed = access_security::parse_acf(&content)?;
-        acf.store(Some(Arc::new(parsed)));
+        let cell = acf.clone();
+        epics_base_rs::runtime::task::spawn_blocking(move || cell.install(parsed))
+            .await
+            .map_err(|e| CaError::Io(std::io::Error::other(e)))?;
         // Notify every active TCP client to recompute and push fresh
         // CA_PROTO_ACCESS_RIGHTS for its open channels. Send-error
         // (no live subscribers) is a normal transient state.
@@ -1430,7 +1433,9 @@ impl CaServer {
                     let acf = acf_clone.clone();
                     let reload_tx = acf_reload_tx_clone.clone();
                     acf_reload_reactor.spawn(async move {
-                        acf.store(Some(Arc::new(cfg)));
+                        let _ =
+                            epics_base_rs::runtime::task::spawn_blocking(move || acf.install(cfg))
+                                .await;
                         let _ = reload_tx.send(());
                     });
                     Ok(())

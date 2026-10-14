@@ -268,7 +268,7 @@ pub(crate) fn as_init(acf: &crate::server::access_security::AcfCell) -> AsInitOu
     // process-wide change notification, so live CA clients re-evaluate their
     // ACCESS_RIGHTS and policy caches drop (C: `asInitialize` swaps `pasbase`
     // and re-computes every ASGCLIENT, asLibRoutines.c `asInitCommon`).
-    acf.store(Some(std::sync::Arc::new(config)));
+    acf.install(config);
     AsInitOutcome::Loaded
 }
 
@@ -412,20 +412,9 @@ fn cmd_asdbdump() -> CommandDef {
             // Delegate to the single dump-format owner in
             // `access_security.rs` (shared with the CA gateway R3 report),
             // printing each rendered line through the shell.
-            with_config(ctx, |cfg| {
-                println_dump(ctx, &cfg.dump_report(&|link| inp_link_value(ctx, link)))
-            })
+            with_config(ctx, |cfg| println_dump(ctx, &cfg.dump_report()))
         },
     )
-}
-
-/// An ASG `INP*` link's live reading, as `asCa.c`'s channel holds it; `None`
-/// is a channel that never connected.
-fn inp_link_value(
-    ctx: &CommandContext,
-    link: &str,
-) -> Option<crate::server::access_security::InpReading> {
-    crate::server::access_security::read_inp_link(ctx.db(), link)
 }
 
 /// Print a rendered dump line by line, as the bytes C's `%s` writes.
@@ -527,8 +516,7 @@ fn cmd_asprules() -> CommandDef {
                 _ => None,
             };
             with_config(ctx, |cfg| {
-                let dump =
-                    cfg.dump_rules(filter.map(str::as_bytes), &|link| inp_link_value(ctx, link));
+                let dump = cfg.dump_rules(filter.map(str::as_bytes));
                 println_dump(ctx, &dump)
             })
         },

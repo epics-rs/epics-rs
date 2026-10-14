@@ -1227,41 +1227,19 @@ impl ClientState {
         }
     }
 
-    /// Compute access rights bits for a channel target, together with
-    /// the write-trap mask of the ACF rule that resolved the level
-    ///. The trap flag is `false` for `SimplePv`/`RecordField`
-    /// targets whose access was not resolved through a `TRAPWRITE`
-    /// rule — including the no-ACF permissive fallback.
-    /// This ASG's live `INP*` state, walked by the owner in `epics-base-rs`.
+    /// Evaluate `cfg`'s rules for `asg_name`.
     ///
-    /// Caller must NOT hold a record read-guard that a link could point back
-    /// to (would re-read the same lock).
-    fn calc_inputs(
-        &self,
-        cfg: &AccessSecurityConfig,
-        asg_name: &str,
-    ) -> epics_base_rs::server::access_security::AsgInputs {
-        cfg.resolve_asg_inputs(asg_name, &|link| {
-            epics_base_rs::server::access_security::read_inp_link(&self.db, link)
-        })
-    }
-
-    /// Evaluate `cfg`'s rules for `asg_name`, with CALC clauses gated against
-    /// the resolved `INP*` values.
-    ///
-    /// The rule walk and the CALC truth test both belong to
-    /// `AccessSecurityConfig::compute_rules`; this server only resolves the
-    /// links and hands the values over. It used to carry its own evaluator,
-    /// a second copy of the one in `epics-base-rs` — and the copies drifted
-    /// together rather than apart: both tested `result != 0.0` where C tests
-    /// the `(0.99, 1.01)` band.
+    /// The rule walk and the CALC results both belong to `epics-base-rs`:
+    /// `AccessSecurityConfig::compute_rules` reads the results its `INP*`
+    /// watcher published, as C's `asComputePvt` reads `pasgrule->result`.
+    /// This server used to carry its own evaluator, and then its own link
+    /// reads; both drifted from C.
     fn access_for_asg(
         &self,
         cfg: &AccessSecurityConfig,
         asg_name: &str,
         asl: u8,
     ) -> (AccessLevel, bool) {
-        let calc_inputs = self.calc_inputs(cfg, asg_name);
         cfg.compute_for_name(
             asg_name,
             self.hostname.as_bytes(),
@@ -1270,10 +1248,14 @@ impl ClientState {
             asl,
             &self.auth_method,
             &self.auth_authority,
-            Some(&calc_inputs),
         )
     }
 
+    /// Compute access rights bits for a channel target, together with
+    /// the write-trap mask of the ACF rule that resolved the level
+    ///. The trap flag is `false` for `SimplePv`/`RecordField`
+    /// targets whose access was not resolved through a `TRAPWRITE`
+    /// rule — including the no-ACF permissive fallback.
     async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
         match target {
             ChannelTarget::SimplePv(pv) => {

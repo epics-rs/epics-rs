@@ -271,10 +271,9 @@ impl PvDatabaseSource {
         acf: AcfCell,
         acl_version: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> epics_base_rs::server::access_security::AccessGate {
-        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, InpResolver};
-        let asg_db = db.clone();
+        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver};
         let resolver: AsgAslResolver = Arc::new(move |pv_name| {
-            let db = asg_db.clone();
+            let db = db.clone();
             Box::pin(async move {
                 // The ASG must come off the record the CHANNEL addresses,
                 // so the name is resolved the same way every operation on
@@ -291,18 +290,10 @@ impl PvDatabaseSource {
                 ("DEFAULT".to_string(), 0u8)
             })
         });
-        let inp_db = db.clone();
-        let inp_resolver: InpResolver = Arc::new(move |link: String| {
-            let db = inp_db.clone();
-            Box::pin(
-                async move { epics_base_rs::server::access_security::read_inp_link(&db, &link) },
-            )
-        });
-        let gate = match acl_version {
+        match acl_version {
             Some(v) => AccessGate::required_with_version(acf, resolver, v),
             None => AccessGate::required(acf, resolver),
-        };
-        gate.with_inp_resolver(inp_resolver)
+        }
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {

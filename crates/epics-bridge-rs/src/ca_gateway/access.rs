@@ -53,7 +53,7 @@ enum Mode {
     /// Explicit opt-in only; not the no-file default.
     AllowAll,
     /// Rules parsed from an `.access` file.
-    Rules(AccessSecurityConfig),
+    Rules(Box<AccessSecurityConfig>),
 }
 
 /// Access security configuration for the gateway.
@@ -104,7 +104,7 @@ impl AccessConfig {
         let config = parse_acf(content)
             .map_err(|e| BridgeError::GroupConfigError(format!("ACF parse: {e}")))?;
         Ok(Self {
-            mode: Mode::Rules(config),
+            mode: Mode::Rules(Box::new(config)),
         })
     }
 
@@ -223,9 +223,7 @@ impl AccessConfig {
         match &self.mode {
             // The R1-R3 reports are assembled as text; a non-UTF-8 name is
             // replaced here rather than carried as bytes through them.
-            Mode::Rules(cfg) => {
-                Some(String::from_utf8_lossy(&cfg.dump_report(&|_| None)).into_owned())
-            }
+            Mode::Rules(cfg) => Some(String::from_utf8_lossy(&cfg.dump_report()).into_owned()),
             Mode::ReadOnly | Mode::AllowAll => None,
         }
     }

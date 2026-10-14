@@ -124,21 +124,16 @@ pub struct AccessGate {
     ///   tcp.rs's monitor loop compared against that stale value,
     ///   missing every inner reload.
     acl_version: AclVersionSource,
-    /// optional `INP*`-link value resolver. When present,
-    /// [`Self::check`] evaluates CALC-gated rules against live values;
-    /// when absent, CALC rules fail closed (deny). Installed by the
-    /// owning server via [`Self::with_inp_resolver`].
-    inp_resolver: Option<InpResolver>,
     /// C `asAddClient` computes a client's access once per channel and
     /// every operation is a bit test; the Rust op layer called
     /// [`Self::check_with_roles`] — resolver + full rule walk — on every
     /// EXEC. The walk result is deterministic in (policy snapshot,
-    /// pv name, credential identity) whenever no [`InpResolver`] is
-    /// installed (CALC rules then fail closed, reading no live values),
-    /// so those checks are cached here, shared across gate clones.
+    /// pv name, credential identity, published [`AsgState`]), so checks
+    /// are cached here, shared across gate clones.
     /// An entry is valid only while all three of its stamps hold: the
     /// `acl_version` generation, the ASG-field-change generation
-    /// ([`asg_change_generation`] — the resolver reads `record.ASG`),
+    /// ([`asg_change_generation`] — the resolver reads `record.ASG`, and the
+    /// `INP*` watcher bumps it after publishing a state),
     /// and the identity of the ACF config `Arc` it was computed against
     /// (so a cell swap that forgot to bump the version still misses).
     /// `Open` gates and unattached cells bypass the cache: their checks
@@ -188,23 +183,6 @@ pub type AsgAslResolver = std::sync::Arc<
         + Sync,
 >;
 
-/// resolves an ASG `INP*` link string (typically a
-/// `record.field` PV name) to its current value and severity, or `None` when
-/// the input is unresolvable / disconnected; [`AsgInputs::record`] decides
-/// what either means. Installed on an [`AccessGate`] by the owning server so
-/// `check` can evaluate `RULE(...) { CALC(...) }` against live values.
-/// Async because the value typically lives behind the server's async
-/// database lock; [`AccessGate::check_with_roles`] resolves the ASG's
-/// links up front, then evaluates the (sync) expression.
-pub type InpResolver = std::sync::Arc<
-    dyn Fn(
-            String,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<InpReading>> + Send>>
-        + Send
-        + Sync,
->;
-
 /// The shared Access Security policy cell — one per server, cloned into every
 /// [`AccessGate`] built from it.
 ///
@@ -229,17 +207,38 @@ pub type InpResolver = std::sync::Arc<
 /// on. A raw `ArcSwapOption` swap would update enforcement (checks load
 /// per-op) but leave those caches and the wire ACCESS_RIGHTS stale.
 #[derive(Clone)]
-pub struct AcfCell(std::sync::Arc<arc_swap::ArcSwapOption<AccessSecurityConfig>>);
+pub struct AcfCell(std::sync::Arc<AcfShared>);
+
+struct AcfShared {
+    policy: arc_swap::ArcSwapOption<AccessSecurityConfig>,
+    /// What the `INP*` watcher has attached, for [`AcfCell::wait_served`].
+    served: parking_lot::Mutex<Served>,
+    served_cv: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct Served {
+    /// A watcher is running for this cell.
+    watching: bool,
+    /// [`load_ident`] of the load whose inputs its last attach pass added.
+    load: usize,
+}
+
+/// Which load of the file `policy` is, 0 for none. A HAG refresh republishes
+/// the same load under a new policy `Arc`; only `asInit` makes a new one.
+fn load_ident(policy: Option<&std::sync::Arc<AccessSecurityConfig>>) -> usize {
+    policy.map_or(0, |c| std::sync::Arc::as_ptr(&c.load.0) as usize)
+}
 
 impl AcfCell {
     /// Snapshot the current policy (lock-free guard).
     pub fn load(&self) -> arc_swap::Guard<Option<std::sync::Arc<AccessSecurityConfig>>> {
-        self.0.load()
+        self.0.policy.load()
     }
 
     /// Snapshot the current policy as an owned `Option<Arc<..>>`.
     pub fn load_full(&self) -> Option<std::sync::Arc<AccessSecurityConfig>> {
-        self.0.load_full()
+        self.0.policy.load_full()
     }
 
     /// Publish a new policy (or `None` to clear it) and fire the
@@ -247,17 +246,45 @@ impl AcfCell {
     /// connections re-evaluate their rights and derived caches drop
     /// their entries.
     pub fn store(&self, value: Option<std::sync::Arc<AccessSecurityConfig>>) {
-        self.0.store(value);
+        self.0.policy.store(value);
         notify_asg_field_changed();
+    }
+
+    /// Block until the `INP*` watcher has added the current policy's inputs,
+    /// each one present taking its first reading — C `asCaStart` waiting on
+    /// `asCaTaskWait`. That wait puts an `asInit`'s initial events before
+    /// `iocInit`'s PINI posts, so when two inputs share a letter the record
+    /// processed last decides. Returns at once for a cell no watcher serves.
+    pub fn wait_served(&self) {
+        let mut served = self.0.served.lock();
+        while served.watching && served.load != load_ident(self.load().as_ref()) {
+            self.0.served_cv.wait(&mut served);
+        }
+    }
+
+    /// C `asInit` for a parsed file: publish it as a new load, then
+    /// [`Self::wait_served`]. Every path that loads a file comes through here
+    /// so none returns with the new inputs still unread. Blocks; an async
+    /// caller runs it under `spawn_blocking`.
+    pub fn install(&self, config: AccessSecurityConfig) {
+        self.store(Some(std::sync::Arc::new(config)));
+        self.wait_served();
+    }
+
+    fn mark_served(&self, watching: bool, load: usize) {
+        *self.0.served.lock() = Served { watching, load };
+        self.0.served_cv.notify_all();
     }
 }
 
 /// Build a shared [`AcfCell`] holding `initial`. The single construction
 /// point, so no caller has to name `arc_swap` or get the `Arc` nesting right.
 pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
-    AcfCell(std::sync::Arc::new(arc_swap::ArcSwapOption::new(
-        initial.map(std::sync::Arc::new),
-    )))
+    AcfCell(std::sync::Arc::new(AcfShared {
+        policy: arc_swap::ArcSwapOption::new(initial.map(std::sync::Arc::new)),
+        served: Default::default(),
+        served_cv: Default::default(),
+    }))
 }
 
 /// Build a shared [`AcfCell`] that serves `db`, with its ASG `INP*` watcher
@@ -342,7 +369,7 @@ fn spawn_hag_refresh(cell: &AcfCell) {
                 if !as_check_client_ip() {
                     continue;
                 }
-                let Some(config) = inner.load_full() else {
+                let Some(config) = inner.policy.load_full() else {
                     continue;
                 };
                 if let Some(refreshed) = config.with_refreshed_hags() {
@@ -376,8 +403,8 @@ const ASG_INP_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 /// after it opened.
 ///
 /// This is that monitor, in-process: one `VALUE | ALARM` subscription per
-/// distinct link target ([`AccessSecurityConfig::inp_link_targets`]), and
-/// [`notify_asg_field_changed`] on any post. That is the signal
+/// distinct link target, each post delivered into the [`AsgState`] of every
+/// input naming it, then [`notify_asg_field_changed`]. That is the signal
 /// [`AcfCell::store`] already raises, so the CA server's `reeval_access_rights`
 /// and the QSRV grant cache need no new plumbing. Like C's `asComputeAsg` this
 /// re-evaluates every client rather than only the ASGs reading the changed
@@ -390,6 +417,18 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
     let weak_cell = std::sync::Arc::downgrade(&cell.0);
     let weak_db = std::sync::Arc::downgrade(db);
     let mut acf_rx = subscribe_asg_changes();
+    cell.mark_served(true, 0);
+    // Clears `watching` however the task ends, so `wait_served` cannot hang
+    // on a watcher that is gone.
+    struct Unwatch(std::sync::Weak<AcfShared>);
+    impl Drop for Unwatch {
+        fn drop(&mut self) {
+            if let Some(inner) = self.0.upgrade() {
+                AcfCell(inner).mark_served(false, 0);
+            }
+        }
+    }
+    let unwatch = Unwatch(weak_cell.clone());
     // Middle band: the watcher spans every ASG INP link in the IOC, so no one
     // record's PRIO applies. It is the other entry behind the cbMedium
     // high-water of 2: C does this work on `asCaTask`, a CA client thread that
@@ -397,6 +436,7 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
     crate::runtime::task::spawn_background(
         crate::runtime::task::CallbackPriority::Medium,
         async move {
+            let _unwatch = unwatch;
             // C `asCaTask` registers with the watchdog as its first act
             // (`asCa.c:171`) and removes on the way out (`:232`) — but the
             // thread itself only exists between `asCaStart` and `asCaStop`,
@@ -409,29 +449,20 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
             // ASG INP readers, and access inputs that never change are not a
             // fault.
             let mut watched: Option<crate::runtime::taskwd::TaskwdEntry> = None;
-            enum Wake {
-                /// A watched link posted a new value.
-                Values,
-                /// Re-derive the watch set (policy may have been replaced, or a
-                /// link's record may have loaded since the last attempt).
-                Rebuild,
-                Stop,
-            }
-            let mut readers: Vec<crate::server::event_queue::EventReader> = Vec::new();
-            // Targets not yet attached, each with whether its full cap has
-            // been reported: C's exception arrives once per `ca_add_event`.
-            let mut pending: Vec<(String, String, bool)> = Vec::new();
-            // Identity of the policy `readers` was built from. A notification this
-            // task raises itself does not move it, so the watcher cannot re-enter
-            // its own rebuild.
-            let mut built_from: usize = 0;
+            let mut watch = InpWatch::default();
+            // The policy whose groups take the deliveries. `watch` is rebuilt
+            // only for a new load: a republish of the same one (a HAG refresh,
+            // or a notification this task raises itself) keeps the
+            // subscriptions and the state C's events built, as C has no
+            // refresher to replay them.
+            let mut built_from: Option<std::sync::Arc<AccessSecurityConfig>> = None;
 
             loop {
                 let (Some(inner), Some(db)) = (weak_cell.upgrade(), weak_db.upgrade()) else {
                     break;
                 };
-                let config = inner.load_full();
-                drop(inner);
+                let cell = AcfCell(inner);
+                let config = cell.load_full();
                 match (config.is_some(), watched.is_some()) {
                     (true, false) => {
                         watched = Some(crate::runtime::taskwd::taskwd_insert(
@@ -443,39 +474,17 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                     (false, true) => watched = None,
                     _ => {}
                 }
-                let id = config
-                    .as_ref()
-                    .map_or(0, |c| std::sync::Arc::as_ptr(c) as usize);
-                if id != built_from {
-                    built_from = id;
-                    readers.clear();
-                    pending = config
-                        .as_ref()
-                        .map(|c| c.inp_link_targets())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(record, field)| (record, field, false))
-                        .collect();
+                if load_ident(config.as_ref()) != load_ident(built_from.as_ref()) {
+                    watch = config.as_deref().map(InpWatch::of).unwrap_or_default();
                 }
-                let mut attached = false;
-                pending.retain_mut(|(record, field, reported)| {
-                    match attach_asg_inp(&db, record, field, &mut readers) {
-                        Ok(()) => {
-                            attached = true;
-                            false
-                        }
-                        Err(SubscribeRefused::CapReached) if !*reported => {
-                            *reported = true;
-                            report_asg_inp_refused(&db, config.as_deref(), record, field);
-                            true
-                        }
-                        Err(_) => true,
-                    }
-                });
+                built_from = config;
+                let attached = built_from
+                    .as_ref()
+                    .is_some_and(|cfg| watch.attach(&db, cfg));
                 drop(db);
-                // C's `asComputeAllAsg` after the adds (asCa.c:204-205): a value
-                // posted before this attach reached no reader, so the clients
-                // that evaluated against the older one re-read it now.
+                cell.mark_served(true, load_ident(built_from.as_ref()));
+                drop(cell);
+                // C's `asComputeAllAsg` after the adds (asCa.c:204-205).
                 if attached {
                     notify_asg_field_changed();
                 }
@@ -485,38 +494,213 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::Stop,
                         _ => Wake::Rebuild,
                     },
-                    () = drain_any_asg_inp(&mut readers) => Wake::Values,
+                    posted = drain_any_asg_inp(&watch.user) => Wake::Values(posted),
                     () = crate::runtime::task::sleep_background(ASG_INP_RETRY) => Wake::Rebuild,
                 };
                 match wake {
                     Wake::Stop => break,
                     Wake::Rebuild => {}
-                    Wake::Values => notify_asg_field_changed(),
+                    Wake::Values(posted) => {
+                        let (Some(cfg), Some(db)) = (&built_from, weak_db.upgrade()) else {
+                            continue;
+                        };
+                        watch.deliver(&db, cfg, posted);
+                        notify_asg_field_changed();
+                    }
                 }
             }
         },
     );
 }
 
+/// Why the watcher woke.
+enum Wake {
+    /// Watched links posted, in post order.
+    Values(Vec<crate::server::event_queue::CircuitEvent>),
+    /// Re-derive the watch set (policy may have been replaced, or a link's
+    /// record may have loaded since the last attempt).
+    Rebuild,
+    Stop,
+}
+
+/// One subscription the watcher holds — C's channel per `ASGINP`, shared by
+/// every input naming the same `(record, field)`.
+struct InpTarget {
+    record: String,
+    field: String,
+    /// `(ASG, INP index)` of each input reading this target.
+    inputs: Vec<(Vec<u8>, u8)>,
+    /// `None` until attached, and again once the record goes away.
+    reader: Option<crate::server::event_queue::EventReader>,
+    /// Whether a full subscriber cap has been reported: C's exception arrives
+    /// once per `ca_add_event`.
+    reported: bool,
+}
+
+/// Everything the watcher holds for one policy: C's CA context and its
+/// channels.
+#[derive(Default)]
+struct InpWatch {
+    /// One event queue for every subscription, read in post order as C's
+    /// `asCaTask` context receives its events: when two inputs share a letter
+    /// the last event decides, so the record processing order does.
+    user: crate::server::event_queue::EventUser,
+    /// Distinct link targets; a subscription's `sid` is its index here.
+    targets: Vec<InpTarget>,
+    /// `(ASG, INP index, target)` in `asCaTask`'s add order (`asCa.c:178-200`):
+    /// ASGs by name, as `asAsgAdd` keeps them, inputs as the file lists them.
+    order: Vec<(Vec<u8>, u8, usize)>,
+}
+
+impl InpWatch {
+    fn of(config: &AccessSecurityConfig) -> Self {
+        let mut watch = Self::default();
+        let mut names: Vec<_> = config.asg.keys().collect();
+        names.sort();
+        for name in names {
+            for inp in &config.asg[name].inp {
+                let Some(link) = inp.record_link() else {
+                    continue;
+                };
+                let (record, field) = inp_link_target(link);
+                let found = watch
+                    .targets
+                    .iter()
+                    .position(|t| t.record == record && t.field == field);
+                let ix = found.unwrap_or_else(|| {
+                    watch.targets.push(InpTarget {
+                        record: record.to_string(),
+                        field: field.to_string(),
+                        inputs: Vec::new(),
+                        reader: None,
+                        reported: false,
+                    });
+                    watch.targets.len() - 1
+                });
+                watch.targets[ix].inputs.push((name.clone(), inp.index));
+                watch.order.push((name.clone(), inp.index, ix));
+            }
+        }
+        watch
+    }
+
+    /// Add every unattached input in `asCaTask` order, each taking the
+    /// reading its `ca_add_event` delivers first. True when any attached.
+    fn attach(
+        &mut self,
+        db: &crate::server::database::PvDatabase,
+        config: &AccessSecurityConfig,
+    ) -> bool {
+        let mut fresh = vec![false; self.targets.len()];
+        for (asg, index, ix) in &self.order {
+            let target = &mut self.targets[*ix];
+            let reading = if target.reader.is_none() {
+                match attach_asg_inp(db, &self.user, *ix, &target.record, &target.field) {
+                    Ok((reader, initial)) => {
+                        target.reader = Some(reader);
+                        fresh[*ix] = true;
+                        initial
+                    }
+                    Err(SubscribeRefused::CapReached) if !target.reported => {
+                        target.reported = true;
+                        report_asg_inp_refused(db, Some(config), &target.record, &target.field);
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+            } else if fresh[*ix] {
+                // C's next channel to the same PV takes its own first event.
+                db.get_record(&target.record)
+                    .and_then(|rec| inp_reading(&rec.read(), &target.field))
+            } else {
+                continue;
+            };
+            if let (Some(reading), Some(group)) = (reading, config.asg.get(asg)) {
+                group.deliver([(*index, InpEvent::Reading(reading))]);
+            }
+        }
+        fresh.contains(&true)
+    }
+
+    /// Events off the queue, in order, each into every input its target
+    /// feeds.
+    fn deliver(
+        &mut self,
+        db: &crate::server::database::PvDatabase,
+        config: &AccessSecurityConfig,
+        posted: Vec<crate::server::event_queue::CircuitEvent>,
+    ) {
+        for post in posted {
+            self.deliver_one(db, config, post);
+        }
+    }
+
+    fn deliver_one(
+        &mut self,
+        db: &crate::server::database::PvDatabase,
+        config: &AccessSecurityConfig,
+        post: crate::server::event_queue::CircuitEvent,
+    ) {
+        use crate::server::event_queue::CircuitEvent;
+        let (ix, event) = match post {
+            CircuitEvent::Event { sid, event, .. } => {
+                let ix = sid as usize;
+                let Some(target) = self.targets.get(ix) else {
+                    return;
+                };
+                let value = event
+                    .value()
+                    .as_value()
+                    .and_then(|v| v.to_f64())
+                    .or_else(|| read_inp_value(db, &target.record, &target.field));
+                let Some(value) = value else { return };
+                let severity = crate::server::record::AlarmSeverity::from_u16(event.sevr());
+                (ix, InpEvent::Reading(InpReading { value, severity }))
+            }
+            CircuitEvent::Ended(id) => {
+                let Some(ix) = self
+                    .targets
+                    .iter()
+                    .position(|t| t.reader.as_ref().is_some_and(|r| r.id() == id))
+                else {
+                    return;
+                };
+                self.targets[ix].reader = None;
+                (ix, InpEvent::Disconnected)
+            }
+        };
+        for (asg, index) in &self.targets[ix].inputs {
+            if let Some(group) = config.asg.get(asg) {
+                group.deliver([(*index, event)]);
+            }
+        }
+    }
+}
+
 /// Subscribe one `INP*` target to its record's value and alarm events, the
-/// default mask of C's `ca_add_event(DBR_STS_DOUBLE, ...)` (`asCa.c:193`).
+/// default mask of C's `ca_add_event(DBR_STS_DOUBLE, ...)` (`asCa.c:193`),
+/// and take the reading that call delivers first. Both happen under one
+/// record lock, so no post falls between them.
 /// Refused = not attached, retry later; the record is not in the database yet,
 /// or its subscriber cap is full (which frees again as clients disconnect).
 fn attach_asg_inp(
     db: &crate::server::database::PvDatabase,
+    user: &crate::server::event_queue::EventUser,
+    sid: usize,
     record: &str,
     field: &str,
-    readers: &mut Vec<crate::server::event_queue::EventReader>,
-) -> Result<(), SubscribeRefused> {
+) -> Result<(crate::server::event_queue::EventReader, Option<InpReading>), SubscribeRefused> {
     let rec = db.get_record(record).ok_or(SubscribeRefused::NoRecord)?;
-    let reader = rec.write().add_subscriber(
+    let mut inst = rec.write();
+    let reader = inst.add_subscriber_on(
+        user,
         field,
-        0,
+        sid as u32,
         crate::types::DbFieldType::Double,
         (crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM).bits(),
+        crate::server::event_queue::no_context(),
     )?;
-    readers.push(reader);
-    Ok(())
+    Ok((reader, inp_reading(&inst, field)))
 }
 
 /// asCa.c:79's `exceptionCallback` line for an `ECA_ALLOCMEM` on
@@ -566,21 +750,20 @@ fn report_asg_inp_refused(
     ));
 }
 
-/// Resolve once any watched link has posted, having drained every queued post
-/// so one re-evaluation covers a burst. C coalesces the same way — many
-/// `asComputeAsg` calls, one `asClientCOAR` per actual level change.
-async fn drain_any_asg_inp(readers: &mut [crate::server::event_queue::EventReader]) {
+/// Resolve once any watched link has posted, with every queued post in post
+/// order, so one wake covers a burst.
+async fn drain_any_asg_inp(
+    user: &crate::server::event_queue::EventUser,
+) -> Vec<crate::server::event_queue::CircuitEvent> {
     std::future::poll_fn(|cx| {
-        let mut fired = false;
-        for reader in readers.iter_mut() {
-            while let std::task::Poll::Ready(Some(_)) = reader.poll_recv(cx) {
-                fired = true;
-            }
+        let mut posted = Vec::new();
+        while let std::task::Poll::Ready(event) = user.poll_next(cx) {
+            posted.push(event);
         }
-        if fired {
-            std::task::Poll::Ready(())
-        } else {
+        if posted.is_empty() {
             std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(posted)
         }
     })
     .await
@@ -629,18 +812,8 @@ impl AccessGate {
         Self {
             inner: AccessGateInner::Required { acf, resolver },
             acl_version: AclVersionSource::Atomic(acl_version),
-            inp_resolver: None,
             check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
-    }
-
-    /// attach an `INP*`-link value resolver so CALC-gated ACF
-    /// rules are evaluated against live values instead of failing
-    /// closed. The owning server installs one backed by its PV value
-    /// registry.
-    pub fn with_inp_resolver(mut self, resolver: InpResolver) -> Self {
-        self.inp_resolver = Some(resolver);
-        self
     }
 
     /// Build a gate that grants `ReadWrite` to everyone. Used for
@@ -652,7 +825,6 @@ impl AccessGate {
             acl_version: AclVersionSource::Atomic(std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(0),
             )),
-            inp_resolver: None,
             check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
@@ -677,7 +849,6 @@ impl AccessGate {
         Self {
             inner: AccessGateInner::Open,
             acl_version: AclVersionSource::Aggregator(f),
-            inp_resolver: None,
             check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
@@ -723,8 +894,7 @@ impl AccessGate {
 
     /// Like [`Self::check`] but with the client's
     /// `roles` (QSRV local-group-derived credentials) so a `role/<name>`
-    /// UAG member can match, and with CALC-gated rules evaluated against
-    /// the installed [`InpResolver`] (fail closed when none is set).
+    /// UAG member can match.
     pub async fn check_with_roles(
         &self,
         pv_name: impl Into<String>,
@@ -744,24 +914,21 @@ impl AccessGate {
                 match acf.load_full() {
                     None => (AccessLevel::ReadWrite, false),
                     Some(cfg) => {
-                        // See the [`Self::check_cache`] field doc: cache
-                        // only walk results that read no live values, and
-                        // snapshot every stamp BEFORE the compute so a
-                        // change racing it invalidates the entry instead
-                        // of being lost.
+                        // See the [`Self::check_cache`] field doc: snapshot
+                        // every stamp BEFORE the compute so a change racing
+                        // it invalidates the entry instead of being lost.
                         let acl_version = self.acl_version();
                         let asg_generation = asg_change_generation();
                         let cfg_ident = std::sync::Arc::as_ptr(&cfg) as usize;
-                        let key = self.inp_resolver.is_none().then(|| CheckKey {
+                        let key = CheckKey {
                             pv_name: pv_name.clone(),
                             host: host.to_string(),
                             user: user.as_ref().to_vec(),
                             method: method.to_string(),
                             authority: authority.to_string(),
                             roles: roles.to_vec(),
-                        });
-                        if let Some(ref key) = key
-                            && let Some(hit) = self.check_cache.read().get(key)
+                        };
+                        if let Some(hit) = self.check_cache.read().get(&key)
                             && hit.acl_version == acl_version
                             && hit.asg_generation == asg_generation
                             && hit.cfg_ident == cfg_ident
@@ -774,27 +941,6 @@ impl AccessGate {
                             };
                         }
                         let (asg, asl) = resolver(pv_name.clone()).await;
-                        // pre-resolve the ASG's INP* links up
-                        // front — the resolver is async (it reads the
-                        // server DB). `None` when there is no resolver →
-                        // every CALC fails closed. Each rule's expression
-                        // is then evaluated synchronously in `compute_rules`.
-                        let inp_values: Option<AsgInputs> = match self.inp_resolver {
-                            None => None,
-                            Some(ref res) => {
-                                let group = cfg.asg_or_default(asg.as_bytes());
-                                let mut inputs = AsgInputs::for_group(group);
-                                for inp in group.map_or(&[][..], |g| &g.inp) {
-                                    let Some(link) = inp.record_link() else {
-                                        continue;
-                                    };
-                                    if let Some(reading) = res(link.to_owned()).await {
-                                        inputs.record(inp.index, reading);
-                                    }
-                                }
-                                Some(inputs)
-                            }
-                        };
                         let (level, rule_was_trap) = cfg.compute_for_name(
                             &asg,
                             host,
@@ -803,24 +949,21 @@ impl AccessGate {
                             asl,
                             method,
                             authority,
-                            inp_values.as_ref(),
                         );
-                        if let Some(key) = key {
-                            let mut cache = self.check_cache.write();
-                            if cache.len() >= CHECK_CACHE_CAP {
-                                cache.clear();
-                            }
-                            cache.insert(
-                                key,
-                                CachedCheck {
-                                    acl_version,
-                                    asg_generation,
-                                    cfg_ident,
-                                    level,
-                                    rule_was_trap,
-                                },
-                            );
+                        let mut cache = self.check_cache.write();
+                        if cache.len() >= CHECK_CACHE_CAP {
+                            cache.clear();
                         }
+                        cache.insert(
+                            key,
+                            CachedCheck {
+                                acl_version,
+                                asg_generation,
+                                cfg_ident,
+                                level,
+                                rule_was_trap,
+                            },
+                        );
                         (level, rule_was_trap)
                     }
                 }
@@ -1041,20 +1184,6 @@ fn calc_result_is_true(result: f64) -> bool {
     result > 0.99 && result < 1.01
 }
 
-impl AccessRule {
-    /// C `pasgrule->result`. `asComputeAsgPvt` (`asLibRoutines.c:966-971`)
-    /// runs the CALC only when `inpChanged & inpUsed`, so a CALC that reads
-    /// no declared input, or only inputs that never delivered a value, keeps
-    /// the initial 0 and never grants.
-    fn calc_result(&self, inputs: &AsgInputs) -> bool {
-        inputs.changed & self.inp_used != 0
-            && self.calc_compiled.as_ref().is_some_and(|compiled| {
-                crate::calc::eval(compiled, &mut inputs.values.clone())
-                    .is_ok_and(calc_result_is_true)
-            })
-    }
-}
-
 /// Monotonic ordering of access levels used by `asComputePvt`'s
 /// `access >= pasgrule->access` short-circuit.
 fn rule_rank(level: AccessLevel) -> u8 {
@@ -1075,34 +1204,124 @@ pub struct AccessSecurityGroup {
     /// inspection and to feed `CALC` rule evaluation; the link
     /// values are not resolved by this crate (see `AccessRule::calc`).
     pub inp: Vec<AsgInp>,
+    /// What `asCa.c` has delivered for [`Self::inp`] and the rule results
+    /// computed from it. Shared by clones, so a HAG refresh keeps it and only
+    /// a reloaded file starts afresh, as C's `asInit` builds a new `ASG`.
+    state: std::sync::Arc<arc_swap::ArcSwap<AsgState>>,
 }
 
-/// The live state of an ASG's `INP(A..U)` links: the resolved values C keeps
-/// in `pasg->pavalue[]` and the `inpBad` bitmap it keeps alongside them.
-///
-/// C sets a bit per *input* (`asCa.c connectCallback:91-105`, on a channel
-/// that is not connected) and `asComputePvt` (`asLibRoutines.c:1048`) tests it
-/// against the *rule's* own `inpUsed`:
-///
-/// ```c
-/// if(!pasgrule->calc
-/// || (!(pasg->inpBad & pasgrule->inpUsed) && (pasgrule->result==1)))
-/// ```
-///
-/// so a bad input disables only the rules that read it. Both of this port's
-/// resolvers used to abort their link walk on the first unresolvable link and
-/// hand `None` to the evaluator, which failed EVERY CALC rule in the group —
-/// one typo in an `INPB` no rule mentions took writes away from the whole ASG.
-#[derive(Debug, Clone)]
-pub struct AsgInputs {
-    /// Resolved values, indexed A..U.
-    pub values: crate::calc::NumericInputs,
-    /// C `pasg->inpBad`: bit `i` set ⟹ `INP(i)` is declared and no good value
-    /// has been delivered for it.
-    pub bad: u32,
-    /// C `pasg->inpChanged`: bit `i` set ⟹ `INP(i)` is declared and delivered
-    /// a value (`asCa.c:160`, the only place C sets it).
-    pub changed: u32,
+/// C's per-ASG `asCa` state: `pavalue`, `inpBad`, `inpChanged` and every
+/// rule's `result`. The ASG `INP*` watcher is its only writer, through
+/// `AccessSecurityGroup::deliver`; access checks and the dumps read the
+/// published snapshot and never resolve a link themselves.
+#[derive(Debug, Clone, Default)]
+pub struct AsgState {
+    /// C `pasg->pavalue`.
+    values: crate::calc::NumericInputs,
+    /// The declared inputs whose last delivery was good — C's `inpBad`
+    /// inverted, so the state before any delivery has every declared input
+    /// bad, as `asCaTask` leaves it (`asCa.c:183`).
+    good: u32,
+    /// C `pasg->inpChanged`, consumed by [`Self::compute`].
+    changed: u32,
+    /// C `pasgrule->result`, by rule index; a rule never computed is FALSE.
+    results: Vec<bool>,
+}
+
+/// One `asCa.c` callback for an input.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InpEvent {
+    /// `eventCallback` with a `DBR_STS_DOUBLE`.
+    Reading(InpReading),
+    /// `connectCallback` on a disconnect: the record went away.
+    Disconnected,
+}
+
+impl AsgState {
+    /// `asCa.c eventCallback` (`:146-162`) and `connectCallback` (`:91-105`).
+    fn apply(&mut self, index: u8, event: InpEvent) {
+        let idx = index as usize;
+        if idx >= crate::calc::CALC_NARGS {
+            return;
+        }
+        let bit = 1u32 << idx;
+        match event {
+            InpEvent::Reading(r) if r.severity == crate::server::record::AlarmSeverity::Invalid => {
+                self.good &= !bit;
+                self.changed |= bit;
+            }
+            InpEvent::Reading(r) => {
+                self.good |= bit;
+                self.values.vars[idx] = r.value;
+                self.changed |= bit;
+            }
+            InpEvent::Disconnected => self.good &= !bit,
+        }
+    }
+
+    /// C `asComputeAsgPvt` (`asLibRoutines.c:953-978`): rerun each CALC that
+    /// reads a changed input, with `VAL` its previous result.
+    fn compute(&mut self, rules: &[AccessRule]) {
+        self.results.resize(rules.len(), false);
+        for (rule, result) in rules.iter().zip(self.results.iter_mut()) {
+            if rule.ignore || self.changed & rule.inp_used == 0 {
+                continue;
+            }
+            let Some(compiled) = &rule.calc_compiled else {
+                continue;
+            };
+            let mut args = self.values.clone();
+            args.prev_val = f64::from(u8::from(*result));
+            *result = crate::calc::eval(compiled, &mut args).is_ok_and(calc_result_is_true);
+        }
+        self.changed = 0;
+    }
+
+    /// C `pasg->inpBad` for a group declaring `declared`.
+    fn bad(&self, declared: u32) -> u32 {
+        declared & !self.good
+    }
+
+    /// C `pasg->pavalue[index]`: the last good value delivered, 0 before one.
+    pub fn value(&self, index: u8) -> f64 {
+        self.values.vars.get(index as usize).copied().unwrap_or(0.0)
+    }
+
+    /// C `pasgrule->result` of rule `index`.
+    pub fn result(&self, index: usize) -> bool {
+        self.results.get(index).copied().unwrap_or(false)
+    }
+}
+
+impl AccessSecurityGroup {
+    /// The inputs this group declares, as a bitmap over A..U.
+    fn declared(&self) -> u32 {
+        self.inp
+            .iter()
+            .filter(|inp| (inp.index as usize) < crate::calc::CALC_NARGS)
+            .fold(0, |bits, inp| bits | 1u32 << inp.index)
+    }
+
+    /// The published state.
+    pub fn state(&self) -> std::sync::Arc<AsgState> {
+        self.state.load_full()
+    }
+
+    /// C `pasg->inpBad`: the declared inputs with no good value delivered.
+    pub fn inp_bad(&self) -> u32 {
+        self.state.load().bad(self.declared())
+    }
+
+    /// Apply `events` in order, each followed by `asComputeAsg` as
+    /// `asCa.c:161` runs it, and publish the result once.
+    pub(crate) fn deliver(&self, events: impl IntoIterator<Item = (u8, InpEvent)>) {
+        let mut state = AsgState::clone(&self.state.load());
+        for (index, event) in events {
+            state.apply(index, event);
+            state.compute(&self.rules);
+        }
+        self.state.store(std::sync::Arc::new(state));
+    }
 }
 
 /// One `INP*` link's value with its alarm severity: the `DBR_STS_DOUBLE`
@@ -1111,46 +1330,6 @@ pub struct AsgInputs {
 pub struct InpReading {
     pub value: f64,
     pub severity: crate::server::record::AlarmSeverity,
-}
-
-impl AsgInputs {
-    /// `group`'s inputs before any delivery: `asCaTask` (`asCa.c:183`) sets
-    /// the bad bit of every declared index, and only an event clears it.
-    pub fn for_group(group: Option<&AccessSecurityGroup>) -> Self {
-        let bad = group.map_or(0, |g| {
-            g.inp
-                .iter()
-                .filter(|inp| (inp.index as usize) < crate::calc::CALC_NARGS)
-                .fold(0, |bad, inp| bad | 1u32 << inp.index)
-        });
-        Self {
-            values: Default::default(),
-            bad,
-            changed: 0,
-        }
-    }
-
-    /// One delivered reading, as `asCa.c eventCallback` (`:146-162`) takes
-    /// it. A link that never resolves delivers nothing, as a channel that
-    /// never connects never calls `eventCallback`, so its input stays as
-    /// [`Self::for_group`] left it. A delivery sets `changed`; an INVALID one
-    /// is also `bad` and its value is not stored.
-    ///
-    /// This is the single owner of "what an INP delivery means"; every
-    /// resolver drives it rather than deciding for itself.
-    pub fn record(&mut self, index: u8, reading: InpReading) {
-        let idx = index as usize;
-        if idx >= crate::calc::CALC_NARGS {
-            return;
-        }
-        if reading.severity == crate::server::record::AlarmSeverity::Invalid {
-            self.bad |= 1u32 << idx;
-        } else {
-            self.bad &= !(1u32 << idx);
-            self.values.vars[idx] = reading.value;
-        }
-        self.changed |= 1u32 << idx;
-    }
 }
 
 /// A single `INP(A..U)` link declaration within an ASG.
@@ -1182,17 +1361,22 @@ pub fn inp_link_target(link: &str) -> (&str, &str) {
     (record, if field.is_empty() { "VAL" } else { field })
 }
 
-/// Read an `INP*` link from this IOC's database: the field as a double and
-/// the record's `SEVR`, which is what a `DBR_STS_DOUBLE` monitor delivers.
-pub fn read_inp_link(db: &crate::server::database::PvDatabase, link: &str) -> Option<InpReading> {
-    let (base, field) = inp_link_target(link);
-    let rec = db.get_record(base)?;
-    let inst = rec.read();
+/// `inst`'s `field` as a `DBR_STS_DOUBLE`.
+fn inp_reading(inst: &crate::server::record::RecordInstance, field: &str) -> Option<InpReading> {
     let value = inst.resolve_field(field).and_then(|v| v.to_f64())?;
     Some(InpReading {
         value,
         severity: inst.common.sevr,
     })
+}
+
+/// `record.field` as a double, for a post whose log holds no value.
+fn read_inp_value(
+    db: &crate::server::database::PvDatabase,
+    record: &str,
+    field: &str,
+) -> Option<f64> {
+    db.get_record(record)?.read().resolve_field(field)?.to_f64()
 }
 
 /// Access Security Configuration parsed from an ACF file.
@@ -1210,7 +1394,14 @@ pub struct AccessSecurityConfig {
     pub hag_raw: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     pub asg: HashMap<Vec<u8>, AccessSecurityGroup>,
     pub unknown_access: AccessLevel,
+    /// This load of the file, kept by clones as each group's state is.
+    load: LoadId,
 }
+
+/// The identity of one parse of an ACF: what C's `asInit` builds afresh with
+/// its `ASG`s and `asCa` channels. Fresh per [`Default`], shared by clones.
+#[derive(Debug, Clone, Default)]
+struct LoadId(std::sync::Arc<()>);
 
 impl AccessSecurityConfig {
     /// Re-run `hag_members` — the single resolution owner — over the
@@ -1240,35 +1431,25 @@ impl AccessSecurityConfig {
 
     /// C `asDumpFP(fp, memcallback, NULL, verbose=TRUE)`, the `asdbdump` and
     /// CA gateway R3 dump, without its MEMBERLIST: this crate keeps no
-    /// `asgMemberList`. `resolve` reads an `INP*` link's live value, `None`
-    /// being C's unconnected channel. Names come out sorted because C's
+    /// `asgMemberList`. Inputs and CALC results are each group's published
+    /// [`AsgState`], as C prints `pasg`'s. Names come out sorted because C's
     /// `asUagAdd`/`asHagAdd`/`asAsgAdd` keep each list sorted.
-    pub fn dump_report(&self, resolve: &dyn Fn(&str) -> Option<InpReading>) -> Vec<u8> {
+    pub fn dump_report(&self) -> Vec<u8> {
         let mut out = Vec::new();
         dump_groups(&mut out, b"UAG", &self.uag);
         dump_groups(&mut out, b"HAG", &self.hag);
-        self.dump_asgs(None, AsgDump::Verbose, resolve, &mut out);
+        self.dump_asgs(None, AsgDump::Verbose, &mut out);
         out
     }
 
     /// C `asDumpRulesFP`, the `asprules` dump: every ASG, or only `asgname`.
-    pub fn dump_rules(
-        &self,
-        asgname: Option<&[u8]>,
-        resolve: &dyn Fn(&str) -> Option<InpReading>,
-    ) -> Vec<u8> {
+    pub fn dump_rules(&self, asgname: Option<&[u8]>) -> Vec<u8> {
         let mut out = Vec::new();
-        self.dump_asgs(asgname, AsgDump::Rules, resolve, &mut out);
+        self.dump_asgs(asgname, AsgDump::Rules, &mut out);
         out
     }
 
-    fn dump_asgs(
-        &self,
-        only: Option<&[u8]>,
-        style: AsgDump,
-        resolve: &dyn Fn(&str) -> Option<InpReading>,
-        out: &mut Vec<u8>,
-    ) {
+    fn dump_asgs(&self, only: Option<&[u8]>, style: AsgDump, out: &mut Vec<u8>) {
         if self.asg.is_empty() {
             out.extend_from_slice(b"No ASGs\n");
         }
@@ -1279,19 +1460,20 @@ impl AccessSecurityConfig {
             push_all(out, &[b"ASG(", name, b")"]);
             let braced = !asg.inp.is_empty() || !asg.rules.is_empty();
             out.extend_from_slice(if braced { b" {\n" } else { b"\n" });
-            let inputs = self.resolve_asg_inputs(name, resolve);
+            let state = asg.state();
+            let inp_bad = state.bad(asg.declared());
             for inp in &asg.inp {
                 push_all(out, &[b"\tINP", &[b'A' + inp.index], b"(", &inp.link, b")"]);
-                let bad = inputs.bad & (1u32 << inp.index) != 0;
+                let bad = inp_bad & (1u32 << inp.index) != 0;
                 out.extend_from_slice(match (bad, style) {
                     (true, _) => b" INVALID".as_slice(),
                     (false, AsgDump::Verbose) => b"   VALID",
                     (false, AsgDump::Rules) => b"",
                 });
-                let value = inputs.values.vars[inp.index as usize];
+                let value = state.value(inp.index);
                 out.extend_from_slice(format!(" value={}\n", c_percent_f(value)).as_bytes());
             }
-            for rule in asg.rules.iter().filter(|r| !r.ignore) {
+            for (index, rule) in asg.rules.iter().enumerate().filter(|(_, r)| !r.ignore) {
                 let access = match rule.access {
                     RuleAccess::None => "NONE",
                     RuleAccess::Read => "READ",
@@ -1322,7 +1504,7 @@ impl AccessSecurityConfig {
                     push_all(out, &[b"\t\tAUTHORITY(\"", a, b"\")\n"]);
                 }
                 if let Some(calc) = &rule.calc {
-                    let result: &[u8] = if rule.calc_result(&inputs) {
+                    let result: &[u8] = if state.result(index) {
                         b"TRUE"
                     } else {
                         b"FALSE"
@@ -1391,9 +1573,7 @@ impl AccessSecurityConfig {
     /// matching rule carried `NOTRAPWRITE`, and when it carried no
     /// trap option at all.
     /// Resolve `asg_name` (falling back to `DEFAULT`) and evaluate its
-    /// rules with the given `roles` and the ASG's resolved `INP*` values.
-    /// The single entry every CALC-aware caller uses — the CA server and
-    /// [`AccessGate::check_with_roles`] alike.
+    /// rules with the given `roles`.
     #[allow(clippy::too_many_arguments)]
     pub fn compute_for_name(
         &self,
@@ -1404,7 +1584,6 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        inputs: Option<&AsgInputs>,
     ) -> (AccessLevel, bool) {
         let Some(asg) = self.asg_or_default(asg_name.as_ref()) else {
             return (AccessLevel::NoAccess, false);
@@ -1417,7 +1596,6 @@ impl AccessSecurityConfig {
             record_asl,
             method,
             authority,
-            inputs,
         )
     }
 
@@ -1460,8 +1638,6 @@ impl AccessSecurityConfig {
         // matching rule's `trapMask` only on the lines that also raise
         // `access` (`asLibRoutines.c:986`, `:1042`). A `NoAccess`
         // outcome therefore always carries `trap = false`.
-        // No INP* resolution on this sync path, so a CALC-gated rule has no
-        // values to evaluate against and fails CLOSED — see `compute_rules`.
         self.compute_rules(
             asg,
             host.as_ref(),
@@ -1470,24 +1646,15 @@ impl AccessSecurityConfig {
             record_asl,
             method,
             authority,
-            None,
         )
     }
 
     /// The single rule-matching loop — C `asComputePvt`
     /// (`asLibRoutines.c:992-1062`) — parameterised by the client's `roles`
-    /// (for `role/<name>` UAG members, QSRV `documentation/ioc.rst:181-188`)
-    /// and by the ASG's resolved `INP*` values.
-    ///
-    /// CALC evaluation lives HERE and nowhere else. C has one owner too:
-    /// `asComputeAsgPvt` (`asLibRoutines.c:953-990`) computes
-    /// `pasgrule->result` and `asComputePvt` (`:1048`) consumes it. The port
-    /// used to take a `calc_ok` closure instead, which every caller wrote for
-    /// itself — and both callers wrote the same wrong truth test.
-    ///
-    /// `inputs` is `None` on the sync path
-    /// ([`Self::check_access_method_trap`]), which resolves no links; a
-    /// CALC-gated rule then fails CLOSED.
+    /// (for `role/<name>` UAG members, QSRV `documentation/ioc.rst:181-188`).
+    /// A CALC-gated rule reads the result the `INP*` watcher published
+    /// ([`AsgState`]); C's `asComputePvt` (`:1048`) likewise only consumes the
+    /// `pasgrule->result` that `asComputeAsgPvt` stored.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compute_rules(
         &self,
@@ -1498,11 +1665,12 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        inputs: Option<&AsgInputs>,
     ) -> (AccessLevel, bool) {
         let mut access = AccessLevel::NoAccess;
         let mut trap = false;
-        for rule in &asg.rules {
+        let state = asg.state.load();
+        let bad = state.bad(asg.declared());
+        for (index, rule) in asg.rules.iter().enumerate() {
             // C `asComputePvt`: a rule disabled by `asAsgRuleDisable`
             // (unsupported keyword) is skipped. A CALC clause no longer
             // forces `ignore`; it is gated by `calc_ok` below.
@@ -1580,24 +1748,12 @@ impl AccessSecurityConfig {
             if !authority_match {
                 continue;
             }
-            // A CALC-gated rule grants only while its expression evaluates
-            // true against the resolved INP* link values. The program was
-            // compiled once at ACF parse; a rule holding `calc` text with no
-            // compiled form (hand-built, bypassing `parse_acf`) fails closed
-            // here, as does one with no resolved inputs at all.
-            if rule.calc.is_some() {
-                let Some(inputs) = inputs else {
-                    continue;
-                };
-                // C `asLibRoutines.c:1048`: `!(pasg->inpBad & pasgrule->inpUsed)`.
-                // A bad input the rule READS disables it; a bad input elsewhere
-                // in the group is none of this rule's business.
-                if inputs.bad & rule.inp_used != 0 {
-                    continue;
-                }
-                if !rule.calc_result(inputs) {
-                    continue;
-                }
+            // C `asLibRoutines.c:1048`:
+            // `!(pasg->inpBad & pasgrule->inpUsed) && (pasgrule->result==1)`.
+            // A bad input the rule READS disables it; a bad input elsewhere
+            // in the group is none of this rule's business.
+            if rule.calc.is_some() && (bad & rule.inp_used != 0 || !state.result(index)) {
+                continue;
             }
             // C `asLibRoutines.c:1041-1042`: a matching rule sets
             // both `access` and `trapMask` together. The trap mask of
@@ -1609,50 +1765,12 @@ impl AccessSecurityConfig {
         (access, trap)
     }
 
-    /// Walk `asg_name`'s declared `INP(A..U)` links (falling back to
-    /// `DEFAULT`, as every other lookup here does) and resolve each with
-    /// `resolve`, returning C's per-ASG input state. This is `asCa.c`'s job
-    /// done on demand: the port has no standing CA monitor per link, so the
-    /// values are read when the rules are evaluated.
-    ///
-    /// An unknown ASG with no `DEFAULT` yields empty inputs — no links, so no
-    /// bad or changed bits, and a CALC rule is never evaluated, as C never
-    /// evaluates one for an ASG that declares no input.
-    pub fn resolve_asg_inputs(
-        &self,
-        asg_name: impl AsRef<[u8]>,
-        resolve: &dyn Fn(&str) -> Option<InpReading>,
-    ) -> AsgInputs {
-        let group = self.asg_or_default(asg_name.as_ref());
-        let mut inputs = AsgInputs::for_group(group);
-        for inp in group.map_or(&[][..], |g| &g.inp) {
-            if let Some(reading) = inp.record_link().and_then(resolve) {
-                inputs.record(inp.index, reading);
-            }
-        }
-        inputs
-    }
-
     /// `asg_name`'s group, or `DEFAULT` for a name the file does not declare
     /// (C `asAddMemberPvt`).
     fn asg_or_default(&self, asg_name: &[u8]) -> Option<&AccessSecurityGroup> {
         self.asg
             .get(asg_name)
             .or_else(|| self.asg.get(b"DEFAULT".as_slice()))
-    }
-
-    /// Every distinct `(record, field)` an `INP*` link in this policy names,
-    /// across all ASGs — the set a re-evaluation trigger must watch. C builds
-    /// the same set one CA channel at a time in `asCaStart`.
-    pub fn inp_link_targets(&self) -> Vec<(String, String)> {
-        let mut targets = std::collections::BTreeSet::new();
-        for group in self.asg.values() {
-            for link in group.inp.iter().filter_map(AsgInp::record_link) {
-                let (record, field) = inp_link_target(link);
-                targets.insert((record.to_string(), field.to_string()));
-            }
-        }
-        targets.into_iter().collect()
     }
 
     /// Check access taking the per-record ASL into account.
@@ -2406,6 +2524,7 @@ pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
         hag_raw: HashMap::new(),
         asg: HashMap::new(),
         unknown_access: AccessLevel::Read,
+        load: LoadId::default(),
     };
 
     // C `asInitialize` (asLibRoutines.c:107) calls `asAsgAdd(DEFAULT)`
@@ -3184,6 +3303,22 @@ mod tests {
     use super::*;
 
     /// A delivered reading with no alarm.
+    /// What the `INP*` watcher delivers for `links`: each declared input whose
+    /// link names one of them takes its reading, then the change signal fires.
+    fn serve(cfg: &AccessSecurityConfig, links: &[(&str, Option<InpReading>)]) {
+        let watch = InpWatch::of(cfg);
+        for (asg, index, ix) in &watch.order {
+            let target = &watch.targets[*ix];
+            for (link, reading) in links {
+                if inp_link_target(link) == (target.record.as_str(), target.field.as_str()) {
+                    let event = reading.map_or(InpEvent::Disconnected, InpEvent::Reading);
+                    cfg.asg[asg].deliver([(*index, event)]);
+                }
+            }
+        }
+        notify_asg_field_changed();
+    }
+
     fn ok(value: f64) -> InpReading {
         InpReading {
             value,
@@ -3793,9 +3928,8 @@ ASG(G) {
     fn a_non_utf8_inp_link_is_bad_and_a_non_utf8_calc_is_refused() {
         let config = parse_acf(b"ASG(G) {\n    INPA(\"r\xff\")\n    RULE(1, WRITE)\n}\n").unwrap();
         assert_eq!(config.asg[b"G".as_slice()].inp[0].link, b"r\xff");
-        let inputs = config.resolve_asg_inputs("G", &|_| panic!("no record to read"));
-        assert_eq!(inputs.bad, 1);
-        assert!(config.inp_link_targets().is_empty());
+        assert_eq!(config.asg[b"G".as_slice()].inp_bad(), 1);
+        assert!(InpWatch::of(&config).targets.is_empty());
         assert!(parse_acf(b"ASG(G) {\n    RULE(1, WRITE) { CALC(\"A\xff\") }\n}\n").is_err());
     }
 
@@ -3872,7 +4006,7 @@ ASG(DEFAULT) { RULE(1, READ) }
 ",
         )
         .unwrap();
-        let resolve = |link: &str| (link == "okrec").then_some(ok(1.0));
+        serve(&cfg, &[("okrec", Some(ok(1.0)))]);
         let zz_rules = "\tRULE(1,WRITE,TRAPWRITE) {
 \t\tUAG(zops,aempty)
 \t\tHAG(lab)
@@ -3885,7 +4019,7 @@ ASG(DEFAULT) { RULE(1, READ) }
 ";
         let head = "ASG(BARE)\nASG(DEFAULT) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\nASG(ZZ) {\n";
         assert_eq!(
-            String::from_utf8(cfg.dump_report(&resolve)).unwrap(),
+            String::from_utf8(cfg.dump_report()).unwrap(),
             format!(
                 "UAG(aempty)\nUAG(zops) {{bob,role/op}}\nHAG(lab) {{pc1,pc2}}\n{head}\
                  \tINPA(okrec)   VALID value=1.000000\n\
@@ -3893,15 +4027,17 @@ ASG(DEFAULT) { RULE(1, READ) }
             )
         );
         assert_eq!(
-            String::from_utf8(cfg.dump_rules(None, &resolve)).unwrap(),
+            String::from_utf8(cfg.dump_rules(None)).unwrap(),
             format!(
                 "{head}\tINPA(okrec) value=1.000000\n\
                  \tINPB(missing) INVALID value=0.000000\n{zz_rules}"
             )
         );
-        assert_eq!(cfg.dump_rules(Some(b"NONE"), &resolve), b"");
-        // CALC result is the rule's own band test on the live inputs.
-        let off = String::from_utf8(cfg.dump_rules(Some(b"ZZ"), &|_| None)).unwrap();
+        assert_eq!(cfg.dump_rules(Some(b"NONE")), b"");
+        // The CALC result is the published one: FALSE until A delivers.
+        let fresh =
+            parse_acf(b"ASG(ZZ) { INPA(okrec) RULE(1, WRITE) { CALC(\"A=1\") } }\n").unwrap();
+        let off = String::from_utf8(fresh.dump_rules(Some(b"ZZ"))).unwrap();
         assert!(off.contains("CALC(\"A=1\") result=FALSE"), "{off}");
     }
 
@@ -3910,7 +4046,7 @@ ASG(DEFAULT) { RULE(1, READ) }
     fn dump_report_names_an_empty_list_as_c_does() {
         let cfg = parse_acf(b"HAG(h) { a }\n").unwrap();
         assert_eq!(
-            String::from_utf8(cfg.dump_report(&|_| None)).unwrap(),
+            String::from_utf8(cfg.dump_report()).unwrap(),
             "No UAGs\nHAG(h) {a}\nASG(DEFAULT)\n"
         );
     }
@@ -4245,6 +4381,7 @@ ASG(MIXED_CASE) {
             hag_raw: HashMap::new(),
             asg: HashMap::new(),
             unknown_access: AccessLevel::Read,
+            load: LoadId::default(),
         };
         assert_eq!(
             config.check_access("WHATEVER", "host", "user"),
@@ -4303,7 +4440,7 @@ ASG(MIXED_CASE) {
         ] {
             let config =
                 parse_acf(format!("{acf}\n").as_bytes()).unwrap_or_else(|e| panic!("{acf}: {e}"));
-            let dump = config.dump_rules(None, &|_| None);
+            let dump = config.dump_rules(None);
             assert_eq!(String::from_utf8(dump).unwrap(), asprules, "{acf}");
         }
         // The READ rule now needs UAG(u): a stranger is denied.
@@ -4864,11 +5001,16 @@ ASG(LOCKED)
             "#,
         )
         .expect("parse");
+        let targets: Vec<_> = InpWatch::of(&cfg)
+            .targets
+            .into_iter()
+            .map(|t| (t.record, t.field))
+            .collect();
         assert_eq!(
-            cfg.inp_link_targets(),
+            targets,
             vec![
-                ("gate".to_string(), "RVAL".to_string()),
                 ("gate".to_string(), "VAL".to_string()),
+                ("gate".to_string(), "RVAL".to_string()),
                 ("other".to_string(), "SEVR".to_string()),
             ],
             "`gate` is read by both groups but is one subscription"
@@ -4885,18 +5027,15 @@ ASG(LOCKED)
             br#"ASG(g) { INPA(okrec) RULE(1,WRITE){CALC("1")} RULE(1,READ){CALC("A")} }"#,
         )
         .unwrap();
-        let resolve = |link: &str| (link == "okrec").then_some(ok(1.0));
-        let dump = String::from_utf8(cfg.dump_rules(Some(b"g"), &resolve)).unwrap();
+        serve(&cfg, &[("okrec", Some(ok(1.0)))]);
+        let dump = String::from_utf8(cfg.dump_rules(Some(b"g"))).unwrap();
         assert!(dump.contains("CALC(\"1\") result=FALSE"), "{dump}");
         assert!(dump.contains("CALC(\"A\") result=TRUE"), "{dump}");
 
         let cell = crate::server::access_security::new_acf_cell(Some(cfg));
         let asg_resolver: AsgAslResolver =
             Arc::new(|_name| Box::pin(async { ("g".to_string(), 0u8) }));
-        let gate =
-            AccessGate::required(cell, asg_resolver).with_inp_resolver(Arc::new(|link: String| {
-                Box::pin(async move { (link == "okrec").then_some(ok(1.0)) })
-            }));
+        let gate = AccessGate::required(cell, asg_resolver);
         let access = gate.check("r", "h", "u", "ca", "").await;
         assert!(access.allows_read() && !access.allows_write(), "{access:?}");
     }
@@ -4914,23 +5053,22 @@ ASG(LOCKED)
             r#"ASG(DEFAULT) { INPA(nope:pv) RULE(1,READ) { CALC("A<1") } }"#,
         ] {
             let cfg = parse_acf(acf).unwrap();
-            let resolve = |link: &str| (link == "rv:ai").then_some(ok(5.0));
-            let dump = String::from_utf8(cfg.dump_rules(None, &resolve)).unwrap();
+            serve(&cfg, &[("rv:ai", Some(ok(5.0)))]);
+            let dump = String::from_utf8(cfg.dump_rules(None)).unwrap();
             assert!(dump.contains("result=FALSE"), "{acf}: {dump}");
 
             let cell = crate::server::access_security::new_acf_cell(Some(cfg));
             let asg_resolver: AsgAslResolver =
                 Arc::new(|_name| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
-            let gate = AccessGate::required(cell, asg_resolver).with_inp_resolver(Arc::new(
-                |link: String| Box::pin(async move { (link == "rv:ai").then_some(ok(5.0)) }),
-            ));
+            let gate = AccessGate::required(cell, asg_resolver);
             let access = gate.check("q", "h", "u", "ca", "").await;
             assert!(!access.allows_read(), "{acf}: {access:?}");
         }
     }
 
-    /// Records `(name, VAL, SEVR)` in a database the `INP*` links read through
-    /// [`read_inp_link`]; returns `asprules` and whether `DEFAULT` grants read.
+    /// Records `(name, VAL, SEVR)` in a database the `INP*` links read; the
+    /// watcher's attach pass delivers each existing one. Returns `asprules`
+    /// and whether `DEFAULT` grants read.
     async fn inp_case(
         acf: &str,
         records: &[(&str, f64, crate::server::record::AlarmSeverity)],
@@ -4948,16 +5086,12 @@ ASG(LOCKED)
             db.get_record(name).unwrap().write().common.sevr = sevr;
         }
         let cfg = parse_acf(acf).unwrap();
-        let dump = String::from_utf8(cfg.dump_rules(None, &|l| read_inp_link(&db, l))).unwrap();
+        InpWatch::of(&cfg).attach(&db, &cfg);
+        let dump = String::from_utf8(cfg.dump_rules(None)).unwrap();
         let cell = crate::server::access_security::new_acf_cell(Some(cfg));
         let asg_resolver: AsgAslResolver =
             Arc::new(|_name| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
-        let gate = AccessGate::required(cell, asg_resolver).with_inp_resolver(Arc::new(
-            move |link: String| {
-                let db = db.clone();
-                Box::pin(async move { read_inp_link(&db, &link) })
-            },
-        ));
+        let gate = AccessGate::required(cell, asg_resolver);
         let read = gate.check("r", "h", "u", "ca", "").await.allows_read();
         (dump, read)
     }
@@ -5021,6 +5155,38 @@ ASG(LOCKED)
         assert!(read);
     }
 
+    /// With nothing processed, each channel's first event arrives in
+    /// `asCaTask`'s add order (`asCa.c:178-200`), so of two inputs on one
+    /// letter the one listed last holds the value. softIoc R7.0.10, `a1` at 1
+    /// and `a2` at 2 with no PINI: `value=2.000000` on both lines, and
+    /// `value=1.000000` with the listing reversed.
+    #[epics_macros_rs::epics_test]
+    async fn two_first_readings_on_one_letter_follow_the_listing() {
+        use crate::server::record::AlarmSeverity;
+        let records = [
+            ("a1", 1.0, AlarmSeverity::NoAlarm),
+            ("a2", 2.0, AlarmSeverity::NoAlarm),
+        ];
+        for (acf, want) in [
+            (
+                r#"ASG(DEFAULT) { INPA(a1) INPA(a2) RULE(1,READ) { CALC("A>1") } }"#,
+                "2",
+            ),
+            (
+                r#"ASG(DEFAULT) { INPA(a2) INPA(a1) RULE(1,READ) { CALC("A>1") } }"#,
+                "1",
+            ),
+        ] {
+            let (dump, _) = inp_case(acf, &records).await;
+            for line in ["\tINPA(a1)", "\tINPA(a2)"] {
+                assert!(
+                    dump.contains(&format!("{line} value={want}.000000\n")),
+                    "{dump}"
+                );
+            }
+        }
+    }
+
     /// Only INVALID makes a delivery bad (`asCa.c:149`): an input in MINOR or
     /// MAJOR alarm is stored and grants. softIoc R7.0.10 with the ai at 5 in a
     /// HIGH alarm of either severity: read, `INPA(..) value=5.000000`.
@@ -5060,48 +5226,28 @@ ASG(LOCKED)
         assert!(!read);
     }
 
-    /// with an `INP*` resolver installed, a CALC-gated rule
-    /// grants when the expression is true, denies when false, denies on
-    /// a bad input, and denies when no resolver is installed.
+    /// A CALC-gated rule grants while the published result is true, denies
+    /// when it is false, when its input disconnects, and before any delivery.
     #[epics_macros_rs::epics_test]
-    async fn calc_gated_rule_evaluates_against_inp_resolver() {
+    async fn calc_gated_rule_follows_the_published_state() {
         use std::sync::Arc;
-        let cfg =
-            parse_acf(r#"ASG(OPS) { INPA("permit.VAL") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
+        let acf = r#"ASG(OPS) { INPA("permit.VAL") RULE(1, WRITE) { CALC("A=1") } }"#;
+        let cfg = parse_acf(acf).unwrap();
         let cell = crate::server::access_security::new_acf_cell(Some(cfg));
         let asg_resolver: AsgAslResolver =
             Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
+        let gate = AccessGate::required(cell.clone(), asg_resolver);
+        let writes = || async { gate.check("x", "h", "u", "ca", "").await.allows_write() };
+        let cfg = cell.load_full().unwrap();
 
-        let grant =
-            AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(Arc::new(
-                |link: String| Box::pin(async move { (link == "permit.VAL").then_some(ok(1.0)) }),
-            ));
-        assert!(
-            grant.check("x", "h", "u", "ca", "").await.allows_write(),
-            "CALC A=1 with permit=1 grants WRITE"
-        );
-
-        let deny =
-            AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(Arc::new(
-                |link: String| Box::pin(async move { (link == "permit.VAL").then_some(ok(0.0)) }),
-            ));
-        assert!(
-            !deny.check("x", "h", "u", "ca", "").await.allows_write(),
-            "CALC A=1 with permit=0 denies WRITE"
-        );
-
-        let bad = AccessGate::required(cell.clone(), asg_resolver.clone())
-            .with_inp_resolver(Arc::new(|_link: String| Box::pin(async move { None })));
-        assert!(
-            !bad.check("x", "h", "u", "ca", "").await.allows_write(),
-            "a bad/disconnected INP denies the CALC-gated rule"
-        );
-
-        let none = AccessGate::required(cell, asg_resolver);
-        assert!(
-            !none.check("x", "h", "u", "ca", "").await.allows_write(),
-            "no INP resolver installed → CALC rule fails closed"
-        );
+        assert!(!writes().await, "no delivery yet: INPA is bad");
+        serve(&cfg, &[("permit", Some(ok(1.0)))]);
+        assert!(writes().await, "CALC A=1 with permit=1 grants WRITE");
+        serve(&cfg, &[("permit", Some(ok(0.0)))]);
+        assert!(!writes().await, "CALC A=1 with permit=0 denies WRITE");
+        serve(&cfg, &[("permit", Some(ok(1.0)))]);
+        serve(&cfg, &[("permit", None)]);
+        assert!(!writes().await, "a disconnected INP denies the rule");
     }
 
     /// a `role/<name>` UAG member matches a client that holds
@@ -5111,22 +5257,14 @@ ASG(LOCKED)
         let cfg =
             parse_acf(r#"UAG(special) { "role/op" } ASG(G) { RULE(1, WRITE) { UAG(special) } }"#)
                 .unwrap();
-        let (lvl, _) = cfg.compute_for_name(
-            "G",
-            "h",
-            "acct",
-            &["op".to_string().into()],
-            0,
-            "ca",
-            "",
-            None,
-        );
+        let (lvl, _) =
+            cfg.compute_for_name("G", "h", "acct", &["op".to_string().into()], 0, "ca", "");
         assert_eq!(
             lvl,
             AccessLevel::ReadWrite,
             "role/op member matches a client holding role 'op'"
         );
-        let (lvl_none, _) = cfg.compute_for_name("G", "h", "acct", &[], 0, "ca", "", None);
+        let (lvl_none, _) = cfg.compute_for_name("G", "h", "acct", &[], 0, "ca", "");
         assert_eq!(
             lvl_none,
             AccessLevel::NoAccess,
@@ -5321,6 +5459,334 @@ ASG(G) {
 #[cfg(test)]
 mod as_ca_task_tests {
     use super::*;
+    use crate::server::database::PvDatabase;
+    use crate::server::records::ai::AiRecord;
+    use crate::types::EpicsValue;
+    use std::sync::Arc;
+
+    /// Poll `DEFAULT`'s published state until `done` holds.
+    async fn wait_state(cell: &AcfCell, done: impl Fn(&AsgState) -> bool) -> Arc<AsgState> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = cell.load_full().unwrap().asg[b"DEFAULT".as_slice()].state();
+            if done(&state) {
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "state never settled: {state:?}"
+            );
+            crate::runtime::task::sleep_background(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A database holding `rv` at `value`, processed so it is not UDF.
+    async fn rv_db(value: f64) -> Arc<PvDatabase> {
+        let db = Arc::new(PvDatabase::new());
+        add_rv(&db, value).await;
+        db
+    }
+
+    async fn add_rv(db: &PvDatabase, value: f64) {
+        db.add_record("rv", Box::new(AiRecord::new(value)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(value))
+            .await
+            .unwrap();
+    }
+
+    /// `asCa.c:149-151`: an INVALID post marks the input bad and keeps the
+    /// value and the result the last good one gave. softIoc R7.0.10, `rv` at 5
+    /// then driven INVALID: `INPA(rv) INVALID value=5.000000`,
+    /// `CALC("A>1") result=TRUE`.
+    #[epics_macros_rs::epics_test]
+    async fn an_invalid_post_keeps_the_last_good_value_and_result() {
+        let db = rv_db(5.0).await;
+        db.put_record_field_from_ca("rv", "HIGH", EpicsValue::Double(6.0))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "HSV", EpicsValue::String("INVALID".into()))
+            .await
+            .unwrap();
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        let cell = new_acf_cell_watching(Some(cfg), &db);
+        let good = wait_state(&cell, |s| s.bad(1) == 0).await;
+        assert_eq!((good.values.vars[0], good.result(0)), (5.0, true));
+
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(7.0))
+            .await
+            .unwrap();
+        let bad = wait_state(&cell, |s| s.bad(1) == 1).await;
+        assert_eq!((bad.values.vars[0], bad.result(0)), (5.0, true));
+        // softIoc R7.0.10 `asprules` after the same two posts.
+        assert_eq!(
+            String::from_utf8(cell.load_full().unwrap().dump_rules(None)).unwrap(),
+            "ASG(DEFAULT) {\n\tINPA(rv) INVALID value=5.000000\n\
+             \tRULE(1,READ,NOTRAPWRITE) {\n\t\tCALC(\"A>1\") result=TRUE\n\t}\n}\n"
+        );
+    }
+
+    /// `asCa.c connectCallback`: a channel that disconnects is bad and keeps
+    /// its value; the record's return is a fresh connection.
+    #[epics_macros_rs::epics_test]
+    async fn a_removed_input_record_is_bad_until_it_returns() {
+        let db = rv_db(5.0).await;
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        let cell = new_acf_cell_watching(Some(cfg), &db);
+        wait_state(&cell, |s| s.bad(1) == 0).await;
+
+        assert!(db.remove_record("rv").await);
+        let gone = wait_state(&cell, |s| s.bad(1) == 1).await;
+        assert_eq!((gone.values.vars[0], gone.result(0)), (5.0, true));
+
+        add_rv(&db, 0.0).await;
+        notify_asg_field_changed();
+        let back = wait_state(&cell, |s| s.bad(1) == 0).await;
+        assert_eq!((back.values.vars[0], back.result(0)), (0.0, false));
+    }
+
+    /// A reload is a new `ASG` (C `asInit`): the new file's inputs start bad
+    /// and take their own first delivery, whatever the old file had.
+    #[epics_macros_rs::epics_test]
+    async fn a_reload_starts_from_a_fresh_state() {
+        let db = rv_db(5.0).await;
+        let acf = r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#;
+        let cell = new_acf_cell_watching(Some(parse_acf(acf).unwrap()), &db);
+        wait_state(&cell, |s| s.bad(1) == 0).await;
+
+        let reloaded = Arc::new(parse_acf(acf).unwrap());
+        assert_eq!(reloaded.asg[b"DEFAULT".as_slice()].state().bad(1), 1);
+        cell.store(Some(reloaded));
+        let state = wait_state(&cell, |s| s.bad(1) == 0).await;
+        assert_eq!((state.values.vars[0], state.result(0)), (5.0, true));
+    }
+
+    /// `asCaStart` returns only after `asCaTask` has added the inputs
+    /// (`asCaTaskWait`), so the first readings are in place when `asInit`
+    /// returns, with no wait of the caller's own.
+    #[epics_macros_rs::epics_test]
+    async fn wait_served_returns_with_the_first_readings_in_place() {
+        let db = rv_db(5.0).await;
+        let cell = new_acf_cell_watching(None, &db);
+        // Two ASGs on one record: C opens a channel per input, so each takes
+        // its own first event.
+        let acf = r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }
+            ASG(B) { INPB(rv) RULE(1,READ) { CALC("B>1") } }"#;
+        cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
+        cell.wait_served();
+        let cfg = cell.load_full().unwrap();
+        for (asg, index) in [(&b"DEFAULT"[..], 0u8), (b"B", 1)] {
+            let state = cfg.asg[asg].state();
+            assert_eq!(
+                (state.bad(1 << index), state.value(index), state.result(0)),
+                (0, 5.0, true),
+                "{}",
+                String::from_utf8_lossy(asg)
+            );
+        }
+    }
+
+    /// U11: two inputs on one letter that both deliver. C keeps whichever
+    /// event arrives last (`asCa.c:146-161`), so the record processed last
+    /// decides, whichever the ACF lists last. softIoc R7.0.10 with `g` an ai
+    /// at 5 and `bi` an ai at 20 with HIHI 10, HHSV INVALID: read exactly
+    /// when `g` is processed after `bi`.
+    #[epics_macros_rs::epics_test]
+    async fn two_inputs_on_one_letter_follow_the_processing_order() {
+        for acf in [
+            r#"ASG(DEFAULT) { INPA(bi) INPA(g) RULE(1,READ) { CALC("A>1") } }"#,
+            r#"ASG(DEFAULT) { INPA(g) INPA(bi) RULE(1,READ) { CALC("A>1") } }"#,
+        ] {
+            for last in ["g", "bi"] {
+                let db = Arc::new(PvDatabase::new());
+                for name in ["g", "bi"] {
+                    db.add_record(name, Box::new(AiRecord::new(0.0)))
+                        .await
+                        .unwrap();
+                }
+                for (field, value) in [
+                    ("HIHI", EpicsValue::Double(10.0)),
+                    ("HHSV", EpicsValue::String("INVALID".into())),
+                ] {
+                    db.put_pv(&format!("bi.{field}"), value).await.unwrap();
+                }
+                let cell = new_acf_cell_watching(None, &db);
+                cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
+                cell.wait_served();
+                let order = if last == "g" {
+                    ["bi", "g"]
+                } else {
+                    ["g", "bi"]
+                };
+                for name in order {
+                    let value = if name == "g" { 5.0 } else { 20.0 };
+                    db.put_record_field_from_ca(name, "VAL", EpicsValue::Double(value))
+                        .await
+                        .unwrap();
+                }
+                let want = u32::from(last == "bi");
+                let state = wait_state(&cell, |s| s.bad(1) == want && s.value(0) == 5.0).await;
+                assert!(state.result(0), "{acf}, {last} last: {state:?}");
+                let (level, _) =
+                    cell.load_full()
+                        .unwrap()
+                        .compute_for_name("x", "h", "u", &[], 0, "ca", "");
+                assert_eq!(
+                    level == AccessLevel::Read,
+                    last == "g",
+                    "{acf}, {last} processed last"
+                );
+            }
+        }
+    }
+
+    /// A HAG refresh republishes the same load. C has no refresher and moves
+    /// the state only on events, so the record processed last still decides:
+    /// the republish must not replay the first readings in listing order.
+    #[epics_macros_rs::epics_test]
+    async fn a_hag_refresh_keeps_the_state_the_events_built() {
+        let db = Arc::new(PvDatabase::new());
+        for name in ["g", "bi"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        for (field, value) in [
+            ("HIHI", EpicsValue::Double(10.0)),
+            ("HHSV", EpicsValue::String("INVALID".into())),
+        ] {
+            db.put_pv(&format!("bi.{field}"), value).await.unwrap();
+        }
+        let acf = r#"ASG(DEFAULT) { INPA(g) INPA(bi) RULE(1,READ) { CALC("A>1") } }"#;
+        let cell = new_acf_cell_watching(None, &db);
+        cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
+        cell.wait_served();
+        for (name, value) in [("bi", 20.0), ("g", 5.0)] {
+            db.put_record_field_from_ca(name, "VAL", EpicsValue::Double(value))
+                .await
+                .unwrap();
+        }
+        wait_state(&cell, |s| s.bad(1) == 0 && s.value(0) == 5.0).await;
+
+        // What `spawn_hag_refresh` publishes: a clone of the loaded policy.
+        let refreshed = AccessSecurityConfig::clone(&cell.load_full().unwrap());
+        cell.store(Some(Arc::new(refreshed)));
+        cell.wait_served();
+        // Let the watcher take the republish's wake.
+        crate::runtime::task::sleep_background(std::time::Duration::from_millis(200)).await;
+        let cfg = cell.load_full().unwrap();
+        assert_eq!(cfg.asg[b"DEFAULT".as_slice()].state().bad(1), 0);
+        let (level, _) = cfg.compute_for_name("x", "h", "u", &[], 0, "ca", "");
+        assert_eq!(level, AccessLevel::Read);
+    }
+
+    /// A post is published before the change signal fires, so whoever sees
+    /// the new generation sees the new state: [`AccessGate`]'s check cache
+    /// stamps the generation before it computes, and a signal first would
+    /// let it cache the old result under the new stamp for good.
+    #[epics_macros_rs::epics_test]
+    async fn the_change_signal_follows_the_published_state() {
+        let db = rv_db(0.0).await;
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        let cell = new_acf_cell_watching(Some(cfg), &db);
+        cell.wait_served();
+        for k in 1..=50 {
+            let before = asg_change_generation();
+            let spinning = Arc::new(std::sync::Barrier::new(2));
+            let checker = {
+                let (cell, spinning) = (cell.clone(), spinning.clone());
+                std::thread::spawn(move || {
+                    spinning.wait();
+                    while asg_change_generation() == before {
+                        std::hint::spin_loop();
+                    }
+                    cell.load_full().unwrap().asg[b"DEFAULT".as_slice()]
+                        .state()
+                        .value(0)
+                })
+            };
+            spinning.wait();
+            db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(f64::from(k)))
+                .await
+                .unwrap();
+            let seen = crate::runtime::task::spawn_blocking(move || checker.join().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(seen, f64::from(k), "post {k}");
+        }
+    }
+
+    /// Posts that queue up between two wakes are delivered in post order, so
+    /// of two inputs on one letter the later post wins.
+    #[epics_macros_rs::epics_test]
+    async fn a_burst_of_posts_is_delivered_in_post_order() {
+        for (first, second, want) in [("a1", "a2", 2.0), ("a2", "a1", 1.0)] {
+            let db = Arc::new(PvDatabase::new());
+            for name in ["a1", "a2"] {
+                db.add_record(name, Box::new(AiRecord::new(0.0)))
+                    .await
+                    .unwrap();
+            }
+            let cfg =
+                parse_acf(r#"ASG(DEFAULT) { INPA(a1) INPA(a2) RULE(1,READ) { CALC("A>1") } }"#)
+                    .unwrap();
+            let mut watch = InpWatch::of(&cfg);
+            assert!(watch.attach(&db, &cfg));
+            for name in [first, second] {
+                let value = if name == "a1" { 1.0 } else { 2.0 };
+                db.put_record_field_from_ca(name, "VAL", EpicsValue::Double(value))
+                    .await
+                    .unwrap();
+            }
+            let posted = drain_any_asg_inp(&watch.user).await;
+            assert!(posted.len() >= 2, "both posts queued");
+            watch.deliver(&db, &cfg, posted);
+            let state = cfg.asg[b"DEFAULT".as_slice()].state();
+            assert_eq!(state.value(0), want, "{second} posted last");
+        }
+    }
+
+    /// `asComputeAsgPvt` passes the rule's previous result as `VAL`
+    /// (`asLibRoutines.c:961`).
+    #[test]
+    fn a_calc_reads_its_previous_result_as_val() {
+        let cfg = parse_acf(r#"ASG(G) { INPA(x) RULE(1,READ) { CALC("A>1||VAL") } }"#).unwrap();
+        let g = &cfg.asg[b"G".as_slice()];
+        let at = |v| {
+            InpEvent::Reading(InpReading {
+                value: v,
+                severity: crate::server::record::AlarmSeverity::NoAlarm,
+            })
+        };
+        g.deliver([(0, at(5.0))]);
+        g.deliver([(0, at(0.0))]);
+        assert!(g.state().result(0), "VAL latched the TRUE result");
+    }
+
+    /// `asComputeAsgPvt` clears `inpChanged` once the CALCs ran
+    /// (`asLibRoutines.c:979`), so an event on B does not rerun a CALC that
+    /// reads only A — which would flip this one, as it toggles on `VAL`.
+    #[test]
+    fn a_calc_reruns_only_for_its_own_inputs() {
+        let cfg = parse_acf(
+            r#"ASG(G) { INPA(x) INPB(y) RULE(1,READ) { CALC("A&&!VAL") } RULE(1,WRITE) { CALC("B") } }"#,
+        )
+        .unwrap();
+        let g = &cfg.asg[b"G".as_slice()];
+        let at = |v| {
+            InpEvent::Reading(InpReading {
+                value: v,
+                severity: crate::server::record::AlarmSeverity::NoAlarm,
+            })
+        };
+        g.deliver([(0, at(1.0))]);
+        assert!(g.state().result(0));
+        g.deliver([(1, at(1.0))]);
+        let state = g.state();
+        assert_eq!((state.result(0), state.result(1)), (true, true));
+        assert_eq!(state.changed, 0);
+    }
 
     /// C only has an `asCaTask` between `asCaStart` and `asCaStop`, and
     /// nothing but `asInitCommon` calls either (`asDbLib.c:147`, `:136`), so

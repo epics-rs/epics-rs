@@ -168,7 +168,10 @@ impl PvaServer {
     pub async fn reload_acf_from(&self, path: &std::path::Path) -> CaResult<()> {
         let content = std::fs::read(path).map_err(epics_base_rs::error::CaError::Io)?;
         let cfg = access_security::parse_acf(&content)?;
-        self.acf.store(Some(std::sync::Arc::new(cfg)));
+        let acf = self.acf.clone();
+        epics_base_rs::runtime::task::spawn_blocking(move || acf.install(cfg))
+            .await
+            .map_err(|e| CaError::Io(std::io::Error::other(e)))?;
         // Bump the shared ACL generation so monitor tasks
         // spawned on the default `PvDatabaseSource` (which captured
         // this counter at spawn time) detect the change on their
@@ -675,5 +678,46 @@ mod tests {
             "Some(0) bound {got_zero}"
         );
         assert_eq!(got_built, built);
+    }
+
+    /// C `asInit` returns only once `asCaStart` has the inputs' first readings
+    /// (`asCaTaskWait`), so a check right after a reload sees them.
+    #[epics_macros_rs::epics_test]
+    async fn reload_acf_from_returns_with_the_first_readings_in_place() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "rv",
+            Box::new(epics_base_rs::server::records::ai::AiRecord::new(5.0)),
+        )
+        .await
+        .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", epics_base_rs::types::EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.acf");
+        std::fs::write(
+            &path,
+            r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
+        )
+        .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(None, &db);
+        let server = PvaServer::from_parts(db.clone(), Some(0), acf.clone(), None, None);
+        // Hold `rv`'s lock across the reload: the first reading is in place at
+        // the assert only if the reload waited for the watcher to take it.
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        server.reload_acf_from(&path).await.unwrap();
+        assert_eq!(
+            acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
     }
 }

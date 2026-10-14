@@ -1,13 +1,10 @@
 //! An ASG `INP*` value that lands before the watcher's subscriber is attached
 //! must still reach a re-evaluation. C adds every input channel with
 //! `caInitializing` set and then runs `asComputeAllAsg` (asCa.c:204-205), so
-//! the attach is itself an evaluation point; the port reads `INP*` values at
-//! evaluation time, so a re-evaluation after the attach covers every post the
-//! subscriber missed. A post racing the attach is covered either way:
-//! `put_pv_and_post_gated` stores and posts under two write-lock
-//! acquisitions, so an attach can land between them, but an attach before
-//! the post gets the post, and the re-evaluation that follows an attach reads
-//! the live value through `inp_resolver` at evaluation time.
+//! the attach is itself an evaluation point; the port takes the record's
+//! current reading under the same lock that attaches the subscriber, so a
+//! post either precedes the attach and is in that reading, or follows it and
+//! reaches the subscriber.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -943,7 +943,9 @@ struct Registry {
 /// `lockSet::lockRecordList` (`dbLockPvt.h:31`).
 struct SetState {
     set: Set,
-    members: BTreeSet<String>,
+    /// In list order, which `dblsr` prints: a merge appends the moved set's
+    /// list to the survivor's (`dbLock.c:619-623`).
+    members: Vec<String>,
 }
 
 impl Default for Registry {
@@ -1020,7 +1022,7 @@ impl Registry {
             set.id,
             SetState {
                 set,
-                members: BTreeSet::from([name.to_string()]),
+                members: vec![name.to_string()],
             },
         );
         lr
@@ -1078,7 +1080,7 @@ impl Registry {
             set.id,
             SetState {
                 set,
-                members: BTreeSet::from([name.to_string()]),
+                members: vec![name.to_string()],
             },
         );
         self.of_record
@@ -1271,6 +1273,27 @@ impl Registry {
             assigned.push(uniform);
         }
 
+        // Each component's list, read before any set is rewritten: the kept
+        // set's list first, then the other touched sets' in id order — the
+        // order `dbLockSetMerge`'s append leaves when one link joins two sets.
+        // Every member is on one of those lists, since relinks run only after
+        // `built` and a registered record is then never on the bootstrap set.
+        let ordered: Vec<Vec<String>> = components
+            .iter()
+            .zip(&assigned)
+            .map(|(component, id)| {
+                let members: Vec<String> = id
+                    .iter()
+                    .chain(touched.iter().filter(|other| Some(**other) != *id))
+                    .flat_map(|id| &self.active[id].members)
+                    .filter(|name| component.contains(*name))
+                    .cloned()
+                    .collect();
+                debug_assert_eq!(members.len(), component.len());
+                members
+            })
+            .collect();
+
         // Mint before freeing, as C does: `dbLockSetSplit` calls `makeSet`
         // while the set it is splitting is still live, so the new set comes
         // off whatever was already on the free list rather than off the id
@@ -1282,21 +1305,15 @@ impl Registry {
             .collect();
         let mut fresh = fresh.into_iter();
 
-        for (component, id) in components.into_iter().zip(assigned) {
+        for (members, id) in ordered.into_iter().zip(assigned) {
             let set = match id {
                 Some(id) => self.active[&id].set,
                 None => fresh
                     .next()
                     .expect("one fresh set per unassigned component"),
             };
-            self.place(component.iter().cloned(), set);
-            self.active.insert(
-                set.id,
-                SetState {
-                    set,
-                    members: component,
-                },
-            );
+            self.place(members.iter().cloned(), set);
+            self.active.insert(set.id, SetState { set, members });
         }
 
         for id in touched.difference(&keeps) {
@@ -1322,7 +1339,7 @@ impl Registry {
         let state = &self.active[&id];
         LockSetInfo {
             id,
-            members: state.members.iter().cloned().collect(),
+            members: state.members.clone(),
             refs: state.members.len() + state.set.many_holds.load(Ordering::Relaxed),
             locked: state.set.is_locked(),
             mutex: rows.get(&state.set.mutex_addr).cloned(),
@@ -1414,14 +1431,13 @@ impl PvDatabase {
     /// free-list count, which a components-first construction would report as
     /// zero.
     pub fn build_lock_sets(&self) {
-        let mut names: Vec<String> = self
-            .inner
-            .records
-            .read()
-            .keys()
-            .map(|n| n.to_string())
+        // C's `forEachRecord` order, which is both the order sets are minted
+        // in (their ids) and the order links merge in (their member lists).
+        let names: Vec<String> = self
+            .iterate_records()
+            .into_iter()
+            .map(|(name, _)| name)
             .collect();
-        names.sort();
         // Every edge is collected BEFORE the registry lock is taken:
         // `record_link_fields` reads the record map and each record's own
         // lock, and neither may be acquired underneath the registry.

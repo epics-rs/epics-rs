@@ -8135,28 +8135,24 @@ mod tests {
     /// Lock Set 3 2 members 2 refs epicsMutexId 0x60c74b8a5c10
     /// ```
     ///
-    /// Two sets for three records, member counts 2 and 1, and `refs` equal to
-    /// the member count because nothing holds a set. The ids and therefore the
-    /// listing order differ from C's — C numbers sets in record-type order and
-    /// this port in name order — which is why the assertion is on the shape
-    /// and the counts rather than on C's exact digits.
+    /// Two sets for three records, numbered in record-type order — the `ai`
+    /// R:C before the `calc` pair — and `refs` equal to the member count
+    /// because nothing holds a set. Only the mutex address is not C's.
     #[test]
     fn dblsr_reports_one_set_per_link_component() {
         let (_db, ctx, _dir) = lock_set_ctx();
         let out = run_cmd(&ctx, "dblsr", &["*", "0"]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2, "three records, two lock sets:\n{out}");
-        for (line, members) in lines.iter().zip([2, 1]) {
+        for (line, expected) in lines
+            .iter()
+            .zip(["Lock Set 2 1 members 1 refs", "Lock Set 3 2 members 2 refs"])
+        {
             let head = line
                 .split(" epicsMutexId ")
                 .next()
                 .expect("split always yields one");
-            let id: u64 = head.split_whitespace().nth(2).unwrap().parse().unwrap();
-            assert_eq!(
-                head,
-                format!("Lock Set {id} {members} members {members} refs"),
-                "in {line}"
-            );
+            assert_eq!(head, expected, "in {line}");
             assert!(
                 line.contains(" epicsMutexId 0x"),
                 "C prints the set's epicsMutexId with %p: {line}"

@@ -94,9 +94,20 @@ impl Hint {
     /// Name `a`'s value and the reference counts `Arc` keeps just before it.
     #[inline(always)]
     pub(crate) fn set_arc<T>(&self, a: &std::sync::Arc<T>) {
+        self.set_arc_body(std::sync::Arc::as_ptr(a));
+    }
+
+    /// [`Self::set_arc`] for a pinned `Arc`.
+    #[inline(always)]
+    pub(crate) fn set_pin_arc<T>(&self, a: &core::pin::Pin<std::sync::Arc<T>>) {
+        self.set_arc_body(core::ptr::from_ref::<T>(a));
+    }
+
+    #[inline(always)]
+    fn set_arc_body<T>(&self, body: *const T) {
         const COUNTS: usize = 2 * std::mem::size_of::<usize>();
         self.set(
-            std::sync::Arc::as_ptr(a).cast::<u8>().wrapping_sub(COUNTS),
+            body.cast::<u8>().wrapping_sub(COUNTS),
             std::mem::size_of::<T>() + COUNTS,
         );
     }

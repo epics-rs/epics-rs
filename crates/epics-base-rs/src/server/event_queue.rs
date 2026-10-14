@@ -93,7 +93,11 @@
 //!   entry from behind the ring's head; the entries ahead of it move up one
 //!   place, so the ring stays contiguous. C has one reader per queue.
 
-use parking_lot::Mutex;
+use crate::runtime::sync::{
+    PinnedPriorityInheritanceMutex, PriorityInheritanceMutex as Mutex,
+    PriorityInheritanceMutexGuard,
+};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::runtime::sync::Arc;
@@ -171,7 +175,7 @@ pub fn event_que_size() -> usize {
 /// flag — and `ppendsem`, the one wakeup of the circuit consumer. Held behind
 /// its own `Arc` so an [`EvQue`] can reach both without a back-pointer to the
 /// [`EventUser`] that owns the chain.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct FlowCtrl {
     on: AtomicBool,
     /// The parked waker of this `event_user`'s one consumer — the circuit's
@@ -179,15 +183,26 @@ struct FlowCtrl {
     /// subscription's private user. One slot for the whole chain, so a burst
     /// touching several queues wakes the consumer once, and a wake moves the
     /// waker out rather than freeing a list.
-    ppendsem: Mutex<Option<std::task::Waker>>,
+    ///
+    /// Never registered: C's `ppendsem` is an `epicsEvent` (`dbEvent.c:314`),
+    /// whose mutex is `osdPosixMutexInit`'s (`posix/osdEvent.c:54`) and is
+    /// not on `epicsMutexShowAll`'s list.
+    ppendsem: PinnedPriorityInheritanceMutex<Option<std::task::Waker>>,
 }
 
 impl FlowCtrl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            on: AtomicBool::new(false),
+            ppendsem: PinnedPriorityInheritanceMutex::new(None),
+        })
+    }
+
     fn is_on(&self) -> bool {
         self.on.load(Ordering::Acquire)
     }
 
-    fn ppendsem(&self) -> parking_lot::MutexGuard<'_, Option<std::task::Waker>> {
+    fn ppendsem(&self) -> PriorityInheritanceMutexGuard<'_, Option<std::task::Waker>> {
         self.ppendsem.lock()
     }
 }
@@ -203,7 +218,7 @@ impl FlowCtrl {
 /// this post.
 #[derive(Default)]
 pub struct PostBurst {
-    head: Option<Arc<EvQue>>,
+    head: Option<Pin<Arc<EvQue>>>,
 }
 
 impl PostBurst {
@@ -470,7 +485,7 @@ struct QueInner {
     /// This queue is on a [`PostBurst`]'s chain, owed one wake.
     in_burst: bool,
     /// The next queue on that chain.
-    burst_next: Option<Arc<EvQue>>,
+    burst_next: Option<Pin<Arc<EvQue>>>,
     /// C's `evSubscrip`s attached here, each in the slot its handles name.
     /// Sized at queue creation for the quota's monitor cap, so neither attach
     /// nor detach allocates, and never moved: [`EvQue::slab`] is its address.
@@ -579,10 +594,16 @@ impl QueInner {
 
     /// C `event_read`'s `evque[getix]`: the ring's oldest live entry, if the
     /// EVENTS_OFF gate lets it go; a cancelled subscription's entries are
-    /// dropped on the way, as C frees them (`dbEvent.c:969-1002`).
-    fn take_oldest(&mut self, flow_ctrl_on: bool, retired: &mut Retired) -> Option<CircuitEvent> {
+    /// dropped on the way, as C frees them (`dbEvent.c:969-1002`). Written
+    /// into `out`; `false` if there is none.
+    fn take_oldest(
+        &mut self,
+        flow_ctrl_on: bool,
+        retired: &mut Retired,
+        out: &mut Option<CircuitEvent>,
+    ) -> bool {
         if self.used == 0 || !self.may_drain(flow_ctrl_on) {
-            return None;
+            return false;
         }
         self.draining = true;
         while let Some((at, id, live)) = self.advance(retired) {
@@ -592,17 +613,23 @@ impl QueInner {
             }
             let sub = self.sub(id).expect("a delivered entry's slot is attached");
             let (sid, context) = (sub.sid, sub.context.clone());
-            return Some(CircuitEvent::Event {
+            // Emptied first: no drop of a previous value between the take
+            // and the store, so the log is copied from its slot into `out`
+            // once.
+            *out = None;
+            let log = self.take_log(at);
+            *out = Some(CircuitEvent::Event {
                 id,
                 sid,
                 context,
-                event: MonitorEvent::of_log(self.take_log(at)),
+                event: MonitorEvent::of_log(log),
                 // C `eventsRemaining`: the next ring slot, a cancelled
                 // monitor's entry included (`dbEvent.c:965`).
                 remaining: self.used > 0,
             });
+            return true;
         }
-        None
+        false
     }
 
     /// Monitor `id`'s oldest entry, for its own reader. A cancelled
@@ -706,7 +733,7 @@ impl QueInner {
 /// views of C's counters for diagnostics and tests.
 pub struct EvQue {
     flow: Arc<FlowCtrl>,
-    inner: Mutex<QueInner>,
+    inner: PinnedPriorityInheritanceMutex<QueInner>,
     /// The address of `inner`'s `subs`, for a prefetch hint taken without
     /// the lock.
     slab: usize,
@@ -766,7 +793,7 @@ mod retiring {
     pub(super) struct QueGuard<'a> {
         // Fields drop in declaration order: the lock is released before
         // `retired` drops.
-        q: parking_lot::MutexGuard<'a, QueInner>,
+        q: crate::runtime::sync::PriorityInheritanceMutexGuard<'a, QueInner>,
         retired: Retired,
         flow: &'a FlowCtrl,
     }
@@ -820,17 +847,17 @@ mod retiring {
 use retiring::Retired;
 
 impl EvQue {
-    fn new(flow: Arc<FlowCtrl>) -> Self {
+    fn new(flow: Arc<FlowCtrl>) -> Pin<Arc<Self>> {
         let replace_threshold = events_per_que();
         let size = EVENT_ENTRIES * replace_threshold;
         // The quota admits at most `size / EVENT_ENTRIES - 1` monitors.
         let slots = u16::try_from(size / EVENT_ENTRIES)
             .expect("events_per_que() is capped at MAX_EVENTS_PER_QUE");
         let subs: Box<[Option<SubQ>]> = (0..slots).map(|_| None).collect();
-        Self {
+        let que = Arc::pin(Self {
             flow,
             slab: subs.as_ptr().addr(),
-            inner: Mutex::new(QueInner {
+            inner: PinnedPriorityInheritanceMutex::new(QueInner {
                 ring: (0..size).map(|_| None).collect(),
                 getix: 0,
                 used: 0,
@@ -845,10 +872,13 @@ impl EvQue {
                 replace_threshold,
                 unreported_ends: 0,
             }),
-        }
+        });
+        // SAFETY: nothing moves `inner` out of a pinned `EvQue`.
+        unsafe { que.as_ref().map_unchecked(|q| &q.inner) }.register();
+        que
     }
 
-    fn lock(&self) -> parking_lot::MutexGuard<'_, QueInner> {
+    fn lock(&self) -> PriorityInheritanceMutexGuard<'_, QueInner> {
         self.inner.lock()
     }
 
@@ -874,7 +904,7 @@ impl EvQue {
     /// ring that already held an entry is parked by EVENTS_OFF, whose release
     /// wakes it; any other reader has that entry still to take.
     fn post(
-        self: &Arc<Self>,
+        self: &Pin<Arc<Self>>,
         burst: &mut PostBurst,
         id: AttachId,
         mut log: impl LogSource,
@@ -992,16 +1022,21 @@ impl EvQue {
     /// The circuit consumer's read of this queue: the ring's oldest entry
     /// whichever monitor it belongs to, else a monitor's end of stream, else
     /// park `cx` in the circuit's `ppendsem` slot.
-    fn poll_oldest(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<CircuitEvent> {
+    fn poll_oldest(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        out: &mut Option<CircuitEvent>,
+    ) -> std::task::Poll<()> {
         use std::task::Poll;
         let mut guard = self.lock_retiring();
         let flow_on = self.flow.is_on();
         let (q, retired) = guard.parts();
-        if let Some(event) = q.take_oldest(flow_on, retired) {
-            return Poll::Ready(event);
+        if q.take_oldest(flow_on, retired, out) {
+            return Poll::Ready(());
         }
         if let Some(ended) = q.take_ended() {
-            return Poll::Ready(ended);
+            *out = Some(ended);
+            return Poll::Ready(());
         }
         guard.park(cx);
         Poll::Pending
@@ -1174,7 +1209,7 @@ pub struct EventUser {
 
 /// The queue chain and where the circuit consumer's drain pass stands on it.
 struct QueChain {
-    ques: Vec<Arc<EvQue>>,
+    ques: Vec<Pin<Arc<EvQue>>>,
     /// The queue `event_task`'s loop is on: `event_read` empties it before
     /// the loop moves to `nextque`, and a new pass starts at `firstque`.
     reading: usize,
@@ -1189,10 +1224,10 @@ impl Default for EventUser {
 impl EventUser {
     /// C `db_init_events`.
     pub fn new() -> Self {
-        let flow = Arc::new(FlowCtrl::default());
+        let flow = FlowCtrl::new();
         Self {
             ques: Mutex::new(QueChain {
-                ques: vec![Arc::new(EvQue::new(flow.clone()))],
+                ques: vec![EvQue::new(flow.clone())],
                 reading: 0,
             }),
             flow,
@@ -1212,7 +1247,7 @@ impl EventUser {
         sid: u32,
         kind: LogKind,
         context: &DeliveryContext,
-    ) -> (Arc<EvQue>, AttachId) {
+    ) -> (Pin<Arc<EvQue>>, AttachId) {
         let mut chain = self.ques.lock();
         let ques = &mut chain.ques;
         let generation = AttachId::next_generation();
@@ -1221,7 +1256,7 @@ impl EventUser {
                 return (que.clone(), id);
             }
         }
-        let que = Arc::new(EvQue::new(self.flow.clone()));
+        let que = EvQue::new(self.flow.clone());
         let id = que
             .lock()
             .try_attach(generation, sid, kind, context)
@@ -1242,14 +1277,35 @@ impl EventUser {
     /// [`EventReader::recv`] calls on the same queues would take entries out
     /// of that order.
     pub fn poll_next(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<CircuitEvent> {
+        let mut out = None;
+        std::task::ready!(self.poll_next_into(cx, &mut out));
+        std::task::Poll::Ready(out.expect("a ready poll fills its slot"))
+    }
+
+    /// [`Self::poll_next`], the entry moved from its ring slot straight into
+    /// `out`: the circuit consumer keeps one slot across polls, so the event
+    /// is not copied through every return on the way out (C hands
+    /// `event_read`'s callback a pointer). `Ready(())` leaves `out` `Some`.
+    ///
+    /// A full `out` is an event its consumer has not taken yet, so it is
+    /// `Ready` at once and the queues are not touched: overwriting it would
+    /// lose that event and drop it under the queue lock.
+    pub fn poll_next_into(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        out: &mut Option<CircuitEvent>,
+    ) -> std::task::Poll<()> {
+        if out.is_some() {
+            return std::task::Poll::Ready(());
+        }
         let mut chain = self.ques.lock();
         let n = chain.ques.len();
         for step in 0..n {
             // `reading < n`: no divide per poll.
             let at = wrap(chain.reading + step, n);
-            if let std::task::Poll::Ready(event) = chain.ques[at].poll_oldest(cx) {
+            if chain.ques[at].poll_oldest(cx, out).is_ready() {
                 chain.reading = at;
-                return std::task::Poll::Ready(event);
+                return std::task::Poll::Ready(());
             }
         }
         // Every queue is parked on `cx`; the next wake is a new pass.
@@ -1324,7 +1380,7 @@ impl std::error::Error for TryRecvError {}
 /// Dropping it cancels the subscription's queue slot (C `db_cancel_event`),
 /// releasing its ring entries and its quota.
 pub struct EventReader {
-    que: Arc<EvQue>,
+    que: Pin<Arc<EvQue>>,
     id: AttachId,
     /// The monitor list holding this subscription's row, which the drop
     /// unlinks it from (C `db_cancel_event`'s `ellDelete`), so the list a
@@ -1372,7 +1428,7 @@ impl EventReader {
 
     /// The queue this subscription is attached to — a read-only handle for
     /// diagnostics and tests (`n_duplicates`, `npend`, `nreplace`).
-    pub fn queue(&self) -> Arc<EvQue> {
+    pub fn queue(&self) -> Pin<Arc<EvQue>> {
         self.que.clone()
     }
 
@@ -1400,7 +1456,7 @@ impl Drop for EventReader {
 /// it. Dropping it is the end-of-stream signal a monitor gets when its channel
 /// goes away.
 pub struct EventSink {
-    que: Arc<EvQue>,
+    que: Pin<Arc<EvQue>>,
     id: AttachId,
     /// The slot's [`LogKind`], fixed at attach.
     kind: LogKind,
@@ -1415,7 +1471,7 @@ impl EventSink {
         slot: &crate::server::record::Hint,
     ) {
         const SLOT: usize = std::mem::size_of::<Option<SubQ>>();
-        que.set_arc(&self.que);
+        que.set_pin_arc(&self.que);
         let at = self.que.slab + usize::from(self.id.slot()) * SLOT;
         slot.set(std::ptr::without_provenance(at), SLOT);
     }
@@ -2425,7 +2481,7 @@ mod tests {
         let (sink_a, mut reader_a) = attach(&user, 1, LogKind::Val);
         let (sink_b, _reader_b) = attach(&user, 2, LogKind::Val);
         assert!(
-            Arc::ptr_eq(&reader_a.queue(), &_reader_b.queue()),
+            std::ptr::eq(&*reader_a.queue(), &*_reader_b.queue()),
             "the quota admits both monitors to one queue — C's sharing granularity"
         );
 
@@ -2474,13 +2530,13 @@ mod tests {
         }
         let first = held[0].1.queue();
         for (_, reader) in &held {
-            assert!(Arc::ptr_eq(&reader.queue(), &first), "all within quota");
+            assert!(std::ptr::eq(&*reader.queue(), &*first), "all within quota");
         }
         assert_eq!(first.quota(), event_que_size() - EVENT_ENTRIES);
 
         let (_sink, overflow) = attach(&user, cap as u32, LogKind::Val);
         assert!(
-            !Arc::ptr_eq(&overflow.queue(), &first),
+            !std::ptr::eq(&*overflow.queue(), &*first),
             "the {cap}th monitor exhausts the quota; the next one chains a queue"
         );
         assert_eq!(overflow.queue().quota(), EVENT_ENTRIES);
@@ -2502,7 +2558,7 @@ mod tests {
         assert_eq!(first.quota(), event_que_size() - 2 * EVENT_ENTRIES);
         let (_sink, reader) = attach(&user, 900, LogKind::Val);
         assert!(
-            Arc::ptr_eq(&reader.queue(), &first),
+            std::ptr::eq(&*reader.queue(), &*first),
             "the released quota must be reusable"
         );
     }
@@ -2608,6 +2664,26 @@ mod tests {
             })
         ));
         assert!(circuit_now(&user).is_pending());
+    }
+
+    /// The queue lock is on `epicsMutexShowAll`'s list for as long as the
+    /// queue lives, and `ppendsem`, an event in C, never is.
+    #[test]
+    fn the_queue_lock_is_listed_and_ppendsem_is_not() {
+        let listed = |addr: usize| {
+            crate::runtime::sync::mutex_report(false)
+                .shown
+                .iter()
+                .any(|e| e.addr() == addr)
+        };
+        let user = EventUser::new();
+        let (sink, reader) = attach(&user, 1, LogKind::Val);
+        let que = reader.queue().inner.registered_addr();
+        let flow = user.flow.ppendsem.registered_addr();
+        assert!(listed(que), "the queue lock is not listed");
+        assert!(!listed(flow), "ppendsem is listed; C's is an epicsEvent");
+        drop((sink, reader, user));
+        assert!(!listed(que), "a dropped lock is still listed");
     }
 
     /// Records whether `ppendsem` was held when it was woken.
@@ -2850,7 +2926,7 @@ mod tests {
     }
 
     /// Records whether the queue lock was held when it was woken or dropped.
-    struct HeldAtDrop(Arc<EvQue>, Arc<std::sync::atomic::AtomicBool>);
+    struct HeldAtDrop(Pin<Arc<EvQue>>, Arc<std::sync::atomic::AtomicBool>);
 
     impl HeldAtDrop {
         fn record(&self) {
@@ -3148,7 +3224,7 @@ mod tests {
         );
         let (sink, reader) = attach(&user, 7, LogKind::Val);
         assert!(
-            Arc::ptr_eq(&reader.queue(), &first),
+            std::ptr::eq(&*reader.queue(), &*first),
             "a freed slot is reused"
         );
         sink.post(ev(70));
@@ -3403,6 +3479,78 @@ mod tests {
         drop((a, c, d, ra, rc));
     }
 
+    /// [`EventUser::poll_next_into`] is the one circuit read: it fills the
+    /// consumer's slot on `Ready`, leaves it empty on `Pending`, and delivers
+    /// what [`EventUser::poll_next`] would — ring order across monitors, then
+    /// an end of stream.
+    #[epics_macros_rs::epics_test]
+    async fn poll_next_into_fills_the_slot_in_ring_order() {
+        let user = EventUser::new();
+        let (a, ra) = attach(&user, 1, LogKind::Val);
+        let (b, _rb) = attach(&user, 2, LogKind::Val);
+        a.post(ev(10));
+        b.post(ev(20));
+        a.post(ev(11));
+        drop(a);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut slot = None;
+        let mut taken = Vec::new();
+        while user.poll_next_into(&mut cx, &mut slot).is_ready() {
+            match slot.take().expect("Ready fills the slot") {
+                CircuitEvent::Event { sid, event, .. } => taken.push((sid, val(&event))),
+                CircuitEvent::Ended(id) => {
+                    assert_eq!(id, ra.id());
+                    taken.push((0, 0));
+                }
+            }
+        }
+        assert!(slot.is_none(), "Pending leaves the slot empty");
+        assert_eq!(taken, [(1, 10), (2, 20), (1, 11), (0, 0)]);
+    }
+
+    /// Records how its last reference went: 1 with the queue lock free, 2
+    /// under it.
+    struct DroppedUnder(Pin<Arc<EvQue>>, Arc<std::sync::atomic::AtomicU8>);
+
+    impl Drop for DroppedUnder {
+        fn drop(&mut self) {
+            let held = self.0.inner.try_lock().is_none();
+            self.1.store(if held { 2 } else { 1 }, Ordering::SeqCst);
+        }
+    }
+
+    /// A slot the consumer has not emptied is handed back as it was: its
+    /// event is neither overwritten nor dropped under the lock, and the
+    /// queued entry waits for the next poll.
+    #[epics_macros_rs::epics_test]
+    async fn poll_next_into_hands_a_full_slot_back_untouched() {
+        let user = EventUser::new();
+        let (a, ra) = attach(&user, 1, LogKind::Val);
+        a.post(ev(10));
+        let dropped = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let mut slot = Some(CircuitEvent::Event {
+            id: ra.id(),
+            sid: 99,
+            context: Arc::new(DroppedUnder(ra.queue(), dropped.clone())),
+            event: ev(1),
+            remaining: false,
+        });
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(user.poll_next_into(&mut cx, &mut slot).is_ready());
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "the slot's event was dropped"
+        );
+        assert!(matches!(slot, Some(CircuitEvent::Event { sid: 99, .. })));
+        drop(slot.take());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(user.poll_next_into(&mut cx, &mut slot).is_ready());
+        assert!(
+            matches!(&slot, Some(CircuitEvent::Event { sid: 1, event, .. }) if val(event) == 10)
+        );
+    }
+
     /// Boundary: the entry a monitor's attach queued first (C
     /// `db_post_single_event` before `db_event_enable`) is deliverable at
     /// once, in post order with every other monitor's.
@@ -3533,9 +3681,9 @@ mod tests {
         let held: Vec<_> = (0..=cap)
             .map(|sid| attach(user, sid, LogKind::Val))
             .collect();
-        assert!(!Arc::ptr_eq(
-            &held[0].1.queue(),
-            &held[cap as usize].1.queue()
+        assert!(!std::ptr::eq(
+            &*held[0].1.queue(),
+            &*held[cap as usize].1.queue()
         ));
         (cap, held)
     }
@@ -3655,7 +3803,7 @@ mod tests {
     /// from is never written.
     #[test]
     fn two_live_ids_never_collide_across_a_32_bit_wrap() {
-        let que = || EvQue::new(Arc::new(FlowCtrl::default()));
+        let que = || EvQue::new(FlowCtrl::new());
         let attach_at = |q: &EvQue, generation: u64| {
             q.lock()
                 .try_attach(generation, 1, LogKind::Val, no_context())

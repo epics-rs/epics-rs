@@ -856,7 +856,7 @@ impl DbAttachment {
     }
 
     /// The queue this subscription is attached to, for diagnostics and tests.
-    pub fn queue(&self) -> std::sync::Arc<crate::server::event_queue::EvQue> {
+    pub fn queue(&self) -> std::pin::Pin<std::sync::Arc<crate::server::event_queue::EvQue>> {
         self.reader.queue()
     }
 }

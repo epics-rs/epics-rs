@@ -419,13 +419,13 @@ fn cmd_asdbdump() -> CommandDef {
     )
 }
 
-/// An ASG `INP*` link's live value, as `asCa.c`'s channel holds it; `None`
+/// An ASG `INP*` link's live reading, as `asCa.c`'s channel holds it; `None`
 /// is a channel that never connected.
-fn inp_link_value(ctx: &CommandContext, link: &str) -> Option<f64> {
-    let (record, field) = crate::server::access_security::inp_link_target(link);
-    let rec = ctx.db().get_record(record)?;
-    let inst = rec.read();
-    inst.resolve_field(field).and_then(|v| v.to_f64())
+fn inp_link_value(
+    ctx: &CommandContext,
+    link: &str,
+) -> Option<crate::server::access_security::InpReading> {
+    crate::server::access_security::read_inp_link(ctx.db(), link)
 }
 
 /// Print a rendered dump line by line, as the bytes C's `%s` writes.

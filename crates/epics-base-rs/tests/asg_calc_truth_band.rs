@@ -22,8 +22,18 @@
 use std::sync::Arc;
 
 use epics_base_rs::server::access_security::{
-    AccessGate, AccessLevel, AsgAslResolver, AsgInputs, InpResolver, new_acf_cell, parse_acf,
+    AccessGate, AccessLevel, AsgAslResolver, AsgInputs, InpReading, InpResolver, new_acf_cell,
+    parse_acf,
 };
+use epics_base_rs::server::record::AlarmSeverity;
+
+/// A delivered reading with no alarm.
+fn ok(value: f64) -> InpReading {
+    InpReading {
+        value,
+        severity: AlarmSeverity::NoAlarm,
+    }
+}
 
 /// `CALC("A")` makes the rule's result the INP value itself, so each case
 /// names the exact number C's band sees.
@@ -53,7 +63,8 @@ async fn calc_gated_rule_grants_only_inside_the_band() {
     let asg: AsgAslResolver = Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
 
     for &(value, expected) in CASES {
-        let inp: InpResolver = Arc::new(move |_link: String| Box::pin(async move { Some(value) }));
+        let inp: InpResolver =
+            Arc::new(move |_link: String| Box::pin(async move { Some(ok(value)) }));
         let gate = AccessGate::required(cell.clone(), asg.clone()).with_inp_resolver(inp);
         assert_eq!(
             gate.check("x", "h", "u", "ca", "").await.allows_write(),
@@ -70,8 +81,8 @@ async fn calc_gated_rule_grants_only_inside_the_band() {
 fn compute_for_name_applies_the_band_to_caller_supplied_inputs() {
     let cfg = parse_acf(ACF).unwrap();
     for &(value, expected) in CASES {
-        let mut inputs = AsgInputs::default();
-        inputs.record(0, Some(value));
+        let mut inputs = AsgInputs::for_group(cfg.asg.get(b"OPS".as_slice()));
+        inputs.record(0, ok(value));
         let (level, _trap) = cfg.compute_for_name("OPS", "h", "u", &[], 0, "ca", "", Some(&inputs));
         assert_eq!(
             level == AccessLevel::ReadWrite,
@@ -87,7 +98,7 @@ fn compute_for_name_applies_the_band_to_caller_supplied_inputs() {
 async fn a_truthy_non_unity_calc_does_not_grant_write() {
     let cell = new_acf_cell(Some(parse_acf(ACF).unwrap()));
     let asg: AsgAslResolver = Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
-    let inp: InpResolver = Arc::new(|_link: String| Box::pin(async { Some(2.0) }));
+    let inp: InpResolver = Arc::new(|_link: String| Box::pin(async { Some(ok(2.0)) }));
     let gate = AccessGate::required(cell, asg).with_inp_resolver(inp);
     let checked = gate.check("x", "h", "u", "ca", "").await;
     assert!(

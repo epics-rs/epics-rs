@@ -23,8 +23,18 @@
 use std::sync::Arc;
 
 use epics_base_rs::server::access_security::{
-    AccessGate, AccessLevel, AsgAslResolver, AsgInputs, InpResolver, new_acf_cell, parse_acf,
+    AccessGate, AccessLevel, AsgAslResolver, AsgInputs, InpReading, InpResolver, new_acf_cell,
+    parse_acf,
 };
+use epics_base_rs::server::record::AlarmSeverity;
+
+/// A delivered reading with no alarm.
+fn ok(value: f64) -> InpReading {
+    InpReading {
+        value,
+        severity: AlarmSeverity::NoAlarm,
+    }
+}
 
 /// `gate:enable` resolves to 1; `typo:pv` does not exist. The WRITE rule reads
 /// only A, the READ rule reads only B.
@@ -38,7 +48,7 @@ ASG(RW) {
 
 /// Resolve `gate:enable` and nothing else — `typo:pv` is the bad input.
 fn one_bad_link() -> InpResolver {
-    Arc::new(|link: String| Box::pin(async move { (link == "gate:enable").then_some(1.0) }))
+    Arc::new(|link: String| Box::pin(async move { (link == "gate:enable").then_some(ok(1.0)) }))
 }
 
 /// The finding's own trigger, through the async gate.
@@ -94,9 +104,8 @@ ASG(SPLIT) {
     )
     .unwrap();
 
-    let mut inputs = AsgInputs::default();
-    inputs.record(0, Some(1.0)); // gate:enable = 1
-    inputs.record(1, None); // typo:pv is bad
+    let mut inputs = AsgInputs::for_group(cfg.asg.get(b"SPLIT".as_slice()));
+    inputs.record(0, ok(1.0)); // gate:enable = 1; typo:pv never delivers
     assert_eq!(inputs.bad, 0b10, "only INPB is marked bad");
 
     let (level, _) = cfg.compute_for_name("SPLIT", "h", "u", &[], 0, "ca", "", Some(&inputs));
@@ -134,9 +143,8 @@ ASG(G) {
 #[test]
 fn a_good_input_that_evaluates_false_still_denies() {
     let cfg = parse_acf(ACF).unwrap();
-    let mut inputs = AsgInputs::default();
-    inputs.record(0, Some(0.0)); // gate:enable = 0
-    inputs.record(1, None);
+    let mut inputs = AsgInputs::for_group(cfg.asg.get(b"RW".as_slice()));
+    inputs.record(0, ok(0.0)); // gate:enable = 0; typo:pv never delivers
     let (level, _) = cfg.compute_for_name("RW", "h", "u", &[], 0, "ca", "", Some(&inputs));
     assert_eq!(level, AccessLevel::NoAccess, "A=1 is false when A is 0");
 }

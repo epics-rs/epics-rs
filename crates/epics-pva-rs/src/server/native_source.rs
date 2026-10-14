@@ -291,18 +291,12 @@ impl PvDatabaseSource {
                 ("DEFAULT".to_string(), 0u8)
             })
         });
-        // resolve an ACF `INP*` link (`record.field`) to its
-        // current numeric value from the live database, so CALC-gated
-        // rules evaluate against real values instead of failing closed.
         let inp_db = db.clone();
         let inp_resolver: InpResolver = Arc::new(move |link: String| {
             let db = inp_db.clone();
-            Box::pin(async move {
-                let (base, field) = epics_base_rs::server::access_security::inp_link_target(&link);
-                let rec = db.get_record(base)?;
-                let inst = rec.read();
-                inst.resolve_field(field).and_then(|v| v.to_f64())
-            })
+            Box::pin(
+                async move { epics_base_rs::server::access_security::read_inp_link(&db, &link) },
+            )
         });
         let gate = match acl_version {
             Some(v) => AccessGate::required_with_version(acf, resolver, v),

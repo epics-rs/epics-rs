@@ -1232,27 +1232,18 @@ impl ClientState {
     ///. The trap flag is `false` for `SimplePv`/`RecordField`
     /// targets whose access was not resolved through a `TRAPWRITE`
     /// rule — including the no-ACF permissive fallback.
-    /// Resolve one ASG `INP*` link (`record` or `record.FIELD`) to its live
-    /// numeric value. `None` — the `asCa.c` "channel not connected" case —
-    /// marks that ONE input bad; which rules that disables is
-    /// `AccessSecurityConfig`'s decision, not this server's.
+    /// This ASG's live `INP*` state, walked by the owner in `epics-base-rs`.
     ///
     /// Caller must NOT hold a record read-guard that a link could point back
     /// to (would re-read the same lock).
-    fn resolve_inp_link(&self, link: &str) -> Option<f64> {
-        let (base, field) = epics_base_rs::server::access_security::inp_link_target(link);
-        let rec = self.db.get_record(base)?;
-        let inst = rec.read();
-        inst.resolve_field(field).and_then(|v| v.to_f64())
-    }
-
-    /// This ASG's live `INP*` state, walked by the owner in `epics-base-rs`.
     fn calc_inputs(
         &self,
         cfg: &AccessSecurityConfig,
         asg_name: &str,
     ) -> epics_base_rs::server::access_security::AsgInputs {
-        cfg.resolve_asg_inputs(asg_name, &|link| self.resolve_inp_link(link))
+        cfg.resolve_asg_inputs(asg_name, &|link| {
+            epics_base_rs::server::access_security::read_inp_link(&self.db, link)
+        })
     }
 
     /// Evaluate `cfg`'s rules for `asg_name`, with CALC clauses gated against

@@ -189,15 +189,18 @@ pub type AsgAslResolver = std::sync::Arc<
 >;
 
 /// resolves an ASG `INP*` link string (typically a
-/// `record.field` PV name) to its current numeric value, or `None` when
-/// the input is unresolvable / disconnected (bad input → the CALC-gated
-/// rule denies). Installed on an [`AccessGate`] by the owning server so
+/// `record.field` PV name) to its current value and severity, or `None` when
+/// the input is unresolvable / disconnected; [`AsgInputs::record`] decides
+/// what either means. Installed on an [`AccessGate`] by the owning server so
 /// `check` can evaluate `RULE(...) { CALC(...) }` against live values.
 /// Async because the value typically lives behind the server's async
 /// database lock; [`AccessGate::check_with_roles`] resolves the ASG's
 /// links up front, then evaluates the (sync) expression.
 pub type InpResolver = std::sync::Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<f64>> + Send>>
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<InpReading>> + Send>>
         + Send
         + Sync,
 >;
@@ -773,22 +776,20 @@ impl AccessGate {
                         let (asg, asl) = resolver(pv_name.clone()).await;
                         // pre-resolve the ASG's INP* links up
                         // front — the resolver is async (it reads the
-                        // server DB). `Some(inputs)` when every declared
-                        // link resolved; `None` when there is no resolver
-                        // or any input is bad/disconnected → CALC fails
-                        // closed. Each rule's expression is then evaluated
-                        // synchronously in `compute_rules`.
+                        // server DB). `None` when there is no resolver →
+                        // every CALC fails closed. Each rule's expression
+                        // is then evaluated synchronously in `compute_rules`.
                         let inp_values: Option<AsgInputs> = match self.inp_resolver {
                             None => None,
                             Some(ref res) => {
-                                let mut inputs = AsgInputs::default();
-                                if let Some(group) = cfg.asg_or_default(asg.as_bytes()) {
-                                    for inp in &group.inp {
-                                        let value = match inp.record_link() {
-                                            Some(link) => res(link.to_owned()).await,
-                                            None => None,
-                                        };
-                                        inputs.record(inp.index, value);
+                                let group = cfg.asg_or_default(asg.as_bytes());
+                                let mut inputs = AsgInputs::for_group(group);
+                                for inp in group.map_or(&[][..], |g| &g.inp) {
+                                    let Some(link) = inp.record_link() else {
+                                        continue;
+                                    };
+                                    if let Some(reading) = res(link.to_owned()).await {
+                                        inputs.record(inp.index, reading);
                                     }
                                 }
                                 Some(inputs)
@@ -1092,37 +1093,63 @@ pub struct AccessSecurityGroup {
 /// resolvers used to abort their link walk on the first unresolvable link and
 /// hand `None` to the evaluator, which failed EVERY CALC rule in the group —
 /// one typo in an `INPB` no rule mentions took writes away from the whole ASG.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AsgInputs {
     /// Resolved values, indexed A..U.
     pub values: crate::calc::NumericInputs,
-    /// Bit `i` set ⟹ `INP(i)` is declared but could not be resolved.
+    /// C `pasg->inpBad`: bit `i` set ⟹ `INP(i)` is declared and no good value
+    /// has been delivered for it.
     pub bad: u32,
     /// C `pasg->inpChanged`: bit `i` set ⟹ `INP(i)` is declared and delivered
     /// a value (`asCa.c:160`, the only place C sets it).
     pub changed: u32,
 }
 
+/// One `INP*` link's value with its alarm severity: the `DBR_STS_DOUBLE`
+/// `asCa.c` subscribes for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InpReading {
+    pub value: f64,
+    pub severity: crate::server::record::AlarmSeverity,
+}
+
 impl AsgInputs {
-    /// Record one declared link's resolution. `None` — no such record, no such
-    /// field, a non-numeric value, a disconnected CA link — sets the input's
-    /// `bad` bit and leaves its value at 0, which is what C holds for a
-    /// channel that never connected.
+    /// `group`'s inputs before any delivery: `asCaTask` (`asCa.c:183`) sets
+    /// the bad bit of every declared index, and only an event clears it.
+    pub fn for_group(group: Option<&AccessSecurityGroup>) -> Self {
+        let bad = group.map_or(0, |g| {
+            g.inp
+                .iter()
+                .filter(|inp| (inp.index as usize) < crate::calc::CALC_NARGS)
+                .fold(0, |bad, inp| bad | 1u32 << inp.index)
+        });
+        Self {
+            values: Default::default(),
+            bad,
+            changed: 0,
+        }
+    }
+
+    /// One delivered reading, as `asCa.c eventCallback` (`:146-162`) takes
+    /// it. A link that never resolves delivers nothing, as a channel that
+    /// never connects never calls `eventCallback`, so its input stays as
+    /// [`Self::for_group`] left it. A delivery sets `changed`; an INVALID one
+    /// is also `bad` and its value is not stored.
     ///
-    /// This is the single owner of "what an unresolvable INP link means";
-    /// every resolver drives it rather than deciding for itself.
-    pub fn record(&mut self, index: u8, value: Option<f64>) {
+    /// This is the single owner of "what an INP delivery means"; every
+    /// resolver drives it rather than deciding for itself.
+    pub fn record(&mut self, index: u8, reading: InpReading) {
         let idx = index as usize;
         if idx >= crate::calc::CALC_NARGS {
             return;
         }
-        match value {
-            Some(v) => {
-                self.values.vars[idx] = v;
-                self.changed |= 1u32 << idx;
-            }
-            None => self.bad |= 1u32 << idx,
+        if reading.severity == crate::server::record::AlarmSeverity::Invalid {
+            self.bad |= 1u32 << idx;
+        } else {
+            self.bad &= !(1u32 << idx);
+            self.values.vars[idx] = reading.value;
         }
+        self.changed |= 1u32 << idx;
     }
 }
 
@@ -1153,6 +1180,19 @@ impl AsgInp {
 pub fn inp_link_target(link: &str) -> (&str, &str) {
     let (record, field) = crate::server::database::parse_pv_name(link);
     (record, if field.is_empty() { "VAL" } else { field })
+}
+
+/// Read an `INP*` link from this IOC's database: the field as a double and
+/// the record's `SEVR`, which is what a `DBR_STS_DOUBLE` monitor delivers.
+pub fn read_inp_link(db: &crate::server::database::PvDatabase, link: &str) -> Option<InpReading> {
+    let (base, field) = inp_link_target(link);
+    let rec = db.get_record(base)?;
+    let inst = rec.read();
+    let value = inst.resolve_field(field).and_then(|v| v.to_f64())?;
+    Some(InpReading {
+        value,
+        severity: inst.common.sevr,
+    })
 }
 
 /// Access Security Configuration parsed from an ACF file.
@@ -1203,7 +1243,7 @@ impl AccessSecurityConfig {
     /// `asgMemberList`. `resolve` reads an `INP*` link's live value, `None`
     /// being C's unconnected channel. Names come out sorted because C's
     /// `asUagAdd`/`asHagAdd`/`asAsgAdd` keep each list sorted.
-    pub fn dump_report(&self, resolve: &dyn Fn(&str) -> Option<f64>) -> Vec<u8> {
+    pub fn dump_report(&self, resolve: &dyn Fn(&str) -> Option<InpReading>) -> Vec<u8> {
         let mut out = Vec::new();
         dump_groups(&mut out, b"UAG", &self.uag);
         dump_groups(&mut out, b"HAG", &self.hag);
@@ -1215,7 +1255,7 @@ impl AccessSecurityConfig {
     pub fn dump_rules(
         &self,
         asgname: Option<&[u8]>,
-        resolve: &dyn Fn(&str) -> Option<f64>,
+        resolve: &dyn Fn(&str) -> Option<InpReading>,
     ) -> Vec<u8> {
         let mut out = Vec::new();
         self.dump_asgs(asgname, AsgDump::Rules, resolve, &mut out);
@@ -1226,7 +1266,7 @@ impl AccessSecurityConfig {
         &self,
         only: Option<&[u8]>,
         style: AsgDump,
-        resolve: &dyn Fn(&str) -> Option<f64>,
+        resolve: &dyn Fn(&str) -> Option<InpReading>,
         out: &mut Vec<u8>,
     ) {
         if self.asg.is_empty() {
@@ -1581,14 +1621,14 @@ impl AccessSecurityConfig {
     pub fn resolve_asg_inputs(
         &self,
         asg_name: impl AsRef<[u8]>,
-        resolve: &dyn Fn(&str) -> Option<f64>,
+        resolve: &dyn Fn(&str) -> Option<InpReading>,
     ) -> AsgInputs {
-        let mut inputs = AsgInputs::default();
-        let Some(group) = self.asg_or_default(asg_name.as_ref()) else {
-            return inputs;
-        };
-        for inp in &group.inp {
-            inputs.record(inp.index, inp.record_link().and_then(resolve));
+        let group = self.asg_or_default(asg_name.as_ref());
+        let mut inputs = AsgInputs::for_group(group);
+        for inp in group.map_or(&[][..], |g| &g.inp) {
+            if let Some(reading) = inp.record_link().and_then(resolve) {
+                inputs.record(inp.index, reading);
+            }
         }
         inputs
     }
@@ -3143,6 +3183,14 @@ fn compile_rule_calc(
 mod tests {
     use super::*;
 
+    /// A delivered reading with no alarm.
+    fn ok(value: f64) -> InpReading {
+        InpReading {
+            value,
+            severity: crate::server::record::AlarmSeverity::NoAlarm,
+        }
+    }
+
     fn bs(items: &[&str]) -> Vec<Vec<u8>> {
         items.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
@@ -3824,7 +3872,7 @@ ASG(DEFAULT) { RULE(1, READ) }
 ",
         )
         .unwrap();
-        let resolve = |link: &str| (link == "okrec").then_some(1.0);
+        let resolve = |link: &str| (link == "okrec").then_some(ok(1.0));
         let zz_rules = "\tRULE(1,WRITE,TRAPWRITE) {
 \t\tUAG(zops,aempty)
 \t\tHAG(lab)
@@ -4837,7 +4885,7 @@ ASG(LOCKED)
             br#"ASG(g) { INPA(okrec) RULE(1,WRITE){CALC("1")} RULE(1,READ){CALC("A")} }"#,
         )
         .unwrap();
-        let resolve = |link: &str| (link == "okrec").then_some(1.0);
+        let resolve = |link: &str| (link == "okrec").then_some(ok(1.0));
         let dump = String::from_utf8(cfg.dump_rules(Some(b"g"), &resolve)).unwrap();
         assert!(dump.contains("CALC(\"1\") result=FALSE"), "{dump}");
         assert!(dump.contains("CALC(\"A\") result=TRUE"), "{dump}");
@@ -4847,7 +4895,7 @@ ASG(LOCKED)
             Arc::new(|_name| Box::pin(async { ("g".to_string(), 0u8) }));
         let gate =
             AccessGate::required(cell, asg_resolver).with_inp_resolver(Arc::new(|link: String| {
-                Box::pin(async move { (link == "okrec").then_some(1.0) })
+                Box::pin(async move { (link == "okrec").then_some(ok(1.0)) })
             }));
         let access = gate.check("r", "h", "u", "ca", "").await;
         assert!(access.allows_read() && !access.allows_write(), "{access:?}");
@@ -4866,7 +4914,7 @@ ASG(LOCKED)
             r#"ASG(DEFAULT) { INPA(nope:pv) RULE(1,READ) { CALC("A<1") } }"#,
         ] {
             let cfg = parse_acf(acf).unwrap();
-            let resolve = |link: &str| (link == "rv:ai").then_some(5.0);
+            let resolve = |link: &str| (link == "rv:ai").then_some(ok(5.0));
             let dump = String::from_utf8(cfg.dump_rules(None, &resolve)).unwrap();
             assert!(dump.contains("result=FALSE"), "{acf}: {dump}");
 
@@ -4874,11 +4922,142 @@ ASG(LOCKED)
             let asg_resolver: AsgAslResolver =
                 Arc::new(|_name| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
             let gate = AccessGate::required(cell, asg_resolver).with_inp_resolver(Arc::new(
-                |link: String| Box::pin(async move { (link == "rv:ai").then_some(5.0) }),
+                |link: String| Box::pin(async move { (link == "rv:ai").then_some(ok(5.0)) }),
             ));
             let access = gate.check("q", "h", "u", "ca", "").await;
             assert!(!access.allows_read(), "{acf}: {access:?}");
         }
+    }
+
+    /// Records `(name, VAL, SEVR)` in a database the `INP*` links read through
+    /// [`read_inp_link`]; returns `asprules` and whether `DEFAULT` grants read.
+    async fn inp_case(
+        acf: &str,
+        records: &[(&str, f64, crate::server::record::AlarmSeverity)],
+    ) -> (String, bool) {
+        use crate::server::database::PvDatabase;
+        use std::sync::Arc;
+        let db = Arc::new(PvDatabase::new());
+        for &(name, value, sevr) in records {
+            db.add_record(
+                name,
+                Box::new(crate::server::records::ai::AiRecord::new(value)),
+            )
+            .await
+            .unwrap();
+            db.get_record(name).unwrap().write().common.sevr = sevr;
+        }
+        let cfg = parse_acf(acf).unwrap();
+        let dump = String::from_utf8(cfg.dump_rules(None, &|l| read_inp_link(&db, l))).unwrap();
+        let cell = crate::server::access_security::new_acf_cell(Some(cfg));
+        let asg_resolver: AsgAslResolver =
+            Arc::new(|_name| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+        let gate = AccessGate::required(cell, asg_resolver).with_inp_resolver(Arc::new(
+            move |link: String| {
+                let db = db.clone();
+                Box::pin(async move { read_inp_link(&db, &link) })
+            },
+        ));
+        let read = gate.check("r", "h", "u", "ca", "").await.allows_read();
+        (dump, read)
+    }
+
+    /// `asCa.c:149-151`: a value delivered at INVALID marks the input bad and
+    /// is not stored, but still sets `inpChanged`, so the CALC runs on the old
+    /// value and the rule denies (`asLibRoutines.c:1049`). softIoc R7.0.10
+    /// with `q` a UDF ai: `INPA(q) INVALID value=0.000000`,
+    /// `CALC("A<1") result=TRUE`, and `cainfo` reports no read.
+    #[epics_macros_rs::epics_test]
+    async fn an_inp_delivered_at_invalid_is_bad_and_denies() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(q) RULE(1,READ) { CALC("A<1") } }"#,
+            &[("q", 5.0, AlarmSeverity::Invalid)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPA(q) INVALID value=0.000000\n"),
+            "{dump}"
+        );
+        assert!(dump.contains("CALC(\"A<1\") result=TRUE"), "{dump}");
+        assert!(!read);
+    }
+
+    /// A link that never resolves delivers nothing (`asCa.c:133-162` runs only
+    /// on an event), so a second `INPA` naming a missing PV leaves the bad bit
+    /// the first one's delivery cleared. softIoc R7.0.10, `rv:ai` at 5: read,
+    /// both lines `value=5.000000` with no INVALID, `result=TRUE`.
+    #[epics_macros_rs::epics_test]
+    async fn an_unresolved_duplicate_input_is_no_event() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(rv:ai) INPA(nope:pv) RULE(1,READ) { CALC("A>1") } }"#,
+            &[("rv:ai", 5.0, AlarmSeverity::NoAlarm)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPA(rv:ai) value=5.000000\n\tINPA(nope:pv) value=5.000000\n"),
+            "{dump}"
+        );
+        assert!(dump.contains("CALC(\"A>1\") result=TRUE"), "{dump}");
+        assert!(read);
+    }
+
+    /// A good delivery clears the input's bad bit (`asCa.c:154`), so a
+    /// missing PV listed first under the same letter does not keep it bad.
+    /// softIoc R7.0.10, `rv:ai` at 5: read, both lines `value=5.000000`.
+    #[epics_macros_rs::epics_test]
+    async fn a_good_delivery_clears_the_bad_bit_whatever_the_order() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(nope:pv) INPA(rv:ai) RULE(1,READ) { CALC("A>1") } }"#,
+            &[("rv:ai", 5.0, AlarmSeverity::NoAlarm)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPA(nope:pv) value=5.000000\n\tINPA(rv:ai) value=5.000000\n"),
+            "{dump}"
+        );
+        assert!(read);
+    }
+
+    /// Only INVALID makes a delivery bad (`asCa.c:149`): an input in MINOR or
+    /// MAJOR alarm is stored and grants. softIoc R7.0.10 with the ai at 5 in a
+    /// HIGH alarm of either severity: read, `INPA(..) value=5.000000`.
+    #[epics_macros_rs::epics_test]
+    async fn a_minor_or_major_input_stays_good() {
+        use crate::server::record::AlarmSeverity;
+        for sevr in [AlarmSeverity::Minor, AlarmSeverity::Major] {
+            let (dump, read) = inp_case(
+                r#"ASG(DEFAULT) { INPA(alm) RULE(1,READ) { CALC("A>1") } }"#,
+                &[("alm", 5.0, sevr)],
+            )
+            .await;
+            assert!(
+                dump.contains("\tINPA(alm) value=5.000000\n"),
+                "{sevr:?}: {dump}"
+            );
+            assert!(read, "{sevr:?}");
+        }
+    }
+
+    /// `asCa.c:183` starts every declared input bad, so an input that never
+    /// delivers still disables the rules reading it. softIoc R7.0.10:
+    /// `INPB(nope:pv) INVALID value=0.000000`, `result=TRUE`, no read.
+    #[epics_macros_rs::epics_test]
+    async fn a_declared_input_that_never_delivers_is_bad() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(rv:ai) INPB(nope:pv) RULE(1,READ) { CALC("A>1&&B<1") } }"#,
+            &[("rv:ai", 5.0, AlarmSeverity::NoAlarm)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPB(nope:pv) INVALID value=0.000000\n"),
+            "{dump}"
+        );
+        assert!(dump.contains("CALC(\"A>1&&B<1\") result=TRUE"), "{dump}");
+        assert!(!read);
     }
 
     /// with an `INP*` resolver installed, a CALC-gated rule
@@ -4893,17 +5072,19 @@ ASG(LOCKED)
         let asg_resolver: AsgAslResolver =
             Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
 
-        let grant = AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(
-            Arc::new(|link: String| Box::pin(async move { (link == "permit.VAL").then_some(1.0) })),
-        );
+        let grant =
+            AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(Arc::new(
+                |link: String| Box::pin(async move { (link == "permit.VAL").then_some(ok(1.0)) }),
+            ));
         assert!(
             grant.check("x", "h", "u", "ca", "").await.allows_write(),
             "CALC A=1 with permit=1 grants WRITE"
         );
 
-        let deny = AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(
-            Arc::new(|link: String| Box::pin(async move { (link == "permit.VAL").then_some(0.0) })),
-        );
+        let deny =
+            AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(Arc::new(
+                |link: String| Box::pin(async move { (link == "permit.VAL").then_some(ok(0.0)) }),
+            ));
         assert!(
             !deny.check("x", "h", "u", "ca", "").await.allows_write(),
             "CALC A=1 with permit=0 denies WRITE"

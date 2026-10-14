@@ -13,10 +13,10 @@
 //! value is written back, so the PV is honest about the accepted value rather
 //! than silently inert.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked, not waived — all 8 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(7): checked, not waived — all 7 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
-// --all-features`, 376/376). ad-core-rs became a census subject when its
+// --all-features`, 377/377). ad-core-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -4656,35 +4656,37 @@ mod tests {
 
         // Arrays 1,2,3 are all out of order against the -1000 sentinel, so
         // sorted mode buffers every one of them: nothing reaches the client
-        // until the sort deadline releases the head (C sortingTask `:646`,
+        // until the sort deadline releases the head (C sortingTask `:662`,
         // `deltaTime > sortTime`), and the rest then cascade out behind it
-        // because each is adjacent to the one just emitted.
+        // because each is adjacent to the one just emitted. The head is
+        // stamped after `sent`, so its arrival can only come later than the
+        // deadline measured from there, however late this thread runs.
+        let sent = std::time::Instant::now();
         send_array(handle.array_sender(), make_test_array(1));
         send_array(handle.array_sender(), make_test_array(2));
         send_array(handle.array_sender(), make_test_array(3));
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let early = rt.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_millis(50), downstream_rx.recv()).await
-        });
+        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 1);
         assert!(
-            early.is_err(),
+            sent.elapsed() >= std::time::Duration::from_millis(100),
             "the first array is held for the sort deadline, not emitted at once"
         );
-        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 1);
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 2);
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 3);
 
         // B3: now send out of order (5 before 4). prev=3, so 4 is in-order
         // and emitted immediately; 5 arrives first, is buffered, then 4
-        // unblocks it.
+        // unblocks it. A deadline that can fire between the two sends would
+        // release 5 alone and correctly put 4 behind it, so it is raised out
+        // of reach and only contiguity can release 5.
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_float64_blocking(handle.plugin_params.sort_time, 0, 30.0)
+            .unwrap();
+        params_applied(&handle);
         send_array(handle.array_sender(), make_test_array(5));
         send_array(handle.array_sender(), make_test_array(4));
-        // 4 emitted immediately (in order), then 5 released by contiguity;
-        // blocking_recv below is the wait.
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 4);
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 5);
     }

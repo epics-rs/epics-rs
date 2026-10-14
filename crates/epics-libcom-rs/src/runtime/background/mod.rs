@@ -53,7 +53,8 @@ pub use callback_executor::{
 };
 pub use delayed_timer::{DelayedTimer, TimerHandle};
 pub use future_exec::{
-    AbortHandle, DEFAULT_SPAWN_PRIORITY, JoinError, JoinFuture, spawn_blocking_on, spawn_future,
+    AbortHandle, DEFAULT_SPAWN_PRIORITY, JoinError, JoinFuture, OnBand, spawn_blocking_offloaded,
+    spawn_blocking_on, spawn_future,
 };
 pub use timer_sleep::{Sleep, TimerInterval};
 

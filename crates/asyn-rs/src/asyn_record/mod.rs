@@ -2471,10 +2471,12 @@ impl SpecialLane {
         }
         drop(queue);
         let lane = Arc::clone(self);
-        epics_libcom_rs::runtime::task::spawn_blocking_background(prio, move || lane.drain());
+        epics_libcom_rs::runtime::task::spawn_blocking_background(prio, move |on| lane.drain(on));
     }
 
-    fn drain(&self) {
+    /// C's `callbackRequest` body: the band runs it, so it takes the band's
+    /// proof and the blocking seam cannot reach it.
+    fn drain(&self, _on: epics_libcom_rs::runtime::task::OnBand) {
         let record = self.record.lock().unwrap().clone();
         loop {
             #[cfg(test)]
@@ -2509,6 +2511,18 @@ impl SpecialLane {
         !self.done.lock().unwrap().draining
     }
 }
+
+/// Where C `exceptCallback`'s refresh runs. C runs it on the raising thread,
+/// most often the port thread at its default `epicsThreadPriorityMedium`
+/// (asynManager.c:2077), and so does this pool. A port whose actor is wedged
+/// holds these workers, not the process blocking pool. The priority is not
+/// per port: the workers are shared, and re-prioritising one per job would
+/// carry a port's priority into the next port's refresh.
+static EXCEPT_REFRESH: epics_libcom_rs::runtime::offload::OffloadPool =
+    epics_libcom_rs::runtime::offload::OffloadPool::new(
+        "asynExcept",
+        epics_libcom_rs::runtime::task::ThreadPriority::Medium,
+    );
 
 /// A rung of C's `findTracePvt` chain — see [`AsynRecord::trace_rung`]. `addr`
 /// is set only with `port`; `port: None` is the global rung.
@@ -2879,28 +2893,22 @@ impl AsynRecord {
         let port = self.port.clone();
         let dirty = Arc::clone(&self.status_dirty);
         let own_raise = Arc::clone(&self.own_raise);
-        // The exception fires on the thread that raised it — iocsh, or the port
-        // actor itself — which is not a worker of the IOC's executor, so the
-        // `Reactor` is captured here, where registration runs in the
-        // database's async init context.
-        let immediate = match (
-            self.async_ctx.clone(),
-            crate::runtime::task::Reactor::current(),
-        ) {
-            (Some((name, db)), Some(rt)) => Some((name, db, rt)),
-            _ => None,
-        };
+        let immediate = self.async_ctx.clone();
         let id = mgr.add_callback(move |ev| {
             // The subscription is per-port in C (the callback hangs off the
             // record's `pasynUser`), which is what this name check reproduces.
             if ev.port_name != port || own_raise.load(Ordering::Acquire) {
                 return;
             }
-            let Some((name, db, rt)) = immediate.clone() else {
+            let Some((name, db)) = immediate.clone() else {
                 dirty.store(true, Ordering::Release);
                 return;
             };
-            rt.spawn_blocking(move || {
+            // The exception fires on the thread that raised it, often the port
+            // actor, whose state the refresh queries, so it runs elsewhere.
+            // On a spawn failure the refresh is lost, as the dirty flag
+            // would be for a record that never processes.
+            let _ = EXCEPT_REFRESH.spawn(move || {
                 db.with_record(&name, |rec| {
                     if let Some(rec) = rec
                         .as_any_mut()
@@ -12310,6 +12318,11 @@ A.OEOS
         assert!(
             posted,
             "a disconnect must refresh CNCT immediately, with no process()"
+        );
+        assert_eq!(
+            EXCEPT_REFRESH.worker_count(),
+            1,
+            "the refresh runs on the Medium exception pool"
         );
 
         // ENBL / AUCT are re-read by the same refresh and are unchanged, so

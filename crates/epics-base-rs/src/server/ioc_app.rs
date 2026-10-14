@@ -2220,6 +2220,7 @@ impl IocApplication {
         F: FnOnce(IocRunConfig) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
     {
+        crate::runtime::task::adopt_current_runtime();
         let result = self.run_to_completion(protocol_runner).await;
         crate::runtime::exit::call_at_exits();
         result

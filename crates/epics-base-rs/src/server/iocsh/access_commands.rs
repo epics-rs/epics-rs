@@ -1031,8 +1031,7 @@ mod tests {
             });
             held.recv().unwrap();
             let cell = acf.clone();
-            // A plain thread, as iocsh's: on the exec backend `spawn_blocking`
-            // is cbMedium, the band the watcher `asInit` waits for runs on.
+            // A plain thread, as iocsh's.
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || tx.send(as_init(&cell)));
             let outcome = rx.await.unwrap();

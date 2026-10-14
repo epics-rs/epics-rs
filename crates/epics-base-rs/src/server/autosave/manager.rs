@@ -182,10 +182,8 @@ impl AutosaveManager {
     /// Start all periodic/triggered/onchange tasks. Returns a join handle.
     ///
     /// Takes the [`Reactor`](crate::runtime::task::Reactor), unlike every
-    /// deferred record tail: a save writes through `runtime::fs`, whose hosted
-    /// implementation is `tokio::task::spawn_blocking` and panics off a runtime
-    /// thread, and each strategy is a poller on `runtime::task::interval`,
-    /// which is `tokio::time` there. Autosave is started from
+    /// deferred record tail: each strategy is a poller on
+    /// `runtime::task::interval`, which is `tokio::time` on a hosted build. Autosave is started from
     /// `IocApplication::run`, which owns that runtime; it is not on the
     /// synchronous record-processing chain that reaches a runtime-less
     /// connection thread. The parameter is what says so for the *spawns*,

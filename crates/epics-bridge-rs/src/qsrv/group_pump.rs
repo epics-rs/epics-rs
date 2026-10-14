@@ -541,8 +541,8 @@ mod tests {
     /// fails deterministically (the pump task is queued behind the pin and
     /// can never run); on the dedicated-thread shape (pvxs's `qsrvGroup`
     /// thread, `db_start_events` at `groupsource.cpp:96`) it passes without
-    /// the band ever becoming free. Exec backend only: on the tokio backend
-    /// `spawn_blocking` goes to a large pool and pins nothing.
+    /// the band ever becoming free. Exec backend only: the tokio backend has
+    /// no callback-band executor to pin.
     #[cfg(exec_backend)]
     #[tokio::test]
     async fn drain_delivers_while_the_medium_band_worker_is_occupied() {
@@ -551,10 +551,13 @@ mod tests {
         // the band can run for the duration of the test.
         let (pinned_tx, pinned_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let pin = epics_base_rs::runtime::task::spawn_blocking(move || {
-            let _ = pinned_tx.send(());
-            let _ = release_rx.recv_timeout(Duration::from_secs(60));
-        });
+        let pin = epics_base_rs::runtime::task::spawn_blocking_background(
+            epics_base_rs::runtime::task::CallbackPriority::Medium,
+            move |_| {
+                let _ = pinned_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(60));
+            },
+        );
         pinned_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("the pin closure reached the band worker");

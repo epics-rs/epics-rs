@@ -185,7 +185,10 @@ pub fn epics_main(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime")
-                .block_on(async move #body)
+                .block_on(async move {
+                    #base::runtime::task::adopt_current_runtime();
+                    #body
+                })
         }
     }
     .into()

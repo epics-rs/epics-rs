@@ -301,19 +301,18 @@ pub(crate) fn peer_display_name(addr: SocketAddr) -> Vec<u8> {
 /// waits for the resolver instead of reading the cache
 /// (`CaChannel::host_name`, libca `ca_host_name`).
 ///
-/// The blocking pool comes from the seam, not from `tokio::task`: this future
-/// is polled by whichever executor the client runs on, and under
-/// `exec_backend` that is a callback-band worker with no ambient tokio
-/// runtime, where `tokio::task::spawn_blocking` panics from inside itself.
+/// It runs on `hostname::NAME_LOOKUP`, behind any queued cache lookups, so a
+/// dead resolver holds the name thread and not the shared blocking pool.
 pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> Vec<u8> {
     #[cfg(feature = "client")]
     {
-        epics_base_rs::runtime::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
-            .await
-            // A join failure is a runtime shutdown, not a channel error, and
-            // C's `ipAddrToA` has a well-defined answer for "no name": the
-            // dotted IP. Give that rather than failing a connected channel.
-            .unwrap_or_else(|_| addr.to_string().into_bytes())
+        match crate::hostname::NAME_LOOKUP.run(move || crate::hostname::ip_addr_to_a(addr)) {
+            Ok(job) => job.await,
+            // No thread to resolve on, and C's `ipAddrToA` has a well-defined
+            // answer for "no name": the dotted IP. Give that rather than
+            // failing a connected channel.
+            Err(_) => addr.to_string().into_bytes(),
+        }
     }
     #[cfg(not(feature = "client"))]
     {
@@ -1667,4 +1666,18 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
             },
         },
     );
+}
+
+#[cfg(all(test, not(epics_embedded_target)))]
+mod peer_name_tests {
+    use super::*;
+
+    /// `ca_host_name`'s blocking lookup is a name lookup too: it runs on
+    /// `hostname::NAME_LOOKUP`, not the shared blocking pool.
+    #[epics_macros_rs::epics_test]
+    async fn peer_resolved_name_runs_on_the_name_thread() {
+        let a: SocketAddr = "192.0.2.9:5064".parse().unwrap();
+        assert_eq!(peer_resolved_name(a).await, b"192.0.2.9:5064");
+        assert_eq!(crate::hostname::NAME_LOOKUP.worker_count(), 1);
+    }
 }

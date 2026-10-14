@@ -99,6 +99,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority, Run, TaskEntry};
+use crate::runtime::offload::{OffloadJob, OffloadPool};
 
 /// Default band for a general spawned tail. C routes general deferred work
 /// through `callbackRequest` at `priorityMedium` (`callback.h:42`) — the middle
@@ -601,8 +602,27 @@ where
     (JoinFuture { shared }, task)
 }
 
-/// Run a blocking closure `f` on a callback-pool worker — the RTEMS backend for
-/// [`crate::runtime::task::spawn_blocking`]. Returns a [`JoinFuture`] resolving
+/// Proof that the code holding it runs on a callback band (C
+/// `callbackRequest`), handed to a band closure by [`spawn_blocking_on`]. A
+/// function that must run there takes one.
+///
+/// Only the band machinery makes one, and it is neither `Send` nor `Clone`,
+/// so it cannot leave the band it was handed on. A band-run function is
+/// therefore unreachable through the blocking seam:
+///
+/// ```compile_fail
+/// use epics_libcom_rs::runtime::task::{
+///     CallbackPriority, OnBand, spawn_blocking, spawn_blocking_background,
+/// };
+/// fn band_only(_: OnBand) {}
+/// spawn_blocking_background(CallbackPriority::Low, |on| {
+///     spawn_blocking(move || band_only(on));
+/// });
+/// ```
+pub struct OnBand(std::marker::PhantomData<*const ()>);
+
+/// Run a blocking closure `f` on a callback-pool worker of `priority`'s band,
+/// handing it the [`OnBand`] that proves it. Returns a [`JoinFuture`] resolving
 /// to `f`'s return value.
 ///
 /// A blocking closure has no suspension point, so it cannot be aborted
@@ -616,7 +636,7 @@ pub fn spawn_blocking_on<F, R>(
     f: F,
 ) -> JoinFuture<R>
 where
-    F: FnOnce() -> R + Send + 'static,
+    F: FnOnce(OnBand) -> R + Send + 'static,
     R: Send + 'static,
 {
     let shared = Shared::new();
@@ -633,7 +653,7 @@ where
             task_shared.finalize(Err(JoinError::cancelled()));
             return;
         }
-        let outcome = catch_unwind(AssertUnwindSafe(f));
+        let outcome = catch_unwind(AssertUnwindSafe(|| f(OnBand(std::marker::PhantomData))));
         let result = match outcome {
             Ok(value) => Ok(value),
             Err(_panic) => Err(JoinError::panicked()),
@@ -645,6 +665,41 @@ where
         tracing::error!(
             target: "epics_base_rs::runtime::future_exec",
             "spawn_blocking_on: callback ring full; closure dropped, handle resolves cancelled"
+        );
+    }
+    JoinFuture { shared }
+}
+
+/// [`spawn_blocking_on`] onto an [`OffloadPool`] instead of a band: the
+/// `exec_backend` [`crate::runtime::task::spawn_blocking`]. Same handle, same
+/// abort-before-start and panic isolation; the closure holds a pool worker,
+/// never a callback band. A pool that cannot create a worker resolves the
+/// handle cancelled.
+pub fn spawn_blocking_offloaded<F, R>(pool: &'static OffloadPool, f: F) -> JoinFuture<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let shared = Shared::new();
+    let task_shared = Arc::clone(&shared);
+    let mut guard = FinalizeOnDrop {
+        shared: Some(Arc::clone(&shared)),
+    };
+    let job: OffloadJob = Box::new(move |release| {
+        guard.defuse();
+        let result = if task_shared.control.abort.load(Ordering::Acquire) {
+            Err(JoinError::cancelled())
+        } else {
+            catch_unwind(AssertUnwindSafe(f)).map_err(|_panic| JoinError::panicked())
+        };
+        release();
+        task_shared.finalize(result);
+    });
+
+    if let Err(e) = pool.submit(job) {
+        tracing::error!(
+            target: "epics_base_rs::runtime::future_exec",
+            "spawn_blocking_offloaded: no worker ({e}); closure dropped, handle resolves cancelled"
         );
     }
     JoinFuture { shared }
@@ -1269,17 +1324,63 @@ mod tests {
     #[test]
     fn spawn_blocking_returns_value_and_isolates_panic() {
         let pool = CallbackPool::new();
-        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, || 123u32);
+        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, |_| 123u32);
         assert_eq!(join(jf).unwrap(), 123);
 
-        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, || {
+        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, |_| {
             panic!("blocking boom")
         });
         assert!(!join::<()>(jf).unwrap_err().is_cancelled());
 
         // Worker survived the panic.
-        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, || 5u32);
+        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, |_| 5u32);
         assert_eq!(join(jf).unwrap(), 5);
+    }
+
+    #[test]
+    fn spawn_blocking_offloaded_returns_value_and_isolates_panic() {
+        use crate::runtime::task::ThreadPriority;
+        static POOL: OffloadPool = OffloadPool::new("test-sbo", ThreadPriority::Low);
+        assert_eq!(
+            join(spawn_blocking_offloaded(&POOL, || 123u32)).unwrap(),
+            123
+        );
+        let jf = spawn_blocking_offloaded(&POOL, || panic!("offloaded boom"));
+        assert!(!join::<()>(jf).unwrap_err().is_cancelled());
+        assert_eq!(join(spawn_blocking_offloaded(&POOL, || 5u32)).unwrap(), 5);
+        assert_eq!(POOL.worker_count(), 1, "the panic cost the pool its worker");
+    }
+
+    /// An abort that lands while the job is still queued cancels it unrun.
+    #[test]
+    fn spawn_blocking_offloaded_abort_before_start_cancels_unrun() {
+        use crate::runtime::offload::MAX_OFFLOAD_WORKERS;
+        use crate::runtime::task::ThreadPriority;
+        static POOL: OffloadPool = OffloadPool::new("test-sboa", ThreadPriority::Low);
+        let (release, held) = mpsc::channel::<()>();
+        let held = Arc::new(Mutex::new(held));
+        let busy: Vec<_> = (0..MAX_OFFLOAD_WORKERS)
+            .map(|_| {
+                let held = Arc::clone(&held);
+                spawn_blocking_offloaded(&POOL, move || {
+                    let _ = held.lock().unwrap().recv_timeout(T);
+                })
+            })
+            .collect();
+        let ran = Arc::new(AtomicBool::new(false));
+        let queued = spawn_blocking_offloaded(&POOL, {
+            let ran = Arc::clone(&ran);
+            move || ran.store(true, Ordering::Release)
+        });
+        queued.abort();
+        for _ in &busy {
+            release.send(()).unwrap();
+        }
+        assert!(join(queued).unwrap_err().is_cancelled());
+        assert!(!ran.load(Ordering::Acquire), "an aborted job ran");
+        for jf in busy {
+            join(jf).unwrap();
+        }
     }
 
     /// A wake runs under whatever lock its waker holds — a record's, when a

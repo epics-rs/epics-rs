@@ -11,7 +11,7 @@ use tokio::runtime::RuntimeFlavor;
 
 pub use tokio::runtime::Handle as RuntimeHandle;
 
-pub use crate::runtime::background::CallbackPriority;
+pub use crate::runtime::background::{CallbackPriority, OnBand};
 
 /// A synchronous caller asked to block on an async operation from a thread
 /// where blocking cannot be made sound.
@@ -402,7 +402,10 @@ pub fn test_block_on<F: Future>(fut: F) -> F::Output {
         .enable_all()
         .build()
         .expect("failed to build tokio test runtime")
-        .block_on(fut)
+        .block_on(async {
+            adopt_current_runtime();
+            fut.await
+        })
 }
 
 /// `exec_backend` twin of [`test_block_on`]: see the `tokio_backend` copy for
@@ -627,10 +630,13 @@ where
 }
 
 /// [`spawn_background`] for a blocking closure — runs it on a callback-pool
-/// worker of the named band.
+/// worker of the named band, holding that worker for the whole run. For work
+/// that belongs on the band (C `callbackRequest`); `f` gets the [`OnBand`]
+/// such work takes. Blocking work that merely must not block a task is
+/// [`spawn_blocking`]'s.
 pub fn spawn_blocking_background<F, R>(priority: CallbackPriority, f: F) -> BackgroundTaskHandle<R>
 where
-    F: FnOnce() -> R + Send + 'static,
+    F: FnOnce(OnBand) -> R + Send + 'static,
     R: Send + 'static,
 {
     use crate::runtime::background::spawn_blocking_on;
@@ -822,22 +828,15 @@ impl Reactor {
         }
     }
 
-    /// [`Reactor::spawn`] for a blocking closure. A bound executor takes it on
-    /// one of its own workers; with none bound this is
-    /// [`spawn_blocking_background`] verbatim, middle band.
+    /// [`Reactor::spawn`] for a blocking closure: [`spawn_blocking`], bound
+    /// executor or not, because a closure that blocks on an executor's worker
+    /// or a band's stalls every future queued behind it.
     pub fn spawn_blocking<F, R>(&self, f: F) -> TaskHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        match &self.exec {
-            Some(exec) => crate::runtime::background::spawn_blocking_on(
-                &exec.handle(),
-                CallbackPriority::Medium,
-                f,
-            ),
-            None => spawn_blocking_background(CallbackPriority::Medium, f),
-        }
+        spawn_blocking(f)
     }
 }
 
@@ -874,36 +873,81 @@ pub async fn yield_now() {
 /// Run a blocking closure on a worker thread.
 ///
 /// **Not the reactor capability.** What this needs is a pool of threads that
-/// may block, not the I/O and time drivers, and the two are different
-/// requirements even though tokio happens to hang both off one runtime: on a
-/// hosted build this is `tokio::task::spawn_blocking`, which does require a
-/// runtime entered on the calling thread, and on `exec_backend` it is the
-/// callback pool, which requires nothing. That residual dual meaning is why
-/// [`Reactor::spawn_blocking`] exists beside it — a site that already holds a
-/// [`Reactor`] should use that one and say so in its signature. This free
-/// function stays for the callers whose work is reactor-free by nature
-/// (`runtime::fs`, `waitpid`, a name lookup) and for whom a process-global
-/// blocking pool, which this crate does not yet have, would be the right
-/// destination.
+/// may block, not the I/O and time drivers. On a hosted build that is the
+/// blocking pool of the runtime entered on this thread, or, from a thread with
+/// none (a callback band, a plain thread), of the runtime
+/// [`adopt_current_runtime`] last named; on `exec_backend` it is
+/// [`offload::BLOCKING`]. Neither needs the caller to be on a runtime. A site
+/// that already holds a [`Reactor`] uses [`Reactor::spawn_blocking`] and says
+/// so in its signature.
+///
+/// [`offload::BLOCKING`]: crate::runtime::offload::BLOCKING
 #[cfg(tokio_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    blocking_runtime().spawn_blocking(f)
 }
 
-/// RTEMS: the callback pool, which needs no runtime — see the `tokio_backend`
-/// copy for why this one is not the reactor capability. Middle band: this is
-/// the ambient `spawn_blocking`, which no record reaches.
+/// The runtime [`spawn_blocking`] uses from a thread with none entered.
+#[cfg(tokio_backend)]
+static BLOCKING_RUNTIME: std::sync::Mutex<Option<RuntimeHandle>> = std::sync::Mutex::new(None);
+
+/// Name the runtime entered on this thread as the one whose blocking pool
+/// [`spawn_blocking`] uses from threads with none: called where a runtime
+/// starts (`#[epics_main]`, [`test_block_on`], the IOC's `run`). The latest
+/// call wins. A no-op with no runtime entered, and on `exec_backend`, whose
+/// blocking pool needs no runtime.
+pub fn adopt_current_runtime() {
+    #[cfg(tokio_backend)]
+    if let Ok(handle) = RuntimeHandle::try_current() {
+        *BLOCKING_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+}
+
+/// The current runtime; else the adopted one; else, when nothing has adopted
+/// one, the first runtime a call was made on; else a runtime of this crate's
+/// own, kept for blocking work only, so the seam never panics.
+#[cfg(tokio_backend)]
+fn blocking_runtime() -> RuntimeHandle {
+    let current = RuntimeHandle::try_current().ok();
+    let mut adopted = BLOCKING_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = current {
+        adopted.get_or_insert_with(|| current.clone());
+        return current;
+    }
+    adopted
+        .get_or_insert_with(|| {
+            static OWN: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+            OWN.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("blockingRt")
+                    .enable_all()
+                    .build()
+                    .expect("the blocking-work runtime starts")
+            })
+            .handle()
+            .clone()
+        })
+        .clone()
+}
+
+/// RTEMS: the process-global [`offload::BLOCKING`] pool, which needs no
+/// runtime and holds no callback band — see the `tokio_backend` copy for why
+/// this one is not the reactor capability. Work that belongs on a band (C
+/// `callbackRequest`) is [`spawn_blocking_background`]'s.
+///
+/// [`offload::BLOCKING`]: crate::runtime::offload::BLOCKING
 #[cfg(exec_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    spawn_blocking_background(CallbackPriority::Medium, f)
+    crate::runtime::background::spawn_blocking_offloaded(&crate::runtime::offload::BLOCKING, f)
 }
 
 /// A set of spawned tasks, joined as they complete — the seam replacement for
@@ -3027,31 +3071,24 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
         let _ = enter_ioc_thread(priority);
         f()
     })
 }
 
-/// RTEMS: run the blocking closure on a callback-pool worker.
+/// RTEMS: [`spawn_blocking`], at that pool's priority.
 ///
-/// The requested EPICS [`ThreadPriority`] is **not** yet mapped onto a callback
-/// band here: the pool workers are long-lived and shared, so re-prioritising the
-/// running worker per task would leak that priority into the next callback it
-/// drains. The closure runs at the pool's default Medium band; mapping
-/// `ThreadPriority` to a `CallbackPriority` band is deferred to RTEMS bring-up.
+/// The requested EPICS [`ThreadPriority`] is **not** applied: the pool workers
+/// are long-lived and shared, so re-prioritising the running worker per job
+/// would leak that priority into the next job it takes.
 #[cfg(exec_backend)]
 pub fn spawn_blocking_with_priority<F, R>(_priority: ThreadPriority, f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
-    spawn_blocking_on(
-        &background().callbacks().handle(),
-        DEFAULT_SPAWN_PRIORITY,
-        f,
-    )
+    spawn_blocking(f)
 }
 
 /// Spawn a **dedicated OS thread** that runs `f` at `priority` with a `stack`
@@ -3075,8 +3112,9 @@ where
 ///
 /// Not [`spawn_blocking_with_priority`], and the difference is the point.
 /// That one hands the closure to a *pool*: tokio's blocking pool on the host,
-/// and on RTEMS a shared callback-pool worker that also drops the priority
-/// (see its `exec_backend` arm). Both are right for work that finishes. A
+/// and on RTEMS [`offload::BLOCKING`](crate::runtime::offload::BLOCKING),
+/// whose shared workers ignore the requested priority (see its
+/// `exec_backend` arm). Both are right for work that finishes. A
 /// server thread that lives as long as its connection would occupy a pool
 /// worker for that whole time, so the pool is the wrong home for it — an IOC
 /// thread that a C IOC would create with `epicsThreadCreate` wants a thread of
@@ -3136,10 +3174,39 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    spawn_entered(InheritedRuntime::capture(), name, priority, stack, f)
+}
+
+/// [`spawn_dedicated_thread`] for a permanent worker that runs jobs from many
+/// callers: the thread enters no runtime of its own, because each job brings
+/// the one it was submitted from (see [`InheritedRuntime`]).
+#[cfg(tokio_backend)]
+pub(crate) fn spawn_pool_worker<F>(
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_entered(InheritedRuntime(None), name, priority, stack, f)
+}
+
+#[cfg(tokio_backend)]
+fn spawn_entered<F>(
+    ambient: InheritedRuntime,
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
     if let Some(refused) = fifo_attr_refusal(priority) {
         return Err(refused);
     }
-    let ambient = InheritedRuntime::capture();
     let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
@@ -3163,8 +3230,8 @@ where
 /// **One owner for the question `spawn_dedicated_thread`'s docs above answer at
 /// length.** Two callers need it and they differ in *when* they capture:
 /// `spawn_dedicated_thread` captures once, at spawn, because the thread it
-/// creates serves exactly one body; `runtime::worker_pool` captures per **job**,
-/// because a pooled worker outlives the runtime that first used it. A pooled
+/// creates serves exactly one body; `runtime::worker_pool` and
+/// `runtime::offload` capture per **job**, because a pooled worker outlives the runtime that first used it. A pooled
 /// worker that inherited its ambient at creation would hold a `Handle` to a
 /// runtime that has since been dropped — every `#[tokio::test]` builds and drops
 /// its own — and enter it for every later connection.
@@ -3236,6 +3303,20 @@ where
             let _ = enter_ioc_thread(priority);
             f()
         })
+}
+
+/// RTEMS: no thread enters a runtime, so a pool worker is a dedicated thread.
+#[cfg(exec_backend)]
+pub(crate) fn spawn_pool_worker<F>(
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_dedicated_thread(name, priority, stack, f)
 }
 
 /// A thread the IOC **cannot correctly run without** — the scan rates, the
@@ -3825,6 +3906,142 @@ mod tests {
         assert_eq!(handle.await.unwrap(), 123);
     }
 
+    /// A job that blocks until released, and the receiver that says it has
+    /// started, so a probe queued after it cannot run first by luck.
+    fn held_job() -> (
+        impl FnOnce() + Send + 'static,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let job = move || {
+            let _ = started_tx.send(());
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        };
+        (job, started, release)
+    }
+
+    /// Every band, and `reactor`'s executor when given, runs a future while a
+    /// job blocks through a blocking seam. Releases the job either way, so a
+    /// failure does not wedge the pool.
+    async fn bands_run_beside(
+        started: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        reactor: Option<&Reactor>,
+    ) {
+        // Awaited, not blocked on: on a current-thread test runtime the job's
+        // spawner runs only when this task yields.
+        timeout(Duration::from_secs(3), async {
+            while started.try_recv().is_err() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the held job started");
+        let mut parked = Vec::new();
+        for prio in [
+            CallbackPriority::Low,
+            CallbackPriority::Medium,
+            CallbackPriority::High,
+        ] {
+            let beside = spawn_background(prio, async { 7 });
+            if timeout(Duration::from_secs(3), beside).await.is_err() {
+                parked.push(format!("{prio:?}"));
+            }
+        }
+        if let Some(r) = reactor {
+            let beside = r.spawn(async { 7 });
+            if timeout(Duration::from_secs(3), beside).await.is_err() {
+                parked.push("the reactor's executor".into());
+            }
+        }
+        let _ = release.send(());
+        assert!(parked.is_empty(), "a blocked job parked {parked:?}");
+    }
+
+    /// reviewer3's probe: a cbMedium future awaiting the blocking seam. On a
+    /// hosted build that thread has no runtime entered, where
+    /// `tokio::task::spawn_blocking` panics; the job lands on the runtime the
+    /// test driver adopted, not one of the seam's own.
+    #[epics_macros_rs::epics_test]
+    async fn spawn_blocking_awaited_from_a_band_future() {
+        let ran = spawn_background(CallbackPriority::Medium, async {
+            spawn_blocking(|| {
+                #[cfg(tokio_backend)]
+                assert_eq!(
+                    RuntimeHandle::current().runtime_flavor(),
+                    RuntimeFlavor::CurrentThread,
+                    "the job ran on a runtime other than the adopted one"
+                );
+                5
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!(
+            timeout(Duration::from_secs(3), ran).await.unwrap().unwrap(),
+            5
+        );
+    }
+
+    /// A process that never started a runtime still gets a blocking pool.
+    #[test]
+    fn spawn_blocking_from_a_thread_with_no_runtime() {
+        let job = std::thread::spawn(|| spawn_blocking(|| 9)).join().unwrap();
+        assert_eq!(park_on_interruptible(job, || false).unwrap().unwrap(), 9);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn spawn_blocking_leaves_the_bands_free() {
+        let (job, started, release) = held_job();
+        let held = spawn_blocking(job);
+        bands_run_beside(started, release, None).await;
+        held.await.unwrap();
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn spawn_blocking_with_priority_leaves_the_bands_free() {
+        let (job, started, release) = held_job();
+        let held = spawn_blocking_with_priority(ThreadPriority::Low, job);
+        bands_run_beside(started, release, None).await;
+        held.await.unwrap();
+    }
+
+    /// Bound or not, a reactor's blocking job holds neither a band nor the
+    /// executor's own worker.
+    #[epics_macros_rs::epics_test]
+    async fn reactor_spawn_blocking_leaves_the_bands_and_executor_free() {
+        let exec = Arc::new(
+            crate::runtime::background::DedicatedExecutor::new(
+                "BLKEXEC",
+                ThreadPriority::Custom(18),
+                1,
+            )
+            .expect("executor starts"),
+        );
+        let reactor = Reactor::current().expect("the test driver enters an executor");
+        for r in [reactor.clone(), reactor.with_executor(&exec)] {
+            let (job, started, release) = held_job();
+            let held = r.spawn_blocking(job);
+            bands_run_beside(started, release, Some(&r)).await;
+            held.await.unwrap();
+        }
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn fs_blocking_leaves_the_bands_free() {
+        let (job, started, release) = held_job();
+        let held = Reactor::current()
+            .expect("the test driver enters an executor")
+            .spawn(crate::runtime::fs::blocking(move || {
+                job();
+                Ok(())
+            }));
+        bands_run_beside(started, release, None).await;
+        held.await.unwrap().unwrap();
+    }
+
     /// The property `spawn_dedicated_thread` exists for. A future written for
     /// the hosted driver — one that spawns a task and arms a timer — must run
     /// unchanged on the thread this hands back. On a plain `std::thread` it
@@ -4003,7 +4220,7 @@ mod tests {
         let (release, mut park_here) = tokio::sync::mpsc::channel::<()>(1);
         let (report, outcome) = std::sync::mpsc::channel();
 
-        let _handle = spawn_blocking_on(&pool.handle(), DEFAULT_SPAWN_PRIORITY, move || {
+        let _handle = spawn_blocking_on(&pool.handle(), DEFAULT_SPAWN_PRIORITY, move |_| {
             let _ = report.send(block_on_sync(async move { park_here.recv().await }));
         });
 

@@ -197,20 +197,16 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
             .unwrap();
     }
 
-    let start = std::time::Instant::now();
+    // Held across the call as in the zero-delay case below: the group cannot
+    // fire before `epoch` is dropped, however long this thread is held up.
+    let epoch = db.lock_records(["H6:SEQ"]);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("H6:SEQ", &mut visited)
         .await
         .unwrap();
-    let returned_after = start.elapsed();
 
-    // C `process` returns straight through `processNextLink`; it does not wait
-    // out `DLY0`.
-    assert!(
-        returned_after < Duration::from_millis(200),
-        "seq process must return before DLY0 elapses, took {returned_after:?}"
-    );
-    // The group has NOT run yet.
+    // C `process` returns straight through `processNextLink`; the group has
+    // NOT run yet.
     assert_eq!(
         db.get_record("H6:SEQTGT")
             .unwrap()
@@ -225,6 +221,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         db.get_record("H6:SEQ").unwrap().read().is_processing(),
         "seq must be PACT while its DLYn chain runs"
     );
+    drop(epoch);
     // The gate is free while the delay runs — the whole point of the port.
     probe_gate_is_free(&db, "H6:SEQ")
         .await
@@ -266,41 +263,6 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
     );
 }
 
-/// A `LNKn` target whose put parks the thread that is driving it. Which
-/// thread that is, is the whole question of UI-81 — so the test needs a put it
-/// can still be standing inside while it asks.
-struct ParkingTarget {
-    val: f64,
-}
-
-impl Record for ParkingTarget {
-    fn record_type(&self) -> &'static str {
-        "ui81_parking_target"
-    }
-    fn process(&mut self) -> CaResult<ProcessOutcome> {
-        Ok(ProcessOutcome::complete())
-    }
-    fn get_field(&self, name: &str) -> Option<EpicsValue> {
-        match name {
-            "VAL" => Some(EpicsValue::Double(self.val)),
-            _ => None,
-        }
-    }
-    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match name {
-            "VAL" => {
-                std::thread::sleep(Duration::from_millis(300));
-                self.val = value.to_f64().ok_or(CaError::InvalidValue("bad".into()))?;
-                Ok(())
-            }
-            _ => Err(CaError::FieldNotFound(name.into())),
-        }
-    }
-    fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
-    }
-}
-
 /// Boundary 2b (UI-81) — a seq whose selected groups are ALL `DLYn == 0` is
 /// async too.
 ///
@@ -313,8 +275,9 @@ impl Record for ParkingTarget {
 /// callback task. The port used to walk a zero-delay group inline, which held
 /// the caller for the whole chain and never made the record active.
 ///
-/// The parking target puts the boundary beyond a race: the walk is provably
-/// still inside the first group's put while this test asks its questions.
+/// The test holds the seq's lock set across the call, as C's caller holds
+/// `dbScanLock` across `dbProcess`, so the boundary is an ordering and not a
+/// race: the group cannot run on the callback task until the test lets go.
 // RTEMS-EXEC-MODEL-ALLOW(1): multi-thread flavored — the gate contention needs
 // real parallel workers; checked to run and pass in the exec-backend suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -323,7 +286,7 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
     db.add_record("UI81:SEQ", Box::new(SeqRecord::new()))
         .await
         .unwrap();
-    db.add_record("UI81:TGT", Box::new(ParkingTarget { val: 0.0 }))
+    db.add_record("UI81:TGT", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
     {
@@ -341,18 +304,22 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
             .unwrap();
     }
 
-    let start = std::time::Instant::now();
+    let epoch = db.lock_records(["UI81:SEQ"]);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("UI81:SEQ", &mut visited)
         .await
         .unwrap();
-    let returned_after = start.elapsed();
 
-    // C returns through `processNextLink` without running a single group.
-    assert!(
-        returned_after < Duration::from_millis(150),
-        "a zero-delay seq must return before its group's put completes, took \
-         {returned_after:?}"
+    // C returns through `processNextLink` without running a single group:
+    // whatever the chain did before `epoch` is dropped, it did inline.
+    assert_eq!(
+        db.get_record("UI81:TGT")
+            .unwrap()
+            .read()
+            .record
+            .get_field("VAL"),
+        Some(EpicsValue::Double(0.0)),
+        "a zero-delay seq must return before its group runs"
     );
     // `prec->pact = TRUE` (`seqRecord.c:143`) — the record is ACTIVE, which is
     // what makes it visible as busy and what `asyncFinish` later clears.
@@ -360,6 +327,7 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
         db.get_record("UI81:SEQ").unwrap().read().is_processing(),
         "a zero-delay seq must be PACT across its group chain"
     );
+    drop(epoch);
     // And the caller is not the walker: the gate the walk re-takes per group
     // (`processCallback`'s `dbScanLock`, `:252`) is not held by this thread.
     probe_gate_is_free(&db, "UI81:SEQ")

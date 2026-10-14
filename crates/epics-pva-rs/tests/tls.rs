@@ -322,26 +322,51 @@ async fn tls_listener_on_every_interface_uses_tls_port() {
         require_client_cert: false,
         trust_roots: Arc::new(RootCertStore::empty()),
     });
-    let free = |ip: &str| {
-        std::net::TcpListener::bind((ip, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
+    // Explicit numbers on both: an entry on port 0 hands its TLS listener
+    // `tls_port` anyway, so TLS bound on the entries' own port would pass.
+    // A number somebody takes before the server binds it fails the start or
+    // moves the listener, so the pair is retried with fresh numbers.
+    let pick = || {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr())
+            .expect("pick a port")
+            .port()
     };
-    let (a, b, tls) = (
-        free("127.0.0.1"),
-        free("127.0.0.2"),
-        free("127.0.0.1").port(),
-    );
-    let cfg = PvaServerConfig {
-        interfaces: vec![a, b],
-        tls_port: tls,
-        tls: Some(server_tls),
-        ..PvaServerConfig::isolated()
+    let mut tries = 0;
+    let (server, report) = loop {
+        tries += 1;
+        let (tcp, tls) = (pick(), pick());
+        let cfg = PvaServerConfig {
+            interfaces: vec![
+                std::net::SocketAddr::from(([127, 0, 0, 1], tcp)),
+                std::net::SocketAddr::from(([127, 0, 0, 2], tcp)),
+            ],
+            tls_port: tls,
+            tls: Some(server_tls.clone()),
+            ..PvaServerConfig::isolated()
+        };
+        let started =
+            epics_pva_rs::server_native::PvaServer::start(Arc::new(StaticSource::new()), cfg);
+        let got = match started {
+            Ok(server) => {
+                let report = server.report();
+                if tcp != tls && (report.tcp_port, report.tls_port) == (tcp, tls) {
+                    break (server, report);
+                }
+                server.stop();
+                format!("tcp {} tls {}", report.tcp_port, report.tls_port)
+            }
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            tries < 5,
+            "asked for tcp {tcp} tls {tls}, got {got}, {tries} times"
+        );
     };
-    let server = epics_pva_rs::server_native::PvaServer::start(Arc::new(StaticSource::new()), cfg)
-        .expect("server start");
-    assert_eq!(server.report().tls_port, tls);
+    let (tcp, tls) = (report.tcp_port, report.tls_port);
+    assert_ne!(tls, tcp, "TLS must have its own listener");
+    let a = std::net::SocketAddr::from(([127, 0, 0, 1], tcp));
+    let b = std::net::SocketAddr::from(([127, 0, 0, 2], tcp));
     for addr in [
         a,
         b,

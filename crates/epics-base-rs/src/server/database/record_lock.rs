@@ -430,13 +430,47 @@ type Set = &'static LockSet;
 /// [`Self::acquire_fresh`] exists to catch.
 pub(crate) struct LockRecord {
     plock_set: AtomicPtr<LockSet>,
+    hints: CycleHints,
+}
+
+/// What a record's next cycle reads past its cell and lock set, for the scan
+/// walk to prefetch records ahead without their hold (rs2001 tail). The body
+/// is named once at registration ([`RecordCell::indexed`]), the rest by the
+/// record's own frame under its hold ([`InFrame::publish_hints`]).
+#[derive(Default)]
+pub(crate) struct CycleHints {
+    pub(crate) body: crate::server::record::Hint,
+    /// The OUT link's parse, then its `DbLink`.
+    pub(crate) out: [crate::server::record::Hint; 2],
+    /// For each of the first two monitors: its event queue, then its slot.
+    pub(crate) posts: [[crate::server::record::Hint; 2]; 2],
 }
 
 impl LockRecord {
     fn new(set: Set) -> Arc<Self> {
         Arc::new(Self {
             plock_set: AtomicPtr::new(Self::as_ptr(set)),
+            hints: CycleHints::default(),
         })
+    }
+
+    /// Hint the lock set this record names and what its next cycle reads.
+    #[inline(always)]
+    pub(crate) fn prefetch_targets(&self) {
+        let set = self.plock_set.load(Ordering::Relaxed);
+        crate::server::record::prefetch_val(set.cast_const());
+        let h = &self.hints;
+        h.body.prefetch();
+        h.out[0].prefetch();
+        h.out[1].prefetch();
+        h.posts[0][0].prefetch();
+        h.posts[0][1].prefetch();
+        h.posts[1][0].prefetch();
+        h.posts[1][1].prefetch();
+    }
+
+    pub(crate) fn hints(&self) -> &CycleHints {
+        &self.hints
     }
 
     /// The cell a record is born with — C's null `lset` before
@@ -1867,6 +1901,12 @@ impl<'a> InFrame<'a> {
     #[inline(always)]
     pub(crate) fn write(&self) -> HeldMut<'a> {
         self.cell.write_in(self.set)
+    }
+
+    /// Name what this record's next cycle reads, for the scan walk.
+    #[inline(always)]
+    pub(crate) fn publish_hints(&self) {
+        self.read().publish_hints(self.cell.lock_record().hints());
     }
 
     /// The set the frame holds, which a link target merged into it is read

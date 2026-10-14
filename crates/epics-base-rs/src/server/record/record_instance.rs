@@ -3390,6 +3390,11 @@ impl RecordCell {
     /// The cell as registered at record-table index `index`.
     pub(crate) fn indexed(mut self, index: crate::server::database::RecordIdx) -> Self {
         self.index = Some(index);
+        let body = &*self.data.0.get_mut().record;
+        self.lock_record.hints().body.set(
+            (body as *const dyn super::Record).cast(),
+            std::mem::size_of_val(body),
+        );
         self
     }
 
@@ -3739,6 +3744,45 @@ impl RecordCell {
     /// The lock-set cell — C `precord->lset`.
     pub(crate) fn lock_record(&self) -> &std::sync::Arc<crate::server::database::LockRecord> {
         &self.lock_record
+    }
+
+    /// The cell's bytes a process cycle reads: the run
+    /// `the_cycle_read_fields_stay_one_run` pins, from the instance's
+    /// `subscribers` through the cell's `cp_edges`.
+    const CYCLE_RUN: core::ops::Range<usize> = {
+        let start = std::mem::offset_of!(RecordCell, data)
+            + std::mem::offset_of!(LockSetGuarded<RecordInstance>, 0)
+            + std::mem::offset_of!(RecordInstance, subscribers);
+        start
+            ..std::mem::offset_of!(RecordCell, cp_edges)
+                + size_of::<std::sync::atomic::AtomicBool>()
+    };
+
+    /// Hint the lines of the cell's cycle run.
+    #[inline(always)]
+    pub(crate) fn prefetch_cell(&self) {
+        let run = Self::CYCLE_RUN;
+        // The run's start is aligned to its own lowest set bit, at most the cell's.
+        let aligned = (run.start | align_of::<Self>()).isolate_lowest_one();
+        super::prefetch_span(
+            (self as *const Self).cast::<u8>().wrapping_add(run.start),
+            run.end - run.start,
+            aligned,
+        );
+    }
+
+    /// Hint the cell's `LockRecord` and name — fields outside the instance,
+    /// so no hold is needed to follow them.
+    #[inline(always)]
+    pub(crate) fn prefetch_lock_record(&self) {
+        super::prefetch_val(std::sync::Arc::as_ptr(&self.lock_record));
+        super::prefetch_val(self.name.as_ptr());
+    }
+
+    /// Hint what the `LockRecord` names: the lock set and the cycle's hints.
+    #[inline(always)]
+    pub(crate) fn prefetch_targets(&self) {
+        self.lock_record.prefetch_targets();
     }
 }
 
@@ -5589,6 +5633,25 @@ fn walk_skip_term(field: &str, deadband_field: &str, event_posted: &[&str]) -> b
 }
 
 impl RecordInstance {
+    /// Name what the next cycle reads past the cell into `hints`: the OUT
+    /// link's parse and `DbLink`, and the first two monitors' queue slots.
+    #[inline(always)]
+    pub(crate) fn publish_hints(&self, hints: &crate::server::database::CycleHints) {
+        let parse = self.parsed_out.shared();
+        hints.out[0].set_arc(parse);
+        match &**parse {
+            super::ParsedLink::Db(link) => hints.out[1].set_arc(link),
+            _ => hints.out[1].clear(),
+        }
+        let mut subs = self.subscribers.iter();
+        for pair in &hints.posts {
+            match subs.next() {
+                Some(s) => s.sub().sink.publish_hints(&pair[0], &pair[1]),
+                None => pair.iter().for_each(|h| h.clear()),
+            }
+        }
+    }
+
     pub fn new(name: String, record: impl Record) -> Self {
         Self::new_boxed(name, Box::new(record))
     }
@@ -12681,7 +12744,7 @@ mod record_cell_layout_tests {
             mlst,
             alst,
         }));
-        packed_in_order(layout!(RecordInstance {
+        let instance = layout!(RecordInstance {
             parsed_inputs,
             link_slots,
             link_rows,
@@ -12721,8 +12784,9 @@ mod record_cell_layout_tests {
             last_posted,
             posted,
             monitor_plan,
-        }));
-        packed_in_order(layout!(RecordCell {
+        });
+        packed_in_order(instance);
+        let cell = layout!(RecordCell {
             data,
             lock_record,
             borrow,
@@ -12740,7 +12804,34 @@ mod record_cell_layout_tests {
             load_order,
             bkpt,
             string_typed,
-        }));
+        });
+        packed_in_order(cell);
+
+        // The cell prefetch covers this run and nothing past it: from the
+        // first field after the instance's marker to the last before the
+        // cell's.
+        fn field(fields: &[(&str, usize, usize, usize)], name: &str) -> (usize, usize) {
+            let f = fields.iter().find(|f| f.0 == name).unwrap();
+            (f.1, f.2)
+        }
+        let (first, _) = field(&instance.3, "subscribers");
+        let (last, last_size) = field(&cell.3, "cp_edges");
+        assert_eq!(RecordCell::CYCLE_RUN, first..last + last_size);
+        assert!(
+            instance
+                .3
+                .iter()
+                .take_while(|f| f.0 != "subscribers")
+                .all(|f| f.1 + f.2 <= first),
+            "a field before the run's first sits inside it"
+        );
+        assert!(
+            cell.3
+                .iter()
+                .skip_while(|f| f.0 != "init_owed")
+                .all(|f| f.1 >= last + last_size),
+            "a field after the run's last sits inside it"
+        );
     }
 }
 

@@ -11,6 +11,8 @@ mod link;
 mod menu_choices;
 pub mod menu_scan;
 mod pini;
+mod prefetch;
+pub(crate) use prefetch::{Hint, prefetch_span, prefetch_val};
 mod process_passive;
 pub(crate) mod record_instance;
 mod record_trait;

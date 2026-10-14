@@ -32,7 +32,7 @@ pub use processing::{
     AsyncDbHandle, AsyncToken, ExternalCpProcess, InputLinkTexts, PostItem, PostRule, ProcStack,
     ProcessCallback, TokenWatch, WriteDone, WriteDoneSource,
 };
-pub(crate) use record_lock::{FrameGate, InFrame, InitPass, LockRecord, SetGuard};
+pub(crate) use record_lock::{CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard};
 pub use record_lock::{
     LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, scan_lock_held,
 };

@@ -473,8 +473,8 @@ struct QueInner {
     burst_next: Option<Arc<EvQue>>,
     /// C's `evSubscrip`s attached here, each in the slot its handles name.
     /// Sized at queue creation for the quota's monitor cap, so neither attach
-    /// nor detach allocates.
-    subs: Vec<Option<SubQ>>,
+    /// nor detach allocates, and never moved: [`EvQue::slab`] is its address.
+    subs: Box<[Option<SubQ>]>,
     /// Slots free for the next attach.
     free: Vec<u16>,
     /// C `event_que::quota` (`dbEvent.c:79`) — ring entries reserved by the
@@ -707,6 +707,9 @@ impl QueInner {
 pub struct EvQue {
     flow: Arc<FlowCtrl>,
     inner: Mutex<QueInner>,
+    /// The address of `inner`'s `subs`, for a prefetch hint taken without
+    /// the lock.
+    slab: usize,
 }
 
 /// The only way to a [`Retired`]: its fields and its guard's are private to
@@ -823,8 +826,10 @@ impl EvQue {
         // The quota admits at most `size / EVENT_ENTRIES - 1` monitors.
         let slots = u16::try_from(size / EVENT_ENTRIES)
             .expect("events_per_que() is capped at MAX_EVENTS_PER_QUE");
+        let subs: Box<[Option<SubQ>]> = (0..slots).map(|_| None).collect();
         Self {
             flow,
+            slab: subs.as_ptr().addr(),
             inner: Mutex::new(QueInner {
                 ring: (0..size).map(|_| None).collect(),
                 getix: 0,
@@ -833,7 +838,7 @@ impl EvQue {
                 draining: false,
                 in_burst: false,
                 burst_next: None,
-                subs: (0..slots).map(|_| None).collect(),
+                subs,
                 free: (0..slots).rev().collect(),
                 quota: 0,
                 size,
@@ -1402,6 +1407,19 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// Name this monitor's queue and slot, which a post reads.
+    #[inline(always)]
+    pub(crate) fn publish_hints(
+        &self,
+        que: &crate::server::record::Hint,
+        slot: &crate::server::record::Hint,
+    ) {
+        const SLOT: usize = std::mem::size_of::<Option<SubQ>>();
+        que.set_arc(&self.que);
+        let at = self.que.slab + usize::from(self.id.slot()) * SLOT;
+        slot.set(std::ptr::without_provenance(at), SLOT);
+    }
+
     /// C `db_queue_event_log` for this subscription: append, or replace this
     /// monitor's last queued entry in place. The single owner of that decision.
     pub fn post(&self, event: MonitorEvent) -> PostOutcome {

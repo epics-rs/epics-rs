@@ -2602,6 +2602,7 @@ impl PvDatabase {
             is_continuation,
             device_callback,
         );
+        record_gate.frame(&rec).publish_hints();
 
         // Breakpoint auto-print, C `dbAccess.c:614-616` — after record
         // support, under the same `lset_stack_count` guard. Reloaded rather

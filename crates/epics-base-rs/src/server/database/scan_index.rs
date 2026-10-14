@@ -990,7 +990,26 @@ impl ScanCursor<'_> {
         {
             self.resync(db);
         }
-        let key = self.snapshot.as_ref()?.get(self.next)?;
+        let snap = self.snapshot.as_ref()?;
+        let n = self.next;
+        // A record's DRAM misses (cell, then what it points at, then what
+        // that names) are serial inside its own cycle; started here, records
+        // ahead, they overlap the current one's (rs2001 tail).
+        if let Some(rec) = snap.get(n + 3).and_then(|k| k.handle.as_ref()) {
+            rec.prefetch_cell();
+        }
+        if let Some(rec) = snap.get(n + 2).and_then(|k| k.handle.as_ref()) {
+            rec.prefetch_lock_record();
+        }
+        if let Some(rec) = snap.get(n + 1).and_then(|k| k.handle.as_ref()) {
+            rec.prefetch_targets();
+        }
+        let key = snap.get(n)?;
+        if let Some(rec) = key.handle.as_ref() {
+            rec.prefetch_cell();
+            rec.prefetch_lock_record();
+            rec.prefetch_targets();
+        }
         self.next += 1;
         Some((&key.name, key.handle.as_ref()))
     }
@@ -1045,6 +1064,70 @@ mod tests {
     use super::EventName;
     use super::PvDatabase;
     use crate::server::record::ScanType;
+
+    /// A frame names on its `LockRecord` what the record's next cycle reads —
+    /// the OUT link's `DbLink`, each monitor's queue and slot — and clears
+    /// what the record no longer has, so the walk is never handed a dropped
+    /// one's address.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[epics_macros_rs::epics_test]
+    async fn a_frame_names_its_next_cycles_reads_for_the_walk() {
+        use crate::server::record::{DbLink, EventMask, ParsedLink};
+        use crate::types::{DbFieldType, EpicsValue};
+        const COUNTS: usize = 2 * std::mem::size_of::<usize>();
+
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ao, "A") {} record(ao, "T") { field(OUT, "A PP") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .expect("db")
+            .build()
+            .await
+            .expect("ioc");
+        let t = db.get_record("T").unwrap();
+        let h = t.lock_record().hints();
+        let body = (&*t.read().record as *const dyn crate::server::record::Record)
+            .cast::<u8>()
+            .addr();
+        let named = |p: usize, len| {
+            let h = crate::server::record::Hint::default();
+            h.set(core::ptr::without_provenance(p), len);
+            h.named()
+        };
+        assert_eq!(
+            h.body.named().0,
+            named(body, 1).0,
+            "registration names the body"
+        );
+
+        let _reader = t
+            .write()
+            .add_subscriber("VAL", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("monitor");
+        let mut stack = crate::server::database::ProcStack::new();
+        db.process_record_with_links_sync("T", &mut stack).unwrap();
+        {
+            let inst = t.read();
+            let ParsedLink::Db(link) = inst.parsed_out.link() else {
+                panic!("OUT is a DB link");
+            };
+            let at = std::sync::Arc::as_ptr(link).cast::<u8>().addr() - COUNTS;
+            assert_eq!(
+                h.out[1].named(),
+                named(at, std::mem::size_of::<DbLink>() + COUNTS)
+            );
+        }
+        assert_ne!(h.posts[0][0].named().1, 0, "the monitor's queue");
+        assert_ne!(h.posts[0][1].named().1, 0, "the monitor's slot");
+        assert_eq!(h.posts[1][0].named(), (0, 0), "one monitor, one pair");
+
+        db.put_record_field_from_ca("T", "OUT", EpicsValue::String(String::new().into()))
+            .await
+            .unwrap();
+        db.process_record_with_links_sync("T", &mut stack).unwrap();
+        assert_eq!(h.out[1].named(), (0, 0), "a cleared OUT names no DbLink");
+    }
 
     /// The cycle guard belongs to the frame that inserted it, and a frame
     /// that does not run must not insert one. The set is ONE per sweep

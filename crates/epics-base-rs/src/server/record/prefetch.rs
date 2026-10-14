@@ -3,13 +3,15 @@
 const LINE: usize = 64;
 
 /// The lines of the `len` bytes at `start`, as the first and a count: every
-/// line of `[start & !63, start + len)`, so an unaligned object's last line
-/// is covered too.
+/// line from `start`'s to the last byte's, and none for an empty span.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
 fn span(start: usize, len: usize) -> (usize, usize) {
     let first = start & !(LINE - 1);
-    (first, (start + len - first).div_ceil(LINE))
+    match len.checked_sub(1) {
+        Some(last) => (first, (start + last) / LINE - start / LINE + 1),
+        None => (first, 0),
+    }
 }
 
 /// Hint every cache line of the `T` at `p` into L1; its constant size lets
@@ -28,14 +30,18 @@ pub(crate) fn prefetch_span(p: *const u8, size: usize, align: usize) {
 
 /// One address in each line of `[start, start + size)` for a `start` aligned
 /// to `align`: a point every line from `start`, then the last byte unless the
-/// alignment already puts it in the last point's line.
+/// alignment already puts it in the last point's line. An empty object has
+/// no last byte, so no point.
 #[inline(always)]
 fn points(start: usize, size: usize, align: usize, mut f: impl FnMut(usize)) {
+    let Some(last) = size.checked_sub(1) else {
+        return;
+    };
     for k in 0..size.div_ceil(LINE) {
         f(start + k * LINE);
     }
-    if size % LINE != 1 && align % LINE != 0 {
-        f(start + size - 1);
+    if last % LINE != 0 && align % LINE != 0 {
+        f(start + last);
     }
 }
 
@@ -190,13 +196,26 @@ mod tests {
         assert_eq!(h.named().1, 0);
     }
 
+    /// An empty span, a zero-sized type's included, names no line, even at
+    /// address 0 where its last byte would wrap.
+    #[test]
+    fn an_empty_span_names_no_line() {
+        for start in [0, 0x1000, 0x1010] {
+            assert_eq!(set(start, 0), [] as [usize; 0], "start {start:#x}");
+            for align in [1, 8, 16, 64] {
+                super::points(start, 0, align, |a| panic!("empty span named {a:#x}"));
+            }
+        }
+        super::prefetch_val(core::ptr::null::<()>());
+    }
+
     /// Every start alignment against every size up to three lines: the fixed
     /// points name exactly the lines [`span`](super::span) does.
     #[test]
     fn fixed_points_name_the_same_lines() {
         for align in [1, 8, 16, 64] {
-            for size in (1..=192).filter(|n| n % align == 0) {
-                for start in (0x1000..0x1040).step_by(align) {
+            for size in (0..=192).filter(|n| n % align == 0) {
+                for start in (0..0x40).chain(0x1000..0x1040).step_by(align) {
                     let mut got = Vec::new();
                     super::points(start, size, align, |a| got.push(a & !63));
                     got.dedup();

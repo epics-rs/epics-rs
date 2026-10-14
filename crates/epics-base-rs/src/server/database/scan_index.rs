@@ -1101,7 +1101,7 @@ mod tests {
             "registration names the body"
         );
 
-        let _reader = t
+        let reader = t
             .write()
             .add_subscriber("VAL", 1, DbFieldType::Double, EventMask::VALUE.bits())
             .expect("monitor");
@@ -1121,6 +1121,14 @@ mod tests {
         assert_ne!(h.posts[0][0].named().1, 0, "the monitor's queue");
         assert_ne!(h.posts[0][1].named().1, 0, "the monitor's slot");
         assert_eq!(h.posts[1][0].named(), (0, 0), "one monitor, one pair");
+
+        t.write().remove_subscriber(reader.id());
+        db.process_record_with_links_sync("T", &mut stack).unwrap();
+        assert_eq!(
+            h.posts[0].each_ref().map(|h| h.named()),
+            [(0, 0); 2],
+            "a removed monitor names no queue or slot"
+        );
 
         db.put_record_field_from_ca("T", "OUT", EpicsValue::String(String::new().into()))
             .await

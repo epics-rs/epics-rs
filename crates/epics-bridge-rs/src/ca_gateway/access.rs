@@ -217,14 +217,15 @@ impl AccessConfig {
     ///
     /// Delegates to the single dump-format owner
     /// [`AccessSecurityConfig::dump_report`] in `epics-base-rs`, shared
-    /// with the `asdbdump` iocsh command. The verbose member/client
-    /// listing of C's `asDumpFP(..., verbose=TRUE)` is not included (no
-    /// live AS-member registry — see that method's note).
+    /// with the `asdbdump` iocsh command. The gateway resolves no `INP*`
+    /// link, so each prints as C's never-connected channel.
     pub fn dump_report(&self) -> Option<String> {
         match &self.mode {
             // The R1-R3 reports are assembled as text; a non-UTF-8 name is
             // replaced here rather than carried as bytes through them.
-            Mode::Rules(cfg) => Some(String::from_utf8_lossy(&cfg.dump_report()).into_owned()),
+            Mode::Rules(cfg) => {
+                Some(String::from_utf8_lossy(&cfg.dump_report(&|_| None)).into_owned())
+            }
             Mode::ReadOnly | Mode::AllowAll => None,
         }
     }

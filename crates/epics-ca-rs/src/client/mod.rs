@@ -1907,6 +1907,8 @@ impl CaChannel {
         epics_base_rs::runtime::task::timeout(timeout, reply_rx)
             .await
             .map_err(|_| {
+                // Display text only: `CaError` carries `String`, and libca has
+                // no counterpart message whose bytes this would have to match.
                 CaError::ChannelNotFound(String::from_utf8_lossy(&self.pv_name).into_owned())
             })?
             .map_err(|_| CaError::Shutdown)
@@ -4647,7 +4649,7 @@ fn handle_server_disconnect(
         exception_slot,
         types::CaException {
             kind: types::CaExceptionKind::ServerDisconnect,
-            message: "server-initiated channel close".to_string(),
+            message: b"server-initiated channel close".to_vec(),
             server_addr: Some(server_addr),
             pv_name: Some(pv_name),
             status: None,
@@ -6426,7 +6428,7 @@ mod disconnect_transition_tests {
             let in_flight = types::InFlightOps::new();
             let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
 
-            let raised: Arc<parking_lot::Mutex<Vec<(u32, String, types::ExceptionSite)>>> =
+            let raised: Arc<parking_lot::Mutex<Vec<(u32, Vec<u8>, types::ExceptionSite)>>> =
                 Arc::new(parking_lot::Mutex::new(Vec::new()));
             let sink = raised.clone();
             let slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
@@ -6461,8 +6463,8 @@ mod disconnect_transition_tests {
                 // sentence; `Source File:` is present because `genLocalExcep`
                 // always passes `__FILE__`/`__LINE__`.
                 assert!(
-                    !ctx.is_empty() && !ctx.contains("circuit"),
-                    "context: {ctx}"
+                    !ctx.is_empty() && !ctx.windows(7).any(|w| w == b"circuit"),
+                    "context: {ctx:?}"
                 );
                 assert_eq!(*source, types::LIBCA_CIRCUIT_DISCONNECT_SITE);
             }

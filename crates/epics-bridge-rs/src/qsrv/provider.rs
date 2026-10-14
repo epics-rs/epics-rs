@@ -2238,8 +2238,7 @@ ASG(SECURE) {
 ASG(OPEN) {
     RULE(1, WRITE)
 }
-ASG(LOCKED) {
-}
+ASG(LOCKED)
 "#;
         let cfg = parse_acf(acf_text).unwrap();
         let db = Arc::new(PvDatabase::new());

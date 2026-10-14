@@ -378,7 +378,10 @@ pub fn set_crate_path(name: &str, manifest_dir: &str, relative: &str) {
 /// caller picks (libca `<unknown host>`, pvxs `invalidhost.`, ca-gateway
 /// `gateway`); C never substitutes `localhost`.
 pub fn hostname() -> Option<Vec<u8>> {
-    let name = hostname::get().ok()?;
+    host_bytes(hostname::get().ok()?)
+}
+
+fn host_bytes(name: std::ffi::OsString) -> Option<Vec<u8>> {
     #[cfg(unix)]
     let name = std::os::unix::ffi::OsStringExt::into_vec(name);
     #[cfg(not(unix))]
@@ -442,6 +445,16 @@ mod tests {
     use super::super::env_table::*;
     use super::*;
     use serial_test::serial;
+
+    /// Setting a non-UTF-8 host name needs root, so the conversion is tested
+    /// on its own.
+    #[cfg(unix)]
+    #[test]
+    fn host_bytes_keeps_a_non_utf8_host_name() {
+        use std::os::unix::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_vec(b"h\xff".to_vec());
+        assert_eq!(host_bytes(name).as_deref(), Some(&b"h\xff"[..]));
+    }
 
     /// A scratch parameter: the accessors are the unit under test, and the
     /// generated table is not the place to add fixtures.

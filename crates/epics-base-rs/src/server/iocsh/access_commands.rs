@@ -412,19 +412,20 @@ fn cmd_asdbdump() -> CommandDef {
             // Delegate to the single dump-format owner in
             // `access_security.rs` (shared with the CA gateway R3 report),
             // printing each rendered line through the shell.
-            with_config(ctx, |cfg| println_dump(ctx, &cfg.dump_report()))
+            with_config(ctx, |cfg| {
+                println_dump(ctx, &cfg.dump_report(&|link| inp_link_value(ctx, link)))
+            })
         },
     )
 }
 
-/// Print the INP links and RULEs of one ASG (used by `asprules`).
-/// Delegates to [`AccessSecurityConfig::fmt_asg`] — the single owner of
-/// the rule-dump format shared with `asdbdump` and the CA gateway R3
-/// report — then prints each rendered line through the shell.
-fn print_asg(ctx: &CommandContext, cfg: &AccessSecurityConfig, name: &[u8]) {
-    let mut buf = Vec::new();
-    cfg.fmt_asg(name, &mut buf);
-    println_dump(ctx, &buf);
+/// An ASG `INP*` link's live value, as `asCa.c`'s channel holds it; `None`
+/// is a channel that never connected.
+fn inp_link_value(ctx: &CommandContext, link: &str) -> Option<f64> {
+    let (record, field) = crate::server::access_security::inp_link_target(link);
+    let rec = ctx.db().get_record(record)?;
+    let inst = rec.read();
+    inst.resolve_field(field).and_then(|v| v.to_f64())
 }
 
 /// Print a rendered dump line by line, as the bytes C's `%s` writes.
@@ -449,21 +450,45 @@ fn cmd_aspuag() -> CommandDef {
                 ArgValue::String(s) => Some(s.as_str()),
                 _ => None,
             };
-            with_config(ctx, |cfg| {
-                let mut names: Vec<_> = cfg.uag.keys().collect();
-                names.sort();
-                for name in names {
-                    if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
-                        continue;
-                    }
-                    ctx.println_bytes(&[b"UAG(", name.as_slice(), b")"].concat());
-                    for m in &cfg.uag[name] {
-                        ctx.println_bytes(&[b"\t", m.as_slice()].concat());
-                    }
-                }
-            })
+            with_config(ctx, |cfg| print_groups(ctx, b"UAG", &cfg.uag, filter))
         },
     )
+}
+
+/// C `asDumpUagFP` / `asDumpHagFP` (asLibRoutines.c:674-728): one line per
+/// group in name order, its name raw and each member through `asDumpQuoted`.
+fn print_groups(
+    ctx: &CommandContext,
+    kind: &[u8],
+    groups: &std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    filter: Option<&str>,
+) {
+    if groups.is_empty() {
+        ctx.println_bytes(&[b"No ", kind, b"s"].concat());
+        return;
+    }
+    let mut names: Vec<_> = groups.keys().collect();
+    names.sort();
+    for name in names {
+        if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
+            continue;
+        }
+        let mut line = [kind, b"(", name.as_slice(), b")"].concat();
+        let members = &groups[name];
+        if !members.is_empty() {
+            line.extend_from_slice(b" {");
+            for (i, m) in members.iter().enumerate() {
+                if i > 0 {
+                    line.push(b',');
+                }
+                line.push(b'"');
+                line.extend_from_slice(crate::runtime::epics_string::print_escaped(m).as_bytes());
+                line.push(b'"');
+            }
+            line.push(b'}');
+        }
+        ctx.println_bytes(&line);
+    }
 }
 
 /// `asphag [hagname]` — show members of a HAG, or every HAG.
@@ -481,19 +506,7 @@ fn cmd_asphag() -> CommandDef {
                 ArgValue::String(s) => Some(s.as_str()),
                 _ => None,
             };
-            with_config(ctx, |cfg| {
-                let mut names: Vec<_> = cfg.hag.keys().collect();
-                names.sort();
-                for name in names {
-                    if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
-                        continue;
-                    }
-                    ctx.println_bytes(&[b"HAG(", name.as_slice(), b")"].concat());
-                    for h in &cfg.hag[name] {
-                        ctx.println_bytes(&[b"\t", h.as_slice()].concat());
-                    }
-                }
-            })
+            with_config(ctx, |cfg| print_groups(ctx, b"HAG", &cfg.hag, filter))
         },
     )
 }
@@ -514,15 +527,9 @@ fn cmd_asprules() -> CommandDef {
                 _ => None,
             };
             with_config(ctx, |cfg| {
-                let mut names: Vec<_> = cfg.asg.keys().collect();
-                names.sort();
-                for name in names {
-                    if filter.is_some_and(|f| f.as_bytes() != name.as_slice()) {
-                        continue;
-                    }
-                    ctx.println_bytes(&[b"ASG(", name.as_slice(), b")"].concat());
-                    print_asg(ctx, cfg, name);
-                }
+                let dump =
+                    cfg.dump_rules(filter.map(str::as_bytes), &|link| inp_link_value(ctx, link));
+                println_dump(ctx, &dump)
             })
         },
     )
@@ -1007,11 +1014,13 @@ mod tests {
     }
 
     /// Run an argument-less command and return the bytes it printed.
-    fn run_bytes(ctx: &CommandContext, name: &str) -> Vec<u8> {
+    fn run_bytes(ctx: &CommandContext, line: &str) -> Vec<u8> {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
-        let cmd = reg.get(name).unwrap();
-        let args = parse_args(&[], &cmd.args).unwrap();
+        let mut words = line.split(' ');
+        let cmd = reg.get(words.next().unwrap()).unwrap();
+        let argv: Vec<String> = words.map(String::from).collect();
+        let args = parse_args(&argv, &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         ctx.with_output(std::fs::File::create(&path).unwrap(), || {
@@ -1042,7 +1051,9 @@ mod tests {
     fn as_init_file_substitutes_without_touching_non_utf8_bytes() {
         let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
         tmp.as_file()
-            .write_all(b"UAG(u\xff) { \"$(M)\" }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(u\xff) } }\n")
+            .write_all(
+                b"UAG(\"u\xff\") { \"$(M)\" }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(\"u\xff\") } }\n",
+            )
             .unwrap();
         let cfg = as_init_file(tmp.path().to_str().unwrap(), Some("M=\"b\u{e9}\"")).unwrap();
         assert_eq!(
@@ -1061,30 +1072,63 @@ mod tests {
         let (_db, ctx) = make_ctx();
         let _tmp = load_acf(
             &ctx,
-            b"UAG(u\xff) { \"a\xfe\" }\nHAG(h\xff) { \"x\xfd\" }\n\
-              ASG(g\xff) { INPA(\"pv\xfc\") RULE(1, WRITE) { UAG(u\xff) HAG(h\xff) } }\n",
+            b"UAG(\"u\xff\") { \"a\xfe\" }\nHAG(\"h\xff\") { \"x\xfd\" }\n\
+              ASG(\"g\xff\") { INPA(\"pv\xfc\") RULE(1, WRITE) { UAG(\"u\xff\") HAG(\"h\xff\") } }\n",
         );
         let has = |out: &[u8], needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
         let dump = run_bytes(&ctx, "asdbdump");
+        // Whole lines: `UAG(u\xff)` is also a substring of the rule's `\t\tUAG(u\xff)`.
+        let lines: Vec<&[u8]> = dump.split(|&b| b == b'\n').collect();
         for needle in [
-            b"UAG(u\xff)".as_slice(),
-            b"HAG(h\xff)",
-            b"ASG(g\xff)",
-            b"\tINPA(\"pv\xfc\")",
+            b"UAG(u\xff) {a\xfe}".as_slice(),
+            b"HAG(h\xff) {x\xfd}",
+            b"ASG(g\xff) {",
+            b"\tINPA(pv\xfc) INVALID value=0.000000",
             b"\t\tUAG(u\xff)",
             b"\t\tHAG(h\xff)",
         ] {
-            assert!(has(&dump, needle), "{needle:?} in {dump:?}");
+            assert!(lines.contains(&needle), "{needle:?} in {dump:?}");
         }
         let hag = run_bytes(&ctx, "asphag");
-        assert!(has(&hag, b"HAG(h\xff)\n\tx\xfd\n"), "{hag:?}");
+        assert!(has(&hag, b"HAG(h\xff) {\"x\\xfd\"}\n"), "{hag:?}");
         let rules = run_bytes(&ctx, "asprules");
-        assert!(has(&rules, b"ASG(g\xff)\n\tINPA(\"pv\xfc\")"), "{rules:?}");
+        assert!(
+            has(&rules, b"ASG(g\xff) {\n\tINPA(pv\xfc) INVALID"),
+            "{rules:?}"
+        );
         let car = run_bytes(&ctx, "ascar");
         assert!(has(&car, b"ASG(g\xff) INPA \"pv\xfc\""), "{car:?}");
         let hash = run_bytes(&ctx, "asDumpHash");
         assert!(has(&hash, b"  a\xfe UAG(u\xff)"), "{hash:?}");
         assert!(has(&hash, b"  x\xfd HAG(h\xff)"), "{hash:?}");
+    }
+
+    /// softIoc's `aspuag`, `aspuag e` and `asphag` on the same file.
+    #[test]
+    fn aspuag_and_asphag_print_as_as_dump_uag_and_hag_fp() {
+        let _guard = as_state_test_guard();
+        reset_as_state_for_test();
+        let (_db, ctx) = make_ctx();
+        let _tmp = load_acf(
+            &ctx,
+            b"UAG(\"u\xff\") { \"a\xfe\", \"\", b }\nUAG(e)\n\
+              HAG(\"h\xff\") { \"x\xfd\", \"y\\\"q\" }\nASG(DEFAULT) { RULE(1,READ) }\n",
+        );
+        assert_eq!(
+            run_bytes(&ctx, "aspuag"),
+            b"UAG(e)\nUAG(u\xff) {\"a\\xfe\",\"\",\"b\"}\n"
+        );
+        assert_eq!(run_bytes(&ctx, "aspuag e"), b"UAG(e)\n");
+        assert_eq!(
+            run_bytes(&ctx, "asphag"),
+            b"HAG(h\xff) {\"x\\xfd\",\"y\\\\\\\"q\"}\n"
+        );
+
+        reset_as_state_for_test();
+        let (_db, bare) = make_ctx();
+        let _tmp2 = load_acf(&bare, b"ASG(DEFAULT) { RULE(1,READ) }\n");
+        assert_eq!(run_bytes(&bare, "aspuag"), b"No UAGs\n");
+        assert_eq!(run_bytes(&bare, "asphag"), b"No HAGs\n");
     }
 
     /// Boundary: access security not active. C `asDumpHashFP` is

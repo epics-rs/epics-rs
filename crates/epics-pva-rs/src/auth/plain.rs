@@ -91,6 +91,37 @@ fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gi
     gids
 }
 
+/// `getgrgid(3)` each gid into its `gr_name` (osgroups.cpp:120-124); a gid
+/// with no group entry names no role.
+#[cfg(local_account_db)]
+fn group_names(gids: &[libc::gid_t]) -> Vec<PvString> {
+    let mut names = Vec::with_capacity(gids.len());
+    for &gid in gids {
+        // SAFETY: getgrgid returns a pointer valid until the next NSS call;
+        // the name is copied out before the next iteration.
+        unsafe {
+            let gr = libc::getgrgid(gid);
+            if !gr.is_null() {
+                names.push(std::ffi::CStr::from_ptr((*gr).gr_name).to_owned());
+            }
+        }
+    }
+    roles_from_gr_names(names.iter().map(|n| n.as_c_str()))
+}
+
+/// pvxs `osdGetRoles` keeps every `gr_name` as the C bytes, sorted and
+/// deduplicated by its `std::set<std::string>`.
+#[cfg(local_account_db)]
+fn roles_from_gr_names<'a>(names: impl IntoIterator<Item = &'a std::ffi::CStr>) -> Vec<PvString> {
+    let mut roles: Vec<PvString> = names
+        .into_iter()
+        .map(|n| PvString::from(n.to_bytes()))
+        .collect();
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
 /// Enumerate the current process's POSIX group names. Mirrors pvxs
 /// `osdGetRoles()` (osgroups.cpp:54). On targets with no local account
 /// database returns an empty list. The `ca` auth method advertises these as
@@ -126,20 +157,7 @@ pub fn posix_groups() -> Vec<PvString> {
         // (osgroups.cpp:65,88) does.
         let gids = getgrouplist_ids(&user_cstr, primary);
         // Step 3: gid → group name via getgrgid.
-        let mut names: Vec<PvString> = Vec::with_capacity(gids.len());
-        for gid in gids {
-            unsafe {
-                let gr = libc::getgrgid(gid);
-                if gr.is_null() {
-                    continue;
-                }
-                // pvxs `osdGetRoles` keeps `gr_name` as the C bytes.
-                names.push(PvString::from(CStr::from_ptr((*gr).gr_name).to_bytes()));
-            }
-        }
-        names.sort();
-        names.dedup();
-        names
+        group_names(&gids)
     }
     #[cfg(not(local_account_db))]
     {
@@ -200,22 +218,7 @@ pub fn osd_get_roles(account: &[u8]) -> Vec<PvString> {
         // getgrouplist(3) doubling loop (osgroups.cpp:82-118).
         let gids = getgrouplist_ids(&name_cstr, pw_gid);
 
-        // gid -> group name via getgrgid, kept as the C bytes.
-        let mut names: Vec<PvString> = Vec::with_capacity(gids.len());
-        for gid in gids {
-            // SAFETY: getgrgid returns a pointer valid until the next NSS
-            // call; the name is copied out immediately.
-            unsafe {
-                let gr = libc::getgrgid(gid);
-                if gr.is_null() {
-                    continue;
-                }
-                names.push(PvString::from(CStr::from_ptr((*gr).gr_name).to_bytes()));
-            }
-        }
-        names.sort();
-        names.dedup();
-        names
+        group_names(&gids)
     }
     #[cfg(not(local_account_db))]
     {
@@ -276,7 +279,7 @@ mod tests {
         // Both halves of the capability must exist: the implementation and the
         // no-database fallback. A count check rather than a mere `contains`, so
         // deleting one arm and leaving the other cannot pass.
-        assert_eq!(prod.matches("#[cfg(local_account_db)]").count(), 3);
+        assert_eq!(prod.matches("#[cfg(local_account_db)]").count(), 5);
         assert_eq!(prod.matches("#[cfg(not(local_account_db))]").count(), 2);
     }
 
@@ -425,6 +428,20 @@ mod tests {
             vec![PvString::from(&b"no\xffsuch"[..])]
         );
         assert_eq!(osd_get_roles(b"root\0x"), osd_get_roles(b"root"));
+    }
+
+    /// A group name that is not UTF-8 is still a role, byte for byte.
+    #[cfg(local_account_db)]
+    #[test]
+    fn a_non_utf8_gr_name_is_kept_as_its_bytes() {
+        let roles = roles_from_gr_names([c"wheel", c"op\xff", c"wheel"]);
+        assert_eq!(
+            roles,
+            [
+                PvString::from(b"op\xff".as_slice()),
+                PvString::from("wheel")
+            ]
+        );
     }
 
     #[cfg(local_account_db)]

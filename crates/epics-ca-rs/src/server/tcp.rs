@@ -13964,7 +13964,7 @@ mod access_change_walk_tests {
     /// reaches `reeval_access_rights` on that driver once a channel exists
     /// (HOST_NAME and CLIENT_NAME are refused after the first channel, and it
     /// has no ACF-reload listener), so this pins its link, not the wire.
-    // RTEMS-EXEC-MODEL-ALLOW(3): all three run and pass under
+    // RTEMS-EXEC-MODEL-ALLOW(5): all five run and pass under
     // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
     #[tokio::test]
     async fn an_access_change_reaches_a_monitor_held_outside_the_async_registry() {
@@ -14053,6 +14053,84 @@ mod access_change_walk_tests {
         assert_eq!(next_event(&state), Some((false, 1.5)), "the restore frame");
         assert_eq!(next_event(&state), None);
     }
+    /// `host_name_action` stores the HOST_NAME bytes as sent, and asCompute
+    /// compares a HAG host with them byte for byte.
+    #[tokio::test]
+    async fn a_non_utf8_host_name_reaches_the_acf_check_byte_for_byte() {
+        use epics_base_rs::server::access_security::{AccessLevel, new_acf_cell, parse_acf};
+        let db = Arc::new(PvDatabase::new());
+        let mut state = ClientState::new(new_acf_cell(None), 5064, db.clone());
+        let (outbox, _drain) = crate::server::outbox::channel();
+        let payload = b"h\xff\0\0\0\0\0\0".to_vec();
+        let mut hdr = CaHeader::new(CA_PROTO_HOST_NAME);
+        hdr.postsize = payload.len() as u16;
+        dispatch_message(
+            &hdr,
+            &payload,
+            &mut state,
+            &db,
+            &outbox,
+            "127.0.0.1:55991".parse().unwrap(),
+            None,
+            SubscriptionDelivery::HandOff,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.hostname.as_bytes(), b"h\xff");
+        let access = |acf: &[u8]| {
+            state
+                .access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0)
+                .0
+        };
+        let rule = b"ASG(DEFAULT) {\n    RULE(1, WRITE) { HAG(hs) }\n}\n";
+        let exact = [b"HAG(hs) { \"h\xff\" }\n".as_slice(), rule].concat();
+        let lossy = [b"HAG(hs) { \"h\xef\xbf\xbd\" }\n".as_slice(), rule].concat();
+        assert_eq!(access(&exact), AccessLevel::ReadWrite);
+        assert_eq!(access(&lossy), AccessLevel::NoAccess);
+    }
+
+    /// `search_reply_tcp` looks the name up by its bytes (camessage.c:2221),
+    /// so `a\xff` does not find a PV named `a\u{FFFD}`.
+    #[tokio::test]
+    async fn a_non_utf8_tcp_search_name_is_not_decoded_lossily() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("a\u{FFFD}", EpicsValue::Double(1.0))
+            .await
+            .expect("add pv");
+        let mut state = ClientState::new(
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            5064,
+            db.clone(),
+        );
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        for (name, want) in [
+            ("a\u{FFFD}".as_bytes(), CA_PROTO_SEARCH),
+            (b"a\xff".as_slice(), CA_PROTO_NOT_FOUND),
+        ] {
+            let mut payload = name.to_vec();
+            payload.resize(name.len().next_multiple_of(8) + 8, 0);
+            let mut hdr = CaHeader::new(CA_PROTO_SEARCH);
+            hdr.postsize = payload.len() as u16;
+            hdr.data_type = CA_DO_REPLY;
+            hdr.count = CA_MINOR_VERSION;
+            dispatch_message(
+                &hdr,
+                &payload,
+                &mut state,
+                &db,
+                &outbox,
+                "127.0.0.1:55991".parse().unwrap(),
+                None,
+                SubscriptionDelivery::HandOff,
+            )
+            .await
+            .unwrap();
+            let out = frames(&mut drain);
+            assert_eq!(out.len(), 1, "{name:?}");
+            assert_eq!(u16::from_be_bytes([out[0][0], out[0][1]]), want, "{name:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_non_utf8_client_name_reaches_the_acf_check_byte_for_byte() {
         use epics_base_rs::server::access_security::{AccessLevel, new_acf_cell, parse_acf};
@@ -14087,6 +14165,15 @@ mod access_change_walk_tests {
                 .access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0)
                 .0,
             AccessLevel::NoAccess
+        );
+        // The member spelled with the same bytes is the one that matches.
+        let exact: &[u8] =
+            b"UAG(ops) { \"op\xff\" }\nASG(DEFAULT) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
+        assert_eq!(
+            state
+                .access_for_asg(&parse_acf(exact).unwrap(), "DEFAULT", 0)
+                .0,
+            AccessLevel::ReadWrite
         );
     }
 }

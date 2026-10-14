@@ -607,13 +607,13 @@ mod tests {
         assert!(body.contains("VAC:PRESSURE asg=DEFAULT level=1"));
         // R3 section: access report carrying the PARSED AS dump
         // (UAG/HAG/ASG/RULE), not the raw ACF file text. The parsed dump
-        // emits `RULE(1,READ)` (no space) under `ASG(DEFAULT)`, distinct
+        // emits `RULE(1,READ,NOTRAPWRITE)` under `ASG(DEFAULT)`, distinct
         // from the file's `RULE(1, READ)`.
         assert!(body.contains("R3 (access security report)"));
         assert!(body.contains("access security rules are installed."));
         assert!(body.contains("--- access security dump ---"));
         assert!(body.contains("ASG(DEFAULT)"));
-        assert!(body.contains("RULE(1,READ)"));
+        assert!(body.contains("RULE(1,READ,NOTRAPWRITE)"));
         // The old raw-file echo must be gone.
         assert!(!body.contains("RULE(1, READ)"));
         // All three sections appended to one file (append, not truncate).
@@ -642,7 +642,7 @@ mod tests {
         // ACF content proven to parse (see upstream.rs ACF tests).
         std::fs::write(
             &acf_path,
-            "ASG(DEFAULT) {\n    RULE(0, READ) { UAG(ops) }\n}\n",
+            "UAG(ops) { alice }\nASG(DEFAULT) {\n    RULE(0, READ) { UAG(ops) }\n}\n",
         )
         .unwrap();
         std::fs::write(&pvl_path, "Beam.*  ALLOW\ntest.*  DENY\n").unwrap();

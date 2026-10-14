@@ -3277,9 +3277,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             .iter()
                             .position(|&b| b == 0)
                             .unwrap_or(msg_bytes.len());
-                        String::from_utf8_lossy(&msg_bytes[..end]).to_string()
+                        msg_bytes[..end].to_vec()
                     } else {
-                        String::new()
+                        Vec::new()
                     };
                     // route to the in-flight operation registry
                     // matching the echoed request command. libca
@@ -3351,7 +3351,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         server = %server_addr,
                         eca = eca_status,
                         cmd = echo.cmmd,
-                        msg = %msg,
+                        msg = %String::from_utf8_lossy(&msg),
                         "CA server error",
                     );
                     // Identity of the failing request, from the record its

@@ -479,9 +479,30 @@ async fn bind_sockets(
 ) -> CaResult<(crate::server::tcp::BoundTcp, crate::server::udp::BoundUdp)> {
     // `rsrv_init` reports its sizing variables first (`caservertask.c:510-530`).
     epics_base_rs::server::event_queue::configure_events_per_que();
-    let tcp = crate::server::tcp::bind_tcp_listeners(tcp_port).await?;
+    // deliberate deviation (user-signed-off 2026-10-14), for a bind nothing
+    // can recover. C's `tryBind` returns -1 silently on EADDRINUSE and
+    // `rsrv_init` drops that interface alone (`caservertask.c:136`, `:630`,
+    // `:745-750`), which `bind_udp_responders` does too — for the broadcast
+    // socket's `tryBind` as well (`:703`). On any other error
+    // `tryBind` prints `CAS: <name> bind ERROR: <why>` and calls
+    // `epicsThreadSuspendSelf()` (`:135-141`), and with no interface left
+    // `rsrv_init` ends in `cantProceed("CAS: No TCP server started")` (`:752`):
+    // `iocInit` hangs on its own thread. Here those two cases return `Err`,
+    // and `run_ca_ioc` returns it.
+    let mut tcp = crate::server::tcp::bind_tcp_listeners(tcp_port).await?;
+    // The TCP set owns the interface list: it has already dropped any address
+    // that is no interface of this host (`caservertask.c:225-226`).
     let cfg = addr_list::from_env()?;
-    let udp = crate::server::udp::bind_udp_responders(udp_port, cfg.intf_addrs, &cfg.mcast_addrs)?;
+    let udp = crate::server::udp::bind_udp_responders_with(
+        udp_port,
+        tcp.interfaces(),
+        &cfg.mcast_addrs,
+        tcp.port(),
+        &crate::server::udp::responder_broadcast_for,
+    )?;
+    // An interface whose UDP bind failed is dropped whole, TCP socket
+    // included (`caservertask.c:744-749`).
+    tcp.retain_interfaces(&udp.interfaces());
     Ok((tcp, udp))
 }
 
@@ -1781,6 +1802,52 @@ mod listeners_need_the_tokio_runtime {
         assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 4242);
 
         server_task.abort();
+    }
+}
+
+#[cfg(test)]
+#[cfg(tokio_backend)]
+mod bind_sockets_tests {
+    use super::*;
+
+    /// A held UDP port on one of two interfaces drops that interface's TCP
+    /// listener too, as `rsrv_init`'s `cleanup:` does.
+    #[tokio::test]
+    async fn an_interface_whose_udp_bind_failed_loses_its_tcp_listener() {
+        let lo2 = std::net::Ipv4Addr::new(127, 0, 0, 2);
+        // SAFETY: nextest runs this test alone in its process; the list is
+        // read once, memoized.
+        unsafe {
+            std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1 127.0.0.2");
+        }
+        // A stranger may hold the picked number on 127.0.0.1 as well, which
+        // fails the start for a reason that says nothing about the rule.
+        let (_held, tcp, udp) = {
+            let mut tries = 0;
+            loop {
+                let held = std::net::UdpSocket::bind((lo2, 0)).expect("hold");
+                let port = held.local_addr().unwrap().port();
+                match bind_sockets(port, 0).await {
+                    Ok((tcp, udp)) => break (held, tcp, udp),
+                    Err(_) if tries < 8 => tries += 1,
+                    Err(e) => panic!("the free interface serves: {e}"),
+                }
+            }
+        };
+        assert_eq!(udp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
+        assert_eq!(tcp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
+    }
+
+    /// An address that is no interface of this host is dropped by the TCP set
+    /// and never reaches the UDP bind, so the start serves on the rest.
+    #[tokio::test]
+    async fn an_address_that_is_no_interface_is_dropped_before_the_udp_bind() {
+        unsafe {
+            std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1 192.0.2.1");
+        }
+        let (tcp, udp) = bind_sockets(0, 0).await.expect("127.0.0.1 serves");
+        assert_eq!(udp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
+        assert_eq!(tcp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
     }
 }
 

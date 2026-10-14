@@ -1414,12 +1414,26 @@ impl BoundTcp {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// The interfaces this set listens on. `rsrv_grab_tcp` deletes an address
+    /// that is no interface of this host from `casIntfAddrList`
+    /// (`caservertask.c:225-226`), so this is the list the UDP responders take.
+    pub(crate) fn interfaces(&self) -> Vec<std::net::Ipv4Addr> {
+        self.listeners.iter().map(|(_, ip)| *ip).collect()
+    }
+
+    /// Close the listener of every interface not in `keep`. An interface whose
+    /// UDP bind failed is dropped whole in C: `cleanup:` frees the conf with
+    /// its TCP socket (`caservertask.c:744-749`).
+    pub(crate) fn retain_interfaces(&mut self, keep: &[std::net::Ipv4Addr]) {
+        self.listeners.retain(|(_, ip)| keep.contains(ip));
+    }
 }
 
 /// Bind one TCP listener per `EPICS_CAS_INTF_ADDR_LIST` interface.
 ///
 /// Tries the configured port first; falls back to an ephemeral port
-/// (port 0) if it is already in use.
+/// (port 0) for the whole set if any interface finds it in use.
 ///
 /// C `rsrv_init` (caservertask.c:604-750) iterates `casIntfAddrList`
 /// and spawns one `CAS-TCP` accept thread per entry, all bound to the
@@ -1428,10 +1442,8 @@ impl BoundTcp {
 /// port is allowed by POSIX; only two 0.0.0.0 binds collide. Empty
 /// list → single `0.0.0.0` listener (default).
 ///
-/// The first successful bind decides the port. All subsequent binds
-/// must use that same port; if a per-interface bind fails it is logged
-/// and skipped (matches C `cleanup:` / `continue;` in
-/// `caservertask.c:744-749`, which frees the conf and proceeds).
+/// The first successful bind decides the port and every other interface
+/// takes it; `bind_tcp_set` holds what a failing interface does.
 #[cfg(tokio_backend)]
 pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
     let intf_addrs: Vec<std::net::Ipv4Addr> = {
@@ -1443,61 +1455,78 @@ pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
         }
     };
 
-    let mut listeners: Vec<(Arc<TcpListener>, std::net::Ipv4Addr)> = Vec::new();
-    let mut actual_port: Option<u16> = None;
-    for ip in &intf_addrs {
-        let target_port = actual_port.unwrap_or(port);
-        let bind_ip = std::net::IpAddr::V4(*ip);
-        let listener = match TcpListener::bind((bind_ip, target_port)).await {
-            Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && actual_port.is_none() => {
-                // Only fall back to ephemeral on the FIRST bind. Once
-                // a port has been chosen all subsequent interfaces
-                // MUST share it — otherwise a multi-NIC server would
-                // advertise a different TCP port per interface in its
-                // SEARCH replies (which already carry a single port).
-                TcpListener::bind((bind_ip, 0)).await?
-            }
-            Err(e) => {
-                if actual_port.is_some() {
-                    // Subsequent bind on chosen port failed: log and
-                    // skip (C parity, `cleanup:` path frees + continues).
-                    tracing::warn!(
-                        target: "epics_ca_rs::server::tcp",
-                        intf = %ip,
-                        port = target_port,
-                        error = %e,
-                        "TCP listener bind failed on this interface — skipping"
-                    );
-                    continue;
-                }
-                return Err(e.into());
-            }
-        };
-        let chosen = listener.local_addr()?.port();
-        if actual_port.is_none() {
-            actual_port = Some(chosen);
-        }
-        listeners.push((Arc::new(listener), *ip));
-    }
+    let (listeners, bound_port) = bind_tcp_set(intf_addrs, port).await?;
+    announce_tcp_port(port, bound_port);
+    Ok(BoundTcp {
+        listeners,
+        port: bound_port,
+    })
+}
 
-    match actual_port {
-        Some(bound_port) => {
-            announce_tcp_port(port, bound_port);
-            Ok(BoundTcp {
-                listeners,
-                port: bound_port,
-            })
-        }
-        None => {
-            // C `cantProceed("CAS: No TCP server started\n")` at
-            // `caservertask.c:752-753`. Every configured interface failed
-            // to bind — there's nothing to serve.
-            Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+/// C's line for an address that is no interface (`caservertask.c:222`);
+/// `ipAddrToDottedIP` prints `a.b.c.d:port` (`osiSock.c:168-170`).
+#[cfg(tokio_backend)]
+fn skipping_line(ip: std::net::Ipv4Addr, port: u16) -> String {
+    format!("Skipping {ip}:{port} which is not an interface address")
+}
+
+/// `rsrv_grab_tcp` (`caservertask.c:155-267`): bind every interface on one
+/// port. `EADDRINUSE` or `EACCES` on any interface closes the whole set and
+/// starts over on one OS-picked port; an interface that is no address of this
+/// host (`EADDRNOTAVAIL`) is dropped with C's line and the set restarted on an
+/// OS-picked port too (`:266`); any other error fails. C loops until it succeeds; the OS-picked
+/// restarts are bounded here.
+#[cfg(tokio_backend)]
+async fn bind_tcp_set(
+    mut intf_addrs: Vec<std::net::Ipv4Addr>,
+    port: u16,
+) -> CaResult<(Vec<(Arc<TcpListener>, std::net::Ipv4Addr)>, u16)> {
+    const OS_PICKED_TRIES: usize = 16;
+    let mut want = port;
+    let mut os_picked = 0;
+    'set: loop {
+        if intf_addrs.is_empty() {
+            // `cantProceed("Error: RSRV has empty interface list ...")`,
+            // `caservertask.c:271`.
+            return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
-                "CAS: No TCP server started — all configured interfaces failed to bind",
-            )))
+                "RSRV has empty interface list: the CA server can't function \
+                 without binding to at least one network interface",
+            )));
         }
+        let mut listeners: Vec<(Arc<TcpListener>, std::net::Ipv4Addr)> = Vec::new();
+        for (i, ip) in intf_addrs.iter().enumerate() {
+            match TcpListener::bind((std::net::IpAddr::V4(*ip), want)).await {
+                Ok(l) => {
+                    if want == 0 {
+                        // The first socket picks the number for the rest.
+                        want = l.local_addr()?.port();
+                    }
+                    listeners.push((Arc::new(l), *ip));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    // `ipAddrToDottedIP` prints `a.b.c.d:port` (`osiSock.c:168-170`).
+                    println!("{}", skipping_line(*ip, want));
+                    intf_addrs.remove(i);
+                    // C leaves `ok = 0`, so the next pass starts on port 0
+                    // (`caservertask.c:266`).
+                    want = 0;
+                    continue 'set;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) && os_picked < OS_PICKED_TRIES =>
+                {
+                    os_picked += 1;
+                    want = 0;
+                    continue 'set;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        return Ok((listeners, want));
     }
 }
 
@@ -14107,5 +14136,77 @@ mod unrouted_command_tests {
                 13
             )]
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(tokio_backend)]
+mod bind_tcp_set_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    const LO: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+    const LO2: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+
+    fn ports(l: &[(Arc<TcpListener>, Ipv4Addr)]) -> Vec<(Ipv4Addr, u16)> {
+        l.iter()
+            .map(|(l, ip)| (*ip, l.local_addr().unwrap().port()))
+            .collect()
+    }
+
+    /// A requested number held on any interface moves the whole set to one
+    /// OS-picked number (`caservertask.c:266`), not just the first interface.
+    #[tokio::test]
+    async fn a_requested_port_held_on_a_later_interface_moves_every_interface() {
+        let held = std::net::TcpListener::bind((LO2, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let (listeners, bound) = bind_tcp_set(vec![LO, LO2], port).await.expect("bind");
+        assert_ne!(bound, port);
+        assert_eq!(ports(&listeners), [(LO, bound), (LO2, bound)]);
+        // The first interface's socket on the old number was released.
+        std::net::TcpListener::bind((LO, port)).expect("old number free on LO");
+    }
+
+    /// Skipping an address that is no interface restarts the set on an
+    /// OS-picked number, not the requested one (`caservertask.c:266`).
+    #[tokio::test]
+    async fn skipping_an_address_that_is_not_an_interface_restarts_on_port_zero() {
+        for _ in 0..5 {
+            let probe = std::net::TcpListener::bind((LO, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let (_, bound) = bind_tcp_set(vec![Ipv4Addr::new(192, 0, 2, 1), LO], port)
+                .await
+                .expect("bind");
+            if bound != port {
+                return;
+            }
+        }
+        panic!("the set stayed on the requested number after the skip");
+    }
+
+    /// An address that is no interface of this host is skipped; the rest
+    /// serve.
+    #[tokio::test]
+    async fn an_address_that_is_not_an_interface_is_skipped() {
+        // 192.0.2.1 (TEST-NET-1) is on no interface of this host.
+        let (listeners, bound) = bind_tcp_set(vec![LO, Ipv4Addr::new(192, 0, 2, 1)], 0)
+            .await
+            .expect("bind");
+        assert_eq!(ports(&listeners), [(LO, bound)]);
+    }
+
+    #[test]
+    fn the_skip_line_carries_the_port_as_ipaddrtodottedip_prints_it() {
+        assert_eq!(
+            skipping_line(Ipv4Addr::new(192, 0, 2, 1), 5064),
+            "Skipping 192.0.2.1:5064 which is not an interface address"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_set_fails() {
+        let r = bind_tcp_set(vec![Ipv4Addr::new(192, 0, 2, 1)], 0).await;
+        assert!(r.is_err());
     }
 }

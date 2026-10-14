@@ -95,22 +95,82 @@ fn tcp_bind_addresses(interfaces: &[SocketAddr], bind_ip: IpAddr, port: u16) -> 
 /// Bind one listener per address, pvxs `server.cpp:476-486`: an address
 /// keeps its own port and only a 0 takes `port`, which becomes the first
 /// listener's bound port. Returns the listeners and that port.
+///
+/// deliberate deviation: when every requested port is 0, an `AddrInUse` on a
+/// later interface releases the whole set and binds it again on a fresh
+/// ephemeral number. pvxs binds interface 1 on 0 and the rest on that number
+/// (`server.cpp:476-486`), so a number the kernel handed out but another
+/// socket already holds on a later address fails the start; with nothing
+/// asked for there is nothing to refuse. A non-zero request, any other
+/// error, or a collision with an address of the set itself (a wildcard
+/// beside a specific entry, a duplicate) behaves as pvxs: it fails.
 fn bind_serv_ifaces(
     addrs: impl IntoIterator<Item = SocketAddr>,
-    mut port: u16,
+    port: u16,
 ) -> PvaResult<(Vec<tokio::net::TcpListener>, u16)> {
+    bind_serv_ifaces_with(addrs, port, &mut |_| {})
+}
+
+/// [`bind_serv_ifaces`], calling `after_first` with the number the first
+/// interface bound before the others try it.
+fn bind_serv_ifaces_with(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    port: u16,
+    after_first: &mut dyn FnMut(u16),
+) -> PvaResult<(Vec<tokio::net::TcpListener>, u16)> {
+    const EPHEMERAL_TRIES: usize = 16;
+    let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
+    let all_ephemeral = port == 0 && addrs.iter().all(|a| a.port() == 0);
+    let mut tries = 1;
+    loop {
+        match bind_serv_ifaces_once(&addrs, port, after_first) {
+            Err((at, PvaError::Io(e)))
+                if all_ephemeral
+                    && e.kind() == std::io::ErrorKind::AddrInUse
+                    && tries < EPHEMERAL_TRIES
+                    && !addrs[..at].iter().any(|a| addresses_overlap(a, &addrs[at])) =>
+            {
+                tracing::warn!(
+                    "ephemeral server port is held on a later interface; choosing another"
+                );
+                tries += 1;
+            }
+            Err((_, e)) => return Err(e),
+            Ok(bound) => return Ok(bound),
+        }
+    }
+}
+
+/// Whether a socket on `a` and one on `b`, on one port, cannot both listen:
+/// the same address, or either one a wildcard.
+fn addresses_overlap(a: &SocketAddr, b: &SocketAddr) -> bool {
+    a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified()
+}
+
+/// One pass over the set; on failure, the index of the address that failed.
+fn bind_serv_ifaces_once(
+    addrs: &[SocketAddr],
+    mut port: u16,
+    after_first: &mut dyn FnMut(u16),
+) -> Result<(Vec<tokio::net::TcpListener>, u16), (usize, PvaError)> {
     let mut listeners = Vec::new();
-    for mut addr in addrs {
+    for (at, &(mut addr)) in addrs.iter().enumerate() {
         if addr.port() == 0 {
             addr.set_port(port);
         }
         let first = listeners.is_empty();
-        let listener = bind_serv_iface(addr, first)?;
-        listener.set_nonblocking(true)?;
+        let listener = bind_serv_iface(addr, first).map_err(|e| (at, e))?;
+        let register = || -> PvaResult<_> {
+            listener.set_nonblocking(true)?;
+            let bound = listener.local_addr()?.port();
+            Ok((tokio::net::TcpListener::from_std(listener)?, bound))
+        };
+        let (tokio_listener, bound) = register().map_err(|e| (at, e))?;
         if first {
-            port = listener.local_addr()?.port();
+            port = bound;
+            after_first(port);
         }
-        listeners.push(tokio::net::TcpListener::from_std(listener)?);
+        listeners.push(tokio_listener);
     }
     Ok((listeners, port))
 }
@@ -174,21 +234,18 @@ impl Drop for PvaServer {
     /// and surviving panics in the binary's main task. Per-connection
     /// handler tasks unwind on their next IO call.
     ///
-    /// Skipped when the JoinHandles have already been moved out (via
-    /// `run`/`wait`) — in that case the consuming method handles
-    /// shutdown. Without the gating the abort would race with a
-    /// reconnect on the same port: the listener task is killed
-    /// mid-syscall before the OS releases the binding, surfacing as
-    /// ConnectionRefused on the next bind attempt for ~hundreds of ms.
+    /// Unconditional: `run`/`wait` move the JoinHandles into their own
+    /// future, so a caller that aborts that future (a cancelled run
+    /// task) would otherwise leave the listener and responder bound
+    /// with nobody to stop them. The AbortHandles reach the live task
+    /// either way, and aborting one that already finished is a no-op.
     fn drop(&mut self) {
-        if self.udp_handle.is_some() || self.tcp_handle.is_some() {
-            self.udp_abort.abort();
-            if let Some(ref abort) = self.udp_v6_abort {
-                abort.abort();
-            }
-            self.tcp_abort.abort();
-            self.interrupt.notify_waiters();
+        self.udp_abort.abort();
+        if let Some(ref abort) = self.udp_v6_abort {
+            abort.abort();
         }
+        self.tcp_abort.abort();
+        self.interrupt.notify_waiters();
     }
 }
 
@@ -2143,5 +2200,92 @@ mod ports_are_read_back_not_probed {
         let cfg = super::PvaServerConfig::isolated();
         assert_eq!(cfg.tcp_port, 0);
         assert_eq!(cfg.udp_port, 0);
+    }
+}
+
+#[cfg(test)]
+#[cfg(tokio_backend)]
+mod serv_iface_tests {
+    use super::*;
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    /// Binds with `held` called on each first-picked number; returns the
+    /// result and every number tried.
+    fn bind_counting(
+        list: &[&str],
+        port: u16,
+        mut held: impl FnMut(usize, u16),
+    ) -> (PvaResult<(Vec<tokio::net::TcpListener>, u16)>, Vec<u16>) {
+        let mut tried = Vec::new();
+        let r = bind_serv_ifaces_with(addrs(list), port, &mut |p| {
+            held(tried.len(), p);
+            tried.push(p);
+        });
+        (r, tried)
+    }
+
+    fn io_kind(r: PvaResult<(Vec<tokio::net::TcpListener>, u16)>) -> std::io::ErrorKind {
+        match r {
+            Err(PvaError::Io(e)) => e.kind(),
+            other => panic!("{:?}", other.map(|(_, p)| p)),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ephemeral_number_held_on_a_later_interface_is_chosen_again() {
+        let mut held = Vec::new();
+        let mut held_ports = Vec::new();
+        let (r, tried) = bind_counting(&["127.0.0.1:0", "127.0.0.2:0"], 0, |n, port| {
+            if n < 2 {
+                // A number the kernel hands out twice is already held.
+                if let Ok(l) = std::net::TcpListener::bind(("127.0.0.2", port)) {
+                    held.push(l);
+                }
+                held_ports.push(port);
+            }
+        });
+        let (listeners, port) = r.expect("bind");
+        assert!(tried.len() >= 3, "{tried:?}");
+        assert_eq!(*tried.last().unwrap(), port);
+        assert!(!held_ports.contains(&port), "{held_ports:?} {port}");
+        let bound: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        assert_eq!(
+            bound,
+            ["127.0.0.1", "127.0.0.2"].map(|a| SocketAddr::new(a.parse().unwrap(), port))
+        );
+    }
+
+    /// A requested number is never replaced: the later interface fails the
+    /// start on the first try, as in pvxs.
+    #[tokio::test]
+    async fn a_requested_number_held_on_a_later_interface_fails_the_start() {
+        let held = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let list = [format!("127.0.0.1:{port}"), format!("127.0.0.2:{port}")];
+        let (r, tried) = bind_counting(&[&list[0], &list[1]], port, |_, _| {});
+        assert_eq!(io_kind(r), std::io::ErrorKind::AddrInUse);
+        assert_eq!(tried.len(), 1, "{tried:?}");
+    }
+
+    /// Only a collision with a stranger is retried: anything else a later
+    /// interface reports ends the start at once.
+    #[tokio::test]
+    async fn another_error_on_a_later_interface_is_not_retried() {
+        // 192.0.2.1 (TEST-NET-1) is on no interface of this host.
+        let (r, tried) = bind_counting(&["127.0.0.1:0", "192.0.2.1:0"], 0, |_, _| {});
+        assert_eq!(io_kind(r), std::io::ErrorKind::AddrNotAvailable);
+        assert_eq!(tried.len(), 1, "{tried:?}");
+    }
+
+    /// A wildcard beside a specific entry collides with the set's own
+    /// listener, which no other number cures.
+    #[tokio::test]
+    async fn a_wildcard_beside_a_specific_entry_fails_on_the_first_try() {
+        let (r, tried) = bind_counting(&["127.0.0.1:0", "0.0.0.0:0"], 0, |_, _| {});
+        assert_eq!(io_kind(r), std::io::ErrorKind::AddrInUse);
+        assert_eq!(tried.len(), 1, "{tried:?}");
     }
 }

@@ -131,3 +131,59 @@ fn run_pva_ioc_serves_on_the_pvas_env_ports() {
         "the REPL did not end on `exit`: {status:?}\n{log}"
     );
 }
+
+/// A search port that cannot be bound stops the PVA server, not the IOC:
+/// pvxs `pvxsBaseRegistrar` catches the `Server(conf)` exception and prints
+/// `Error in pvxsBaseRegistrar : <what>` (`ioc/iochooks.cpp:508-509`, pvxs 1.5.3), and the
+/// shell keeps running. The silent version of this was a stuck IOC.
+#[test]
+fn a_held_search_port_is_printed_and_the_shell_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("held.db");
+    std::fs::write(&db, "record(ai, \"HELD:X\") { field(VAL, \"1\") }\n").unwrap();
+    let held = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let udp = held.local_addr().unwrap().port();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["ioc_child", "--exact", "--nocapture"])
+        .env(CHILD, &db)
+        .env("EPICS_PVAS_SERVER_PORT", "0")
+        .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
+        .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+        .env("EPICS_PVAS_BEACON_ADDR_LIST", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the IOC child");
+    let mut stdin = child.stdin.take().unwrap();
+    // Long enough for the server task to try its bind and fail.
+    std::thread::sleep(Duration::from_secs(2));
+    let alive = child.try_wait().unwrap().is_none();
+    let _ = stdin.write_all(b"exit\n");
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    drop(held);
+    assert!(alive, "the IOC left before `exit`\n{stderr}");
+    assert!(
+        stderr.contains("Error in pvxsBaseRegistrar"),
+        "a search port that could not be bound was not reported\n{stderr}"
+    );
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the shell did not survive: {status:?}\n{stderr}"
+    );
+}

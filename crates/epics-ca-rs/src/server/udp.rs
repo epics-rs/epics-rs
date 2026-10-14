@@ -104,6 +104,11 @@ impl BoundUdp {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// The interfaces a responder is bound on.
+    pub(crate) fn interfaces(&self) -> Vec<Ipv4Addr> {
+        self.responders.iter().map(|r| r.bind_ip).collect()
+    }
 }
 
 /// Bind one UDP search responder per `EPICS_CAS_INTF_ADDR_LIST`
@@ -125,32 +130,69 @@ pub fn bind_udp_responders(
     intf_addrs: Vec<Ipv4Addr>,
     mcast_addrs: &[Ipv4Addr],
 ) -> CaResult<BoundUdp> {
+    bind_udp_responders_with(port, intf_addrs, mcast_addrs, 0, &responder_broadcast_for)
+}
+
+/// `osiSockDiscoverBroadcastAddresses` for one responder interface: 127.0.0.1
+/// is answered with itself (`osdNetIfAddrs.c:41-52`), so rsrv binds a second
+/// socket on it; any other address gets its broadcast address, if it has one.
+#[cfg(tokio_backend)]
+pub(crate) fn responder_broadcast_for(interface: Ipv4Addr) -> Option<Ipv4Addr> {
+    if interface == Ipv4Addr::LOCALHOST {
+        Some(interface)
+    } else {
+        super::addr_list::broadcast_for_ip(interface)
+    }
+}
+
+/// [`bind_udp_responders`] with the interface-to-broadcast-address lookup
+/// (`osiSockDiscoverBroadcastAddresses`, `caservertask.c:680`) supplied, so a
+/// test can name a broadcast address on a host that has none. `tcp_port` is
+/// only the number C's interface name carries in its warnings (`:615`).
+#[cfg(tokio_backend)]
+pub(crate) fn bind_udp_responders_with(
+    port: u16,
+    intf_addrs: Vec<Ipv4Addr>,
+    mcast_addrs: &[Ipv4Addr],
+    tcp_port: u16,
+    broadcast_of: &dyn Fn(Ipv4Addr) -> Option<Ipv4Addr>,
+) -> CaResult<BoundUdp> {
     let mut responders = Vec::new();
     let mut actual_port = if port == 0 { None } else { Some(port) };
-    // Decided once, from the *request*, and then carried: after the first
-    // NIC answers, `actual_port` is a plain non-zero number whichever way it
-    // was obtained, and nothing downstream could tell the two apart.
-    let port_use = if port == 0 {
-        PortUse::Exclusive
-    } else {
-        PortUse::Shared
-    };
+    let mut held: Option<epics_base_rs::error::CaError> = None;
     for (bind_ip, mcast_groups) in plan_responder_specs(intf_addrs, mcast_addrs) {
-        let responder =
-            bind_single_responder(bind_ip, actual_port.unwrap_or(0), port_use, &mcast_groups)?;
+        let responder = match bind_single_responder(
+            bind_ip,
+            actual_port.unwrap_or(0),
+            &mcast_groups,
+            tcp_port,
+            broadcast_of,
+        ) {
+            Ok(r) => r,
+            // `tryBind` returns -1 without a word on EADDRINUSE and
+            // `rsrv_init` drops that interface alone
+            // (`caservertask.c:136`, `:630`, `:745-750`); the others serve.
+            Err(epics_base_rs::error::CaError::Io(e))
+                if e.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                held = Some(epics_base_rs::error::CaError::Io(e));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if actual_port.is_none() {
             actual_port = Some(responder.socket.local_addr()?.port());
         }
         responders.push(responder);
     }
     // `plan_responder_specs` always yields at least one spec (an empty
-    // interface list becomes the wildcard entry), so the port is set.
-    let port = actual_port.ok_or_else(|| {
-        epics_base_rs::error::CaError::Io(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "CAS: no UDP search responder bound",
-        ))
-    })?;
+    // interface list becomes the wildcard entry).
+    // `cantProceed("CAS: No TCP server started")` only when none is left
+    // (`caservertask.c:752`); here that is the error the last interface gave.
+    if responders.is_empty() {
+        return Err(held.expect("a spec that bound nothing was held"));
+    }
+    let port = actual_port.expect("a bound responder fixed the port");
     Ok(BoundUdp { responders, port })
 }
 
@@ -213,14 +255,48 @@ pub async fn run_udp_search_responder(
     }
 }
 
+/// What `rsrv_init` prints when an interface bound to a specific address has
+/// no broadcast address (`caservertask.c:683-685`); `ifaceName` is the TCP
+/// address `a.b.c.d:port` (`:615`).
+#[cfg(tokio_backend)]
+fn missing_broadcast_warning(
+    bind_ip: Ipv4Addr,
+    tcp_port: u16,
+    found: Option<Ipv4Addr>,
+) -> Option<String> {
+    (found.is_none() && !bind_ip.is_unspecified()).then(|| {
+        format!(
+            "Warning: Can't find broadcast address of interface {bind_ip}:{tcp_port}\n         \
+             Name lookup may not work on this interface\n"
+        )
+    })
+}
+
+/// `tryBind`'s line for a bind error other than `EADDRINUSE`
+/// (`caservertask.c:138-139`): `CAS: %s bind ERL_ERROR: %s`, the text being
+/// `epicsSocketConvertErrnoToString`, which is `strerror` alone.
+#[cfg(tokio_backend)]
+fn try_bind_error_line(name: &str, e: &std::io::Error) -> String {
+    let os = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<BindContext>())
+        .map_or(e, |ctx| &ctx.source);
+    format!(
+        "CAS: {name} bind {}: {}",
+        epics_base_rs::runtime::log::erl_error(),
+        crate::repeater_clients::sock_err_string(os)
+    )
+}
+
 #[cfg(tokio_backend)]
 fn bind_single_responder(
     bind_ip: Ipv4Addr,
     port: u16,
-    port_use: PortUse,
     mcast_groups: &[Ipv4Addr],
+    tcp_port: u16,
+    broadcast_of: &dyn Fn(Ipv4Addr) -> Option<Ipv4Addr>,
 ) -> CaResult<BoundResponder> {
-    let socket = bind_responder_socket(bind_ip, port, port_use)?;
+    let socket = bind_responder_socket(bind_ip, port)?;
     // The port the primary actually took — identical to `port`, except
     // for an ephemeral (0) request, where the kernel chose it. The only
     // consumer of the resolved port is the broadcast secondary responder
@@ -284,26 +360,36 @@ fn bind_single_responder(
     let bcast: Option<Arc<UdpSocket>> = {
         #[cfg(any(windows, target_os = "windows"))]
         {
+            let _ = broadcast_of;
             None
         }
         #[cfg(not(any(windows, target_os = "windows")))]
         {
-            super::addr_list::broadcast_for_ip(bind_ip).and_then(|bcast_ip| {
-                match bind_responder_socket(bcast_ip, port, port_use) {
-                    Ok(s) => Some(Arc::new(s)),
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "epics_ca_rs::server::udp",
-                            %bind_ip,
-                            %bcast_ip,
-                            error = %e,
-                            "CA server bcast responder bind failed; broadcast SEARCHes \
-                             to this interface will not be answered"
-                        );
-                        None
-                    }
+            let found = broadcast_of(bind_ip);
+            if let Some(w) = missing_broadcast_warning(bind_ip, tcp_port, found) {
+                eprint!("{w}");
+            }
+            match found.map(|bcast_ip| (bcast_ip, bind_responder_socket(bcast_ip, port))) {
+                None => None,
+                Some((_, Ok(s))) => Some(Arc::new(s)),
+                // `tryBind` on `udpbcast` failing with EADDRINUSE reaches
+                // `goto cleanup` (`caservertask.c:703`): the interface is
+                // dropped whole, as for its primary socket.
+                Some((_, Err(epics_base_rs::error::CaError::Io(e))))
+                    if e.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    return Err(epics_base_rs::error::CaError::Io(e));
                 }
-            })
+                // Any other error: `tryBind` prints and suspends the init
+                // thread (`:135-141`). Under the signed-off deviation of
+                // 2026-10-14 the start returns the error instead.
+                Some((_, Err(e))) => {
+                    if let epics_base_rs::error::CaError::Io(io) = &e {
+                        eprintln!("{}", try_bind_error_line("UDP Socket bcast", io));
+                    }
+                    return Err(e);
+                }
+            }
         }
     };
 
@@ -357,30 +443,34 @@ async fn run_single_responder(
     }
 }
 
-/// Whether a responder socket may share its port with other sockets.
-///
-/// The distinction cannot be recovered from the port number. `bind(0)`
-/// answers with an ordinary non-zero port, and
-/// [`bind_udp_responders`] then imposes that number on every remaining
-/// NIC — so a `port != 0` test reads the kernel's own answer as if the
-/// operator had configured it, and hands NICs 2..N the fanout flags on a
-/// port nobody asked to share. The caller states the intent instead.
-#[cfg(tokio_backend)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PortUse {
-    /// A well-known number: C's datagram fanout, so several IOCs can
-    /// answer SEARCHes on the same CA port.
-    Shared,
-    /// A number the kernel chose. Nothing may join it — see
-    /// [`bind_responder_socket`].
-    Exclusive,
-}
-
 /// Build and configure the per-bind UDP socket. Centralised so the
 /// primary (interface IP) and secondary (interface broadcast addr)
 /// sockets share identical socket-option setup.
+/// A bind error with the address it was for. Displays as `<what>: <source>`;
+/// the source stays reachable so `tryBind`'s line can print `strerror` alone.
 #[cfg(tokio_backend)]
-fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16, port_use: PortUse) -> CaResult<UdpSocket> {
+#[derive(Debug)]
+struct BindContext {
+    what: String,
+    source: std::io::Error,
+}
+
+#[cfg(tokio_backend)]
+impl std::fmt::Display for BindContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.what, self.source)
+    }
+}
+
+#[cfg(tokio_backend)]
+impl std::error::Error for BindContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(tokio_backend)]
+fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // This is a *datagram fanout* socket, so it mirrors libcom's
     // `epicsSocketEnableAddressUseForDatagramFanout`
@@ -398,21 +488,13 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16, port_use: PortUse) -> CaR
     // governs the TCP listener and caRepeater's exclusive bind, not this
     // socket.
     //
-    // Only for a *well-known* port, which is the case the fanout exists
-    // for — C likewise leaves its PORT_ANY sockets bare (udpiiu.cpp:248
-    // binds the client search socket to PORT_ANY and enables no reuse).
-    // On an ephemeral bind the flags are actively harmful: Linux may hand
-    // bind(0) a port that already belongs to a reuse-compatible socket,
-    // silently joining its SO_REUSEPORT group — the kernel then
-    // load-balances arriving datagrams across the group, so SEARCHes for
-    // this server land on an unrelated socket and go unanswered. Leaving
-    // the flags off makes the kernel pick a port this socket exclusively
-    // owns.
-    if port_use == PortUse::Shared {
-        sock.set_reuse_address(true)?;
-        #[cfg(unix)]
-        sock.set_reuse_port(true)?;
-    }
+    // Unconditionally, ephemeral ports included: `rsrv_init` applies the helper
+    // to its responders whatever the port (`caservertask.c:628`, `:698`).
+    // The cost is that Linux may hand `bind(0)` a port a reuse-compatible
+    // socket already holds, joining its SO_REUSEPORT group; C has that too.
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    sock.set_reuse_port(true)?;
     // libcom commit 51191e6: Linux defaults IP_MULTICAST_ALL=1, which makes
     // a socket bound to 0.0.0.0 receive multicast for groups joined on ANY
     // socket on this host. Clear it so per-NIC search responders don't see
@@ -429,7 +511,10 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16, port_use: PortUse) -> CaR
         .map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("CA server UDP search responder bind {bind_ip}:{port}: {e}"),
+                BindContext {
+                    what: format!("CA server UDP search responder bind {bind_ip}:{port}"),
+                    source: e,
+                },
             )
         })?;
     let socket = UdpSocket::from_std(sock.into())?;
@@ -1233,16 +1318,112 @@ mod responder_bind_tests {
         }
     }
 
-    /// Boundary — port 0: an ephemeral responder must own its port
-    /// exclusively. The reuse flags exist so a well-known CA port can be
-    /// co-bound (caRepeater, a second IOC); on an ephemeral bind they let
-    /// Linux hand out a port already held by a reuse-compatible socket,
-    /// joining its SO_REUSEPORT group. The kernel then load-balances
-    /// arriving datagrams across the group and SEARCHes for this server
-    /// vanish into the other socket. A second bind of the same port must
-    /// therefore be refused.
+    /// `tryBind` drops one held interface and `rsrv_init` serves on the rest
+    /// (`caservertask.c:136`, `:630`, `:745-752`); only an empty set fails.
     #[test]
-    fn ephemeral_responder_port_cannot_be_co_bound() {
+    fn a_held_interface_is_dropped_and_the_others_serve() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _g = rt.enter();
+
+        // A stranger may hold the picked number on 127.0.0.1 as well; that
+        // pick says nothing about the rule, so take another.
+        let (held, bound) = (0..8)
+            .find_map(|_| {
+                let held =
+                    std::net::UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).expect("hold");
+                let port = held.local_addr().expect("held addr").port();
+                bind_udp_responders(
+                    port,
+                    vec![Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)],
+                    &[],
+                )
+                .ok()
+                .map(|bound| (held, bound))
+            })
+            .expect("the free interface serves");
+        assert_eq!(bound.port(), held.local_addr().unwrap().port());
+        assert_eq!(bound.responders.len(), 1);
+    }
+
+    /// A held broadcast-address socket drops the interface whole, as `tryBind`
+    /// on `udpbcast` failing with EADDRINUSE does (`caservertask.c:703`).
+    #[test]
+    fn a_held_broadcast_socket_drops_the_interface() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _g = rt.enter();
+
+        // 127.0.0.2 stands in for the broadcast address, which loopback has
+        // none of; plain std sockets set no reuse option, so ours cannot
+        // co-bind it.
+        let (ip, bcast) = (Ipv4Addr::new(127, 0, 0, 3), Ipv4Addr::new(127, 0, 0, 2));
+        let held = std::net::UdpSocket::bind((bcast, 0)).expect("hold the broadcast address");
+        let port = held.local_addr().unwrap().port();
+        let lookup = |i: Ipv4Addr| (i == ip).then_some(bcast);
+
+        let bound = bind_udp_responders_with(port, vec![Ipv4Addr::LOCALHOST, ip], &[], 0, &lookup)
+            .expect("the other interface serves");
+        assert_eq!(bound.interfaces(), [Ipv4Addr::LOCALHOST]);
+        assert!(bind_udp_responders_with(port, vec![ip], &[], 0, &lookup).is_err());
+    }
+
+    /// A broadcast-socket bind error other than EADDRINUSE is `tryBind`'s
+    /// print-and-suspend path (`caservertask.c:135-141`); here the start
+    /// returns the error, and the line is C's.
+    #[test]
+    fn a_broadcast_bind_error_other_than_addr_in_use_fails_the_start() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _g = rt.enter();
+
+        // 192.0.2.1 (TEST-NET-1) is no address of this host: EADDRNOTAVAIL.
+        let lookup = |_: Ipv4Addr| Some(Ipv4Addr::new(192, 0, 2, 1));
+        match bind_udp_responders_with(0, vec![Ipv4Addr::new(127, 0, 0, 3)], &[], 0, &lookup) {
+            Err(epics_base_rs::error::CaError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::AddrNotAvailable, "{e}");
+                // strerror alone, not the address-carrying chain.
+                #[cfg(target_os = "linux")]
+                assert_eq!(
+                    try_bind_error_line("UDP Socket bcast", &e),
+                    "CAS: UDP Socket bcast bind ERROR: Cannot assign requested address"
+                );
+            }
+            Err(e) => panic!("expected EADDRNOTAVAIL, got {e}"),
+            Ok(_) => panic!("an unbindable broadcast address must fail the start"),
+        }
+    }
+
+    #[test]
+    fn an_interface_without_a_broadcast_address_is_warned_about_as_c_does() {
+        let ip = Ipv4Addr::new(192, 0, 2, 1);
+        assert_eq!(
+            missing_broadcast_warning(ip, 5064, None).as_deref(),
+            Some(
+                "Warning: Can't find broadcast address of interface 192.0.2.1:5064\n         \
+                 Name lookup may not work on this interface\n"
+            )
+        );
+        assert_eq!(missing_broadcast_warning(ip, 5064, Some(ip)), None);
+        assert_eq!(
+            missing_broadcast_warning(Ipv4Addr::UNSPECIFIED, 5064, None),
+            None,
+            "a wildcard bind has no second socket (`:663`)"
+        );
+    }
+
+    /// Boundary — port 0: `rsrv_init` enables datagram fanout on every
+    /// responder whatever the port (`caservertask.c:628`, `:698`), so a
+    /// reuse-enabled socket can co-bind an ephemeral responder's port, as it
+    /// can in C.
+    #[test]
+    fn ephemeral_responder_port_can_be_co_bound() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1252,18 +1433,13 @@ mod responder_bind_tests {
         let bound = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("bind ephemeral");
         assert_ne!(bound.port(), 0, "an ephemeral bind reports its real port");
 
-        // A reuse-enabled datagram socket — exactly the kind the CA
-        // client and caRepeater open — must NOT be able to join it.
-        let intruder = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
-        intruder.set_reuse_address(true).expect("reuse addr");
+        let peer = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+        peer.set_reuse_address(true).expect("reuse addr");
         #[cfg(unix)]
-        intruder.set_reuse_port(true).expect("reuse port");
+        peer.set_reuse_port(true).expect("reuse port");
         let addr = std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound.port());
-        assert!(
-            intruder.bind(&addr.into()).is_err(),
-            "the responder's ephemeral port must be exclusively owned; a \
-             second socket co-binding it would steal half its SEARCHes"
-        );
+        peer.bind(&addr.into())
+            .expect("a fanout socket co-binds the responder's port, as in rsrv");
     }
 
     /// C reaches the watchdog for its UDP name-search thread through the same
@@ -1318,54 +1494,6 @@ mod responder_bind_tests {
                 table()
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    /// Boundary — the *second and later* NICs of an ephemeral bundle, which
-    /// are handed the first NIC's kernel-assigned number rather than a
-    /// literal 0. That number is an ordinary non-zero `u16`, so the old
-    /// `port != 0` reading called it well-known and gave those sockets the
-    /// fanout flags; a stranger's reuse group could then take the port on
-    /// every NIC but the first, and half this server's SEARCHes with it.
-    ///
-    /// The bundle is bound over loopback plus the first up non-loopback
-    /// interface. With no such interface the check reduces to the
-    /// single-NIC case above — it cannot manufacture a second NIC.
-    #[test]
-    fn every_nic_of_an_ephemeral_bundle_owns_the_port() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _g = rt.enter();
-
-        let mut intf = vec![Ipv4Addr::LOCALHOST];
-        if let Ok(ifaces) = epics_base_rs::net::iface_v4::enumerate() {
-            if let Some(i) = ifaces
-                .iter()
-                .find(|i| i.is_up() && !i.is_loopback() && !i.ip.is_unspecified())
-            {
-                intf.push(i.ip);
-            }
-        }
-
-        let bound = bind_retrying_addr_in_use(|| bind_udp_responders(0, intf.clone(), &[]));
-        assert_ne!(bound.port(), 0, "an ephemeral bind reports its real port");
-
-        for responder in &bound.responders {
-            let intruder =
-                Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
-            intruder.set_reuse_address(true).expect("reuse addr");
-            #[cfg(unix)]
-            intruder.set_reuse_port(true).expect("reuse port");
-            let addr = std::net::SocketAddrV4::new(responder.bind_ip, bound.port());
-            assert!(
-                intruder.bind(&addr.into()).is_err(),
-                "NIC {} of the ephemeral bundle does not own port {}: a reuse-enabled \
-                 socket joined it, and the kernel will split this server's SEARCHes",
-                responder.bind_ip,
-                bound.port()
-            );
         }
     }
 

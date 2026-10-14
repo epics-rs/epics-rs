@@ -33,6 +33,18 @@ pub struct PvaServerBuilder {
     acf: Option<access_security::AccessSecurityConfig>,
 }
 
+/// A server that cannot start leaves the IOC and its shell running, with
+/// the reason on stderr: pvxs `pvxsBaseRegistrar` catches the
+/// `Server(conf)` exception thrown by a failed `sock.bind()`
+/// (`udp_collector.cpp:151`) and prints `Error in <func> : <what>`
+/// (`ioc/iochooks.cpp:508-509`, pvxs 1.5.3).
+fn announce_server_failure(result: CaResult<()>) -> CaResult<()> {
+    if let Err(e) = &result {
+        eprintln!("Error in pvxsBaseRegistrar : {e}");
+    }
+    result
+}
+
 impl PvaServerBuilder {
     pub fn new() -> Self {
         Self {
@@ -353,7 +365,7 @@ impl PvaServer {
         let server_clone = server.clone();
         let server_handle = bridge
             .reactor()
-            .spawn(async move { server_clone.run_reporting(None).await });
+            .spawn(async move { announce_server_failure(server_clone.run_reporting(None).await) });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -413,9 +425,9 @@ impl PvaServer {
         let server = Arc::new(self);
 
         let server_clone = server.clone();
-        let server_handle = bridge
-            .reactor()
-            .spawn(async move { server_clone.run_with_source_inner(source, None).await });
+        let server_handle = bridge.reactor().spawn(async move {
+            announce_server_failure(server_clone.run_with_source_inner(source, None).await)
+        });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {

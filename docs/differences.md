@@ -26,6 +26,28 @@ difference is either invisible to a client or is an improvement:
   linearly. epics-rs maps it onto a POSIX band offset, which keeps IOC threads
   correctly ordered against the high-priority libbsd network threads — the
   linear map does not.
+- **Ephemeral server TCP port on several interfaces.** pvxs binds interface 1
+  on port 0 and every later interface on the number it got
+  (`server.cpp:476-486`), so a number held on a later address fails the start.
+  When every requested port is 0, epics-rs releases the set and picks again
+  (16 tries: each try is an independent draw from the kernel's ephemeral
+  range, so one collision is rare and 16 in a row means the bind is failing
+  for another reason; the bound only keeps that case from looping). A
+  requested port, any other error, or a collision with an address of the set
+  itself (a wildcard beside a specific entry, a duplicate) fails as in pvxs.
+- **CA server start returns an error where rsrv hangs.** C drops an interface
+  whose UDP bind hits EADDRINUSE and serves on the rest (`caservertask.c:136`,
+  `:630`, `:745-750`); so does epics-rs. When no interface is left, C ends in
+  `cantProceed("CAS: No TCP server started")` (`:752`), and on any other bind
+  error `tryBind` prints and suspends the init thread (`:135-141`): `iocInit`
+  hangs and the shell never starts. `CaServer::from_parts` and `build` return
+  the error and `run_ca_ioc` returns it. Signed off 2026-10-14. A dropped
+  interface loses its TCP listener with its UDP responder, as in C, and the
+  whole-set restart on an OS-picked TCP port (`rsrv_grab_tcp`) is capped at 16
+  tries where C loops without end, for the reason given for the PVA ephemeral
+  port retry above. An address that is no interface of this host leaves the
+  list before any UDP bind, and a held broadcast-address socket drops its
+  interface whole (`:703`), both as in C.
 - **Fanout options on a chosen UDP port.** pvxs sets `SO_REUSEADDR` and
   `SO_REUSEPORT` before every collector bind, port 0 included. Linux then may
   hand `bind(0)` a number that another same-user fanout socket holds, and the

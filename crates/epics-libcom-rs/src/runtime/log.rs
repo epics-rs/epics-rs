@@ -673,6 +673,16 @@ pub fn erl_warning() -> &'static str {
     }
 }
 
+/// [`erl_warning`] for `ERL_ERROR`: red on a terminal console, plain
+/// everywhere else, for the word an `errlogPrintf` line carries.
+pub fn erl_error() -> &'static str {
+    if errlog_console_paints() {
+        ERL_ERROR
+    } else {
+        "ERROR"
+    }
+}
+
 /// Whether an errlog line keeps the ANSI escapes its C literal carries.
 ///
 /// C strips them at print time when the console is not a terminal
@@ -2363,6 +2373,7 @@ mod tests {
         // and this is the assertion that would fail if it were — under
         // `cargo test` stderr is not a terminal.
         assert_eq!(erl_warning(), "WARNING");
+        assert_eq!(erl_error(), "ERROR");
     }
 
     /// The escapes `iocsh` and `softIoc` paint with, pinned to the macros they

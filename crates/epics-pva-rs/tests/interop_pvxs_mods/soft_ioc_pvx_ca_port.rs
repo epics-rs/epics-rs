@@ -6,8 +6,8 @@
 // No exec-model census marker: the test is a plain `#[test]`.
 
 use super::interop_helpers::{
-    PvxsLogs, SOFT_IOC_PVX, ioc_ready, pick_localhost_port, require_pvxs, soft_ioc_pvx_command,
-    start_pvxs,
+    PvxsLogs, SOFT_IOC_PVX, ioc_ready, pick_localhost_port, port_collision, require_pvxs,
+    soft_ioc_pvx_command, start_pvxs,
 };
 
 #[test]
@@ -38,7 +38,24 @@ fn a_held_ca_port_is_rerun_on_a_fresh_one() {
     };
     let started = start_pvxs(&logs, build, ioc_ready);
     assert!(started.is_ok(), "{}", started.err().unwrap_or_default());
-    assert_eq!(ca_ports.len(), 2, "{ca_ports:?}");
-    let lost = logs.kept(1).text();
-    assert!(lost.contains("CAS: No TCP server started"), "{lost}");
+    // A fresh port is a probe released before the IOC binds it, so a parallel
+    // test can take it too and cost another rerun: the count is not fixed.
+    // What is fixed is that the first attempt ran on the held UDP port and
+    // lost it, and that every later rerun was one `start_pvxs` itself
+    // reruns on (`port_collision`): a UDP, TCP or PVA steal, not a whim.
+    assert!(ca_ports.len() >= 2, "no rerun: {ca_ports:?}");
+    assert_eq!(ca_ports[0], held, "{ca_ports:?}");
+    let first = logs.kept(1).text();
+    assert!(
+        first.contains(named_port::verdict::NO_TCP_SERVER),
+        "{first}"
+    );
+    for n in 2..ca_ports.len() {
+        let lost = logs.kept(n).text();
+        assert!(
+            port_collision(&lost),
+            "attempt {n} on CA port {} was rerun without losing a port: {lost}",
+            ca_ports[n - 1]
+        );
+    }
 }

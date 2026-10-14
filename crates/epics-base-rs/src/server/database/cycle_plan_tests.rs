@@ -82,6 +82,28 @@ const BASE: Scenario = Scenario {
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
+        // An output's `writeValue` (`aoRecord.c:560-590`): SIMM YES/RAW
+        // writes SIOL instead of OUT, NO writes OUT.
+        name: "ao SIMM toggled across cycles",
+        arms: "GGGGGGGG",
+        db: with_fixtures!(
+            r#"record(ai, "SS") { field(VAL, "42") }
+               record(ao, "T") { field(DTYP, "Soft Channel") field(OUT, "F.B") field(SIOL, "SS")
+                field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("T", "3")],
+            &[("T.SIMM", "1")],
+            &[("T", "4")],
+            &[("T.SIMM", "0")],
+            &[("T", "5")],
+            &[("T.SIMM", "2")],
+            &[("T", "6")],
+        ],
+        ..BASE
+    },
+    Scenario {
         name: "const INP, alarm limits, runtime INP put",
         arms: "PPPPPP",
         db: with_fixtures!(
@@ -825,7 +847,10 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
             CyclePlan::ConstSoftIn => 'P',
             CyclePlan::DbSoftIn => 'D',
         });
-        for n in ["T", "F", "C"] {
+        for n in ["T", "F", "C", "SS"] {
+            if n == "SS" && db.get_record(n).is_none() {
+                continue;
+            }
             out.push(format!("step {i} {}", describe(&db, n)));
         }
         // The stamp's value is the clock's, so each run is compared by how it
@@ -922,6 +947,50 @@ async fn a_runtime_siml_put_leaves_the_plain_arm() {
     assert_eq!(t.record.get_field("VAL"), Some(EpicsValue::Double(42.0)));
 }
 
+/// An ao skips the simulation block only while SIMM is NO: softIoc, caput by
+/// caput, routes YES and RAW to SIOL and NO to OUT (values read back with
+/// caget from `SS F.B F` after each put).
+#[epics_macros_rs::epics_test]
+async fn an_ao_writes_siol_only_while_simulating() {
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"record(ai, "SS") { field(VAL, "42") }
+               record(calc, "F") { field(CALC, "VAL+1") }
+               record(ao, "T") { field(DTYP, "Soft Channel") field(OUT, "F.B") field(SIOL, "SS")
+                field(FLNK, "F") }"#,
+            &HashMap::new(),
+        )
+        .expect("db")
+        .build()
+        .await
+        .expect("ioc");
+    let value = |name: &str, field: &str| {
+        db.get_record(name)
+            .unwrap()
+            .read()
+            .record
+            .get_field(field)
+            .and_then(|v| v.to_f64())
+    };
+    for (simm, val, ss, b, f) in [
+        (0.0, 3.0, 42.0, 3.0, 1.0),
+        (1.0, 4.0, 4.0, 3.0, 2.0),
+        (0.0, 5.0, 4.0, 5.0, 3.0),
+        (2.0, 6.0, 6.0, 5.0, 4.0),
+    ] {
+        db.put_pv("T.SIMM", EpicsValue::Double(simm)).await.unwrap();
+        db.put_pv("T", EpicsValue::Double(val)).await.unwrap();
+        db.process_record_with_links("T", &mut super::ProcStack::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            (value("SS", "VAL"), value("F", "B"), value("F", "VAL")),
+            (Some(ss), Some(b), Some(f)),
+            "SIMM={simm} VAL={val}"
+        );
+    }
+}
+
 /// The D-arm severity scenarios above compare against General, whose soft DB
 /// read shares `soft_db_inp_read`; these pin C's `recGblInheritSevrMsg` table
 /// itself (`dbDbLink.c:228-232`) on the D arm.
@@ -967,4 +1036,128 @@ async fn the_d_arm_inherits_link_severity_as_c_does() {
             assert_eq!(t.common.sevr, want, "{mode} S.INP={s_inp}");
         }
     }
+}
+
+/// An ao `T` whose OUT names `A`, with the lent OUT target the frame takes
+/// set to the decoy `D` (on `scan`) at the name revision plus `skew`.
+async fn ao_with_lent_out_target(
+    out: &str,
+    field: &str,
+    scan: &str,
+    skew: u64,
+) -> std::sync::Arc<PvDatabase> {
+    use crate::server::record::record_instance::{LinkTargetResolver, OutTarget, PutAddr};
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            &format!(
+                r#"record(calc, "A") {{ field(CALC, "B+1") }}
+                   record(calc, "D") {{ field(CALC, "B+1") field(SCAN, "{scan}") }}
+                   record(ao, "T") {{ field(DTYP, "Soft Channel") field(OUT, "{out}")
+                    field(HIHI, "5") field(HHSV, "MAJOR") }}"#
+            ),
+            &HashMap::new(),
+        )
+        .expect("db")
+        .build()
+        .await
+        .expect("ioc");
+    let decoy = db.get_record("D").unwrap();
+    let target = OutTarget::new(
+        &decoy,
+        PutAddr::resolve_in(&decoy, field),
+        db.name_revision() + skew,
+    );
+    let t = db.get_record("T").unwrap();
+    t.write().parsed_out.set_out_target(Some(target));
+    db.put_pv("T", EpicsValue::Double(6.0)).await.unwrap();
+    db.process_record_with_links("T", &mut super::ProcStack::new())
+        .await
+        .unwrap();
+    db
+}
+
+/// `(B, VAL, SEVR)` of a calc.
+fn calc_state(db: &PvDatabase, name: &str) -> (f64, f64, crate::server::record::AlarmSeverity) {
+    let r = db.get_record(name).unwrap();
+    let r = r.read();
+    let f = |n| r.record.get_field(n).and_then(|v| v.to_f64()).unwrap();
+    (f("B"), f("VAL"), r.common.sevr)
+}
+
+/// A lent target at the current revision is C's `dbAddr`: the frame puts
+/// through it, then inherits MS and processes the Passive target for PP
+/// from the link's facts, never asking the link.
+#[epics_macros_rs::epics_test]
+async fn a_current_out_target_is_where_the_frame_puts() {
+    use crate::server::record::AlarmSeverity::{Invalid, Major};
+    let db = ao_with_lent_out_target("A.B PP MS", "B", "Passive", 0).await;
+    assert_eq!(calc_state(&db, "D"), (6.0, 7.0, Major));
+    // Never processed: still UDF.
+    assert_eq!(calc_state(&db, "A"), (0.0, 0.0, Invalid));
+}
+
+/// T's OUT target: the cell it lends and the revision it was lent at.
+fn out_target_of(db: &PvDatabase) -> Option<(bool, bool)> {
+    use crate::server::record::record_instance::LinkTargetResolver;
+    let a = db.get_record("A").unwrap();
+    let t = db.get_record("T").unwrap();
+    let target = t.read().parsed_out.out_target();
+    target.map(|t| (t.is_cell(&a), t.revision() == db.name_revision()))
+}
+
+/// A target lent at another name revision is not dereferenced: the frame
+/// lends the link's target again, writes it, and keeps that one.
+#[epics_macros_rs::epics_test]
+async fn a_stale_out_target_is_not_written() {
+    use crate::server::record::AlarmSeverity::{Invalid, Major};
+    let db = ao_with_lent_out_target("A.B PP MS", "B", "Passive", 1).await;
+    assert_eq!(calc_state(&db, "A"), (6.0, 7.0, Major));
+    assert_eq!(calc_state(&db, "D"), (0.0, 0.0, Invalid));
+    assert_eq!(out_target_of(&db), Some((true, true)));
+}
+
+/// An OUT link with no target yet lends one on its first cycle, and the
+/// next cycle writes through it at the same revision.
+#[epics_macros_rs::epics_test]
+async fn the_first_cycle_lends_the_out_target_the_next_one_writes() {
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"record(calc, "A") { field(CALC, "B+1") }
+               record(ao, "T") { field(DTYP, "Soft Channel") field(OUT, "A.B PP") }"#,
+            &HashMap::new(),
+        )
+        .expect("db")
+        .build()
+        .await
+        .expect("ioc");
+    assert_eq!(out_target_of(&db), None);
+    for val in [3.0, 4.0] {
+        db.put_pv("T", EpicsValue::Double(val)).await.unwrap();
+        db.process_record_with_links("T", &mut super::ProcStack::new())
+            .await
+            .unwrap();
+        assert_eq!(out_target_of(&db), Some((true, true)), "VAL={val}");
+        assert_eq!(calc_state(&db, "A").1, val + 1.0, "VAL={val}");
+    }
+}
+
+/// A lent target at `.PROC` processes its record through C's first
+/// `dbDbPutValue` gate (`dbDbLink.c:387`): no PP on the link, and a target
+/// that is not Passive.
+#[epics_macros_rs::epics_test]
+async fn a_current_out_target_at_proc_processes_its_record() {
+    let db = ao_with_lent_out_target("A.PROC", "PROC", "10 second", 0).await;
+    assert_eq!(calc_state(&db, "D").1, 1.0);
+    assert_eq!(calc_state(&db, "A").1, 0.0);
+}
+
+/// A stale target whose link no longer names a local record is dropped,
+/// not kept beside the link's own route.
+#[epics_macros_rs::epics_test]
+async fn a_stale_out_target_with_no_local_answer_is_dropped() {
+    use crate::server::record::AlarmSeverity::Invalid;
+    let db = ao_with_lent_out_target("NOSUCH.B PP", "B", "Passive", 1).await;
+    assert_eq!(calc_state(&db, "D"), (0.0, 0.0, Invalid));
+    let t = db.get_record("T").unwrap();
+    assert!(t.read().parsed_out.out_target().is_none());
 }

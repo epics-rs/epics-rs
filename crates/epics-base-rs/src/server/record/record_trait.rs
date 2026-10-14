@@ -6382,6 +6382,13 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Whether [`Self::output_time_input_links`] can ever be non-empty for
+    /// this type. Read once into the process plan; the cycle never asks
+    /// `output_time_input_links` of a type that answers `false`.
+    fn declares_output_time_input_links(&self) -> bool {
+        false
+    }
+
     /// The value the framework writes to the OUT link. The single owner of
     /// "what goes out", shared by the soft-OUT write, the async-completion
     /// write and the simulated SIOL redirect.

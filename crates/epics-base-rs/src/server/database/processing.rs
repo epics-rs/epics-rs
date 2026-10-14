@@ -1962,6 +1962,7 @@ struct CycleCtx<'c, 'a> {
     is_continuation: bool,
     device_callback: bool,
     plan: &'c crate::server::record::record_instance::ProcessPlan,
+    facts: crate::server::record::record_instance::CycleFacts,
     input_link_texts: &'c InputLinkTexts,
 }
 
@@ -3196,6 +3197,7 @@ impl PvDatabase {
     /// `:728`, `:1185` — never inside `asyncFinish`), the second `aborting`
     /// post (`:1192`), and `scalerRecord.c:372` (`cnt`). So a member published
     /// in the same cycle as an alarm transition omits a `DBE_ALARM` C sets.
+    #[inline(always)]
     pub(crate) fn publish_post_write_fields(
         &self,
         rec: InFrame<'_>,
@@ -3204,6 +3206,15 @@ impl PvDatabase {
         if fields.is_empty() {
             return;
         }
+        Self::publish_fields(rec, fields);
+    }
+
+    /// [`Self::publish_post_write_fields`] for a non-empty list, out of line
+    /// so the cycles of every other type pay a branch and not this frame.
+    fn publish_fields(
+        rec: InFrame<'_>,
+        fields: crate::server::record::CycleList<(String, EpicsValue)>,
+    ) {
         let mut inst = rec.write();
         for (field, value) in fields {
             // C's `db_post_events` result is never read nor printed
@@ -4974,7 +4985,7 @@ impl PvDatabase {
         // them across two acquisitions cost the record lock twice at the top
         // of every cycle and bought nothing.
         let read_texts;
-        let (plan, active, input_link_texts, cycle_plan) = {
+        let (plan, active, input_link_texts, (cycle_plan, facts)) = {
             let plan = guard.rec.process_plan();
             let instance = guard.hold();
             if instance.is_destroyed() {
@@ -5014,6 +5025,7 @@ impl PvDatabase {
             is_continuation,
             device_callback,
             plan,
+            facts,
             input_link_texts,
         };
         match cycle_plan {
@@ -5049,6 +5061,7 @@ impl PvDatabase {
             is_continuation,
             device_callback,
             plan,
+            facts,
             input_link_texts,
         } = ctx;
         // The arm's answers are facts of its plan, so every `plan.*` below
@@ -5291,10 +5304,9 @@ impl PvDatabase {
         // carried to whichever `recGblFwdLink` tail this cycle ends at, so the
         // put-notify parked on that window is replayed there (C
         // `dbNotifyCompletion`) instead of being stranded.
-        let (sim_outcome, sim_pact_exit) = if let Some(simm) = plan.simm {
-            self.check_simulation_mode(guard, rec, &simm)
-        } else {
-            (SimOutcome::NotSimulated, no_sim_pact_exit)
+        let (sim_outcome, sim_pact_exit) = match plan.simm {
+            Some(simm) if !facts.not_simulating => self.check_simulation_mode(guard, rec, &simm),
+            _ => (SimOutcome::NotSimulated, no_sim_pact_exit),
         };
         // Every exit below this line owes C's `recGblFwdLink` tail. The guard
         // owns that debt so no path can leave without either paying it or
@@ -5869,9 +5881,7 @@ impl PvDatabase {
                 // for CA puts to VAL. We only set true here, never reset to false.
                 if device_did_compute {
                     instance.record.set_device_did_compute(true);
-                } else if instance.record.skips_forward_convert_when_undefined()
-                    && instance.common.udf != 0
-                {
+                } else if plan.skips_forward_convert_when_undefined && instance.common.udf != 0 {
                     // C output-record `else if (prec->udf) goto CONTINUE`
                     // (mbboRecord.c:210-213): an output record whose VAL is still
                     // undefined and had no value source this cycle (no VAL put —
@@ -6599,23 +6609,28 @@ impl PvDatabase {
                 // another record) and re-taken, the same way the pre-process
                 // `ReadDbLink` stage above does it; the record stays claimed by the
                 // `processing` guard meanwhile.
-                let out_time_reads: Option<Vec<(String, &'static str)>> = if skip_out {
-                    None
-                } else {
-                    let out_time_links = instance.record.output_time_input_links();
-                    if !out_time_links.is_empty() && instance.record.should_output() {
-                        Some(
-                            out_time_links
-                                .iter()
-                                .filter_map(|(link_field, value_field)| {
-                                    Some((instance.link_text(link_field)?, *value_field))
-                                })
-                                .collect(),
-                        )
-                    } else {
+                let out_time_reads: Option<Vec<(String, &'static str)>> =
+                    if skip_out || !plan.reads_links_at_output {
+                        debug_assert!(
+                            plan.reads_links_at_output
+                                || instance.record.output_time_input_links().is_empty()
+                        );
                         None
-                    }
-                };
+                    } else {
+                        let out_time_links = instance.record.output_time_input_links();
+                        if !out_time_links.is_empty() && instance.record.should_output() {
+                            Some(
+                                out_time_links
+                                    .iter()
+                                    .filter_map(|(link_field, value_field)| {
+                                        Some((instance.link_text(link_field)?, *value_field))
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            None
+                        }
+                    };
 
                 (restamps_after, skip_out, out_time_reads)
             };
@@ -6676,7 +6691,7 @@ impl PvDatabase {
             let dispatched = if !has_output {
                 super::links::MultiOutDispatch::default()
             } else {
-                let (out_info, src_putf, src_notify, src_alarm) = {
+                let (out_value, src_putf, src_notify, src_alarm) = {
                     let instance = guard.hold();
                     if let Some(out_time_fetched) = out_time_fetched {
                         for (field, value) in out_time_fetched {
@@ -6694,7 +6709,7 @@ impl PvDatabase {
                     // output-fire decision. Spawned (not inline) like
                     // `dispatch_event_record` so the woken `SCAN="Event"` records run
                     // on the callback path, not recursively inside this cycle.
-                    if !skip_out {
+                    if !skip_out && plan.posts_output_event {
                         if let Some(event_name) = instance.record.output_event() {
                             let db = self.clone();
                             // Middle band, not this record's PRIO: C `postEvent`
@@ -6717,7 +6732,7 @@ impl PvDatabase {
                     // OUT stage: soft channel -> link put, non-soft -> device.write()
                     // Must run BEFORE check_deadband_ext so MLST is not prematurely
                     // updated for async writes that return early.
-                    let out_info = if sim_output.is_some() {
+                    let out_value = if sim_output.is_some() {
                         // Simulated OUTPUT record: C `writeValue` redirects the output
                         // to SIOL (`dbPutLink(&prec->siol, ..., &prec->oval)`) INSTEAD
                         // of the real device write / soft OUT-link write. The redirect
@@ -6746,8 +6761,7 @@ impl PvDatabase {
                             // soft OUT link (DB or external ca://`/`pva://`).
                             // Write OVAL to OUT when the record says should_output().
                             if record_should_output && instance.parsed_out.is_writable_out_link() {
-                                let out_val = instance.record.output_link_value();
-                                out_val.map(|v| (Arc::clone(instance.parsed_out.shared()), v))
+                                instance.record.output_link_value()
                             } else {
                                 None
                             }
@@ -6761,10 +6775,7 @@ impl PvDatabase {
                                 None
                             } else if instance.parsed_out.is_writable_out_link() {
                                 // Built only for an OUT link that will take it.
-                                instance
-                                    .soft_output_value()
-                                    .flatten()
-                                    .map(|v| (Arc::clone(instance.parsed_out.shared()), v))
+                                instance.soft_output_value().flatten()
                             } else {
                                 None
                             }
@@ -6860,7 +6871,7 @@ impl PvDatabase {
                     let src_putf = instance.common.putf;
                     let src_notify = instance.notify.clone();
                     let src_alarm = super::links::LinkAlarm::pending(&instance.common);
-                    (out_info, src_putf, src_notify, src_alarm)
+                    (out_value, src_putf, src_notify, src_alarm)
                 };
 
                 // C `writeValue` reaches `conditional_write` — whose epilogue
@@ -6871,6 +6882,13 @@ impl PvDatabase {
                 // skips the `writeValue` call site altogether (`:169-171`).
                 let reached_conditional_write =
                     sim_output.is_none() && !sim_write_aborted && !skip_out;
+
+                let out_info = super::links::OutLinkWrite::capture(
+                    out_value,
+                    &mut guard.hold().parsed_out,
+                    self,
+                    rec.set(),
+                );
 
                 // C `process()` runs every output of the cycle BEFORE `monitor()`,
                 // and `monitor()` is where `recGblResetAlarms` commits the cycle's
@@ -6909,14 +6927,8 @@ impl PvDatabase {
                     alarm: &src_alarm,
                     field: "OUT",
                 };
-                if let Some((link, ref out_val)) = out_info {
-                    self.write_out_link_value(
-                        rec,
-                        link,
-                        super::PutSrc::Value(out_val),
-                        src,
-                        visited,
-                    );
+                if let Some((out, ref out_val)) = out_info {
+                    self.write_out(rec, out, super::PutSrc::Value(out_val), src, visited);
                 }
                 // C `longoutRecord.c:492-493`, OUTSIDE `if (doDevSupWrite)`:
                 // the OOPT reference advances on a suppressed cycle too, which
@@ -8183,20 +8195,19 @@ impl PvDatabase {
                 // synchronous OUT stage (`RecordInstance::soft_output_value`).
                 let soft_out = instance.soft_output_value();
                 let record_should_output = instance.record.should_output();
-                let out_info = if skip_out {
+                let out_value = if skip_out {
                     None
                 } else if !can_dev_write {
                     // Non-output records (calcout, etc.) with soft OUT link
                     // (DB or external `ca://`/`pva://`).
                     if record_should_output && instance.parsed_out.is_writable_out_link() {
-                        let out_val = instance.record.output_link_value();
-                        out_val.map(|v| (Arc::clone(instance.parsed_out.shared()), v))
+                        instance.record.output_link_value()
                     } else {
                         None
                     }
                 } else if let Some(out_val) = soft_out {
                     if instance.parsed_out.is_writable_out_link() {
-                        out_val.map(|v| (Arc::clone(instance.parsed_out.shared()), v))
+                        out_val
                     } else {
                         None
                     }
@@ -8206,6 +8217,12 @@ impl PvDatabase {
                     // write_begin -- it would start another async cycle.
                     None
                 };
+                let out_info = super::links::OutLinkWrite::capture(
+                    out_value,
+                    &mut instance.parsed_out,
+                    self,
+                    rec.set(),
+                );
 
                 // PUTF / put-notify wait-set / source PENDING alarm — the
                 // values C `dbDbPutValue` reads at the put (dbDbLink.c:382-383
@@ -8233,8 +8250,8 @@ impl PvDatabase {
                 alarm: &src_alarm,
                 field: "OUT",
             };
-            if let Some((link, ref out_val)) = out_info {
-                self.write_out_link_value(rec, link, super::PutSrc::Value(out_val), src, visited);
+            if let Some((out, ref out_val)) = out_info {
+                self.write_out(rec, out, super::PutSrc::Value(out_val), src, visited);
             }
             // Same `conditional_write` epilogue as the synchronous stage. C
             // runs it on the async device's first pass as well (the record
@@ -8530,6 +8547,7 @@ impl PvDatabase {
     /// record never enters `process_record_with_links_inner`'s async state —
     /// that future is polled one frame deeper per FLNK hop, unbounded as in C,
     /// and bloating it overflows the stack sooner (the deep-chain tests).
+    #[inline(always)]
     fn write_simulated_output_siol(
         &self,
         rec: InFrame<'_>,
@@ -8547,12 +8565,25 @@ impl PvDatabase {
         if skip_out || !siol.is_writable_out_link() {
             return;
         }
+        self.write_siol(rec, siol, *raw_mode, src, visited);
+    }
+
+    /// [`Self::write_simulated_output_siol`] past its gates, out of line so a
+    /// record that is not simulating pays a branch and not this frame.
+    fn write_siol(
+        &self,
+        rec: InFrame<'_>,
+        siol: &Arc<crate::server::record::ParsedLink>,
+        raw_mode: bool,
+        src: super::links::OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) {
         // The record's own OUT value (RAW: RVAL) — matching C `writeValue`
         // (`dbPutLink(&prec->siol, ..., &prec->oval)`), so the SIOL redirect
         // sends exactly what the real OUT link would have.
         let value = {
             let instance = rec.read();
-            if *raw_mode {
+            if raw_mode {
                 instance
                     .record
                     .get_field("RVAL")
@@ -10133,10 +10164,16 @@ impl SiolStamp {
 }
 
 /// The alarm a device support's last transfer left, raised into the record.
+#[inline(always)]
 fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) {
-    if is_soft {
-        return;
+    if !is_soft {
+        apply_hard_device_alarm(instance);
     }
+}
+
+/// [`apply_device_alarm`] for a device that is not soft, out of line so a
+/// soft record pays a branch and not this frame.
+fn apply_hard_device_alarm(instance: &mut RecordInstance) {
     if let Some(alarm) = instance.device.as_ref().and_then(|d| d.last_alarm()) {
         crate::server::recgbl::rec_gbl_set_sevr_msg(
             &mut instance.common,

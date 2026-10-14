@@ -1045,6 +1045,9 @@ impl ProcessPlan {
         fetches_dol_closed_loop: false,
         soft_channel_skips_convert: true,
         skips_timestamp_when_undefined: false,
+        skips_forward_convert_when_undefined: false,
+        posts_output_event: false,
+        reads_links_at_output: false,
         restamps_time_after_completion: false,
         alarms_before_stamp: false,
         stamps_before_alarms: true,
@@ -1082,6 +1085,9 @@ impl ProcessPlan {
             fetches_dol_closed_loop,
             soft_channel_skips_convert,
             skips_timestamp_when_undefined,
+            skips_forward_convert_when_undefined,
+            posts_output_event,
+            reads_links_at_output,
             restamps_time_after_completion,
             alarms_before_stamp,
             stamps_before_alarms,
@@ -1113,6 +1119,9 @@ impl ProcessPlan {
             && fetches_dol_closed_loop == p.fetches_dol_closed_loop
             && soft_channel_skips_convert == p.soft_channel_skips_convert
             && skips_timestamp_when_undefined == p.skips_timestamp_when_undefined
+            && skips_forward_convert_when_undefined == p.skips_forward_convert_when_undefined
+            && posts_output_event == p.posts_output_event
+            && reads_links_at_output == p.reads_links_at_output
             && restamps_time_after_completion == p.restamps_time_after_completion
             && alarms_before_stamp == p.alarms_before_stamp
             && stamps_before_alarms == p.stamps_before_alarms
@@ -1174,6 +1183,9 @@ impl ProcessPlan {
             fetches_dol_closed_loop: record.fetches_dol_closed_loop(),
             soft_channel_skips_convert: record.soft_channel_skips_convert(),
             skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
+            skips_forward_convert_when_undefined: record.skips_forward_convert_when_undefined(),
+            posts_output_event: field_desc_of(record, "OEVT").is_some(),
+            reads_links_at_output: record.declares_output_time_input_links(),
             restamps_time_after_completion: record.restamps_time_after_completion(),
             alarms_before_stamp: record.alarms_before_stamp(),
             stamps_before_alarms: !record.alarms_before_stamp()
@@ -1200,9 +1212,10 @@ pub(crate) struct UdfAlarm {
 
 mod link_cache {
     use crate::server::builtin_devices::soft_callback::AddRecordRefusal;
+    use crate::server::database::ProcessTargetGate;
     use crate::server::device_support::SoftDtyp;
     use crate::server::recgbl::simm::has_const_lset;
-    use crate::server::record::{DbLinkType, LinkFieldType, ParsedLink};
+    use crate::server::record::{DbLinkType, LinkFieldType, MonitorSwitch, ParsedLink};
     use std::sync::{Arc, LazyLock};
 
     /// A parsed `dbCommon` link, readable as the [`ParsedLink`] it holds and
@@ -1217,6 +1230,12 @@ mod link_cache {
         parse: Arc<ParsedLink>,
     }
 
+    // SAFETY: `facts.target` is the only field that is not `Send + Sync`, and
+    // it is dereferenced only by the frame of the set that owns this record,
+    // under that set's hold; see `OutTarget`.
+    unsafe impl Send for LinkCache {}
+    unsafe impl Sync for LinkCache {}
+
     /// What the process cycle asks of the link on every pass, copied from
     /// the parse whenever one is installed so the cycle answers from the
     /// entry without following the `Arc` (spec-R2 §10: resolved at attach).
@@ -1224,14 +1243,102 @@ mod link_cache {
     struct LinkFacts {
         constant: bool,
         writable_out: bool,
+        gate: Option<ProcessTargetGate>,
+        switch: MonitorSwitch,
+        target: Option<OutTarget>,
     }
 
     impl LinkFacts {
         fn of(link: &ParsedLink) -> Self {
+            let gate = match link {
+                ParsedLink::Db(db) => ProcessTargetGate::of_put(db),
+                _ => None,
+            };
             Self {
                 constant: crate::server::recgbl::simm::is_constant(link),
                 writable_out: link.is_writable_out_link(),
+                gate,
+                switch: link.monitor_switch().unwrap_or_default(),
+                target: None,
             }
+        }
+    }
+
+    /// An OUT link's local target as the frame writes it, C's `dbAddr` of
+    /// `dbDbPutValue`: the target record's cell, its put address, and the
+    /// name revision both were resolved at.
+    ///
+    /// `rec` borrows the cell the link's lent entry (`DbLink::lend_out_addr`)
+    /// keeps alive. That entry is emptied only by
+    /// `RecordInstance::release_link_addrs`, under `&mut` and a full acquire
+    /// of the owning set, or by the `DbLink`'s drop after `LinkCache::swap`
+    /// under the hold, and both of those clear this copy first; so a frame
+    /// holding the owning set, at a matching revision, sees a live cell. Not
+    /// `Send`: a copy never leaves the frame.
+    #[derive(Clone, Copy)]
+    pub(crate) struct OutTarget {
+        rec: std::ptr::NonNull<super::RecordCell>,
+        put: super::PutAddr,
+        revision: u64,
+    }
+
+    impl std::fmt::Debug for OutTarget {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("OutTarget")
+                .field("rec", &self.rec)
+                .field("revision", &self.revision)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl OutTarget {
+        /// `rec` is the lent entry's cell, so the pointer is an `Arc`'s.
+        pub(crate) fn new(
+            rec: &Arc<super::RecordCell>,
+            put: super::PutAddr,
+            revision: u64,
+        ) -> Self {
+            Self {
+                rec: std::ptr::NonNull::from(&**rec),
+                put,
+                revision,
+            }
+        }
+
+        /// The target cell, for the frame of `owner`'s set at a revision
+        /// equal to [`Self::revision`]: no refcount, nothing to drop.
+        ///
+        /// # Safety
+        ///
+        /// The copy is the one `owner`'s OUT [`LinkCache`] held when the
+        /// frame read it under `held`, and the frame checked its revision
+        /// against `name_revision()` then; see [`OutTarget`].
+        pub(crate) unsafe fn lend(
+            &self,
+            held: &crate::server::database::SetGuard,
+            owner: &super::RecordCell,
+        ) -> std::mem::ManuallyDrop<Arc<super::RecordCell>> {
+            debug_assert!(
+                held.holds(&owner.lock_record),
+                "an OUT target lent outside its owner's set"
+            );
+            // SAFETY: `new` took the pointer from an `Arc`, and the caller's
+            // contract keeps that `Arc` alive; `ManuallyDrop` never releases
+            // the count this does not hold.
+            std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(self.rec.as_ptr()) })
+        }
+
+        pub(crate) fn put(&self) -> super::PutAddr {
+            self.put
+        }
+
+        #[cfg(test)]
+        pub(crate) fn is_cell(&self, rec: &super::RecordCell) -> bool {
+            std::ptr::eq(self.rec.as_ptr(), rec)
+        }
+
+        pub(crate) fn revision(&self) -> u64 {
+            self.revision
         }
     }
 
@@ -1263,6 +1370,28 @@ mod link_cache {
             self.facts.writable_out
         }
 
+        /// [`ProcessTargetGate::of_put`] of a DB link.
+        pub(crate) fn process_gate(&self) -> Option<ProcessTargetGate> {
+            self.facts.gate
+        }
+
+        /// [`ParsedLink::monitor_switch`], `NMS` for a link without one.
+        pub(crate) fn monitor_switch(&self) -> MonitorSwitch {
+            self.facts.switch
+        }
+
+        pub(crate) fn out_target(&self) -> Option<OutTarget> {
+            self.facts.target
+        }
+
+        /// Store the frame's copy of the lent OUT target, under the write
+        /// guard, from the entry `DbLink::lend_out_addr` lent.
+        pub(crate) fn set_out_target(&mut self, target: Option<OutTarget>) {
+            self.facts.target = target;
+        }
+
+        /// The swap empties the target with the facts: the old parse, and
+        /// the entry it lent, leave with `link`.
         pub(super) fn swap(&mut self, link: &mut Arc<ParsedLink>) {
             std::mem::swap(&mut self.parse, link);
             self.facts = LinkFacts::of(&self.parse);
@@ -1929,8 +2058,8 @@ mod link_cache {
 
 pub use link_cache::LinkCache;
 pub(crate) use link_cache::{
-    CycleLink, CycleLinkSlots, LinkRow, LinkSlots, NewDset, PreparedCommonLink, PreparedLink,
-    PreparedLinks,
+    CycleLink, CycleLinkSlots, LinkRow, LinkSlots, NewDset, OutTarget, PreparedCommonLink,
+    PreparedLink, PreparedLinks,
 };
 
 /// How one process cycle of one record instance runs, resolved from the
@@ -1953,6 +2082,18 @@ pub(crate) enum CyclePlan {
     /// the general stage otherwise. Any other request is General: the arm's
     /// slot carries an `f64`, so the arm itself is the request.
     DbSoftIn,
+}
+
+/// Instance answers a cycle would otherwise test on every process, resolved
+/// with the [`CyclePlan`] arm and stale with it: each `true` names a region the
+/// cycle skips. [`Default`] skips nothing, which is the General reference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CycleFacts {
+    /// SIMM is NO, SSCN is unset and SIML and SDIS are constants: C
+    /// `recGblGetSimm` reads nothing and `readValue`/`writeValue` take the
+    /// real I/O, and no SDIS read has released the guard since the entry
+    /// read the put-notify queue.
+    pub(crate) not_simulating: bool,
 }
 
 /// What a record's TYPE can reach in a process cycle.
@@ -2058,12 +2199,18 @@ pub(crate) struct ProcessPlan {
     /// (`calcRecord.c` has no such lines): the cycle skips it, and with it the
     /// guard boundary the stage's link writes would need.
     pub(crate) output_stage: bool,
-    /// Five per-type answers the cycle asked the record for through the
+    /// Six per-type answers the cycle asked the record for through the
     /// vtable every process; each is a literal in every implementation, so
     /// they are read once here. See the `Record` method of the same name.
     pub(crate) fetches_dol_closed_loop: bool,
     pub(crate) soft_channel_skips_convert: bool,
     pub(crate) skips_timestamp_when_undefined: bool,
+    pub(crate) skips_forward_convert_when_undefined: bool,
+    /// The type has an `OEVT` field, the only place
+    /// [`Record::output_event`] answers from.
+    pub(crate) posts_output_event: bool,
+    /// See [`Record::declares_output_time_input_links`].
+    pub(crate) reads_links_at_output: bool,
     pub(crate) restamps_time_after_completion: bool,
     pub(crate) alarms_before_stamp: bool,
     /// The cycle stamps before `checkAlarms`: neither `alarms_before_stamp`
@@ -4612,7 +4759,7 @@ pub struct RecordInstance {
     /// [`Self::invalidate_plan`].
     plan_rev: u32,
     /// The plan resolved at `cycle_plan.0`; stale when that is not `plan_rev`.
-    cycle_plan: (u32, CyclePlan),
+    cycle_plan: (u32, CyclePlan, CycleFacts),
     /// Test knob: run every cycle as [`CyclePlan::General`], the reference a
     /// plain arm is compared against.
     #[cfg(test)]
@@ -5587,14 +5734,23 @@ impl RecordInstance {
     /// The plan this cycle runs under, re-resolved when anything it was
     /// resolved from has changed since.
     #[inline(always)]
-    pub(crate) fn cycle_plan(&mut self, plan: &ProcessPlan, is_continuation: bool) -> CyclePlan {
+    pub(crate) fn cycle_plan(
+        &mut self,
+        plan: &ProcessPlan,
+        is_continuation: bool,
+    ) -> (CyclePlan, CycleFacts) {
         if self.cycle_plan.0 != self.plan_rev {
             self.replan(plan);
         }
         #[cfg(test)]
         if self.plan_forced_general {
-            return CyclePlan::General;
+            return (CyclePlan::General, CycleFacts::default());
         }
+        let facts = self.cycle_plan.2;
+        debug_assert!(
+            !facts.not_simulating || self.record.simm_cells().is_some_and(|c| c.simm == 0),
+            "SIMM changed without invalidate_plan"
+        );
         let arm = match self.cycle_plan.1 {
             // What the stamp does not own: the device slot is set by init,
             // and a continuation re-enters with PACT held.
@@ -5613,7 +5769,7 @@ impl RecordInstance {
         {
             self.ran_arm = arm;
         }
-        arm
+        (arm, facts)
     }
 
     /// The arm the last cycle dispatched to, for the differential harness.
@@ -5626,14 +5782,17 @@ impl RecordInstance {
     #[inline(never)]
     fn replan(&mut self, plan: &ProcessPlan) {
         // SIMM is stamped: a put reaches it through `invalidate_plan_for`, and
-        // the SIML read that also writes it runs only on a General plan.
-        let plain = plan.is_plain_input()
-            && self.record.simm_cells().is_some_and(|c| c.simm == 0)
-            && self.common.dtyp.is_soft()
+        // the SIML read that also writes it runs only for a SIML that is not
+        // a constant, which is neither plain nor `not_simulating`.
+        let not_simulating = self.record.simm_cells().is_some_and(|c| c.simm == 0)
             && self.common.sscn.is_unset()
             && self.parsed_sdis.is_constant()
-            && plan.simm.is_some()
             && self.siml_has_const_lset();
+        let facts = CycleFacts { not_simulating };
+        let plain = plan.is_plain_input()
+            && not_simulating
+            && self.common.dtyp.is_soft()
+            && plan.simm.is_some();
         let reads_double = || match self.parsed_inp.link() {
             ParsedLink::Db(db)
                 if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
@@ -5664,7 +5823,7 @@ impl RecordInstance {
         } else {
             CyclePlan::General
         };
-        self.cycle_plan = (self.plan_rev, arm);
+        self.cycle_plan = (self.plan_rev, arm, facts);
     }
 
     /// Whether the soft dset's `read_xxx` reaches INP this cycle: not for a
@@ -6178,7 +6337,7 @@ impl RecordInstance {
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             watchdog_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_rev: 1,
-            cycle_plan: (0, CyclePlan::General),
+            cycle_plan: (0, CyclePlan::General, CycleFacts::default()),
             #[cfg(test)]
             plan_forced_general: false,
             #[cfg(test)]
@@ -12133,6 +12292,8 @@ impl RecordInstance {
     /// through (`DbLink::release_addr`): INP for its reads, OUT and the
     /// type's declared links for its writes.
     fn release_link_addrs(&mut self) {
+        // Before the entries go: the targets borrow them.
+        self.parsed_out.set_out_target(None);
         let links = [self.parsed_inp.link(), self.parsed_out.link()]
             .into_iter()
             .chain(self.link_slots.links().map(|l| &**l));
@@ -16235,6 +16396,70 @@ mod link_cache_fact_tests {
                 );
             }
         }
+    }
+
+    /// A DB link's PROC target, else its PP, and its MS reach the facts;
+    /// any other kind answers no gate and NMS.
+    #[test]
+    fn the_out_facts_follow_the_parse() {
+        use crate::server::database::ProcessTargetGate::{ProcField, ScanPassive};
+        use crate::server::record::MonitorSwitch;
+        let mut inst = RecordInstance::new("LCF".to_string(), AiRecord::new(0.0));
+        for (text, gate, switch) in [
+            ("OTHER.PROC PP MS", Some(ProcField), MonitorSwitch::Maximize),
+            ("OTHER.PROC NPP", Some(ProcField), MonitorSwitch::NoMaximize),
+            ("OTHER.VAL PP", Some(ScanPassive), MonitorSwitch::NoMaximize),
+            ("OTHER.VAL NPP MSI", None, MonitorSwitch::MaximizeIfInvalid),
+            // C `dbParseLink` defaults an output link to NPP.
+            ("OTHER", None, MonitorSwitch::NoMaximize),
+            ("ca://OTHER.PROC MSS", None, MonitorSwitch::MaximizeStatus),
+            ("5", None, MonitorSwitch::NoMaximize),
+        ] {
+            assert!(inst.set_link_cache("OUT", parse_link_field(text, LinkFieldType::Out)));
+            let cache = &inst.parsed_out;
+            assert_eq!(
+                (cache.process_gate(), cache.monitor_switch()),
+                (gate, switch),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Both sites that let the lent entry go empty the target first: a link
+    /// swap, and `release_link_addrs` behind `release_link_targets_to` and
+    /// `destroy`.
+    #[test]
+    fn the_out_target_empties_where_its_entry_can_go() {
+        use crate::server::records::ao::AoRecord;
+        let target = Arc::new(RecordCell::new(
+            RecordInstance::new("TGT".to_string(), AoRecord::new(0.0)),
+            0,
+            false,
+        ));
+        let put = PutAddr::resolve_in(&target, "VAL");
+        let mut inst = RecordInstance::new("SRC".to_string(), AoRecord::new(0.0));
+        let parse = parse_link_field("TGT.VAL PP", LinkFieldType::Out);
+        let lend = |inst: &mut RecordInstance| {
+            inst.parsed_out
+                .set_out_target(Some(link_cache::OutTarget::new(&target, put, 7)));
+            assert_eq!(inst.parsed_out.out_target().map(|t| t.revision()), Some(7));
+        };
+
+        assert!(inst.set_link_cache("OUT", parse.clone()));
+        lend(&mut inst);
+        assert!(inst.set_link_cache("OUT", parse.clone()));
+        assert!(inst.parsed_out.out_target().is_none(), "swap");
+
+        lend(&mut inst);
+        inst.release_link_targets_to(&target);
+        assert!(
+            inst.parsed_out.out_target().is_none(),
+            "release_link_targets_to"
+        );
+
+        lend(&mut inst);
+        inst.destroy();
+        assert!(inst.parsed_out.out_target().is_none(), "destroy");
     }
 }
 

@@ -24,8 +24,8 @@ pub use link_set::{
     LinkSetRegistry, PutAdmission, RemoteAlarm,
 };
 pub(crate) use links::{
-    multi_out_rows, multi_output_dispatch_owned, posts_software_event, reads_sell,
-    resolves_subroutine_from_link,
+    ProcessTargetGate, multi_out_rows, multi_output_dispatch_owned, posts_software_event,
+    reads_sell, resolves_subroutine_from_link,
 };
 pub(crate) use processing::NotifiedRead;
 pub use processing::{

@@ -936,6 +936,10 @@ impl Record for SwaitRecord {
         }
     }
 
+    fn declares_output_time_input_links(&self) -> bool {
+        true
+    }
+
     /// C `execOutput` posts the refreshed DOLD with `DBE_VALUE` alone
     /// (swaitRecord.c:770), not the framework default `DBE_VALUE | DBE_LOG`;
     /// CLCV's post (`:309`, `:566`) carries a literal `DBE_VALUE` too.

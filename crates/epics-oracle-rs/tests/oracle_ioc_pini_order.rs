@@ -50,27 +50,30 @@ fn pini_passes_bracket_the_ioc_run_line_as_in_oracle_ioc() {
     std::fs::write(&db, DB).expect("write db");
     // The TPRO line is on stdout and the rest on stderr; one pipe takes both
     // in the order they are written, as `2>&1` does.
+    let claim = epics_oracle_rs::ioc::claim_port().expect("claim a port");
     let (output, writer) = std::io::pipe().expect("pipe");
     let mut child = Command::new(env!("CARGO_BIN_EXE_oracle-ioc"))
         .arg("--db")
         .arg(&db)
+        .arg("--port")
+        .arg(claim.port().to_string())
         .stdin(Stdio::null())
         .stdout(writer.try_clone().expect("clone the pipe"))
         .stderr(writer)
         .spawn()
         .expect("spawn oracle-ioc");
-    // The process serves until killed, so the stream is read up to the server
-    // line, which follows every PINI pass.
+    // The process serves until killed, so the stream is read up to the ready
+    // marker, which follows every PINI pass and the socket binds.
     let mut stderr = String::new();
     let mut seen = Vec::new();
     for line in BufReader::new(output).lines().map_while(Result::ok) {
         stderr.push_str(&line);
         stderr.push('\n');
-        if line.starts_with("CA server: UDP search on port ") {
+        if line == "ORACLE_IOC_READY" {
             break;
         }
-        // The banner, elided above, and the harness's `ORACLE_IOC_` handshake,
-        // which oracleIoc does not print.
+        // The banner, elided above, and the harness's port line, which
+        // oracleIoc does not print.
         if line.starts_with('#') || line.starts_with("ORACLE_IOC_") {
             continue;
         }

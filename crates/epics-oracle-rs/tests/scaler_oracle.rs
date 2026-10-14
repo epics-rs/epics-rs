@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use epics_oracle_rs::ioc::{BootNames, CTools, LogPolicy, RustIoc, boot_on_free_port};
+use epics_oracle_rs::ioc::{
+    BootNames, CTools, LogPolicy, PortClaim, RustIoc, boot_on_free_port, claim_port,
+};
 
 const DEFAULT_SCALER_IOC: &str =
     "/home/stevek/work/epics-modules/oracle-ioc/bin/linux-x86_64/oracleScalerIoc";
@@ -98,6 +100,8 @@ type Said = Box<dyn Fn() -> String>;
 /// One IOC under test, reachable at `addr` (`EPICS_CA_ADDR_LIST`).
 struct Served {
     _ioc: Proc,
+    /// Keeps the IOC's port claimed for as long as it runs; dropped after it.
+    _claim: PortClaim,
     addr: String,
     said: Said,
 }
@@ -201,14 +205,18 @@ impl Setup {
         Served {
             addr: format!("127.0.0.1:{}", booted.port),
             _ioc: Proc(booted.child),
+            _claim: booted.claim,
             said: Box::new(move || tail.all_lines().join("\n")),
         }
     }
 
     fn boot_rs(&self, prefix: &str) -> Served {
+        let claim = claim_port().expect("a port to serve on");
         let mut cmd = Command::new(RustIoc::binary().expect("oracle-ioc built"));
         cmd.arg("--db")
             .arg(&self.db)
+            .arg("--port")
+            .arg(claim.port().to_string())
             .arg("--macro")
             .arg(format!("P={prefix}"));
         for (port, chans, template) in &self.ports {
@@ -224,6 +232,7 @@ impl Setup {
         let port = line.rsplit(' ').next().unwrap().to_string();
         Served {
             _ioc: Proc(child),
+            _claim: claim,
             addr: format!("127.0.0.1:{port}"),
             said: Box::new(move || log.lock().unwrap().join("\n")),
         }

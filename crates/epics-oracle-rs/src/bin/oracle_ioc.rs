@@ -1,10 +1,9 @@
 //! The Rust side of the differential pair.
 //!
-//! Loads a `.db`, brings up a server on a kernel-assigned port, and prints
+//! Loads a `.db`, brings up a server on the claimed `--port`, and prints
 //! that port on stdout. The harness reads the number back rather than
-//! predicting it: `from_parts(db, 0, ..)` binds the sockets and *then* reports
-//! what it got, so nothing can take the port in between and no number is ever
-//! hard-coded.
+//! predicting it: `from_parts(db, port, ..)` binds the sockets and *then* reports
+//! what it got; the number is a claim the harness holds, never hard-coded.
 //!
 //! Two protocols, selected by `--pva`. The two server types are named in code
 //! spans rather than linked: both are `tokio_backend`-only and this doc block
@@ -44,7 +43,7 @@ use epics_oracle_rs::{port_ioc_builder, register_port_ioc_devices};
 use epics_pva_rs::server::PvaServer;
 
 #[derive(Parser)]
-#[command(about = "Rust IOC under differential test: serves a .db on a bound :0 port")]
+#[command(about = "Rust IOC under differential test: serves a .db on a claimed port")]
 struct Args {
     /// The `.db` to serve — the same file the C IOC is given.
     #[arg(long)]
@@ -57,6 +56,13 @@ struct Args {
     /// so a reading is always attributable to the server that answered it.
     #[arg(long)]
     pva: bool,
+
+    /// The port to serve on (CA UDP+TCP, or PVA UDP+TCP). Required: the harness
+    /// claims it (`epics_oracle_rs::ioc::claim_port`) so that it is never drawn
+    /// from the kernel's ephemeral pool, where any other socket could be handed
+    /// the same number. The bound port is still reported back.
+    #[arg(long)]
+    port: u16,
 
     /// A `NAME=VALUE` substitution for the `.db`, repeatable — the macro
     /// string the C oracle's `st-*.cmd` hands `dbLoadRecords` (`P=`).
@@ -109,6 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1");
         std::env::set_var("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1");
         std::env::set_var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO");
+        // `PvaServer::from_parts(.., Some(port), ..)` names the TCP port only;
+        // the search port is the environment's (default 5076, a port shared
+        // with the host), so the claim is put there too.
+        std::env::set_var("EPICS_PVAS_BROADCAST_PORT", args.port.to_string());
     }
 
     let db_path = args.db.to_string_lossy().to_string();
@@ -163,15 +173,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ioc.run().await;
 
     if args.pva {
-        return serve_pva(db).await;
+        return serve_pva(db, args.port).await;
     }
 
-    // Port 0 => the kernel assigns; `from_parts` binds first and reports the
-    // port it actually bound. This is the bind-and-read-back the harness
-    // requires, not a probe-then-rebind.
+    // `from_parts` binds first and reports the port it actually bound, which
+    // the harness checks against the one it claimed.
     let server = CaServer::from_parts(
         db,
-        0,
+        args.port,
         None,
         epics_base_rs::server::access_security::new_acf_cell(None),
         None,
@@ -188,13 +197,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Serve `db` over PVA on kernel-assigned ports, reporting the UDP search
+/// Serve `db` over PVA on the claimed port, reporting the UDP search
 /// port once it is bound.
 ///
-/// `from_parts(db, 0, ..)` is the ephemeral sentinel: both TCP and UDP are
-/// bound by the kernel. The port cannot be known before the bind and is not
-/// guessed — `run_reporting` hands back a `ServerReportHandle` the instant
-/// the listeners are up, and the number is read off that.
+/// TCP is `Some(port)`, UDP search is `EPICS_PVAS_BROADCAST_PORT` (set in
+/// `main`). `run_reporting` hands back a `ServerReportHandle` the instant the
+/// listeners are up, and the number is read off that.
 ///
 /// Read-back is not a nicety here. A PVA search socket sets `SO_REUSEPORT`,
 /// so two servers on one port bind **without any error** and then answer
@@ -206,10 +214,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(tokio_backend)]
 async fn serve_pva(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
+    port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server = PvaServer::from_parts(
         db,
-        Some(0),
+        Some(port),
         epics_base_rs::server::access_security::new_acf_cell(None),
         None,
         None,

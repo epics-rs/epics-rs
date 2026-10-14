@@ -24,9 +24,12 @@ const DB: &str = "record(sub, \"BADSUB\") { field(SNAM, \"noSuchSub\") }\n";
 fn starting_ioc_init_precedes_the_init_record_report_as_in_oracle_ioc() {
     let db = std::env::temp_dir().join(format!("oracle-badsub-{}.db", std::process::id()));
     std::fs::write(&db, DB).expect("write db");
+    let claim = epics_oracle_rs::ioc::claim_port().expect("claim a port");
     let mut child = Command::new(env!("CARGO_BIN_EXE_oracle-ioc"))
         .arg("--db")
         .arg(&db)
+        .arg("--port")
+        .arg(claim.port().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

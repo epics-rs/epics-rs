@@ -1648,7 +1648,8 @@ mod adjudicate_tests {
             "the C EPICS tree must be built for the oracle to have ground truth; \
              set EPICS_BASE_BIN if it is not at the default path",
         );
-        let dead = crate::ioc::alloc_free_port().expect("a port to aim at");
+        let dead_claim = crate::ioc::claim_port().expect("a port to aim at");
+        let dead = dead_claim.port();
 
         let side_err = |side: Side| -> ToolError {
             CaTools::new(&tools, dead, side)

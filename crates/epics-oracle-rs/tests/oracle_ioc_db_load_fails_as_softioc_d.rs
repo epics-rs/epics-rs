@@ -31,9 +31,12 @@ fn scratch(case: &str) -> std::path::PathBuf {
 
 /// Run `oracle-ioc --db <name>` in `dir`; its exit code and stderr.
 fn load(dir: &std::path::Path, name: &str) -> (Option<i32>, String) {
+    let claim = epics_oracle_rs::ioc::claim_port().expect("claim a port");
     let mut child = Command::new(env!("CARGO_BIN_EXE_oracle-ioc"))
         .arg("--db")
         .arg(name)
+        .arg("--port")
+        .arg(claim.port().to_string())
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

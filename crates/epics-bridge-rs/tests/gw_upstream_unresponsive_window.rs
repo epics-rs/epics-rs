@@ -30,7 +30,10 @@ async fn manager(db: Arc<PvDatabase>) -> UpstreamManager {
         stats: Arc::new(Stats::new("gw:".into())),
         read_only: false,
         cache_mode: CacheMode::Cached,
-        connect_timeout: Duration::from_secs(1),
+        // No deadline: the IOC answers, so `ensure_subscribed` waits on the
+        // connect itself rather than racing the 1 s policy clock on a loaded
+        // host. `bound` below is the hang guard.
+        connect_timeout: Duration::MAX,
         event_mask: resolve_event_mask(None),
         beacon_anomaly: Arc::new(BeaconAnomaly::new()),
         #[cfg(feature = "ca-gateway-tls")]

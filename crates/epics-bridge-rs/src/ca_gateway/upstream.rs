@@ -2398,12 +2398,25 @@ mod tests {
         }
     }
 
+    /// The connect budget for a manager whose upstream is a hosted server
+    /// that answers: none, so `ensure_subscribed` waits on the connect itself.
+    /// The 1 s policy deadline is a wall clock a loaded gate host outruns, and
+    /// only the tests about that deadline (a dead upstream) may run under it.
+    #[cfg(tokio_backend)]
+    const NO_CONNECT_DEADLINE: Duration = Duration::MAX;
+
     /// Build an `UpstreamManager` whose internal `CaClient::new()` reads
     /// the ambient `EPICS_CA_*` env — call [`pin_env`] first so the client
     /// is pinned to the test server.
     #[cfg(tokio_backend)]
     async fn pinned_manager(db: Arc<PvDatabase>) -> UpstreamManager {
-        pinned_manager_full(db, Arc::new(RwLock::new(PvCache::new())), CacheMode::Cached).await
+        pinned_manager_full(
+            db,
+            Arc::new(RwLock::new(PvCache::new())),
+            CacheMode::Cached,
+            NO_CONNECT_DEADLINE,
+        )
+        .await
     }
 
     /// Like [`pinned_manager`] but with a caller-supplied cache (so a test
@@ -2414,6 +2427,7 @@ mod tests {
         db: Arc<PvDatabase>,
         cache: Arc<RwLock<PvCache>>,
         cache_mode: CacheMode,
+        connect_timeout: Duration,
     ) -> UpstreamManager {
         let env = dummy_env();
         UpstreamManager::new(UpstreamManagerConfig {
@@ -2426,7 +2440,7 @@ mod tests {
             stats: env.stats.clone(),
             read_only: false,
             cache_mode,
-            connect_timeout: Duration::from_secs(1),
+            connect_timeout,
             event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
             #[cfg(feature = "ca-gateway-tls")]
@@ -3181,7 +3195,13 @@ ASG(NewGroup) {
         let (_dead, port) = dead_upstream();
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
-        let mgr = pinned_manager(db.clone()).await;
+        let mgr = pinned_manager_full(
+            db.clone(),
+            Arc::new(RwLock::new(PvCache::new())),
+            CacheMode::Cached,
+            Duration::from_secs(1),
+        )
+        .await;
 
         let name = "Ghost:pv";
         let result = mgr.ensure_subscribed(name, name, None, 0).await;
@@ -3238,6 +3258,7 @@ ASG(NewGroup) {
             db.clone(),
             Arc::new(RwLock::new(PvCache::new())),
             CacheMode::NoCache,
+            NO_CONNECT_DEADLINE,
         )
         .await;
 
@@ -3366,6 +3387,7 @@ ASG(NewGroup) {
             db.clone(),
             Arc::new(RwLock::new(PvCache::new())),
             CacheMode::NoCache,
+            NO_CONNECT_DEADLINE,
         )
         .await;
 

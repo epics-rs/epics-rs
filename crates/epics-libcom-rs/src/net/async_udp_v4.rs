@@ -37,7 +37,7 @@
 //! socket-per-NIC mapping (e.g. for diagnostics or NS-driven response
 //! correlation).
 
-// RTEMS-EXEC-MODEL-ALLOW(22): every test binds tokio::net UDP sockets, which
+// RTEMS-EXEC-MODEL-ALLOW(23): every test binds tokio::net UDP sockets, which
 // need a reactor the exec backend does not start; on the exec backend these
 // still run on the tokio driver `#[tokio::test]` builds, and pass. b3ab3ab8
 // added the three bundle-port tests without touching the count; all 17 were
@@ -1623,6 +1623,31 @@ mod tests {
     /// a bundle of unicast-bound sockets alone never sees it.
     #[tokio::test]
     async fn an_ephemeral_bundle_receives_a_subnet_broadcast() {
+        let bundle = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, true)
+            .expect("ephemeral bundle");
+        receives_subnet_broadcasts(&bundle).await;
+    }
+
+    /// The configured-port half of the same rule: rsrv binds the broadcast
+    /// RX socket at `EPICS_CA_SERVER_PORT` (`caservertask.c:671-709`).
+    #[tokio::test]
+    async fn a_configured_port_bundle_receives_a_subnet_broadcast() {
+        // A number free now; another process may take it before the bind.
+        let bundle = (0..5)
+            .find_map(|_| {
+                let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                    .and_then(|s| s.local_addr())
+                    .expect("probe")
+                    .port();
+                AsyncUdpV4::bind(port, PortUse::Exclusive, true).ok()
+            })
+            .expect("a configured-port bundle on a free number");
+        receives_subnet_broadcasts(&bundle).await;
+    }
+
+    /// Send to every broadcast-capable interface's broadcast address at the
+    /// bundle's port, and require each datagram to reach the bundle.
+    async fn receives_subnet_broadcasts(bundle: &AsyncUdpV4) {
         let map = IfaceMap::new().expect("iface map");
         let targets: Vec<_> = map
             .all()
@@ -1633,8 +1658,6 @@ mod tests {
             !targets.is_empty(),
             "this host enumerates no broadcast-capable interface; the run cannot be made here"
         );
-        let bundle = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, true)
-            .expect("ephemeral bundle");
         let port = bundle.ifaces()[0].sock.local_addr().unwrap().port();
         let sender = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("sender");
         sender.set_broadcast(true).expect("SO_BROADCAST");

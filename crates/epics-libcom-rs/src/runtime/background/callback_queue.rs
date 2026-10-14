@@ -428,8 +428,8 @@ impl<T> Drop for Pool<T> {
     fn drop(&mut self) {
         // Sole owner here, so the chunks can be reclaimed; dropping a chunk
         // drops whatever values were still queued in its nodes.
-        for c in 0..MAX_CHUNKS {
-            let ptr = *self.chunks[c].get_mut();
+        for (c, chunk) in self.chunks.iter_mut().enumerate() {
+            let ptr = *chunk.get_mut();
             if ptr.is_null() {
                 continue;
             }

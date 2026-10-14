@@ -5658,7 +5658,8 @@ mod as_ca_task_tests {
         ] {
             db.put_pv(&format!("bi.{field}"), value).await.unwrap();
         }
-        let acf = r#"ASG(DEFAULT) { INPA(g) INPA(bi) RULE(1,READ) { CALC("A>1") } }"#;
+        let acf = r#"HAG(local) { localhost }
+            ASG(DEFAULT) { INPA(g) INPA(bi) RULE(1,READ) { CALC("A>1") } }"#;
         let cell = new_acf_cell_watching(None, &db);
         cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
         cell.wait_served();
@@ -5669,8 +5670,12 @@ mod as_ca_task_tests {
         }
         wait_state(&cell, |s| s.bad(1) == 0 && s.value(0) == 5.0).await;
 
-        // What `spawn_hag_refresh` publishes: a clone of the loaded policy.
-        let refreshed = AccessSecurityConfig::clone(&cell.load_full().unwrap());
+        // What `spawn_hag_refresh` publishes once a HAG resolution moves.
+        let mut moved = AccessSecurityConfig::clone(&cell.load_full().unwrap());
+        moved
+            .hag
+            .insert(b"local".to_vec(), vec![b"192.0.2.1".to_vec()]);
+        let refreshed = moved.with_refreshed_hags().expect("the HAG moved");
         cell.store(Some(Arc::new(refreshed)));
         cell.wait_served();
         // Let the watcher take the republish's wake.

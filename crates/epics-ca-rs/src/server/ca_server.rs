@@ -741,6 +741,17 @@ impl CaServer {
                 .map_err(|e| CaError::Io(std::io::Error::other(e)))?
                 .map_err(CaError::Io)?;
         let parsed = access_security::parse_acf(&content)?;
+        Self::publish_acf(path, parsed, acf, reload_tx).await
+    }
+
+    /// Install a parsed ACF from `path` and push the access-rights refresh:
+    /// every reload, whoever asks for it, ends here.
+    async fn publish_acf(
+        path: &str,
+        parsed: access_security::AccessSecurityConfig,
+        acf: &epics_base_rs::server::access_security::AcfCell,
+        reload_tx: &tokio::sync::broadcast::Sender<()>,
+    ) -> CaResult<()> {
         let cell = acf.clone();
         epics_base_rs::runtime::task::spawn_blocking(move || cell.install(parsed))
             .await
@@ -756,6 +767,30 @@ impl CaServer {
         );
         metrics::counter!("ca_server_acf_reloads_total").increment(1);
         Ok(())
+    }
+
+    /// The POST /reload-acf hook. A bad file is the response, so the read and
+    /// parse run on the caller; the publish runs on `reactor`, since the hook
+    /// is called from an introspection handler task, not from `run`.
+    fn reload_acf_hook(
+        path: Option<String>,
+        acf: epics_base_rs::server::access_security::AcfCell,
+        reload_tx: tokio::sync::broadcast::Sender<()>,
+        reactor: tokio::runtime::Handle,
+    ) -> Arc<dyn Fn() -> Result<(), String> + Send + Sync> {
+        Arc::new(move || {
+            let path = path.clone().ok_or("no ACF source path registered")?;
+            let content = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+            let cfg =
+                access_security::parse_acf(&content).map_err(|e| format!("parse {path}: {e}"))?;
+            let (acf, reload_tx) = (acf.clone(), reload_tx.clone());
+            reactor.spawn(async move {
+                if let Err(e) = Self::publish_acf(&path, cfg, &acf, &reload_tx).await {
+                    tracing::warn!(error = %e, "POST /reload-acf: publish failed");
+                }
+            });
+            Ok(())
+        })
     }
 
     /// Returns the path the ACF was loaded from, if any.
@@ -1410,37 +1445,12 @@ impl CaServer {
             // Share the drain flag so POST /drain triggers the same
             // graceful-shutdown path as SIGTERM.
             let state = state.with_drain(drain.clone());
-            // Wire POST /reload-acf to the same machinery the
-            // built-in reload uses.
-            let acf_clone = self.acf.clone();
-            let acf_path_clone = self.acf_source_path.lock().ok().and_then(|g| g.clone());
-            let acf_reload_tx_clone = self.acf_reload_tx.clone();
-            // The closure outlives this scope inside `IntrospectionState`, and
-            // it is called from an introspection handler task, not from here —
-            // so it has to carry the executor rather than read one off whatever
-            // thread happens to invoke it.
-            let acf_reload_reactor = reactor.clone();
-            let reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
-                Arc::new(move || -> Result<(), String> {
-                    let path = acf_path_clone
-                        .as_ref()
-                        .ok_or("no ACF source path registered")?;
-                    let content = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-                    let cfg = access_security::parse_acf(&content)
-                        .map_err(|e| format!("parse {path}: {e}"))?;
-                    // Avoid awaiting inside the closure — spawn a one-shot
-                    // task to swap the RwLock contents and notify clients.
-                    let acf = acf_clone.clone();
-                    let reload_tx = acf_reload_tx_clone.clone();
-                    acf_reload_reactor.spawn(async move {
-                        let _ =
-                            epics_base_rs::runtime::task::spawn_blocking(move || acf.install(cfg))
-                                .await;
-                        let _ = reload_tx.send(());
-                    });
-                    Ok(())
-                });
-            let state = state.with_reload_acf(reload_fn);
+            let state = state.with_reload_acf(Self::reload_acf_hook(
+                self.acf_source_path(),
+                self.acf.clone(),
+                self.acf_reload_tx.clone(),
+                reactor.clone(),
+            ));
 
             // POST /reload-tls hook: re-read the cert/key paths and
             // swap the inner ServerConfig Arc atomically. Available
@@ -1648,6 +1658,60 @@ fn drain_grace_from_env() -> u64 {
     epics_base_rs::runtime::env::get_lossy("EPICS_CAS_DRAIN_GRACE_SECS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(30)
+}
+
+#[cfg(test)]
+#[cfg(tokio_backend)]
+mod reload_acf_hook_tests {
+    use super::*;
+    use epics_base_rs::server::records::ai::AiRecord;
+    use epics_base_rs::types::EpicsValue;
+
+    /// POST /reload-acf answers at once and publishes on the reactor; the
+    /// access-rights refresh it fires must find the new inputs' first readings
+    /// in place, as `asInit`'s return does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reload_hook_refreshes_with_the_first_readings_in_place() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("rv", Box::new(AiRecord::new(5.0)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.acf");
+        std::fs::write(
+            &path,
+            r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
+        )
+        .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(None, &db);
+        let (reload_tx, mut refreshed) = tokio::sync::broadcast::channel(4);
+        let hook = CaServer::reload_acf_hook(
+            Some(path.to_string_lossy().into()),
+            acf.clone(),
+            reload_tx,
+            tokio::runtime::Handle::current(),
+        );
+        // Hold `rv`'s lock across the reload: the first reading is in place
+        // at the refresh only if the publish waited for the watcher to take it.
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        hook().unwrap();
+        refreshed.recv().await.unwrap();
+        assert_eq!(
+            acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
+    }
 }
 
 #[cfg(test)]

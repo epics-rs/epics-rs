@@ -996,6 +996,55 @@ mod tests {
         assert!(ctx.acf().load().is_some());
     }
 
+    /// C `asInit` returns only once `asCaStart` has the inputs' first
+    /// readings (`asCaTaskWait`), so a check right after it sees them.
+    #[test]
+    fn as_init_returns_with_the_first_readings_in_place() {
+        use crate::server::records::ai::AiRecord;
+        use crate::types::EpicsValue;
+        let _guard = as_state_test_guard();
+        reset_as_state_for_test();
+        let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
+        )
+        .unwrap();
+        as_state().lock().unwrap().filename = Some(tmp.path().to_string_lossy().into());
+        crate::runtime::task::test_block_on(async move {
+            let db = Arc::new(PvDatabase::new());
+            db.add_record("rv", Box::new(AiRecord::new(5.0)))
+                .await
+                .unwrap();
+            db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(5.0))
+                .await
+                .unwrap();
+            let acf = crate::server::access_security::new_acf_cell_watching(None, &db);
+            // Hold `rv`'s lock across `asInit`: the first reading is in place
+            // at the assert only if `asInit` waited for the watcher to take it.
+            let (locked, held) = std::sync::mpsc::channel();
+            let rec = db.get_record("rv").unwrap();
+            let holder = std::thread::spawn(move || {
+                let _guard = rec.write();
+                locked.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            });
+            held.recv().unwrap();
+            let cell = acf.clone();
+            // A plain thread, as iocsh's: on the exec backend `spawn_blocking`
+            // is cbMedium, the band the watcher `asInit` waits for runs on.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || tx.send(as_init(&cell)));
+            let outcome = rx.await.unwrap();
+            assert!(matches!(outcome, AsInitOutcome::Loaded));
+            assert_eq!(
+                acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+                0
+            );
+            holder.join().unwrap();
+        });
+    }
+
     /// Run `asDumpHash` and return everything it printed.
     fn run_as_dump_hash(ctx: &CommandContext) -> String {
         String::from_utf8(run_bytes(ctx, "asDumpHash")).unwrap()

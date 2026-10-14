@@ -1,6 +1,6 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_ca_rs::DbFieldType;
-use epics_ca_rs::client::CaClient;
+use epics_ca_rs::client::{CaClient, ChannelInfo};
 use epics_ca_rs::copt::{self, CTool};
 
 /// Owner of every C-scanned option argument in this binary (see
@@ -185,36 +185,16 @@ async fn main() {
     for (pv_name, ch) in pv_names.iter().zip(&channels) {
         match ch.info().await {
             Ok(info) => {
-                // C `cainfo.c::printResult`: PV name on its own
-                // line, then five indented lines using a
-                // fixed-column key layout. Mirror it exactly so
-                // existing operator workflows that grep on
-                // `State:` / `Host:` etc. keep working.
-                let read_prefix = if info.access_rights.read { "" } else { "no " };
-                let write_prefix = if info.access_rights.write { "" } else { "no " };
                 // C `cainfo.c:101` prints `ca_host_name(chid)` — the
                 // reverse-resolved name, not the dotted IP (W10-B5). The
                 // resolution lives behind `Channel::host_name`, the
                 // `ca_host_name` analog; `info.server_addr` is the raw peer
                 // address and must not reach this line.
                 let host = ch.host_name().await.unwrap_or_default();
-                epics_ca_rs::cli::println_named(
-                    info.pv_name.as_bytes(),
-                    format_args!(
-                        "\n    \
-                     State:            connected\n    \
-                     Host:             {host}\n    \
-                     Access:           {rp}read, {wp}write\n    \
-                     Native data type: {dbf}\n    \
-                     Request type:     {dbr}\n    \
-                     Element count:    {n}",
-                        rp = read_prefix,
-                        wp = write_prefix,
-                        dbf = dbf_name(info.native_type),
-                        dbr = dbr_name(info.native_type),
-                        n = info.element_count,
-                    ),
-                );
+                use std::io::Write as _;
+                let _ = std::io::stdout()
+                    .lock()
+                    .write_all(&connected_block(&info, &host));
             }
             Err(e) => {
                 use std::io::Write as _;
@@ -240,6 +220,34 @@ async fn main() {
     if failed {
         std::process::exit(1);
     }
+}
+
+/// C `cainfo.c::printResult` for a connected channel: PV name on its own
+/// line, then five indented lines in a fixed-column key layout, so operator
+/// workflows that grep on `State:` / `Host:` keep working. `host` is
+/// `ca_host_name`'s bytes, printed as `%s` prints them.
+fn connected_block(info: &ChannelInfo, host: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut out = [
+        info.pv_name.as_bytes(),
+        b"\n    State:            connected\n    Host:             ",
+        host,
+    ]
+    .concat();
+    let _ = writeln!(
+        out,
+        "\n    \
+         Access:           {rp}read, {wp}write\n    \
+         Native data type: {dbf}\n    \
+         Request type:     {dbr}\n    \
+         Element count:    {n}",
+        rp = if info.access_rights.read { "" } else { "no " },
+        wp = if info.access_rights.write { "" } else { "no " },
+        dbf = dbf_name(info.native_type),
+        dbr = dbr_name(info.native_type),
+        n = info.element_count,
+    );
+    out
 }
 
 /// `dbf_type_to_text` parity. Maps our native field type to the
@@ -299,6 +307,29 @@ mod tests {
         assert_eq!(u.len() - banner.len(), 380);
     }
     use super::*;
+
+    #[test]
+    fn a_non_utf8_host_name_is_printed_as_its_bytes() {
+        let info = ChannelInfo {
+            pv_name: "rv:ai".into(),
+            server_addr: "192.0.2.3:5064".parse().unwrap(),
+            native_type: DbFieldType::Double,
+            element_count: 1,
+            access_rights: epics_ca_rs::client::AccessRights {
+                read: true,
+                write: false,
+            },
+        };
+        assert_eq!(
+            connected_block(&info, b"caf\xe9.lab:5064"),
+            b"rv:ai\n    State:            connected\n    \
+              Host:             caf\xe9.lab:5064\n    \
+              Access:           read, no write\n    \
+              Native data type: DBF_DOUBLE\n    \
+              Request type:     DBR_DOUBLE\n    \
+              Element count:    1\n"
+        );
+    }
 
     /// `cainfo -s <arg>`, resolved the way `main` resolves it — through the
     /// ordered scan over a real command line, since that is the only way a

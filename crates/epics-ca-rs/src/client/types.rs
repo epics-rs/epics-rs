@@ -286,14 +286,14 @@ fn c_prefix(s: &[u8], max: usize) -> &[u8] {
     &s[..s.len().min(max)]
 }
 
-pub(crate) fn peer_display_name(addr: SocketAddr) -> String {
+pub(crate) fn peer_display_name(addr: SocketAddr) -> Vec<u8> {
     #[cfg(feature = "client")]
     {
         crate::hostname::cached_name(addr)
     }
     #[cfg(not(feature = "client"))]
     {
-        addr.to_string()
+        addr.to_string().into_bytes()
     }
 }
 
@@ -305,7 +305,7 @@ pub(crate) fn peer_display_name(addr: SocketAddr) -> String {
 /// is polled by whichever executor the client runs on, and under
 /// `exec_backend` that is a callback-band worker with no ambient tokio
 /// runtime, where `tokio::task::spawn_blocking` panics from inside itself.
-pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> String {
+pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> Vec<u8> {
     #[cfg(feature = "client")]
     {
         epics_base_rs::runtime::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
@@ -313,11 +313,11 @@ pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> String {
             // A join failure is a runtime shutdown, not a channel error, and
             // C's `ipAddrToA` has a well-defined answer for "no name": the
             // dotted IP. Give that rather than failing a connected channel.
-            .unwrap_or_else(|_| addr.to_string())
+            .unwrap_or_else(|_| addr.to_string().into_bytes())
     }
     #[cfg(not(feature = "client"))]
     {
-        addr.to_string()
+        addr.to_string().into_bytes()
     }
 }
 
@@ -376,7 +376,7 @@ pub(crate) fn circuit_disconnect_exception(server_addr: SocketAddr) -> CaExcepti
     CaException {
         kind: CaExceptionKind::ServerError,
         // `char hostNameTmp[64]` (cac.cpp:1239).
-        message: c_prefix(peer_display_name(server_addr).as_bytes(), 63).to_vec(),
+        message: c_prefix(&peer_display_name(server_addr), 63).to_vec(),
         server_addr: Some(server_addr),
         pv_name: None,
         status: Some(crate::protocol::ECA_DISCONN),
@@ -400,7 +400,7 @@ pub(crate) fn unresponsive_circuit_exception(server_addr: SocketAddr) -> CaExcep
     CaException {
         kind: CaExceptionKind::ServerError,
         // `char hostNameTmp[128]` (tcpiiu.cpp:923).
-        message: c_prefix(peer_display_name(server_addr).as_bytes(), 127).to_vec(),
+        message: c_prefix(&peer_display_name(server_addr), 127).to_vec(),
         server_addr: Some(server_addr),
         pv_name: None,
         status: Some(crate::protocol::ECA_UNRESPTMO),
@@ -1639,7 +1639,7 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
         // `char hostName[64]` and `"host=%s ctx=%.400s"`.
         [
             b"host=".as_slice(),
-            c_prefix(peer_display_name(server_addr).as_bytes(), 63),
+            c_prefix(&peer_display_name(server_addr), 63),
             b" ctx=",
             c_prefix(&message, 400),
         ]

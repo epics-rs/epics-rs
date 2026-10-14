@@ -43,10 +43,19 @@ use dashmap::DashMap;
 /// fallback branch reachable at all.
 ///
 /// BLOCKING. See the module docs before calling this from a task.
-pub fn ip_addr_to_a(addr: SocketAddr) -> String {
-    match ip_addr_to_host_name(addr) {
-        Some(name) => format!("{name}:{}", addr.port()),
-        None => addr.to_string(),
+pub fn ip_addr_to_a(addr: SocketAddr) -> Vec<u8> {
+    ip_addr_to_a_from(addr, ip_addr_to_host_name(addr))
+}
+
+/// [`ip_addr_to_a`] given the lookup's answer, so the formatting is testable
+/// without a PTR record to resolve.
+fn ip_addr_to_a_from(addr: SocketAddr, name: Option<Vec<u8>>) -> Vec<u8> {
+    match name {
+        Some(mut name) => {
+            name.extend_from_slice(format!(":{}", addr.port()).as_bytes());
+            name
+        }
+        None => addr.to_string().into_bytes(),
     }
 }
 
@@ -56,7 +65,7 @@ pub fn ip_addr_to_a(addr: SocketAddr) -> String {
 /// The reverse lookup itself is the OS `getnameinfo(NI_NAMEREQD)` — the same
 /// call C libcom makes. It lives behind [`resolve_ptr`] because that symbol is
 /// in `libc` on unix but in Winsock on Windows.
-fn ip_addr_to_host_name(addr: SocketAddr) -> Option<String> {
+fn ip_addr_to_host_name(addr: SocketAddr) -> Option<Vec<u8>> {
     // `socket2` owns the `SocketAddr` → `sockaddr` conversion (and its
     // length), so this module does not hand-roll a `sockaddr_in`.
     let sa = socket2::SockAddr::from(addr);
@@ -65,7 +74,7 @@ fn ip_addr_to_host_name(addr: SocketAddr) -> Option<String> {
 
 /// POSIX `getnameinfo(NI_NAMEREQD)` — the resolver C libcom uses on unix.
 #[cfg(unix)]
-fn resolve_ptr(sa: &socket2::SockAddr) -> Option<String> {
+fn resolve_ptr(sa: &socket2::SockAddr) -> Option<Vec<u8>> {
     let mut buf = [0 as libc::c_char; 256];
     // SAFETY: `sa` outlives the call and reports its own length; `buf` is
     // `buf.len()` bytes of writable storage. `getnameinfo` NUL-terminates
@@ -85,16 +94,14 @@ fn resolve_ptr(sa: &socket2::SockAddr) -> Option<String> {
         return None;
     }
     // SAFETY: `getnameinfo` returned 0, so `buf` holds a NUL-terminated name.
-    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-    let name = name.to_str().ok()?;
-    (!name.is_empty()).then(|| name.to_string())
+    ptr_name(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) })
 }
 
 /// Winsock `getnameinfo(NI_NAMEREQD)` — the same resolver C EPICS uses on
 /// Windows, where the symbol lives in `ws2_32` rather than the CRT. Winsock is
 /// already initialised: no socket in this process exists without it.
 #[cfg(windows)]
-fn resolve_ptr(sa: &socket2::SockAddr) -> Option<String> {
+fn resolve_ptr(sa: &socket2::SockAddr) -> Option<Vec<u8>> {
     use windows_sys::Win32::Networking::WinSock::{NI_NAMEREQD, SOCKADDR, getnameinfo};
     let mut buf = [0u8; 256];
     // SAFETY: `sa` outlives the call and reports its own length; `buf` is
@@ -117,16 +124,21 @@ fn resolve_ptr(sa: &socket2::SockAddr) -> Option<String> {
         return None;
     }
     // SAFETY: `getnameinfo` returned 0, so `buf` holds a NUL-terminated name.
-    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
-    let name = name.to_str().ok()?;
-    (!name.is_empty()).then(|| name.to_string())
+    ptr_name(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) })
+}
+
+/// The name `getnameinfo` wrote, as the bytes C copies into its buffer: a
+/// PTR name that is not UTF-8 is still a name, not a lookup failure.
+fn ptr_name(name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    let name = name.to_bytes();
+    (!name.is_empty()).then(|| name.to_vec())
 }
 
 /// The resolved names libca's `ipAddrToAsciiEngine` has answered so far.
 /// Process-wide, as it is in libca — the engine is a singleton shared by
 /// every `hostNameCache` in the process.
-fn cache() -> &'static DashMap<SocketAddr, String> {
-    static CACHE: OnceLock<DashMap<SocketAddr, String>> = OnceLock::new();
+fn cache() -> &'static DashMap<SocketAddr, Vec<u8>> {
+    static CACHE: OnceLock<DashMap<SocketAddr, Vec<u8>>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
 }
 
@@ -142,12 +154,12 @@ fn cache() -> &'static DashMap<SocketAddr, String> {
 /// With no executor to schedule the lookup on there is nothing to resolve it,
 /// so the answer stays the dotted IP — the same degradation libca shows before
 /// its engine has run.
-pub(crate) fn cached_name(addr: SocketAddr) -> String {
+pub(crate) fn cached_name(addr: SocketAddr) -> Vec<u8> {
     if let Some(name) = cache().get(&addr) {
         return name.clone();
     }
     schedule(addr);
-    addr.to_string()
+    addr.to_string().into_bytes()
 }
 
 /// Start resolving `addr` now, so a later [`cached_name`] has an answer.
@@ -215,7 +227,7 @@ mod tests {
         while cache().get(&a).is_none() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let got = cached_name(a);
+        let got = String::from_utf8(cached_name(a)).unwrap();
         assert_ne!(
             got, "127.0.0.1:5199",
             "a warmed address answers with the resolved name, as C's \
@@ -236,7 +248,7 @@ mod tests {
     #[test]
     fn loopback_resolves_to_a_name_and_keeps_the_port() {
         let a: SocketAddr = "127.0.0.1:5064".parse().unwrap();
-        let got = ip_addr_to_a(a);
+        let got = String::from_utf8(ip_addr_to_a(a)).unwrap();
         let (name, port) = got.rsplit_once(':').expect("`<host>:<port>`");
         assert_eq!(port, "5064");
         // Not asserting `localhost` literally: the PTR for 127.0.0.1 is the
@@ -256,7 +268,27 @@ mod tests {
     #[test]
     fn an_unresolvable_address_falls_back_to_the_dotted_ip() {
         let a: SocketAddr = "192.0.2.1:5064".parse().unwrap();
-        assert_eq!(ip_addr_to_a(a), "192.0.2.1:5064");
+        assert_eq!(ip_addr_to_a(a), b"192.0.2.1:5064");
+    }
+
+    /// A PTR name that is not UTF-8 is still the name `ipAddrToHostName`
+    /// copies out; only an empty one is "no name".
+    #[test]
+    fn a_non_utf8_ptr_name_is_kept_as_its_bytes() {
+        assert_eq!(ptr_name(c"caf\xe9.lab"), Some(b"caf\xe9.lab".to_vec()));
+        assert_eq!(ptr_name(c""), None);
+    }
+
+    /// The bytes `getnameinfo` wrote reach the `<name>:<port>` that
+    /// `ca_host_name` hands to dbcar and cainfo unchanged.
+    #[test]
+    fn a_non_utf8_ptr_name_reaches_the_host_text_as_its_bytes() {
+        let a: SocketAddr = "192.0.2.3:5064".parse().unwrap();
+        assert_eq!(
+            ip_addr_to_a_from(a, ptr_name(c"caf\xe9.lab")),
+            b"caf\xe9.lab:5064"
+        );
+        assert_eq!(ip_addr_to_a_from(a, None), b"192.0.2.3:5064");
     }
 
     /// The non-blocking half answers immediately on a cold cache — with the
@@ -264,7 +296,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn the_cache_answers_without_blocking_on_a_miss() {
         let a: SocketAddr = "192.0.2.2:5064".parse().unwrap();
-        assert_eq!(cached_name(a), "192.0.2.2:5064");
+        assert_eq!(cached_name(a), b"192.0.2.2:5064");
     }
 
     /// The position the CA client actually asks from on the exec backend: a
@@ -294,7 +326,7 @@ mod tests {
         }
         assert_ne!(
             cached_name(a),
-            "127.0.0.1:5197",
+            b"127.0.0.1:5197",
             "the callback band is always there on this backend, so a warmed \
              address must answer with the resolved name"
         );

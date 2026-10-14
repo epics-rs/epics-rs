@@ -534,7 +534,7 @@ impl CaLink {
                 // C prints whatever `ca_host_name` returns, and for an
                 // unconnected chid libca answers the literal
                 // `"<disconnected>"` (`oldChannelNotify.cpp:189-196`).
-                .unwrap_or_else(|_| "<disconnected>".to_string()),
+                .unwrap_or_else(|_| b"<disconnected>".to_vec()),
             read_access: self.connected.has_read_access(),
             write_access: self.connected.has_write_access(),
             n_disconnect: self.connected.disconnect_count(),

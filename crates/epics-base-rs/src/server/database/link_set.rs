@@ -165,7 +165,7 @@ pub struct LinkDiagnostics {
     /// unreadable to a record.
     pub connected: bool,
     /// C `ca_host_name(pca->chid)` — the server's name with its port.
-    pub host: String,
+    pub host: Vec<u8>,
     /// C `ca_read_access(pca->chid)`.
     pub read_access: bool,
     /// C `ca_write_access(pca->chid)`.

@@ -179,9 +179,9 @@ async fn link_diagnostics_reads_a_live_channel() {
     // C prints `ca_host_name(chid)`, the peer with its port — never the
     // empty string, and never the PV name.
     assert!(
-        after.host.contains(&tcp_port.to_string()),
+        after.host.ends_with(format!(":{tcp_port}").as_bytes()),
         "host must name the server's own address, got {:?}",
-        after.host
+        String::from_utf8_lossy(&after.host)
     );
     // The three C never sets at the pin: both OUT bits are inside
     // `/* Disabled by ANJ ... */` (`dbCa.c:539-542`, `:555-558`), and the

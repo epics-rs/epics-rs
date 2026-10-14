@@ -6445,16 +6445,18 @@ fn cmd_dbcar() -> CommandDef {
                                     ["No Access", "Read Only", "Write Only", "Read/Write"];
                                 let rights =
                                     usize::from(d.read_access) | usize::from(d.write_access) << 1;
-                                ctx.println(&format!(
-                                    "{:>21} [{}{}{}{}] host {}, {}",
+                                let mut line = format!(
+                                    "{:>21} [{}{}{}{}] host ",
                                     "",
                                     if d.input_native { "IN" } else { "  " },
                                     if d.input_string { "IS" } else { "  " },
                                     if d.output_native { "ON" } else { "  " },
                                     if d.output_string { "OS" } else { "  " },
-                                    d.host,
-                                    RIGHTS[rights],
-                                ));
+                                )
+                                .into_bytes();
+                                line.extend_from_slice(&d.host);
+                                line.extend_from_slice(format!(", {}", RIGHTS[rights]).as_bytes());
+                                ctx.println_bytes(&line);
                             }
                         }
                         // C's `pca ? pca->nDisconnect : 0` (`dbCaTest.c:131`):
@@ -7585,7 +7587,7 @@ mod tests {
     ) -> crate::server::database::LinkDiagnostics {
         crate::server::database::LinkDiagnostics {
             connected,
-            host: "ioc1.lab:5064".to_string(),
+            host: b"ioc1.lab:5064".to_vec(),
             read_access: read,
             write_access: write,
             n_disconnect: nd,
@@ -7715,6 +7717,35 @@ mod tests {
         assert_eq!(
             lines[3],
             "                      [IN      ] host ioc1.lab:5064, Read/Write"
+        );
+    }
+
+    /// `%s` of `ca_host_name` prints the resolver's bytes, UTF-8 or not.
+    #[test]
+    fn a_non_utf8_host_name_is_printed_as_its_bytes() {
+        let (_db, ctx, lset, _dir) = dbcar_ctx();
+        lset.set(
+            "UP:PV",
+            crate::server::database::LinkDiagnostics {
+                host: b"caf\xe9.lab:5064".to_vec(),
+                ..diag(true, true, true, 0)
+            },
+        );
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbcar").unwrap();
+        let tokens = ["L:UP".to_string(), "2".to_string()];
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        ctx.with_output(std::fs::File::create(tmp.path()).unwrap(), || {
+            cmd.handler.call(&args, &ctx).unwrap();
+        });
+        let out = std::fs::read(tmp.path()).unwrap();
+        let needle = b"[IN      ] host caf\xe9.lab:5064, Read/Write\n";
+        assert!(
+            out.windows(needle.len()).any(|w| w == needle),
+            "{}",
+            String::from_utf8_lossy(&out)
         );
     }
 

@@ -3266,7 +3266,7 @@ impl CaChannel {
     /// Returns `Err` if the channel hasn't connected yet — pvxs
     /// returns `"<disconnected>"` for the same case; we surface
     /// the typed error instead so callers can decide.
-    pub async fn host_name(&self) -> CaResult<String> {
+    pub async fn host_name(&self) -> CaResult<Vec<u8>> {
         let info = self.info().await?;
         let addr = info.server_addr;
         Ok(types::peer_resolved_name(addr).await)

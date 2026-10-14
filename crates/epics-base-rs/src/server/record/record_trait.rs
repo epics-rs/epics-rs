@@ -2323,11 +2323,22 @@ impl CycleHooks {
     /// [`Record::gate_after_pre_input_reads`]: outside [`Self::ALL`],
     /// declared by the type whose cycle hangs on a pre-input read.
     pub const PRE_INPUT_GATE: Self = Self(512);
+    /// [`Record::set_resolved_input_links`], [`Record::set_fetch_gate_failed`]
+    /// and [`Record::read_constant_inp`]: what the input stage tells the type.
+    pub const INPUT_FETCH: Self = Self(64);
+    /// [`Record::prev_compared_inputs`], [`Record::force_posted_fields`] and
+    /// [`Record::log_swept_fields`]: `monitor()`'s per-type post lists.
+    pub const MONITOR_SETS: Self = Self(1024);
+    /// [`Record::should_output`] and [`Record::output_event`]: the output
+    /// stage's questions.
+    pub const OUTPUT_HOOKS: Self = Self(2048);
+    /// [`Record::set_process_continuation`].
+    pub const CONTINUATION: Self = Self(4096);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
     /// otherwise pays the call and never loses an action.
-    pub const ALL: Self = Self(31);
+    pub const ALL: Self = Self(31 | 64 | 1024 | 2048 | 4096);
 
     /// Both sets together.
     pub const fn union(self, other: Self) -> Self {
@@ -2361,6 +2372,10 @@ const _: () = {
         CycleHooks::HAND_POSTED.0,
         CycleHooks::OWN_STAMP,
         CycleHooks::PRE_INPUT_GATE.0,
+        CycleHooks::INPUT_FETCH.0,
+        CycleHooks::MONITOR_SETS.0,
+        CycleHooks::OUTPUT_HOOKS.0,
+        CycleHooks::CONTINUATION.0,
     ];
     let mut seen = 0;
     let mut i = 0;
@@ -2862,9 +2877,10 @@ impl From<String> for PostName {
 /// `head` and `rest` carry no meaning of their own: `head` is post 0 and `rest`
 /// is posts 1.., so nothing may read them apart from [`Self::iter`].
 ///
-/// A cycle that posts nothing drops its snapshot as one inline test, as
-/// [`CycleList`] does; drop glue over the two fields was an out-of-line call
-/// on every cycle.
+/// A snapshot with nothing to free drops as one inline test of `owns_heap`,
+/// as [`CycleList`] does; drop glue over the two fields was an out-of-line
+/// call on every cycle, and decoding the head post's variants there cost a
+/// monitored cycle more than the call.
 #[derive(Default)]
 pub struct ProcessSnapshot(std::mem::ManuallyDrop<SnapshotPosts>);
 
@@ -2874,12 +2890,14 @@ struct SnapshotPosts {
     rest: Vec<FieldPost>,
     /// The classes of the posts made with no subscriber to deliver to.
     unwatched: crate::server::recgbl::EventMask,
+    /// A post was pushed that frees something on drop, or spilled to `rest`.
+    owns_heap: bool,
 }
 
 impl Drop for ProcessSnapshot {
     #[inline]
     fn drop(&mut self) {
-        if self.0.rest.capacity() != 0 || self.0.head.as_ref().is_some_and(owns_heap) {
+        if self.0.owns_heap {
             Self::release(&mut self.0);
         }
     }
@@ -2936,8 +2954,14 @@ impl ProcessSnapshot {
     /// Add one post, after every post already added.
     pub fn push(&mut self, post: FieldPost) {
         match self.0.head {
-            None => self.0.head = Some(post),
-            Some(_) => self.0.rest.push(post),
+            None => {
+                self.0.owns_heap |= owns_heap(&post);
+                self.0.head = Some(post);
+            }
+            Some(_) => {
+                self.0.owns_heap = true;
+                self.0.rest.push(post);
+            }
         }
     }
 
@@ -2963,13 +2987,31 @@ impl ProcessSnapshot {
         self.0.head.iter().chain(self.0.rest.iter())
     }
 
-    /// Keep only the posts `keep` accepts; `keep` sees every post once, in
-    /// the order they were added.
-    pub fn retain(&mut self, mut keep: impl FnMut(&FieldPost) -> bool) {
-        if self.0.head.as_ref().is_some_and(|post| !keep(post)) {
-            self.0.head = None;
+    /// Keep the posts before `first`, and of the rest only those `keep`
+    /// accepts; `keep` sees each of the rest once, in the order they were
+    /// added. A cycle whose walk added nothing returns before any call.
+    #[inline]
+    pub fn retain_from(&mut self, first: usize, mut keep: impl FnMut(&FieldPost) -> bool) {
+        if first >= self.len() {
+            return;
         }
-        self.0.rest.retain(|post| keep(post));
+        let rest_from = match first {
+            0 => {
+                if self.0.head.as_ref().is_some_and(|post| !keep(post)) {
+                    self.0.head = None;
+                }
+                0
+            }
+            _ => first - 1,
+        };
+        let mut kept = rest_from;
+        for i in rest_from..self.0.rest.len() {
+            if keep(&self.0.rest[i]) {
+                self.0.rest.swap(kept, i);
+                kept += 1;
+            }
+        }
+        self.0.rest.truncate(kept);
         if self.0.head.is_none() && !self.0.rest.is_empty() {
             self.0.head = Some(self.0.rest.remove(0));
         }
@@ -4805,6 +4847,9 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Fields inside the list keep their normal treatment (change detection,
     /// [`Self::value_only_change_fields`] mask, deadband, `log_swept_fields`).
+    ///
+    /// The list may depend on the record's state, but `Some` versus `None`
+    /// is fixed per type: the monitor plan reads it once.
     fn process_posted_fields(&self) -> Option<DeclaredFields> {
         None
     }
@@ -7763,6 +7808,57 @@ pub(crate) mod tests {
         assert_eq!(releases(two), 1, "a spilled post's Vec is freed");
     }
 
+    /// `retain_from` keeps every post before `first` unasked, asks `keep`
+    /// once of each later one, and keeps the survivors in order, at each
+    /// boundary of the head/rest split.
+    #[test]
+    fn retain_from_asks_only_of_the_posts_from_first_on() {
+        use crate::server::recgbl::EventMask;
+        let ao_val = crate::server::record::declared_field_registry::declared_fields("ao")
+            .find(|d| d.name == "VAL")
+            .unwrap();
+        let run = |len: usize, first: usize, drop: &[usize]| {
+            let mut snap: ProcessSnapshot = (0..len)
+                .map(|i| {
+                    (
+                        PostName::Declared(ao_val),
+                        PostedValue::Val(EpicsValue::Long(i as i32)),
+                        EventMask::VALUE,
+                    )
+                })
+                .collect();
+            let mut asked = Vec::new();
+            snap.retain_from(first, |(_, val, _)| {
+                let PostedValue::Val(EpicsValue::Long(i)) = val else {
+                    unreachable!()
+                };
+                asked.push(*i as usize);
+                !drop.contains(&(*i as usize))
+            });
+            let kept: Vec<usize> = snap
+                .iter()
+                .map(|(_, val, _)| match val {
+                    PostedValue::Val(EpicsValue::Long(i)) => *i as usize,
+                    _ => unreachable!(),
+                })
+                .collect();
+            (asked, kept)
+        };
+        assert_eq!(run(0, 0, &[]), (vec![], vec![]));
+        assert_eq!(run(1, 1, &[0]), (vec![], vec![0]), "walk added nothing");
+        assert_eq!(run(3, 3, &[0, 1, 2]), (vec![], vec![0, 1, 2]));
+        assert_eq!(run(1, 0, &[0]), (vec![0], vec![]));
+        assert_eq!(
+            run(3, 0, &[0]),
+            (vec![0, 1, 2], vec![1, 2]),
+            "rest refills head"
+        );
+        assert_eq!(run(3, 0, &[0, 1, 2]), (vec![0, 1, 2], vec![]));
+        assert_eq!(run(3, 1, &[0, 1]), (vec![1, 2], vec![0, 2]));
+        assert_eq!(run(4, 2, &[2]), (vec![2, 3], vec![0, 1, 3]));
+        assert_eq!(run(5, 1, &[2, 4]), (vec![1, 2, 3, 4], vec![0, 1, 3]));
+    }
+
     /// Every module-owned type too: the sweeps below cover `RECORD_TYPES`.
     pub(crate) fn any_record(record_type: &str) -> Box<dyn Record> {
         use crate::server::records::{
@@ -8308,22 +8404,38 @@ pub(crate) mod tests {
     fn a_type_that_overrides_a_cycle_hook_says_so() {
         use crate::server::record::dbd_generated::RECORD_TYPES;
         let expected = |t: &str| match t {
-            "waveform" | "aai" | "aao" | "subArray" => CycleHooks::PRE_INPUT,
+            "waveform" | "aai" | "aao" | "subArray" => {
+                CycleHooks::PRE_INPUT.union(CycleHooks::INPUT_FETCH)
+            }
             "compress" => CycleHooks::PRE_INPUT.union(CycleHooks::WRITE_POSTED),
             "acalcout" => CycleHooks::CYCLE_POSTED
                 .union(CycleHooks::WRITE_POSTED)
                 .union(CycleHooks::PROCESS_POSTED)
-                .union(CycleHooks::PUT_REPORT),
+                .union(CycleHooks::PUT_REPORT)
+                .union(CycleHooks::INPUT_FETCH)
+                .union(CycleHooks::CONTINUATION)
+                .union(CycleHooks::OUTPUT_HOOKS),
             "mbbiDirect" | "mbboDirect" | "seq" => CycleHooks::CYCLE_POSTED,
             "calcout" => CycleHooks::WRITE_POSTED
                 .union(CycleHooks::PUT_REPORT)
-                .union(CycleHooks::PROCESS_POSTED),
-            "swait" => CycleHooks::WRITE_POSTED.union(CycleHooks::PUT_REPORT),
+                .union(CycleHooks::PROCESS_POSTED)
+                .union(CycleHooks::INPUT_FETCH)
+                .union(CycleHooks::CONTINUATION)
+                .union(CycleHooks::MONITOR_SETS)
+                .union(CycleHooks::OUTPUT_HOOKS),
+            "swait" => CycleHooks::WRITE_POSTED
+                .union(CycleHooks::PUT_REPORT)
+                .union(CycleHooks::INPUT_FETCH)
+                .union(CycleHooks::OUTPUT_HOOKS),
             "mbbi" | "mbbo" | "lso" | "lsi" => CycleHooks::WRITE_POSTED,
             "transform" => CycleHooks::CYCLE_POSTED
                 .union(CycleHooks::WRITE_POSTED)
                 .union(CycleHooks::CONTEXT)
-                .union(CycleHooks::PUT_REPORT),
+                .union(CycleHooks::PUT_REPORT)
+                .union(CycleHooks::INPUT_FETCH),
+            "calc" | "sel" | "printf" => CycleHooks::INPUT_FETCH,
+            "aSub" => CycleHooks::MONITOR_SETS,
+            "longout" => CycleHooks::OUTPUT_HOOKS,
             "sseq" => CycleHooks::ALL,
             "scalcout" => CycleHooks::ALL.union(CycleHooks::PUT_REPORT),
             _ => CycleHooks::NONE,
@@ -8350,6 +8462,15 @@ pub(crate) mod tests {
             }
             if !hooks.has(CycleHooks::PROCESS_POSTED) {
                 assert!(r.take_process_posted_fields().is_empty(), "{record_type}");
+            }
+            if !hooks.has(CycleHooks::MONITOR_SETS) {
+                assert!(r.prev_compared_inputs().0.is_empty(), "{record_type}");
+                assert!(r.force_posted_fields().is_empty(), "{record_type}");
+                assert!(r.log_swept_fields().is_empty(), "{record_type}");
+            }
+            if !hooks.has(CycleHooks::OUTPUT_HOOKS) {
+                assert!(r.should_output(), "{record_type}");
+                assert!(r.output_event().is_none(), "{record_type}");
             }
         }
     }

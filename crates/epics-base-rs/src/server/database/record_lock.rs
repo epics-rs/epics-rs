@@ -1882,6 +1882,12 @@ impl<'a> InFrame<'a> {
         self.cell.process_plan()
     }
 
+    /// The record type's declaration — fixed at construction, so no lock.
+    #[inline(always)]
+    pub(crate) fn rdes(&self) -> &'a crate::server::record::record_instance::RecordDesc {
+        self.cell.rdes()
+    }
+
     /// The cell, for work that leaves the frame — a spawn, a name for
     /// another set. Reading or writing through it is a bypass of the gate.
     #[inline(always)]
@@ -2854,11 +2860,6 @@ mod tests {
         else {
             panic!("a local DB link");
         };
-        let alarm = super::super::links::LinkAlarm {
-            stat: 0,
-            sevr: crate::server::record::AlarmSeverity::NoAlarm,
-            amsg: Default::default(),
-        };
         let mut visited = crate::server::database::ProcStack::new();
         let failed = db.write_db_link_value(
             &link,
@@ -2866,7 +2867,6 @@ mod tests {
             super::super::links::OutLinkSrc {
                 putf: false,
                 notify: None,
-                alarm: &alarm,
                 field: "OUT",
             },
             &mut visited,

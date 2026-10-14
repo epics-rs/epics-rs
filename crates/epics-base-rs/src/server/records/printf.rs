@@ -893,7 +893,7 @@ impl Record for PrintfRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::INPUT_FETCH
     }
 
     fn record_type(&self) -> &'static str {

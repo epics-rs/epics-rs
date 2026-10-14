@@ -343,11 +343,8 @@ impl LinkAlarm {
     /// the committed `stat`/`sevr` here would carry the PREVIOUS cycle's
     /// severity to every MS-class target.
     ///
-    /// EVERY OUT-link put site uses this: the record's own OUT, the generic
-    /// multi-output pairs, the fanout/dfanout/seq dispatch, the `WriteDbLink`
-    /// / `WriteDbLinkNotify` process actions, and sseq's `put_link_notify`
-    /// (sseqRecord.c: `dbPutLink` in `processCallback`, `recGblResetAlarms` in
-    /// `asyncFinish` — the puts still precede the commit).
+    /// Read at each put, after the put itself, as C does: an earlier link's
+    /// failure in the same cycle has already raised the source's LINK_ALARM.
     pub(crate) fn pending(common: &crate::server::record::CommonFields) -> Self {
         LinkAlarm {
             stat: common.nsta,
@@ -417,9 +414,6 @@ pub(crate) fn inherit_sevr_msg(
 ///
 /// * `putf` / `notify` — the PUTF bit and put-notify wait-set that C
 ///   `processTarget` carries to each target (dbDbLink.c:460-474).
-/// * `alarm` — the PENDING alarm that C `recGblInheritSevrMsg` folds
-///   into the dest per the link's MS-class switch (dbDbLink.c:382-383
-///   reads `psrce->nsta`/`nsev`/`namsg`, before the source commits them).
 /// * `field` — the source's link FIELD name (`OUT`, `SIOL`, `OUTA`, …),
 ///   which C `setLinkAlarm` puts in the source's alarm message on a failed
 ///   put (`dbLink.c:319-323`: `"field %s", dbLinkFieldName(plink)`).
@@ -432,7 +426,6 @@ pub(crate) fn inherit_sevr_msg(
 pub(crate) struct OutLinkSrc<'a> {
     pub putf: bool,
     pub notify: Option<&'a Arc<NotifyWaitSet>>,
-    pub alarm: &'a LinkAlarm,
     pub field: &'static str,
 }
 
@@ -2824,15 +2817,18 @@ impl PvDatabase {
     /// alarm inherited by the target (`dbDbLink.c:382-383`), then
     /// `processTarget` on a successful put (`:384-390`). Returns `true` when
     /// the put failed — C `dbPutLink` status `!= 0`.
-    #[inline(always)]
+    ///
+    /// `source` is the writing record's frame (`None` only for a test's
+    /// frameless write, which inherits nothing).
     fn finish_db_link_write(
         &self,
         write: DbLinkWrite,
         staged: &mut Option<LinkStage>,
-        held: Option<&super::SetGuard>,
+        source: Option<InFrame<'_>>,
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
     ) -> bool {
+        let held = source.map(|source| source.set());
         let DbLinkWrite {
             target,
             switch,
@@ -2844,16 +2840,18 @@ impl PvDatabase {
         {
             failed |= self.finish_link_stage(rec, staged, held, visited);
         }
-        // C folds the source's PENDING alarm (`psrce->nsta/nsev/namsg`: the
-        // put runs inside the source's `process()`, before its
-        // `recGblResetAlarms`) into the destination whatever the put's
-        // status; the dest commits it on its own next cycle. NMS (the
-        // common case) takes no borrow.
+        // C `dbDbPutValue` (`dbDbLink.c:382-383`) folds the source's PENDING
+        // alarm into the destination after this put, whatever its status:
+        // `psrce->nsta/nsev/namsg` read now, so an earlier link's
+        // `setLinkAlarm` (`dbLink.c:445`) in the same cycle is part of
+        // it. NMS (the common case) reads nothing.
         if switch != crate::server::record::MonitorSwitch::NoMaximize
             && let Some(rec) = &target
+            && let Some(source) = source
         {
+            let alarm = LinkAlarm::pending(&source.read().common);
             let mut tg = rec.write_under(held);
-            inherit_sevr_msg(&mut tg.common, switch, src.alarm);
+            inherit_sevr_msg(&mut tg.common, switch, &alarm);
         }
         // Only a successful write reaches target processing. An empty array
         // into a scalar field is not a failure: C `dbPut` raises LINK/INVALID
@@ -3363,6 +3361,8 @@ impl PvDatabase {
     /// `sseq` once implemented `Record::multi_output_links` as well and was
     /// double-dispatched; the `multi_output_dispatch_owned` gate makes that
     /// structurally impossible rather than fixed at the record.
+    ///
+    /// Inline so the no-op answer of every type without pairs costs no call.
     #[inline(always)]
     pub(crate) fn dispatch_multi_output_values(
         &self,
@@ -3504,15 +3504,20 @@ impl PvDatabase {
         let ls = puts_long_string(src_rec, &value);
         let failed = match &*link {
             crate::server::record::ParsedLink::Db(_) => {
-                let held = Some(src_rec.set());
                 let mut staged = None;
                 let mut out = LinkWriteOut {
                     staged: &mut staged,
                     visited,
                 };
-                let write =
-                    self.write_db_link_value_in(held, link, value, ls, src.notify, &mut out);
-                self.finish_db_link_write(write, out.staged, held, src, out.visited)
+                let write = self.write_db_link_value_in(
+                    Some(src_rec.set()),
+                    link,
+                    value,
+                    ls,
+                    src.notify,
+                    &mut out,
+                );
+                self.finish_db_link_write(write, out.staged, Some(src_rec), src, out.visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
@@ -3600,7 +3605,7 @@ impl PvDatabase {
             visited,
         };
         let write = self.write_local_target(Some(held), to, lent.acts, value, ls, &mut out);
-        let failed = self.finish_db_link_write(write, out.staged, Some(held), src, out.visited);
+        let failed = self.finish_db_link_write(write, out.staged, Some(src_rec), src, out.visited);
         if failed {
             set_out_link_alarm(src_rec, src.field);
         }
@@ -3757,18 +3762,10 @@ impl PvDatabase {
         // Snapshot the source record's PUTF bit + put-notify wait-set so
         // every write_db_link_value_in call below propagates them to its
         // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
-        // wait-set invariants (see write_db_link_value_in doc). The PENDING
-        // alarm travels the same way for `recGblInheritSevrMsg` MS-class
-        // propagation into each OUT-link target: the OUTn/LNKn puts precede
-        // the source's `recGblResetAlarms`, so C reads `psrce->nsta/nsev`
-        // here ([`LinkAlarm::pending`], dbDbLink.c:382-383).
-        let (src_putf, src_notify, src_alarm) = {
+        // wait-set invariants (see write_db_link_value_in doc).
+        let (src_putf, src_notify) = {
             let guard = rec.read();
-            (
-                guard.common.putf,
-                guard.notify.clone(),
-                LinkAlarm::pending(&guard.common),
-            )
+            (guard.common.putf, guard.notify.clone())
         };
         // One snapshot threaded to every OUT-link write below; each arm
         // overrides `field` with the link field it is driving (OUTn / LNKn),
@@ -3776,7 +3773,6 @@ impl PvDatabase {
         let out_src = OutLinkSrc {
             putf: src_putf,
             notify: src_notify.as_ref(),
-            alarm: &src_alarm,
             field: "",
         };
 
@@ -3942,7 +3938,7 @@ impl PvDatabase {
                 }
             }
             MultiOut::Dfanout(mut links) => {
-                if let Some(ref val) = val {
+                if let Some(val) = val {
                     for idx in indices {
                         // Taken, so the handle ends inside the put.
                         let Some(parsed) = links[idx].take() else {
@@ -3977,7 +3973,7 @@ impl PvDatabase {
                         if self.write_out_link_value(
                             rec,
                             parsed,
-                            super::PutSrc::Value(val),
+                            super::PutSrc::Value(&val),
                             OutLinkSrc {
                                 field: DFANOUT_LINK_FIELDS[idx],
                                 ..out_src
@@ -3987,6 +3983,8 @@ impl PvDatabase {
                             link_failed = true;
                         }
                     }
+                    // VAL is a DBF_DOUBLE: nothing to free.
+                    val.release();
                 }
             }
             MultiOut::Seq(groups) => {
@@ -4154,13 +4152,9 @@ impl PvDatabase {
         // both through the link set's `putValue` (dbLink.c:434-448). Only a
         // real LNK does anything; a constant LNK is a no-op.
         if lnk_real {
-            let (src_putf, src_notify, src_alarm) = {
+            let (src_putf, src_notify) = {
                 let guard = rec.read();
-                (
-                    guard.common.putf,
-                    guard.notify.clone(),
-                    LinkAlarm::pending(&guard.common),
-                )
+                (guard.common.putf, guard.notify.clone())
             };
             // Through the put owner: a failed LNKn `dbPutLink` raises the seq
             // record's LINK_ALARM/INVALID from inside the put (C
@@ -4172,7 +4166,6 @@ impl PvDatabase {
                 OutLinkSrc {
                     putf: src_putf,
                     notify: src_notify.as_ref(),
-                    alarm: &src_alarm,
                     field: LNK_LINK_FIELDS[idx],
                 },
                 visited,
@@ -5095,7 +5088,7 @@ fn takes_chars(
         None => rec.read(),
     };
     // The primary field's variant, lent: a waveform VAL is not cloned.
-    if field == guard.record.primary_field()
+    if rec.rdes().is_primary(field, &*guard.record)
         && let Some(view) = guard.record.monitor_value_view()
     {
         use crate::server::record::ValueView;
@@ -5108,7 +5101,7 @@ fn takes_chars(
 
 #[cfg(test)]
 mod out_link_put_fail_tests {
-    use super::{LinkAlarm, OutLinkSrc};
+    use super::OutLinkSrc;
     use crate::server::database::PvDatabase;
     use crate::server::record::{AlarmSeverity, DbLink, LinkProcessPolicy, MonitorSwitch};
     use crate::server::records::calc::CalcRecord;
@@ -5144,15 +5137,9 @@ mod out_link_put_fail_tests {
             LinkProcessPolicy::ProcessPassive, // ` PP` token
             MonitorSwitch::NoMaximize,
         );
-        let alarm = LinkAlarm {
-            stat: 0,
-            sevr: AlarmSeverity::NoAlarm,
-            amsg: crate::server::record::SparseText::default(),
-        };
         let src = OutLinkSrc {
             putf: false,
             notify: None,
-            alarm: &alarm,
             field: "OUT",
         };
         let mut visited = crate::server::database::ProcStack::new();
@@ -5195,15 +5182,9 @@ mod out_link_put_fail_tests {
             LinkProcessPolicy::ProcessPassive, // ` PP` token
             MonitorSwitch::NoMaximize,
         );
-        let alarm = LinkAlarm {
-            stat: 0,
-            sevr: AlarmSeverity::NoAlarm,
-            amsg: crate::server::record::SparseText::default(),
-        };
         let src = OutLinkSrc {
             putf: false,
             notify: None,
-            alarm: &alarm,
             field: "OUT",
         };
         let mut visited = crate::server::database::ProcStack::new();
@@ -5266,20 +5247,11 @@ mod nonlocal_db_link_write_tests {
         }
     }
 
-    fn out_src(alarm: &super::LinkAlarm) -> OutLinkSrc<'_> {
+    fn out_src() -> OutLinkSrc<'static> {
         OutLinkSrc {
             putf: false,
             notify: None,
-            alarm,
             field: "OUT",
-        }
-    }
-
-    fn no_alarm() -> super::LinkAlarm {
-        super::LinkAlarm {
-            stat: 0,
-            sevr: AlarmSeverity::NoAlarm,
-            amsg: crate::server::record::SparseText::default(),
         }
     }
 
@@ -5302,14 +5274,8 @@ mod nonlocal_db_link_write_tests {
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
         );
-        let alarm = no_alarm();
         let mut visited = crate::server::database::ProcStack::new();
-        db.write_db_link_value(
-            &link,
-            EpicsValue::Double(42.0),
-            out_src(&alarm),
-            &mut visited,
-        );
+        db.write_db_link_value(&link, EpicsValue::Double(42.0), out_src(), &mut visited);
         // Staged on the link-put queue and returned, as C `dbCaPutLink`
         // does (`dbCa.c:593-595`); `dbCaSync` (`dbCa.c:1126-1129`) is the
         // barrier that makes the wire write observable.
@@ -5343,14 +5309,8 @@ mod nonlocal_db_link_write_tests {
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
         );
-        let alarm = no_alarm();
         let mut visited = crate::server::database::ProcStack::new();
-        db.write_db_link_value(
-            &link,
-            EpicsValue::Double(7.0),
-            out_src(&alarm),
-            &mut visited,
-        );
+        db.write_db_link_value(&link, EpicsValue::Double(7.0), out_src(), &mut visited);
 
         assert!(
             puts.lock().unwrap().is_empty(),

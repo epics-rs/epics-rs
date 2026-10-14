@@ -206,7 +206,7 @@ impl Record for LongoutRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::OUTPUT_HOOKS
     }
 
     fn has_array_monitor_post(&self) -> bool {

@@ -1172,6 +1172,9 @@ impl Record for AcalcoutRecord {
             .union(crate::server::record::CycleHooks::WRITE_POSTED)
             .union(crate::server::record::CycleHooks::PROCESS_POSTED)
             .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
+            .union(crate::server::record::CycleHooks::CONTINUATION)
+            .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {

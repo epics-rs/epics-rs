@@ -247,7 +247,7 @@ impl Record for SelRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::INPUT_FETCH
     }
 
     /// C `selRecord.c::init_record` (:88-110) seeds the A..L inputs to NaN and

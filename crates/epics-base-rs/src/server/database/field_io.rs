@@ -2626,7 +2626,8 @@ impl PvDatabase {
         }
         // A scalar into the primary array field: element 0 of the buffer in
         // place, `put_array_info(paddr, 1)` (`dbAccess.c:1350-1367`).
-        if at.dbaddr() && !at.field().char_view() && field == instance.record.primary_field() {
+        if at.dbaddr() && !at.field().char_view() && rec.rdes().is_primary(field, &*instance.record)
+        {
             if let Some(element) = src.element() {
                 let old_nord = array_nord_before_put(&instance, field);
                 if instance.record.put_primary_element0(element) {
@@ -2724,7 +2725,7 @@ impl PvDatabase {
             inst.record.check_alarms(&mut inst.common);
             let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
         }
-        if at.udf_defining() && field != instance.record.primary_field() {
+        if at.udf_defining() && !rec.rdes().is_primary(field, &*instance.record) {
             instance.common.udf = 0;
         }
         if status.is_err() {

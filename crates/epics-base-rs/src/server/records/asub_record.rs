@@ -572,7 +572,7 @@ impl Record for ASubRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::MONITOR_SETS
     }
 
     fn has_array_monitor_post(&self) -> bool {

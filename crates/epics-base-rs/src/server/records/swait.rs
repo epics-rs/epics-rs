@@ -503,6 +503,8 @@ impl Record for SwaitRecord {
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::WRITE_POSTED
             .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
+            .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {

@@ -587,6 +587,7 @@ impl Record for TransformRecord {
             .union(crate::server::record::CycleHooks::WRITE_POSTED)
             .union(crate::server::record::CycleHooks::CONTEXT)
             .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {

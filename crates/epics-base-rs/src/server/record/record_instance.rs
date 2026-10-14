@@ -968,6 +968,10 @@ pub(crate) struct SimmBlock {
     /// this from the record TYPE NAME meant allocating that name as a `String`
     /// once per cycle to match against it.
     pub(crate) is_input: bool,
+    /// [`Record::aborts_on_failed_siml_read`].
+    pub(crate) aborts_on_failed_siml_read: bool,
+    /// [`Record::raises_simm_after_read`].
+    pub(crate) raises_simm_after_read: bool,
 }
 
 impl SimmBlock {
@@ -992,6 +996,8 @@ impl SimmBlock {
                         | "aai"
                         | "mca"
                 ),
+            aborts_on_failed_siml_read: record.aborts_on_failed_siml_read(),
+            raises_simm_after_read: record.raises_simm_after_read(),
         }
     }
 }
@@ -1054,6 +1060,7 @@ impl ProcessPlan {
         stamps_before_siml_read: false,
         clears_udf: true,
         soft_read_clears_udf: true,
+        can_device_write: false,
     };
 
     /// Whether this type's cycle is [`Self::PLAIN_INPUT`] once the simulation
@@ -1094,6 +1101,7 @@ impl ProcessPlan {
             stamps_before_siml_read,
             clears_udf,
             soft_read_clears_udf,
+            can_device_write,
         } = *self;
         let p = &Self::PLAIN_INPUT;
         dset_can_refuse == p.dset_can_refuse
@@ -1128,6 +1136,7 @@ impl ProcessPlan {
             && stamps_before_siml_read == p.stamps_before_siml_read
             && clears_udf == p.clears_udf
             && soft_read_clears_udf == p.soft_read_clears_udf
+            && can_device_write == p.can_device_write
     }
 
     /// The answers, asked of the record type once. Pure in the record's
@@ -1194,6 +1203,7 @@ impl ProcessPlan {
             stamps_before_siml_read: output_stage && !record.stamps_after_write(),
             clears_udf: record.clears_udf(),
             soft_read_clears_udf: record.soft_read_clears_udf(),
+            can_device_write: record.can_device_write(),
         }
     }
 }
@@ -2236,6 +2246,8 @@ pub(crate) struct ProcessPlan {
     pub(crate) stamps_before_siml_read: bool,
     pub(crate) clears_udf: bool,
     pub(crate) soft_read_clears_udf: bool,
+    /// [`Record::can_device_write`], a literal of the type.
+    pub(crate) can_device_write: bool,
 }
 
 /// Which pass of `process()` a stamp belongs to. The completion pass is the
@@ -2476,9 +2488,68 @@ pub(crate) struct RecordDesc {
     /// [`Record::primary_field`] and [`Record::process_passive_fields`].
     primary_field: &'static str,
     pp_fields: &'static [&'static str],
+    /// [`Record::rederives_udf_on_computed_read`]. Kept here, not in
+    /// [`ProcessPlan`], because `ai` and `bi` answer it differently and
+    /// share [`ProcessPlan::PLAIN_INPUT`].
+    rederives_udf_on_computed_read: bool,
+    /// [`Record::refused_async_read_keeps_udf`], here for the same reason.
+    refused_async_read_keeps_udf: bool,
+    /// [`Record::raw_soft_read_failure_skips_convert`], here for the same reason.
+    raw_soft_read_failure_skips_convert: bool,
+    /// [`Record::string_input_links`].
+    string_input_links: &'static [(&'static str, &'static str)],
 }
 
 impl RecordDesc {
+    /// Whether `field` is the type's [`Record::primary_field`]. `record` is
+    /// the cell's own record, asked only by a debug build to check the fact.
+    #[inline]
+    pub(crate) fn is_primary(&self, field: &str, record: &dyn Record) -> bool {
+        debug_assert_eq!(self.primary_field, record.primary_field());
+        field == self.primary_field
+    }
+
+    /// [`Record::rederives_udf_on_computed_read`]; `record` as in
+    /// [`Self::is_primary`].
+    #[inline]
+    pub(crate) fn rederives_udf_on_computed_read(&self, record: &dyn Record) -> bool {
+        debug_assert_eq!(
+            self.rederives_udf_on_computed_read,
+            record.rederives_udf_on_computed_read()
+        );
+        self.rederives_udf_on_computed_read
+    }
+
+    /// [`Record::refused_async_read_keeps_udf`]; `record` as in [`Self::is_primary`].
+    #[inline]
+    pub(crate) fn refused_async_read_keeps_udf(&self, record: &dyn Record) -> bool {
+        debug_assert_eq!(
+            self.refused_async_read_keeps_udf,
+            record.refused_async_read_keeps_udf()
+        );
+        self.refused_async_read_keeps_udf
+    }
+
+    /// [`Record::raw_soft_read_failure_skips_convert`]; `record` as in [`Self::is_primary`].
+    #[inline]
+    pub(crate) fn raw_soft_read_failure_skips_convert(&self, record: &dyn Record) -> bool {
+        debug_assert_eq!(
+            self.raw_soft_read_failure_skips_convert,
+            record.raw_soft_read_failure_skips_convert()
+        );
+        self.raw_soft_read_failure_skips_convert
+    }
+
+    /// [`Record::string_input_links`]; `record` as in [`Self::is_primary`].
+    #[inline]
+    pub(crate) fn string_input_links(
+        &self,
+        record: &dyn Record,
+    ) -> &'static [(&'static str, &'static str)] {
+        debug_assert_eq!(self.string_input_links, record.string_input_links());
+        self.string_input_links
+    }
+
     pub(crate) fn of<R: Record + ?Sized>(record: &R) -> Self {
         RecordDesc {
             record_type: record.record_type(),
@@ -2486,6 +2557,10 @@ impl RecordDesc {
             noaccess: record.noaccess_names(),
             primary_field: record.primary_field(),
             pp_fields: record.process_passive_fields(),
+            rederives_udf_on_computed_read: record.rederives_udf_on_computed_read(),
+            refused_async_read_keeps_udf: record.refused_async_read_keeps_udf(),
+            raw_soft_read_failure_skips_convert: record.raw_soft_read_failure_skips_convert(),
+            string_input_links: record.string_input_links(),
         }
     }
 }
@@ -5000,6 +5075,9 @@ pub(crate) struct MonitorPlan {
     claimed_bits: FieldBits,
     /// [`Record::answers_own_posts`].
     answers_own_posts: bool,
+    /// [`Record::process_posted_fields`] answers `Some`, which is fixed per
+    /// type, so a type with an open set is not asked every cycle.
+    posts_closed: bool,
     /// The declared fields [`walk_skip_term`] answers for.
     walk_skip_bits: FieldBits,
     /// The `HASH` field's declaration, for the array types' hash post.
@@ -5158,6 +5236,7 @@ impl MonitorPlan {
             claimed,
             claimed_bits: FieldBits::of(record, |desc| claimed.contains(&desc.name)),
             answers_own_posts: record.answers_own_posts(),
+            posts_closed: record.process_posted_fields().is_some(),
             walk_skip_bits: FieldBits::of(record, |desc| {
                 walk_skip_term(desc.name, deadband_field, event_posted)
             }),
@@ -6777,7 +6856,16 @@ impl RecordInstance {
     /// against it.
     #[inline]
     fn settle_posted(&mut self) -> Option<DeclaredFields> {
-        let list = self.record.process_posted_fields();
+        let list = match self.monitor_plan.posts_closed {
+            true => self.record.process_posted_fields(),
+            false => None,
+        };
+        debug_assert_eq!(
+            list.is_some(),
+            self.record.process_posted_fields().is_some(),
+            "{} opened or closed its process post set after the plan was built",
+            self.record.record_type()
+        );
         if !self.posted.is_settled(list) {
             self.resettle_posted(list);
         }
@@ -7076,8 +7164,62 @@ impl RecordInstance {
     /// [`Record::set_process_continuation`], handed this instance's PACT.
     #[inline(always)]
     pub(crate) fn set_process_continuation(&mut self, continuation: bool) {
-        self.record
-            .set_process_continuation(continuation, crate::server::record::Pact::new(&self.pact));
+        if self.has_hook(crate::server::record::CycleHooks::CONTINUATION) {
+            self.record.set_process_continuation(
+                continuation,
+                crate::server::record::Pact::new(&self.pact),
+            );
+        }
+    }
+
+    /// Whether the type answers `hook` with anything but the trait default;
+    /// the wrappers below ask the record only then.
+    #[inline(always)]
+    fn has_hook(&self, hook: crate::server::record::CycleHooks) -> bool {
+        self.monitor_plan.hooks.has(hook)
+    }
+
+    /// [`Record::set_fetch_gate_failed`].
+    #[inline(always)]
+    pub(crate) fn set_fetch_gate_failed(&mut self, failed: bool) {
+        if self.has_hook(crate::server::record::CycleHooks::INPUT_FETCH) {
+            self.record.set_fetch_gate_failed(failed);
+        }
+    }
+
+    /// [`Record::set_resolved_input_links`].
+    #[inline(always)]
+    pub(crate) fn set_resolved_input_links(
+        &mut self,
+        resolved: crate::server::record::ResolvedInputLinks<'_>,
+    ) {
+        if self.has_hook(crate::server::record::CycleHooks::INPUT_FETCH) {
+            self.record.set_resolved_input_links(resolved);
+        }
+    }
+
+    /// [`Record::read_constant_inp`] of this record's INP.
+    #[inline(always)]
+    pub(crate) fn read_constant_inp(&mut self) -> bool {
+        self.has_hook(crate::server::record::CycleHooks::INPUT_FETCH)
+            && self.record.read_constant_inp(self.parsed_inp.link())
+    }
+
+    /// [`Record::should_output`].
+    #[inline(always)]
+    pub(crate) fn should_output(&self) -> bool {
+        !self.has_hook(crate::server::record::CycleHooks::OUTPUT_HOOKS)
+            || self.record.should_output()
+    }
+
+    /// [`Record::output_event`].
+    #[inline(always)]
+    pub(crate) fn output_event(&self) -> Option<String> {
+        if self.has_hook(crate::server::record::CycleHooks::OUTPUT_HOOKS) {
+            self.record.output_event()
+        } else {
+            None
+        }
     }
 
     /// C `prec->pact = TRUE` — the record goes busy for an async device
@@ -10177,10 +10319,19 @@ impl RecordInstance {
             } else {
                 alarm_bits
             };
+        let sets = self.has_hook(crate::server::record::CycleHooks::MONITOR_SETS);
         self.settle_roles(Lists {
-            forced: self.record.force_posted_fields(),
+            forced: if sets {
+                self.record.force_posted_fields()
+            } else {
+                &[]
+            },
             fanout: alarm_fanout,
-            swept: self.record.log_swept_fields(),
+            swept: if sets {
+                self.record.log_swept_fields()
+            } else {
+                &[]
+            },
             marks: if any_marks {
                 cycle_marks.table()
             } else {
@@ -10188,7 +10339,11 @@ impl RecordInstance {
             },
         });
         let process_posted = self.settle_posted();
-        let prev_changed = self.record.prev_compared_inputs().1;
+        let prev_changed = if sets {
+            self.record.prev_compared_inputs().1
+        } else {
+            0
+        };
 
         // The walk covers every field whose published value is tracked — each
         // subscribed field, and each field a post has already published — not
@@ -10421,11 +10576,8 @@ impl RecordInstance {
             };
             self.record_value_post_as(key, field, val.clone());
         }
-        let mut index = 0;
-        snapshot.retain(|(field, _, _)| {
-            let walked = index >= first_post;
-            index += 1;
-            !walked || self.subscribers.iter().any(|sub| sub.watches(field))
+        snapshot.retain_from(first_post, |(field, _, _)| {
+            self.subscribers.iter().any(|sub| sub.watches(field))
         });
     }
 

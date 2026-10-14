@@ -980,6 +980,18 @@ impl EpicsValue {
         self.num()?.int()
     }
 
+    /// Drop the value with its tag tested inline: a numeric scalar owns
+    /// nothing, and the drop glue is an out-of-line call that would only
+    /// test the tag. A heap value pays the test on top of the glue, so this
+    /// is for a value that is a scalar by its field's type.
+    #[inline]
+    pub(crate) fn release(self) {
+        match self.num() {
+            Some(_) => std::mem::forget(self),
+            None => drop(self),
+        }
+    }
+
     /// A numeric scalar as the one [`Scalar`] every narrowing reads, and the
     /// classification [`Self::as_int_i64`] is a view of.
     #[inline]
@@ -2576,5 +2588,27 @@ mod scalar_row_tests {
             }
             assert_eq!(s.to_field(T::String), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// `release` skips the destructor only of a value that owns nothing: an
+    /// array's buffer share and an NTEnum carrier's labels are still freed.
+    #[test]
+    fn release_frees_what_the_value_owns() {
+        let buf: Arc<[f64]> = Arc::from(vec![1.0, 2.0]);
+        EpicsValue::DoubleArray(Arc::clone(&buf).into()).release();
+        assert_eq!(Arc::strong_count(&buf), 1, "array share freed");
+
+        let labels: Arc<[PvString]> = Arc::from(vec![PvString::from("a")]);
+        EpicsValue::StringArray(Arc::clone(&labels).into()).release();
+        assert_eq!(Arc::strong_count(&labels), 1, "string array share freed");
+
+        EpicsValue::Double(1.0).release();
+        EpicsValue::String(PvString::from("s")).release();
     }
 }

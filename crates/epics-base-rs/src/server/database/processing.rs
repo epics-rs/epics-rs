@@ -9287,7 +9287,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         // never gated.
         let gated = link_field != "INP" || instance.common.dtyp.is_soft();
         let text = if link_field == "INP" {
-            instance.common.inp.clone()
+            instance.common.text.inp.clone()
         } else {
             match instance.record.get_field(link_field) {
                 Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
@@ -9319,7 +9319,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     //    that reads its own INP (compress) gets no init load in C, and its
     //    constant therefore never reaches the record at all.
     if instance.common.dtyp.is_soft() && instance.record.input_read_by_device_support() {
-        let inp = crate::server::record::parse_link_v2(&instance.common.inp);
+        let inp = crate::server::record::parse_link_v2(&instance.common.text.inp);
         let soft = instance.common.dtyp.soft();
         let raw_dset = soft == Some(crate::server::device_support::SoftDtyp::Raw);
         // An array dset's `dbLoadLinkArray`, the dset's own

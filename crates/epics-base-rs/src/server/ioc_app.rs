@@ -2707,8 +2707,8 @@ pub(crate) fn attach_device_support(
     let ctx = DeviceSupportContext {
         record_type: instance.record.record_type(),
         dtyp: &dtyp,
-        inp: &instance.common.inp,
-        out: &instance.common.out,
+        inp: &instance.common.text.inp,
+        out: &instance.common.text.out,
     };
     let dev_opt = resolve.and_then(|resolve| resolve(&ctx));
     let Some(dev) = dev_opt else {

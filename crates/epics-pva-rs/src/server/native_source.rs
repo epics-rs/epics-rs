@@ -106,7 +106,7 @@ pub struct PvDatabaseSource {
     /// surface on this source. The gate holds an `Arc` clone of
     /// the caller's `AcfCell` (so hot-swap via that cell is
     /// visible) plus a per-name `(ASG, ASL)` resolver that reads
-    /// the live record's `common.asg` / `common.asl`. Wire-layer
+    /// the live record's `common.text.asg` / `common.asl`. Wire-layer
     /// `*_checked` ops cannot run without an `AccessChecked` minted
     /// here.
     gate: epics_base_rs::server::access_security::AccessGate,
@@ -3996,7 +3996,7 @@ ASG(SECURE) {
             .unwrap();
         // Mark the record as belonging to the SECURE ASG.
         let rec = db.get_record("AI:SECURE").unwrap();
-        rec.write().common.asg = "SECURE".to_string();
+        rec.write().common.text.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -4052,7 +4052,7 @@ ASG(LOCKED) {
             .await
             .unwrap();
         let rec = db.get_record("AI:LOCKED").unwrap();
-        rec.write().common.asg = "LOCKED".to_string();
+        rec.write().common.text.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -4092,7 +4092,7 @@ ASG(LOCKED) {
             .await
             .unwrap();
         let rec = db.get_record("AI:MON").unwrap();
-        rec.write().common.asg = "LOCKED".to_string();
+        rec.write().common.text.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -4135,7 +4135,7 @@ ASG(SECURE) {
             .await
             .unwrap();
         let rec = db.get_record("AI:LIVE").unwrap();
-        rec.write().common.asg = "SECURE".to_string();
+        rec.write().common.text.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(db.clone(), cell.clone());
 
@@ -4221,7 +4221,7 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
             .await
             .unwrap();
-        db.get_record("AI:LOCKED").unwrap().write().common.asg = "LOCKED".into();
+        db.get_record("AI:LOCKED").unwrap().write().common.text.asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -4277,7 +4277,7 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
             .await
             .unwrap();
-        db.get_record("AI:LOCKED").unwrap().write().common.asg = "LOCKED".into();
+        db.get_record("AI:LOCKED").unwrap().write().common.text.asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -5770,7 +5770,7 @@ ASG(AUDIT) {
         db.add_record("AI:AUDIT", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        db.get_record("AI:AUDIT").unwrap().write().common.asg = "AUDIT".to_string();
+        db.get_record("AI:AUDIT").unwrap().write().common.text.asg = "AUDIT".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -5841,7 +5841,7 @@ ASG(PLAIN) {
         db.add_record("AI:PLAIN", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        db.get_record("AI:PLAIN").unwrap().write().common.asg = "PLAIN".to_string();
+        db.get_record("AI:PLAIN").unwrap().write().common.text.asg = "PLAIN".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -6509,7 +6509,7 @@ ASG(PLAIN) {
     #[epics_macros_rs::epics_test]
     async fn a_dollar_string_channel_serves_its_char_image() {
         let db = ai_db("AI:LS").await;
-        db.get_record("AI:LS").unwrap().write().common.desc = "a description".into();
+        db.get_record("AI:LS").unwrap().write().common.text.desc = "a description".into();
         let source = PvDatabaseSource::new(db.clone());
 
         assert!(
@@ -7049,8 +7049,8 @@ ASG(PLAIN) {
         {
             let rec = db.get_record("AI:LNK").unwrap();
             let mut inst = rec.write();
-            inst.common.inp = "OTHER:PV CP MS".into();
-            inst.common.flnk = "NEXT:REC".into();
+            inst.common.text.inp = "OTHER:PV CP MS".into();
+            inst.common.text.flnk = "NEXT:REC".into();
         }
         let source = PvDatabaseSource::new(db.clone());
 

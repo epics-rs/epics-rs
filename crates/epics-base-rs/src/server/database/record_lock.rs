@@ -2835,7 +2835,7 @@ mod tests {
         {
             let src = db.get_record("LF:SRC").expect("record");
             let mut inst = src.write();
-            inst.common.inp = "LF:DST".to_string();
+            inst.common.text.inp = "LF:DST".to_string();
             inst.set_link_cache("INP", parse_link_field("LF:DST", LinkFieldType::In));
         }
         db.build_lock_sets();
@@ -2873,7 +2873,12 @@ mod tests {
         );
         assert!(failed, "dbPut refuses a link field");
         assert_eq!(
-            db.get_record("LF:DST").expect("record").read().common.flnk,
+            db.get_record("LF:DST")
+                .expect("record")
+                .read()
+                .common
+                .text
+                .flnk,
             ""
         );
 

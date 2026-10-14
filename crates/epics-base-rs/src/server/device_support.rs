@@ -1043,7 +1043,7 @@ pub fn wire_device_to_record(instance: &mut RecordInstance, dev: Box<dyn DeviceS
 pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn DeviceSupport>) {
     let name = instance.name.clone();
     dev.set_record_info(&name, instance.common.scan);
-    dev.apply_record_info(&instance.info);
+    dev.apply_record_info(instance.info());
     instance.device = Some(dev);
 }
 

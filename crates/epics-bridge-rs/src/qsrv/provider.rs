@@ -2211,7 +2211,7 @@ ASG(SECURE) {
             .await
             .unwrap();
         let rec = db.get_record("AI:SEC").unwrap();
-        rec.write().common.asg = "SECURE".to_string();
+        rec.write().common.text.asg = "SECURE".to_string();
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Anyone can read.
@@ -2247,7 +2247,7 @@ ASG(LOCKED) {
             .await
             .unwrap();
         let rec = db.get_record("AI:MOVE").unwrap();
-        rec.write().common.asg = "OPEN".to_string();
+        rec.write().common.text.asg = "OPEN".to_string();
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Twice: the second call is the cache-hit path.
@@ -2256,7 +2256,7 @@ ASG(LOCKED) {
 
         // The field-I/O layer's `dbPut record.ASG` sequence: mutate,
         // then notify.
-        rec.write().common.asg = "LOCKED".to_string();
+        rec.write().common.text.asg = "LOCKED".to_string();
         notify_asg_field_changed();
         assert!(!acl.can_write("AI:MOVE", b"guest", "anywhere").await);
     }
@@ -2311,26 +2311,26 @@ ASG(ROLE_GATED) {
         {
             let rec = db.get_record("AI:ASL0").unwrap();
             let mut w = rec.write();
-            w.common.asg = "ASL_GATED".to_string();
+            w.common.text.asg = "ASL_GATED".to_string();
             w.common.asl = 0;
         }
         {
             let rec = db.get_record("AI:ASL1").unwrap();
             let mut w = rec.write();
-            w.common.asg = "ASL_GATED".to_string();
+            w.common.text.asg = "ASL_GATED".to_string();
             w.common.asl = 1;
         }
         {
             let rec = db.get_record("AI:METH").unwrap();
-            rec.write().common.asg = "METHOD_GATED".to_string();
+            rec.write().common.text.asg = "METHOD_GATED".to_string();
         }
         {
             let rec = db.get_record("AI:AUTH").unwrap();
-            rec.write().common.asg = "AUTHORITY_GATED".to_string();
+            rec.write().common.text.asg = "AUTHORITY_GATED".to_string();
         }
         {
             let rec = db.get_record("AI:ROLE").unwrap();
-            rec.write().common.asg = "ROLE_GATED".to_string();
+            rec.write().common.text.asg = "ROLE_GATED".to_string();
         }
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
@@ -2611,7 +2611,7 @@ ASG(ANON_GATED) {
             .unwrap();
         {
             let rec = db.get_record("AI:ANON").unwrap();
-            rec.write().common.asg = "ANON_GATED".to_string();
+            rec.write().common.text.asg = "ANON_GATED".to_string();
         }
         let acl = AcfAccessControl::new(db.clone(), cfg);
 

@@ -5627,12 +5627,12 @@ mod tests {
 
     /// `record_link_fields` must surface a record's device-support `INP`
     /// link. An `ai`'s `INP` is a `DBF_INLINK` field stored in
-    /// `common.inp` — it is not a `DbFieldType::String` entry in
+    /// `common.text.inp` — it is not a `DbFieldType::String` entry in
     /// `field_list()` — so the earlier `field_list()` scan filtered by
     /// `String` silently dropped it. The pvalink install scan walks this
     /// method, so a Passive `ai` carrying a CP/CPP pvalink `INP` never had
     /// its monitor opened at iocInit. Enumerating the canonical
-    /// `common.inp` storage fixes it; C `dbpvar`/`dbcar` likewise dump
+    /// `common.text.inp` storage fixes it; C `dbpvar`/`dbcar` likewise dump
     /// every link field including device-support INP/OUT.
     #[epics_macros_rs::epics_test]
     async fn record_link_fields_surfaces_device_support_inp() {
@@ -5643,7 +5643,7 @@ mod tests {
         // A `pva` link set has to be installed for a `pva://` link to survive
         // `db_init_link_locality`, which refuses a link whose scheme nothing
         // can service. This test is about the ENUMERATION reaching
-        // `common.inp`, so it installs the lset the link names rather than
+        // `common.text.inp`, so it installs the lset the link names rather than
         // asserting the refusal.
         db.register_link_set(
             "pva",
@@ -5656,11 +5656,11 @@ mod tests {
         db.add_record("AI", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        // Device-support INP lives in `common.inp` (DBF_INLINK), the
+        // Device-support INP lives in `common.text.inp` (DBF_INLINK), the
         // exact storage a `field_list()` String scan cannot reach.
         {
             let rec = db.get_record("AI").unwrap();
-            rec.write().common.inp = "pva://mini:current?proc=CP".to_string();
+            rec.write().common.text.inp = "pva://mini:current?proc=CP".to_string();
         }
 
         let links = db.record_link_fields("AI");

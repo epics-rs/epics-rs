@@ -577,7 +577,7 @@ impl Record for SwaitRecord {
     }
 
     fn init_links(&mut self, common: &crate::server::record::CommonFields) {
-        self.out.set(&common.out);
+        self.out.set(&common.text.out);
         self.refresh_link_status();
     }
 
@@ -665,8 +665,8 @@ impl Record for SwaitRecord {
 
         // OUTN lives in the common fields, so a runtime re-point is invisible to
         // `special()`. Catch it here — the same split calcout uses for its OUT.
-        if self.out != common.out {
-            self.out.set(&common.out);
+        if self.out != common.text.out {
+            self.out.set(&common.text.out);
             self.refresh_link_status();
         }
 
@@ -1032,7 +1032,7 @@ impl Record for SwaitRecord {
             "OVAL" => Some(EpicsValue::Double(self.oval)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             "ODLY" => Some(EpicsValue::Float(self.odly)),
-            // OUTN is aliased to common.out via RecordInstance; not stored locally.
+            // OUTN is aliased to common.text.out via RecordInstance; not stored locally.
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
@@ -1115,7 +1115,7 @@ impl Record for SwaitRecord {
                         .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?,
                 );
             }
-            // OUTN falls through to put_common_field which mirrors to common.out.
+            // OUTN falls through to put_common_field which mirrors to common.text.out.
             "SIML" => match value {
                 EpicsValue::String(s) => self.siml = s.as_str_lossy().into_owned(),
                 _ => return Err(CaError::TypeMismatch("SIML".into())),

@@ -64,7 +64,7 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         let r = db.get_record(name).unwrap();
         let mut inst = r.write();
         inst.common.scan = ScanType::Event;
-        inst.common.evnt = evnt.to_string();
+        inst.common.text.evnt = evnt.to_string();
     }
     db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }

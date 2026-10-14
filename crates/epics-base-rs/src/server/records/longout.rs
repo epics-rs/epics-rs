@@ -81,7 +81,7 @@ pub struct LongoutRecord {
     /// reaches C's `conditional_write`. The OUT-change re-trigger
     /// (PR #6c573b4 part 2) is wired through
     /// [`Record::special("OUT", true)`] — `RecordInstance::put_common_field`
-    /// fires it after `common.out` is updated, so OUT is owned by
+    /// fires it after `common.text.out` is updated, so OUT is owned by
     /// the RecordInstance (common-field side), not by this struct.
     pub first_output_done: bool,
     /// `OOCH` (Output Exec. on OUT Change) — C `menuYesNo`. When YES
@@ -554,7 +554,7 @@ impl Record for LongoutRecord {
     /// `val == pval` suppression. We fire on `after=true` because the
     /// common `out` field is set inside `RecordInstance::put_common_field`
     /// AFTER the `special(name, false)` validation hook — so by the
-    /// time we run, `instance.common.out` already holds the new value
+    /// time we run, `instance.common.text.out` already holds the new value
     /// (we don't need to read it; just react to the field name).
     fn special(&mut self, field: &str, after: bool) -> crate::error::CaResult<()> {
         if after && field == "OUT" && self.ooch == 1 {

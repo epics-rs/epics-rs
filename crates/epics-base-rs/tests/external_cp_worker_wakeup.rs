@@ -75,7 +75,7 @@ async fn holder_db(lset: Arc<CounterLset>) -> PvDatabase {
     {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.common.inp = "ca://UP:PV CP".to_string();
+        inst.common.text.inp = "ca://UP:PV CP".to_string();
         inst.install_link_cache(
             "INP",
             Arc::new(epics_base_rs::server::record::parse_link_v2(

@@ -116,14 +116,17 @@ ASG(RW)      { RULE(1, WRITE) }
     .expect("acf parses");
 
     let mut inst = instance("ai");
-    assert_eq!(inst.common.asg, "", "a record names no group by default");
+    assert_eq!(
+        inst.common.text.asg, "",
+        "a record names no group by default"
+    );
     assert_eq!(
         cfg.check_access(inst.common.access_group(), "host", "user"),
         AccessLevel::Read,
         "the empty ASG must evaluate against DEFAULT, not against nothing"
     );
 
-    inst.common.asg = "RW".to_string();
+    inst.common.text.asg = "RW".to_string();
     assert_eq!(
         cfg.check_access(inst.common.access_group(), "host", "user"),
         AccessLevel::ReadWrite,

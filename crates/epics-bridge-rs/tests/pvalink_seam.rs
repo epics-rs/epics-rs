@@ -60,7 +60,7 @@ async fn pvalink_installs_at_iocinit_seam_and_not_in_external_link_wait() {
     // pvxs JSON longhand. The install scan walks `record_link_fields`,
     // which surfaces every link-bearing field — the record-specific
     // INPA–INPU used here as well as a device-support `ai`'s/`ao`'s
-    // `common.inp`/`common.out`. `proc: 'CP'` keeps it a `PvaJson` link,
+    // `common.text.inp`/`common.text.out`. `proc: 'CP'` keeps it a `PvaJson` link,
     // which the install scan always pre-opens (no bare-PV early-out) — so
     // its monitor identity is in the registry before the iocInit wait
     // runs. PINI=NO / SCAN=Passive so the record never self-processes.

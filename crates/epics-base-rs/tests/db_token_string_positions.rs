@@ -59,7 +59,7 @@ async fn the_file_softioc_loads_loads() {
         );
     }
     let rec = db.get_record("QT1").unwrap();
-    let desc = rec.read().common.desc.clone();
+    let desc = rec.read().common.text.desc.clone();
     assert_eq!(desc, "quoted type and field");
 }
 

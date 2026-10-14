@@ -3288,8 +3288,8 @@ mod tests {
         db.add_record("UPLNK", Box::new(AoRecord::new(0.0)))
             .await
             .unwrap();
-        db.get_record("DOWN").unwrap().write().common.inp = "pva://UP:AI".to_string();
-        db.get_record("UPLNK").unwrap().write().common.out = "pva://UP:AO".to_string();
+        db.get_record("DOWN").unwrap().write().common.text.inp = "pva://UP:AI".to_string();
+        db.get_record("UPLNK").unwrap().write().common.text.out = "pva://UP:AO".to_string();
 
         let resolver = install_pvalink_resolver(&db).await;
         assert_eq!(

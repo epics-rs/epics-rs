@@ -138,7 +138,7 @@ pub(crate) fn add_record_input_of(
         (
             instance.record.record_type(),
             instance.common.dtyp.as_str().to_string(),
-            inp.is_none().then(|| instance.common.inp.clone()),
+            inp.is_none().then(|| instance.common.text.inp.clone()),
         )
     };
     add_record_input(db, record_type, &dtyp, inp.or(own_inp.as_deref())?)
@@ -193,7 +193,7 @@ pub(crate) fn add_record(
     if served_soft(instance.record.record_type(), dtyp) != Some(SoftDtyp::Async) {
         return None;
     }
-    let input = input.unwrap_or_else(|| match pv_link_name(&instance.common.inp) {
+    let input = input.unwrap_or_else(|| match pv_link_name(&instance.common.text.inp) {
         Some(_) => AddRecordInput::Channel(Ok(())),
         None => AddRecordInput::NotPvLink,
     });

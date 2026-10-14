@@ -959,7 +959,7 @@ mod tests {
         let rec = db.get_record(from).expect("record");
         {
             let mut inst = rec.write();
-            inst.common.flnk = to.to_string();
+            inst.common.text.flnk = to.to_string();
             inst.set_link_cache(
                 "FLNK",
                 crate::server::record::parse_link_field(
@@ -1677,7 +1677,7 @@ mod tests {
         ] {
             let rec = db.get_record(from).expect("record");
             let mut inst = rec.write();
-            inst.common.out = to.to_string();
+            inst.common.text.out = to.to_string();
             inst.set_link_cache("OUT", parse_link_field(to, LinkFieldType::Out));
         }
         db.build_lock_sets();

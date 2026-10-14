@@ -64,6 +64,36 @@ impl Default for TimeLast {
 #[must_use]
 pub(crate) struct StampBegun(());
 
+/// [`CommonFields`]' strings. A link field's text is served and re-parsed
+/// on a put; the cycle reads the parse cached on the instance, never these.
+#[derive(Clone, Debug, Default)]
+pub struct CommonText {
+    pub flnk: String,
+    pub inp: String,
+    pub out: String,
+    pub tsel: String,
+    /// Access security group — C `dbCommon.ASG`, a `DBF_STRING` with NO
+    /// `initial()` in `dbCommon.dbd`, so a record that does not name a group
+    /// holds the EMPTY string and `caget -t REC.ASG` on any C IOC prints an
+    /// empty line. It is `asAddMember` (asLibRoutines.c:893-928) that resolves
+    /// an empty or unknown name to the DEFAULT group — the FIELD never says
+    /// "DEFAULT" unless the `.db` put it there. Ask [`CommonFields::access_group`] for
+    /// the group to evaluate against; read this only to serve the field.
+    pub asg: String,
+    /// Description — C `dbCommon` `field(DESC,DBF_STRING) size(41)`. A
+    /// genuine DBF_STRING data field served verbatim to clients, so it is
+    /// a byte-preserving [`PvString`] (a non-UTF-8 DESC put must round-trip
+    /// unchanged, matching EPICS fixed-size char-array string semantics).
+    pub desc: PvString,
+    /// Event name for `SCAN="Event"` records. C `dbCommon.dbd.pod`:
+    /// `field(EVNT,DBF_STRING) { size(40) }` — since EPICS 7 this is
+    /// an event *name* (resolved by `eventNameToHandle`), not a
+    /// numeric subscript. A numeric string ("5") still works for
+    /// backward compatibility. Empty means "no event".
+    pub evnt: String,
+    pub sdis: String,
+}
+
 /// Common fields shared by all records.
 #[derive(Clone, Debug)]
 pub struct CommonFields {
@@ -128,10 +158,8 @@ pub struct CommonFields {
     /// [`Self::disp`], so the byte round-trips; consumers test `!= 0`.
     pub tpro: u8,
     pub bkpt: BkptFlag,
-    // Links (raw strings)
-    pub flnk: String,
-    pub inp: String,
-    pub out: String,
+    /// The strings no process cycle reads, off the record's cycle lines.
+    pub text: Box<CommonText>,
     // Device
     /// `DTYP` and the soft-channel class it names, taken together — see
     /// [`Dtyp`](crate::server::device_support::Dtyp).
@@ -143,7 +171,6 @@ pub struct CommonFields {
     /// measures its gap from here.
     pub time_last: TimeLast,
     pub tse: i16,
-    pub tsel: String,
     /// Time-tag — C `dbCommon.dbd.pod` `field(UTAG,DBF_UINT64)`. A
     /// 64-bit user/hardware tag set alongside `time` by
     /// `recGblGetTimeStampSimm` via `dbGetTimeStampTag`. Zero when no
@@ -151,14 +178,6 @@ pub struct CommonFields {
     pub utag: u64,
     // Analog alarm config (Some for analog record types)
     pub analog_alarm: Option<AnalogAlarmConfig>,
-    /// Access security group — C `dbCommon.ASG`, a `DBF_STRING` with NO
-    /// `initial()` in `dbCommon.dbd`, so a record that does not name a group
-    /// holds the EMPTY string and `caget -t REC.ASG` on any C IOC prints an
-    /// empty line. It is `asAddMember` (asLibRoutines.c:893-928) that resolves
-    /// an empty or unknown name to the DEFAULT group — the FIELD never says
-    /// "DEFAULT" unless the `.db` put it there. Ask [`Self::access_group`] for
-    /// the group to evaluate against; read this only to serve the field.
-    pub asg: String,
     /// Access security level. C `dbCommon.ASL`
     /// (0 or 1, default 0). Compared against `RULE(N, …)` levels
     /// in [`crate::server::access_security::AccessSecurityConfig::check_access_method`] —
@@ -168,24 +187,12 @@ pub struct CommonFields {
     /// `RULE(N>0, WRITE)` was always considered "applicable" and
     /// the per-record ASL gate was silently inert.
     pub asl: u8,
-    /// Description — C `dbCommon` `field(DESC,DBF_STRING) size(41)`. A
-    /// genuine DBF_STRING data field served verbatim to clients, so it is
-    /// a byte-preserving [`PvString`] (a non-UTF-8 DESC put must round-trip
-    /// unchanged, matching EPICS fixed-size char-array string semantics).
-    pub desc: PvString,
     // Phase/priority/event
     pub phas: i16,
-    /// Event name for `SCAN="Event"` records. C `dbCommon.dbd.pod`:
-    /// `field(EVNT,DBF_STRING) { size(40) }` — since EPICS 7 this is
-    /// an event *name* (resolved by `eventNameToHandle`), not a
-    /// numeric subscript. A numeric string ("5") still works for
-    /// backward compatibility. Empty means "no event".
-    pub evnt: String,
     pub prio: i16,
     // Disable support
     pub disv: i16,
     pub disa: i16,
-    pub sdis: String,
     /// `DISS` (`DBF_MENU menu(menuAlarmSevr)`) — the severity a disabled record
     /// takes. Holds the **raw stored ordinal** (see [`AnalogAlarmConfig`]).
     pub diss: i16,
@@ -221,7 +228,7 @@ impl CommonFields {
     /// (asLibRoutines.c:893-928) resolves an empty or unknown group name to the
     /// always-present `DEFAULT` group.
     ///
-    /// Every access-security call site asks this, never [`Self::asg`] directly:
+    /// Every access-security call site asks this, never [`CommonText::asg`] directly:
     /// the FIELD is what the `.db` wrote (empty by default, and that is what the
     /// wire must show), the GROUP is what the ACF is evaluated against. Three
     /// call sites used to spell the empty→DEFAULT rule out for themselves and a
@@ -229,10 +236,10 @@ impl CommonFields {
     /// different rule (C's unknown-NAME reassignment) that happened to have the
     /// same effect.
     pub fn access_group(&self) -> &str {
-        if self.asg.is_empty() {
+        if self.text.asg.is_empty() {
             "DEFAULT"
         } else {
-            &self.asg
+            &self.text.asg
         }
     }
 
@@ -296,9 +303,7 @@ impl Default for CommonFields {
             pini: 0,
             tpro: 0,
             bkpt: BkptFlag::default(),
-            flnk: String::new(),
-            inp: String::new(),
-            out: String::new(),
+            text: Box::default(),
             dtyp: crate::server::device_support::Dtyp::default(),
             // An `epicsTimeStamp {0,0}` — C's never-processed `dbCommon.time`
             // — is the EPICS epoch, not the Unix epoch. Seeding this with
@@ -310,18 +315,13 @@ impl Default for CommonFields {
             time: crate::runtime::general_time::epics_epoch(),
             time_last: TimeLast::default(),
             tse: 0,
-            tsel: String::new(),
             utag: 0,
             analog_alarm: None,
-            asg: String::new(),
             asl: 0,
-            desc: PvString::new(),
             phas: 0,
-            evnt: String::new(),
             prio: 0,
             disv: 1,
             disa: 0,
-            sdis: String::new(),
             diss: 0,
             hyst: 0.0,
             lcnt: 0,

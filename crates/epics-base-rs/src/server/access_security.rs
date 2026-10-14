@@ -532,7 +532,7 @@ fn report_asg_inp_refused(
         let rec = rec.read();
         (
             rec.resolve_field(field),
-            (rec.common.asg.clone(), rec.common.asl),
+            (rec.common.text.asg.clone(), rec.common.asl),
         )
     };
     let level = config.map_or(AccessLevel::ReadWrite, |c| {
@@ -2051,7 +2051,7 @@ fn trap_fields(meta: &TrapWriteMeta<'_>, value: &crate::types::EpicsValue) -> Tr
 /// callback; `dbPut record.ASG NEW_ASG` invokes `asChangeGroup` →
 /// `asAddMemberPvt` → `asComputePvt` for every `ASGCLIENT` and
 /// fires the COAR callback for each affected CA connection. Pre-fix
-/// Rust mutated `instance.common.asg` directly with no notification
+/// Rust mutated `instance.common.text.asg` directly with no notification
 /// — the *next* CA op used live `compute_access` so enforcement was
 /// correct, but the wire ACCESS_RIGHTS the client saw still
 /// reflected the OLD ASG until something else (CLIENT_NAME / ACF

@@ -1757,7 +1757,7 @@ impl Record for CalcoutRecord {
         // `set_async_context` (which ran before the common fields were
         // applied), so capture it here, once the framework has resolved it,
         // and classify so a passive never-processed record already shows OUTV.
-        self.out.set(&common.out);
+        self.out.set(&common.text.out);
         // A load-time `special()` marked posts nobody could watch; this full
         // classification supersedes them, so the first runtime put must not
         // drain them.

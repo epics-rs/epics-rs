@@ -1473,7 +1473,7 @@ fn dump_one_record(ctx: &CommandContext, name: &str, record_type: &str, level: i
     // C's `infoList` is an ELLLIST in declaration order
     // (`dbStaticLib.c:855-864`); the port's `info` is a HashMap with no order
     // to report, so one record's tags come out sorted by tag name.
-    let mut tags: Vec<(&String, &String)> = inst.info.iter().collect();
+    let mut tags: Vec<(&String, &String)> = inst.info().iter().collect();
     tags.sort();
     for (key, value) in tags {
         lines.push(format!("\tinfo(\"{key}\",\"{}\")", print_escaped(value)));

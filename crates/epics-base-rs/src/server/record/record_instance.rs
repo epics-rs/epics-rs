@@ -662,7 +662,7 @@ pub(crate) struct MetadataSnapshot {
 ///
 /// `DESC` feeds `display.description` but is deliberately absent: its
 /// invalidation is owned by the DESC arm of `put_common_field`, the single
-/// writer of `common.desc`. The `Q:form` info tag (`populate_display_info` ->
+/// writer of `common.text.desc`. The `Q:form` info tag (`populate_display_info` ->
 /// `display.form`) is an immutable load-time tag, not a runtime field, so it
 /// needs no invalidation either.
 fn is_metadata_cache_source(name: &str) -> bool {
@@ -4144,12 +4144,16 @@ impl FieldIx {
 }
 
 /// A set of a type's declared fields by [`FieldIx`], built with the plan so a
-/// cycle tests a bit where it would search a name list.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct FieldBits(Box<[u64]>);
+/// cycle tests a bit where it would search a name list. Interned by content,
+/// so the records of a type share one copy and a cycle's test reads a line
+/// every record keeps warm, not one of its own.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FieldBits(&'static [u64]);
 
 impl FieldBits {
     fn of(record: &dyn Record, mut has: impl FnMut(&'static FieldDesc) -> bool) -> Self {
+        static INTERNED: std::sync::Mutex<std::collections::BTreeSet<&'static [u64]>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
         let common = super::dbd_generated::DB_COMMON_FIELDS;
         let own = record.field_list();
         let mut words = vec![0u64; (common.len() + own.len()).div_ceil(64)];
@@ -4158,7 +4162,13 @@ impl FieldBits {
                 words[i / 64] |= 1 << (i % 64);
             }
         }
-        Self(words.into())
+        let mut interned = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&bits) = interned.get(words.as_slice()) {
+            return Self(bits);
+        }
+        let bits: &'static [u64] = Box::leak(words.into_boxed_slice());
+        interned.insert(bits);
+        Self(bits)
     }
 
     #[inline(always)]
@@ -4575,18 +4585,6 @@ pub struct RecordInstance {
     pub dpvt: crate::server::device_support::Dpvt,
     // Subroutine (for sub records)
     pub subroutine: Option<Arc<SubroutineFn>>,
-    /// The by-name function registry this record's PENDING `init_record` pass
-    /// 1 will resolve INAM/SNAM against — C `registryFunctionFind`, reading a
-    /// process-global table from inside `init_record`.
-    ///
-    /// One meaning on every path: armed by the creation sink immediately
-    /// before [`Self::run_init_passes`], consumed (and cleared) by the pass
-    /// itself. It exists because the lookup's failure is an EARLY RETURN — the
-    /// init tail must not run past it — and only the init owner can honour
-    /// that, while only the database holds the registry. Resolving from
-    /// outside the passes, as both builders used to, put the lookup after the
-    /// tail it is supposed to skip.
-    init_subroutines: Option<Arc<HashMap<String, Arc<SubroutineFn>>>>,
     /// What this record's dset `init_record` did; written only by
     /// [`crate::server::device_support::init_device_support`].
     pub(crate) dset_init: crate::server::device_support::DsetInit,
@@ -4660,53 +4658,8 @@ pub struct RecordInstance {
     /// [`RecordInstance::notify_field_with_origin`] included — advances it
     /// through the owner.
     last_posted: PostedLog,
-    /// Published values for the fields [`Self::collect_subscriber_posts`]'s
-    /// change-detection walk SKIPS whatever happens — the deadband field, the
-    /// `recGblResetAlarms` set, `UDF`, and the record's event-posted fields.
-    /// They are not walk input, so they must not be in `last_posted`: the
-    /// walk's gate asks `last_posted.is_empty()`, and the first alarm
-    /// transition put SEVR/STAT/AMSG/ACKS there, so every later cycle of every
-    /// record ran the whole walk — six vtable calls and one hash probe plus a
-    /// name compare per field — to iterate exactly the four fields it then
-    /// discarded. Same owner and same read accessor as `last_posted`; the two
-    /// differ only in whether the walk can act on the field, which is what the
-    /// gate asks. Linear, because the set is the static skip list.
-    skipped_posted: SkippedLog,
     /// Owner of every `last_posted` entry's `posted`; see [`PostedSet`].
     posted: PostedSet,
-    /// The live store for a field the record's `.dbd` DECLARES but the record
-    /// struct has no `put_field` arm / no storage for — the WRITE analog of the
-    /// read-side [`Self::declared_default`] fallback.
-    ///
-    /// C makes every `.dbd` field not just readable but WRITABLE: `dbPutField`
-    /// resolves the field from its `dbFldDes` and `dbPut` writes the incoming
-    /// value into record memory, whether or not any record code ever reads it
-    /// back — a `caput dfanout.HOPR 10` sticks even though `dfanoutRecord.c`
-    /// never touches HOPR. A Rust record models only the fields it has
-    /// behaviour for, so a field it declares but never stores had nowhere for a
-    /// put to land: [`Self::put_common_field`]'s catch-all reported
-    /// `S_dbLib_fieldNotFound` and the client's put was refused, while a READ of
-    /// the same field succeeded through `declared_default`. This map is that
-    /// missing storage — one uniform mechanism for the whole family, not a
-    /// per-field struct member on each record type.
-    ///
-    /// Keyed by upper-case field name, holding the value already coerced to the
-    /// field's C-declared DBF type (the same projection `declared_default` and
-    /// the read path serve). [`Self::resolve_field`] reads it BEFORE
-    /// `declared_default`, so a read reflects a prior write and an untouched
-    /// field still reads its `.dbd` initial. Empty for a record whose declared
-    /// fields are all modeled.
-    declared_overrides: HashMap<String, EpicsValue>,
-    /// This record's OWN link fields whose target supplies some field's
-    /// units/precision/graphic/alarm — the distinct answers of
-    /// [`Record::link_backed_metadata_field`] over the record's declared
-    /// field list, collected ONCE here.
-    ///
-    /// Derived, never declared a second time: the record type states the
-    /// mapping in one place and this is the reverse index of that one
-    /// statement, so the two cannot drift the way the central
-    /// `match rtype` list they replace drifted away from `aSub`.
-    link_backed_metadata_links: Vec<String>,
     /// What this record's TYPE can reach in a process cycle, settled once at
     /// construction. See [`ProcessPlan`].
     /// C's `UDF_ALARM` guard for this type, or `None` for a type whose C
@@ -4717,13 +4670,6 @@ pub struct RecordInstance {
     /// What this record's TYPE answers to `monitor()`'s type-static
     /// questions, settled once at construction. See [`MonitorPlan`].
     monitor_plan: MonitorPlan,
-    /// Where each of those links sits in [`Record::multi_input_links`] — the
-    /// list a process cycle reads once at its top. Both lists are properties
-    /// of the record TYPE, so the mapping is fixed here and cannot drift;
-    /// `None` marks a metadata link the multi-input fetch does not cover,
-    /// which the cycle then reads for itself. Taken once because the
-    /// alternative is searching the pre-read list by name, per link, per pass.
-    link_backed_metadata_input_slot: Vec<Option<usize>>,
     /// Set by `check_deadband_ext` for waveform/aai/aao when their
     /// content hash changed this cycle (C `monitor()` On Change mode,
     /// waveformRecord.c:310-319). The snapshot builders read it to post
@@ -4766,12 +4712,83 @@ pub struct RecordInstance {
     pub(crate) plan_forced_general: bool,
     #[cfg(test)]
     ran_arm: CyclePlan,
+    /// The fields no process cycle reads; see [`RecordCold`].
+    cold: Box<RecordCold>,
+}
+
+/// [`RecordInstance`]'s fields no process cycle reads, behind one pointer so
+/// the lines a cycle does read sit closer together.
+struct RecordCold {
+    /// The by-name function registry this record's PENDING `init_record` pass
+    /// 1 will resolve INAM/SNAM against — C `registryFunctionFind`, reading a
+    /// process-global table from inside `init_record`.
+    ///
+    /// One meaning on every path: armed by the creation sink immediately
+    /// before [`Self::run_init_passes`], consumed (and cleared) by the pass
+    /// itself. It exists because the lookup's failure is an EARLY RETURN — the
+    /// init tail must not run past it — and only the init owner can honour
+    /// that, while only the database holds the registry. Resolving from
+    /// outside the passes, as both builders used to, put the lookup after the
+    /// tail it is supposed to skip.
+    init_subroutines: Option<Arc<HashMap<String, Arc<SubroutineFn>>>>,
+    /// Published values for the fields [`Self::collect_subscriber_posts`]'s
+    /// change-detection walk SKIPS whatever happens — the deadband field, the
+    /// `recGblResetAlarms` set, `UDF`, and the record's event-posted fields.
+    /// They are not walk input, so they must not be in `last_posted`: the
+    /// walk's gate asks `last_posted.is_empty()`, and the first alarm
+    /// transition put SEVR/STAT/AMSG/ACKS there, so every later cycle of every
+    /// record ran the whole walk — six vtable calls and one hash probe plus a
+    /// name compare per field — to iterate exactly the four fields it then
+    /// discarded. Same owner and same read accessor as `last_posted`; the two
+    /// differ only in whether the walk can act on the field, which is what the
+    /// gate asks. Linear, because the set is the static skip list.
+    skipped_posted: SkippedLog,
+    /// The live store for a field the record's `.dbd` DECLARES but the record
+    /// struct has no `put_field` arm / no storage for — the WRITE analog of the
+    /// read-side [`Self::declared_default`] fallback.
+    ///
+    /// C makes every `.dbd` field not just readable but WRITABLE: `dbPutField`
+    /// resolves the field from its `dbFldDes` and `dbPut` writes the incoming
+    /// value into record memory, whether or not any record code ever reads it
+    /// back — a `caput dfanout.HOPR 10` sticks even though `dfanoutRecord.c`
+    /// never touches HOPR. A Rust record models only the fields it has
+    /// behaviour for, so a field it declares but never stores had nowhere for a
+    /// put to land: [`Self::put_common_field`]'s catch-all reported
+    /// `S_dbLib_fieldNotFound` and the client's put was refused, while a READ of
+    /// the same field succeeded through `declared_default`. This map is that
+    /// missing storage — one uniform mechanism for the whole family, not a
+    /// per-field struct member on each record type.
+    ///
+    /// Keyed by upper-case field name, holding the value already coerced to the
+    /// field's C-declared DBF type (the same projection `declared_default` and
+    /// the read path serve). [`Self::resolve_field`] reads it BEFORE
+    /// `declared_default`, so a read reflects a prior write and an untouched
+    /// field still reads its `.dbd` initial. Empty for a record whose declared
+    /// fields are all modeled.
+    declared_overrides: HashMap<String, EpicsValue>,
+    /// This record's OWN link fields whose target supplies some field's
+    /// units/precision/graphic/alarm — the distinct answers of
+    /// [`Record::link_backed_metadata_field`] over the record's declared
+    /// field list, collected ONCE here.
+    ///
+    /// Derived, never declared a second time: the record type states the
+    /// mapping in one place and this is the reverse index of that one
+    /// statement, so the two cannot drift the way the central
+    /// `match rtype` list they replace drifted away from `aSub`.
+    link_backed_metadata_links: Vec<String>,
+    /// Where each of those links sits in [`Record::multi_input_links`] — the
+    /// list a process cycle reads once at its top. Both lists are properties
+    /// of the record TYPE, so the mapping is fixed here and cannot drift;
+    /// `None` marks a metadata link the multi-input fetch does not cover,
+    /// which the cycle then reads for itself. Taken once because the
+    /// alternative is searching the pre-read list by name, per link, per pass.
+    link_backed_metadata_input_slot: Vec<Option<usize>>,
     /// Per-record info tags from `info("key", "value")` directives in
     /// the .db file (epics-base info(...) grammar). Consumers include
     /// asyn (`asyn:READBACK`), record-as-PV bridge tags
     /// (`Q:group`, `Q:form`), and IOC-specific extensions. Empty for
     /// records loaded without info(...) clauses.
-    pub info: HashMap<String, String>,
+    info: HashMap<String, String>,
     /// Cached metadata (display/control/enums) — `None` means stale or
     /// not yet built. Populated lazily by `snapshot_for_field` and
     /// invalidated by `invalidate_metadata_cache`
@@ -4818,7 +4835,7 @@ pub struct RecordInstance {
     /// decides ([`RecordInstance::field_posts_property`]). (The `Q:form`
     /// -> `display.form` mapping is exempt: it reads an immutable
     /// load-time info tag, not a runtime field.)
-    pub(crate) metadata_cache: StdMutex<Option<MetadataSnapshot>>,
+    metadata_cache: StdMutex<Option<MetadataSnapshot>>,
 }
 
 /// The cycle status [`RecordInstance::run_registered_subroutine`] reports when
@@ -5480,11 +5497,11 @@ impl RecordInstance {
     /// other field name.
     pub fn common_link_text(&self, field: &str) -> Option<&str> {
         Some(match field {
-            "INP" => self.common.inp.as_str(),
-            "OUT" => self.common.out.as_str(),
-            "TSEL" => self.common.tsel.as_str(),
-            "SDIS" => self.common.sdis.as_str(),
-            "FLNK" => self.common.flnk.as_str(),
+            "INP" => self.common.text.inp.as_str(),
+            "OUT" => self.common.text.out.as_str(),
+            "TSEL" => self.common.text.tsel.as_str(),
+            "SDIS" => self.common.text.sdis.as_str(),
+            "FLNK" => self.common.text.flnk.as_str(),
             _ => return None,
         })
     }
@@ -5546,13 +5563,13 @@ impl RecordInstance {
     ///
     /// [`PvDatabase::resolve_link_backed_metadata`]: crate::server::database::PvDatabase
     pub fn link_backed_metadata_links(&self) -> &[String] {
-        &self.link_backed_metadata_links
+        &self.cold.link_backed_metadata_links
     }
 
     /// Where each [`Self::link_backed_metadata_links`] entry sits in the
     /// record's multi-input link list, in that same order. See the field.
     pub(crate) fn link_backed_metadata_input_slots(&self) -> &[Option<usize>] {
-        &self.link_backed_metadata_input_slot
+        &self.cold.link_backed_metadata_input_slot
     }
 
     /// The record type's [`Record::cycle_hooks`](crate::server::record::Record::cycle_hooks),
@@ -6201,10 +6218,10 @@ impl RecordInstance {
 
     #[cold]
     fn override_link_text(&self, field: &str) -> Option<String> {
-        if self.declared_overrides.is_empty() {
+        if self.cold.declared_overrides.is_empty() {
             return None;
         }
-        match self.declared_overrides.get(field)? {
+        match self.cold.declared_overrides.get(field)? {
             EpicsValue::String(text) if !text.is_empty() => Some(text.as_str_lossy().into_owned()),
             _ => None,
         }
@@ -6318,17 +6335,12 @@ impl RecordInstance {
             device: None,
             dpvt: Default::default(),
             subroutine: None,
-            init_subroutines: None,
             dset_init: crate::server::device_support::DsetInit::Succeeded,
             pact: AtomicBool::new(false),
             notify: None,
             notify_restart_list: std::collections::VecDeque::new(),
             last_posted: PostedLog::default(),
-            skipped_posted: SkippedLog::default(),
             posted: PostedSet::new(),
-            declared_overrides: HashMap::new(),
-            link_backed_metadata_links,
-            link_backed_metadata_input_slot,
             udf_alarm,
             monitor_plan,
             array_hash_changed: false,
@@ -6342,19 +6354,26 @@ impl RecordInstance {
             plan_forced_general: false,
             #[cfg(test)]
             ran_arm: CyclePlan::General,
-            info: HashMap::new(),
-            metadata_cache: StdMutex::new(None),
+            cold: Box::new(RecordCold {
+                init_subroutines: None,
+                skipped_posted: SkippedLog::default(),
+                declared_overrides: HashMap::new(),
+                link_backed_metadata_links,
+                link_backed_metadata_input_slot,
+                info: HashMap::new(),
+                metadata_cache: StdMutex::new(None),
+            }),
         }
     }
 
     /// Hand the record the function registry its pending init pass 1 resolves
-    /// INAM/SNAM against. The creation sink's line; see [`Self::
-    /// init_subroutines`].
+    /// INAM/SNAM against. The creation sink's line; see
+    /// [`RecordCold::init_subroutines`].
     pub(crate) fn arm_init_subroutines(
         &mut self,
         registry: Arc<HashMap<String, Arc<SubroutineFn>>>,
     ) {
-        self.init_subroutines = Some(registry);
+        self.cold.init_subroutines = Some(registry);
     }
 
     /// C's `if (!pdset) { recGblRecordError(S_dev_noDSET, prec, "init_record");
@@ -6387,7 +6406,7 @@ impl RecordInstance {
     /// that already resolved. Nothing to look up again, and C's tail is
     /// reached.
     fn resolve_init_subroutine(&mut self, name: &str) -> bool {
-        match self.init_subroutines.take() {
+        match self.cold.init_subroutines.take() {
             Some(registry) => crate::server::ioc_app::wire_subroutine(self, name, &registry),
             None => true,
         }
@@ -6618,13 +6637,18 @@ impl RecordInstance {
     /// write wins. Used by the .db loader (`info(...)` directive) and
     /// `dbpf`-style tools.
     pub fn set_info(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.info.insert(key.into(), value.into());
+        self.cold.info.insert(key.into(), value.into());
+    }
+
+    /// Every info tag of the record.
+    pub fn info(&self) -> &HashMap<String, String> {
+        &self.cold.info
     }
 
     /// Look up a single info tag. Returns `None` when the record has
     /// no tag with that key.
     pub fn get_info(&self, key: &str) -> Option<&str> {
-        self.info.get(key).map(|s| s.as_str())
+        self.cold.info.get(key).map(|s| s.as_str())
     }
 
     /// The value of `field` already published to its `DBE_VALUE`/`DBE_LOG`
@@ -6640,7 +6664,7 @@ impl RecordInstance {
     fn posted_value_at(&self, key: PostKey<'_>) -> Option<&PostedValue> {
         match self.last_posted.get(key) {
             Some(published) => Some(&published.value),
-            None => self.skipped_posted.get(key),
+            None => self.cold.skipped_posted.get(key),
         }
     }
 
@@ -6793,7 +6817,7 @@ impl RecordInstance {
             PostKey::Named(name) => self.walk_skips(name),
         };
         if walk_skip {
-            self.skipped_posted.set(key, value);
+            self.cold.skipped_posted.set(key, value);
             return;
         }
         let (desc, member) = match key {
@@ -6818,7 +6842,7 @@ impl RecordInstance {
     /// DRVH/DRVL, enum strings). The next snapshot will rebuild the
     /// cache from the new values.
     pub fn invalidate_metadata_cache(&self) {
-        if let Ok(mut guard) = self.metadata_cache.lock() {
+        if let Ok(mut guard) = self.cold.metadata_cache.lock() {
             *guard = None;
         }
     }
@@ -6951,7 +6975,7 @@ impl RecordInstance {
     /// at most once per metadata-stable interval.
     fn cached_metadata(&self) -> MetadataSnapshot {
         // Fast path: cache hit
-        if let Ok(guard) = self.metadata_cache.lock()
+        if let Ok(guard) = self.cold.metadata_cache.lock()
             && let Some(cached) = guard.as_ref()
         {
             return cached.clone();
@@ -6976,7 +7000,7 @@ impl RecordInstance {
         };
 
         // Store back; ignore poisoning (cache is best-effort).
-        if let Ok(mut guard) = self.metadata_cache.lock() {
+        if let Ok(mut guard) = self.cold.metadata_cache.lock() {
             *guard = Some(meta.clone());
         }
         meta
@@ -7459,7 +7483,7 @@ impl RecordInstance {
             None => self
                 .get_common_field(name)
                 .or_else(|| self.get_virtual_field(name))
-                .or_else(|| self.declared_overrides.get(name).cloned())
+                .or_else(|| self.cold.declared_overrides.get(name).cloned())
                 .or_else(|| self.declared_default(name)),
         }
     }
@@ -8282,7 +8306,7 @@ impl RecordInstance {
             "Exponential",
             "Engineering",
         ];
-        let tag = self.info.get("Q:form")?;
+        let tag = self.cold.info.get("Q:form")?;
         FORM_NAMES
             .iter()
             .position(|name| name == tag)
@@ -8394,7 +8418,7 @@ impl RecordInstance {
         // posting DBE_PROPERTY (epics-base#785 / UI-106).
         snap.display
             .get_or_insert_with(Default::default)
-            .description = self.common.desc.clone();
+            .description = self.common.text.desc.clone();
     }
 
     /// The record-level control-limit cache — what C's `get_control_double`
@@ -8606,7 +8630,7 @@ impl RecordInstance {
             // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
             CommonField::Tpro => Some(EpicsValue::UChar(self.common.tpro)),
             CommonField::Bkpt => Some(EpicsValue::Char(self.common.bkpt.get())),
-            CommonField::Flnk => Some(EpicsValue::String(self.common.flnk.clone().into())),
+            CommonField::Flnk => Some(EpicsValue::String(self.common.text.flnk.clone().into())),
             // A record type whose C `.dbd` has no INP has no `.INP` channel
             // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
             // a histogram answers "PV 'HI.INP' not found". The port keeps INP on
@@ -8615,27 +8639,27 @@ impl RecordInstance {
             // the write side (`put_common_field`) — otherwise the field is
             // unloadable and unwritable yet still resolves as a channel.
             CommonField::Inp if self.record.declares_inp_link() => {
-                Some(EpicsValue::String(self.common.inp.clone().into()))
+                Some(EpicsValue::String(self.common.text.inp.clone().into()))
             }
-            CommonField::Out => Some(EpicsValue::String(self.common.out.clone().into())),
+            CommonField::Out => Some(EpicsValue::String(self.common.text.out.clone().into())),
             // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
             // type's device menu, NOT the name. The name is what this port
             // stores and dispatches on; the index is what the wire carries.
             CommonField::Dtyp => Some(EpicsValue::Enum(self.dtyp_index())),
             CommonField::Tse => Some(EpicsValue::Short(self.common.tse)),
-            CommonField::Tsel => Some(EpicsValue::String(self.common.tsel.clone().into())),
+            CommonField::Tsel => Some(EpicsValue::String(self.common.text.tsel.clone().into())),
             // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
             // 64-bit value variant so values above i64::MAX round-trip.
             CommonField::Utag => Some(EpicsValue::UInt64(self.common.utag)),
-            CommonField::Asg => Some(EpicsValue::String(self.common.asg.clone().into())),
+            CommonField::Asg => Some(EpicsValue::String(self.common.text.asg.clone().into())),
             CommonField::Asl => Some(EpicsValue::Char(self.common.asl)),
-            CommonField::Desc => Some(EpicsValue::String(self.common.desc.clone())),
+            CommonField::Desc => Some(EpicsValue::String(self.common.text.desc.clone())),
             CommonField::Phas => Some(EpicsValue::Short(self.common.phas)),
-            CommonField::Evnt => Some(EpicsValue::String(self.common.evnt.clone().into())),
+            CommonField::Evnt => Some(EpicsValue::String(self.common.text.evnt.clone().into())),
             CommonField::Prio => Some(EpicsValue::Short(self.common.prio)),
             CommonField::Disv => Some(EpicsValue::Short(self.common.disv)),
             CommonField::Disa => Some(EpicsValue::Short(self.common.disa)),
-            CommonField::Sdis => Some(EpicsValue::String(self.common.sdis.clone().into())),
+            CommonField::Sdis => Some(EpicsValue::String(self.common.text.sdis.clone().into())),
             CommonField::Diss => Some(EpicsValue::Short(self.common.diss)),
             CommonField::Hyst => Some(EpicsValue::Double(self.common.hyst)),
             CommonField::Lcnt => Some(EpicsValue::Short(self.common.lcnt)),
@@ -8690,10 +8714,10 @@ impl RecordInstance {
                 .analog_alarm
                 .as_ref()
                 .map(|a| EpicsValue::Short(a.llsv)),
-            // swait OUTN is aliased to common.out
+            // swait OUTN is aliased to common.text.out
             CommonField::Outn => {
                 if self.record.record_type() == "swait" {
-                    Some(EpicsValue::String(self.common.out.clone().into()))
+                    Some(EpicsValue::String(self.common.text.out.clone().into()))
                 } else {
                     None
                 }
@@ -8706,8 +8730,8 @@ impl RecordInstance {
     /// i.e. the record stores the field itself and owns whatever behaviour
     /// hangs off it.
     ///
-    /// This separates the two meanings a link field carries. `common.inp` /
-    /// `common.out` is the link *text* — always the value the `.db` file
+    /// This separates the two meanings a link field carries. `common.text.inp` /
+    /// `common.text.out` is the link *text* — always the value the `.db` file
     /// wrote, for every record type, because C device support reads
     /// `prec->inp` / `prec->out` at `init_record` no matter which layer owns
     /// the field ([`crate::server::db_loader::apply_fields`] keeps it
@@ -9319,7 +9343,7 @@ impl RecordInstance {
             }
             "FLNK" => {
                 if let Some(link) = link {
-                    std::mem::swap(&mut self.common.flnk, &mut link.text);
+                    std::mem::swap(&mut self.common.text.flnk, &mut link.text);
                     self.swap_link_cache("FLNK", &mut link.parsed);
                 }
             }
@@ -9333,7 +9357,7 @@ impl RecordInstance {
                     return Err(CaError::FieldNotFound("INP".to_string()));
                 }
                 if let Some(link) = link {
-                    std::mem::swap(&mut self.common.inp, &mut link.text);
+                    std::mem::swap(&mut self.common.text.inp, &mut link.text);
                     if !self.record_declares_field("INP") {
                         self.swap_link_cache("INP", &mut link.parsed);
                     }
@@ -9341,7 +9365,7 @@ impl RecordInstance {
             }
             "OUT" => {
                 if let Some(link) = link {
-                    std::mem::swap(&mut self.common.out, &mut link.text);
+                    std::mem::swap(&mut self.common.text.out, &mut link.text);
                     // C `dbDbPutValue` (dbDbLink.c:386-389): an OUT
                     // link processes its target only on an explicit
                     // ` PP` token (or a `.PROC` destination). A bare
@@ -9396,7 +9420,7 @@ impl RecordInstance {
             }
             "TSEL" => {
                 if let Some(link) = link {
-                    std::mem::swap(&mut self.common.tsel, &mut link.text);
+                    std::mem::swap(&mut self.common.text.tsel, &mut link.text);
                     self.swap_link_cache("TSEL", &mut link.parsed);
                 }
             }
@@ -9427,7 +9451,7 @@ impl RecordInstance {
             }
             "ASG" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.asg = s.as_str_lossy().into_owned();
+                    self.common.text.asg = s.as_str_lossy().into_owned();
                 }
             }
             "ASL" => {
@@ -9452,8 +9476,8 @@ impl RecordInstance {
                 if let EpicsValue::String(s) = value {
                     // DBF_STRING data field — store the bytes verbatim so a
                     // non-UTF-8 DESC round-trips unchanged.
-                    if self.common.desc != s {
-                        self.common.desc = s;
+                    if self.common.text.desc != s {
+                        self.common.text.desc = s;
                         // DESC feeds `display.description` (a metadata-cache
                         // source) but is not property-class — C never marks
                         // it prop(YES) (epics-base#785) — so refresh the
@@ -9488,14 +9512,14 @@ impl RecordInstance {
                 // backward compatibility (numeric events / a calc
                 // record driving EVNT) by formatting it as a string.
                 match value {
-                    EpicsValue::String(s) => self.common.evnt = s.as_str_lossy().into_owned(),
-                    EpicsValue::Short(v) => self.common.evnt = v.to_string(),
-                    EpicsValue::Long(v) => self.common.evnt = v.to_string(),
-                    EpicsValue::Enum(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::String(s) => self.common.text.evnt = s.as_str_lossy().into_owned(),
+                    EpicsValue::Short(v) => self.common.text.evnt = v.to_string(),
+                    EpicsValue::Long(v) => self.common.text.evnt = v.to_string(),
+                    EpicsValue::Enum(v) => self.common.text.evnt = v.to_string(),
                     EpicsValue::Double(v) => {
                         // Match C `eventNameToHandle`: a double with
                         // an integer part is treated as that integer.
-                        self.common.evnt = (v as i64).to_string();
+                        self.common.text.evnt = (v as i64).to_string();
                     }
                     _ => {}
                 }
@@ -9517,7 +9541,7 @@ impl RecordInstance {
             }
             "SDIS" => {
                 if let Some(link) = link {
-                    std::mem::swap(&mut self.common.sdis, &mut link.text);
+                    std::mem::swap(&mut self.common.text.sdis, &mut link.text);
                     self.swap_link_cache("SDIS", &mut link.parsed);
                 }
             }
@@ -9614,7 +9638,7 @@ impl RecordInstance {
                 }
             }
             // swait-specific: OUTN is the output link name for swait records.
-            // Mirrors to common.out so the processing framework dispatches it.
+            // Mirrors to common.text.out so the processing framework dispatches it.
             "OUTN" => {
                 if self.record.record_type() != "swait" {
                     // No OUTN field on any other record type — the same
@@ -9622,7 +9646,7 @@ impl RecordInstance {
                     return Err(self.unknown_field_error(name.into_owned()));
                 }
                 if let Some(link) = link {
-                    std::mem::swap(&mut self.common.out, &mut link.text);
+                    std::mem::swap(&mut self.common.text.out, &mut link.text);
                     // Bare OUT link is NPP — see the "OUT" arm.
                     self.swap_link_cache("OUT", &mut link.parsed);
                 }
@@ -9682,7 +9706,7 @@ impl RecordInstance {
     }
 
     /// Store a put to a field the record's `.dbd` DECLARES but the record
-    /// models no storage for — the WRITE owner of [`Self::declared_overrides`]
+    /// models no storage for — the WRITE owner of [`RecordCold::declared_overrides`]
     /// and the write analog of [`Self::declared_default`].
     ///
     /// Reached only from [`Self::put_common_field_bounded`]'s catch-all, i.e.
@@ -9777,7 +9801,8 @@ impl RecordInstance {
                     self.link_slots
                         .install_text(i, desc, text.as_str_lossy().as_ref());
                 }
-                self.declared_overrides
+                self.cold
+                    .declared_overrides
                     .insert(name.to_ascii_uppercase(), coerced);
             }
             // Nothing stored: the override keeps whatever it held.
@@ -12748,7 +12773,7 @@ mod metadata_cache_tests {
         let inst = ai_instance();
 
         // Cache starts empty
-        assert!(inst.metadata_cache.lock().unwrap().is_none());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
 
         // First snapshot triggers populate + cache store
         let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -12759,7 +12784,7 @@ mod metadata_cache_tests {
         assert_eq!(display.lower_disp_limit, 0.0);
 
         // Cache is now populated
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
     }
 
     #[test]
@@ -12961,49 +12986,49 @@ mod metadata_cache_tests {
     fn invalidate_clears_cache() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         inst.invalidate_metadata_cache();
-        assert!(inst.metadata_cache.lock().unwrap().is_none());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
     }
 
     #[test]
     fn notify_field_written_invalidates_for_metadata_field() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         // Writing a metadata field should invalidate
         inst.notify_field_written("EGU");
-        assert!(inst.metadata_cache.lock().unwrap().is_none());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
     }
 
     #[test]
     fn notify_field_written_skips_non_metadata_field() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         // Writing a value field should NOT invalidate the cache
         inst.notify_field_written("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         // DESC is not property-class either — its cache invalidation
         // is owned by the DESC arm of `put_common_field`, not by this
         // notify path (UI-106).
         inst.notify_field_written("DESC");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
     }
 
     #[test]
     fn notify_field_written_is_case_insensitive() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         // Lowercase metadata field name should still trigger invalidation
         inst.notify_field_written("egu");
-        assert!(inst.metadata_cache.lock().unwrap().is_none());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
     }
 
     /// epics-base faac1df1 — `notify_field_written_if_changed` must
@@ -13015,14 +13040,14 @@ mod metadata_cache_tests {
     fn notify_field_written_if_changed_skips_when_unchanged() {
         let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         // Capture prev, do a no-op put, then notify — cache must remain.
         let prev = inst.record.get_field("EGU");
         let _ = inst.record.put_field("EGU", prev.clone().unwrap());
         inst.notify_field_written_if_changed("EGU", prev.as_ref());
         assert!(
-            inst.metadata_cache.lock().unwrap().is_some(),
+            inst.cold.metadata_cache.lock().unwrap().is_some(),
             "no-op put must not invalidate the metadata cache"
         );
     }
@@ -13032,7 +13057,7 @@ mod metadata_cache_tests {
     fn notify_field_written_if_changed_invalidates_on_real_change() {
         let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         let prev = inst.record.get_field("EGU");
         let _ = inst
@@ -13040,7 +13065,7 @@ mod metadata_cache_tests {
             .put_field("EGU", EpicsValue::String("kPa".into()));
         inst.notify_field_written_if_changed("EGU", prev.as_ref());
         assert!(
-            inst.metadata_cache.lock().unwrap().is_none(),
+            inst.cold.metadata_cache.lock().unwrap().is_none(),
             "real metadata change must invalidate cache"
         );
     }
@@ -13062,7 +13087,7 @@ mod metadata_cache_tests {
         inst.put_common_field("DESC", EpicsValue::String("after".into()))
             .unwrap();
         assert!(
-            inst.metadata_cache.lock().unwrap().is_none(),
+            inst.cold.metadata_cache.lock().unwrap().is_none(),
             "a changed DESC must invalidate the metadata cache"
         );
         let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -13080,11 +13105,11 @@ mod metadata_cache_tests {
         inst.put_common_field("DESC", EpicsValue::String("same".into()))
             .unwrap();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
         inst.put_common_field("DESC", EpicsValue::String("same".into()))
             .unwrap();
         assert!(
-            inst.metadata_cache.lock().unwrap().is_some(),
+            inst.cold.metadata_cache.lock().unwrap().is_some(),
             "an unchanged DESC must not invalidate the metadata cache"
         );
     }
@@ -13096,11 +13121,11 @@ mod metadata_cache_tests {
     fn notify_field_written_if_changed_skips_non_metadata_field() {
         let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
         // VAL is neither a cache source nor `prop(YES)` — must be skipped
         // even with a changed value.
         inst.notify_field_written_if_changed("VAL", None);
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
     }
 
     #[test]
@@ -13939,14 +13964,14 @@ mod metadata_cache_tests {
         // Build the cache once with the original EGU
         let snap1 = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap1.display.unwrap().units, "V");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         // Run process_local — the stub record sets took_change inside process()
         let _ = inst.process_local();
 
         // Cache should now be invalidated (took_metadata_change returned true)
         assert!(
-            inst.metadata_cache.lock().unwrap().is_none(),
+            inst.cold.metadata_cache.lock().unwrap().is_none(),
             "process_local should invalidate cache when took_metadata_change is true"
         );
 
@@ -13992,15 +14017,15 @@ mod metadata_cache_tests {
         let mut inst = RecordInstance::new("STABLE".to_string(), StableMetaRecord { val: 0.0 });
 
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
 
         // Run process_local several times — cache should remain intact
         let _ = inst.process_local();
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
         let _ = inst.process_local();
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
         let _ = inst.process_local();
-        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
     }
 
     // ── Regression: DBE_PROPERTY event delivery boundaries ──────────────
@@ -14530,7 +14555,10 @@ mod common_field_dbload_tests {
 
         // A String-typed common field is untouched by the coercion.
         put(&mut inst, "DESC", "a description");
-        assert_eq!(inst.common.desc.as_str_lossy().as_ref(), "a description");
+        assert_eq!(
+            inst.common.text.desc.as_str_lossy().as_ref(),
+            "a description"
+        );
     }
 }
 
@@ -14550,7 +14578,7 @@ mod declared_override_tests {
         // Untouched: reads its declared default (initial / type-zero), NOT an
         // error, and the override store is empty.
         assert_eq!(inst.resolve_field("HOPR"), Some(EpicsValue::Double(0.0)));
-        assert!(inst.declared_overrides.is_empty());
+        assert!(inst.cold.declared_overrides.is_empty());
 
         // DBF_DOUBLE, DBF_SHORT and DBF_STRING declared metadata fields all
         // land, coerced to the declared type.
@@ -14604,7 +14632,7 @@ mod declared_override_tests {
             inst.put_common_field("XYZZY", EpicsValue::String("1".into())),
             Err(CaError::FieldNotFound(_))
         ));
-        assert!(inst.declared_overrides.is_empty());
+        assert!(inst.cold.declared_overrides.is_empty());
     }
 
     /// A PARTIALLY modeled field — one the record SERVES via `get_field` but
@@ -14622,7 +14650,7 @@ mod declared_override_tests {
         // the record's read.
         let _ = inst.put_common_field("PVAL", EpicsValue::String("1".into()));
         assert!(
-            inst.declared_overrides.is_empty(),
+            inst.cold.declared_overrides.is_empty(),
             "a field the record serves via get_field must not enter the override map"
         );
     }
@@ -15636,6 +15664,17 @@ mod mlis_tests {
         }
     }
 
+    #[test]
+    fn records_of_one_type_share_their_field_bits() {
+        use crate::server::records::calcout::CalcoutRecord;
+        let (a, b) = (AoRecord::default(), AoRecord::default());
+        let (a, b) = (MonitorPlan::of(&a), MonitorPlan::of(&b));
+        assert!(std::ptr::eq(a.claimed_bits.0, b.claimed_bits.0));
+        assert!(std::ptr::eq(a.walk_skip_bits.0, b.walk_skip_bits.0));
+        let calcout = MonitorPlan::of(&CalcoutRecord::default());
+        assert_ne!(a.walk_skip_bits.0, calcout.walk_skip_bits.0);
+    }
+
     /// A pending pass's notify posts the record's own value of each field it
     /// names, found by index, and only a changed one.
     #[test]
@@ -16055,7 +16094,7 @@ mod skipped_posted_tests {
         let mut inst = calc();
         inst.record_value_post("VAL", PostedValue::Val(EpicsValue::Double(1.0)));
         inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
-        assert!(inst.last_posted.is_empty() && inst.skipped_posted.is_empty());
+        assert!(inst.last_posted.is_empty() && inst.cold.skipped_posted.is_empty());
         assert_eq!(inst.posted_value("VAL"), None);
     }
 
@@ -16175,7 +16214,7 @@ mod skipped_posted_tests {
         let mut inst = calc();
         inst.record_value_post("SEVR", PostedValue::Val(EpicsValue::Long(1)));
         inst.record_value_post("SEVR", PostedValue::Val(EpicsValue::Long(2)));
-        assert_eq!(inst.skipped_posted.len(), 1);
+        assert_eq!(inst.cold.skipped_posted.len(), 1);
         assert_eq!(
             inst.posted_value("SEVR"),
             Some(&PostedValue::Val(EpicsValue::Long(2)))

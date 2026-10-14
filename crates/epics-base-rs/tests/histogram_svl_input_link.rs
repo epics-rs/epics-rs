@@ -227,7 +227,14 @@ record(histogram, "H:INP") {
         .unwrap()
         .0;
 
-    let inp = db.get_record("H:INP").unwrap().read().common.inp.clone();
+    let inp = db
+        .get_record("H:INP")
+        .unwrap()
+        .read()
+        .common
+        .text
+        .inp
+        .clone();
     assert!(inp.is_empty(), "field(INP) must not land on a histogram");
 
     // And it drives nothing. A process still bins the current SGNL — that is

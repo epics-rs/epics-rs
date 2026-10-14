@@ -87,9 +87,9 @@ fn link_text(db: &PvDatabase, field: &str) -> String {
         .unwrap_or_else(|| panic!("{REC} must survive a refused link, as it does in C"));
     let inst = rec.read();
     match field {
-        "INP" => inst.common.inp.clone(),
-        "SDIS" => inst.common.sdis.clone(),
-        "FLNK" => inst.common.flnk.clone(),
+        "INP" => inst.common.text.inp.clone(),
+        "SDIS" => inst.common.text.sdis.clone(),
+        "FLNK" => inst.common.text.flnk.clone(),
         other => panic!("no accessor for {other}"),
     }
 }
@@ -263,7 +263,7 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
         "{err}"
     );
     assert_eq!(
-        inst.common.inp, "@instio parm",
+        inst.common.text.inp, "@instio parm",
         "a refused put must leave the link exactly as it was — C's does"
     );
 }
@@ -341,7 +341,7 @@ async fn a_refused_link_leaves_no_stale_classification_behind() {
         inst.record.get_field("INPA"),
         Some(epics_base_rs::types::EpicsValue::String("".into()))
     );
-    assert_eq!(inst.common.out, "");
+    assert_eq!(inst.common.text.out, "");
     // calcout's `INAV`/`OUTV` menu is `{Ext PV NC, Ext PV OK, Local PV,
     // Constant}` (`calcoutRecord.dbd`), so `Constant` is index 3.
     assert_eq!(

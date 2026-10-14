@@ -2361,10 +2361,10 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
             extras.push(("ALIASES".to_string(), aliases.join(", ")));
         }
         if level >= 2 {
-            let mut info_keys: Vec<&String> = inst.info.keys().collect();
+            let mut info_keys: Vec<&String> = inst.info().keys().collect();
             info_keys.sort();
             for key in info_keys {
-                let val = inst.info.get(key).cloned().unwrap_or_default();
+                let val = inst.info().get(key).cloned().unwrap_or_default();
                 extras.push((format!("info({key})"), val));
             }
         }
@@ -6831,7 +6831,7 @@ fn cmd_dbli() -> CommandDef {
                 // out sorted by tag name.
                 let mut tags: Vec<(String, String)> = rec
                     .read()
-                    .info
+                    .info()
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect();
@@ -8528,7 +8528,7 @@ mod tests {
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = scan;
-                w.common.evnt = evnt.to_string();
+                w.common.text.evnt = evnt.to_string();
             }
             db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
         }
@@ -8615,7 +8615,7 @@ mod tests {
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = ScanType::Event;
-                w.common.evnt = evnt.to_string();
+                w.common.text.evnt = evnt.to_string();
             }
             db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
         }
@@ -9395,7 +9395,7 @@ record(lso, "SOD") { field(SIZV, "128") }
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = scan;
-                w.common.evnt = evnt.to_string();
+                w.common.text.evnt = evnt.to_string();
                 w.common.prio = prio;
             }
             db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
@@ -12431,7 +12431,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
             matches!(put, Err(crate::error::CaError::NoSupport)),
             "{put:?}"
         );
-        assert_eq!(rec.read().common.inp, "@st1");
+        assert_eq!(rec.read().common.text.inp, "@st1");
     }
 
     /// `dbpr <rec> 4`'s `DSET` row on one record of every `softIoc.dbd`
@@ -12751,7 +12751,10 @@ record(mbbo, "DUP:CM") {{
             // Last-write-wins: DESC + ZRST should reflect the SECOND
             // record block. ONST stays from the FIRST block since
             // the second didn't override it.
-            assert_eq!(inst.common.desc, "second", "second block's DESC must win");
+            assert_eq!(
+                inst.common.text.desc, "second",
+                "second block's DESC must win"
+            );
             assert_eq!(
                 inst.record.get_field("ZRST"),
                 Some(crate::types::EpicsValue::String("Mono-Override".into())),
@@ -14416,7 +14419,7 @@ record(mbboDirect, "MBD0") {{ }}
         let desc = ctx.block_on(async {
             let rec = db.get_record("R:FROMDBD").unwrap();
             let r = rec.read();
-            r.common.desc.to_string()
+            r.common.text.desc.to_string()
         });
         assert_eq!(desc, "declared in a .dbd");
 

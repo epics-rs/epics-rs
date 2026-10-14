@@ -2657,8 +2657,8 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
     if let Some(rec) = db.get_record("BI_RAW") {
         let mut inst = rec.write();
         inst.common.dtyp = "Raw Soft Channel".into();
-        inst.common.inp = "SRC_LI".to_string();
-        let inp = epics_base_rs::server::record::parse_link_v2(&inst.common.inp);
+        inst.common.text.inp = "SRC_LI".to_string();
+        let inp = epics_base_rs::server::record::parse_link_v2(&inst.common.text.inp);
         inst.install_link_cache("INP", std::sync::Arc::new(inp))
             .expect("a common link");
         inst.record
@@ -4835,7 +4835,7 @@ async fn r6_9_put_to_a_record_attribute_is_read_only_not_not_found() {
     assert_eq!(inst.name, "ATTRFLD", "NAME must be unchanged");
 }
 
-/// R6-9 boundary — `OUTN` exists only on `swait` (it aliases `common.out`
+/// R6-9 boundary — `OUTN` exists only on `swait` (it aliases `common.text.out`
 /// there). On any other record type C has no such field, so the put is an
 /// `S_dbLib_fieldNotFound` like any other unknown name; the port's `OUTN` arm
 /// used to swallow it.
@@ -4862,7 +4862,7 @@ async fn r6_9_outn_is_swait_only() {
     let mut sw = sw.write();
     sw.put_common_field("OUTN", EpicsValue::String("TGT".into()))
         .expect("OUTN on swait must still be accepted");
-    assert_eq!(sw.common.out, "TGT");
+    assert_eq!(sw.common.text.out, "TGT");
 }
 
 /// R6-6 — C `piniProcess` (`iocInit.c:607-626`) sweeps the database once per
@@ -6708,7 +6708,7 @@ async fn test_sdis_cp_link_registration() {
         .await
         .unwrap();
     if let Some(rec_arc) = db.get_record("GUARDED") {
-        rec_arc.write().common.sdis = "DISABLE_SRC CP".to_string();
+        rec_arc.write().common.text.sdis = "DISABLE_SRC CP".to_string();
     }
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6841,8 +6841,8 @@ async fn test_tsel_cp_link_registration() {
         .unwrap();
     if let Some(rec_arc) = db.get_record("TARGET") {
         let mut inst = rec_arc.write();
-        inst.common.tsel = "TSE_SRC CP".to_string();
-        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.common.text.tsel = "TSE_SRC CP".to_string();
+        let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
     }
@@ -6886,8 +6886,8 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
     {
         let rec = db.get_record("TS_DST").unwrap();
         let mut inst = rec.write();
-        inst.common.tsel = "TSE_SRC.TIME".to_string();
-        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.common.text.tsel = "TSE_SRC.TIME".to_string();
+        let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
     }
@@ -6961,8 +6961,8 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     {
         let rec = db.get_record("TS_CADST").unwrap();
         let mut inst = rec.write();
-        inst.common.tsel = "ca://TSE_SRC.TIME".to_string();
-        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.common.text.tsel = "ca://TSE_SRC.TIME".to_string();
+        let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
     }
@@ -7039,8 +7039,8 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     {
         let rec = db.get_record("TS_NLDST").unwrap();
         let mut inst = rec.write();
-        inst.common.tsel = "TSE_SRC.TIME".to_string();
-        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.common.text.tsel = "TSE_SRC.TIME".to_string();
+        let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
     }

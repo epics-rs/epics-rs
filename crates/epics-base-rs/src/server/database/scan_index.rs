@@ -264,7 +264,7 @@ impl PvDatabase {
         let mut evnt_len = None;
         let (cur_scan, cur_phas, cur_type) = {
             let inst = rec_arc.read();
-            let bytes = inst.common.evnt.as_bytes();
+            let bytes = inst.common.text.evnt.as_bytes();
             if inst.common.scan == ScanType::Event
                 && bytes.len() <= evnt.len()
                 && self
@@ -383,7 +383,8 @@ impl PvDatabase {
             let Some(rec) = key.handle.clone().or_else(|| self.get_record(&key.name)) else {
                 continue;
             };
-            let Some(event) = EventName::of(&rec.read().common.evnt).map(|e| e.to_string()) else {
+            let Some(event) = EventName::of(&rec.read().common.text.evnt).map(|e| e.to_string())
+            else {
                 continue;
             };
             if let Some((_, names)) = events.iter_mut().find(|(label, _)| *label == event) {
@@ -430,7 +431,7 @@ impl PvDatabase {
         for (_, _, rec) in &records {
             let evnt = {
                 let inst = rec.read();
-                (inst.common.scan == ScanType::Event).then(|| inst.common.evnt.clone())
+                (inst.common.scan == ScanType::Event).then(|| inst.common.text.evnt.clone())
             };
             if let Some(evnt) = evnt {
                 self.event_name_to_handle(&evnt);
@@ -789,7 +790,7 @@ impl PvDatabase {
                     None => continue,
                 },
             };
-            if EventName::of(&rec.read().common.evnt) != Some(want) {
+            if EventName::of(&rec.read().common.text.evnt) != Some(want) {
                 continue;
             }
             let _ = self.process_record_with_links_resolved(name, rec, &mut visited);

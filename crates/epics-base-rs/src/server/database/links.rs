@@ -5540,7 +5540,7 @@ mod cp_link_locality_tests {
             .unwrap();
         {
             let rec = db.get_record("HOLDER").unwrap();
-            rec.write().common.inp = "OTHER:PV CP".to_string();
+            rec.write().common.text.inp = "OTHER:PV CP".to_string();
         }
 
         db.initialize_link_locality().await;
@@ -5596,7 +5596,7 @@ mod cp_link_locality_tests {
         {
             let rec = db.get_record("HOLDER").unwrap();
             let mut inst = rec.write();
-            inst.common.inp = "SRC CP".to_string();
+            inst.common.text.inp = "SRC CP".to_string();
             // Seed the parse cache as load would, so the assertion proves
             // setup_cp_links leaves a local CP link untouched.
             inst.install_link_cache(
@@ -5700,12 +5700,17 @@ mod external_link_pv_name_tests {
 
         // Two records, one upstream PV, two spellings: the bare ` CA`
         // modifier and the explicit scheme. One registry entry.
-        db.get_record("IN1").unwrap().write().common.inp = "UP:ZED CP".to_string();
-        db.get_record("IN2").unwrap().write().common.inp = "ca://UP:ZED CP".to_string();
+        db.get_record("IN1").unwrap().write().common.text.inp = "UP:ZED CP".to_string();
+        db.get_record("IN2").unwrap().write().common.text.inp = "ca://UP:ZED CP".to_string();
         // An OUT link reaches `dbCaAddLink` in C exactly as an IN link does.
-        db.get_record("OUT1").unwrap().write().common.out = "ca://UP:ALPHA".to_string();
+        db.get_record("OUT1").unwrap().write().common.text.out = "ca://UP:ALPHA".to_string();
         // A link to a record this IOC does have is local and must not count.
-        db.get_record("LOCAL_HOLDER").unwrap().write().common.inp = "LOCAL_SRC CP".to_string();
+        db.get_record("LOCAL_HOLDER")
+            .unwrap()
+            .write()
+            .common
+            .text
+            .inp = "LOCAL_SRC CP".to_string();
 
         db.initialize_link_locality().await;
 
@@ -6777,7 +6782,7 @@ mod out_link_held_set_tests {
     fn point_out(db: &PvDatabase, from: &str, to: &str) {
         let rec = db.get_record(from).expect("record");
         let mut inst = rec.write();
-        inst.common.out = to.to_string();
+        inst.common.text.out = to.to_string();
         inst.set_link_cache("OUT", parse_link_field(to, LinkFieldType::Out));
     }
 

@@ -1023,7 +1023,7 @@ impl Record for CompressRecord {
     ///
     /// compress emits no link action of its own. It used to emit a `ReadDbLink`
     /// reading a link string off a `CompressRecord::inp` field the loader never
-    /// populates (a `.db`'s `field(INP,...)` lands in `common.inp`, since
+    /// populates (a `.db`'s `field(INP,...)` lands in `common.text.inp`, since
     /// `COMPRESS_FIELDS` declares no INP, matching `compressRecord.dbd.pod`).
     /// That field was a second, always-empty INP: the action never fired for a
     /// loaded record, and a `caget CMP.INP` answered `""` where softIoc answers

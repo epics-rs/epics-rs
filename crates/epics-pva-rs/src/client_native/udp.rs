@@ -1025,6 +1025,134 @@ mod tests {
         assert_eq!(c.listener_count(), 3);
     }
 
+    /// Sockets on UDP `port`, the collector's own included. Only Linux can
+    /// say; elsewhere a timeout is never put down to a co-holder.
+    fn udp_sockets_on(port: u16) -> usize {
+        let want = format!(":{port:04X}");
+        std::fs::read_to_string("/proc/net/udp")
+            .map(|t| {
+                t.lines()
+                    .skip(1)
+                    .filter(|l| {
+                        l.split_whitespace()
+                            .nth(1)
+                            .is_some_and(|a| a.ends_with(&want))
+                    })
+                    .count()
+            })
+            .unwrap_or(1)
+    }
+
+    /// What a stand-in does to the one datagram of an attempt.
+    #[derive(Clone, Copy)]
+    enum Fate {
+        Deliver,
+        /// A same-user, options-first socket co-binds the collector's number
+        /// (a pvxs or softIoc process whose `bind(0)` was handed it) and takes
+        /// the datagram, as the kernel's reuse hash does about half the time.
+        TakenByStranger,
+        /// Sent to a number nobody listens on.
+        Misdirected,
+    }
+
+    enum Attempt {
+        Got(CollectedDatagram),
+        /// Nothing arrived; `co_holders` other sockets sit on the number.
+        TimedOut {
+            co_holders: usize,
+        },
+    }
+
+    async fn attempt(fate: Fate, wait: Duration) -> Attempt {
+        let mgr = UdpManager::new();
+        let collector = mgr
+            .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
+            .expect("bind wildcard collector");
+        let port = collector.local_addr().unwrap().port();
+        let mut rx = collector
+            .add_listener(&ep("0.0.0.0:0"))
+            .expect("wildcard listener");
+        let mut stranger = None;
+        if let Fate::TakenByStranger = fate {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())
+                .expect("co-bind the collector's number");
+            let s: std::net::UdpSocket = s.into();
+            s.set_nonblocking(true).unwrap();
+            stranger = Some(s);
+        }
+        let target = match fate {
+            Fate::Misdirected => {
+                // A number that is free now: bind, read, release.
+                let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                probe.local_addr().unwrap().port()
+            }
+            _ => port,
+        };
+        // Send from fresh source ports until the stranger's share of the
+        // reuse hash takes one, so the loss is not left to chance.
+        let mut sent = 0;
+        loop {
+            let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+            sender
+                .send_to(b"hello-pva", &format!("127.0.0.1:{target}"))
+                .await
+                .expect("send");
+            sent += 1;
+            let Some(stranger) = &stranger else { break };
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if stranger.recv(&mut [0u8; 64]).is_ok() {
+                break;
+            }
+            // The collector got this one: drop it and draw another source.
+            while rx.try_recv().is_ok() {}
+            assert!(sent < 200, "the stranger never drew a datagram");
+        }
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(got) => Attempt::Got(got.expect("channel open")),
+            Err(_) => Attempt::TimedOut {
+                co_holders: udp_sockets_on(port).saturating_sub(1),
+            },
+        }
+    }
+
+    /// The first datagram a wildcard collector delivers. A collector binds its
+    /// ephemeral number before it sets the reuse options, so a stranger whose
+    /// own `bind(0)` was handed that number co-binds it and takes some of the
+    /// datagrams: a timeout with another socket on the number is the stranger,
+    /// and a fresh collector is drawn. A timeout with nobody else there is the
+    /// collector failing, and fails the test.
+    async fn first_delivery(fates: &[Fate], wait: Duration) -> CollectedDatagram {
+        const ATTEMPTS: usize = 4;
+        let mut co_held = Vec::new();
+        for n in 0..ATTEMPTS {
+            let fate = fates.get(n).copied().unwrap_or(Fate::Deliver);
+            match attempt(fate, wait).await {
+                Attempt::Got(got) => return got,
+                Attempt::TimedOut { co_holders: 0 } => {
+                    panic!("datagram never arrived and no other socket holds the number")
+                }
+                Attempt::TimedOut { co_holders } => co_held.push(co_holders),
+            }
+        }
+        panic!(
+            "{ATTEMPTS} collectors in a row shared their number; co-holders per attempt: {co_held:?}"
+        );
+    }
+
+    fn assert_recovered_orig_dest(got: &CollectedDatagram) {
+        assert_eq!(&got.data, b"hello-pva");
+        assert_eq!(
+            got.orig_dest,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "original destination must be recovered from ancillary data"
+        );
+        assert_eq!(got.src.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
     // Asserts a recovered original destination. Unix uses `recvmsg`/cmsg,
     // Windows uses `WSARecvMsg`/`IP_PKTINFO`; only other targets report
     // `orig_dest == None` by construction (see `enable_recv_orig_dest`), so
@@ -1036,34 +1164,26 @@ mod tests {
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wildcard_listener_receives_with_orig_dest() {
-        let mgr = UdpManager::new();
-        let collector = mgr
-            .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
-            .expect("bind wildcard collector");
-        let port = collector.local_addr().unwrap().port();
-        let mut rx = collector
-            .add_listener(&ep("0.0.0.0:0"))
-            .expect("wildcard listener");
-
         // Send a unicast datagram to loopback; the collector must recover
         // 127.0.0.1 as the original destination via the pktinfo cmsg.
-        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
-        sender
-            .send_to(b"hello-pva", &format!("127.0.0.1:{port}"))
-            .await
-            .expect("send");
+        let got = first_delivery(&[], Duration::from_secs(3)).await;
+        assert_recovered_orig_dest(&got);
+    }
 
-        let got = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("datagram must arrive")
-            .expect("channel open");
-        assert_eq!(&got.data, b"hello-pva");
-        assert_eq!(
-            got.orig_dest,
-            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            "original destination must be recovered from ancillary data"
-        );
-        assert_eq!(got.src.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    #[cfg(target_os = "linux")]
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stranger_on_the_collectors_number_costs_a_fresh_collector_not_the_test() {
+        let got = first_delivery(&[Fate::TakenByStranger], Duration::from_secs(1)).await;
+        assert_recovered_orig_dest(&got);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "no other socket holds the number")]
+    async fn a_collector_that_never_delivers_still_fails_the_test() {
+        first_delivery(&[Fate::Misdirected], Duration::from_millis(500)).await;
     }
 
     /// A port-0 collector binds before its fanout options, so it never lands

@@ -352,11 +352,9 @@ impl CaServerBuilder {
         // `EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT` precedence
         // via cas_server_port() at builder construction.
         let tcp_port = self.tcp_port.unwrap_or(self.port);
-        let ephemeral_requested = self.port == 0 || tcp_port == 0;
         let (tcp, udp) = bind_sockets(self.port, tcp_port).await?;
         let server = CaServer {
             db,
-            ephemeral_requested,
             port: udp.port(),
             tcp_port: tcp.port(),
             tcp,
@@ -503,15 +501,25 @@ async fn bind_sockets(
     // An interface whose UDP bind failed is dropped whole, TCP socket
     // included (`caservertask.c:744-749`).
     tcp.retain_interfaces(&udp.interfaces());
+    // C's RSRV announces nothing, so a configured port stays silent and
+    // stderr carries only C's own lines. `--port 0` has no C counterpart and
+    // a caller must be able to read the ports it got; that report goes
+    // through the errlog so `eltc 0` silences it. Written here, where the
+    // ports become final, so it precedes the shell: from `run()` it raced the
+    // shell's EOF exit and was lost when the shell won.
+    if udp_port == 0 || tcp_port == 0 {
+        epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+            "CA server: UDP search on port {}, TCP on port {}, beacons → {} address(es)\n",
+            udp.port(),
+            tcp.port(),
+            cfg.beacon_addrs.len()
+        ));
+    }
     Ok((tcp, udp))
 }
 
 pub struct CaServer {
     db: Arc<PvDatabase>,
-    /// A port of 0 was asked for outright (`softioc-rs --port 0`), which C
-    /// cannot express; the bound numbers are then the caller's only way to
-    /// learn them and `run()` reports them.
-    ephemeral_requested: bool,
     /// UDP discovery port actually bound by the search responders in
     /// `udp` — the port clients SEARCH on. Equal to the configured port,
     /// or the kernel-assigned one when 0 was requested.
@@ -1137,7 +1145,6 @@ impl CaServer {
         let db_udp = self.db.clone();
         let db_tcp = self.db.clone();
         let acf = self.acf.clone();
-        let port = self.port;
         // Sockets were bound at construction (`bind_sockets`), so the
         // TCP port is already final — no start-up handshake back from
         // the listener task, and nothing downstream (beacon, SEARCH
@@ -1341,16 +1348,6 @@ impl CaServer {
         let tcp_abort = tcp_handle.abort_handle();
 
         let udp_cfg = addr_list::from_env()?;
-        // C's RSRV announces nothing here, so a configured port stays silent
-        // and stderr carries only C's own lines. `--port 0` has no C
-        // counterpart and a caller must be able to read the ports it got;
-        // that report goes through the errlog so `eltc 0` silences it.
-        if self.ephemeral_requested {
-            epics_base_rs::runtime::log::errlog_vprintf(format_args!(
-                "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)\n",
-                udp_cfg.beacon_addrs.len()
-            ));
-        }
 
         // mDNS announce: held for the lifetime of run(). Drops when
         // the function returns, deregistering us from the network.
@@ -1362,11 +1359,11 @@ impl CaServer {
         let _mdns = if let Some(ref instance) = self.mdns_instance {
             match crate::discovery::MdnsBackend::announce_helper(
                 instance,
-                port,
+                self.port,
                 self.mdns_txt.clone(),
             ) {
                 Ok(announcer) => {
-                    tracing::info!(instance = %instance, port,
+                    tracing::info!(instance = %instance, port = self.port,
                         "mDNS announce active");
                     metrics::counter!("ca_server_mdns_announces_total").increment(1);
                     Some(announcer)
@@ -1396,7 +1393,7 @@ impl CaServer {
             // registration with the UDP search `port` before sending: a
             // client searches the SRV port (see the mDNS announce above).
             let mut reg = reg.clone();
-            reg.port = port;
+            reg.port = self.port;
             match crate::discovery::DnsUpdater::register(reg).await {
                 Ok(updater) => {
                     tracing::info!("RFC 2136 dynamic DNS registration active");

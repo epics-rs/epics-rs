@@ -242,7 +242,26 @@ fn steps_in_argv_order(matches: &clap::ArgMatches) -> Vec<Step> {
     ordered.into_iter().map(|(_, step)| step).collect()
 }
 
+/// What the IOC does once `iocInit` has returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterStartup {
+    /// `iocsh(NULL)`, which returns at EOF and ends the process.
+    Shell,
+    /// No shell: serve until killed.
+    Serve,
+}
+
 impl Args {
+    /// C `softMain.cpp:137`: interactive by default, and `-S` is the only
+    /// thing that turns it off (`:202-203`).
+    fn after_startup(&self) -> AfterStartup {
+        if self.no_shell {
+            AfterStartup::Serve
+        } else {
+            AfterStartup::Shell
+        }
+    }
+
     /// [`clap::Parser::parse_from`] plus the argv order clap discards.
     ///
     /// The one thing overridden on the way in is what counts as an option's
@@ -882,7 +901,8 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
     // loaded nothing and ran no script; an interactive one always has
     // something to do, because the shell it is about to start is the thing
     // to do, and a script on its own is enough as well (`ranScript`, `:236`).
-    if args.no_shell && !loaded_db && args.startup_script.is_none() {
+    let after_startup = args.after_startup();
+    if after_startup == AfterStartup::Serve && !loaded_db && args.startup_script.is_none() {
         return Err(Failure::NothingToDo);
     }
     // Held for the life of the IOC: the loader opens it during the startup
@@ -918,9 +938,7 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
         app = app.startup_script(script);
     }
 
-    // C `softMain.cpp:137`: interactive by default, and `-S` is the only
-    // thing that turns it off (`:202-203`).
-    let interactive = !args.no_shell;
+    let interactive = after_startup == AfterStartup::Shell;
     // C `softMain.cpp:239`: `iocInit()` runs only when argv loaded a
     // database. Everything a running IOC has — the scan threads, PINI, and
     // RSRV, which starts inside `iocRun` — hangs off that call, so a
@@ -961,16 +979,17 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
                 builder = builder.tcp_port(tcp_port);
             }
             let server = server_options.apply(builder).build().await?;
-            if interactive {
-                server
-                    .run_with_shell(move |shell| {
-                        for cmd in config.shell_commands {
-                            shell.register(cmd);
-                        }
-                    })
-                    .await
-            } else {
-                server.run().await
+            match after_startup {
+                AfterStartup::Shell => {
+                    server
+                        .run_with_shell(move |shell| {
+                            for cmd in config.shell_commands {
+                                shell.register(cmd);
+                            }
+                        })
+                        .await
+                }
+                AfterStartup::Serve => server.run().await,
             }
         },
     )
@@ -1338,11 +1357,27 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, CommandFactory, ERL_ERROR, Failure, SOFT_IOC_EXIT_DB, Step, blamed_option, copt,
-        db_load_records_line, parse_record_def, startup_plan, usage,
+        AfterStartup, Args, CommandFactory, ERL_ERROR, Failure, SOFT_IOC_EXIT_DB, Step,
+        blamed_option, copt, db_load_records_line, parse_record_def, startup_plan, usage,
     };
     #[cfg(tokio_backend)]
     use super::{ServerOptions, run_ioc_app};
+
+    /// `-S` alone picks the serving arm; without it (and with the ignored
+    /// `-s`) the shell's. `dash_s_keeps_serving_after_stdin_is_closed` then
+    /// only has to show that the serving arm outlives EOF.
+    #[test]
+    fn dash_s_selects_the_serving_arm() {
+        for (argv, arm) in [
+            (&["softioc-rs"][..], AfterStartup::Shell),
+            (&["softioc-rs", "-s"][..], AfterStartup::Shell),
+            (&["softioc-rs", "-S"][..], AfterStartup::Serve),
+            (&["softioc-rs", "--no-shell"][..], AfterStartup::Serve),
+        ] {
+            let args = Args::from_argv(argv).expect("parse argv");
+            assert_eq!(args.after_startup(), arm, "{argv:?}");
+        }
+    }
 
     #[cfg(tokio_backend)]
     /// `-d`/`--db` on a file that is not there is a failing `dbLoadRecords`,

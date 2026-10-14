@@ -193,11 +193,12 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
         .spawn()
         .expect("spawn softioc-rs");
 
-    // Startup is what prints, and the "CA server:" banner is emitted after
-    // the one-shot env resolution (`addr_list::from_env` in `run()`) — every
-    // startup point that historically duplicated the diagnostic precedes it.
-    // Wait for the banner itself (a fixed sleep races startup under load),
-    // then take the IOC down and judge everything it wrote.
+    // Startup is what prints. The "CA server:" banner is written in
+    // `bind_sockets`, after its env resolution but before `run()`'s, so the
+    // banner alone does not cover every startup point that historically
+    // duplicated the diagnostic. A read answered on the banner's port does:
+    // `run()` resolves before it starts the search responder. Neither wait is
+    // a fixed sleep, which races startup under load.
     let err_lines = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
     assert!(
         err_lines.wait_for(fact_budget::FACT_BUDGET, |t| {
@@ -205,6 +206,23 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
         }),
         "softioc-rs never printed its startup banner; stderr: {:?}",
         err_lines.text()
+    );
+    let banner = err_lines.text();
+    let port = banner
+        .split_once("CA server: UDP search on port ")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .expect("the banner names the search port");
+    let read = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .args(["-w", "10", "R16-18:PV"])
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
+        .output()
+        .expect("run caget-rs");
+    assert!(
+        read.status.success(),
+        "softioc-rs never served R16-18:PV: {}",
+        String::from_utf8_lossy(&read.stderr)
     );
     let _ = child.kill();
     let _ = child.wait();

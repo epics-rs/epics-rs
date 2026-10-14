@@ -1560,48 +1560,51 @@ pub fn encode_pv_field_with_bitset(
     order: ByteOrder,
     out: &mut Vec<u8>,
 ) {
-    match desc {
-        FieldDesc::Scalar(_)
-        | FieldDesc::ScalarArray(_)
-        | FieldDesc::Variant
-        | FieldDesc::VariantArray
-        | FieldDesc::Union { .. }
-        | FieldDesc::UnionArray { .. }
-        | FieldDesc::StructureArray { .. } => {
-            if bitset.get(bit_offset) {
-                encode_pv_field(value, desc, order, out);
-            }
-            // else: emit no bytes
+    if bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
+        encode_marked(value, desc, bitset, bit_offset, order, out);
+    }
+}
+
+/// [`encode_pv_field_with_bitset`] for a subtree with some bit set. A member
+/// is looked up only once its own span tests set, as pvxs `to_wire_valid`
+/// touches storage only at valid bits.
+fn encode_marked(
+    value: &PvField,
+    desc: &FieldDesc,
+    bitset: &crate::proto::BitSet,
+    bit_offset: usize,
+    order: ByteOrder,
+    out: &mut Vec<u8>,
+) {
+    let FieldDesc::Structure { fields, .. } = desc else {
+        encode_pv_field(value, desc, order, out);
+        return;
+    };
+    // Own bit set → the whole subtree changed; emit every
+    // descendant leaf unconditionally (pvxs BitSet compression).
+    if bitset.get(bit_offset) {
+        encode_pv_field(value, desc, order, out);
+        return;
+    }
+    let mut child_bit = bit_offset + 1;
+    for (i, (name, child_desc)) in fields.iter().enumerate() {
+        let span = child_desc.total_bits();
+        if bitset.any_in(child_bit..child_bit + span) {
+            let missing;
+            let child_value = match value {
+                PvField::Structure(s) => member_at(s, i, name),
+                _ => None,
+            };
+            let child_value = match child_value {
+                Some(v) => v,
+                None => {
+                    missing = default_value_for(child_desc);
+                    &missing
+                }
+            };
+            encode_marked(child_value, child_desc, bitset, child_bit, order, out);
         }
-        FieldDesc::Structure { fields, .. } => {
-            // Own bit set → the whole subtree changed; emit every
-            // descendant leaf unconditionally (pvxs BitSet compression).
-            if bitset.get(bit_offset) {
-                encode_pv_field(value, desc, order, out);
-                return;
-            }
-            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
-                return;
-            }
-            // Recurse into each child; emit only set ones.
-            let mut child_bit = bit_offset + 1;
-            for (i, (name, child_desc)) in fields.iter().enumerate() {
-                let missing;
-                let child_value = match value {
-                    PvField::Structure(s) => member_at(s, i, name),
-                    _ => None,
-                };
-                let child_value = match child_value {
-                    Some(v) => v,
-                    None => {
-                        missing = default_value_for(child_desc);
-                        &missing
-                    }
-                };
-                encode_pv_field_with_bitset(child_value, child_desc, bitset, child_bit, order, out);
-                child_bit += child_desc.total_bits();
-            }
-        }
+        child_bit += span;
     }
 }
 

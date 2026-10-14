@@ -24859,7 +24859,8 @@ mod r14_tests {
         Frame { header, payload }
     }
 
-    struct SlowGetSource;
+    /// Sets its flag once the delayed read completes.
+    struct SlowGetSource(Arc<std::sync::atomic::AtomicBool>);
 
     impl crate::server_native::source::ChannelSource for SlowGetSource {
         async fn list_pvs(&self) -> Vec<RecordName> {
@@ -24872,7 +24873,8 @@ mod r14_tests {
             Some(FieldDesc::Variant)
         }
         async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(500)).await;
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             Some(PvField::Scalar(ScalarValue::Double(1.0)))
         }
         async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
@@ -24896,7 +24898,8 @@ mod r14_tests {
         let ioid: u32 = 100;
         let peer: SocketAddr = "127.0.0.1:9001".parse().unwrap();
 
-        let source: DynSource = std::sync::Arc::new(SlowGetSource);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source: DynSource = std::sync::Arc::new(SlowGetSource(ran.clone()));
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
@@ -24980,6 +24983,10 @@ mod r14_tests {
         assert!(
             resp.len() > PvaHeader::SIZE,
             "GET response frame must be non-empty"
+        );
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the GET response did not come from the slow source"
         );
     }
 }
@@ -25073,7 +25080,7 @@ mod bfr15_tests {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
             if self.block_get {
                 let _d = DropSignal(self.get_cancelled.clone());
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_secs(3600)).await;
             }
             Some(nt_scalar_value(1.0))
         }
@@ -25081,7 +25088,7 @@ mod bfr15_tests {
             self.put_calls.fetch_add(1, Ordering::SeqCst);
             if self.block_put {
                 let _d = DropSignal(self.put_cancelled.clone());
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_secs(3600)).await;
             }
             Ok(())
         }
@@ -25129,10 +25136,6 @@ mod bfr15_tests {
         synth_frame(Command::Get, order, payload)
     }
 
-    // Used only by the three reactor-dependent tests gated below, so it
-    // carries the same predicate — otherwise it is dead code on the exec
-    // backend.
-    #[cfg(tokio_backend)]
     fn put_exec_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let intro = nt_scalar_desc();
         let mut payload = Vec::new();
@@ -25145,10 +25148,6 @@ mod bfr15_tests {
         synth_frame(Command::Put, order, payload)
     }
 
-    // Used only by the three reactor-dependent tests gated below, so it
-    // carries the same predicate — otherwise it is dead code on the exec
-    // backend.
-    #[cfg(tokio_backend)]
     fn destroy_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -25158,16 +25157,12 @@ mod bfr15_tests {
 
     /// Poll `counter` until it reaches `want`, panicking after ~1 s. Used to
     /// wait for a spawned task to enter its (blocking) source call.
-    // Used only by the three reactor-dependent tests gated below, so it
-    // carries the same predicate — otherwise it is dead code on the exec
-    // backend.
-    #[cfg(tokio_backend)]
     async fn wait_for(counter: &AtomicUsize, want: usize) {
         for _ in 0..200 {
             if counter.load(Ordering::SeqCst) >= want {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!(
             "counter never reached {want}; stuck at {}",
@@ -25199,14 +25194,6 @@ mod bfr15_tests {
     /// (a) `Executing` boundary on GET: a second GET EXEC arriving while the
     /// first source read is in flight is ignored — it neither starts a second
     /// source read nor aborts the first.
-    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
-    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
-    // `exec_backend` the `runtime::task` seam drives that future on a
-    // `cbMedium` executor worker, which has no tokio reactor — the fixture
-    // panics with "there is no reactor running" before the assertion is
-    // reached. The production path under test is backend-neutral; only the
-    // way the fixture blocks is not.
-    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn bfr15_second_get_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -25282,7 +25269,7 @@ mod bfr15_tests {
         )
         .await
         .expect("second GET EXEC ok (ignored)");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
 
         assert_eq!(
             get_calls.load(Ordering::SeqCst),
@@ -25301,14 +25288,6 @@ mod bfr15_tests {
     /// (b) `Executing` boundary on PUT: a second PUT EXEC arriving while the
     /// first write is in flight is ignored — neither a second write starts nor
     /// the first is aborted.
-    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
-    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
-    // `exec_backend` the `runtime::task` seam drives that future on a
-    // `cbMedium` executor worker, which has no tokio reactor — the fixture
-    // panics with "there is no reactor running" before the assertion is
-    // reached. The production path under test is backend-neutral; only the
-    // way the fixture blocks is not.
-    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn bfr15_second_put_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -25385,7 +25364,7 @@ mod bfr15_tests {
         )
         .await
         .expect("second PUT EXEC ok (ignored)");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
 
         assert_eq!(
             put_calls.load(Ordering::SeqCst),
@@ -25404,14 +25383,6 @@ mod bfr15_tests {
     /// removing the op drops its `AbortOnDrop` guard, cancelling the spawned
     /// read. (The `Executing` gate suppresses only an implicit re-EXEC, never
     /// an explicit teardown.)
-    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
-    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
-    // `exec_backend` the `runtime::task` seam drives that future on a
-    // `cbMedium` executor worker, which has no tokio reactor — the fixture
-    // panics with "there is no reactor running" before the assertion is
-    // reached. The production path under test is backend-neutral; only the
-    // way the fixture blocks is not.
-    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn bfr15_destroy_request_aborts_in_flight_exec_task() {
         let order = ByteOrder::Little;

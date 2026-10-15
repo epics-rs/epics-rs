@@ -7,8 +7,8 @@ use crate::error::{CaError, CaResult};
 use crate::server::database::{AsyncDbHandle, PostRule};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CycleMarks, CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions,
-    ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
+    CycleMarks, CyclePostMask, LinkReadAs, LinkType, OutTarget, PostStage, ProcessAction,
+    ProcessActions, ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -56,9 +56,10 @@ const STR_FIELDS: [&str; NUM_STEPS] = [
 /// The posts [`SseqRecord::mark_value_write`] can owe: step `i`'s written
 /// view (`DBE_VALUE|DBE_LOG`) and derived view (`DBE_VALUE`) for a numeric
 /// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`; then
-/// a `DLYn` put's DLY1 post at [`DLY1_POST`].
-const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); DLY1_POST + 1] = {
-    let mut table = [("", CyclePostMask::Value); DLY1_POST + 1];
+/// a `DLYn` put's DLY1 post at [`DLY1_POST`]; then the `ABORT` `special()`'s
+/// `busy`, `aborting` and `waiting` posts from [`BUSY_POST`].
+const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
+    let mut table = [("", CyclePostMask::Value); POSTS];
     let mut i = 0;
     while i < NUM_STEPS {
         table[4 * i] = (DO_FIELDS[i], CyclePostMask::ValueLog);
@@ -68,9 +69,20 @@ const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); DLY1_POST + 1] = {
         i += 1;
     }
     table[DLY1_POST] = ("DLY1", CyclePostMask::Value);
+    table[BUSY_POST] = ("BUSY", CyclePostMask::Value);
+    table[ABORTING_POST] = ("ABORTING", CyclePostMask::Value);
+    let mut i = 0;
+    while i < NUM_STEPS {
+        table[WTG_POST + i] = (WTG_FIELDS[i], CyclePostMask::Value);
+        i += 1;
+    }
     table
 };
 const DLY1_POST: usize = 4 * NUM_STEPS;
+const BUSY_POST: usize = DLY1_POST + 1;
+const ABORTING_POST: usize = BUSY_POST + 1;
+const WTG_POST: usize = ABORTING_POST + 1;
+const POSTS: usize = WTG_POST + NUM_STEPS;
 const LNK_FIELDS: [&str; NUM_STEPS] = [
     "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
 ];
@@ -383,9 +395,9 @@ pub struct SseqRecord {
     /// disturb the next sequence. `None` while `Idle`.
     seq_wake: Option<Arc<Notify>>,
     /// Canonical record name + cycle-free database handle, stashed at
-    /// `add_record` via [`Record::set_async_context`]. Drives out-of-band
-    /// status posts (`BUSY`/`WTGn`/`ABORTING`) and the `ABORT` finish
-    /// re-entry — the surfaces a `process()` cannot reach itself.
+    /// `add_record` via [`Record::set_async_context`]. Drives the `ABORT` finish
+    /// re-entry and the link-status refresh — the surfaces a `process()`
+    /// cannot reach itself.
     async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     /// The callback band this record's `PRIO` selects, refreshed from
     /// [`crate::server::record::ProcessContext`] before every `process()` — C
@@ -534,49 +546,19 @@ impl SseqRecord {
         }
     }
 
-    /// Post machine-driven status fields (`BUSY`/`WTGn`/`ABORTING`/`ABORT`)
-    /// to monitors out-of-band — the C `db_post_events` calls a record's
-    /// `process()` makes inline, which the Rust framework does not perform
-    /// for an `AsyncPending` cycle. Batched into one post per call so a
-    /// cycle's changes never reorder; cycles are themselves serialised by
-    /// the per-step re-entry chain. No-op without an async context.
-    ///
-    /// `DBE_VALUE` alone: C posts every one of these four at `DBE_VALUE`
-    /// (`BUSY` `sseqRecord.c:304`, `:1176`; `WTGn` `:343`, `:559`, `:728`,
-    /// `:750`, `:780`, `:1185`; `ABORT` `:724`, `:746`, `:776`; `ABORTING`
-    /// `:1192`), and the three that go through `asyncFinish`'s `MonitorMask`
-    /// (`:481`, `:482`, `:505`) are `DBE_VALUE | recGblResetAlarms(pR)`
-    /// (`:471`) — an alarm bit, never `DBE_LOG`. `post_fields` would default
-    /// to `VALUE | LOG` (`processing.rs:1229-1239`) and hand an archiver a
-    /// sample stream C never emits.
-    fn post_live(&self, fields: Vec<(String, EpicsValue)>) {
-        if fields.is_empty() {
-            return;
-        }
-        if let Some((name, handle)) = &self.async_ctx {
-            let name = name.clone();
-            let handle = handle.clone();
-            let prio = self.callback_priority;
-            crate::runtime::task::spawn_background(prio, async move {
-                let _ = handle.post_fields_with_mask(
-                    &name,
-                    fields,
-                    crate::server::recgbl::EventMask::VALUE,
-                );
-            });
-        }
-    }
-
     /// Build the selection mask and start a sequence (C `process`, the
     /// `!pact` branch). Returns the first step's scheduling outcome, or a
     /// `Complete` (running the forward link) when nothing is selected.
-    fn start_sequence(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+    fn start_sequence(
+        &mut self,
+        live: &mut Vec<(PostStage, String, EpicsValue)>,
+    ) -> ProcessOutcome {
         // C `process` (sseqRecord.c:302-305) raises `busy` at the top of a
         // start, before the selection is resolved — so an invalid selection
         // posts the same `busy` 1→0 transition C does.
         if self.busy == 0 {
             self.busy = 1;
-            live.push(("BUSY".to_string(), EpicsValue::Short(1)));
+            live.push((PostStage::Output, "BUSY".to_string(), EpicsValue::Short(1)));
             // The stand-in for C's 0.5s `checkLinks` re-poll, which C keeps
             // armed only while `linkStat == LINKS_NOT_OK` (sseqRecord.c:955):
             // some link still classifies EXT_NC. A record whose links all
@@ -597,14 +579,12 @@ impl SseqRecord {
             x if x == SELM_SPECIFIED => {
                 if self.seln > NUM_STEPS as u16 {
                     self.selm_invalid = true;
-                    self.finish(live);
-                    return ProcessOutcome::complete();
+                    return self.finish(live);
                 }
             }
             _ => {
                 self.selm_invalid = true;
-                self.finish(live);
-                return ProcessOutcome::complete();
+                return self.finish(live);
             }
         }
         // C `process` (sseqRecord.c:339-344) clears every `waiting` flag
@@ -612,7 +592,11 @@ impl SseqRecord {
         for i in 0..NUM_STEPS {
             if self.steps[i].waiting != 0 {
                 self.steps[i].waiting = 0;
-                live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+                live.push((
+                    PostStage::Output,
+                    WTG_FIELDS[i].to_string(),
+                    EpicsValue::Short(0),
+                ));
             }
         }
         // Fresh per-sequence concurrency state: the in-flight put-callback set
@@ -631,8 +615,7 @@ impl SseqRecord {
         self.cursor = 0;
         if self.active.is_empty() {
             // Nothing selected (C `asyncFinish` still runs `recGblFwdLink`).
-            self.finish(live);
-            return ProcessOutcome::complete();
+            return self.finish(live);
         }
         self.advance_sequence(live)
     }
@@ -655,7 +638,7 @@ impl SseqRecord {
     /// `WTGn` here, under the record lock, so the post always belongs to the
     /// current sequence (C `putCallbackCB` posts `waiting=0`, but doing it
     /// owner-side keeps a stale waiter from clobbering a fresh sequence).
-    fn prune_done(&mut self, live: &mut Vec<(String, EpicsValue)>) {
+    fn prune_done(&mut self, live: &mut Vec<(PostStage, String, EpicsValue)>) {
         let mut done_steps = Vec::new();
         self.in_flight.retain(|f| {
             if f.done.load(Ordering::SeqCst) {
@@ -668,7 +651,11 @@ impl SseqRecord {
         for i in done_steps {
             if self.steps[i].waiting != 0 {
                 self.steps[i].waiting = 0;
-                live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+                live.push((
+                    PostStage::Output,
+                    WTG_FIELDS[i].to_string(),
+                    EpicsValue::Short(0),
+                ));
             }
         }
     }
@@ -693,15 +680,17 @@ impl SseqRecord {
     /// Advance the sequence from the current cursor (C `processNextLink`):
     /// prune completed put-callbacks, then either finish, drain, block on a
     /// barrier, or schedule the current step's `DLYn` delay.
-    fn advance_sequence(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+    fn advance_sequence(
+        &mut self,
+        live: &mut Vec<(PostStage, String, EpicsValue)>,
+    ) -> ProcessOutcome {
         self.prune_done(live);
         if self.cursor >= self.active.len() {
             // C `processNextLink` plinkGroupCurrent == NULL (sseqRecord.c:
             // 407-417): finish only once every outstanding put-callback has
             // drained; otherwise return and let a completion wake the finish.
             if self.in_flight.is_empty() {
-                self.finish(live);
-                return ProcessOutcome::complete();
+                return self.finish(live);
             }
             self.phase = SeqPhase::Wait;
             self.arm_wake();
@@ -775,7 +764,10 @@ impl SseqRecord {
     /// Both put seams then carry the buffer this one decision produced — the
     /// framework never re-resolves the target and never makes a second,
     /// possibly different, no-put call.
-    fn fire_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+    fn fire_current_step(
+        &mut self,
+        live: &mut Vec<(PostStage, String, EpicsValue)>,
+    ) -> ProcessOutcome {
         let i = self.active[self.cursor];
         let buffer = self.typed_output_buffer(LNK_FIELDS[i], &self.steps[i].lnk_target);
         // C `processCallback` (sseqRecord.c:717,739,763) uses the
@@ -864,7 +856,7 @@ impl SseqRecord {
         &mut self,
         i: usize,
         value: EpicsValue,
-        live: &mut Vec<(String, EpicsValue)>,
+        live: &mut Vec<(PostStage, String, EpicsValue)>,
     ) -> bool {
         let admitted = match &self.async_ctx {
             Some((_, handle)) => handle.put_link_admitted(&self.steps[i].lnk),
@@ -874,12 +866,16 @@ impl SseqRecord {
         };
         if !admitted {
             self.abort = 1;
-            live.push(("ABORT".to_string(), EpicsValue::Short(1)));
+            live.push((PostStage::Output, "ABORT".to_string(), EpicsValue::Short(1)));
             println!("sseq:processCallback: dbCaPutLinkCallback for link {i} failed.  Aborting.");
             return false;
         }
         self.steps[i].waiting = 1;
-        live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
+        live.push((
+            PostStage::Output,
+            WTG_FIELDS[i].to_string(),
+            EpicsValue::Short(1),
+        ));
         let done = Arc::new(AtomicBool::new(false));
         self.in_flight.push(InFlight {
             step: i,
@@ -949,11 +945,10 @@ impl SseqRecord {
     /// end path under `pR->abort`): no new step fires; prune completed
     /// callbacks and finish once they have all drained, otherwise stay
     /// blocked and let the next completion wake the finish.
-    fn drain_abort(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+    fn drain_abort(&mut self, live: &mut Vec<(PostStage, String, EpicsValue)>) -> ProcessOutcome {
         self.prune_done(live);
         if self.in_flight.is_empty() {
-            self.finish(live);
-            return ProcessOutcome::complete();
+            return self.finish(live);
         }
         self.phase = SeqPhase::Wait;
         self.arm_wake();
@@ -972,13 +967,14 @@ impl SseqRecord {
     /// [`ProcessAction::WriteDbLink`] here ([`Self::fire_current_step`]) that
     /// the framework runs after `process()` returns, so storing the clears
     /// now would expose `BUSY == 0` with `LNKn` unwritten — a state C cannot
-    /// produce. They travel out as [`ProcessOutcome::post_write_fields`] and
-    /// the drain applies them once the writes have run.
-    ///
-    /// The whole group moves together. `busy`, `abort`, `aborting` and every
-    /// `waiting` are simultaneous in C and in this port; deferring one and
-    /// storing the rest would put `BUSY == 1` next to `WTGn == 0` at a moment
-    /// neither C nor this machine ever produces.
+    /// produce. The `waiting`, `abort` and `aborting` clears travel out as
+    /// [`ProcessOutcome::post_write_fields`], stored once the writes have run;
+    /// `monitor()`'s walk posts `abort` and `aborting` after
+    /// `recGblResetAlarms` with its mask (`:471`, `:479-482`). `busy` is a
+    /// [`ProcessAction::PutAfterEpilogue`], stored and posted after
+    /// `recGblFwdLink` and the stamp (`:499-505`), so an FLNK target still
+    /// reads `BUSY == 1` as it does in C — and posted whatever it held, as
+    /// C's `:505` is.
     ///
     /// The MACHINE state below (`active`, `cursor`, `phase`, `in_flight`,
     /// `seq_wake`) is reset immediately and is what the next cycle dispatches
@@ -987,20 +983,29 @@ impl SseqRecord {
     /// per-record processing gate (`processing.rs::run_process_frame`, the
     /// `dbScanLock` analogue) is held across this whole body, and both a
     /// foreign `process()` and a client put take it.
-    fn finish(&mut self, live: &mut Vec<(String, EpicsValue)>) {
+    fn finish(&mut self, live: &mut Vec<(PostStage, String, EpicsValue)>) -> ProcessOutcome {
         if self.abort != 0 {
-            live.push(("ABORT".to_string(), EpicsValue::Short(0)));
+            live.push((
+                PostStage::Monitor,
+                "ABORT".to_string(),
+                EpicsValue::Short(0),
+            ));
         }
         if self.aborting != 0 {
-            live.push(("ABORTING".to_string(), EpicsValue::Short(0)));
+            live.push((
+                PostStage::Monitor,
+                "ABORTING".to_string(),
+                EpicsValue::Short(0),
+            ));
         }
         for i in 0..NUM_STEPS {
             if self.steps[i].waiting != 0 {
-                live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+                live.push((
+                    PostStage::Output,
+                    WTG_FIELDS[i].to_string(),
+                    EpicsValue::Short(0),
+                ));
             }
-        }
-        if self.busy != 0 {
-            live.push(("BUSY".to_string(), EpicsValue::Short(0)));
         }
         self.active.clear();
         self.cursor = 0;
@@ -1010,6 +1015,10 @@ impl SseqRecord {
         // start) wake bridge, so it cannot touch this record's fields.
         self.in_flight.clear();
         self.seq_wake = None;
+        ProcessOutcome::complete_with(vec![ProcessAction::PutAfterEpilogue {
+            field: "BUSY",
+            value: crate::server::record::CycleValue::Short(0),
+        }])
     }
 
     /// Drive an immediate abort completion from `special` (C
@@ -1254,7 +1263,7 @@ impl Record for SseqRecord {
         static VALUE_WRITE_POSTS: [(
             crate::server::record::FieldIx,
             crate::server::record::CyclePostMask,
-        ); DLY1_POST + 1] = crate::server::record::declared_post_table(
+        ); POSTS] = crate::server::record::declared_post_table(
             crate::server::record::dbd_generated::SSEQ_FIELDS,
             VALUE_WRITE_POSTS_NAMED,
         );
@@ -1285,9 +1294,11 @@ impl Record for SseqRecord {
     }
 
     /// C `sseqRecord.c:1155` posts the re-quantized DLY1 with a bare
-    /// `DBE_VALUE`, not the framework default `DBE_VALUE | DBE_LOG`.
+    /// `DBE_VALUE`, not the framework default `DBE_VALUE | DBE_LOG`;
+    /// `asyncFinish` posts `abort` and `aborting` with `MonitorMask`,
+    /// `DBE_VALUE` plus the alarm bit (`:471`, `:481-482`).
     fn value_only_change_fields(&self) -> &'static [&'static str] {
-        &["DLY1"]
+        &["DLY1", "ABORT", "ABORTING"]
     }
 
     /// C `sseqRecord.c::asyncFinish` (474) posts `VAL` on EVERY process:
@@ -1340,20 +1351,16 @@ impl Record for SseqRecord {
                 SeqPhase::Wait => self.advance_sequence(&mut live),
             }
         };
-        // The cycle's status posts leave through the outcome, not through
-        // [`Self::post_live`]: the framework applies them (store + `DBE_VALUE`
-        // post, in this order) once the cycle's queued `LNKn` writes have run.
+        // The cycle's status posts leave through the outcome: the framework
+        // stores each once the cycle's queued `LNKn` writes have run and posts
+        // it at its [`PostStage`].
         //
         // The whole list travels, not just `finish`'s clears. A cycle can both
         // raise and clear `BUSY` (C `process` sets it at `:302-305`, and an
         // out-of-range `SELN` reaches `asyncFinish` in the same call), and the
-        // two must be published in that order by one owner. Splitting them
-        // between the spawned `post_live` and the synchronous drain would let
-        // the raise land after the clear and leave the record busy forever.
-        //
-        // `special()` keeps `post_live`: a put is not a process cycle, has no
-        // queued link writes to be ordered against, and C posts from `special`
-        // inline (`sseqRecord.c:1176`, `:1185`, `:1192`).
+        // raise must land first: it is in this list, the clear a deferred
+        // action the framework runs after both. A spawned post of the raise
+        // could land after the clear and leave the record busy forever.
         outcome.post_write_fields = live;
         Ok(outcome)
     }
@@ -1477,17 +1484,15 @@ impl Record for SseqRecord {
         if !field.eq_ignore_ascii_case("ABORT") {
             return Ok(());
         }
-        let mut live = Vec::new();
+        // The posts below are C's `db_post_events` calls under the put's lock,
+        // so they are marks the put path drains, never a spawned post that
+        // could land after the finish re-entry clears what it stores.
         if self.busy == 0 {
-            // C: "no activity to abort" (sseqRecord.c:1173-1178) — reset `abort`,
-            // post, and `return(-1)`: the put is REJECTED. The reset/post is done
-            // first (as C does), only the status is a failure — the abort state
-            // machine is untouched.
-            if self.abort != 0 {
-                self.abort = 0;
-                live.push(("ABORT".to_string(), EpicsValue::Short(0)));
-            }
-            self.post_live(live);
+            // C: "no activity to abort" (sseqRecord.c:1173-1178) — reset `abort`
+            // silently, post `busy`, and `return(-1)`: the put is REJECTED, so
+            // `dbPut` posts nothing for `abort` either.
+            self.abort = 0;
+            self.pending_posts |= 1 << BUSY_POST;
             return Err(CaError::BadField("ABORT".to_string()));
         }
         if self.aborting != 0 {
@@ -1498,11 +1503,10 @@ impl Record for SseqRecord {
             // `done` Arcs and notify the per-sequence bridge nobody listens
             // on, so they are harmless (C's `waiting == 0` abandoned-callback
             // guard).
+            // C clears and posts all ten, waiting or not (:1183-1186).
             for i in 0..NUM_STEPS {
-                if self.steps[i].waiting != 0 {
-                    self.steps[i].waiting = 0;
-                    live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
-                }
+                self.steps[i].waiting = 0;
+                self.pending_posts |= 1 << (WTG_POST + i);
             }
             self.in_flight.clear();
             self.cursor = self.active.len();
@@ -1514,11 +1518,10 @@ impl Record for SseqRecord {
             } else {
                 self.force_finish_reentry();
             }
-            self.post_live(live);
             return Ok(());
         }
         self.aborting = 1;
-        live.push(("ABORTING".to_string(), EpicsValue::Short(1)));
+        self.pending_posts |= 1 << ABORTING_POST;
         // No further step dispatches; the drain only waits out the in-flight
         // callbacks.
         self.cursor = self.active.len();
@@ -1537,7 +1540,6 @@ impl Record for SseqRecord {
         } else if self.phase == SeqPhase::Wait {
             self.wake_machine();
         }
-        self.post_live(live);
         Ok(())
     }
 
@@ -1746,8 +1748,8 @@ impl Record for SseqRecord {
             // ABORTING (sseqRecord.dbd:820) is machine-driven: C
             // `sseqRecord.c:special`/`asyncFinish` toggle it across an abort.
             // The sequence machine here holds it live (1 while an abort is
-            // draining the outstanding step, 0 otherwise) and posts it via
-            // `post_live`; read-only to clients.
+            // draining the outstanding step, 0 otherwise); read-only to
+            // clients.
             "ABORTING" => Some(EpicsValue::Short(self.aborting)),
             "BUSY" => Some(EpicsValue::Short(self.busy)),
             _ => {
@@ -1783,7 +1785,7 @@ impl Record for SseqRecord {
                         "WERR" => Some(EpicsValue::Short(step.wait_err)),
                         // WTGn — live "outstanding put-callback" flag for
                         // this step (C `processCallback`/`putCallbackCB`
-                        // toggle `waiting`); posted via `post_live`.
+                        // toggle `waiting`).
                         "WTG" => Some(EpicsValue::Short(self.steps[idx].waiting)),
                         // IXn holds the step's own 0-based index
                         // (sseqRecord.dbd initial: IX1=0 .. IXA=9). Served from
@@ -2224,15 +2226,23 @@ mod tests {
         // A record with nothing selected raises `busy` (C `process:302-305`)
         // and reaches `asyncFinish` in the same call. The raise is stored, the
         // clear is EMITTED: `finish` hands it to the framework so it cannot
-        // become visible before the cycle's queued `LNKn` writes have run.
+        // become visible before the forward link has run.
         assert_eq!(rec.busy, 1, "the clear is the framework's to store");
         assert_eq!(
             outcome.post_write_fields,
-            vec![
-                ("BUSY".to_string(), EpicsValue::Short(1)),
-                ("BUSY".to_string(), EpicsValue::Short(0)),
-            ],
-            "both transitions travel, in the order C posts them"
+            vec![(PostStage::Output, "BUSY".to_string(), EpicsValue::Short(1))],
+            "the raise travels to the output site"
+        );
+        assert!(
+            matches!(
+                outcome.actions.as_slice(),
+                [ProcessAction::PutAfterEpilogue {
+                    field: "BUSY",
+                    value: crate::server::record::CycleValue::Short(0),
+                }]
+            ),
+            "the clear runs after the epilogue: {:?}",
+            outcome.actions
         );
     }
 
@@ -2650,12 +2660,48 @@ mod tests {
             Some(EpicsValue::Short(0)),
             "C resets abort to 0 in the no-activity path"
         );
+        assert_eq!(
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
+            vec![("BUSY", CyclePostMask::Value)],
+            "C posts busy, not abort (sseqRecord.c:1176)"
+        );
 
         // The accepted SPC_MOD siblings still return Ok (C has switch cases).
         let mut rec = SseqRecord::new();
         rec.put_field("DLY1", EpicsValue::Double(0.02)).unwrap();
         rec.special("DLY1", true).unwrap();
         rec.special("WAIT1", true).unwrap();
+    }
+
+    /// A busy `ABORT` posts `aborting` (`sseqRecord.c:1192`), a second one all
+    /// ten `waiting` fields whatever they held (`:1183-1186`) — both inline,
+    /// drained by the put path, not spawned.
+    #[test]
+    fn sseq_abort_special_posts_inline_like_c() {
+        let mut rec = SseqRecord::new();
+        rec.busy = 1;
+        rec.steps[2].waiting = 1;
+        rec.special("ABORT", true).unwrap();
+        assert_eq!(rec.get_field("ABORTING"), Some(EpicsValue::Short(1)));
+        assert_eq!(
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
+            vec![("ABORTING", CyclePostMask::Value)],
+        );
+        rec.special("ABORT", true).unwrap();
+        assert_eq!(rec.get_field("WTG3"), Some(EpicsValue::Short(0)));
+        assert_eq!(
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
+            WTG_FIELDS
+                .iter()
+                .map(|f| (*f, CyclePostMask::Value))
+                .collect::<Vec<_>>(),
+        );
     }
 
     /// R17-1: a NEGATIVE `PREC` reaches C's

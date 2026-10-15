@@ -2228,6 +2228,18 @@ pub enum ProcessAction {
     /// marks name a static table, so the action owns no allocation; a
     /// `Reset*` entry has no meaning here.
     PostAfterEpilogue(CycleMarks),
+
+    /// Store `field` and post it `DBE_VALUE` plus the bit the cycle's
+    /// `recGblResetAlarms` returned — C `asyncFinish`'s `busy = 0` and its
+    /// `MonitorMask` post, after `recGblFwdLink` and the closing stamp
+    /// (`sseqRecord.c:471`, `:499-505`), so a forward-link target still reads
+    /// the field set. Run with the cycle's other deferred actions. A
+    /// [`CycleValue`], so the variant adds no drop to the link stage that
+    /// carries the actions.
+    PutAfterEpilogue {
+        field: &'static str,
+        value: CycleValue,
+    },
 }
 
 /// A list a record hands the framework for one cycle — the actions of
@@ -2570,19 +2582,32 @@ pub struct ProcessOutcome {
     /// `LNKn` unwritten, `CNT == 0` with `COUT` unwritten.
     ///
     /// A record therefore does not store such a field in `process()`; it emits
-    /// it here, and the framework applies it — store plus a `DBE_VALUE` monitor
-    /// post — immediately after this cycle's link writes and before the
-    /// cycle's snapshot notification. One owner for one transition.
-    ///
-    /// Applied in order, so a cycle that raises and clears the same field
-    /// (`sseqRecord.c:302-305` `busy = 1` then an invalid `SELN` reaching
-    /// `asyncFinish`) publishes both transitions exactly as C does.
+    /// it here with the [`PostStage`] that names who posts it, and the
+    /// framework stores the list, in order, once the writes have run. One
+    /// owner for one transition. A clear C makes after `recGblFwdLink` is a
+    /// [`ProcessAction::PutAfterEpilogue`] instead, so that a cycle that
+    /// raises and clears the same field (`sseqRecord.c:302-305` `busy = 1`
+    /// then an invalid `SELN` reaching `asyncFinish`) publishes both
+    /// transitions in C's order.
     ///
     /// Only the STORE moves. A flag whose value is an input to a later
     /// decision in the same cycle keeps its `process()` store: motor's `DMOV`
     /// gates `recGblFwdLink` at `motorRecord.cc:1509-1510`, so it is read after
     /// it is set and does not belong here.
-    pub post_write_fields: Vec<(String, EpicsValue)>,
+    pub post_write_fields: Vec<(PostStage, String, EpicsValue)>,
+}
+
+/// Who posts a [`ProcessOutcome::post_write_fields`] entry, stored after the
+/// cycle's link writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostStage {
+    /// Posted there, `DBE_VALUE` (`sseqRecord.c:304`).
+    Output,
+    /// Posted by the cycle's `monitor()` change walk with the field's mask,
+    /// after `recGblResetAlarms` (`asyncFinish`'s `abort`/`aborting`,
+    /// `:471`, `:479-482`, which the type declares `DBE_VALUE` plus the alarm
+    /// bit through [`Record::value_only_change_fields`]).
+    Monitor,
 }
 
 impl ProcessOutcome {

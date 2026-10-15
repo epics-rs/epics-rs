@@ -14,9 +14,7 @@
 //!
 //! C posts BUSY 0 after `asyncFinish`'s `recGblResetAlarms` with its
 //! `MonitorMask` (`:471`, `:505`), so the first cycle's carries no alarm and
-//! reaches `DBE_ALARM`. The port still publishes it from
-//! `publish_post_write_fields` before the reset at `DBE_VALUE` alone; the pin
-//! is C's stream and stays ignored until that publish stage moves.
+//! reaches `DBE_ALARM`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -140,7 +138,6 @@ impl SubscriptionFilter for Line {
 }
 
 #[epics_macros_rs::epics_test]
-#[ignore = "red until BUSY 0 publishes after the alarm reset (sseqRecord.c:471, 505)"]
 async fn sseq_posts_its_link_reads_as_the_oracle_does() {
     let (db, _) = IocBuilder::new()
         .register_record_type("sseq", || Box::new(SseqRecord::default()))
@@ -208,6 +205,103 @@ async fn sseq_posts_its_link_reads_as_the_oracle_does() {
     }
 }
 
+/// `asyncFinish`'s abort completion: `abort`, `aborting` and `busy` post with
+/// `MonitorMask` (`sseqRecord.c:471`, `:481-482`, `:505`), so the first
+/// cycle's clears reach `DBE_ALARM` and none reaches `DBE_LOG`; an idle abort
+/// posts `busy` alone (`:1173-1177`). oracleStdIoc, `caput Q.PROC 1; Q.ABORT 1`
+/// inside `DLY1`, then `caput Q.PROC 1` and, idle, `caput Q.ABORT 1`.
+#[epics_macros_rs::epics_test]
+async fn sseq_abort_posts_as_the_oracle_does() {
+    const VALUE: &str = "\
+Q.BUSY 1 UDF INVALID
+Q.ABORTING 1 UDF INVALID
+Q.ABORT 1 UDF INVALID
+Q 0
+Q.ABORT 0
+Q.ABORTING 0
+Q.BUSY 0
+Q.BUSY 1
+Q 0
+Q.BUSY 0
+Q.BUSY 0
+";
+    const ALARM: &str = "\
+Q 0
+Q.ABORT 0
+Q.ABORTING 0
+Q.BUSY 0
+";
+    const LOG: &str = "\
+Q.ABORT 1 UDF INVALID
+";
+    let (db, _) = IocBuilder::new()
+        .register_record_type("sseq", || Box::new(SseqRecord::default()))
+        .db_string(
+            r#"
+record(ao, "Y") {}
+record(sseq, "Q") {
+  field(DLY1, "0.5")
+  field(DOL1, "5")
+  field(LNK1, "Y PP")
+}
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    let cell = db.get_record("Q").unwrap();
+    let classes = [EventMask::VALUE, EventMask::ALARM, EventMask::LOG];
+    let streams: Vec<Arc<Mutex<String>>> = classes.iter().map(|_| Arc::default()).collect();
+    let mut readers = Vec::new();
+    {
+        let mut inst = cell.write();
+        let mut sid = 0;
+        for (class, stream) in classes.iter().zip(&streams) {
+            for (pv, field, ty) in [
+                ("Q", "VAL", DbFieldType::Long),
+                ("Q.ABORT", "ABORT", DbFieldType::Short),
+                ("Q.ABORTING", "ABORTING", DbFieldType::Short),
+                ("Q.BUSY", "BUSY", DbFieldType::Short),
+            ] {
+                readers.push(inst.add_subscriber(field, sid, ty, class.bits()).unwrap());
+                sid += 1;
+                assert!(inst.attach_filter_to_last_subscriber(
+                    field,
+                    Arc::new(Line {
+                        pv,
+                        stream: stream.clone(),
+                    }),
+                ));
+            }
+        }
+    }
+    // Plain `caput`, C `dbPutField`: a put-notify would wait out the
+    // sequence's PACT (`dbNotify.c` restart queue) and reach an idle record.
+    for (field, settle) in [
+        ("PROC", 200),
+        ("ABORT", 1000),
+        ("PROC", 1000),
+        ("ABORT", 200),
+    ] {
+        // The idle ABORT is refused, as C's `return(-1)` is.
+        let _ = db
+            .put_record_field_from_ca_no_notify("Q", field, EpicsValue::String("1".into()))
+            .await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(settle)).await;
+    }
+    let got: Vec<String> = streams.iter().map(|s| s.lock().unwrap().clone()).collect();
+    for (got, want, class) in [
+        (&got[0], VALUE, "DBE_VALUE"),
+        (&got[1], ALARM, "DBE_ALARM"),
+        (&got[2], LOG, "DBE_LOG"),
+    ] {
+        assert_eq!(by_pv(got), by_pv(want), "{class}");
+    }
+}
+
 /// Each PV's lines in the order it received them.
 fn by_pv(stream: &str) -> std::collections::BTreeMap<&str, Vec<&str>> {
     let mut m = std::collections::BTreeMap::<&str, Vec<&str>>::new();
@@ -217,4 +311,31 @@ fn by_pv(stream: &str) -> std::collections::BTreeMap<&str, Vec<&str>> {
             .push(line);
     }
     m
+}
+
+/// `asyncFinish` clears `busy` after `recGblFwdLink` (`sseqRecord.c:499-504`),
+/// so the forward-link target still reads `BUSY == 1`.
+#[epics_macros_rs::epics_test]
+async fn the_forward_link_target_reads_busy_still_set() {
+    let (db, _) = IocBuilder::new()
+        .register_record_type("sseq", || Box::new(SseqRecord::default()))
+        .db_string(
+            r#"
+record(sseq, "Q") { field(FLNK, "C") }
+record(calc, "C") { field(INPA, "Q.BUSY NPP") field(CALC, "A") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    db.put_record_field_from_ca("Q", "PROC", EpicsValue::String("1".into()))
+        .await
+        .unwrap();
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+    let read = |rec: &str, field: &str| db.get_record(rec).unwrap().read().record.get_field(field);
+    assert_eq!(read("C", "VAL"), Some(EpicsValue::Double(1.0)));
+    assert_eq!(read("Q", "BUSY"), Some(EpicsValue::Short(0)));
 }

@@ -85,7 +85,7 @@ impl Record for FlagSource {
             link_field: "LNK",
             value: EpicsValue::Long(42),
         };
-        let clear = vec![(CLEAR.0.to_string(), CLEAR.1)];
+        let clear = vec![(PostStage::Output, CLEAR.0.to_string(), CLEAR.1)];
         Ok(match self.arm {
             Arm::SyncComplete => ProcessOutcome {
                 post_write_fields: clear,
@@ -105,8 +105,12 @@ impl Record for FlagSource {
             },
             Arm::DeferredAfterAFailingField => ProcessOutcome {
                 post_write_fields: vec![
-                    ("REJECT".to_string(), EpicsValue::Short(1)),
-                    (CLEAR.0.to_string(), CLEAR.1),
+                    (
+                        PostStage::Output,
+                        "REJECT".to_string(),
+                        EpicsValue::Short(1),
+                    ),
+                    (PostStage::Output, CLEAR.0.to_string(), CLEAR.1),
                 ],
                 ..ProcessOutcome::complete_with(vec![write])
             },

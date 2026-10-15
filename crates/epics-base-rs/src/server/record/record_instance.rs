@@ -21,7 +21,7 @@ use super::link::{ParsedLink, parse_link_v2};
 use super::menu_choices::MenuBound;
 use super::record_trait::{
     AuxPostMask, CommonFieldPutResult, DeclaredFields, EnumSlots, FieldDeclaration, FieldDesc,
-    InputLinkRequest, LinkReadAs, PostName, PostedValue, ProcessSnapshot, Record,
+    InputLinkRequest, LinkReadAs, PostName, PostStage, PostedValue, ProcessSnapshot, Record,
     RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
@@ -5018,6 +5018,12 @@ struct RecordCold {
     /// -> `display.form` mapping is exempt: it reads an immutable
     /// load-time info tag, not a runtime field.)
     metadata_cache: StdMutex<Option<MetadataSnapshot>>,
+    /// `DBE_ALARM` when the last epilogue's `recGblResetAlarms` posted the
+    /// alarm fields (its return value, `recGbl.c:209-212`), else empty. Set
+    /// only by the alarm-moving monitor publication and taken by the same
+    /// cycle's [`crate::server::record::ProcessAction::PutAfterEpilogue`], so
+    /// no other cycle pays for it.
+    alarm_reset: crate::server::recgbl::EventMask,
 }
 
 /// The cycle status [`RecordInstance::run_registered_subroutine`] reports when
@@ -6682,7 +6688,65 @@ impl RecordInstance {
                 link_backed_metadata_input_slot,
                 info: HashMap::new(),
                 metadata_cache: StdMutex::new(None),
+                alarm_reset: crate::server::recgbl::EventMask::NONE,
             }),
+        }
+    }
+
+    /// Record what this cycle's `recGblResetAlarms` returned. See
+    /// [`RecordCold::alarm_reset`].
+    pub(crate) fn note_alarm_reset(&mut self, mask: crate::server::recgbl::EventMask) {
+        self.cold.alarm_reset = mask;
+    }
+
+    /// Take what [`Self::note_alarm_reset`] recorded, leaving it empty.
+    pub(crate) fn take_alarm_reset(&mut self) -> crate::server::recgbl::EventMask {
+        std::mem::replace(
+            &mut self.cold.alarm_reset,
+            crate::server::recgbl::EventMask::NONE,
+        )
+    }
+
+    /// The single owner of [`crate::server::record::ProcessOutcome::post_write_fields`]:
+    /// store each withheld field, in list order, and post the
+    /// [`PostStage::Output`] ones at `DBE_VALUE`. A [`PostStage::Monitor`]
+    /// field is left to the cycle's `monitor()` walk, which posts its change
+    /// with the type's mask.
+    ///
+    /// Each field is applied independently. The group is one transition and a
+    /// field that fails to store must not strand the rest of it — a partial
+    /// apply that abandoned `BUSY` would leave the record busy forever.
+    pub(crate) fn apply_post_write_fields(
+        &mut self,
+        fields: impl IntoIterator<Item = (PostStage, String, EpicsValue)>,
+    ) {
+        for (stage, field, value) in fields {
+            // C's `db_post_events` result is never read nor printed
+            // (`scalerRecord.c:316`).
+            if self.put_internal_field(&field, value).is_err() {
+                continue;
+            }
+            // Snapshot-cache contract, as `post_fields_with_mask`: invalidate
+            // before the monitor snapshot is built.
+            self.notify_field_written(&field);
+            if stage == PostStage::Output {
+                self.notify_field(&field, crate::server::recgbl::EventMask::VALUE);
+            }
+        }
+    }
+
+    /// [`crate::server::record::ProcessAction::PutAfterEpilogue`]: store
+    /// `field` and post it with `DBE_VALUE | reset`, `reset` being this cycle's
+    /// `recGblResetAlarms` return.
+    pub(crate) fn put_after_epilogue(
+        &mut self,
+        field: &str,
+        value: crate::server::record::CycleValue,
+        reset: crate::server::recgbl::EventMask,
+    ) {
+        if self.put_internal_field(field, value.into()).is_ok() {
+            self.notify_field_written(field);
+            self.notify_field(field, crate::server::recgbl::EventMask::VALUE | reset);
         }
     }
 
@@ -11124,21 +11188,17 @@ impl RecordInstance {
         let outcome = self.process_and_drain()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are
-        // handled by the full process_record_with_links() path in processing.rs.
+        // handled by the full process_record_with_links() path in processing.rs
+        // — save the `PutAfterEpilogue`s, applied after `monitor()` below.
         //
         // It must still apply `post_write_fields`. There are no link writes
-        // here for them to be ordered against, so the ordering rule is
-        // satisfied trivially; what is NOT optional is applying them at all —
-        // a record that hands its completion-flag clear to the framework
-        // (sseq's `busy`, scaler's `cnt`) would otherwise stay busy forever on
-        // this path. Same store-then-`DBE_VALUE`-post as
-        // `PvDatabase::publish_post_write_fields`.
-        for (field, value) in outcome.post_write_fields {
-            if self.put_internal_field(&field, value).is_ok() {
-                self.notify_field_written(&field);
-                self.notify_field(&field, crate::server::recgbl::EventMask::VALUE);
-            }
-        }
+        // here for them to be ordered against, so they apply now, through the
+        // engine's owner; what is NOT optional is applying them at all — a
+        // record that hands its completion-flag clear to the framework (sseq's
+        // `busy`, scaler's `cnt`) would otherwise stay busy forever on this
+        // path.
+        self.apply_post_write_fields(outcome.post_write_fields);
+        let after_epilogue = outcome.actions;
 
         // If the record reports it modified a metadata-class field during
         // process(), invalidate the metadata cache so the next snapshot
@@ -11223,6 +11283,14 @@ impl RecordInstance {
 
         let mut snapshot = ProcessSnapshot::new();
         let alarm_posts = self.monitor_cycle(&mut snapshot);
+        // The engine's tail runs these after `recGblFwdLink`; this path has no
+        // forward link, so `monitor()` is the last site they follow.
+        for action in after_epilogue {
+            if let crate::server::record::ProcessAction::PutAfterEpilogue { field, value } = action
+            {
+                self.put_after_epilogue(field, value, alarm_posts.reset_mask());
+            }
+        }
 
         Ok((snapshot, alarm_posts.to_vec()))
     }

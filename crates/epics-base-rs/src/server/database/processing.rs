@@ -556,23 +556,7 @@ impl AsyncDbHandle {
         }
     }
 
-    /// Out-of-band field post under the caller's own event mask — see
-    /// `PvDatabase::post_fields_with_mask`. Returns an empty `Vec` (no-op)
-    /// if the database has been dropped.
-    pub(crate) fn post_fields_with_mask(
-        &self,
-        name: impl AsRef<[u8]>,
-        fields: Vec<(String, EpicsValue)>,
-        mask: crate::server::recgbl::EventMask,
-    ) -> CaResult<Vec<String>> {
-        let name = name.as_ref();
-        match self.db() {
-            Some(db) => db.post_fields_with_mask(name, fields, mask),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// [`Self::post_fields_with_mask`], dropped whole unless `current` holds
+    /// [`PvDatabase::post_fields_with_mask`], dropped whole unless `current` holds
     /// once the record write lock is taken — see
     /// [`PvDatabase::post_fields_with_mask_if`].
     pub(crate) fn post_fields_with_mask_if<P: PostItem>(
@@ -990,6 +974,7 @@ fn publish_alarm_cycle(
     snapshot: &crate::server::record::ProcessSnapshot,
     alarm_posts: AlarmPosts,
 ) {
+    instance.note_alarm_reset(alarm_posts.reset_mask());
     alarm_posts.for_each(|desc, mask| instance.notify_declared(None, desc, mask));
     // A value-class post advances the record's already-published state
     // (`RecordInstance::record_value_post`), so this is a `&mut` operation.
@@ -1067,6 +1052,16 @@ impl AlarmPosts {
             m |= EventMask::VALUE;
         }
         m
+    }
+
+    /// `recGblResetAlarms`'s return value: `DBE_ALARM` when it posted the
+    /// alarm fields at all (`recGbl.c:209-212`).
+    pub fn reset_mask(&self) -> crate::server::recgbl::EventMask {
+        if self.stat_mask.is_empty() {
+            crate::server::recgbl::EventMask::NONE
+        } else {
+            crate::server::recgbl::EventMask::ALARM
+        }
     }
 
     /// The posts as a list, for the callers that hold them.
@@ -3244,23 +3239,19 @@ impl PvDatabase {
     /// `process()` returning and this call sees the flag still SET, which is
     /// the conservative half of C's two observable states.
     ///
-    /// Each field is applied independently. The group is one transition and a
-    /// field that fails to store must not strand the rest of it — a partial
-    /// apply that abandoned `BUSY` would leave the record busy forever.
-    ///
-    /// `DBE_VALUE` alone. C's masks, measured: `asyncFinish` (`sseqRecord.c:461`)
-    /// posts `abort` at `:481`, `aborting` at `:482` and `busy` at `:505`, all
-    /// three with `MonitorMask` — `DBE_VALUE | recGblResetAlarms(pR)` (`:471`),
-    /// i.e. `DBE_VALUE` plus the alarm bit only when the alarm changed. Bare
-    /// `DBE_VALUE` is what the other posts use: `waiting` (`:343`, `:559`,
-    /// `:728`, `:1185` — never inside `asyncFinish`), the second `aborting`
-    /// post (`:1192`), and `scalerRecord.c:372` (`cnt`). So a member published
-    /// in the same cycle as an alarm transition omits a `DBE_ALARM` C sets.
+    /// [`RecordInstance::apply_post_write_fields`] stores them and posts each
+    /// at its [`crate::server::record::PostStage`]. A clear C posts after
+    /// `recGblFwdLink` is not one of them: it is a
+    /// [`crate::server::record::ProcessAction::PutAfterEpilogue`].
     #[inline(always)]
     pub(crate) fn publish_post_write_fields(
         &self,
         rec: InFrame<'_>,
-        fields: crate::server::record::CycleList<(String, EpicsValue)>,
+        fields: crate::server::record::CycleList<(
+            crate::server::record::PostStage,
+            String,
+            EpicsValue,
+        )>,
     ) {
         if fields.is_empty() {
             return;
@@ -3272,20 +3263,13 @@ impl PvDatabase {
     /// so the cycles of every other type pay a branch and not this frame.
     fn publish_fields(
         rec: InFrame<'_>,
-        fields: crate::server::record::CycleList<(String, EpicsValue)>,
+        fields: crate::server::record::CycleList<(
+            crate::server::record::PostStage,
+            String,
+            EpicsValue,
+        )>,
     ) {
-        let mut inst = rec.write();
-        for (field, value) in fields {
-            // C's `db_post_events` result is never read nor printed
-            // (`scalerRecord.c:316`).
-            if inst.put_internal_field(&field, value).is_err() {
-                continue;
-            }
-            // Snapshot-cache contract, as `post_fields_with_mask`: invalidate
-            // before the monitor snapshot is built.
-            inst.notify_field_written(&field);
-            inst.notify_field(&field, crate::server::recgbl::EventMask::VALUE);
-        }
+        rec.write().apply_post_write_fields(fields.into_vec());
     }
 
     /// Resolve a link's target field [`DbFieldType`] for a LOCAL `DB_LINK`,
@@ -7969,6 +7953,11 @@ impl PvDatabase {
                 }
                 ProcessAction::PostAfterEpilogue(marks) => {
                     super::field_io::post_cycle_marks(&mut rec.write(), marks);
+                }
+                ProcessAction::PutAfterEpilogue { field, value } => {
+                    let mut inst = rec.write();
+                    let reset = inst.take_alarm_reset();
+                    inst.put_after_epilogue(field, value, reset);
                 }
             }
         }

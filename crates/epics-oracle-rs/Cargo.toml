@@ -9,6 +9,9 @@ description = "Differential oracle harness: boots the C softIoc and the Rust IOC
 publish = false
 
 [dependencies]
+# Path-only and unpublished, as this crate is: the one exact reader of who
+# holds a port (`foreign_udp_holders`, `listens_on_tcp`).
+named-port = { path = "../named-port" }
 epics-base-rs = { workspace = true }
 epics-ca-rs = { workspace = true }
 # The Rust side of the PVA differential pair (`oracle-ioc --pva`), measured

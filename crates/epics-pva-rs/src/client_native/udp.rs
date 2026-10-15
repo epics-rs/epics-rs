@@ -1025,22 +1025,22 @@ mod tests {
         assert_eq!(c.listener_count(), 3);
     }
 
-    /// Sockets on UDP `port`, the collector's own included. Only Linux can
-    /// say; elsewhere a timeout is never put down to a co-holder.
+    /// IPv4 sockets on UDP `port`, the collector's own included, from one
+    /// sock_diag snapshot (`/proc/net/udp` repeats and skips rows under
+    /// churn). Only Linux can say; elsewhere a timeout is never put down to a
+    /// co-holder.
     fn udp_sockets_on(port: u16) -> usize {
-        let want = format!(":{port:04X}");
-        std::fs::read_to_string("/proc/net/udp")
-            .map(|t| {
-                t.lines()
-                    .skip(1)
-                    .filter(|l| {
-                        l.split_whitespace()
-                            .nth(1)
-                            .is_some_and(|a| a.ends_with(&want))
-                    })
-                    .count()
-            })
-            .unwrap_or(1)
+        #[cfg(target_os = "linux")]
+        {
+            named_port::port_holders::udp_holders(port)
+                .map(|h| h.iter().filter(|h| h.local.is_ipv4()).count())
+                .unwrap_or(1)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = port;
+            1
+        }
     }
 
     /// What a stand-in does to the one datagram of an attempt.

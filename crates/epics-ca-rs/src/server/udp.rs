@@ -1622,6 +1622,36 @@ mod responder_bind_tests {
                 bound.port()
             );
         }
+        // Every restarted set released what it bound: on a stranger's number
+        // the only sockets of this process are the strangers.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let link = |fd: i32| {
+                std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                    .map(|l| l.to_string_lossy().into_owned())
+                    .ok()
+            };
+            let strangers: std::collections::HashSet<String> =
+                held.iter().filter_map(|s| link(s.as_raw_fd())).collect();
+            let ours: std::collections::HashSet<String> = std::fs::read_dir("/proc/self/fd")
+                .expect("list own fds")
+                .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+                .map(|l| l.to_string_lossy().into_owned())
+                .collect();
+            for port in &theirs {
+                let left: Vec<_> = named_port::port_holders::udp_holders(*port)
+                    .expect("sock_diag dump")
+                    .into_iter()
+                    .map(|h| h.fd_link())
+                    .filter(|l| ours.contains(l) && !strangers.contains(l))
+                    .collect();
+                assert!(
+                    left.is_empty(),
+                    "a refused set still holds {port}: {left:?}"
+                );
+            }
+        }
     }
 
     /// Boundary — an ephemeral set whose interfaces overlap (the same address,

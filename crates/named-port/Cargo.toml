@@ -10,3 +10,6 @@ repository.workspace = true
 # which `cargo package` drops from the uploaded manifest, so this crate's
 # absence from crates.io is not a hole in anyone's dependency graph.
 publish = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

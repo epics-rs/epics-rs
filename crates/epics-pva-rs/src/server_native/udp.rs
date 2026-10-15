@@ -1396,18 +1396,16 @@ mod tests {
         // This runtime is current-thread, so the responder has not run yet.
         #[cfg(target_os = "linux")]
         {
-            let wildcard = format!("00000000:{port:04X}");
+            let wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let ours: std::collections::HashSet<String> = std::fs::read_dir("/proc/self/fd")
                 .unwrap()
                 .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
                 .map(|l| l.to_string_lossy().into_owned())
                 .collect();
-            let held = std::fs::read_to_string("/proc/net/udp")
+            let held = named_port::port_holders::udp_holders(port)
                 .unwrap()
-                .lines()
-                .skip(1)
-                .map(|l| l.split_whitespace().collect::<Vec<_>>())
-                .any(|f| f[1] == wildcard && ours.contains(&format!("socket:[{}]", f[9])));
+                .iter()
+                .any(|h| h.local == wildcard && ours.contains(&h.fd_link()));
             assert!(held, "no wildcard socket of ours on {port} at start");
         }
 

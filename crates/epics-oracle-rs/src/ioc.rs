@@ -864,27 +864,17 @@ fn watch_boot(
     })
 }
 
-/// Is process `pid` listening on TCP `port`? `None` where `/proc` cannot say.
+/// Is process `pid` listening on TCP `port`? `None` where `/proc` or
+/// sock_diag cannot say. The listeners come from one sock_diag dump of the
+/// port: a `/proc/net/tcp` read skips rows under churn, and a skipped LISTEN
+/// row reads a healthy IOC as a collision.
 #[cfg(target_os = "linux")]
 fn listens_on_tcp(pid: u32, port: u16) -> Option<bool> {
-    let mut inodes = std::collections::HashSet::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        for row in std::fs::read_to_string(table).ok()?.lines().skip(1) {
-            let f: Vec<&str> = row.split_whitespace().collect();
-            // local_address is `ADDR:PORT` in hex; state 0A is LISTEN.
-            let (Some(local), Some(&"0A"), Some(inode)) = (f.get(1), f.get(3), f.get(9)) else {
-                continue;
-            };
-            if local
-                .rsplit(':')
-                .next()
-                .and_then(|p| u16::from_str_radix(p, 16).ok())
-                == Some(port)
-            {
-                inodes.insert(format!("socket:[{inode}]"));
-            }
-        }
-    }
+    let inodes: std::collections::HashSet<String> = named_port::port_holders::tcp_listeners(port)
+        .ok()?
+        .iter()
+        .map(|h| h.fd_link())
+        .collect();
     let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
     Some(fds.filter_map(Result::ok).any(|fd| {
         std::fs::read_link(fd.path())
@@ -907,23 +897,13 @@ fn listens_on_tcp(_pid: u32, _port: u16) -> Option<bool> {
 /// and does not answer, which no retry on a fresh port can cure.
 #[cfg(target_os = "linux")]
 fn foreign_udp_holders(pid: u32, port: u16) -> Option<Vec<String>> {
-    let mut on_port = Vec::new();
-    for table in ["/proc/net/udp", "/proc/net/udp6"] {
-        for row in std::fs::read_to_string(table).ok()?.lines().skip(1) {
-            let f: Vec<&str> = row.split_whitespace().collect();
-            let (Some(local), Some(inode)) = (f.get(1), f.get(9)) else {
-                continue;
-            };
-            if local
-                .rsplit(':')
-                .next()
-                .and_then(|p| u16::from_str_radix(p, 16).ok())
-                == Some(port)
-            {
-                on_port.push(format!("socket:[{inode}]"));
-            }
-        }
-    }
+    // One sock_diag snapshot of the port: `/proc/net/udp` repeats and skips
+    // rows while other processes open and close sockets.
+    let on_port: Vec<String> = named_port::port_holders::udp_holders(port)
+        .ok()?
+        .iter()
+        .map(|h| h.fd_link())
+        .collect();
     let owned_by = |pid: &str| -> Option<Vec<String>> {
         Some(
             std::fs::read_dir(format!("/proc/{pid}/fd"))

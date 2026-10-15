@@ -47,6 +47,8 @@
 //!
 //! [`verdict`] reads the two IOC consoles for that evidence.
 
+#[cfg(target_os = "linux")]
+pub mod port_holders;
 pub mod verdict;
 
 use std::net::{TcpListener, UdpSocket};

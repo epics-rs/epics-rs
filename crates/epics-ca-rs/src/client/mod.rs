@@ -2594,6 +2594,20 @@ impl CaChannel {
             .collect()
     }
 
+    /// The rights the channel's last `AccessRightsChanged` reported, read
+    /// from the coordinator's state rather than a receiver: none unless
+    /// `Connected`, so an unresponsive channel answers no-rights like the
+    /// event C sends at that edge (`nciu.cpp:170-177`), not its held
+    /// permits as `ca_write_access` would. The coordinator stores a frame's
+    /// rights before it dispatches the frames after it, so a monitor event
+    /// never sees older rights here than the stream carried ahead of it.
+    pub fn access_rights(&self) -> AccessRights {
+        match self.snapshots.get(&self.cid) {
+            Some(s) if s.state == ChannelState::Connected => s.access_rights,
+            _ => AccessRights::from_u32(0),
+        }
+    }
+
     /// The channel's native field type, known once connected. Mirrors
     /// libca `ca_field_type(chid)` — the CLI tools read it after connect
     /// to decide the readback DBR type (e.g. ENUM → STRING by default,
@@ -3519,9 +3533,10 @@ async fn run_coordinator(
                 match req {
                     CoordRequest::RegisterChannel { cid, pv_name, priority, conn_tx } => {
                         // Drain any waiters that arrived before registration.
-                        let early_waiters = pending_wait_connected
-                            .remove(&cid)
-                            .unwrap_or_default();
+                        let mut conn_tx = conn_tx;
+                        for waiter in pending_wait_connected.remove(&cid).unwrap_or_default() {
+                            conn_tx.add_waiter(waiter);
+                        }
                         channels.insert(cid, ChannelInner {
                             cid,
                             pv_name: pv_name.clone(),
@@ -3532,7 +3547,6 @@ async fn run_coordinator(
                             element_count: 0,
                             server_addr: None,
                             access_rights: AccessRights::from_u32(0),
-                            connect_waiters: early_waiters,
                             conn_tx,
                             reconnect_count: 0,
                             last_connected_at: None,
@@ -3556,7 +3570,7 @@ async fn run_coordinator(
                             if ch.state == ChannelState::Connected {
                                 let _ = reply.send(());
                             } else {
-                                ch.connect_waiters.push(reply);
+                                ch.conn_tx.add_waiter(reply);
                             }
                         } else {
                             // Channel not yet registered — stash the waiter
@@ -3573,7 +3587,12 @@ async fn run_coordinator(
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
                             });
                             let priority = ch.priority;
-                            let connected = ch.state == ChannelState::Connected;
+                            // C `nciu::subscribe` installs the subscription when
+                            // the channel `isInstalledInServer` (`nciu.h:370-377`),
+                            // which includes an unresponsive circuit's channels:
+                            // the EVENT_ADD queues on the live socket and the
+                            // server answers it when the circuit recovers.
+                            let installed = ch.state.is_operational();
                             // Single owner of the subscribe-time readback
                             // derivation: ENUM substituted per enum_readback
                             // (Label→DBR_TIME_STRING, Numeric→DBR_TIME_INT,
@@ -3635,14 +3654,14 @@ async fn run_coordinator(
                                 deadband,
                                 callback_tx,
                                 coalesce_slot,
-                                needs_restore: !connected,
+                                needs_restore: !installed,
                                 last_value: None,
                                 nreplace: 0,
                             });
 
-                            if connected {
+                            if installed {
                                 let data_type =
-                                    data_type.expect("connected channel has native type");
+                                    data_type.expect("installed channel has native type");
                                 // C `tcpiiu::subscriptionRequest`
                                 // (`tcpiiu.cpp:1572-1585`): resolve the wire
                                 // count, then bound it against what the circuit
@@ -3650,7 +3669,7 @@ async fn run_coordinator(
                                 // never installed and `ca_create_subscription`
                                 // returns ECA_TOLARGE.
                                 let wire_count = crate::protocol::subscription_wire_count(
-                                    count.expect("connected channel has element count"),
+                                    count.expect("installed channel has element count"),
                                     ch.element_count,
                                     data_type,
                                     peer_minor,
@@ -3682,7 +3701,10 @@ async fn run_coordinator(
                         if let Some(rec) = subscriptions.get(subid) {
                             let cid = rec.cid;
                             if let Some(ch) = channels.get(&cid) {
-                                if ch.state == ChannelState::Connected {
+                                // Same predicate as the EVENT_ADD: the server
+                                // holds the subscription while the circuit is
+                                // unresponsive.
+                                if ch.state.is_operational() {
                                     if let Some(data_type) = rec.data_type {
                                         let server_addr = ch.server_addr.unwrap();
                                         // C `tcpiiu::subscriptionCancelRequest`
@@ -3719,7 +3741,7 @@ async fn run_coordinator(
                         for subid in sub_ids {
                             if let Some(rec) = subscriptions.get(subid) {
                                 if let Some(ch) = channels.get(&cid) {
-                                    if ch.state == ChannelState::Connected {
+                                    if ch.state.is_operational() {
                                         if let Some(data_type) = rec.data_type {
                                             let server_addr = ch.server_addr.unwrap();
                                             let peer_minor = server_minor_version
@@ -4074,21 +4096,12 @@ async fn run_coordinator(
                             // for cleanup.
                             search_attempts.remove(&cid);
 
-                            // Wake connect waiters
-                            for waiter in ch.connect_waiters.drain(..) {
-                                let _ = waiter.send(());
-                            }
-
                             // Rights, then Connected: rsrv sends ACCESS_RIGHTS
                             // before the CREATE_CHAN reply (`camessage.c:1180`,
                             // `:1201`) and `nciu::connect` notifies in that order
                             // (`nciu.cpp:145-158`), so dbCa's rights handler sees
                             // the channel unconnected and dispatches nothing.
-                            let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-                                read: access.read,
-                                write: access.write,
-                            });
-                            let _ = ch.conn_tx.send(ConnectionEvent::Connected);
+                            ch.announce_connected(&snapshots);
                             // epics-base `16877577` parity: surface native
                             // DBR type changes so consumers can react before
                             // the next event flows. Only a transition from a
@@ -4106,10 +4119,13 @@ async fn run_coordinator(
                             // event is gated on a real prior type.
                             if native_changed && previous_native.is_some() {
                                 if let Some(cur) = dbr_type {
-                                    let _ = ch.conn_tx.send(ConnectionEvent::NativeTypeChanged {
-                                        previous: previous_native,
-                                        current: cur,
-                                    });
+                                    ch.announce(
+                                        &snapshots,
+                                        ConnectionEvent::NativeTypeChanged {
+                                            previous: previous_native,
+                                            current: cur,
+                                        },
+                                    );
                                     tracing::info!(
                                         pv = %ch.pv_name,
                                         previous = ?previous_native,
@@ -4249,13 +4265,13 @@ async fn run_coordinator(
                     TransportEvent::AccessRightsChanged { cid, access } => {
                         if let Some(ch) = channels.get_mut(&cid) {
                             ch.access_rights = access;
-                            let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-                                read: access.read,
-                                write: access.write,
-                            });
-                            if let Some(mut snap) = snapshots.get_mut(&cid) {
-                                snap.access_rights = access;
-                            }
+                            ch.announce(
+                                &snapshots,
+                                ConnectionEvent::AccessRightsChanged {
+                                    read: access.read,
+                                    write: access.write,
+                                },
+                            );
                         }
                     }
                     TransportEvent::ChannelCreateFailed { cid } => {
@@ -4266,8 +4282,7 @@ async fn run_coordinator(
                             // the channel will immediately re-search and may
                             // still connect before the caller's timeout.
                             ch.state = ChannelState::Disconnected;
-                            snapshots.remove(&cid);
-                            let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
+                            ch.announce(&snapshots, ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
                                 pv_name: ch.pv_name.clone(),
@@ -4369,20 +4384,15 @@ async fn run_coordinator(
                                 && ch.state == ChannelState::Unresponsive
                             {
                                 ch.state = ChannelState::Connected;
-                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
-                                    snap.state = ChannelState::Connected;
-                                }
                                 // The down edge told the receiver no-rights;
                                 // C's connect handlers re-read the held
                                 // permits (`dbCa.c:875-876`,
                                 // `gatePv.cc:395-396`), a receiver has only
                                 // this event to read them from. Ahead of
-                                // `Connected`, as on a first connect.
-                                let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-                                    read: ch.access_rights.read,
-                                    write: ch.access_rights.write,
-                                });
-                                let _ = ch.conn_tx.send(ConnectionEvent::Connected);
+                                // `Connected`, as on a first connect; a
+                                // `wait_connected` begun in the window
+                                // returns here too.
+                                ch.announce_connected(&snapshots);
                                 recovered_cids.push(ch.cid);
                             }
                         }
@@ -4579,27 +4589,22 @@ fn disconnect_channels(
         // (`tcpiiu.cpp:929-937` only moves it to `unrespCircuit`), so its
         // permits are held and `ca_write_access` keeps answering them.
         ch.state = kind.terminal_state();
-        match kind {
-            DisconnectKind::CircuitGone => {
-                ch.access_rights = NO_RIGHTS;
-                snapshots.remove(cid);
-            }
-            DisconnectKind::Unresponsive => {
-                if let Some(mut snap) = snapshots.get_mut(cid) {
-                    snap.state = ChannelState::Unresponsive;
-                }
-            }
+        if kind == DisconnectKind::CircuitGone {
+            ch.access_rights = NO_RIGHTS;
         }
         // Steps 3 and 4 — C `disconnectNotify` then
         // `accessRightsNotify(noRights)` (`nciu.cpp:170-177`), in that
         // order. Both kinds emit `Disconnected`: C has no third connection
         // state, and an event only the port can emit is an event no
         // consumer handles.
-        let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
-        let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-            read: false,
-            write: false,
-        });
+        ch.announce(snapshots, ConnectionEvent::Disconnected);
+        ch.announce(
+            snapshots,
+            ConnectionEvent::AccessRightsChanged {
+                read: false,
+                write: false,
+            },
+        );
         per_channel(ch);
     }
 
@@ -6390,7 +6395,6 @@ mod disconnect_transition_tests {
                 read: true,
                 write: true,
             },
-            connect_waiters: Vec::new(),
             conn_tx,
             reconnect_count: 0,
             last_connected_at: None,

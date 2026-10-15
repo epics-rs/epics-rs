@@ -13,8 +13,8 @@
 
 #![cfg(feature = "client-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(6): measured, not argued — every case here is
-// `#[ignore]`d, and all six pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread
+// RTEMS-EXEC-MODEL-ALLOW(9): measured, not argued — every case here is
+// `#[ignore]`d, and all nine pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread
 // cargo nextest run --profile interop -p epics-ca-rs --run-ignored all`.
 
 use std::time::Duration;
@@ -294,4 +294,145 @@ async fn a_write_right_held_across_an_unresponsive_circuit() {
 #[ignore = "spawns external libca softIoc; run with --include-ignored"]
 async fn a_read_only_right_held_across_an_unresponsive_circuit() {
     rights_survive_an_unresponsive_circuit("ASG(DEFAULT) { RULE(1, READ) }").await;
+}
+
+/// Subscribe before or during one unresponsive window, then caput after
+/// recovery: the update must arrive. libca installs a subscription on an
+/// unresponsive circuit at once (`isInstalledInServer` includes
+/// `cs_unrespCircuit`, `nciu.h:370-377`), so softIoc answers the EVENT_ADD
+/// it read on SIGCONT; nothing re-adds it at recovery.
+async fn a_monitor_spans_an_unresponsive_window(subscribe_during: bool) {
+    use epics_ca_rs::client::ConnectionEvent;
+    require_tool("softIoc");
+    let ioc = spawn_softioc(TEST_DB);
+    set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
+    unsafe { std::env::set_var("EPICS_CA_CONN_TMO", "1") };
+    let client = epics_ca_rs::client::CaClient::new()
+        .await
+        .expect("CaClient");
+    let (ch, mut rx) = client.create_channel_with_events("TEST:LOUT", 0);
+    let mut next = async || {
+        tokio::time::timeout(fact_budget::FACT_BUDGET, rx.recv())
+            .await
+            .expect("connection event inside the budget")
+            .expect("receiver open, not lagged")
+    };
+    assert!(matches!(
+        next().await,
+        ConnectionEvent::AccessRightsChanged { .. }
+    ));
+    assert_eq!(next().await, ConnectionEvent::Connected);
+
+    let mut monitor = None;
+    if !subscribe_during {
+        monitor = Some(ch.subscribe().await.expect("subscribe"));
+    }
+    signal(ioc.pid(), "-STOP");
+    assert_eq!(next().await, ConnectionEvent::Disconnected);
+    assert!(matches!(
+        next().await,
+        ConnectionEvent::AccessRightsChanged { .. }
+    ));
+    if subscribe_during {
+        monitor = Some(ch.subscribe().await.expect("subscribe while unresponsive"));
+    }
+    signal(ioc.pid(), "-CONT");
+    assert!(matches!(
+        next().await,
+        ConnectionEvent::AccessRightsChanged { .. }
+    ));
+    assert_eq!(next().await, ConnectionEvent::Connected);
+
+    let (addr_list, port) = (ioc.ca_addr_list(), ioc.udp_port);
+    let put = tokio::task::spawn_blocking(move || {
+        c_ca_tools::run_caput(&addr_list, port, "TEST:LOUT", "77")
+    });
+    assert!(put.await.expect("caput task"), "caput after recovery");
+    let mut monitor = monitor.expect("subscribed");
+    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
+    loop {
+        let snap = tokio::time::timeout_at(deadline, monitor.recv())
+            .await
+            .expect("the post-recovery caput reaches the monitor")
+            .expect("monitor open");
+        if let Ok(snap) = snap
+            && snap.value.to_f64() == Some(77.0)
+        {
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "spawns external libca softIoc; run with --include-ignored"]
+async fn a_monitor_made_before_an_unresponsive_window_sees_updates_after_it() {
+    a_monitor_spans_an_unresponsive_window(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "spawns external libca softIoc; run with --include-ignored"]
+async fn a_monitor_made_inside_an_unresponsive_window_sees_updates_after_it() {
+    a_monitor_spans_an_unresponsive_window(true).await;
+}
+
+/// `wait_connected` begun before the first connect, then again inside an
+/// unresponsive window: both return at the next `Connected`. The second
+/// must not return while softIoc is stopped, and must return at recovery —
+/// the window keeps the circuit, so no `ChannelCreated` follows.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "spawns external libca softIoc; run with --include-ignored"]
+async fn wait_connected_inside_an_unresponsive_window_returns_at_recovery() {
+    use epics_ca_rs::client::ConnectionEvent;
+    require_tool("softIoc");
+    let ioc = spawn_softioc(TEST_DB);
+    set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
+    unsafe { std::env::set_var("EPICS_CA_CONN_TMO", "1") };
+    let client = epics_ca_rs::client::CaClient::new()
+        .await
+        .expect("CaClient");
+    let (ch, mut rx) = client.create_channel_with_events("TEST:LOUT", 0);
+    ch.wait_connected(fact_budget::FACT_BUDGET)
+        .await
+        .expect("a waiter from before the first connect returns at it");
+    let mut next = async || {
+        tokio::time::timeout(fact_budget::FACT_BUDGET, rx.recv())
+            .await
+            .expect("connection event inside the budget")
+            .expect("receiver open, not lagged")
+    };
+    assert!(matches!(
+        next().await,
+        ConnectionEvent::AccessRightsChanged { .. }
+    ));
+    assert_eq!(next().await, ConnectionEvent::Connected);
+
+    signal(ioc.pid(), "-STOP");
+    assert_eq!(next().await, ConnectionEvent::Disconnected);
+    assert!(matches!(
+        next().await,
+        ConnectionEvent::AccessRightsChanged { .. }
+    ));
+    let waiter = {
+        let ch = ch.clone();
+        tokio::spawn(async move { ch.wait_connected(fact_budget::FACT_BUDGET).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let early = waiter.is_finished();
+    signal(ioc.pid(), "-CONT");
+    assert!(
+        !early,
+        "wait_connected returned while the circuit was unresponsive"
+    );
+    assert!(matches!(
+        next().await,
+        ConnectionEvent::AccessRightsChanged { .. }
+    ));
+    assert_eq!(next().await, ConnectionEvent::Connected);
+    waiter
+        .await
+        .expect("waiter task")
+        .expect("a waiter from inside the window returns at recovery");
 }

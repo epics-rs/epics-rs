@@ -627,7 +627,6 @@ fn an_int64_input_counts_its_low_32_bits_as_oracle_scaler_ioc_does() {
 
 /// A double input above `INT_MAX` is C's out-of-range `(epicsInt32)` cast.
 #[test]
-#[ignore = "needs i15/c-cast-policy: c_cast::f64_to_i32 saturates on this base, where x86 C stores INT_MIN"]
 fn a_double_input_above_int_max_counts_as_oracle_scaler_ioc_does() {
     let (c, rs) = out_of_range_inputs("scd:", &["SX.S2"]);
     assert_eq!(rs, c);

@@ -64,6 +64,18 @@ impl PortUse {
     }
 }
 
+/// Whether a failed `bind` means the number cannot be had here: EADDRINUSE or
+/// EACCES, the pair pvxs falls back on (`serverconn.cpp:437`). Winsock reports
+/// a port another socket holds as `WSAEACCES` whenever either side set
+/// `SO_REUSEADDR` or `SO_EXCLUSIVEADDRUSE`, so `AddrInUse` alone reads every
+/// such Windows collision as some other failure.
+pub fn port_unavailable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+    )
+}
+
 /// Whose number a fanout socket binds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PortOrigin {

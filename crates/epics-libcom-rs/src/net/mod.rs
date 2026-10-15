@@ -66,7 +66,7 @@ pub mod search_udp;
 /// it.
 pub const ORIGIN_TAG_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
 
-pub use fanout::{PortOrigin, PortUse, bind_fanout};
+pub use fanout::{PortOrigin, PortUse, bind_fanout, port_unavailable};
 pub use iface_v4::{IfaceV4, broadcast_addrs, local_addr};
 pub use search_udp::{SearchDatagram, SearchUdpSocket, SearchUdpSocketV6};
 

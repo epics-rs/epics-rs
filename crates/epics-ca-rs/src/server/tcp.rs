@@ -1438,10 +1438,7 @@ async fn bind_tcp_set(
                     continue 'set;
                 }
                 Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
-                    ) && os_picked < OS_PICKED_TRIES =>
+                    if epics_base_rs::net::bind_falls_back(&e) && os_picked < OS_PICKED_TRIES =>
                 {
                     os_picked += 1;
                     want = 0;

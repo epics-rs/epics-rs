@@ -120,7 +120,7 @@ async fn a_search_port_held_on_v6_only_refuses_the_v6_start_as_softiocpvx() {
 
     drop(rs_start(port, false).expect("v4-only start on a v6-held number"));
     match rs_start(port, true) {
-        Err(PvaError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse),
+        Err(PvaError::Io(e)) => assert!(epics_base_rs::net::port_held(&e), "{e}"),
         Err(e) => panic!("refused for another reason: {e}"),
         Ok(_) => panic!("the v6 start took a number held on v6"),
     }

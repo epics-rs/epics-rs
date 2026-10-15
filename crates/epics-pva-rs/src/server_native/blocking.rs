@@ -3544,7 +3544,7 @@ pub(super) mod tests {
                 two_port_config(other),
             ) {
                 Ok(server) => Some((Arc::new(server), other)),
-                Err(e) if e.kind() == io::ErrorKind::AddrInUse => None,
+                Err(e) if epics_base_rs::net::port_held(&e) => None,
                 Err(e) => panic!("bind the blocking PVA server: {e}"),
             }
         });
@@ -4123,7 +4123,7 @@ pub(super) mod tests {
         let port = holder.local_addr().expect("holder addr").port();
         let err = bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).err();
         assert!(
-            matches!(&err, Some(e) if e.kind() == io::ErrorKind::AddrInUse),
+            matches!(&err, Some(e) if epics_base_rs::net::port_held(e)),
             "{err:?}"
         );
     }

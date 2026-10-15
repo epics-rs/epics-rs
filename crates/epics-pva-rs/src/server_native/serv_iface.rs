@@ -52,9 +52,9 @@ pub(crate) fn tcp_bind_addresses(
 /// keeps its own port and only a 0 takes `port`, which becomes the first
 /// listener's bound port. Returns the listeners and that port.
 ///
-/// deliberate deviation: when every requested port is 0, an `AddrInUse` on a
-/// later interface releases the whole set and binds it again on a fresh
-/// ephemeral number. pvxs binds interface 1 on 0 and the rest on that number
+/// deliberate deviation: when every requested port is 0, a held number
+/// (`port_held`) on a later interface releases the whole set and binds it
+/// again on a fresh ephemeral number. pvxs binds interface 1 on 0 and the rest on that number
 /// (`server.cpp:476-486`), so a number the kernel handed out but another
 /// socket already holds on a later address fails the start; with nothing
 /// asked for there is nothing to refuse. A non-zero request, any other
@@ -82,7 +82,7 @@ pub(crate) fn bind_serv_ifaces_with(
         match bind_serv_ifaces_once(&addrs, port, after_first) {
             Err((at, PvaError::Io(e)))
                 if all_ephemeral
-                    && e.kind() == io::ErrorKind::AddrInUse
+                    && epics_base_rs::net::port_held(&e)
                     && tries < EPHEMERAL_TRIES
                     && !addrs[..at].iter().any(|a| addresses_overlap(a, &addrs[at])) =>
             {
@@ -148,13 +148,7 @@ fn bind_serv_iface(addr: SocketAddr, mut fallback: bool) -> PvaResult<(TcpListen
                 }
                 return Ok((listener, name.port()));
             }
-            Err(e)
-                if fallback
-                    && matches!(
-                        e.kind(),
-                        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
-                    ) =>
-            {
+            Err(e) if fallback && epics_base_rs::net::bind_falls_back(&e) => {
                 debug!(
                     "Address {} in use or not permitted: {e}",
                     crate::config::env::sock_addr_text(bind_addr)

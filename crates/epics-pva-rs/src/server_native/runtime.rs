@@ -882,7 +882,7 @@ mod tcp_fallback_tests {
             source.add("dut", SharedPV::new());
             match PvaServer::start(Arc::new(source), config) {
                 Ok(server) => Some((server, other)),
-                Err(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(PvaError::Io(e)) if epics_base_rs::net::port_held(&e) => None,
                 Err(e) => panic!("start the PVA server: {e}"),
             }
         });

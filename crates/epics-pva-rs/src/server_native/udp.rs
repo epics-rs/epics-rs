@@ -190,7 +190,7 @@ pub(crate) fn bind_udp(port: u16, interfaces: &ServerInterfaces, v6: bool) -> Pv
         };
         match companions() {
             Ok((v6, collector)) => break (sock, bound, v6, collector),
-            Err(e) if port == 0 && port_held(&e) && tries < EPHEMERAL_TRIES => {
+            Err(e) if port == 0 && epics_base_rs::net::port_held(&e) && tries < EPHEMERAL_TRIES => {
                 debug!("UDP port {bound} is held; choosing another search port");
                 tries += 1;
             }
@@ -209,15 +209,6 @@ pub(crate) fn bind_udp(port: u16, interfaces: &ServerInterfaces, v6: bool) -> Pv
         collector,
         port,
     })
-}
-
-/// Whether a bind failed on a number another socket holds. Windows reports a
-/// fanout (`SO_REUSEADDR`) bind beside a socket that did not share as
-/// `WSAEACCES`, not `WSAEADDRINUSE`, as pvxs `ServIface` knows
-/// (`serverconn.cpp:437`, `SOCK_EACCES`).
-fn port_held(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::AddrInUse
-        || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 /// A server start's search sockets, all on [`Self::port`].
@@ -1457,7 +1448,7 @@ mod tests {
         };
         let err = PvaServer::start(Arc::new(SharedSource::new()), config).err();
         assert!(
-            matches!(&err, Some(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse),
+            matches!(&err, Some(PvaError::Io(e)) if epics_base_rs::net::port_held(e)),
             "{:?}",
             err.map(|e| e.to_string())
         );
@@ -1626,7 +1617,7 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
         match s.bind(&addr.into()) {
             Ok(()) => Some(s),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+            Err(e) if epics_base_rs::net::port_held(&e) => None,
             Err(e) => panic!("hold {port} on v6: {e}"),
         }
     }
@@ -1659,7 +1650,7 @@ mod tests {
         let err = super::bind_udp(0, &localhost_only(), true).err();
         BEFORE_V6_BIND.take();
         assert!(
-            matches!(&err, Some(PvaError::Io(e)) if port_held(e)),
+            matches!(&err, Some(PvaError::Io(e)) if epics_base_rs::net::port_held(e)),
             "{err:?}"
         );
         assert_eq!(tried.borrow().len(), 32);
@@ -1685,7 +1676,7 @@ mod tests {
             assert!(tries < 5, "v4 bind of {port} failed {tries} times: {err:?}");
         };
         assert!(
-            matches!(&err, Some(PvaError::Io(e)) if port_held(e)),
+            matches!(&err, Some(PvaError::Io(e)) if epics_base_rs::net::port_held(e)),
             "{err:?}"
         );
         assert_eq!(*tried.borrow(), [port]);

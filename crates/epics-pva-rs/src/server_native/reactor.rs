@@ -684,7 +684,7 @@ mod tests {
                 two_port_config(other),
             ) {
                 Ok(server) => Some((Arc::new(server), other)),
-                Err(e) if e.kind() == io::ErrorKind::AddrInUse => None,
+                Err(e) if epics_base_rs::net::port_held(&e) => None,
                 Err(e) => panic!("bind the reactor PVA server: {e}"),
             }
         });

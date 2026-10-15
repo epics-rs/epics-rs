@@ -907,11 +907,11 @@ impl Default for AsynRecord {
 /// thread leaves the outcome for the completion re-entry.
 #[derive(Default)]
 struct ProcessJob {
-    request: Mutex<ProcessRequest>,
-    outcome: Mutex<Option<IoOutcome>>,
+    request: parking_lot::Mutex<ProcessRequest>,
+    outcome: parking_lot::Mutex<Option<IoOutcome>>,
     /// The completion's `epicsCallback`, kept in the record's private structure
     /// as C keeps it in `asynRecPvt` (asynRecord.c:227); set at `add_record`.
-    reentry: Mutex<Option<ProcessCallback>>,
+    reentry: parking_lot::Mutex<Option<ProcessCallback>>,
 }
 
 struct ProcessRequest {
@@ -932,8 +932,8 @@ impl Default for ProcessRequest {
 impl CellBody for ProcessJob {
     /// C `asynCallbackProcess`'s `performIO` (asynRecord.c:819-827).
     fn process(&self, port: &mut dyn PortCalls) {
-        let out = run_io_phases(&self.request.lock().unwrap().plan, port);
-        *self.outcome.lock().unwrap() = Some(out);
+        let out = run_io_phases(&self.request.lock().plan, port);
+        *self.outcome.lock() = Some(out);
     }
 
     /// C `queueTimeoutCallbackProcess` (asynRecord.c:919-927), the `AQR`
@@ -941,22 +941,22 @@ impl CellBody for ProcessJob {
     fn unrun(&self, why: Unrun) {
         let mut out = IoOutcome::default();
         {
-            let trace = &self.request.lock().unwrap().plan.trace;
+            let trace = &self.request.lock().plan.trace;
             match why {
                 Unrun::Canceled => out.report_canceled(trace),
                 Unrun::TimedOut => out.report_queue_timeout(trace),
                 Unrun::Refused(_) => out.report_queue_refused(trace),
             }
         }
-        *self.outcome.lock().unwrap() = Some(out);
+        *self.outcome.lock() = Some(out);
     }
 
     /// C `callbackRequestProcessCallback`. The re-entry takes the record's
     /// hold, which a record waiting on this port may hold, so it never runs on
     /// the port's thread.
     fn done(self: Arc<Self>) {
-        let prio = self.request.lock().unwrap().prio;
-        if let Some(cb) = self.reentry.lock().unwrap().as_ref() {
+        let prio = self.request.lock().prio;
+        if let Some(cb) = self.reentry.lock().as_ref() {
             // asynRecord ignores the status (asynRecord.c:830-831).
             let _ = cb.request(prio);
         }
@@ -2307,13 +2307,13 @@ impl SpecialRequest {
 /// before the cell is released, so a put that reuses the cell never meets it.
 struct SpecialBody {
     lane: Arc<SpecialLane>,
-    request: Mutex<SpecialRequest>,
+    request: parking_lot::Mutex<SpecialRequest>,
 }
 
 impl CellBody for SpecialBody {
     fn process(&self, port: &mut dyn PortCalls) {
         let (done, prio) = {
-            let request = self.request.lock().unwrap();
+            let request = self.request.lock();
             (request.run(port), request.prio)
         };
         self.lane.complete(done, prio);
@@ -2321,7 +2321,7 @@ impl CellBody for SpecialBody {
 
     fn unrun(&self, why: Unrun) {
         let (queued_by, prio) = {
-            let request = self.request.lock().unwrap();
+            let request = self.request.lock();
             (request.what.queued_by(), request.prio)
         };
         let e = match why {
@@ -2446,12 +2446,12 @@ fn read_eos(port: &mut dyn PortCalls, user: SpecialUser) -> Result<(String, Stri
 /// that actor.
 #[derive(Default)]
 struct SpecialLane {
-    done: Mutex<SpecialQueue>,
+    done: parking_lot::Mutex<SpecialQueue>,
     /// The record the drainer applies results to, set at `add_record`.
-    record: Mutex<Option<(epics_base_rs::types::RecordName, AsyncDbHandle)>>,
+    record: parking_lot::Mutex<Option<(epics_base_rs::types::RecordName, AsyncDbHandle)>>,
     /// Held by a test to stop the drainer before it takes the next result.
     #[cfg(test)]
-    gate: Mutex<()>,
+    gate: parking_lot::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -2468,7 +2468,7 @@ impl SpecialLane {
         done: SpecialDone,
         prio: epics_libcom_rs::runtime::task::CallbackPriority,
     ) {
-        let mut queue = self.done.lock().unwrap();
+        let mut queue = self.done.lock();
         queue.done.push_back(done);
         if std::mem::replace(&mut queue.draining, true) {
             return;
@@ -2481,12 +2481,12 @@ impl SpecialLane {
     /// C's `callbackRequest` body: the band runs it, so it takes the band's
     /// proof and the blocking seam cannot reach it.
     fn drain(&self, _on: epics_libcom_rs::runtime::task::OnBand) {
-        let record = self.record.lock().unwrap().clone();
+        let record = self.record.lock().clone();
         loop {
             #[cfg(test)]
-            let _gate = self.gate.lock().unwrap();
+            let _gate = self.gate.lock();
             let done = {
-                let mut queue = self.done.lock().unwrap();
+                let mut queue = self.done.lock();
                 match queue.done.pop_front() {
                     Some(done) => done,
                     None => {
@@ -2512,7 +2512,7 @@ impl SpecialLane {
     /// No result is waiting or being applied.
     #[cfg(test)]
     fn is_idle(&self) -> bool {
-        !self.done.lock().unwrap().draining
+        !self.done.lock().draining
     }
 }
 
@@ -3113,7 +3113,7 @@ impl AsynRecord {
         );
         {
             use std::fmt::Write;
-            let mut request = special.body.request.lock().unwrap();
+            let mut request = special.body.request.lock();
             request.key = key;
             request.value.clear();
             match value {
@@ -3148,7 +3148,7 @@ impl AsynRecord {
 
     fn queue_port_request(&mut self, mut handle: PortHandle, special: SpecialCell) {
         let (user, queued_by) = {
-            let request = special.body.request.lock().unwrap();
+            let request = special.body.request.lock();
             (request.queue_user(), request.what.queued_by())
         };
         if let Err(refusal) = handle.queue_gate(&user) {
@@ -3160,7 +3160,7 @@ impl AsynRecord {
                 self.report_queue_refused(refusal.status(), format_args!("{refusal}"), queued_by);
             }
         } else {
-            let done = special.body.request.lock().unwrap().run(&mut handle);
+            let done = special.body.request.lock().run(&mut handle);
             self.complete_special(done);
         }
     }
@@ -3189,7 +3189,7 @@ impl AsynRecord {
             None => {
                 let body = Arc::new(SpecialBody {
                     lane: Arc::clone(&self.special_lane),
-                    request: Mutex::default(),
+                    request: parking_lot::Mutex::default(),
                 });
                 let cell = handle.new_cell(body.clone());
                 self.special_cells.push(SpecialCell {
@@ -3201,7 +3201,7 @@ impl AsynRecord {
         };
         {
             use crate::interfaces::InterfaceType as Registry;
-            let mut request = special.body.request.lock().unwrap();
+            let mut request = special.body.request.lock();
             request.what = what;
             request.user = self.special_user(queue);
             request.option = handle.has_interface(Registry::Option);
@@ -3524,7 +3524,7 @@ impl AsynRecord {
         );
         {
             let field = if output { &self.oeos } else { &self.ieos };
-            let mut request = special.body.request.lock().unwrap();
+            let mut request = special.body.request.lock();
             request.eos.clear();
             translate_escape_into(field.as_bytes(), &mut request.eos);
         }
@@ -4251,7 +4251,7 @@ impl AsynRecord {
     fn queue_process(&mut self, handle: &PortHandle, gpib: Option<GpibCycle>) -> ProcessOutcome {
         let job = Arc::clone(&self.process_job);
         let user = {
-            let mut request = job.request.lock().unwrap();
+            let mut request = job.request.lock();
             self.fill_io_plan(&mut request.plan, gpib);
             request.prio = self.callback_priority;
             io_user(&request.plan).with_priority(crate::port::QueuePriority::Low)
@@ -4264,7 +4264,7 @@ impl AsynRecord {
             }
             Err(_) => {
                 let mut out = IoOutcome::default();
-                out.report_queue_refused(&job.request.lock().unwrap().plan.trace);
+                out.report_queue_refused(&job.request.lock().plan.trace);
                 self.apply_io_outcome(out);
                 ProcessOutcome::complete()
             }
@@ -4461,8 +4461,8 @@ impl Record for AsynRecord {
             let held = db.lock_for_put(&target, "SCAN", &passive);
             let _ = db.put_pv_already_locked(held, passive);
         }));
-        *self.process_job.reentry.lock().unwrap() = Some(db.process_callback(&name));
-        *self.special_lane.record.lock().unwrap() = Some((name.clone(), db.clone()));
+        *self.process_job.reentry.lock() = Some(db.process_callback(&name));
+        *self.special_lane.record.lock() = Some((name.clone(), db.clone()));
         self.trace_name = name.to_string();
         self.async_ctx = Some((name, db));
     }
@@ -5416,7 +5416,7 @@ impl AsynRecord {
         // thread produced and finish (`state = stateIdle`). Checked first so
         // a completion never re-issues I/O.
         if std::mem::take(&mut self.io_pending) {
-            let outcome = self.process_job.outcome.lock().unwrap().take();
+            let outcome = self.process_job.outcome.lock().take();
             self.apply_io_outcome(outcome.unwrap_or_default());
             return Ok(ProcessOutcome::complete());
         }
@@ -6013,7 +6013,7 @@ mod tests {
 
         // C `cancelRequest` with the request still queued: `wasQueued == true`.
         rec.process_job.unrun(Unrun::Canceled);
-        let out = rec.process_job.outcome.lock().unwrap().take().unwrap();
+        let out = rec.process_job.outcome.lock().take().unwrap();
         rec.apply_io_outcome(out);
 
         assert_eq!(rec.errs, "I/O request canceled");
@@ -10628,7 +10628,7 @@ mod tests {
         let job = Arc::clone(&rec.process_job);
         let mut filled = false;
         for _ in 0..2000 {
-            if job.outcome.lock().unwrap().is_some() {
+            if job.outcome.lock().is_some() {
                 filled = true;
                 break;
             }
@@ -10722,7 +10722,7 @@ mod tests {
         // Both requests run and release their cells while the drainer is held,
         // so their results are still unapplied.
         let lane = Arc::clone(&rec.special_lane);
-        let gate = lane.gate.lock().unwrap();
+        let gate = lane.gate.lock();
         release.wait();
         while rec.special_cells.iter().any(|s| s.cell.is_outstanding()) {
             std::thread::yield_now();
@@ -10845,7 +10845,7 @@ mod tests {
         let job = Arc::clone(&rec.process_job);
         let mut filled = false;
         for _ in 0..2000 {
-            if job.outcome.lock().unwrap().is_some() {
+            if job.outcome.lock().is_some() {
                 filled = true;
                 break;
             }

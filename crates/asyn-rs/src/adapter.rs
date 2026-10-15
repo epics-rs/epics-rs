@@ -812,9 +812,9 @@ impl AsynDeviceSupport {
         self.handle.queue_gate(&user)?;
         // The port takes this slot before it records or lands a result, so
         // holding it across the queue keeps the new one from being cleared.
-        let mut slot = self.write_job.request.lock().unwrap();
+        let mut slot = self.write_job.request.lock();
         cell.queue(&user)?;
-        self.write_job.ran.lock().unwrap().take();
+        self.write_job.ran.lock().take();
         *slot = Some((op, user));
         Ok(())
     }
@@ -1131,18 +1131,18 @@ fn convert_param_array_to_iface(
 /// port queues its write under the record's hold without allocating.
 #[derive(Default)]
 struct WriteJob {
-    request: std::sync::Mutex<Option<(RequestOp, AsynUser)>>,
+    request: parking_lot::Mutex<Option<(RequestOp, AsynUser)>>,
     /// The write's result while its cell is still queued.
-    ran: std::sync::Mutex<Option<AsynResult<()>>>,
+    ran: parking_lot::Mutex<Option<AsynResult<()>>>,
     /// The record's completion and its band, C `pPvt->processCallback` and
     /// `pr->prio`; set by the put that queued the write.
     reentry:
-        std::sync::Mutex<Option<(WriteDone, epics_libcom_rs::runtime::task::CallbackPriority)>>,
+        parking_lot::Mutex<Option<(WriteDone, epics_libcom_rs::runtime::task::CallbackPriority)>>,
 }
 
 impl WriteJob {
     fn ran(&self, result: AsynResult<()>) {
-        *self.ran.lock().unwrap() = Some(result);
+        *self.ran.lock() = Some(result);
     }
 }
 
@@ -1151,14 +1151,13 @@ impl CellBody for WriteJob {
         let (op, user) = self
             .request
             .lock()
-            .unwrap()
             .take()
             .expect("a write is queued with its request");
         self.ran(port.call(op, user).map(|_| ()));
     }
 
     fn unrun(&self, why: Unrun) {
-        self.request.lock().unwrap().take();
+        self.request.lock().take();
         self.ran(Err(match why {
             Unrun::Refused(e) => e,
             // Nothing cancels the write, and its user arms no queue timer:
@@ -1176,9 +1175,9 @@ impl CellBody for WriteJob {
     /// Under the request slot, so a put queued meanwhile has already cleared
     /// this request's result rather than receiving it.
     fn done(self: Arc<Self>) {
-        let _slot = self.request.lock().unwrap();
-        if let Some(result) = self.ran.lock().unwrap().take() {
-            if let Some((reentry, prio)) = &*self.reentry.lock().unwrap() {
+        let _slot = self.request.lock();
+        if let Some(result) = self.ran.lock().take() {
+            if let Some((reentry, prio)) = &*self.reentry.lock() {
                 let _ =
                     reentry.complete(*prio, result.map_err(|e| CaError::Protocol(e.to_string())));
             }
@@ -2813,7 +2812,7 @@ impl DeviceSupport for AsynDeviceSupport {
         }
 
         {
-            let mut reentry = self.write_job.reentry.lock().unwrap();
+            let mut reentry = self.write_job.reentry.lock();
             match &mut *reentry {
                 Some((_, prio)) => *prio = done.priority(),
                 None => *reentry = Some((done.write_done(), done.priority())),

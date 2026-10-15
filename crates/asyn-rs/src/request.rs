@@ -1,7 +1,9 @@
 //! Request types for the port actor.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 use std::time::SystemTime;
 
 use epics_libcom_rs::SharedArray;
@@ -32,7 +34,7 @@ impl DriverCall {
     }
 
     pub(crate) fn take(&self) -> Option<DriverFn> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.0.lock().take()
     }
 }
 
@@ -244,8 +246,8 @@ impl RequestCell {
         self.lock().request
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Slot> {
+        self.slot.lock()
     }
 
     /// The port thread's dequeue of the entry queued as `seq` (C
@@ -369,7 +371,7 @@ impl CellQueue {
     /// never grows the queue.
     pub(crate) fn new_cell(self: &Arc<Self>, body: Arc<dyn CellBody>) -> Arc<RequestCell> {
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             inner.registered += 1;
             let spare = inner.registered - inner.cells.len();
             inner.cells.reserve(spare);
@@ -392,7 +394,7 @@ impl CellQueue {
     }
 
     fn unregister(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock();
         inner.registered -= 1;
         drop(inner);
         queue_timer().unregister();
@@ -400,7 +402,7 @@ impl CellQueue {
 
     fn push(&self, cell: &Arc<RequestCell>, seq: u64) -> bool {
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             if inner.closed {
                 return false;
             }
@@ -411,18 +413,14 @@ impl CellQueue {
     }
 
     fn unlink(&self, cell: &RequestCell) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock();
         inner
             .cells
             .retain(|(queued, _)| !std::ptr::eq(Arc::as_ptr(queued), cell));
     }
 
     pub(crate) fn pop(&self) -> Option<(Arc<RequestCell>, u64)> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cells
-            .pop_front()
+        self.inner.lock().cells.pop_front()
     }
 
     /// Wake the actor with nothing queued — for a store it owes announces for.
@@ -450,7 +448,7 @@ impl CellQueue {
     /// The actor is gone: refuse what is queued and everything queued later.
     pub(crate) fn close(&self) {
         let cells = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             inner.closed = true;
             std::mem::take(&mut inner.cells)
         };
@@ -1518,11 +1516,11 @@ mod tests {
                 assert!(matches!(cell.claim(seq), Claim::Run));
             }
             let state = cell.lock().state;
-            self.seen.lock().unwrap().push((what, state, requeued));
+            self.seen.lock().push((what, state, requeued));
         }
 
         fn seen(&self) -> Vec<Seen> {
-            std::mem::take(&mut *self.seen.lock().unwrap())
+            std::mem::take(&mut *self.seen.lock())
         }
     }
 
@@ -1539,7 +1537,7 @@ mod tests {
         }
         fn done(self: Arc<Self>) {
             let state = self.cell().lock().state;
-            self.seen.lock().unwrap().push(("done", state, None));
+            self.seen.lock().push(("done", state, None));
         }
     }
 

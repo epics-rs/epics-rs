@@ -6,6 +6,7 @@ use std::time::Duration;
 use asyn_rs::param::ParamValue;
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
+use asyn_rs::trace::TraceMask;
 use rumqttc::Outgoing;
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
 use tokio::sync::{Notify, mpsc};
@@ -13,6 +14,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::address::{PayloadFormat, TopicAddress, ValueType};
 use crate::config::MqttConfig;
 use crate::driver::{PublishRequest, SharedTopicMap, TopicMap};
+use crate::error::MqttError;
 use crate::payload::{DecodedValue, decode_payload, octet_bytes_cstr, octet_cstr};
 
 /// The two lifecycle signals the event loop waits on. Both are raised by the
@@ -337,6 +339,7 @@ fn decode_for_subscribers(
     subscribers: &[(usize, TopicAddress)],
     bound_reasons: &HashSet<usize>,
     topic: &str,
+    report: &mut dyn FnMut(std::fmt::Arguments<'_>),
 ) -> Vec<ParamSetValue> {
     let mut batch_updates = Vec::new();
 
@@ -349,10 +352,10 @@ fn decode_for_subscribers(
             // the next (drvMqtt.cpp:250-296); before MQ38 a payload that is not
             // UTF-8 returned from the message and denied every subscriber on
             // the topic an update C would have delivered to each.
-            tracing::debug!(
-                "Non-text payload on topic '{topic}' for {}; this subscriber skipped",
-                addr.value_type.label(),
-            );
+            // A JSON subscriber fails in `json::parse`, a flat one in its value
+            // parser.
+            let json = addr.format == PayloadFormat::Json;
+            report_drop(report, topic, addr, json, &"payload is not UTF-8 text");
             continue;
         };
         let text = match input {
@@ -416,15 +419,36 @@ fn decode_for_subscribers(
                 }
             }
             Err(e) => {
-                tracing::debug!(
-                    "Failed to decode '{}' on topic '{topic}': {e}",
-                    addr.value_type.label(),
-                );
+                let json = matches!(e, MqttError::JsonParse(_) | MqttError::JsonFieldNotFound(_));
+                report_drop(report, topic, addr, json, &e);
             }
         }
     }
 
     batch_updates
+}
+
+/// The `ASYN_TRACE_ERROR` line C's `onMessageCb` prints for a subscriber it
+/// skips: the JSON text when the parse or field lookup failed
+/// (drvMqtt.cpp:268-270), the value text otherwise (drvMqtt.cpp:328-330).
+fn report_drop(
+    report: &mut dyn FnMut(std::fmt::Arguments<'_>),
+    topic: &str,
+    addr: &TopicAddress,
+    json: bool,
+    why: &dyn std::fmt::Display,
+) {
+    if json {
+        let field = addr.json_field.as_deref().unwrap_or_default();
+        report(format_args!(
+            "MqttDriver::onMessageCb: Failed to parse JSON payload for topic '{topic}', field '{field}': {why}"
+        ));
+    } else {
+        report(format_args!(
+            "MqttDriver::onMessageCb: Unexpected value received for topic '{topic}' ({}): {why}",
+            addr.value_type.label(),
+        ));
+    }
 }
 
 /// Resolve the de-duplicated set of MQTT topics to subscribe from the live
@@ -484,7 +508,13 @@ async fn handle_incoming_message(
         .map(|(reason, _addr)| reason)
         .collect();
 
-    let batch_updates = decode_for_subscribers(payload, subscribers, &bound_reasons, topic);
+    // C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`: on by default and
+    // governed by this port's `asynSetTraceMask`.
+    let (trace, port) = (port_handle.trace(), port_handle.port_name());
+    let mut report =
+        |args: std::fmt::Arguments<'_>| trace.print(Some(port), None, 0, TraceMask::ERROR, args);
+    let batch_updates =
+        decode_for_subscribers(payload, subscribers, &bound_reasons, topic, &mut report);
 
     if !batch_updates.is_empty()
         && let Err(e) = port_handle.set_params_and_notify(0, batch_updates).await
@@ -555,8 +585,13 @@ mod tests {
 
         // C: `std::string val("hello\0\xff\xfe", 8)`; setStringParam stores
         // val.c_str() == "hello". The INT record's strtol never consumes it.
-        let batch =
-            decode_for_subscribers(b"hello\x00\xff\xfe", &subscribers, &bound, "sensor/raw");
+        let batch = decode_for_subscribers(
+            b"hello\x00\xff\xfe",
+            &subscribers,
+            &bound,
+            "sensor/raw",
+            &mut |_| {},
+        );
         assert_eq!(
             batch.len(),
             1,
@@ -574,14 +609,15 @@ mod tests {
         }
 
         // Text that both can read still reaches both.
-        let batch = decode_for_subscribers(b"42", &subscribers, &bound, "sensor/raw");
+        let batch = decode_for_subscribers(b"42", &subscribers, &bound, "sensor/raw", &mut |_| {});
         assert_eq!(batch.len(), 2, "a readable payload reaches both: {batch:?}");
 
         // Bytes that are not text at all and carry no NUL: C's octet branch
         // never decodes, so `setStringParam(val.c_str())` stores both bytes and
         // only the INT record's parse fails. The port matches now that
         // `ParamValue::Octet` carries `Vec<u8>`.
-        let batch = decode_for_subscribers(b"\xff\xfe", &subscribers, &bound, "sensor/raw");
+        let batch =
+            decode_for_subscribers(b"\xff\xfe", &subscribers, &bound, "sensor/raw", &mut |_| {});
         assert_eq!(
             batch.len(),
             1,
@@ -601,7 +637,13 @@ mod tests {
         // The NUL is still the octet terminator, and it is now the ONLY thing
         // that truncates: a payload that is nothing but non-text bytes before
         // its NUL stores that prefix rather than being denied.
-        let batch = decode_for_subscribers(b"\xff\xfe\x00tail", &subscribers, &bound, "sensor/raw");
+        let batch = decode_for_subscribers(
+            b"\xff\xfe\x00tail",
+            &subscribers,
+            &bound,
+            "sensor/raw",
+            &mut |_| {},
+        );
         assert_eq!(batch.len(), 1, "{batch:?}");
         match &batch[0] {
             ParamSetValue::Value { value, .. } => match value {
@@ -617,7 +659,13 @@ mod tests {
         let json_addr = TopicAddress::parse("JSON:STRING sensor/raw name").unwrap();
         let json_subs = vec![(3usize, json_addr)];
         let json_bound: HashSet<usize> = [3usize].into_iter().collect();
-        let batch = decode_for_subscribers(b"\xff\xfe", &json_subs, &json_bound, "sensor/raw");
+        let batch = decode_for_subscribers(
+            b"\xff\xfe",
+            &json_subs,
+            &json_bound,
+            "sensor/raw",
+            &mut |_| {},
+        );
         assert!(batch.is_empty(), "JSON octet still needs text: {batch:?}");
     }
 
@@ -660,7 +708,13 @@ mod tests {
 
         // Not text, and a NUL after it: C stores `val.c_str()`, i.e. the two
         // raw bytes, and drops the tail.
-        let batch = decode_for_subscribers(b"\xff\xfe\x00tail", &subscribers, &bound, "sensor/raw");
+        let batch = decode_for_subscribers(
+            b"\xff\xfe\x00tail",
+            &subscribers,
+            &bound,
+            "sensor/raw",
+            &mut |_| {},
+        );
         port.set_params_and_notify(0, batch)
             .await
             .expect("the store takes the batch");
@@ -672,7 +726,8 @@ mod tests {
         );
 
         // And a plain text payload still round-trips unchanged.
-        let batch = decode_for_subscribers(b"hello", &subscribers, &bound, "sensor/raw");
+        let batch =
+            decode_for_subscribers(b"hello", &subscribers, &bound, "sensor/raw", &mut |_| {});
         port.set_params_and_notify(0, batch).await.unwrap();
         let got = port.read_octet(reason, 0, 32).await.unwrap();
         assert_eq!(got.as_slice(), b"hello");
@@ -901,5 +956,54 @@ mod tests {
         let topic_map: TopicMap = HashMap::new();
         let idx = reason_topic_index(&topic_map);
         assert!(subscribe_topics(&idx, &[(99, 0)]).is_empty());
+    }
+
+    /// C prints an `ASYN_TRACE_ERROR` line for every subscriber it skips
+    /// (drvMqtt.cpp:268-270, :328-330); the port used to log these at debug,
+    /// so a malformed or partial payload left no trace on the console.
+    #[test]
+    fn every_skipped_subscriber_is_reported_with_c_s_text() {
+        let subscribers = vec![
+            (
+                1usize,
+                TopicAddress::parse("JSON:FLOAT dev temperature").unwrap(),
+            ),
+            (2usize, TopicAddress::parse("JSON:INT dev battery").unwrap()),
+            (
+                3usize,
+                TopicAddress::parse("JSON:FLOAT dev humidity").unwrap(),
+            ),
+        ];
+        let bound: HashSet<usize> = [1usize, 2, 3].into_iter().collect();
+        let mut lines = Vec::new();
+        let batch = decode_for_subscribers(
+            br#"{"temperature":"warm","battery":99.7}"#,
+            &subscribers,
+            &bound,
+            "dev",
+            &mut |args| lines.push(args.to_string()),
+        );
+        assert!(batch.is_empty());
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[0].starts_with(
+            "MqttDriver::onMessageCb: Unexpected value received for topic 'dev' (FLOAT)"
+        ));
+        assert!(lines[1].starts_with(
+            "MqttDriver::onMessageCb: Unexpected value received for topic 'dev' (INT)"
+        ));
+        assert!(lines[2].starts_with(
+            "MqttDriver::onMessageCb: Failed to parse JSON payload for topic 'dev', field 'humidity'"
+        ));
+
+        lines.clear();
+        let batch =
+            decode_for_subscribers(b"notjson", &subscribers[..1], &bound, "dev", &mut |args| {
+                lines.push(args.to_string())
+            });
+        assert!(batch.is_empty());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("Failed to parse JSON payload for topic 'dev', field 'temperature'")
+        );
     }
 }

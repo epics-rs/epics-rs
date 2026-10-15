@@ -62,7 +62,11 @@ record(mca, "MA") {
         .await
         .unwrap();
     let db = local.database().clone();
-    let resolver = install_calink_resolver(&db).await;
+    let resolver = install_calink_resolver(
+        &db,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    )
+    .await;
     db.setup_external_link_opens().await;
 
     let deadline = Instant::now() + Duration::from_secs(10);

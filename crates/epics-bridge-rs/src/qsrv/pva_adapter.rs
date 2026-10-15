@@ -1553,7 +1553,11 @@ where
     // at `AfterCaLinkInit`, before link init refuses a scheme with no set.
     // `ca` because softIocPVX links dbCa as every softIoc does.
     let app = app
-        .register_link_type("ca", epics_ca_rs::calink::calink_link_set_install)
+        .register_link_type("ca", {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("run_qsrv_ioc_app is awaited on the IOC's reactor");
+            move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
         .register_link_type("pva", pvalink_link_set_install);
     let slot = Arc::new(parking_lot::Mutex::new(None::<QsrvMount>));
     let built = slot.clone();

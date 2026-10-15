@@ -148,7 +148,7 @@ mod tests {
     use super::*;
 
     fn dummy_resolver() -> CaLinkResolver {
-        CaLinkResolver::new()
+        CaLinkResolver::new(epics_base_rs::runtime::task::Reactor::current().expect("test runtime"))
     }
 
     #[tokio::test(flavor = "multi_thread")]

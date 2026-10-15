@@ -47,6 +47,7 @@
 //! first CA link open, so an IOC with no CA links never spins one up.
 
 mod iocsh;
+mod local;
 mod resolver;
 
 use std::sync::Arc;
@@ -67,7 +68,10 @@ pub use resolver::{CaLink, CaLinkError, CaLinkResolver, install_calink_resolver}
 /// CA-serving IOC needs to make CA links resolve: no feature opt-in, no
 /// manual [`CaLinkResolver::open`] calls. The shared CA client is
 /// created lazily on the first link open.
-pub async fn calink_link_set_install(db: Arc<PvDatabase>) -> Vec<CommandDef> {
-    let resolver = install_calink_resolver(&db).await;
+pub async fn calink_link_set_install(
+    db: Arc<PvDatabase>,
+    reactor: epics_base_rs::runtime::task::Reactor,
+) -> Vec<CommandDef> {
+    let resolver = install_calink_resolver(&db, reactor).await;
     register_calink_commands(resolver)
 }

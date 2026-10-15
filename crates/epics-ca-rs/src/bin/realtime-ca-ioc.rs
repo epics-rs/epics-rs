@@ -963,7 +963,9 @@ mod ioc {
         let resolver = Arc::new(std::sync::OnceLock::new());
         let installed = Arc::clone(&resolver);
         let mut builder = IocBuilder::new().register_link_type("ca", move |db| async move {
-            let _ = installed.set(install_calink_resolver(&db).await);
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the exec backend's reactor is process-global");
+            let _ = installed.set(install_calink_resolver(&db, reactor).await);
             Vec::new()
         });
         if db_files.is_empty() {
@@ -1683,7 +1685,7 @@ mod tests {
         let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
         assert!(
-            prod.contains(concat!("install_calink_", "resolver(&db)")),
+            prod.contains(concat!("install_calink_", "resolver(&db, reactor)")),
             "the calink resolver is no longer installed; ` CA`-modified and \
              ca://... record links would silently never resolve, and there is no \
              shell on the target to say so"
@@ -1718,7 +1720,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("this entry point no longer calls `{needle}`"))
         };
         let registered = at(concat!("register_link_", "type(\"ca\", "));
-        let mount = at(concat!("install_calink_", "resolver(&db)"));
+        let mount = at(concat!("install_calink_", "resolver(&db, reactor)"));
         let build = at(concat!("builder.build_", "ioc()"));
         assert!(
             registered < mount && mount < build,

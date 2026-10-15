@@ -111,7 +111,6 @@ async fn a_pv_name_opens_a_local_channel_devaisoftcallback_c_95() {
 }
 
 #[epics_macros_rs::epics_test]
-#[ignore = "the port reads a CA-flagged Async INP over CA; add_record opens it as a local dbChannel"]
 async fn a_ca_flagged_pv_name_reads_the_local_record_devaisoftcallback_c_95() {
     let (db, _) = processed(&["A1"]).await;
     assert_eq!(state(&db, "A1"), (5.0, 0.0, 0.0, 0.0));

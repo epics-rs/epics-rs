@@ -10,7 +10,9 @@ use epics_ca_rs::calink::CaLinkResolver;
 
 #[tokio::test(flavor = "current_thread")]
 async fn get_value_of_an_unconnected_link_on_current_thread_runtime() {
-    let resolver = CaLinkResolver::new();
+    let resolver = CaLinkResolver::new(
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    );
     assert!(
         resolver.get_value(b"NO:SUCH:PV:CALINK").await.is_none(),
         "an unconnected link reads as no value"
@@ -19,7 +21,9 @@ async fn get_value_of_an_unconnected_link_on_current_thread_runtime() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_value_of_an_unconnected_link_on_multi_thread_runtime() {
-    let resolver = CaLinkResolver::new();
+    let resolver = CaLinkResolver::new(
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    );
     assert!(
         resolver.get_value(b"NO:SUCH:PV:CALINK").await.is_none(),
         "an unconnected link reads as no value"

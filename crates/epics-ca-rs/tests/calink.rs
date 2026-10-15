@@ -386,7 +386,11 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // the monitor callback can dispatch CP holders (this
     // fix). Uses its own client, which picks
     // up the pinned env set above.
-    let _resolver = install_calink_resolver(&db).await;
+    let _resolver = install_calink_resolver(
+        &db,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    )
+    .await;
 
     // iocInit step: registers the external CP edge AND warms (opens) the
     // monitor for the Passive holder's source PV.
@@ -717,7 +721,11 @@ async fn install_registers_ca_scheme() {
     pin_env(port);
 
     let db = PvDatabase::new();
-    let _resolver = install_calink_resolver(&db).await;
+    let _resolver = install_calink_resolver(
+        &db,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    )
+    .await;
     let schemes = db.registered_link_schemes().await;
     assert!(
         schemes.contains(&"ca".to_string()),
@@ -801,7 +809,11 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
     // wiring, no feature opt-in.
     let result = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
-        .register_link_type("ca", epics_ca_rs::calink::calink_link_set_install)
+        .register_link_type("ca", {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test is awaited on the IOC's reactor");
+            move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
         .run(|config| async move {
             // By here iocInit has already run `setup_cp_links` and the
             // external-link wait. Poll the holder until the warm's monitor

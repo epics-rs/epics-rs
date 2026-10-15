@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::local::{LocalChannel, LocalMonitor};
 use crate::DbFieldType;
 use crate::client::{CaChannel, CaClient, ConnFold};
 use crate::protocol::{DBE_ALARM, DBE_VALUE};
@@ -120,19 +121,58 @@ pub struct CaLink {
     /// /`getAlarmLimits`/`getPrecision`/`getUnits` (`dbCa.c:697-772`) later
     /// serve.
     meta: Arc<ArcSwap<Option<LinkMetadata>>>,
-    /// The CA channel — kept alive so the monitor stays subscribed.
+    /// The channel — kept alive so the monitor stays subscribed.
     /// Used by the OUT-link write path.
-    channel: Arc<CaChannel>,
+    channel: LinkChannel,
     /// Abort-on-drop handle for the monitor task. Dropping the
     /// `CaLink` stops the task and (via `MonitorHandle::drop`)
     /// unsubscribes the remote monitor.
     _monitor_task: AbortOnDrop,
     /// Abort-on-drop handle for the connection-event watcher task.
     /// Drains `CaChannel::connection_events()` and keeps `connected`
-    /// in sync with the real circuit state.
-    _conn_task: AbortOnDrop,
+    /// in sync with the real circuit state. `None` for a local channel,
+    /// which never disconnects.
+    _conn_task: Option<AbortOnDrop>,
     /// The link's one processor of CP/CPP holders ([`run_processor`]).
     _process_task: AbortOnDrop,
+}
+
+/// The channel a [`CaLink`] holds: C's `chid`, which `ca_create_channel`
+/// hands out from whichever service claimed the name — `dbContext` for a
+/// name the local database serves, the network context otherwise.
+enum LinkChannel {
+    Net(Arc<CaChannel>),
+    Local(Arc<LocalChannel>),
+}
+
+impl LinkChannel {
+    /// `ca_field_type` / `ca_element_count`; `None` while a network channel
+    /// is not connected.
+    fn native(&self) -> Option<(DbFieldType, u32)> {
+        match self {
+            Self::Net(channel) => match (channel.native_field_type(), channel.element_count()) {
+                (Ok(native), Ok(count)) => Some((native, count)),
+                _ => None,
+            },
+            Self::Local(local) => Some((local.native_type(), local.element_count())),
+        }
+    }
+
+    /// `ca_host_name`.
+    async fn host_name(&self) -> Vec<u8> {
+        match self {
+            // C prints whatever `ca_host_name` returns, and for an
+            // unconnected chid libca answers the literal
+            // `"<disconnected>"` (`oldChannelNotify.cpp:189-196`).
+            Self::Net(channel) => channel
+                .host_name()
+                .await
+                .unwrap_or_else(|_| b"<disconnected>".to_vec()),
+            // `cacChannel::getHostName` default, which `dbChannelIO` does
+            // not override: the local host name (`cacChannel.cpp:120-129`).
+            Self::Local(_) => epics_base_rs::runtime::env::ca_local_host_name(),
+        }
+    }
 }
 
 /// The single owner of a `ca://` link's connection-state transition.
@@ -423,17 +463,14 @@ impl CaLink {
     /// current one. A disconnected channel (no current description) is not
     /// servable. Thin wrapper over the pure [`cache_native_matches`].
     fn cache_matches_channel(&self, cached: &CachedSnapshot) -> bool {
-        match (
-            self.channel.native_field_type(),
-            self.channel.element_count(),
-        ) {
-            (Ok(cur_type), Ok(cur_count)) => cache_native_matches(
+        match self.channel.native() {
+            Some((cur_type, cur_count)) => cache_native_matches(
                 cached.snapshot.value.dbr_type(),
                 cached.native_count,
                 cur_type,
                 cur_count,
             ),
-            _ => false,
+            None => false,
         }
     }
 
@@ -527,14 +564,7 @@ impl CaLink {
     pub async fn diagnostics(&self) -> LinkDiagnostics {
         LinkDiagnostics {
             connected: self.connected.is_set(),
-            host: self
-                .channel
-                .host_name()
-                .await
-                // C prints whatever `ca_host_name` returns, and for an
-                // unconnected chid libca answers the literal
-                // `"<disconnected>"` (`oldChannelNotify.cpp:189-196`).
-                .unwrap_or_else(|_| b"<disconnected>".to_vec()),
+            host: self.channel.host_name().await,
             read_access: self.connected.has_read_access(),
             write_access: self.connected.has_write_access(),
             n_disconnect: self.connected.disconnect_count(),
@@ -620,25 +650,25 @@ pub struct CaLinkResolver {
     /// attached after construction — the same shape as `pvalink`'s
     /// `PvaLinkResolver::db`.
     db: Arc<RwLock<Option<PvDatabase>>>,
-}
-
-impl Default for CaLinkResolver {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Where every link task is spawned. Handed in by the owner rather
+    /// than taken from the client, because a link the local database
+    /// serves never creates the client.
+    reactor: task::Reactor,
 }
 
 impl CaLinkResolver {
     /// Build a resolver whose shared [`CaClient`] is created lazily on
-    /// the first link [`Self::open`]. Infallible — an IOC with no CA
-    /// links never constructs a client, and any client-init failure
-    /// surfaces at the first `open` (mirroring `pvalink`'s lazy client),
-    /// so installation cannot fail and never aborts the IOC.
-    pub fn new() -> Self {
+    /// the first link [`Self::open`] of a name the local database does not
+    /// serve. Infallible — an IOC with no such link never constructs a
+    /// client, and any client-init failure surfaces at that `open`
+    /// (mirroring `pvalink`'s lazy client), so installation cannot fail
+    /// and never aborts the IOC.
+    pub fn new(reactor: task::Reactor) -> Self {
         Self {
             client: Arc::new(tokio::sync::OnceCell::new()),
             links: Arc::new(RwLock::new(HashMap::new())),
             db: Arc::new(RwLock::new(None)),
+            reactor,
         }
     }
 
@@ -649,6 +679,7 @@ impl CaLinkResolver {
     /// is bypassed.
     pub fn with_client(client: Arc<CaClient>) -> Self {
         Self {
+            reactor: client.reactor().clone(),
             client: Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
             links: Arc::new(RwLock::new(HashMap::new())),
             db: Arc::new(RwLock::new(None)),
@@ -694,6 +725,89 @@ impl CaLinkResolver {
         if let Some(existing) = self.links.read().get(pv_name.as_bytes()).cloned() {
             return Ok(existing);
         }
+        // `dbContext::createChannel` tries `dbChannel_create` first and
+        // reaches the network context only for a name it refuses
+        // (`dbContext.cpp:87-121`).
+        let db = self.db.read().clone();
+        let local = match db {
+            Some(db) => LocalChannel::create(&db, pv_name.as_bytes()).await,
+            None => None,
+        };
+        let link = match local {
+            Some(local) => self.open_local(local, pv_name.clone())?,
+            None => self.open_net(pv_name.clone()).await?,
+        };
+        // Re-check under the write lock so two concurrent first-callers
+        // converge on one link (the loser's freshly opened link drops,
+        // unsubscribing its monitor).
+        let mut links = self.links.write();
+        if let Some(existing) = links.get(pv_name.as_bytes()).cloned() {
+            return Ok(existing);
+        }
+        links.insert(pv_name, link.clone());
+        Ok(link)
+    }
+
+    /// The link over a channel the local database serves: C `dbChannelIO`,
+    /// connected the moment it is created (`dbChannelIO::initiateConnect`
+    /// calls `connectNotify` synchronously), with full access rights
+    /// (`cacChannel::accessRights` default) and no disconnect to watch.
+    fn open_local(
+        &self,
+        local: LocalChannel,
+        pv_name: RecordName,
+    ) -> Result<Arc<CaLink>, CaLinkError> {
+        let local = Arc::new(local);
+        let native = local.native_type();
+        let native_count = local.element_count();
+        // The `DBR_TIME` native monitor `dbCa` asks for (`dbCa.c:1225-1229`),
+        // the first event being the current value (`dbSubscriptionIO`).
+        let monitor = local
+            .subscribe(native.time_dbr_type(), CALINK_EVENT_MASK)
+            .map_err(|e| CaLinkError::Subscribe {
+                pv: pv_name.to_string(),
+                reason: format!("{e:?}"),
+            })?;
+        let connected = Arc::new(LinkConnState::new(self.db.clone(), pv_name.clone()));
+        connected.mark_connected();
+        // `CA_GET_ATTRIBUTES`, which `connectionCallback` schedules on the
+        // connect: the same two gets `fetch_link_metadata` makes, answered
+        // synchronously by `dbContextReadNotifyCache`.
+        let attrs = (native != DbFieldType::String)
+            .then(|| local.read(DBR_CTRL_DOUBLE, 1))
+            .flatten();
+        let labels = (native == DbFieldType::Enum)
+            .then(|| local.read(native.ctrl_dbr_type(), 1))
+            .flatten();
+        let meta = Arc::new(ArcSwap::from_pointee(Some(build_link_metadata(
+            Some(native),
+            Some(native_count),
+            attrs.as_ref(),
+            labels.as_ref(),
+        ))));
+        let cache: Arc<ArcSwap<Option<CachedSnapshot>>> = Arc::new(ArcSwap::from_pointee(None));
+        let process_task = self.reactor.spawn(run_processor(connected.clone()));
+        let monitor_task = self.reactor.spawn(run_local_monitor(
+            monitor,
+            cache.clone(),
+            connected.clone(),
+            native_count,
+            pv_name,
+        ));
+        Ok(Arc::new(CaLink {
+            cache,
+            connected,
+            meta,
+            channel: LinkChannel::Local(local),
+            _monitor_task: AbortOnDrop(monitor_task),
+            _conn_task: None,
+            _process_task: AbortOnDrop(process_task),
+        }))
+    }
+
+    /// The link over a network channel, for a name the local database
+    /// does not serve.
+    async fn open_net(&self, pv_name: RecordName) -> Result<Arc<CaLink>, CaLinkError> {
         // The receiver is taken with the channel, before its search starts:
         // an `AccessRightsChanged` / `Connected` pair published ahead of the
         // watcher is lost for good — `meta` stays empty and the write right
@@ -725,7 +839,7 @@ impl CaLinkResolver {
         // disconnects (mirrors `pvalink`'s `monitor_connected` flag), and
         // re-fetches the remote CTRL attributes into `meta` on each
         // connect.
-        let reactor = self.client().await?.reactor().clone();
+        let reactor = &self.reactor;
         let conn_task = reactor.spawn(run_connection_watcher(
             reactor.clone(),
             conn_rx,
@@ -742,24 +856,15 @@ impl CaLinkResolver {
             channel.clone(),
             pv_name.clone(),
         ));
-        let link = Arc::new(CaLink {
+        Ok(Arc::new(CaLink {
             cache,
             connected,
             meta,
-            channel,
+            channel: LinkChannel::Net(channel),
             _monitor_task: AbortOnDrop(monitor_task),
-            _conn_task: AbortOnDrop(conn_task),
+            _conn_task: Some(AbortOnDrop(conn_task)),
             _process_task: AbortOnDrop(process_task),
-        });
-        // Re-check under the write lock so two concurrent first-callers
-        // converge on one link (the loser's freshly opened link drops,
-        // unsubscribing its monitor).
-        let mut links = self.links.write();
-        if let Some(existing) = links.get(pv_name.as_bytes()).cloned() {
-            return Ok(existing);
-        }
-        links.insert(pv_name, link.clone());
-        Ok(link)
+        }))
     }
 
     /// Wait until the CA link for `pv_name` has received at least one
@@ -923,6 +1028,28 @@ async fn run_monitor(
     // Subscription ended (channel dropped). Reflect the disconnect —
     // through the owner, so the CP holders are processed here too.
     connected.mark_disconnected();
+}
+
+/// [`run_monitor`] for a local channel: C `dbContext`'s event task
+/// handing each `dbSubscriptionIO` event to `dbCa`'s `eventCallback`.
+async fn run_local_monitor(
+    mut monitor: LocalMonitor,
+    cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
+    connected: Arc<LinkConnState>,
+    native_count: u32,
+    pv_name: RecordName,
+) {
+    while let Some(event) = monitor.next().await {
+        match event {
+            Some(snapshot) => note_monitor_value(&cache, &connected, snapshot, native_count),
+            // `callStateNotify`'s `ECA_GETFAIL` exception: C `dbCa` keeps the
+            // last value, as for a network monitor error.
+            None => tracing::debug!(
+                pv = %pv_name,
+                "calink: local monitor event not deliverable, keeping last cached value"
+            ),
+        }
+    }
 }
 
 /// Connection-event watcher: keep `connected` in sync with the CA
@@ -1279,7 +1406,6 @@ impl LinkSet for CaLinkResolver {
             .link_for(name)
             .await
             .ok_or_else(|| format!("CA link {} not open", String::from_utf8_lossy(name)))?;
-        let channel = link.channel.clone();
         // The clamp C applies before the CA request is ever built:
         // `dbCaPutLinkCallback` converts the caller's buffer to the
         // channel's native type and bounds the request to the channel's
@@ -1300,8 +1426,8 @@ impl LinkSet for CaLinkResolver {
         // already clamped. Clamping the converted value keeps
         // `validate_put_count` unreachable from this path by
         // construction rather than by a second bound inside the client.
-        let value = match (channel.native_field_type(), channel.element_count()) {
-            (Ok(native), Ok(nelements)) => {
+        let value = match link.channel.native() {
+            Some((native, nelements)) => {
                 let mut converted = value.into_type(native);
                 converted.truncate(nelements as usize);
                 converted
@@ -1309,13 +1435,16 @@ impl LinkSet for CaLinkResolver {
             // No native description yet: the channel is not operational,
             // so there is nothing to clamp against and the write below
             // reports the disconnect itself.
-            _ => value,
+            None => value,
         };
-        match op {
-            LinkPutOp::Plain => channel.put_nowait(&value).await,
-            LinkPutOp::Async => channel.put(&value).await,
+        match &link.channel {
+            LinkChannel::Net(channel) => match op {
+                LinkPutOp::Plain => channel.put_nowait(&value).await,
+                LinkPutOp::Async => channel.put(&value).await,
+            }
+            .map_err(|e| e.to_string()),
+            LinkChannel::Local(local) => local.write(value, op).await,
         }
-        .map_err(|e| e.to_string())
     }
 
     fn alarm_severity(&self, name: &[u8]) -> Option<i32> {
@@ -1390,8 +1519,8 @@ fn strip_ca_scheme(name: &[u8]) -> &[u8] {
 /// and never fails — a database with no CA links is fully serviceable
 /// and an IOC must not be aborted by CA-client init. This is the
 /// CA-side twin of the bridge's infallible `install_pvalink_resolver`.
-pub async fn install_calink_resolver(db: &PvDatabase) -> CaLinkResolver {
-    let resolver = CaLinkResolver::new();
+pub async fn install_calink_resolver(db: &PvDatabase, reactor: task::Reactor) -> CaLinkResolver {
+    let resolver = CaLinkResolver::new(reactor);
     // Attach the DB before registering the lset, so the monitor callback
     // can request the holders' process from the first event on.
     // This runs before iocInit's `setup_cp_links` warms any external CP

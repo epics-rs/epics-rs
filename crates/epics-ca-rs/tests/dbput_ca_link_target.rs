@@ -77,7 +77,11 @@ async fn a_ca_out_link_writes_a_local_target_and_alarms_on_an_unresolved_one() {
         std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
     }
     let db = server.database().clone();
-    let resolver = install_calink_resolver(&db).await;
+    let resolver = install_calink_resolver(
+        &db,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    )
+    .await;
     // iocInit's open pass, which the build ran before the link set existed:
     // C opens every CA link at `dbCaAddLink`, so the first put through an
     // unresolved one is already refused (`dbCa.c:558-560`).

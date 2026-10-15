@@ -147,8 +147,11 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     // spelling, kept for order fidelity), then the CP warm-up that stages
     // this link's open, then the stage for everything else.
     let downstream = build_db(DOWNSTREAM_DB);
-    let resolver = block_on_sync(install_calink_resolver(&downstream))
-        .expect("no async runtime entered on this test thread");
+    let resolver = block_on_sync(install_calink_resolver(
+        &downstream,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    ))
+    .expect("no async runtime entered on this test thread");
     block_on_sync(async {
         downstream.initialize_link_locality().await;
         downstream.setup_cp_links().await;

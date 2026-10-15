@@ -868,9 +868,14 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
     // than at the function head costs nothing and keeps one call site.
     app = epics_ca_rs::server::iocsh::register_rsrv_commands(app);
     // C's dbCa is linked into every softIoc. The `ca` link set installs at
-    // `AfterCaLinkInit`; its client is made on the first link open, so a
-    // database with no CA link starts no thread and opens no socket.
-    app = app.register_link_type("ca", epics_ca_rs::calink::calink_link_set_install);
+    // `AfterCaLinkInit`; its client is made on the first link to a name the
+    // database does not serve, so a database with no such link starts no
+    // thread and opens no socket.
+    app = app.register_link_type("ca", {
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("run_ioc_app is awaited on the IOC's reactor");
+        move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+    });
     if let Some(port) = args.port {
         app = app.port(port);
     }

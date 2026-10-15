@@ -98,29 +98,7 @@ pub(super) fn apply_native_long_string(
     }
 }
 
-/// How a channel presents a long-string field on the CA wire. `$`-access
-/// and plain access to a long-string *record* field are mutually
-/// exclusive boundary conversions, so they share one mode rather than two
-/// booleans — the illegal "both at once" state cannot be constructed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum LongStringMode {
-    /// Ordinary field: deliver the value verbatim.
-    Plain,
-    /// Client appended `$`: the field is delivered as C's `DBR_CHAR`
-    /// address of it, `no_elements` long (`dbAccess.c:682-701`). See
-    /// [`apply_long_string`].
-    DollarChar {
-        no_elements: u32,
-        nul_at_count: bool,
-        /// The `DBR_CHAR` image the channel's post chain runs on.
-        view: epics_base_rs::server::database::char_view::DollarView,
-    },
-    /// Plain access to a long-string *record* field (lsi/lso VAL & OVAL,
-    /// printf VAL): C `cvt_dbaddr` presents it as a scalar `DBF_STRING`,
-    /// so the CHAR-array carrier is decoded to a scalar string before
-    /// encoding. See [`apply_native_long_string`].
-    NativeString,
-}
+pub(crate) use epics_base_rs::server::database::channel_io::LongStringMode;
 
 /// Apply the boundary conversion selected by `mode` to a delivery
 /// snapshot before DBR encoding.
@@ -291,7 +269,11 @@ impl DeliveryStage {
 #[cfg(tokio_backend)]
 pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
     iocsh::register_rsrv_commands(app)
-        .register_link_type("ca", crate::calink::calink_link_set_install)
+        .register_link_type("ca", {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("run_ca_ioc_app is awaited on the IOC's reactor");
+            move |db| crate::calink::calink_link_set_install(db, reactor)
+        })
         .run(run_ca_ioc)
         .await
 }

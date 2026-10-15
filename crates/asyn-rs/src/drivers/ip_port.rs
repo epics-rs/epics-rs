@@ -1247,6 +1247,18 @@ pub(crate) fn would_block_text() -> String {
     sock_err_text(&std::io::Error::from_raw_os_error(errno))
 }
 
+/// The errno C's non-blocking `connect()` leaves for a pending handshake, which
+/// is the one its "Can't connect" text names (drvAsynIPPort.c:534-541):
+/// `EINPROGRESS`, and `WSAEWOULDBLOCK` on WIN32.
+#[cfg(test)]
+fn connect_in_progress_text() -> String {
+    #[cfg(unix)]
+    let errno = libc::EINPROGRESS;
+    #[cfg(windows)]
+    let errno = windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK;
+    sock_err_text(&std::io::Error::from_raw_os_error(errno))
+}
+
 /// C's `TCP_NODELAY` failure after the connect (drvAsynIPPort.c:580-589).
 fn nodelay_failure_text(device: &str, e: &std::io::Error) -> String {
     format!(
@@ -3573,7 +3585,10 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(
             err.message(),
-            "Can't connect to 192.0.2.1:9: Operation now in progress"
+            format!(
+                "Can't connect to 192.0.2.1:9: {}",
+                connect_in_progress_text()
+            )
         );
 
         set_auto_connect_timeout(1.0);
@@ -3585,7 +3600,10 @@ mod tests {
         );
         assert_eq!(
             err.message(),
-            "Can't connect to 192.0.2.1:9: Operation now in progress"
+            format!(
+                "Can't connect to 192.0.2.1:9: {}",
+                connect_in_progress_text()
+            )
         );
     }
 
@@ -3606,7 +3624,10 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(
             err.message(),
-            format!("Can't connect to 127.0.0.1:{port}: Operation now in progress")
+            format!(
+                "Can't connect to 127.0.0.1:{port}: {}",
+                connect_in_progress_text()
+            )
         );
     }
 

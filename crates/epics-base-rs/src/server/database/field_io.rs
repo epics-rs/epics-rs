@@ -2805,6 +2805,9 @@ impl PvDatabase {
             &via,
             PutVia::DbPutField { link, common, .. } if link.is_some() || common.is_some()
         );
+        let before = link_put
+            .then(|| Self::link_before_put(&instance, field))
+            .flatten();
         // Refused before `dbPutSpecial(paddr, 0)` returns: neither pass runs.
         let pass0 = match &mut via {
             PutVia::DbPut => check_not_link_field(field, at.field().desc, &value, tail)
@@ -2813,6 +2816,7 @@ impl PvDatabase {
         }
         .and_then(|()| instance.record.special(field, false));
         if let Err(e) = pass0 {
+            self.remove_put_link(&instance, field, before);
             set_refused_processes(&mut via, &instance, field);
             return Err(e);
         }
@@ -2883,6 +2887,7 @@ impl PvDatabase {
                 Err(e) => status = Err(e),
             }
         }
+        self.remove_put_link(&instance, field, before);
         if status.is_ok() && link_put {
             self.open_put_link(&mut instance, field);
         }

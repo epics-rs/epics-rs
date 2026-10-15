@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::{
-    LinkForward, LinkForwardRefused, LinkOpen, LinkPutOp, LinkSet, PvDatabase,
+    LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkSet, PvDatabase,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -21,7 +21,7 @@ struct Opens {
 
 #[async_trait::async_trait]
 impl LinkSet for Opens {
-    fn open_link(&self, name: &[u8]) -> LinkOpen {
+    fn open_link(&self, _: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
         self.opened
             .lock()
             .push(String::from_utf8_lossy(name).into_owned());

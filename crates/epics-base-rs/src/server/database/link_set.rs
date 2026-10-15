@@ -355,6 +355,34 @@ pub struct RemoteAlarm {
     pub message: Arc<str>,
 }
 
+/// The record field a link lives in — C's `plink->precord` and
+/// `dbLinkFieldName(plink)`, which pvxs `pvaOpenLink` keeps on its `pvaLink`
+/// to scan the holder on a monitor event (`pvalink_lset.cpp:91-92`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkHolder<'a> {
+    pub record: &'a [u8],
+    pub field: &'a str,
+    class: Option<crate::types::DbfLinkClass>,
+}
+
+impl<'a> LinkHolder<'a> {
+    /// `record`'s `field`, of a `record_type` record.
+    pub fn new(record_type: &str, record: &'a [u8], field: &'a str) -> Self {
+        Self {
+            record,
+            field,
+            class: crate::types::dbf_link_class(record_type, field),
+        }
+    }
+
+    /// The field's declared link class — what pvxs keeps as
+    /// `pvaLink::type` (`getLinkType`, `pvalink_lset.cpp:52-62`). `None` for
+    /// a field the type does not declare as a link.
+    pub fn class(&self) -> Option<crate::types::DbfLinkClass> {
+        self.class
+    }
+}
+
 /// What an lset's [`LinkSet::open_link`] left the link with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkOpen {
@@ -481,9 +509,18 @@ pub trait LinkSet: Send + Sync {
     /// [`PvDatabase::has_name_no_resolve`](super::PvDatabase::has_name_no_resolve).
     ///
     /// [`ParsedLink::Removed`]: crate::server::record::ParsedLink::Removed
-    fn open_link(&self, name: &[u8]) -> LinkOpen {
-        let _ = name;
+    fn open_link(&self, holder: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
+        let _ = (holder, name);
         LinkOpen::Lset
+    }
+
+    /// C `lset->removeLink` (`dbLink.c:202-213`), from `dbPutFieldLink`'s
+    /// `dbRemoveLink` (`dbAccess.c:1167`): `holder` no longer carries the
+    /// link `name` that [`Self::open_link`] opened for it. Asked under the
+    /// put's hold, once the put has replaced or removed the link, before the
+    /// open of whatever replaced it. MUST NOT perform I/O.
+    fn remove_link(&self, holder: LinkHolder<'_>, name: &[u8]) {
+        let _ = (holder, name);
     }
 
     /// Open (subscribe / connect) `name` so later

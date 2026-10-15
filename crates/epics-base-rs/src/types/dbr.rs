@@ -379,7 +379,7 @@ impl DbFieldType {
 /// `dbf_link_class(..).is_some()` (or [`is_link_dbf_type`] when they
 /// already hold a dbStatic code), rather than maintaining their own
 /// partial spelling lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum DbfLinkClass {
     /// `DBF_INLINK` (14) — an input link (`INP`, `DOL`, `SIML`, …).

@@ -25,13 +25,13 @@ use std::sync::Arc;
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    ExternalPvResolver, LinkForward, LinkForwardRefused, LinkPutOp, LinkSet, PutAdmission,
-    PvDatabase,
+    ExternalPvResolver, LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkSet,
+    PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::record::{
     JlinkValue, PVAJSON_IDENTITY_SEP, pvajson_identity_key, pvajson_identity_parts,
 };
-use epics_base_rs::types::{EpicsValue, RecordName};
+use epics_base_rs::types::{DbfLinkClass, EpicsValue, RecordName};
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
 use super::config::{LinkDirection, PvaLinkConfig, PvaLinkParseError};
@@ -102,6 +102,14 @@ pub struct PvaLinkResolver {
     /// variants of one PV each get their own forwarder draining their
     /// own monitor receiver.
     forwarders: Arc<parking_lot::Mutex<std::collections::HashSet<MonitorKey>>>,
+    /// The link each record field carries — pvxs's `pvaLink` on its
+    /// channel's `links`. The one owner of a holder's back-index entry and
+    /// CP/CPP scan target: [`Self::attach`] replaces whatever the holder
+    /// carried, [`Self::detach`] removes it, so no open can leave a holder
+    /// scanned by a channel it no longer links.
+    holders: Arc<parking_lot::Mutex<std::collections::HashMap<Holder, Attached>>>,
+    /// Source of [`Attached::id`].
+    next_attach: Arc<std::sync::atomic::AtomicU64>,
     /// B4 `local`: optional handle to the QSRV provider's name
     /// registry. When the IOC also runs QSRV (the common dual-server
     /// deployment), a `local=true` link may target a QSRV group
@@ -146,6 +154,61 @@ impl MonitorKey {
     }
 }
 
+/// A record field carrying a pvalink: `plink->precord` and its field.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Holder {
+    record: RecordName,
+    field: Box<str>,
+    class: Option<DbfLinkClass>,
+}
+
+impl From<LinkHolder<'_>> for Holder {
+    fn from(h: LinkHolder<'_>) -> Self {
+        Self {
+            record: RecordName::from(h.record),
+            field: h.field.into(),
+            class: h.class(),
+        }
+    }
+}
+
+impl Holder {
+    /// pvxs `pvaLink::scanOnUpdate` (`pvxs/ioc/pvalink_link.cpp:122-133`):
+    /// only a `DBF_INLINK` with `proc=CP`/`CPP` scans its record; an output
+    /// or forward link never does, whatever its `proc`.
+    fn scans_on_update(&self, cfg: &PvaLinkConfig) -> bool {
+        self.class == Some(DbfLinkClass::InLink) && cfg.scan_on_update
+    }
+}
+
+/// The link a [`Holder`] carries.
+struct Attached {
+    cfg: LinkCfg,
+    state: Attachment,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attachment {
+    /// On its channel's back-index and fan-out. The id tells this
+    /// attachment from a later one of the same holder, for an open that
+    /// finishes after the holder moved on.
+    Open(u64),
+    /// Refused by the `local` gate: pvxs's `plink->lset = NULL`
+    /// (`pvxs/ioc/pvalink_lset.cpp:70-75`), registered nowhere until a put
+    /// replaces it.
+    Refused,
+}
+
+/// The direction pvalink gives a link of `class`: a `DBF_OUTLINK` writes,
+/// every other link — `FLNK` included, see [`install_pvalink_resolver`] —
+/// keeps the INP config.
+fn holder_direction(class: Option<DbfLinkClass>) -> LinkDirection {
+    match class {
+        Some(DbfLinkClass::OutLink) => LinkDirection::Out,
+        _ => LinkDirection::Inp,
+    }
+}
+
 /// Per-monitor-variant scan-on-update fan-out state (B3).
 #[derive(Default)]
 struct ScanFanout {
@@ -159,6 +222,9 @@ struct ScanFanout {
 /// One record bound to a CP/CPP pvalink (B3).
 struct ScanTarget {
     record: RecordName,
+    /// The holder field, so [`PvaLinkResolver::detach`] removes this link's
+    /// target and no sibling field's.
+    field: Box<str>,
     /// pvxs `pvaLinkConfig::monorder` — lower scans first within one
     /// monitor batch.
     monorder: i32,
@@ -196,6 +262,8 @@ impl PvaLinkResolver {
             db,
             scan_targets: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             forwarders: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            holders: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            next_attach: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "qsrv-core")]
             qsrv,
         }
@@ -283,16 +351,15 @@ impl PvaLinkResolver {
     pub async fn open_link_for_record(
         &self,
         link_string: &str,
-        record: impl AsRef<[u8]>,
+        holder: LinkHolder<'_>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
-        self.open_link_inner(link_string, Some(RecordName::from(record.as_ref())))
-            .await
+        self.open_link_inner(link_string, Some(holder.into())).await
     }
 
     async fn open_link_inner(
         &self,
         link_string: &str,
-        record: Option<RecordName>,
+        holder: Option<Holder>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Inp)?;
         // Convenience-URI path: key the per-link options by the full
@@ -302,7 +369,7 @@ impl PvaLinkResolver {
         let options_key = strip_scheme(link_string.as_bytes())
             .unwrap_or(link_string)
             .to_string();
-        self.open_inp_cfg(cfg, options_key, record).await
+        self.open_inp_cfg(cfg, options_key, holder).await
     }
 
     /// Like [`Self::open_link_for_record`] but for a link parsed from
@@ -323,11 +390,11 @@ impl PvaLinkResolver {
         &self,
         pv: &str,
         options: &[(String, JlinkValue)],
-        record: impl AsRef<[u8]>,
+        holder: LinkHolder<'_>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Inp)?;
         let options_key = pvajson_identity_key(pv, options);
-        self.open_inp_cfg(cfg, options_key, Some(RecordName::from(record.as_ref())))
+        self.open_inp_cfg(cfg, options_key, Some(holder.into()))
             .await
     }
 
@@ -342,21 +409,21 @@ impl PvaLinkResolver {
         &self,
         cfg: PvaLinkConfig,
         options_key: String,
-        record: Option<RecordName>,
+        holder: Option<Holder>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         // An INP link that is meaningful for the resolver must keep a
         // monitor open; force it on (pvxs treats `proc=CP/CPP` and the
         // resolver path as monitored).
-        let cfg = PvaLinkConfig {
-            monitor: true,
-            ..cfg
-        };
+        let cfg = entry(cfg, LinkDirection::Inp);
+        let attached = holder
+            .as_ref()
+            .and_then(|h| self.attach(h, &cfg).map(|id| (h, id)));
         // B4 `local`: a `local`-flagged link must resolve a PV served by
         // *this* IOC. Reject up-front so the operator gets a clear error
         // instead of a silent remote resolution. The identical gate runs
         // on the OUT open and lazy-write paths — see
         // [`ChannelOpener::check_local_admission`].
-        self.opener.check_local_admission(&cfg).await?;
+        self.admit(holder.as_ref(), &cfg).await?;
         // Register the per-link options under the caller-chosen key:
         // the full scheme-stripped link string for the convenience-URI
         // path (two links to the same PV with different options each keep
@@ -368,61 +435,159 @@ impl PvaLinkResolver {
         // pvxs equivalent: each `pvaLink` carries its own `pvaLinkConfig`
         // (`pvxs/ioc/pvalink.h:65`). The registry key shares the channel
         // by (pv_name, pipeline, queue_size) per `pvxs/ioc/pvalink.h:116`.
-        self.link_options
-            .write()
-            .insert(options_key, entry(cfg.clone(), LinkDirection::Inp));
-        // Record the owning record on this channel's back-index (every
-        // INP link, not just CP/CPP scan targets) so `dbpvar` can filter
-        // channels by record-name glob, matching pvxs's
-        // `pvaLinkChannel::links` (`pvxs/ioc/pvalink.cpp:216-231`).
-        if let Some(rec) = &record {
-            self.registry.attach_record(&cfg, rec);
-        }
-        // B3: register the scan-on-update target before opening so the
-        // forwarder spawned below already sees it. Keyed by the monitor
-        // variant identity, NOT bare PV name, so a `Q=1` record's scan
-        // targets are not merged with a `Q=64` sibling's
-        // (pvxs keys links onto their channel
-        // by `(channelName, pvRequest)`, `pvxs/ioc/pvalink.h:116-120`).
-        let monitor_key = MonitorKey::from_config(&cfg);
-        // Track the newly-attached scan target so an attach-time scan
-        // can fire below once the (possibly reused) channel is known
-        // connected. `(record, passive_only)`.
-        let attach_target: Option<(RecordName, bool)> = match record {
-            Some(rec) if cfg.scan_on_update => {
-                self.scan_targets
-                    .write()
-                    .entry(monitor_key.clone())
-                    .or_default()
-                    .records
-                    .push(ScanTarget {
-                        record: rec.clone(),
-                        monorder: cfg.monorder,
-                        atomic: cfg.atomic,
-                        passive_only: cfg.scan_on_passive,
-                    });
-                Some((rec, cfg.scan_on_passive))
-            }
-            _ => None,
-        };
+        self.link_options.write().insert(options_key, cfg.clone());
         let link = self.opener.open(&cfg).await?;
-        self.spawn_notify_forwarder(monitor_key, &link);
-        // Attach-time scan (`pvxs/ioc/pvalink_lset.cpp:148-167`,
-        // `scanOnce(plink->precord)`): when the shared channel is
-        // ALREADY connected at attach, fire one immediate scan of just
-        // the newly attached record. This is observably needed on the
-        // reuse-of-an-already-connected-monitor path —
-        // `spawn_notify_forwarder` returned early without wiring a
-        // fresh first-event scan for this record, so without this the
-        // record stays unprocessed until the next upstream update. A
-        // freshly-opened monitor variant is not yet connected here and
-        // gets its first scan from the monitor task's `on_event`.
-        if let Some((rec, passive_only)) = attach_target {
-            if link.is_connected() {
-                self.scan_attached_record(&rec, passive_only).await;
-            }
+        if let Some((holder, id)) = attached {
+            self.finish_inp_attach(holder, &cfg, id, &link).await;
+        } else {
+            self.spawn_notify_forwarder(MonitorKey::from_config(&cfg), &link);
         }
         Ok(link)
+    }
+
+    /// pvxs `pvaOpenLink`'s attach (`pvxs/ioc/pvalink_lset.cpp:139-171`)
+    /// for `holder`: whatever link it carried is [`Self::detach`]ed, then
+    /// `cfg`'s channel gets the record on its back-index and, for an INP
+    /// `proc=CP`/`CPP` link, as a scan target. `None` when the holder
+    /// already carries this very link, open or refused — the iocInit open
+    /// of a link the install scan attached — so nothing is attached or
+    /// reported twice.
+    fn attach(&self, holder: &Holder, cfg: &LinkCfg) -> Option<u64> {
+        let mut holders = self.holders.lock();
+        if holders.get(holder).is_some_and(|a| *a.cfg == **cfg) {
+            return None;
+        }
+        if let Some(old) = holders.remove(holder) {
+            self.unregister(holder, &old);
+        }
+        self.registry.attach_record(cfg, holder.record.as_bytes());
+        // B3: keyed by the monitor variant identity, NOT bare PV name, so
+        // a `Q=1` record's scan targets are not merged with a `Q=64`
+        // sibling's (pvxs keys links onto their channel by
+        // `(channelName, pvRequest)`, `pvxs/ioc/pvalink.h:116-120`).
+        if cfg.direction == LinkDirection::Inp && holder.scans_on_update(cfg) {
+            self.scan_targets
+                .write()
+                .entry(MonitorKey::from_config(cfg))
+                .or_default()
+                .records
+                .push(ScanTarget {
+                    record: holder.record.clone(),
+                    field: holder.field.clone(),
+                    monorder: cfg.monorder,
+                    atomic: cfg.atomic,
+                    passive_only: cfg.scan_on_passive,
+                });
+        }
+        let id = self
+            .next_attach
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        holders.insert(
+            holder.clone(),
+            Attached {
+                cfg: cfg.clone(),
+                state: Attachment::Open(id),
+            },
+        );
+        Some(id)
+    }
+
+    /// The `local` gate ([`ChannelOpener::check_local_admission`]); a link
+    /// it refuses stays on `holder` as [`Attachment::Refused`].
+    async fn admit(&self, holder: Option<&Holder>, cfg: &PvaLinkConfig) -> PvaLinkResult<()> {
+        let admitted = self.opener.check_local_admission(cfg).await;
+        if admitted.is_err()
+            && let Some(holder) = holder
+        {
+            self.refuse(holder, cfg);
+        }
+        admitted
+    }
+
+    /// `holder`'s link `cfg` has no lset from here on.
+    fn refuse(&self, holder: &Holder, cfg: &PvaLinkConfig) {
+        let mut holders = self.holders.lock();
+        if let Some(attached) = holders.get_mut(holder).filter(|a| *a.cfg == *cfg) {
+            self.unregister(holder, attached);
+            attached.state = Attachment::Refused;
+        }
+    }
+
+    /// pvxs `pvaRemoveLink` → `~pvaLink` (`pvxs/ioc/pvalink_link.cpp:27-35`):
+    /// `holder` leaves its channel's `links`, so that channel's monitor no
+    /// longer scans it. `cfg` names the link being removed; a holder that
+    /// has since moved to another link keeps it.
+    fn detach(&self, holder: &Holder, cfg: &PvaLinkConfig) {
+        let mut holders = self.holders.lock();
+        if holders.get(holder).is_some_and(|a| *a.cfg == *cfg)
+            && let Some(old) = holders.remove(holder)
+        {
+            self.unregister(holder, &old);
+        }
+    }
+
+    /// Undo what [`Self::attach`] registered for `holder`'s link, if it is
+    /// open. Called under the `holders` lock.
+    fn unregister(&self, holder: &Holder, attached: &Attached) {
+        if attached.state == Attachment::Refused {
+            return;
+        }
+        let cfg = &*attached.cfg;
+        self.registry.detach_record(cfg, holder.record.as_bytes());
+        if let Some(fanout) = self
+            .scan_targets
+            .write()
+            .get_mut(&MonitorKey::from_config(cfg))
+        {
+            fanout
+                .records
+                .retain(|t| !(t.record == holder.record && t.field == holder.field));
+        }
+    }
+
+    /// Whether `holder` still carries attachment `id`.
+    fn is_attached(&self, holder: &Holder, id: u64) -> bool {
+        self.holders
+            .lock()
+            .get(holder)
+            .is_some_and(|a| a.state == Attachment::Open(id))
+    }
+
+    /// The rest of an INP attach once its channel is open: the variant's
+    /// forwarder, then the attach-time scan
+    /// (`pvxs/ioc/pvalink_lset.cpp:148-167`, `scanOnce(plink->precord)`):
+    /// when the shared channel is ALREADY connected at attach, fire one
+    /// immediate scan of just this holder. A freshly-opened monitor
+    /// variant is not yet connected here and gets its first scan from the
+    /// monitor task's `on_event`.
+    async fn finish_inp_attach(
+        &self,
+        holder: &Holder,
+        cfg: &PvaLinkConfig,
+        id: u64,
+        link: &Arc<PvaLink>,
+    ) {
+        self.spawn_notify_forwarder(MonitorKey::from_config(cfg), link);
+        if holder.scans_on_update(cfg) && link.is_connected() && self.is_attached(holder, id) {
+            self.scan_attached_record(&holder.record, cfg.scan_on_passive)
+                .await;
+        }
+    }
+
+    /// The open [`LinkSet::open_link`] stages for attachment `id`, on the
+    /// reactor: the `local` gate, the channel, and for an INP link the
+    /// rest of [`Self::finish_inp_attach`]. Reports nothing: the install
+    /// scan is what prints a refused link's line.
+    async fn open_attached(&self, holder: Holder, cfg: LinkCfg, id: u64) {
+        if self.admit(Some(&holder), &cfg).await.is_err() {
+            return;
+        }
+        let Ok(link) = self.opener.open(&cfg).await else {
+            return;
+        };
+        if cfg.direction == LinkDirection::Inp {
+            self.finish_inp_attach(&holder, &cfg, id, &link).await;
+        }
     }
 
     /// B3: spawn the monitor-notification forwarder, at most once per
@@ -504,14 +669,14 @@ impl PvaLinkResolver {
     pub async fn open_out_link(
         &self,
         link_string: &str,
-        record: Option<&[u8]>,
+        holder: Option<LinkHolder<'_>>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Out)?;
         // key by full link string (same rationale as open_link_inner).
         let options_key = strip_scheme(link_string.as_bytes())
             .unwrap_or(link_string)
             .to_string();
-        self.open_out_cfg(cfg, options_key, record).await
+        self.open_out_cfg(cfg, options_key, holder).await
     }
 
     /// OUT counterpart of [`Self::open_json_link_for_record`]: open an
@@ -527,11 +692,11 @@ impl PvaLinkResolver {
         &self,
         pv: &str,
         options: &[(String, JlinkValue)],
-        record: Option<&[u8]>,
+        holder: Option<LinkHolder<'_>>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Out)?;
         let options_key = pvajson_identity_key(pv, options);
-        self.open_out_cfg(cfg, options_key, record).await
+        self.open_out_cfg(cfg, options_key, holder).await
     }
 
     /// Register an OUT link's options under `options_key` and open/cache
@@ -543,21 +708,23 @@ impl PvaLinkResolver {
         &self,
         cfg: PvaLinkConfig,
         options_key: String,
-        record: Option<&[u8]>,
+        holder: Option<LinkHolder<'_>>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         // `local`-admission gate before any registration or open, so a
         // rejected `local=true` OUT link leaves no stale option entry and
         // never opens — or reuses a sibling's already-open — remote
         // channel (pvxs `pvaOpenLink`, direction-agnostic).
-        self.opener.check_local_admission(&cfg).await?;
-        self.out_link_options
-            .write()
-            .insert(options_key, Arc::new(cfg.clone()));
+        let cfg = entry(cfg, LinkDirection::Out);
+        let holder = holder.map(Holder::from);
         // Back-index the owning record for `dbpvar`'s record-name glob
         // filter (pvxs `pvaLinkChannel::links`).
-        if let Some(rec) = record {
-            self.registry.attach_record(&cfg, rec);
+        if let Some(holder) = &holder {
+            self.attach(holder, &cfg);
         }
+        self.admit(holder.as_ref(), &cfg).await?;
+        self.out_link_options
+            .write()
+            .insert(options_key, cfg.clone());
         self.opener.open(&cfg).await
     }
 
@@ -778,14 +945,21 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
     // (`pvxs/ioc/pvalink_lset.cpp:672-688`), and pvxs' own test helper accepts
     // `DBF_FWDLINK` as a pvalink field (`pvxs/ioc/pvalink.cpp:117-127`).
     //
-    // An `FLNK` takes the non-`OUT` arm below on purpose even though a pvxs
+    // An `FLNK` takes the INP arm below on purpose even though a pvxs
     // forward link ends in a Put: [`PvaLinkResolver::forward_handle`] opens
     // the target through `inp_cfg_for` / `get_or_open`, i.e. the INP config and
     // registry entry this arm creates (pvxs' `pvaLinkChannel` always monitors).
     // Routing `FLNK` to `open_out_link` would register its options under the
     // OUT map, where the forward dispatch would never find them.
     for record_name in db.all_record_names().await {
+        let Some(record_type) = db
+            .get_record(&record_name)
+            .map(|rec| rec.read().record.record_type())
+        else {
+            continue;
+        };
         for (field_name, _raw, parsed) in db.record_link_fields(&record_name) {
+            let holder = LinkHolder::new(record_type, record_name.as_bytes(), &field_name);
             match &parsed {
                 // Convenience-URI / legacy-suffix form: the verbatim
                 // channel-name string may carry options in the
@@ -811,12 +985,11 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // banner reported 1 link for 3 link-bearing records.
                 ParsedLink::Pva(s) => {
                     let link_str = format!("pva://{s}");
-                    let opened = if field_name == "OUT" {
-                        resolver
-                            .open_out_link(&link_str, Some(record_name.as_bytes()))
-                            .await
-                    } else {
-                        resolver.open_link_for_record(&link_str, &record_name).await
+                    let opened = match holder_direction(holder.class()) {
+                        LinkDirection::Out => resolver.open_out_link(&link_str, Some(holder)).await,
+                        LinkDirection::Inp => {
+                            resolver.open_link_for_record(&link_str, holder).await
+                        }
                     };
                     report_open_failure(record_name.as_bytes(), &field_name, &link_str, opened);
                 }
@@ -827,14 +1000,17 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // precisely to carry options (a pv-only longhand yields a
                 // plain `Pva`), so there is no bare-PV early-out here.
                 ParsedLink::PvaJson(j) => {
-                    let opened = if field_name == "OUT" {
-                        resolver
-                            .open_json_out_link(&j.pv, &j.options, Some(record_name.as_bytes()))
-                            .await
-                    } else {
-                        resolver
-                            .open_json_link_for_record(&j.pv, &j.options, &record_name)
-                            .await
+                    let opened = match holder_direction(holder.class()) {
+                        LinkDirection::Out => {
+                            resolver
+                                .open_json_out_link(&j.pv, &j.options, Some(holder))
+                                .await
+                        }
+                        LinkDirection::Inp => {
+                            resolver
+                                .open_json_link_for_record(&j.pv, &j.options, holder)
+                                .await
+                        }
                     };
                     report_open_failure(record_name.as_bytes(), &field_name, &j.pv, opened);
                 }
@@ -1166,6 +1342,39 @@ impl LinkSet for PvaLinkResolver {
             .registry
             .try_get_inp(link_pv_name(full), cfg.pipeline, cfg.queue_size)
             .is_some_and(|link| link.is_valid())
+    }
+
+    /// pvxs `pvaOpenLink` (`pvxs/ioc/pvalink_lset.cpp:63-171`), at iocInit
+    /// and on every put of the link: the holder is attached under
+    /// the caller's hold, and its channel opened on the reactor.
+    fn open_link(&self, holder: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
+        let Some(full) = strip_scheme(name) else {
+            return LinkOpen::Lset;
+        };
+        let direction = holder_direction(holder.class());
+        let cfg = match direction {
+            LinkDirection::Inp => self.inp_cfg_for(full),
+            LinkDirection::Out => self.out_cfg_for(full),
+        };
+        let holder = Holder::from(holder);
+        if let Some(id) = self.attach(&holder, &cfg) {
+            let this = self.clone();
+            self.reactor
+                .spawn(async move { this.open_attached(holder, cfg, id).await });
+        }
+        LinkOpen::Lset
+    }
+
+    /// pvxs `pvaRemoveLink` (`pvxs/ioc/pvalink_lset.cpp:176-185`).
+    fn remove_link(&self, holder: LinkHolder<'_>, name: &[u8]) {
+        let Some(full) = strip_scheme(name) else {
+            return;
+        };
+        let cfg = match holder_direction(holder.class()) {
+            LinkDirection::Inp => self.inp_cfg_for(full),
+            LinkDirection::Out => self.out_cfg_for(full),
+        };
+        self.detach(&holder.into(), &cfg);
     }
 
     /// C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:393`): open the monitor so
@@ -2100,6 +2309,16 @@ fn scalar_to_epics(sv: &ScalarValue) -> EpicsValue {
 mod tests {
     use super::*;
 
+    /// `record`'s `INP` as a link holder.
+    fn inp(record: &str) -> LinkHolder<'_> {
+        LinkHolder::new("ai", record.as_bytes(), "INP")
+    }
+
+    /// `record`'s `OUT` as a link holder.
+    fn out(record: &[u8]) -> LinkHolder<'_> {
+        LinkHolder::new("ao", record, "OUT")
+    }
+
     fn default_inp_cfg(pv_name: &str) -> PvaLinkConfig {
         PvaLinkConfig {
             monitor: true,
@@ -2447,6 +2666,7 @@ mod tests {
         // CP target: scans on every event.
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "DEST".into(),
             monorder: 0,
             atomic: false,
@@ -2504,6 +2724,7 @@ mod tests {
         // CP target: scans on every event.
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "DEST".into(),
             monorder: 0,
             atomic: false,
@@ -2582,7 +2803,7 @@ mod tests {
             .insert(MonitorKey::from_config(&cfg));
 
         resolver
-            .open_inp_cfg(cfg, "SRC".to_string(), Some("DEST".into()))
+            .open_inp_cfg(cfg, "SRC".to_string(), Some(inp("DEST").into()))
             .await
             .unwrap();
 
@@ -2627,7 +2848,7 @@ mod tests {
             .insert(MonitorKey::from_config(&cfg));
 
         resolver
-            .open_inp_cfg(cfg, "SRC".to_string(), Some("DEST".into()))
+            .open_inp_cfg(cfg, "SRC".to_string(), Some(inp("DEST").into()))
             .await
             .unwrap();
 
@@ -2661,6 +2882,7 @@ mod tests {
 
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "DEST".into(),
             monorder: 0,
             atomic: false,
@@ -2730,6 +2952,7 @@ mod tests {
 
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "DEST".into(),
             monorder: 0,
             atomic: false,
@@ -2802,6 +3025,7 @@ mod tests {
         let mut fanout = ScanFanout::default();
         // CP: scans on every event, not passive-restricted.
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "CP_REC".into(),
             monorder: 0,
             atomic: false,
@@ -2809,6 +3033,7 @@ mod tests {
         });
         // CPP: passive-restricted; owner is Passive so it is eligible.
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "CPP_REC".into(),
             monorder: 1,
             atomic: false,
@@ -2887,6 +3112,7 @@ mod tests {
 
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "DEST".into(),
             monorder: 0,
             atomic: false,
@@ -2927,7 +3153,7 @@ mod tests {
         let resolver = PvaLinkResolver::new(crate::test_reactor());
         // proc=CP → scan_on_update; sevr=MS exercised together.
         let _ = resolver
-            .open_link_for_record("pva://SRC:PV?proc=CP&sevr=MS", "MY:REC")
+            .open_link_for_record("pva://SRC:PV?proc=CP&sevr=MS", inp("MY:REC"))
             .await;
         // Scan target registered under the bare PV name.
         let targets = resolver.scan_targets.read();
@@ -2950,7 +3176,7 @@ mod tests {
     async fn b3_non_cp_link_registers_no_scan_target() {
         let resolver = PvaLinkResolver::new(crate::test_reactor());
         let _ = resolver
-            .open_link_for_record("pva://OTHER:PV?proc=NPP", "REC2")
+            .open_link_for_record("pva://OTHER:PV?proc=NPP", inp("REC2"))
             .await;
         assert!(resolver.scan_targets.read().get(&mk("OTHER:PV")).is_none());
     }
@@ -3074,12 +3300,14 @@ mod tests {
         let mut fanout = ScanFanout::default();
         // Non-atomic, monorder 1 / -1.
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "C".into(),
             monorder: 1,
             atomic: false,
             passive_only: false,
         });
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "D".into(),
             monorder: -1,
             atomic: false,
@@ -3087,12 +3315,14 @@ mod tests {
         });
         // Atomic, monorder 5 / 0.
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "A".into(),
             monorder: 5,
             atomic: true,
             passive_only: false,
         });
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "B".into(),
             monorder: 0,
             atomic: true,
@@ -3141,6 +3371,7 @@ mod tests {
         .unwrap();
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "DEST".into(),
             monorder: 0,
             atomic: true, // but atomic → scans anyway
@@ -3572,7 +3803,7 @@ mod tests {
         // loaded record carrying this PvaJson link.
         let resolver = PvaLinkResolver::new(crate::test_reactor());
         let _ = resolver
-            .open_json_link_for_record(&j.pv, &j.options, "MY:RECORD")
+            .open_json_link_for_record(&j.pv, &j.options, inp("MY:RECORD"))
             .await;
 
         // options are registered under the per-link IDENTITY KEY — the
@@ -3663,7 +3894,7 @@ mod tests {
         // for a suffix link exactly as it does for a query-bearing one.
         let resolver = PvaLinkResolver::new(crate::test_reactor());
         let _ = resolver
-            .open_link_for_record(&format!("pva://{stored}"), "MY:RECORD")
+            .open_link_for_record(&format!("pva://{stored}"), inp("MY:RECORD"))
             .await;
 
         // inp_cfg_for keyed by the full suffix string returns the parsed
@@ -3714,11 +3945,11 @@ mod tests {
 
         // Link A: read sub-field "alarm.severity", CPP (scan on passive).
         let link_a = "pva://TARGET:PV?field=alarm.severity&proc=CPP";
-        let _ = resolver.open_link_for_record(link_a, "RECORD:A").await;
+        let _ = resolver.open_link_for_record(link_a, inp("RECORD:A")).await;
 
         // Link B: read sub-field "value", CP (always scan).
         let link_b = "pva://TARGET:PV?field=value&proc=CP";
-        let _ = resolver.open_link_for_record(link_b, "RECORD:B").await;
+        let _ = resolver.open_link_for_record(link_b, inp("RECORD:B")).await;
 
         // Each link must have its own config — no cross-contamination.
         let cfg_a = resolver.inp_cfg_for("TARGET:PV?field=alarm.severity&proc=CPP");
@@ -3804,10 +4035,10 @@ mod tests {
             ("proc".to_string(), JlinkValue::Str("CP".to_string())),
         ];
         let _ = resolver
-            .open_json_link_for_record("TARGET:PV", &opts_a, "RECORD:A")
+            .open_json_link_for_record("TARGET:PV", &opts_a, inp("RECORD:A"))
             .await;
         let _ = resolver
-            .open_json_link_for_record("TARGET:PV", &opts_b, "RECORD:B")
+            .open_json_link_for_record("TARGET:PV", &opts_b, inp("RECORD:B"))
             .await;
 
         // Each link resolves its own config by its identity key — the same
@@ -3877,10 +4108,10 @@ mod tests {
             ("Q".to_string(), JlinkValue::Int(64)),
         ];
         let _ = resolver
-            .open_json_link_for_record("VAR:PV", &opts_q1, "REC:Q1")
+            .open_json_link_for_record("VAR:PV", &opts_q1, inp("REC:Q1"))
             .await;
         let _ = resolver
-            .open_json_link_for_record("VAR:PV", &opts_q64, "REC:Q64")
+            .open_json_link_for_record("VAR:PV", &opts_q64, inp("REC:Q64"))
             .await;
 
         let targets = resolver.scan_targets.read();
@@ -3927,10 +4158,10 @@ mod tests {
         let opts_b: Vec<(String, JlinkValue)> =
             vec![("field".to_string(), JlinkValue::Str("c.d".to_string()))];
         let _ = resolver
-            .open_json_out_link("OUT:PV", &opts_a, Some(b"WRITER:A"))
+            .open_json_out_link("OUT:PV", &opts_a, Some(out(b"WRITER:A")))
             .await;
         let _ = resolver
-            .open_json_out_link("OUT:PV", &opts_b, Some(b"WRITER:B"))
+            .open_json_out_link("OUT:PV", &opts_b, Some(out(b"WRITER:B")))
             .await;
 
         let key_a = pvajson_identity_key("OUT:PV", &opts_a);
@@ -3957,10 +4188,10 @@ mod tests {
 
         // Same PV, CP scan, but different queue depths → two variants.
         let _ = resolver
-            .open_link_for_record("pva://VAR:PV?proc=CP&Q=1", "REC:Q1")
+            .open_link_for_record("pva://VAR:PV?proc=CP&Q=1", inp("REC:Q1"))
             .await;
         let _ = resolver
-            .open_link_for_record("pva://VAR:PV?proc=CP&Q=64", "REC:Q64")
+            .open_link_for_record("pva://VAR:PV?proc=CP&Q=64", inp("REC:Q64"))
             .await;
 
         {
@@ -4026,10 +4257,10 @@ mod tests {
         // Default variant (no query options) and a pipelined Q=1 variant
         // of the SAME PV, both CP so each registers a scan target.
         let _ = resolver
-            .open_link_for_record("pva://PIPE:PV?proc=CP", "REC:DEF")
+            .open_link_for_record("pva://PIPE:PV?proc=CP", inp("REC:DEF"))
             .await;
         let _ = resolver
-            .open_link_for_record("pva://PIPE:PV?proc=CP&Q=1&pipeline=true", "REC:PIPE")
+            .open_link_for_record("pva://PIPE:PV?proc=CP&Q=1&pipeline=true", inp("REC:PIPE"))
             .await;
 
         let default_q = PvaLinkConfig::defaults_for("", LinkDirection::Inp).queue_size;
@@ -4177,12 +4408,14 @@ mod tests {
         // Atomic group: A (monorder 0) then B (monorder 1).
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "AT:A".into(),
             monorder: 0,
             atomic: true,
             passive_only: false,
         });
         fanout.records.push(ScanTarget {
+            field: "INP".into(),
             record: "AT:B".into(),
             monorder: 1,
             atomic: true,

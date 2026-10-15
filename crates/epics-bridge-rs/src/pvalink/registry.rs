@@ -8,7 +8,7 @@
 // §4.2, stage 3.)
 
 use std::borrow::Borrow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -164,11 +164,12 @@ pub struct PvaLinkRegistry {
     pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>,
     /// Channel → owning record-name back-index. Mirrors pvxs's
     /// `pvaLinkChannel::links` (a list of `pvaLink*` each with
-    /// `plink->precord->name`): the set of records whose links attached
-    /// to each cached channel. Populated at open time via
-    /// [`Self::attach_record`]; backs the `dbpvar` record-name glob
-    /// filter (`pvxs/ioc/pvalink.cpp:216-231`).
-    channel_records: RwLock<HashMap<RegistryKey, BTreeSet<RecordName>>>,
+    /// `plink->precord->name`): the records whose links attached to each
+    /// cached channel, each with its count of attached links. Populated
+    /// via [`Self::attach_record`], drained by [`Self::detach_record`];
+    /// backs the `dbpvar` record-name glob filter
+    /// (`pvxs/ioc/pvalink.cpp:216-231`).
+    channel_records: RwLock<HashMap<RegistryKey, BTreeMap<RecordName, usize>>>,
 }
 
 /// Build the `RegistryKey` for a config — the shared
@@ -225,11 +226,33 @@ impl PvaLinkRegistry {
     /// record. Mirrors pvxs appending a `pvaLink` to
     /// `pvaLinkChannel::links` (`pvxs/ioc/pvalink_channel.cpp` link attach).
     pub fn attach_record(&self, config: &PvaLinkConfig, record: &[u8]) {
-        self.channel_records
+        *self
+            .channel_records
             .write()
             .entry(key_of(config))
             .or_default()
-            .insert(RecordName::from(record));
+            .entry(RecordName::from(record))
+            .or_default() += 1;
+    }
+
+    /// Undo one [`Self::attach_record`]: pvxs `~pvaLink` erasing itself
+    /// from `pvaLinkChannel::links` (`pvxs/ioc/pvalink_link.cpp:27-35`).
+    pub fn detach_record(&self, config: &PvaLinkConfig, record: &[u8]) {
+        let mut channels = self.channel_records.write();
+        let key = key_of(config);
+        let Some(records) = channels.get_mut(&key) else {
+            return;
+        };
+        let record = RecordName::from(record);
+        if let Some(n) = records.get_mut(&record) {
+            *n -= 1;
+            if *n == 0 {
+                records.remove(&record);
+            }
+        }
+        if records.is_empty() {
+            channels.remove(&key);
+        }
     }
 
     /// Exact lookup for the full config's `RegistryKey`. Returns
@@ -523,7 +546,7 @@ impl PvaLinkRegistry {
                     monorder: c.monorder,
                     records: records
                         .get(key)
-                        .map(|s| s.iter().cloned().collect())
+                        .map(|s| s.keys().cloned().collect())
                         .unwrap_or_default(),
                 }
             })

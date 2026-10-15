@@ -2109,8 +2109,15 @@ impl PvDatabase {
         let opened: Vec<(String, super::LinkOpen)> = texts
             .into_iter()
             .filter_map(|(field, raw, ftype)| {
-                let open =
-                    self.open_external_link(&crate::server::record::parse_link_field(&raw, ftype))?;
+                let holder = super::LinkHolder::new(
+                    rec_arc.rdes().record_type,
+                    rec_arc.name().as_bytes(),
+                    &field,
+                );
+                let open = self.open_external_link(
+                    holder,
+                    &crate::server::record::parse_link_field(&raw, ftype),
+                )?;
                 Some((field, open))
             })
             .collect();
@@ -2131,12 +2138,63 @@ impl PvDatabase {
         instance: &mut crate::server::record::RecordInstance,
         field: &str,
     ) {
+        let holder = super::LinkHolder::new(
+            instance.record.record_type(),
+            instance.name.as_bytes(),
+            field,
+        );
         let open = instance
             .stored_link_shared(field)
-            .and_then(|link| self.open_external_link(link));
+            .and_then(|link| self.open_external_link(holder, link));
         if let Some(open) = open {
             self.bind_opened(instance, field, open);
         }
+    }
+
+    /// `field`'s stored link ahead of a put that may replace it, when an lset
+    /// opened it: what [`Self::remove_put_link`] compares the put's result to.
+    pub(crate) fn link_before_put(
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+    ) -> Option<Arc<crate::server::record::ParsedLink>> {
+        instance
+            .stored_link_shared(field)
+            .filter(|link| Self::scheme_link_name(link).is_some())
+            .cloned()
+    }
+
+    /// `dbPutFieldLink`'s `dbRemoveLink` (`dbAccess.c:1167`) → the lset's
+    /// `removeLink` for `before`, the link [`Self::link_before_put`] saw, once
+    /// the put replaced it or left the field unadded. Under the put's hold,
+    /// ahead of [`Self::open_put_link`], so an lset never holds two links for
+    /// one holder.
+    pub(crate) fn remove_put_link(
+        &self,
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+        before: Option<Arc<crate::server::record::ParsedLink>>,
+    ) {
+        let Some(before) = before else {
+            return;
+        };
+        let replaced = instance
+            .stored_link_shared(field)
+            .is_none_or(|now| !Arc::ptr_eq(now, &before));
+        if !replaced && !instance.link_unadded(field) {
+            return;
+        }
+        let Some((target, body)) = Self::scheme_link_name(&before) else {
+            return;
+        };
+        let holder = super::LinkHolder::new(
+            instance.record.record_type(),
+            instance.name.as_bytes(),
+            field,
+        );
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+            lset.remove_link(holder, body);
+            Some(())
+        });
     }
 
     /// A record's own post of `field` under its hold: the put, then the open
@@ -2150,7 +2208,9 @@ impl PvDatabase {
         value: EpicsValue,
         links: &mut crate::server::record::PreparedLinks,
     ) -> crate::error::CaResult<()> {
+        let before = Self::link_before_put(instance, field);
         if let Some(link_field) = instance.put_internal_field_of(field, value, links)? {
+            self.remove_put_link(instance, link_field, before);
             self.open_put_link(instance, link_field);
         }
         Ok(())
@@ -2163,14 +2223,23 @@ impl PvDatabase {
     /// of `open_link`, so every link is opened once per init and once per put.
     fn open_external_link(
         &self,
+        holder: super::LinkHolder<'_>,
         link: &crate::server::record::ParsedLink,
     ) -> Option<super::LinkOpen> {
+        let (target, body) = Self::scheme_link_name(link)?;
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+            Some(lset.open_link(holder, body))
+        })
+    }
+
+    /// The lset target and name of a link naming its scheme — the links an
+    /// lset opens and removes.
+    fn scheme_link_name(
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<(super::link_put_queue::LinkTarget, &[u8])> {
         let external = link.external()?;
         let (target, body) = Self::split_external_link_name(external.name);
-        if !matches!(target, super::link_put_queue::LinkTarget::Scheme(_)) {
-            return None;
-        }
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| Some(lset.open_link(body)))
+        matches!(target, super::link_put_queue::LinkTarget::Scheme(_)).then_some((target, body))
     }
 
     /// What an open of `field`'s stored link answered, bound into the record:
@@ -4906,7 +4975,9 @@ impl PvDatabase {
                 if !unopened {
                     continue;
                 }
-                if let Some(open) = self.open_external_link(&link) {
+                let holder =
+                    super::LinkHolder::new(rec.rdes().record_type, rec.name().as_bytes(), field);
+                if let Some(open) = self.open_external_link(holder, &link) {
                     self.bind_opened(&mut rec.write(), field, open);
                 }
             }

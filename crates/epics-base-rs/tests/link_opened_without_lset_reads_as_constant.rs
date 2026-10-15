@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_base_rs::server::database::{
-    LinkForward, LinkForwardRefused, LinkOpen, LinkPutOp, LinkSet, PvDatabase,
+    LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkSet, PvDatabase,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -31,7 +31,7 @@ struct LocalOnly {
 
 #[async_trait::async_trait]
 impl LinkSet for LocalOnly {
-    fn open_link(&self, name: &[u8]) -> LinkOpen {
+    fn open_link(&self, _: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
         if name.starts_with(b"NL:NOPE") {
             LinkOpen::NoLset
         } else {

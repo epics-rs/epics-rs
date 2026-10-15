@@ -23,7 +23,8 @@ pub(crate) use field_io::{PutSrc, render_for_string_target};
 pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
-    LinkMetadata, LinkOpen, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission, RemoteAlarm,
+    LinkHolder, LinkMetadata, LinkOpen, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
+    RemoteAlarm,
 };
 pub(crate) use links::{
     LinkAlarm, ProcessTargetGate, inherit_sevr_msg, multi_out_rows, multi_output_dispatch_owned,

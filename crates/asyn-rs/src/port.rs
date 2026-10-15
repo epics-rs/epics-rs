@@ -868,9 +868,12 @@ impl PortDriverBase {
     /// A port whose services were never bound has no trace manager and the
     /// call is a no-op; that is the same port that has no trace file to write
     /// to and no mask to consult.
-    pub fn trace_print(&self, mask: crate::trace::TraceMask, msg: &str) {
+    ///
+    /// `args` is formatted only when `mask` is enabled, onto the stack: a
+    /// driver write that fails under a record's lock allocates nothing.
+    pub fn trace_print(&self, mask: crate::trace::TraceMask, args: std::fmt::Arguments<'_>) {
         if let Some(trace) = &self.trace {
-            trace.output(&self.port_name, mask, msg);
+            trace.print(Some(&self.port_name), None, 0, mask, args);
         }
     }
 
@@ -4955,5 +4958,45 @@ mod tests {
                 "asynReport {level} must print no options block: {out}"
             );
         }
+    }
+
+    /// `trace_print` formats nothing while its mask is off, and with it on
+    /// writes the one line.
+    #[test]
+    fn trace_print_formats_only_when_the_mask_is_on() {
+        use crate::trace::{TraceFile, TraceMask};
+        use std::sync::atomic::AtomicUsize;
+
+        struct Counted<'a>(&'a AtomicUsize);
+        impl std::fmt::Display for Counted<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                f.write_str("why")
+            }
+        }
+
+        let services = crate::services::PortServices::new();
+        let mut base = PortDriverBase::new("tprint", 1, PortFlags::default());
+        services.bind(&mut base);
+        let trace = services.trace();
+        trace.register_port("tprint", false);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let path = dir.path().join("tprint.log");
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("tprint"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let n = AtomicUsize::new(0);
+
+        trace.set_trace_mask(Some("tprint"), TraceMask::empty());
+        base.trace_print(TraceMask::ERROR, format_args!("failed: {}", Counted(&n)));
+        assert_eq!(n.load(Ordering::Relaxed), 0, "formatted with ERROR off");
+
+        trace.set_trace_mask(Some("tprint"), TraceMask::ERROR);
+        base.trace_print(TraceMask::ERROR, format_args!("failed: {}", Counted(&n)));
+        assert_eq!(n.load(Ordering::Relaxed), 1);
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log.matches("failed: why\n").count(), 1, "{log:?}");
     }
 }

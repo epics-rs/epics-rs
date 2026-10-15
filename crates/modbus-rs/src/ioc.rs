@@ -768,7 +768,7 @@ impl ModbusPortDriver {
     fn trace_binding_error(&self, addr: i32, what: &str) {
         self.base.trace_print(
             TraceMask::ERROR,
-            &format!(
+            format_args!(
                 "drvModbusAsyn::readPoller port {} offset {addr} {what}\n",
                 self.base.port_name
             ),
@@ -1537,7 +1537,7 @@ impl PortDriver for ModbusPortDriver {
             if let Err(ref e) = result {
                 self.base.trace_print(
                     TraceMask::ERROR,
-                    &format!(
+                    format_args!(
                         "drvModbusAsyn::readPoller port {} poll cycle failed: {e}\n",
                         self.base.port_name
                     ),

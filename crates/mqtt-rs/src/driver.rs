@@ -369,9 +369,9 @@ impl MqttDriver {
     fn traced<T>(&self, reason: usize, function: &str, r: AsynResult<T>) -> AsynResult<T> {
         if let Err(e) = &r {
             // C prints `exc.what()`, the bare cause.
-            let why = match e {
-                AsynError::Status { message, .. } => std::borrow::Cow::Borrowed(message.as_str()),
-                other => std::borrow::Cow::Owned(other.to_string()),
+            let why: &dyn std::fmt::Display = match e {
+                AsynError::Status { message, .. } => message,
+                other => other,
             };
             let topic = self
                 .reason_to_addr
@@ -380,7 +380,7 @@ impl MqttDriver {
                 .map_or("", |a| a.topic.as_str());
             self.base.trace_print(
                 TraceMask::ERROR,
-                &format!(
+                format_args!(
                     "MqttDriver::{function}: Failed to set value for topic '{topic}': {why}. asynStatus: {})",
                     AsynStatus::Error as i32
                 ),

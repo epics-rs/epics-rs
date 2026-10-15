@@ -2079,6 +2079,11 @@ pub fn resume_thread(id: u64) -> bool {
         .is_some_and(|t| t.resume())
 }
 
+/// The calling thread's OS id, read without `std` thread-local state — the
+/// identity that still works in a process `atexit` handler, after macOS has
+/// destroyed the main thread's locals.
+pub(crate) use thread_registry::os_thread_id;
+
 mod thread_registry {
     use super::{PriorityApplied, ThreadPriority};
     use std::sync::Mutex;
@@ -2208,19 +2213,19 @@ mod thread_registry {
     /// POSIX defines. C makes the same split, in two `osdThreadExtra.c`
     /// files.
     #[cfg(target_os = "linux")]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `gettid` takes no arguments and cannot fail.
         unsafe { libc::syscall(libc::SYS_gettid) as u64 }
     }
 
     #[cfg(target_os = "rtems")]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `pthread_self` takes no arguments and cannot fail.
         unsafe { super::rtems_sched::pthread_self() as u64 }
     }
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "rtems"))))]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `pthread_self` takes no arguments and cannot fail.
         unsafe { libc::pthread_self() as u64 }
     }
@@ -2233,7 +2238,7 @@ mod thread_registry {
     /// `epicsThreadShow 0` to print a stranger's row and for
     /// `epicsThreadResume 0` to report on it instead of rejecting the id.
     #[cfg(windows)]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `GetCurrentThreadId` takes no arguments and cannot fail.
         unsafe { GetCurrentThreadId() }.into()
     }

@@ -912,9 +912,6 @@ struct ErrlogQueue {
     print: ErrlogBuf,
     n_lost: usize,
     at_exit: bool,
-    /// The worker has left its loop for good — the end of C's
-    /// `epicsThreadMustJoin(tid)` in `errlogExitHandler` (`errlog.c:530`).
-    stopped: bool,
     to_console: bool,
     flush_seq: u64,
     /// Producers blocked in [`errlog_flush`], C's `pvt.nFlushers`
@@ -951,8 +948,15 @@ struct Errlog {
     queue: PriorityInheritanceMutex<ErrlogQueue>,
     /// C `pvt.waitForWork` (`errlog.c:93`) — one waiter, the worker.
     work: Event,
-    /// Signalled once, when the worker sets `stopped`.
-    exited: Event,
+    /// The worker has left its loop for good — the end of C's
+    /// `epicsThreadMustJoin(tid)` in `errlogExitHandler` (`errlog.c:530`).
+    ///
+    /// Not an [`Event`]: its waiter is the process `atexit` handler, and on
+    /// macOS `exit()` destroys the main thread's locals first, so
+    /// `std::thread::current()` and `park` abort there. parking_lot parks
+    /// on a stack `ThreadData` once its thread-local is gone.
+    stopped: parking_lot::Mutex<bool>,
+    exited: parking_lot::Condvar,
     listeners: ErrlogListeners,
     next_id: std::sync::atomic::AtomicU64,
 }
@@ -994,7 +998,6 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
                     print: ErrlogBuf::new(buf_size),
                     n_lost: 0,
                     at_exit: false,
-                    stopped: false,
                     // C `errlogInitPvt`: `pvt.toConsole = TRUE`.
                     to_console: true,
                     flush_seq: 0,
@@ -1003,7 +1006,8 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
                 CMutex::ErrlogMsgQueue,
             ),
             work: Event::new(),
-            exited: Event::new(),
+            stopped: parking_lot::Mutex::new(false),
+            exited: parking_lot::Condvar::new(),
             listeners: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(Vec::new())),
             next_id: std::sync::atomic::AtomicU64::new(1),
         }));
@@ -1045,16 +1049,19 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
     })
 }
 
-/// The errlog worker's thread, so the exit handler never waits for itself.
-static WORKER: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+/// The errlog worker's [`os_thread_id`](crate::runtime::task::os_thread_id),
+/// so the exit handler never waits for itself.
+static WORKER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// C `errlogExitHandler` (`errlog.c:523-531`): stop admitting, and wait for
 /// the worker to write out what was already queued.
+///
+/// Nothing here may touch `std` thread-local state (`thread::current`,
+/// `park`, a `thread_local!`): see [`Errlog::stopped`].
 fn errlog_exit_handler() {
     let Some(errlog) = ERRLOG.get() else {
         return;
     };
-    let waiter = errlog.exited.waiter();
     {
         let mut q = errlog.queue.lock();
         if q.at_exit {
@@ -1063,16 +1070,19 @@ fn errlog_exit_handler() {
         q.at_exit = true;
     }
     errlog.work.signal();
-    if WORKER.get() == Some(&std::thread::current().id()) {
+    if WORKER.get() == Some(&crate::runtime::task::os_thread_id()) {
         return;
     }
-    waiter.wait_until(|| errlog.queue.lock().stopped);
+    let mut stopped = errlog.stopped.lock();
+    while !*stopped {
+        errlog.exited.wait(&mut stopped);
+    }
 }
 
 /// C `errlogThread` (`errlog.c:624-720`): swap the buffers, drain the snapshot
 /// with the queue UNLOCKED, then report anything the arena refused.
 fn errlog_worker(errlog: &'static Errlog) {
-    let _ = WORKER.set(std::thread::current().id());
+    let _ = WORKER.set(crate::runtime::task::os_thread_id());
     let parked = errlog.work.waiter();
     let mut q = errlog.queue.lock();
     loop {
@@ -1150,9 +1160,9 @@ fn errlog_worker(errlog: &'static Errlog) {
         q = errlog.queue.lock();
         q.print = print;
     }
-    q.stopped = true;
     drop(q);
-    errlog.exited.signal();
+    *errlog.stopped.lock() = true;
+    errlog.exited.notify_all();
 }
 
 /// C `errlogThread`'s listener walk (`errlog.c:801-815`): the live list, under
@@ -1977,7 +1987,6 @@ mod tests {
             print: ErrlogBuf::new(buf_size),
             n_lost: 0,
             at_exit: false,
-            stopped: false,
             to_console: true,
             flush_seq: 0,
             flushers: Vec::new(),
@@ -2746,6 +2755,74 @@ mod tests {
             lines[1].as_deref(),
             Some("WARN  epics_base_rs::runtime: a runtime line"),
             "every other target still renders"
+        );
+    }
+
+    /// The exit handler drains a queued line from a context where
+    /// `std::thread::current()` is already gone — what macOS makes of the
+    /// `atexit` list on the main thread. Linux gives one to a pthread key
+    /// destructor that runs after std's own, which destroys `CURRENT`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial(errlog)]
+    fn the_exit_handler_drains_after_the_threads_locals_are_gone() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static DRAINED: AtomicBool = AtomicBool::new(false);
+        static KEY: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn on_thread_exit(_: *mut libc::c_void) {
+            let current_gone = std::panic::catch_unwind(|| {
+                let _ = std::thread::current();
+            })
+            .is_err();
+            if !current_gone {
+                // Std's key has not run yet: come back next round.
+                // SAFETY: `KEY` was created by `pthread_key_create`.
+                unsafe {
+                    libc::pthread_setspecific(
+                        KEY.load(Ordering::SeqCst),
+                        std::ptr::dangling::<libc::c_void>(),
+                    )
+                };
+                return;
+            }
+            errlog_exit_handler();
+            let code = if DRAINED.load(Ordering::SeqCst) { 0 } else { 4 };
+            // SAFETY: ends the process from a thread that is exiting anyway.
+            unsafe { libc::_exit(code) };
+        }
+
+        with_a_process_of_its_own(
+            "runtime::log::tests::the_exit_handler_drains_after_the_threads_locals_are_gone",
+            || {
+                let mut key: libc::pthread_key_t = 0;
+                // SAFETY: `key` is a valid out-pointer.
+                assert_eq!(
+                    unsafe { libc::pthread_key_create(&mut key, Some(on_thread_exit)) },
+                    0
+                );
+                KEY.store(key, Ordering::SeqCst);
+                errlog_init(0);
+                // The worker sits in the first line's delivery until the exit
+                // handler has started, so the second is still queued then.
+                errlog_add_listener(|text| {
+                    if text.contains("held") {
+                        while !errlog_pvt().queue.lock().at_exit {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    } else if text.contains("queued at exit") {
+                        DRAINED.store(true, Ordering::SeqCst);
+                    }
+                });
+                errlog_printf_no_console(format_args!("held\n"));
+                errlog_printf_no_console(format_args!("queued at exit\n"));
+                let _ = std::thread::spawn(move || {
+                    // SAFETY: `key` was created above.
+                    unsafe { libc::pthread_setspecific(key, std::ptr::dangling::<libc::c_void>()) };
+                })
+                .join();
+                unreachable!("the exiting thread's key destructor ends the process");
+            },
         );
     }
 

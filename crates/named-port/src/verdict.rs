@@ -1,6 +1,10 @@
 //! The verdict a spawned IOC's console carries about the port it was given —
 //! the retry trigger for a test that names that port, and nothing else.
 
+use std::io::ErrorKind;
+use std::net::UdpSocket;
+use std::sync::OnceLock;
+
 /// C's report that the IOC is up: `iocRun` prints it after `iocBuild` has
 /// bound the server sockets and `rsrv_run` has started their threads
 /// (iocInit.c:272-273 at R7.0.10). Waiting for it replaces an 800 ms sleep,
@@ -61,6 +65,22 @@ pub fn softioc_verdict(console: &str) -> SoftIocVerdict {
     }
 }
 
+/// What an epics-rs binary prints for EADDRINUSE: std's `io::Error` text,
+/// `{strerror} (os error {errno})`. Taken from a real collision, because
+/// both halves are the platform's — Linux says `... (os error 98)`, macOS
+/// `(os error 48)`, Windows another sentence and 10048 — and a verdict that
+/// spells one of them reads every other platform's steal as a regression.
+pub fn addr_in_use() -> &'static str {
+    static TEXT: OnceLock<String> = OnceLock::new();
+    TEXT.get_or_init(|| {
+        let held = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral UDP port");
+        let e = UdpSocket::bind(held.local_addr().expect("read the ephemeral port"))
+            .expect_err("a second bind of a held UDP port");
+        assert_eq!(e.kind(), ErrorKind::AddrInUse, "{e}");
+        e.to_string()
+    })
+}
+
 /// An epics-rs IOC's report that `port` belonged to somebody else — the retry
 /// trigger for a test that names the port of `softioc-rs` or
 /// `realtime-ca-ioc`.
@@ -69,38 +89,40 @@ pub fn softioc_verdict(console: &str) -> SoftIocVerdict {
 /// console only once its attempt is over. softioc-rs prints C's
 /// [`PORT_WAS_TAKEN`] for the TCP listener and serves on a dynamic one as C
 /// does, or names the address its search responder could not bind and exits
-/// 1; realtime-ca-ioc names the port on either bind arm and exits 1. The
-/// errno text is required on the lines that carry one: realtime-ca-ioc's TCP
-/// arm also covers a `local_addr` failure, which is no steal.
+/// 1; realtime-ca-ioc names the port on either bind arm and exits 1. On the
+/// lines that carry an error the cause must be [`addr_in_use`] and nothing
+/// else: realtime-ca-ioc's TCP arm also covers a `local_addr` failure, which
+/// is no steal.
 pub fn rs_ioc_port_was_taken(console: &str, port: u16) -> bool {
-    let udp = format!(":{port}: Address already in use");
+    let in_use = addr_in_use();
+    let udp = format!(":{port}: {in_use}");
     let rt_tcp = format!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: ");
     let rt_udp =
         format!("realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: ");
     console.lines().any(|l| {
         l.contains(PORT_WAS_TAKEN)
-            || (l.contains("CA server UDP search responder bind ") && l.contains(&udp))
-            || ((l.starts_with(&rt_tcp) || l.starts_with(&rt_udp))
-                && l.contains("Address already in use"))
+            || (l.contains("CA server UDP search responder bind ") && l.ends_with(&udp))
+            || [&rt_tcp, &rt_udp]
+                .iter()
+                .any(|arm| l.strip_prefix(arm.as_str()) == Some(in_use))
     })
 }
 
 /// `qsrv-rs`'s report that the port it was given belonged to somebody else.
 ///
 /// A taken TCP port is not fatal there: the server warns
-/// `Server unable to bind port {tcp}, falling back to …` (runtime.rs:871)
+/// `Server unable to bind port {tcp}, falling back to …` (runtime.rs:929)
 /// and serves on another, which a client dialling `tcp` never finds. A taken
-/// UDP search port ends the process with the only line it prints,
-/// `AsyncUdpV4: failed to bind any interface`, which names no number and
-/// is printed for any per-interface error (EADDRNOTAVAIL too). It counts
-/// only with `udp_held`, the kernel's answer for `tcp + 1` after the child
-/// has exited. Both follow `iocRun`, so a test judges the console after
-/// its attempt.
+/// UDP search port ends the process with `qsrv-rs: …` and the bind's own
+/// error, which names no number; it counts only when that error is
+/// [`addr_in_use`] and `udp_held`, the kernel's answer for `tcp + 1` after
+/// the child has exited. Both follow `iocRun`, so a test judges the console
+/// after its attempt.
 pub fn qsrv_rs_port_was_taken(console: &str, tcp: u16, udp_held: bool) -> bool {
     let fell_back = format!("Server unable to bind port {tcp},");
     console.lines().any(|l| {
         l.contains(&fell_back)
-            || (udp_held && l.contains("AsyncUdpV4: failed to bind any interface"))
+            || (udp_held && l.starts_with("qsrv-rs: ") && l.ends_with(addr_in_use()))
     })
 }
 
@@ -124,21 +146,56 @@ pub const LOCAL_ADDR_FAILED_PORT: u16 = 32961;
 mod tests {
     use super::*;
 
+    /// qsrv-rs's stderr, verbatim, with `tcp + 1` held on UDP by one socket
+    /// the measuring process owned: Linux 6.14 / glibc 2.39 at 3afdb55dc.
+    const QSRV_UDP_HELD: &str = "Starting iocInit\n\
+        iocRun: All initialization complete\n\
+        qsrv-rs: invalid value: invalid value: I/O error: Address already in use (os error 98)\n";
+
     #[test]
     fn qsrv_rs_names_a_stolen_port_only_by_its_own_two_lines() {
         let fell_back = " WARN epics_pva_rs::server_native::runtime: Server unable to bind \
                          port 38017, falling back to 127.0.0.1:43637\n";
         assert!(qsrv_rs_port_was_taken(fell_back, 38017, false));
         assert!(!qsrv_rs_port_was_taken(fell_back, 3801, false));
-        const UDP_LINE: &str = "qsrv-rs: invalid value: invalid value: I/O error: AsyncUdpV4: \
-             failed to bind any interface\n";
-        assert!(qsrv_rs_port_was_taken(UDP_LINE, 1, true));
-        assert!(!qsrv_rs_port_was_taken(UDP_LINE, 1, false));
+        let udp_line = format!("qsrv-rs: invalid value: I/O error: {}\n", addr_in_use());
+        assert!(qsrv_rs_port_was_taken(&udp_line, 1, true));
+        assert!(!qsrv_rs_port_was_taken(&udp_line, 1, false));
         assert!(!qsrv_rs_port_was_taken(
             "Starting iocInit\niocRun: All initialization complete\n",
             38017,
             true
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn qsrv_rs_measured_udp_held_line_is_a_stolen_port() {
+        assert!(qsrv_rs_port_was_taken(QSRV_UDP_HELD, 42041, true));
+    }
+
+    /// A fatal bind with another cause is no steal, even with `tcp + 1` held:
+    /// the `AsyncUdpV4` line is EADDRNOTAVAIL, printed when no interface was
+    /// selected at all.
+    #[test]
+    fn qsrv_rs_fatal_bind_of_another_cause_is_not_a_stolen_port() {
+        for console in [
+            "qsrv-rs: invalid value: invalid value: I/O error: AsyncUdpV4: failed to bind \
+             any interface\n",
+            "qsrv-rs: invalid value: invalid value: I/O error: Cannot assign requested \
+             address (os error 99)\n",
+        ] {
+            assert!(!qsrv_rs_port_was_taken(console, 1, true), "{console:?}");
+        }
+    }
+
+    /// The text is the kernel's own: whatever the platform calls EADDRINUSE,
+    /// [`addr_in_use`] is what std prints for it.
+    #[test]
+    fn addr_in_use_is_what_std_prints_for_a_held_port() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let e = std::net::TcpListener::bind(held.local_addr().unwrap()).unwrap_err();
+        assert_eq!(e.to_string(), addr_in_use());
     }
 
     #[test]
@@ -147,31 +204,63 @@ mod tests {
             LOCAL_ADDR_FAILED,
             LOCAL_ADDR_FAILED_PORT
         ));
-        assert!(rs_ioc_port_was_taken(
-            "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
-             Address already in use (os error 98)\n",
-            32961
-        ));
     }
 
-    /// A report names the port it is about: softioc-rs's measured UDP-held
-    /// line and realtime-ca-ioc's UDP arm are no steal of another number,
-    /// including one the named port's digits start with.
+    /// The CA binaries' stderr lines, verbatim, each with the named port held
+    /// by one socket the measuring process owned (UDP for the search arms, a
+    /// TCP listener for the TCP arm): Linux 6.14 / glibc 2.39 at 3afdb55dc,
+    /// realtime-ca-ioc on the thread backend.
+    const SOFTIOC_RS_UDP_HELD: &str = "iocRun: All initialization complete\n\
+        \x1b[31;1mERROR\x1b[0m: I/O error: CA server UDP search responder bind \
+        127.0.0.1:32961: Address already in use (os error 98)\n";
+    const RT_TCP_HELD: &str = "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
+        Address already in use (os error 98)\n";
+    const RT_UDP_HELD: &str = "realtime-ca-ioc: cannot start the CA UDP search responder on port \
+        32961: Address already in use (os error 98)\n";
+
+    /// A report names the port it is about: each measured line is a steal of
+    /// its own number and of no other, including one the named port's digits
+    /// start with.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn a_report_about_another_port_is_not_a_stolen_port() {
-        const UDP_HELD: &str = "iocRun: All initialization complete\n\
-            \x1b[31;1mERROR\x1b[0m: I/O error: CA server UDP search responder bind \
-            127.0.0.1:32961: Address already in use (os error 98)\n";
-        const RT_UDP: &str = "realtime-ca-ioc: cannot start the CA UDP search responder on port \
-            32961: Address already in use (os error 98)\n";
-        for console in [UDP_HELD, RT_UDP] {
+    fn each_ca_binarys_measured_line_names_its_own_stolen_port() {
+        for console in [SOFTIOC_RS_UDP_HELD, RT_TCP_HELD, RT_UDP_HELD] {
             assert!(rs_ioc_port_was_taken(console, 32961), "{console:?}");
+            assert!(!rs_ioc_port_was_taken(console, 3296), "{console:?}");
+            assert!(!rs_ioc_port_was_taken(console, 32962), "{console:?}");
         }
-        assert!(!rs_ioc_port_was_taken(UDP_HELD, 3296));
-        assert!(!rs_ioc_port_was_taken(RT_UDP, 32962));
         assert!(!rs_ioc_port_was_taken(
             "Starting iocInit\niocRun: All initialization complete\n",
             32961
         ));
+    }
+
+    /// softioc-rs's TCP arm is C's line and serves on a dynamic port.
+    #[test]
+    fn softioc_rs_tcp_fallback_is_a_stolen_port() {
+        let console = format!("iocRun: All initialization complete\n{PORT_WAS_TAKEN}\n");
+        assert!(rs_ioc_port_was_taken(&console, 32961));
+    }
+
+    /// The arms judge the cause, not the presence of the words: a bind error
+    /// of another kind on the same port, or EADDRINUSE quoted mid-line before
+    /// another cause, is no steal.
+    #[test]
+    fn a_ca_bind_failure_of_another_cause_is_not_a_stolen_port() {
+        let in_use = addr_in_use();
+        for console in [
+            "realtime-ca-ioc: cannot start the CA UDP search responder on port 32961: \
+             Cannot assign requested address (os error 99)\n"
+                .to_string(),
+            format!(
+                "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
+                 {in_use}; local_addr() on the listener failed: Invalid argument\n"
+            ),
+            "\x1b[31;1mERROR\x1b[0m: I/O error: CA server UDP search responder bind \
+             127.0.0.1:32961: Permission denied (os error 13)\n"
+                .to_string(),
+        ] {
+            assert!(!rs_ioc_port_was_taken(&console, 32961), "{console:?}");
+        }
     }
 }

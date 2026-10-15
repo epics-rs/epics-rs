@@ -73,3 +73,39 @@ async fn qsrv_rs_resolves_a_pva_link_as_soft_ioc_pva() {
     .await;
     assert_eq!(got, (5.0, 0));
 }
+
+/// The console qsrv-rs prints when its search port is held is what
+/// `on_a_qsrv_port` retries on: one UDP socket this test owns holds `tcp + 1`.
+#[test]
+fn a_held_search_port_reads_as_a_stolen_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pl.db");
+    std::fs::write(&db, "record(ao, \"SRC\") { field(VAL, \"5\") }\n").unwrap();
+    let tcp = named_port::free_tcp_with_udp_successor();
+    let held = std::net::UdpSocket::bind(("0.0.0.0", tcp + 1)).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_qsrv-rs"))
+        .arg("--db-file")
+        .arg(&db)
+        .envs([
+            ("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1".to_string()),
+            ("EPICS_PVAS_SERVER_PORT", tcp.to_string()),
+            ("EPICS_PVAS_BROADCAST_PORT", (tcp + 1).to_string()),
+            ("EPICS_PVA_BROADCAST_PORT", (tcp + 1).to_string()),
+            ("EPICS_PVA_ADDR_LIST", "127.0.0.1".to_string()),
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO".to_string()),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run qsrv-rs");
+    let console = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{console}");
+    assert!(
+        named_port::verdict::qsrv_rs_port_was_taken(
+            &console,
+            tcp,
+            named_port::udp_port_is_held(tcp + 1)
+        ),
+        "{console}"
+    );
+    drop(held);
+}

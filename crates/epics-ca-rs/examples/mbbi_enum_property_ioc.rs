@@ -90,7 +90,7 @@ impl DeviceSupport for EnumProp {
                 })
                 .await;
         });
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

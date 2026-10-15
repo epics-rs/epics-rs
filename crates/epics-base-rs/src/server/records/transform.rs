@@ -1410,7 +1410,7 @@ mod tests {
     /// while `A..P` hold their loaded values — i.e. as if every loaded field had
     /// just been written, which suppresses the very calc C performs.
     fn ioc_init(rec: &mut TransformRecord) {
-        rec.seed_deadband_tracking(crate::server::device_support::DsetInit::Succeeded);
+        rec.seed_deadband_tracking(crate::server::device_support::DsetInit::Ok);
     }
 
     /// An expression that compiles clean and FAILS at eval — C

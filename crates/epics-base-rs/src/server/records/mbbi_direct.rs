@@ -126,7 +126,7 @@ impl Record for MbbiDirectRecord {
     /// `special(SPC_NOMOD)` so it has no `put_field` arm for the trait default
     /// to go through.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
-        if dset_init == crate::server::device_support::DsetInit::Succeeded {
+        if dset_init == crate::server::device_support::DsetInit::Ok {
             self.val_to_bits();
         }
         self.mlst = self.val;

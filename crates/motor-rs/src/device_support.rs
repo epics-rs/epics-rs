@@ -319,7 +319,7 @@ impl DeviceSupport for MotorDeviceSupport {
         }
 
         self.initialized = true;
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

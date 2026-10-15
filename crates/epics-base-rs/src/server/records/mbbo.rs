@@ -661,6 +661,19 @@ impl Record for MbboRecord {
         self.orbv = self.rbv;
     }
 
+    /// `devMbboSoft`/`devMbboSoftRaw` `init_record` return 2.
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::DoNotConvert
+    }
+
+    /// C `mbboRecord.c:143-166`: the RVAL shifted by SHFT, resolved through
+    /// the state table (65535 when no state matches), and `udf = FALSE`.
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        let raw = self.rval.checked_shr(u32::from(self.shft)).unwrap_or(0);
+        self.val = self.raw_to_val(raw);
+        Some(false)
+    }
+
     /// C `mbboRecord.c:179-180` — `mlst = lalm = val`. No ALST: mbbo has no
     /// ADEL.
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {

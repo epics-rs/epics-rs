@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(r.mlst, 0, "precondition: tracker is the 0 default");
         assert_eq!(r.alst, 0);
         assert_eq!(r.lalm, 0);
-        r.seed_deadband_tracking(crate::server::device_support::DsetInit::Succeeded);
+        r.seed_deadband_tracking(crate::server::device_support::DsetInit::Ok);
         assert_eq!(r.mlst, 5, "mlst seeded from val");
         assert_eq!(r.alst, 5, "alst seeded from val");
         assert_eq!(r.lalm, 5, "lalm seeded from val");

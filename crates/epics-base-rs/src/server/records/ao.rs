@@ -454,6 +454,23 @@ impl Record for AoRecord {
         )]
     }
 
+    /// `devAoSoft` `init_record` returns 2; `devAoSoftRaw` has none.
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::DoNotConvert
+    }
+
+    /// C `aoRecord.c:132-150` `case(0)`: RVAL through the readback convert,
+    /// then `udf = isnan(value)`. A breakpoint failure `break`s with VAL and
+    /// UDF untouched and raises nothing at init.
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        self.convert_readback();
+        if self.readback_bpt_error {
+            self.readback_bpt_error = false;
+            return None;
+        }
+        Some(self.val.is_nan())
+    }
+
     /// C `aoRecord.c:155-161`: `oval = pval = val`, the deadband trackers,
     /// then `oraw = rval; orbv = rbv` — all after `:152` returns
     /// `S_dev_badInitRet` for a dset status other than 0 or 2. softIoc with

@@ -64,7 +64,7 @@ async fn probe_ioc(db: &str) -> Arc<PvDatabase> {
     let (db, _) = IocBuilder::new()
         .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
             let outcome = match ctx.dtyp {
-                "probeLive" => Some(DeviceInitOutcome::Live),
+                "probeLive" => Some(DeviceInitOutcome::ok()),
                 "probeDead" => Some(DeviceInitOutcome::dead()),
                 "probeErr" => None,
                 _ => return None,
@@ -130,9 +130,10 @@ async fn bi_seeds_mlst_lalm_oraw_only_after_a_successful_dset_init() {
 
 /// `aoRecord.c:152` returns `S_dev_badInitRet` for a dset status other than
 /// 0 or 2, before `:156` (`oval = pval = val`) and `:160-161` (ORAW, ORBV).
+/// The Live probe returns 0, so `:132-146` converts RVAL into VAL first.
 #[epics_macros_rs::epics_test]
 async fn ao_seeds_oval_pval_oraw_orbv_only_after_a_successful_dset_init() {
-    let db = probe_ioc_of("ao", r#"field(VAL, "3")"#).await;
+    let db = probe_ioc_of("ao", r#"field(RVAL, "3")"#).await;
     let num = |f| by_outcome(&db, "ao", f).map(|v| v.and_then(|v| v.to_f64()));
     let [val, ..] = num("VAL");
     for field in ["OVAL", "PVAL", "ORAW", "ORBV"] {

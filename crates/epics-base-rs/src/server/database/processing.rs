@@ -10738,7 +10738,7 @@ mod ls_init_udf_tests {
     /// `udf = FALSE` sits below its `if (status) return status;`.
     #[test]
     fn lso_udf_clears_only_when_the_dset_init_did_not_fail() {
-        assert_eq!(udf_after_seed(DsetInit::Succeeded), 0);
+        assert_eq!(udf_after_seed(DsetInit::Ok), 0);
         assert_eq!(udf_after_seed(DsetInit::Absent), 0);
         assert_eq!(udf_after_seed(DsetInit::Failed), 1);
     }

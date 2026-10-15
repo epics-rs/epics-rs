@@ -93,7 +93,7 @@ impl DeviceSupport for GetenvDeviceSupport {
                 "DTYP=getenv: unsupported record type '{rtype}' (use stringin or lsi)"
             )));
         }
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

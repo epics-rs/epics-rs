@@ -83,7 +83,7 @@ fn seed_deadband_tracking_seeds_trackers_and_derives_nothing() {
     let mut bo = create_record("bo").unwrap();
     bo.put_field("MASK", EpicsValue::ULong(255)).unwrap();
     bo.put_field("VAL", EpicsValue::Enum(1)).unwrap();
-    bo.seed_deadband_tracking(DsetInit::Succeeded);
+    bo.seed_deadband_tracking(DsetInit::Ok);
     assert_eq!(cell(&*bo, "MLST"), 1.0, "boRecord.c:172");
     assert_eq!(cell(&*bo, "LALM"), 1.0, "boRecord.c:173");
     assert_eq!(
@@ -94,7 +94,7 @@ fn seed_deadband_tracking_seeds_trackers_and_derives_nothing() {
 
     let mut ao = create_record("ao").unwrap();
     ao.put_field("VAL", EpicsValue::Double(2.5)).unwrap();
-    ao.seed_deadband_tracking(DsetInit::Succeeded);
+    ao.seed_deadband_tracking(DsetInit::Ok);
     assert_eq!(cell(&*ao, "ALST"), 2.5, "aoRecord.c:158");
     // OVAL/PVAL are previous-value cells like MLST, and ao's tail has no
     // convert: all of it sits behind aoRecord.c:152's status return.
@@ -104,7 +104,7 @@ fn seed_deadband_tracking_seeds_trackers_and_derives_nothing() {
     let mut md = create_record("mbboDirect").unwrap();
     md.put_field("VAL", EpicsValue::Long(5)).unwrap();
     md.put_field("RVAL", EpicsValue::ULong(5)).unwrap();
-    md.seed_deadband_tracking(DsetInit::Succeeded);
+    md.seed_deadband_tracking(DsetInit::Ok);
     assert_eq!(cell(&*md, "MLST"), 5.0, "mbboDirectRecord.c:160");
     // Not B0: the VAL put re-derives the bit cells itself, so only ORAW
     // isolates the hook. `oraw = rval` is mbboDirectRecord.c:161.

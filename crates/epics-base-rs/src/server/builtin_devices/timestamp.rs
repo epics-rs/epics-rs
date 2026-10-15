@@ -336,7 +336,7 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
                 "DTYP='Soft Timestamp': unsupported record type '{rt}' (use ai or stringin)"
             )));
         }
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     // devTimestamp.c `{6, NULL, initAllow, NULL, NULL}`.

@@ -104,7 +104,7 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
             .num_channels()
             .min(MAX_SCALER_CHANNELS) as i16;
         scaler.bind_dset(self.driver());
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

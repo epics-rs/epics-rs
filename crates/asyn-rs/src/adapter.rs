@@ -1256,6 +1256,26 @@ impl EnumRecordShape {
     }
 }
 
+/// The status and `udf` write of the C asyn `init*` function for this record
+/// type and interface, given whether its initial read succeeded.
+fn init_status(record_type: &str, iface_type: &str, read_back: bool) -> DeviceInitOutcome {
+    use epics_base_rs::server::device_support::DeviceUdf::{Defined, Untouched};
+    match (record_type, iface_type) {
+        // initAo (devAsynInt32.c:955-959), initBo, initMbbo: 0 lets the record
+        // convert the RVAL read back, 2 otherwise.
+        ("ao", "asynInt32") | ("bo" | "mbbo", _) if read_back => DeviceInitOutcome::ok(),
+        // devAsynFloat64.c initAo sets VAL and `udf = 0`; initMbboDirect sets
+        // VAL, B0-B15 and `udf = FALSE`; devAsynInt64.c initAo sets VAL only.
+        ("ao", "asynFloat64") | ("mbboDirect", _) if read_back => {
+            DeviceInitOutcome::DoNotConvert(Defined)
+        }
+        ("ao" | "bo" | "mbbo" | "mbboDirect", _) => DeviceInitOutcome::DoNotConvert(Untouched),
+        // initLo/initLLo and devAsynOctet.c initCommon: `udf = 0`, INIT_OK.
+        _ if read_back => DeviceInitOutcome::Ok(Defined),
+        _ => DeviceInitOutcome::ok(),
+    }
+}
+
 /// Build the `(field, value)` list C `setEnums` (devAsynInt32.c:415-435)
 /// writes for `entries` onto a record of the given `shape` — the single
 /// producer shared by init (apply directly to the record) and the runtime
@@ -2245,6 +2265,7 @@ impl DeviceSupport for AsynDeviceSupport {
             }
         }
 
+        let mut read_back = false;
         if self.initial_readback {
             if let Some(op) = self.read_op() {
                 let user = self.init_user();
@@ -2279,6 +2300,7 @@ impl DeviceSupport for AsynDeviceSupport {
                             if !seeded {
                                 let _ = record.set_val(val);
                             }
+                            read_back = true;
                         }
                     }
                 }
@@ -2291,7 +2313,11 @@ impl DeviceSupport for AsynDeviceSupport {
         if self.scan == ScanType::IoIntr {
             self.refresh_average_decimation_threshold(record);
         }
-        Ok(DeviceInitOutcome::Live)
+        Ok(init_status(
+            record.record_type(),
+            &self.iface_type,
+            read_back,
+        ))
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -3657,6 +3683,53 @@ mod tests {
     use super::*;
     use crate::port_actor::ActorLink;
 
+    /// C asyn `init*` status per output record: 0 (convert) only where the
+    /// dset returns it after a successful read back, 2 on every miss.
+    #[test]
+    fn init_status_matches_c_asyn_init_return() {
+        use epics_base_rs::server::device_support::DeviceUdf::{Defined, Untouched};
+        let ok = DeviceInitOutcome::ok();
+        let no_convert = DeviceInitOutcome::DoNotConvert(Untouched);
+        let cases = [
+            ("ao", "asynInt32", true, ok),
+            (
+                "ao",
+                "asynFloat64",
+                true,
+                DeviceInitOutcome::DoNotConvert(Defined),
+            ),
+            ("ao", "asynInt64", true, no_convert),
+            ("bo", "asynUInt32Digital", true, ok),
+            ("mbbo", "asynInt32", true, ok),
+            (
+                "mbboDirect",
+                "asynUInt32Digital",
+                true,
+                DeviceInitOutcome::DoNotConvert(Defined),
+            ),
+            ("ao", "asynInt32", false, no_convert),
+            ("bo", "asynInt32", false, no_convert),
+            ("mbbo", "asynUInt32Digital", false, no_convert),
+            ("mbboDirect", "asynInt32", false, no_convert),
+            ("longout", "asynInt32", true, DeviceInitOutcome::Ok(Defined)),
+            (
+                "stringout",
+                "asynOctetWrite",
+                true,
+                DeviceInitOutcome::Ok(Defined),
+            ),
+            ("longout", "asynInt32", false, ok),
+            ("ai", "asynInt32", false, ok),
+        ];
+        for (rtype, iface, read_back, want) in cases {
+            assert_eq!(
+                init_status(rtype, iface, read_back),
+                want,
+                "{rtype} {iface} {read_back}"
+            );
+        }
+    }
+
     /// The generated asyn device menus match the C `asyn.dbd` load, in the exact
     /// order (the DTYP index is wire-visible): `mbbo` gets `asynInt32` then
     /// `asynUInt32Digital` (devAsynInt32.dbd before devAsynUInt32Digital.dbd in
@@ -4929,7 +5002,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
         let mut ads = make_timeseries_adapter("asynInt32");
         let mut rec = WaveformRecord::new(4, DbFieldType::Long);
-        assert_eq!(ads.init(&mut rec).unwrap(), DeviceInitOutcome::Live);
+        assert_eq!(ads.init(&mut rec).unwrap(), DeviceInitOutcome::ok());
         assert!(
             ads.time_series
                 .as_ref()

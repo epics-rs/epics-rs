@@ -45,10 +45,10 @@ async fn ioc(db: &str) -> Arc<PvDatabase> {
     IocBuilder::new()
         .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
             let (outcome, raw) = match ctx.dtyp {
-                "probeLive" => (Some(DeviceInitOutcome::Live), None),
+                "probeLive" => (Some(DeviceInitOutcome::ok()), None),
                 "probeDead" => (Some(DeviceInitOutcome::dead()), None),
                 "probeErr" => (None, None),
-                "probeRaw" => (Some(DeviceInitOutcome::Live), Some(58)),
+                "probeRaw" => (Some(DeviceInitOutcome::ok()), Some(58)),
                 _ => return None,
             };
             Some(Box::new(Probe(outcome, raw)) as Box<dyn DeviceSupport>)

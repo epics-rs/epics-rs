@@ -446,6 +446,18 @@ impl Record for MbboDirectRecord {
         self.orbv = self.rbv;
     }
 
+    /// `devMbboDirectSoft` has no `init_record` and `devMbboDirectSoftRaw`
+    /// returns 2.
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::DoNotConvert
+    }
+
+    /// C `mbboDirectRecord.c:128-136`: `val = rval >> shft; udf = FALSE`.
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        self.val = self.rval.checked_shr(u32::from(self.shft)).unwrap_or(0);
+        Some(false)
+    }
+
     /// C `mbboDirectRecord.c:160` — `mlst = val`, and that is the whole tracker
     /// half: mbboDirect has neither ADEL nor LALM.
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {

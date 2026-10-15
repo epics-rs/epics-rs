@@ -97,7 +97,7 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
     for (rtype, val, seeds) in CASES {
         for (dset_init, seeds) in [
             (DsetInit::Absent, seeds.absent),
-            (DsetInit::Succeeded, seeds.succeeded),
+            (DsetInit::Ok, seeds.succeeded),
             (DsetInit::Failed, seeds.failed),
         ] {
             let mut rec =

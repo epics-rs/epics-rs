@@ -491,7 +491,7 @@ mod tests {
         rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
         rec.init_record(0).unwrap();
         rec.init_record(1).unwrap();
-        rec.seed_deadband_tracking(crate::server::device_support::DsetInit::Succeeded);
+        rec.seed_deadband_tracking(crate::server::device_support::DsetInit::Ok);
         for field in ["MLST", "ALST", "LALM"] {
             assert_eq!(
                 rec.get_field(field),

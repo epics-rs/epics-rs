@@ -99,7 +99,7 @@ pub mod ioc_support {
         fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             let val = self.value.get();
             record.put_field("VAL", epics_base_rs::types::EpicsValue::Double(val))?;
-            Ok(DeviceInitOutcome::Live)
+            Ok(DeviceInitOutcome::ok())
         }
 
         fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

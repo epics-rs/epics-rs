@@ -45,7 +45,7 @@ impl DeviceSupport for SoftMca {
     /// C `init_record` (`devMCA_soft.c:64-72`): `pmca->nord = 0`.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         Self::mca(record)?.nord = 0;
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     /// The device half of one process cycle: send what the record asked to send,

@@ -255,7 +255,7 @@ pub mod ioc_support {
 
         fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             record.put_field("VAL", EpicsValue::DoubleArray(self.current_data().into()))?;
-            Ok(DeviceInitOutcome::Live)
+            Ok(DeviceInitOutcome::ok())
         }
 
         fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

@@ -65,6 +65,12 @@ impl DeviceSupport for DbStateDeviceSupport {
         self.state.is_some()
     }
 
+    /// `devBiDbState`/`devBoDbState` carry no `init_record` entry
+    /// (`devBoDbState.c:73`), so bo never runs its status-0 convert.
+    fn has_init_record(&self) -> bool {
+        false
+    }
+
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C registers a SEPARATE dset per record type (devBiDbState for bi,
         // devBoDbState for bo); both carry DTYP "Db State". The Rust dynamic
@@ -77,7 +83,7 @@ impl DeviceSupport for DbStateDeviceSupport {
             )));
         }
         let _ = self.add_record(rt);
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn add_record(&mut self, record_type: &str) -> Result<(), LinkRefusal> {

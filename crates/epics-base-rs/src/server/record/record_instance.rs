@@ -6611,7 +6611,7 @@ impl RecordInstance {
             device: None,
             dpvt: Default::default(),
             subroutine: None,
-            dset_init: crate::server::device_support::DsetInit::Succeeded,
+            dset_init: crate::server::device_support::DsetInit::Ok,
             pact: AtomicBool::new(false),
             notify: None,
             notify_restart_list: std::collections::VecDeque::new(),

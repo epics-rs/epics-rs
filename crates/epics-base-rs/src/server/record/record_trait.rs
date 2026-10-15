@@ -4951,6 +4951,21 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// The status this record type's soft channel dset `init_record` returns.
+    /// Default `0`; `devBoSoft`, `devMbboSoft`, `devMbboDirectSoftRaw` and
+    /// `devAoSoft` return `2` (or have no `init_record`, which their record
+    /// treats the same).
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::Ok
+    }
+
+    /// The record's `init_record` arm for a dset `init_record` that returned
+    /// 0: convert the RVAL the dset left into VAL, returning the UDF it sets.
+    /// `None` for the record types with no such arm (default).
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        None
+    }
+
     /// Post-init finalisation hook with mutable access to the
     /// framework's UDF flag. Called once after both `init_record`
     /// passes complete. Default implementation is a no-op.

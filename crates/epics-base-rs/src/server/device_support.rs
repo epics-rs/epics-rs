@@ -619,9 +619,11 @@ impl DeviceReadOutcome {
 pub enum DsetInit {
     /// The dset has no `init_record` entry (devTimestampAI).
     Absent,
-    /// C status 0, or `ao`/`bo`/`mbbo`'s "do not convert" 2. Every soft
-    /// channel dset lands here.
-    Succeeded,
+    /// C status 0. `bo`, `mbbo`, `mbboDirect` and `ao` convert the RVAL the
+    /// dset left and define the record; `mbbiDirect` derives B0-B1F.
+    Ok,
+    /// C status 2, "do not convert": the record keeps the VAL the dset left.
+    DoNotConvert,
     /// Any other status: [`DeviceInitOutcome::Dead`] or an `Err` from
     /// [`DeviceSupport::init`].
     Failed,
@@ -648,11 +650,17 @@ pub enum DsetInit {
 /// severity: a dead waveform reads PACT=1 and BUSY=0 forever, `caput REC.RARM 1`
 /// sets RPRO and processes nothing (`dbAccess.c:1267-1271`), and a *scanned*
 /// dead record collects SCAN_ALARM/INVALID once `lcnt` passes MAX_LOCK.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceInitOutcome {
-    /// C `return INIT_OK` / `return 0` — the record processes normally.
-    #[default]
-    Live,
+    /// C `return INIT_OK` / `return 0` — the record processes normally, and
+    /// the record types that test the status convert the RVAL the dset left
+    /// ([`DsetInit::Ok`]). The [`DeviceUdf`] is what the dset itself wrote to
+    /// `prec->udf` (devAsynInt32.c `initLo`: `pr->udf = 0`).
+    Ok(DeviceUdf),
+    /// C `return INIT_DO_NOT_CONVERT` / `return 2` — the record keeps the VAL
+    /// the dset left ([`DsetInit::DoNotConvert`]); the [`DeviceUdf`] as above
+    /// (devAsynFloat64.c `initAo`: `pao->udf = 0`).
+    DoNotConvert(DeviceUdf),
     /// C's `bad:` arm — `pr->pact = 1`. The framework sets PACT and never
     /// releases it, so the record never processes again.
     ///
@@ -675,6 +683,12 @@ pub enum DeviceInitOutcome {
 }
 
 impl DeviceInitOutcome {
+    /// C `return 0` with `prec->udf` untouched — every dset that does not
+    /// test or write either.
+    pub fn ok() -> Self {
+        Self::Ok(DeviceUdf::Untouched)
+    }
+
     /// C's bare `bad:` arm — `pr->pact = 1` with no `recGblSetSevr`
     /// (`devAsynXXXTimeSeries.h:118-120`).
     pub fn dead() -> Self {
@@ -741,9 +755,10 @@ pub struct DeviceAlarm<'a> {
 pub trait DeviceSupport: Send + Sync + 'static {
     /// C `init_record`. See [`DeviceInitOutcome`] for the two failure shapes:
     /// `Err` flags the record but leaves it processing, `Ok(Dead)` is C's
-    /// `pr->pact = 1` and stops it for good.
+    /// `pr->pact = 1` and stops it for good. The default does nothing, so
+    /// there is nothing for the record to convert.
     fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched))
     }
 
     /// Whether the C dset this ports has an `init_record` entry. `aiRecord.c`
@@ -1060,12 +1075,30 @@ pub fn init_device_support(instance: &mut RecordInstance) {
         instance.record.init_soft_dset(soft);
     }
     let Some(mut dev) = instance.device.take() else {
-        instance.dset_init = DsetInit::Succeeded;
+        instance.dset_init = if instance.common.dtyp.is_soft() {
+            instance.record.soft_dset_init()
+        } else {
+            DsetInit::Ok
+        };
         return;
     };
     let name = instance.name.clone();
-    let succeeded = match dev.init(&mut *instance.record) {
-        Ok(DeviceInitOutcome::Live) => true,
+    let status = match dev.init(&mut *instance.record) {
+        Ok(DeviceInitOutcome::Ok(udf)) => {
+            apply_init_udf(instance, udf);
+            // The record's own `if (status == 0)` arm, after the dset's write;
+            // a dset with no `init_record` never reaches it.
+            if dev.has_init_record() {
+                if let Some(udf) = instance.record.dset_init_convert() {
+                    instance.common.udf = udf as u8;
+                }
+            }
+            DsetInit::Ok
+        }
+        Ok(DeviceInitOutcome::DoNotConvert(udf)) => {
+            apply_init_udf(instance, udf);
+            DsetInit::DoNotConvert
+        }
         Ok(DeviceInitOutcome::Dead { alarm }) => {
             // C's `bad:` arm. The driver has already printed why. The
             // `recGblSetSevr` comes first in every C arm that has one, so it
@@ -1075,7 +1108,7 @@ pub fn init_device_support(instance: &mut RecordInstance) {
                 crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
             }
             instance.enter_pact();
-            false
+            DsetInit::Failed
         }
         Err(e) => {
             eprintln!(
@@ -1086,17 +1119,24 @@ pub fn init_device_support(instance: &mut RecordInstance) {
             // than presenting a healthy-looking record.
             instance.common.sevr = AlarmSeverity::Invalid;
             instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
-            false
+            DsetInit::Failed
         }
     };
     instance.dset_init = if !dev.has_init_record() {
         DsetInit::Absent
-    } else if succeeded {
-        DsetInit::Succeeded
     } else {
-        DsetInit::Failed
+        status
     };
     instance.device = Some(dev);
+}
+
+/// The dset's own write of `prec->udf` from inside its `init_record`.
+fn apply_init_udf(instance: &mut RecordInstance, udf: DeviceUdf) {
+    match udf {
+        DeviceUdf::Untouched => {}
+        DeviceUdf::Defined => instance.common.udf = 0,
+        DeviceUdf::Undefined => instance.common.udf = 1,
+    }
 }
 
 #[cfg(test)]
@@ -1158,7 +1198,7 @@ mod tests {
             o.record_info_before_init = self.record_info_set;
             o.info_at_init = self.info.keys().cloned().collect();
             match self.verdict {
-                InitVerdict::Live => Ok(DeviceInitOutcome::Live),
+                InitVerdict::Live => Ok(DeviceInitOutcome::ok()),
                 InitVerdict::Dead => Ok(DeviceInitOutcome::dead()),
                 InitVerdict::Fail => Err(CaError::InvalidValue("device init failed".into())),
             }

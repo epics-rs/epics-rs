@@ -52,7 +52,7 @@ impl DeviceSupport for AsynRecordDevice {
             .as_any_mut()
             .and_then(|any| any.downcast_mut::<AsynRecord>())
             .map(|rec| rec.io_intr_scan());
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     /// C's DSET has no `write` (slot 5 is 0): the asyn record is not an output

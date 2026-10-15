@@ -290,6 +290,18 @@ impl Record for BoRecord {
         self.orbv = self.rbv;
     }
 
+    /// `devBoSoft`/`devBoSoftRaw` `init_record` return 2 (`devBoSoft.c:46-49`).
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::DoNotConvert
+    }
+
+    /// C `boRecord.c:158-162`: `if(prec->rval==0) prec->val = 0; else
+    /// prec->val = 1; prec->udf = FALSE;`
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        self.val = u16::from(self.rval != 0);
+        Some(false)
+    }
+
     /// C `boRecord.c:172-173` — `mlst = lalm = val`, the tracker half of the
     /// same tail. (C assigns `mlst` twice, once on each side of the convert at
     /// `:165` and `:172`; only the second is reachable.) bo seeds no ALST: it

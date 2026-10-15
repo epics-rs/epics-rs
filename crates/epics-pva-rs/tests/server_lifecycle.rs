@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+// Probe the wildcard the listener binds: Windows lets a specific address
+// bind beside a wildcard listener.
 fn tcp_is_held(port: u16) -> bool {
-    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+    std::net::TcpListener::bind(("0.0.0.0", port)).is_err()
 }
 
 // Probe the loopback address the bundle binds. A wildcard bind does not

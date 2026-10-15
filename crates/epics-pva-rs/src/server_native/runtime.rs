@@ -1091,6 +1091,10 @@ mod tcp_fallback_tests {
     /// `127.0.0.1 0.0.0.0:7000` binds 127.0.0.1:5383, then fails on the
     /// wildcard with `ERR Bind to [::]:5383 fails after fallback with 98` and
     /// serves no PVA. rs binds the v4 wildcard where pvxs binds `[::]`.
+    // Not on Windows: a plain wildcard bind beside a specific one succeeds
+    // there, and pvxs sets no option to refuse it (libevent's
+    // `evutil_make_listen_socket_reuseable` is a no-op on WIN32).
+    #[cfg(not(windows))]
     #[tokio::test]
     #[serial_test::serial(epics_env)]
     async fn wildcard_entry_binds_after_a_specific_one() {

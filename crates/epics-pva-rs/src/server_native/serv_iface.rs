@@ -327,6 +327,9 @@ mod tests {
 
     /// A wildcard beside a specific entry collides with the set's own
     /// listener, which no other number cures.
+    // Not on Windows, where the wildcard binds beside it, as pvxs's does
+    // (`wildcard_entry_binds_after_a_specific_one`).
+    #[cfg(not(windows))]
     #[test]
     fn a_wildcard_beside_a_specific_entry_fails_on_the_first_try() {
         let (r, tried) = bind_counting(&["127.0.0.1:0", "0.0.0.0:0"], 0, |_, _| {});

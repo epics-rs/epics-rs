@@ -97,9 +97,9 @@ async fn run(args: Args) -> Result<(), String> {
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
         app = app.startup_line(&format!(
-            "dbLoadRecords(\"{}\", \"{}\")",
-            iocsh_quote(&path.to_string_lossy()),
-            iocsh_quote(&macros.join(","))
+            "dbLoadRecords({}, {})",
+            iocsh_escape(&path.to_string_lossy()),
+            iocsh_escape(&macros.join(","))
         ));
     }
     let group_files: Vec<GroupLoadRequest> = args
@@ -131,9 +131,20 @@ async fn run(args: Args) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// An argument as iocsh text that splits back into exactly its bytes. Inside
+/// a quote C's `split` takes a backslash as data and escapes nothing
+/// (`iocsh.cpp:252-371`); outside one a backslash makes the next byte data
+/// for both `macDefExpand` and `split`. The same rule as softioc-rs's.
 #[cfg(tokio_backend)]
-fn iocsh_quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+fn iocsh_escape(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len());
+    for c in arg.chars() {
+        if c.is_ascii_whitespace() || "\\\"'(),$<>".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The `exec_backend` arm. QSRV serves its groups over the async PVA front-end

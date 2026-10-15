@@ -1205,7 +1205,15 @@ pub(crate) fn fill_until_refused(sock: &TcpStream) {
         };
         if taken == 0 {
             assert!(total > 0, "the socket refused the very first byte");
-            return;
+            // A refusal is the pipe being full only once it stays: in-flight
+            // bytes reaching the peer, or Darwin's buffer auto-tuning, can
+            // open room after it, and the stalled write would then fit.
+            match socket::poll_ready(sock, socket::Readiness::Writable, 50) {
+                Ok(false) => return,
+                Ok(true) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("polling the filled socket failed: {e}"),
+            }
         }
         total += taken;
     }

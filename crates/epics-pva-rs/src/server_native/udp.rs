@@ -190,11 +190,7 @@ pub(crate) fn bind_udp(port: u16, interfaces: &ServerInterfaces, v6: bool) -> Pv
         };
         match companions() {
             Ok((v6, collector)) => break (sock, bound, v6, collector),
-            Err(e)
-                if port == 0
-                    && e.kind() == std::io::ErrorKind::AddrInUse
-                    && tries < EPHEMERAL_TRIES =>
-            {
+            Err(e) if port == 0 && port_held(&e) && tries < EPHEMERAL_TRIES => {
                 debug!("UDP port {bound} is held; choosing another search port");
                 tries += 1;
             }
@@ -213,6 +209,15 @@ pub(crate) fn bind_udp(port: u16, interfaces: &ServerInterfaces, v6: bool) -> Pv
         collector,
         port,
     })
+}
+
+/// Whether a bind failed on a number another socket holds. Windows reports a
+/// fanout (`SO_REUSEADDR`) bind beside a socket that did not share as
+/// `WSAEACCES`, not `WSAEADDRINUSE`, as pvxs `ServIface` knows
+/// (`serverconn.cpp:437`, `SOCK_EACCES`).
+fn port_held(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AddrInUse
+        || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 /// A server start's search sockets, all on [`Self::port`].
@@ -1654,7 +1659,7 @@ mod tests {
         let err = super::bind_udp(0, &localhost_only(), true).err();
         BEFORE_V6_BIND.take();
         assert!(
-            matches!(&err, Some(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse),
+            matches!(&err, Some(PvaError::Io(e)) if port_held(e)),
             "{err:?}"
         );
         assert_eq!(tried.borrow().len(), 32);
@@ -1680,7 +1685,7 @@ mod tests {
             assert!(tries < 5, "v4 bind of {port} failed {tries} times: {err:?}");
         };
         assert!(
-            matches!(&err, Some(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse),
+            matches!(&err, Some(PvaError::Io(e)) if port_held(e)),
             "{err:?}"
         );
         assert_eq!(*tried.borrow(), [port]);

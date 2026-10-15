@@ -380,22 +380,90 @@ pub(super) trait SendWithoutParking {
 /// connect, and `ip_server_port`'s `ClientSlot::assign` for a served
 /// connection.
 ///
-/// Non-blocking on unix, which is C's `setNonBlock(fd, 1)`
-/// (`drvAsynIPPort.c:516`) under `USE_POLL` — one statement covering both,
-/// since the server-accepted fd reaches `connectIt` through
-/// `pasynUser->reason` (:436-437) and passes the same line. With the mode owned, neither
-/// direction can park whatever the target does with `MSG_DONTWAIT`,
-/// `SO_SNDTIMEO` or `SO_RCVTIMEO`, and the bound is the poll in
-/// [`WaitWritable`] / [`BoundNextRead`] on every unix alike. Blocking
-/// elsewhere: Windows implements both options and both bounds ride on them.
-/// RTEMS differs from C: `__rtems__` selects `USE_SOCKTIMEOUT` (:71-72), so C
-/// never calls `setNonBlock` there and bounds each transfer by `SO_*TIMEO`.
-pub(super) const OWNED_NONBLOCKING: bool = cfg!(unix);
+/// Non-blocking, which is C's `setNonBlock(fd, 1)` (`drvAsynIPPort.c:516`)
+/// under `USE_POLL` — one statement covering both, since the server-accepted
+/// fd reaches `connectIt` through `pasynUser->reason` (:436-437) and passes the
+/// same line. With the mode owned, neither direction can park whatever the
+/// target does with `MSG_DONTWAIT`, `SO_SNDTIMEO` or `SO_RCVTIMEO`, and the
+/// bound is the poll in [`WaitWritable`] / [`BoundNextRead`] everywhere. WIN32
+/// is `USE_POLL` too, polling through `WSAPoll` (:77-79), so a read that
+/// times out there reports `WSAEWOULDBLOCK` as C's does, not the
+/// `WSAETIMEDOUT` an `SO_RCVTIMEO` bound answers. RTEMS differs from C:
+/// `__rtems__` selects `USE_SOCKTIMEOUT` (:71-72), so C never calls
+/// `setNonBlock` there and bounds each transfer by `SO_*TIMEO`.
+pub(super) const OWNED_NONBLOCKING: bool = true;
+
+/// Which readiness [`PollSocket::poll_socket`] waits for.
+#[derive(Clone, Copy)]
+pub(super) enum Readiness {
+    Readable,
+    Writable,
+}
+
+/// One C `poll` of this socket for `want`: `Ok(true)` ready, `Ok(false)` the
+/// interval expired. `ms < 0` waits without bound. `WSAPoll` on Windows, as C
+/// `#define`s it (drvAsynIPPort.c:77-79).
+pub(super) trait PollSocket {
+    fn poll_socket(&self, want: Readiness, ms: i32) -> std::io::Result<bool>;
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> PollSocket for T {
+    fn poll_socket(&self, want: Readiness, ms: i32) -> std::io::Result<bool> {
+        let mut fds = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: match want {
+                Readiness::Readable => POLLIN_EVENT,
+                Readiness::Writable => POLLOUT_EVENT,
+            },
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
+        // and stays open for the call; `poll` reads `fd`/`events` and writes
+        // only `revents`.
+        match unsafe { libc::poll(&mut fds, 1, ms) } {
+            0 => Ok(false),
+            rc if rc > 0 => Ok(true),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsRawSocket> PollSocket for T {
+    fn poll_socket(&self, want: Readiness, ms: i32) -> std::io::Result<bool> {
+        use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLOUT, WSAPOLLFD, WSAPoll};
+        let mut fds = WSAPOLLFD {
+            fd: self.as_raw_socket() as usize,
+            events: match want {
+                Readiness::Readable => POLLIN,
+                Readiness::Writable => POLLOUT,
+            },
+            revents: 0,
+        };
+        // SAFETY: one initialised `WSAPOLLFD` whose `fd` is this borrowed
+        // socket's and stays open for the call; `WSAPoll` writes only `revents`.
+        match unsafe { WSAPoll(&mut fds, 1, ms) } {
+            0 => Ok(false),
+            rc if rc > 0 => Ok(true),
+            // `WSAGetLastError` is `GetLastError`, which `last_os_error` reads.
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+}
+
+/// [`wait_millis`] as `poll`'s interval; `None` is its own `-1`.
+fn poll_millis(timeout: Option<Duration>) -> i32 {
+    match timeout {
+        Some(t) => wait_millis(t).min(i32::MAX as u128) as i32,
+        None => -1,
+    }
+}
 
 /// Make the `read`/`recv_from` that follows return within `timeout`.
 ///
 /// The read-side counterpart to [`WaitWritable`], and it moved here for the
-/// same reason the write bound did: on unix the descriptor is non-blocking, so
+/// same reason the write bound did: the descriptor is non-blocking, so
 /// `SO_RCVTIMEO` no longer applies to the call and a `POLLIN` wait does. C is
 /// again the same shape — under `USE_POLL` it polls its reads too, which is
 /// what makes the option's absence from that path unremarkable rather than a
@@ -412,72 +480,30 @@ pub(super) trait BoundNextRead {
     fn bound_next_read(&self, timeout: Option<Duration>);
 }
 
-#[cfg(unix)]
-impl<T: std::os::fd::AsRawFd> BoundNextRead for T {
+impl<T: PollSocket> BoundNextRead for T {
     fn bound_next_read(&self, timeout: Option<Duration>) {
-        let mut fds = libc::pollfd {
-            fd: self.as_raw_fd(),
-            events: POLLIN_EVENT,
-            revents: 0,
-        };
         // `None` is C's negative timeout: `readPollmsec = -1`
         // (drvAsynIPPort.c:794), which is `poll`'s own "no timeout".
-        let ms = match timeout {
-            Some(t) => wait_millis(t).min(libc::c_int::MAX as u128) as libc::c_int,
-            None => -1,
-        };
-        // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
-        // and stays open for the call; `poll` reads `fd`/`events` and writes
-        // only `revents`.
-        unsafe { libc::poll(&mut fds, 1, ms) };
+        let _ = self.poll_socket(Readiness::Readable, poll_millis(timeout));
     }
 }
 
-#[cfg(not(unix))]
-impl BoundNextRead for TcpStream {
-    fn bound_next_read(&self, timeout: Option<Duration>) {
-        // `None` clears `SO_RCVTIMEO`, which is the blocking read C's
-        // `readPollmsec = -1` performs (drvAsynIPPort.c:794).
-        let _ = self.set_read_timeout(timeout);
-    }
-}
-
-#[cfg(not(unix))]
-impl BoundNextRead for UdpSocket {
-    fn bound_next_read(&self, timeout: Option<Duration>) {
-        let _ = self.set_read_timeout(timeout);
-    }
-}
-
-#[cfg(unix)]
-impl<T: std::os::fd::AsRawFd> WaitWritable for T {
+impl<T: PollSocket> WaitWritable for T {
     fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
         loop {
-            let ms = match deadline {
+            let remaining = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining.is_zero() {
                         return Ok(false);
                     }
-                    wait_millis(remaining).min(libc::c_int::MAX as u128) as libc::c_int
+                    Some(remaining)
                 }
-                None => -1,
+                None => None,
             };
-            let mut fds = libc::pollfd {
-                fd: self.as_raw_fd(),
-                events: POLLOUT_EVENT,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut fds, 1, ms) };
-            if rc > 0 {
-                return Ok(true);
-            }
-            if rc == 0 {
-                return Ok(false);
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                return Err(err);
+            match self.poll_socket(Readiness::Writable, poll_millis(remaining)) {
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                outcome => return outcome,
             }
         }
     }
@@ -501,42 +527,9 @@ impl<T: std::os::fd::AsRawFd> SendWithoutParking for T {
     }
 }
 
-/// Windows implements `SO_SNDTIMEO`, so there the bound rides on the option and
-/// the send may park under it — the same split `blocking_io.rs` takes.
-#[cfg(not(unix))]
-fn arm_send_timeout(
-    set: impl FnOnce(Option<Duration>) -> std::io::Result<()>,
-    deadline: Option<std::time::Instant>,
-) -> std::io::Result<bool> {
-    // `None` clears `SO_SNDTIMEO`: the send waits as long as it takes, which is
-    // what C's negative `pasynUser->timeout` asks for.
-    let Some(deadline) = deadline else {
-        set(None)?;
-        return Ok(true);
-    };
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Ok(false);
-    }
-    set(Some(remaining))?;
-    Ok(true)
-}
-
-#[cfg(not(unix))]
-impl WaitWritable for TcpStream {
-    fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
-        arm_send_timeout(|t| self.set_write_timeout(t), deadline)
-    }
-}
-
-#[cfg(not(unix))]
-impl WaitWritable for UdpSocket {
-    fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
-        arm_send_timeout(|t| self.set_write_timeout(t), deadline)
-    }
-}
-
-#[cfg(not(unix))]
+/// Windows has no `MSG_DONTWAIT`; the owned non-blocking mode alone keeps the
+/// send out of a park, as it does C's `send` there.
+#[cfg(windows)]
 impl SendWithoutParking for TcpStream {
     fn send_without_parking(&self, buf: &[u8]) -> std::io::Result<usize> {
         (&mut &*self).write(buf)
@@ -1240,6 +1233,18 @@ fn setup_failure_text(device: &str, e: &socket::SetupError) -> String {
         // Only `tcp_listener` reports it, and no client port listens.
         socket::SetupStep::Listen => format!("Can't listen on {device}: {err}"),
     }
+}
+
+/// What C's `epicsSocketConvertErrnoToString` prints for the errno a timed-out
+/// read leaves on the non-blocking socket: `EWOULDBLOCK`'s `strerror`, or
+/// `WSAEWOULDBLOCK`'s system message on WIN32.
+#[cfg(test)]
+pub(crate) fn would_block_text() -> String {
+    #[cfg(unix)]
+    let errno = libc::EWOULDBLOCK;
+    #[cfg(windows)]
+    let errno = windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK;
+    sock_err_text(&std::io::Error::from_raw_os_error(errno))
 }
 
 /// C's `TCP_NODELAY` failure after the connect (drvAsynIPPort.c:580-589).
@@ -2749,7 +2754,7 @@ mod tests {
         // `strerror` (drvAsynIPPort.c:852-859).
         assert_eq!(
             err.message(),
-            format!("127.0.0.1:{port} read error: Resource temporarily unavailable")
+            format!("127.0.0.1:{port} read error: {}", would_block_text())
         );
         assert!(
             !drv.base().is_connected(),
@@ -2791,7 +2796,7 @@ mod tests {
         // (drvAsynIPPort.c:861-865).
         assert_eq!(
             err.message(),
-            format!("127.0.0.1:{port} timeout: Resource temporarily unavailable")
+            format!("127.0.0.1:{port} timeout: {}", would_block_text())
         );
         assert!(
             drv.base().is_connected(),
@@ -3098,7 +3103,6 @@ mod tests {
     /// recv that follows then reports asynTimeout without the socket ever
     /// having been waited on. `poll` waits at least its interval, so the call
     /// cannot return in the few microseconds the truncated form took.
-    #[cfg(unix)]
     #[test]
     fn bound_next_read_waits_a_whole_tick_for_a_sub_millisecond_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3348,15 +3352,13 @@ mod tests {
     /// Host proxy for a target-only failure: Linux implements the option, so
     /// the pre-fix code also returned Timeout here. What fails before the fix
     /// is the `write_timeout()` assertion — arming the option AT ALL is the
-    /// defect. `unix` only, because on Windows `SO_SNDTIMEO` works and the
-    /// bound deliberately still rides on it.
+    /// defect.
     ///
     /// Darwin included, and it is the case that proves the mode is what carries
     /// the bound: there `SO_SNDTIMEO` is absent by this test's own construction
     /// *and* `MSG_DONTWAIT` is ignored by XNU, so before
     /// [`IpIoInner::own_blocking_mode`] this write parked with nothing to end
     /// it.
-    #[cfg(unix)]
     #[test]
     fn a_stalled_write_bounds_itself_without_arming_so_sndtimeo() {
         let (listener, port) = start_echo_server();

@@ -2350,7 +2350,10 @@ mod tests {
         let err = child.read_octet(&user, &mut [0u8; 8]).unwrap_err();
         assert_eq!(
             err.message(),
-            "127.0.0.1:0 timeout: Resource temporarily unavailable"
+            format!(
+                "127.0.0.1:0 timeout: {}",
+                crate::drivers::ip_port::would_block_text()
+            )
         );
     }
 
@@ -2386,8 +2389,10 @@ mod tests {
         // C `readIt`'s `"%s timeout: %s"` with the recv errno's `strerror`
         // (drvAsynIPPort.c:861-865).
         assert!(
-            err.message()
-                .ends_with(" timeout: Resource temporarily unavailable"),
+            err.message().ends_with(&format!(
+                " timeout: {}",
+                crate::drivers::ip_port::would_block_text()
+            )),
             "got {err:?}"
         );
         assert!(
@@ -2417,8 +2422,10 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
         // `"%s read error: %s"` (drvAsynIPPort.c:852-859).
         assert!(
-            err.message()
-                .ends_with(" read error: Resource temporarily unavailable"),
+            err.message().ends_with(&format!(
+                " read error: {}",
+                crate::drivers::ip_port::would_block_text()
+            )),
             "got {err:?}"
         );
         assert!(

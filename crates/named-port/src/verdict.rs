@@ -148,6 +148,7 @@ mod tests {
 
     /// qsrv-rs's stderr, verbatim, with `tcp + 1` held on UDP by one socket
     /// the measuring process owned: Linux 6.14 / glibc 2.39 at 3afdb55dc.
+    #[cfg(target_os = "linux")]
     const QSRV_UDP_HELD: &str = "Starting iocInit\n\
         iocRun: All initialization complete\n\
         qsrv-rs: invalid value: invalid value: I/O error: Address already in use (os error 98)\n";
@@ -210,11 +211,14 @@ mod tests {
     /// by one socket the measuring process owned (UDP for the search arms, a
     /// TCP listener for the TCP arm): Linux 6.14 / glibc 2.39 at 3afdb55dc,
     /// realtime-ca-ioc on the thread backend.
+    #[cfg(target_os = "linux")]
     const SOFTIOC_RS_UDP_HELD: &str = "iocRun: All initialization complete\n\
         \x1b[31;1mERROR\x1b[0m: I/O error: CA server UDP search responder bind \
         127.0.0.1:32961: Address already in use (os error 98)\n";
+    #[cfg(target_os = "linux")]
     const RT_TCP_HELD: &str = "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
         Address already in use (os error 98)\n";
+    #[cfg(target_os = "linux")]
     const RT_UDP_HELD: &str = "realtime-ca-ioc: cannot start the CA UDP search responder on port \
         32961: Address already in use (os error 98)\n";
 

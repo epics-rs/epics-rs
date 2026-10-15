@@ -110,6 +110,15 @@ jobs:
           python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
           ifconfig | grep 'inet ' | grep -qv '127\.0\.0\.1'
 
+      # The multi-interface bind tests hold 127.0.0.2 and 127.0.0.4 as a second
+      # NIC; Linux and Windows route all of 127/8 to loopback, Darwin's lo0
+      # carries only 127.0.0.1.
+      - name: Second loopback addresses - macOS
+        if: runner.os == 'macOS'
+        run: |
+          sudo ifconfig lo0 alias 127.0.0.2 up
+          sudo ifconfig lo0 alias 127.0.0.4 up
+
       - name: Test prerequisites (::1, external NIC) - Windows
         if: runner.os == 'Windows'
         shell: pwsh

@@ -289,6 +289,44 @@ impl SubscriptionFilter for Line {
 /// Starts each step's posts in a stream.
 const STEP: &str = "--\n";
 
+/// Below this a value is cancellation residue of an exact 0 — `8.88178e-16`
+/// here is 4 ulp of 1.0.
+const RESIDUE: f64 = 1e-12;
+
+/// The stream with residue printed as `0~`, and without a post that only
+/// moved a field within the residue.
+///
+/// Its digits are not portable even for C: they come from the platform libm's
+/// `sin`/`cos`/`asin` and from whether the compiler fuses multiply-adds, and
+/// the oracle is glibc on x86_64. Apple clang fuses by default on
+/// darwin-aarch64 and Apple's libm rounds differently, so there C posts its
+/// own residue (`1.33227e-15` where glibc gives `8.88178e-16`), and later a
+/// residue-to-residue change that glibc never sees.
+fn portable(stream: &str) -> String {
+    let mut last: HashMap<&str, String> = HashMap::new();
+    let mut out = String::new();
+    for post in stream.lines() {
+        let mut words: Vec<&str> = post.split(' ').collect();
+        let residue = words
+            .get(1)
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|v| v.abs() < RESIDUE);
+        if residue {
+            words[1] = "0~";
+        }
+        let line = words.join(" ");
+        if residue && last.get(words[0]) == Some(&line) {
+            continue;
+        }
+        if post != STEP.trim_end() {
+            last.insert(words[0], line.clone());
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 /// A stream as each step's posts, grouped by PV in each PV's own order: C posts
 /// an axis's fields together in `monitor()`'s loop, the port in its walk's.
 fn steps_of(stream: &str) -> Vec<Vec<&str>> {
@@ -353,7 +391,7 @@ async fn table_stops_each_read_loop_at_a_failed_read_as_the_oracle_does() {
         (&streams[1], ALARM, "DBE_ALARM"),
         (&streams[2], LOG, "DBE_LOG"),
     ] {
-        let got = stream.lock().unwrap().clone();
-        assert_eq!(steps_of(&got), steps_of(want), "{class}");
+        let got = portable(&stream.lock().unwrap());
+        assert_eq!(steps_of(&got), steps_of(&portable(want)), "{class}");
     }
 }

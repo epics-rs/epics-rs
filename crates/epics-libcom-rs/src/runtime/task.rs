@@ -2085,12 +2085,108 @@ pub fn resume_thread(id: u64) -> bool {
 pub(crate) use thread_registry::os_thread_id;
 
 mod thread_registry {
-    use super::{PriorityApplied, ThreadPriority};
-    use std::sync::Mutex;
+    use super::{PriorityApplied, Suspension, ThreadPriority};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Creation order, as C's `ellAdd` appends.
-    static THREADS: Mutex<Vec<super::ThreadInfo>> = Mutex::new(Vec::new());
+    static THREADS: Mutex<Vec<Row>> = Mutex::new(Vec::new());
+
+    /// One listed thread: the [`super::ThreadInfo`] columns, less the `OSSPRI`
+    /// a snapshot reads, plus what that read needs.
+    struct Row {
+        id: u64,
+        name: String,
+        os_id: u64,
+        priority: ThreadPriority,
+        sched: Sched,
+        suspension: Arc<Suspension>,
+    }
+
+    /// Where `OSSPRI` comes from. Hosted POSIX reads it from the thread, as C
+    /// does (`posix/osdThreadExtra.c:36-40`): the default policy's
+    /// `sched_priority` is 0 on Linux but 31 on Darwin, so no constant can
+    /// stand in for it. The `pthread_t` is kept as an integer because Darwin's
+    /// is a pointer, which would make the list `!Send`.
+    #[cfg(all(unix, not(epics_embedded_target)))]
+    struct Sched(usize);
+
+    /// The embedded targets and Windows recompute it from the band the
+    /// prologue applied — the only scheduling change this workspace makes.
+    #[cfg(not(all(unix, not(epics_embedded_target))))]
+    struct Sched(PriorityApplied);
+
+    impl Sched {
+        #[cfg(all(unix, not(epics_embedded_target)))]
+        fn current(_applied: PriorityApplied) -> Self {
+            // SAFETY: `pthread_self` takes no arguments and cannot fail.
+            Sched(unsafe { libc::pthread_self() } as usize)
+        }
+
+        #[cfg(not(all(unix, not(epics_embedded_target))))]
+        fn current(applied: PriorityApplied) -> Self {
+            Sched(applied)
+        }
+    }
+
+    impl Row {
+        fn info(&self) -> super::ThreadInfo {
+            super::ThreadInfo {
+                id: self.id,
+                name: self.name.clone(),
+                os_id: self.os_id,
+                priority: self.priority,
+                os_priority: self.os_priority(),
+                suspension: Arc::clone(&self.suspension),
+            }
+        }
+
+        /// Called only under the list lock. A row leaves the list from its
+        /// thread's own TLS destructor, so the thread is alive here — C's
+        /// `listLock` gives `epicsThreadShowInfo` the same guarantee.
+        #[cfg(all(unix, not(epics_embedded_target)))]
+        fn os_priority(&self) -> i32 {
+            let mut policy = 0;
+            // SAFETY: plain-integer struct, valid zeroed.
+            let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+            // SAFETY: a live thread (above), with stack-local out-params.
+            let status = unsafe {
+                libc::pthread_getschedparam(
+                    self.sched.0 as libc::pthread_t,
+                    &mut policy,
+                    &mut param,
+                )
+            };
+            if status == 0 { param.sched_priority } else { 0 }
+        }
+
+        /// Any outcome but [`PriorityApplied::Realtime`] left the thread on
+        /// the default policy, whose `sched_priority` C's live read returns as
+        /// 0 on these targets.
+        #[cfg(not(all(unix, not(epics_embedded_target))))]
+        fn os_priority(&self) -> i32 {
+            if self.sched.0 != PriorityApplied::Realtime {
+                return 0;
+            }
+            self.mapped_os_priority()
+        }
+
+        #[cfg(target_os = "rtems")]
+        fn mapped_os_priority(&self) -> i32 {
+            super::map_epics_priority_rtems(self.priority.value())
+        }
+
+        #[cfg(target_os = "vxworks")]
+        fn mapped_os_priority(&self) -> i32 {
+            super::map_epics_priority_vxworks(self.priority.value())
+        }
+
+        #[cfg(not(any(unix, epics_embedded_target)))]
+        fn mapped_os_priority(&self) -> i32 {
+            // No band is applied on these targets, so `Realtime` never occurs.
+            0
+        }
+    }
 
     /// C hands out the address of the thread's `epicsThreadOSD` as the
     /// `EPICS ID`; a counter serves the same purpose — an opaque handle
@@ -2118,7 +2214,7 @@ mod thread_registry {
 
     /// A poisoned list is still a readable list: a panic while formatting one
     /// row must not make the IOC's thread listing permanently unavailable.
-    fn lock() -> std::sync::MutexGuard<'static, Vec<super::ThreadInfo>> {
+    fn lock() -> std::sync::MutexGuard<'static, Vec<Row>> {
         THREADS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -2151,12 +2247,12 @@ mod thread_registry {
     /// The one place a row is built, so which entry point made a row cannot
     /// change the row's shape or how it is reaped.
     fn push(name: String, priority: ThreadPriority, applied: PriorityApplied) {
-        let info = super::ThreadInfo {
+        let info = Row {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name,
             os_id: os_thread_id(),
             priority,
-            applied,
+            sched: Sched::current(applied),
             // The same cell the thread's own `suspend_self` blocks on, so
             // the row cannot report a state the thread is not in.
             suspension: super::current_suspension(),
@@ -2203,9 +2299,10 @@ mod thread_registry {
     /// A copy rather than a borrow because C walks the live list under
     /// `listLock` while calling `epicsThreadShowInfo`, which does I/O; taking
     /// the rows out first keeps the lock off the write path of whatever
-    /// stream the shell is printing to.
+    /// stream the shell is printing to. `OSSPRI` is read here, under the
+    /// lock, which is what keeps every listed thread alive for the read.
     pub(super) fn snapshot() -> Vec<super::ThreadInfo> {
-        lock().clone()
+        lock().iter().map(Row::info).collect()
     }
 
     /// Linux prints `LWP ID` because that is the number `top`, `ps -L` and
@@ -2257,7 +2354,7 @@ pub struct ThreadInfo {
     name: String,
     os_id: u64,
     priority: ThreadPriority,
-    applied: PriorityApplied,
+    os_priority: i32,
     suspension: Arc<Suspension>,
 }
 
@@ -2284,50 +2381,10 @@ impl ThreadInfo {
         self.priority.value()
     }
 
-    /// The `OSSPRI` column: the OS scheduling priority the thread runs at.
-    ///
-    /// C reads this live with `pthread_getschedparam` (`osdThreadExtra.c:39`).
-    /// This recomputes it from the outcome the prologue recorded, through the
-    /// same map that produced it, which is the same number: nothing in this
-    /// workspace re-bands a thread after the prologue
-    /// (`only_the_prologue_reaches_the_banding_call`), and the map's other
-    /// input — the probed range — is fixed for the life of the process.
-    ///
-    /// Any outcome but [`PriorityApplied::Realtime`] left the thread on the
-    /// default policy, whose `sched_priority` is 0 by POSIX. That is what C's
-    /// live read returns for those threads too, and what a non-privileged
-    /// Linux IOC shows in this column for every row.
+    /// The `OSSPRI` column: the thread's `sched_priority`, read when the
+    /// snapshot was taken, as C reads it per row (`osdThreadExtra.c:36-40`).
     pub fn os_priority(&self) -> i32 {
-        if self.applied != PriorityApplied::Realtime {
-            return 0;
-        }
-        self.mapped_os_priority()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn mapped_os_priority(&self) -> i32 {
-        match permitted_fifo_range() {
-            RtRange::Available { min, max } => map_epics_priority(self.priority.value(), min, max),
-            // Not reachable while the recorded outcome is `Realtime`: the
-            // other two range states return before the map.
-            RtRange::Unsupported | RtRange::Denied => 0,
-        }
-    }
-
-    #[cfg(target_os = "rtems")]
-    fn mapped_os_priority(&self) -> i32 {
-        map_epics_priority_rtems(self.priority.value())
-    }
-
-    #[cfg(target_os = "vxworks")]
-    fn mapped_os_priority(&self) -> i32 {
-        map_epics_priority_vxworks(self.priority.value())
-    }
-
-    #[cfg(not(any(target_os = "linux", epics_embedded_target)))]
-    fn mapped_os_priority(&self) -> i32 {
-        // No band is applied on these targets, so `Realtime` never occurs.
-        0
+        self.os_priority
     }
 
     /// C `epicsThreadIsSuspended` (`osdThread.c:910-914`) — the `STATE`
@@ -5354,7 +5411,6 @@ mod tests {
         registered_rx.recv().unwrap();
         let row = thread_by_name("_main_").expect("listed while the shell runs");
         assert_eq!(row.epics_priority(), 0, "C's `_main_` is EPICS priority 0");
-        assert_eq!(row.os_priority(), 0, "C changes no scheduling for `_main_`");
         assert_eq!(
             sched_calls_made(),
             before,
@@ -5435,28 +5491,38 @@ mod tests {
         join.join().unwrap();
     }
 
-    /// The `OSSPRI` boundary: a thread that never entered the real-time band
-    /// reads 0, which is the `sched_priority` a SCHED_OTHER thread has and
-    /// what C's live `pthread_getschedparam` returns for it. Every row on a
-    /// default hosted IOC is this case.
+    /// `OSSPRI` is the thread's own `sched_priority`, whatever the platform's
+    /// default policy reads — 0 on Linux, 31 on Darwin — as C's live
+    /// `pthread_getschedparam` prints it.
+    #[cfg(all(unix, not(epics_embedded_target)))]
     #[test]
-    fn os_priority_is_zero_for_every_outcome_but_realtime() {
-        for applied in [
-            PriorityApplied::Disabled,
-            PriorityApplied::Unsupported,
-            PriorityApplied::BestEffortFailed,
-        ] {
-            let row = ThreadInfo {
-                id: 1,
-                name: "cbOss".to_string(),
-                os_id: 7,
-                priority: ThreadPriority::High,
-                applied,
-                suspension: Arc::default(),
-            };
-            assert_eq!(row.os_priority(), 0, "{applied:?}");
-            assert_eq!(row.epics_priority(), ThreadPriority::High.value());
-        }
+    fn os_priority_is_the_threads_own_sched_priority() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::Builder::new()
+            .name("cbOssLive".to_string())
+            .spawn(move || {
+                let _ = enter_ioc_thread(ThreadPriority::High);
+                let mut policy = 0;
+                // SAFETY: plain-integer struct, valid zeroed.
+                let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+                // SAFETY: the calling thread, with stack-local out-params.
+                unsafe {
+                    libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)
+                };
+                tx.send(param.sched_priority).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .unwrap();
+        let own = rx.recv().unwrap();
+        let row = thread_report()
+            .into_iter()
+            .find(|t| t.name() == "cbOssLive")
+            .expect("listed while it runs");
+        assert_eq!(row.os_priority(), own);
+        assert_eq!(row.epics_priority(), ThreadPriority::High.value());
+        finish_tx.send(()).unwrap();
+        join.join().unwrap();
     }
 
     /// C's `%16.16s %14p %8lu    %3d%8d %8.8s%s`, against two rows copied from
@@ -5471,7 +5537,7 @@ mod tests {
             name: "_main_".to_string(),
             os_id: 3_650_070,
             priority: ThreadPriority::Custom(0),
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         assert_eq!(
@@ -5484,7 +5550,7 @@ mod tests {
             name: "errlog".to_string(),
             os_id: 3_650_072,
             priority: ThreadPriority::Low,
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         assert_eq!(
@@ -5509,7 +5575,7 @@ mod tests {
             name: "_main_".to_string(),
             os_id: 3_650_070,
             priority: ThreadPriority::Custom(0),
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         assert_eq!(
@@ -5616,7 +5682,7 @@ mod tests {
             name: "aVeryLongThreadNameIndeed".to_string(),
             os_id: 7,
             priority: ThreadPriority::Low,
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         let short = ThreadInfo {

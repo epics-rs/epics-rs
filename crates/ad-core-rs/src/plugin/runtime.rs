@@ -4255,12 +4255,14 @@ mod tests {
 
     /// Records the stack of the thread each hook runs on: `on_param_change`
     /// on the data thread, `process_array` on a callback thread.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[derive(Clone, Default)]
     struct StackProbe {
         data: Arc<parking_lot::Mutex<Vec<usize>>>,
         callback: Arc<parking_lot::Mutex<Vec<usize>>>,
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     impl NDPluginProcess for StackProbe {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
@@ -4416,7 +4418,7 @@ mod tests {
             let (handle, _data_jh) = if with_output {
                 create_plugin_runtime_with_output(
                     &port,
-                    StackProbe::default(),
+                    PassthroughProcessor,
                     NDArrayPool::new(1_000_000),
                     10,
                     NDArrayOutput::new(),
@@ -4427,7 +4429,7 @@ mod tests {
             } else {
                 create_plugin_runtime(
                     &port,
-                    StackProbe::default(),
+                    PassthroughProcessor,
                     NDArrayPool::new(1_000_000),
                     10,
                     "",

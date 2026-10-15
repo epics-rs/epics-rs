@@ -12656,8 +12656,12 @@ impl RecordInstance {
         }
     }
 
-    /// C `db_post_single_event` for the `field` subscriber holding slot `id`.
-    pub fn post_single_event(
+    /// C `db_post_single_event` for the `field` subscriber holding slot `id`,
+    /// queueing a snapshot the caller read; outside this crate the read and
+    /// the queue go through
+    /// [`channel_io::post_single_event`](crate::server::database::channel_io::post_single_event),
+    /// which keeps them in one hold.
+    pub(crate) fn post_single_event(
         &self,
         field: &str,
         id: crate::server::event_queue::AttachId,

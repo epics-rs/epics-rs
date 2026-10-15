@@ -549,23 +549,101 @@ pub fn add_event(
             pv.add_monitor_on(user, sid, native_type, mask, context, pre_chain)
         }
         ChannelTarget::RecordField { record, field } => {
-            // Read outside the record guard: a link-backed field's metadata
-            // comes from the link target's record, so this takes locks of its
-            // own and `parking_lot` is not reentrant. C registers before it
-            // posts, so a change landing in between is at worst delivered
-            // twice, never lost.
-            let snap = record_field_snapshot_scan_locked(db, record, field, false).map(Arc::new);
-            let mut instance = record.write();
-            instance
-                .add_subscriber_on(user, field, sid, native_type, mask, context)
-                .inspect(|rx| {
-                    for filt in pre_chain {
-                        instance.attach_filter_to_last_subscriber(field, filt);
-                    }
-                    if let Some(snap) = snap {
-                        instance.post_single_event(field, rx.id(), snap);
-                    }
-                })
+            // rsrv posts the first event before `db_event_enable`
+            // (`camessage.c:1907-1913`), so a post in between is lost and the
+            // stale first event stands. One hold across the attach and the
+            // first event leaves no in-between.
+            let _scan_lock = db.lock_instance(record);
+            let rx = {
+                let mut instance = record.write();
+                let rx =
+                    instance.add_subscriber_on(user, field, sid, native_type, mask, context)?;
+                for filt in pre_chain {
+                    instance.attach_filter_to_last_subscriber(field, filt);
+                }
+                rx
+            };
+            #[cfg(test)]
+            tests::AFTER_ATTACH.with(|hook| hook.get().map(|hook| hook(record)));
+            post_single_event(db, record, field, rx.id());
+            Ok(rx)
         }
+    }
+}
+
+/// C `db_post_single_event` (`dbEvent.c:914-927`) for the `field` subscriber
+/// holding slot `id`: the read and the queue are one scan-lock hold, so no
+/// post lands between them and leaves the subscriber's last event older than
+/// the field. The read takes the link target's lock for a link-backed
+/// field's metadata, so it runs with no record guard held.
+pub fn post_single_event(
+    db: &PvDatabase,
+    record: &Arc<RecordCell>,
+    field: &str,
+    id: crate::server::event_queue::AttachId,
+) {
+    let _scan_lock = db.lock_instance(record);
+    if let Some(snap) = db.channel_snapshot_for_field(record, field, false) {
+        record.read().post_single_event(field, id, Arc::new(snap));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::recgbl::EventMask;
+
+    thread_local! {
+        /// Runs in [`add_event`] between the attach and the first event.
+        pub(super) static AFTER_ATTACH: std::cell::Cell<Option<fn(&Arc<RecordCell>)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// A post landing between the attach and the first event reaches the new
+    /// subscriber, and no event it is handed is older than that post.
+    #[epics_macros_rs::epics_test]
+    async fn a_post_after_the_attach_is_delivered_and_the_first_event_is_not_stale() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "X",
+            Box::new(crate::server::records::ai::AiRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
+        let record = db.get_record("X").unwrap();
+        AFTER_ATTACH.with(|hook| {
+            hook.set(Some(|record| {
+                // Nothing else can post here: the subscribe holds the record.
+                assert_eq!(crate::server::database::scan_lock_held(), Some(true));
+                let mut instance = record.write();
+                instance
+                    .record
+                    .put_field("VAL", EpicsValue::Double(2.0))
+                    .unwrap();
+                instance.notify_field("VAL", EventMask::VALUE);
+            }))
+        });
+        let user = EventUser::new();
+        let mut rx = add_event(
+            &db,
+            &ChannelTarget::RecordField {
+                record: record.clone(),
+                field: "VAL".into(),
+            },
+            &user,
+            1,
+            DbFieldType::Double,
+            EventMask::VALUE.bits(),
+            crate::server::event_queue::no_context(),
+            FilterChain::default(),
+        )
+        .unwrap();
+        AFTER_ATTACH.with(|hook| hook.set(None));
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(event.value().as_value().and_then(EpicsValue::to_f64));
+        }
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|v| *v == Some(2.0)), "{seen:?}");
     }
 }

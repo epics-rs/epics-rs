@@ -5923,9 +5923,6 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         if entry.subscriptions.is_empty() {
             continue;
         }
-        // Read before the record guard: a link-backed field's metadata
-        // takes the link target's lock.
-        let snap = get_full_snapshot(&state.db, &entry.target).map(Arc::new);
         // C `casAccessRightsCB` (`camessage.c:1114-1122`): a monitor losing
         // read access posts a single event, which `read_reply` answers with
         // `no_read_access_event`, and is then disabled; one regaining it is
@@ -5939,23 +5936,20 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                     if new_read {
                         pv.set_subscriber_active(id, true);
                     }
-                    if let Some(snap) = &snap {
-                        pv.post_single_event(id, snap.clone());
-                    }
+                    pv.post_single_event(id);
                     if !new_read {
                         pv.set_subscriber_active(id, false);
                     }
                 }
                 ChannelTarget::RecordField { record, field } => {
-                    let instance = record.write();
                     if new_read {
-                        instance.set_subscriber_active(id, true);
+                        record.write().set_subscriber_active(id, true);
                     }
-                    if let Some(snap) = &snap {
-                        instance.post_single_event(field, id, snap.clone());
-                    }
+                    epics_base_rs::server::database::channel_io::post_single_event(
+                        &state.db, record, field, id,
+                    );
                     if !new_read {
-                        instance.set_subscriber_active(id, false);
+                        record.write().set_subscriber_active(id, false);
                     }
                 }
             }

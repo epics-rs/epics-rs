@@ -396,15 +396,12 @@ impl SubscriptionActivation {
     /// `dbChannelGet` under the scan lock, as the CA seed reads it.
     pub async fn enable(&self, db: &PvDatabase) {
         self.set_active(true).await;
-        let snap = {
-            let _scan_lock = db.lock_instance(&self.record);
-            db.channel_snapshot_for_field(&self.record, &self.field, false)
-        };
-        if let Some(snap) = snap {
-            self.record
-                .read()
-                .post_single_event(&self.field, self.id, std::sync::Arc::new(snap));
-        }
+        crate::server::database::channel_io::post_single_event(
+            db,
+            &self.record,
+            &self.field,
+            self.id,
+        );
     }
 }
 

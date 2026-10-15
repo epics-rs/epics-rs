@@ -1382,13 +1382,7 @@ impl ProcessVariable {
         filters: FilterChain,
     ) -> Result<EventReader, SubscribeRefused> {
         let reader = self.attach(user, sid, data_type, mask, context, filters)?;
-        // The value read hold spans the read and the enqueue, as C's
-        // dbScanLock does (dbEvent.c:920-926): a set waits for the seed, so
-        // the monitor's last value is never older than the PV's.
-        let value = self.value.read();
-        let seed = self.snapshot_of(value.clone());
-        self.post_single_event(reader.id(), Arc::new(seed));
-        drop(value);
+        self.post_single_event(reader.id());
         Ok(reader)
     }
 
@@ -1423,10 +1417,14 @@ impl ProcessVariable {
         Ok(reader.owned_by(Arc::downgrade(&owner)))
     }
 
-    /// C `db_post_single_event` for the subscriber holding slot `id`.
-    pub fn post_single_event(&self, id: AttachId, snapshot: Arc<Snapshot>) {
+    /// C `db_post_single_event` (`dbEvent.c:914-927`) for the subscriber
+    /// holding slot `id`. The value read hold spans the read and the enqueue,
+    /// as C's dbScanLock does: a set waits for it, so the monitor's last
+    /// value is never older than the PV's.
+    pub fn post_single_event(&self, id: AttachId) {
         if let Some(sub) = self.subscribers.load().of(0).find(|s| s.id() == id) {
-            sub.post_single(snapshot);
+            let value = self.value.read();
+            sub.post_single(Arc::new(self.snapshot_of(value.clone())));
         }
     }
 

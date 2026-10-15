@@ -58,6 +58,8 @@ impl DeviceSupport for Sink {
     }
 }
 
+/// Linux only: `/proc` is the count's source, and std has no portable one.
+#[cfg(target_os = "linux")]
 fn threads_of_this_process() -> usize {
     std::fs::read_dir("/proc/self/task").unwrap().count()
 }
@@ -143,8 +145,10 @@ async fn a_blocking_write_completes_once_on_the_record_s_band() {
 
     put(&db, 0, 1.0).await;
     // PRIO is read per put: the second completes on the band it now selects.
+    #[cfg(target_os = "linux")]
     let threads = threads_of_this_process();
     put(&db, 2, 2.0).await;
+    #[cfg(target_os = "linux")]
     assert_eq!(
         threads_of_this_process(),
         threads,

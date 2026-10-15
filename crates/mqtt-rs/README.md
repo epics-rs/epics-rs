@@ -213,7 +213,7 @@ and masks, so `asynSetTraceMask` / `asynSetTraceFile` govern them:
 | Event | Mask | Message |
 |-------|------|---------|
 | Live session lost | `ERROR` | `MqttDriver::onDisconnectCb: Connection lost. Reconnecting... (<error>)` |
-| Reconnect attempt, subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` |
+| Boot connect attempt (before the first ConnAck), subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` |
 | ConnAck after a loss | `ERROR\|DRIVER` | `MqttDriver::onConnectCb: Reconnected.` |
 | Every ConnAck | `DRIVER` | `MqttDriver::onConnectCb: Connected to broker` |
 | Subscribe / publish handed to the client | `DRIVER` | `MqttDriver::onSubscribeCb: Subscribed to topic '<t>'` / `MqttDriver::onPublishCb: Published to topic '<t>'` |

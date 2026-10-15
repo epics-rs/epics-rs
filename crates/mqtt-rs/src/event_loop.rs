@@ -146,24 +146,21 @@ pub async fn mqtt_event_loop(
     // Subscriptions are driven exclusively on ConnAck (covers both the first
     // connect and every reconnect), so no pre-loop subscribe is needed.
     //
-    // `is_connected` mirrors the Connected PV locally so we can detect the
+    // `session` mirrors the Connected PV locally so we can detect the
     // "stuck at 0" case where a recoverable rumqttc error flipped the PV to 0
     // but the underlying TCP/MQTT session is still alive (no ConnAck will come
     // to flip it back). Any inbound packet (`Publish`, `PingResp`) is direct
     // proof the session is alive, so we use it as a fallback recovery signal.
-    let mut is_connected = false;
-    // C `onConnectCb` tells a reconnect from the first connect
-    // (drvMqtt.cpp:196-204).
-    let mut was_connected = false;
+    let mut session = Session::Booting;
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::Publish(publish))) => {
-                if !is_connected {
+                if session != Session::Up {
                     tracing::debug!(
                         "MQTT Publish received while Connected=0 — restoring Connected=1"
                     );
                     mark_connected(&port_handle, connected_param, &connected).await;
-                    is_connected = true;
+                    session = Session::Up;
                 }
                 // v5 Publish.topic is raw bytes; a declared topic_map key (the
                 // asyn drvInfo) is UTF-8 text, so a non-UTF-8 topic can never
@@ -184,15 +181,14 @@ pub async fn mqtt_event_loop(
             }
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 mark_connected(&port_handle, connected_param, &connected).await;
-                is_connected = true;
-                if was_connected {
+                if session == Session::Lost {
                     asyn_print(
                         &port_handle,
                         TraceMask::IO_DRIVER | TraceMask::ERROR,
                         format_args!("MqttDriver::onConnectCb: Reconnected."),
                     );
                 }
-                was_connected = true;
+                session = Session::Up;
                 asyn_print(
                     &port_handle,
                     TraceMask::IO_DRIVER,
@@ -218,12 +214,12 @@ pub async fn mqtt_event_loop(
                 });
             }
             Ok(Event::Incoming(Incoming::PingResp(_))) => {
-                if !is_connected {
+                if session != Session::Up {
                     tracing::debug!(
                         "MQTT PingResp received while Connected=0 — restoring Connected=1"
                     );
                     mark_connected(&port_handle, connected_param, &connected).await;
-                    is_connected = true;
+                    session = Session::Up;
                 }
             }
             Ok(Event::Outgoing(Outgoing::Disconnect)) => {
@@ -239,23 +235,27 @@ pub async fn mqtt_event_loop(
                     break;
                 }
                 // C reports the loss of a live session from `onDisconnectCb`
-                // (drvMqtt.cpp:219-220) and each failed reconnect attempt from
-                // `onFailCb` (drvMqtt.cpp:234-235). The rumqttc error is kept:
-                // its variant tells a network failure from a state error.
-                if is_connected {
-                    asyn_print(
-                        &port_handle,
-                        TraceMask::ERROR,
-                        format_args!(
-                            "MqttDriver::onDisconnectCb: Connection lost. Reconnecting... ({e})"
-                        ),
-                    );
-                } else {
-                    asyn_print(
+                // (drvMqtt.cpp:219-220) and a failed attempt of the initHook
+                // connect from `onFailCb` (drvMqtt.cpp:234-235). The rumqttc
+                // error is kept: its variant tells a network failure from a
+                // state error.
+                match session {
+                    Session::Up => {
+                        asyn_print(
+                            &port_handle,
+                            TraceMask::ERROR,
+                            format_args!(
+                                "MqttDriver::onDisconnectCb: Connection lost. Reconnecting... ({e})"
+                            ),
+                        );
+                        session = Session::Lost;
+                    }
+                    Session::Booting => asyn_print(
                         &port_handle,
                         TraceMask::ERROR,
                         format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
-                    );
+                    ),
+                    Session::Lost => {}
                 }
                 // Close the publish gate first so a concurrent write fails fast
                 // (C: publish throws while disconnected) instead of buffering.
@@ -266,7 +266,6 @@ pub async fn mqtt_event_loop(
                         vec![ParamSetValue::new(connected_param, 0, ParamValue::Int32(0))],
                     )
                     .await;
-                is_connected = false;
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             _ => {}
@@ -280,6 +279,23 @@ pub async fn mqtt_event_loop(
     // release it too; sending first is what lets the far side tell a loop that
     // ended from a task that died.
     let _ = done.send(());
+}
+
+/// The session as paho's connect token sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Session {
+    /// The initHook `connect()` has not yet succeeded. Its token's
+    /// `onFailure` reports every attempt that fails to connect
+    /// (paho.mqtt.c MQTTAsyncUtils.c:1574-1626), and its `onSuccess` makes the first
+    /// ConnAck a connect rather than `Reconnected.` (:2195). A failure paho
+    /// meets only after the TCP connect is in flight spends the token instead
+    /// (:1685-1712); rumqttc does not tell the two apart.
+    Booting,
+    Up,
+    /// Down after a session was up. The first ConnAck spent the token
+    /// (:2173-2174), so a failed retry prints nothing and the next ConnAck is
+    /// `Reconnected.`.
+    Lost,
 }
 
 /// Mark the session up: raise the internal publish-gate flag and the
@@ -945,9 +961,10 @@ mod tests {
     }
 
     /// C prints the session's edges through `asynPrint` (drvMqtt.cpp:202-205,
-    /// :219, :234): one boundary each — the first ConnAck is not a reconnect,
-    /// an error on a live session is a loss, an error while already down is a
-    /// failed attempt, and a ConnAck after a loss is `Reconnected.`.
+    /// :219, :234): one boundary each — a failed boot connect attempt is an
+    /// `onFailCb`, the first ConnAck is not a reconnect, an error on a live
+    /// session is a loss, a failed retry after it prints nothing (paho spent
+    /// the connect token), and a ConnAck after a loss is `Reconnected.`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_edges_print_c_s_trace_lines() {
         use asyn_rs::runtime::config::RuntimeConfig;
@@ -956,8 +973,12 @@ mod tests {
         use tokio::io::AsyncWriteExt;
 
         const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        // No broker at boot.
+        let addr = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
 
         let config = MqttConfig {
             broker_host: "127.0.0.1".into(),
@@ -997,8 +1018,16 @@ mod tests {
         );
         trace.set_trace_mask(Some("MQEDGE"), TraceMask::ERROR | TraceMask::IO_DRIVER);
         async fn wait_for(path: &std::path::Path, needle: &str) {
+            wait_for_n(path, needle, 1).await;
+        }
+        async fn wait_for_n(path: &std::path::Path, needle: &str, n: usize) {
             for _ in 0..100 {
-                if std::fs::read_to_string(path).unwrap().contains(needle) {
+                if std::fs::read_to_string(path)
+                    .unwrap()
+                    .matches(needle)
+                    .count()
+                    >= n
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1030,15 +1059,23 @@ mod tests {
         });
         start.notify_one();
 
+        // Each failed attempt of the boot connect is reported.
+        wait_for_n(&path, "onFailCb: MQTT Operation error: 'Error: ", 2).await;
+
         // First session, then the broker goes away entirely.
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let (mut sock, _) = listener.accept().await.unwrap();
         assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
         sock.write_all(&CONNACK).await.unwrap();
         wait_for(&path, "onConnectCb: Connected to broker").await;
+        let booted = std::fs::read_to_string(&path).unwrap();
+        assert!(!booted.contains("Reconnected."), "{booted}");
+        let boot_failures = booted.matches("Operation error").count();
         drop(listener);
         drop(sock);
         wait_for(&path, "onDisconnectCb: Connection lost. Reconnecting...").await;
-        wait_for(&path, "onFailCb: MQTT Operation error: 'Error: ").await;
+        // The first retry after a loss is immediate and refused.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // The broker is back.
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -1052,10 +1089,7 @@ mod tests {
         assert_eq!(n("Connected to broker"), 2, "{text}");
         assert_eq!(n("Reconnected."), 1, "{text}");
         assert_eq!(n("Connection lost"), 1, "{text}");
-        assert!(
-            text.find("Connection lost").unwrap() < text.find("Operation error").unwrap(),
-            "{text}"
-        );
+        assert_eq!(n("Operation error"), boot_failures, "{text}");
 
         runtime.shutdown();
         assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");

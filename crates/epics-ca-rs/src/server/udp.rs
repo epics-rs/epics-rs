@@ -22,7 +22,7 @@ use crate::protocol::*;
 use epics_base_rs::error::CaResult;
 #[cfg(tokio_backend)]
 use epics_base_rs::net::{
-    PortOrigin, PortUse, enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket,
+    PortOrigin, PortUse, enable_so_rxq_ovfl_for_socket, port_held, recv_from_with_drop_count_socket,
 };
 use epics_base_rs::server::database::PvDatabase;
 
@@ -231,7 +231,7 @@ fn bind_responder_set(
         ) {
             Ok(r) => r,
             Err(epics_base_rs::error::CaError::Io(e))
-                if e.kind() == std::io::ErrorKind::AddrInUse && origin == PortOrigin::Chosen =>
+                if bind_was_held(&e) && origin == PortOrigin::Chosen =>
             {
                 return Ok(SetBind::NumberHeld(
                     responders.into_iter().map(|(_, r)| r).collect(),
@@ -241,9 +241,9 @@ fn bind_responder_set(
             // `tryBind` returns -1 without a word on EADDRINUSE and
             // `rsrv_init` drops that interface alone
             // (`caservertask.c:136`, `:630`, `:745-750`); the others serve.
-            Err(epics_base_rs::error::CaError::Io(e))
-                if e.kind() == std::io::ErrorKind::AddrInUse =>
-            {
+            // Winsock reports a held number as WSAEACCES to a `SO_REUSEADDR`
+            // bind, which C on WIN32 takes as fatal; here it is held too.
+            Err(epics_base_rs::error::CaError::Io(e)) if bind_was_held(&e) => {
                 held = Some(epics_base_rs::error::CaError::Io(e));
                 continue;
             }
@@ -356,10 +356,7 @@ fn missing_broadcast_warning(
 /// caller is the broadcast socket, which only `ca_udp_bcast` opens.
 #[cfg(all(tokio_backend, ca_udp_bcast))]
 fn try_bind_error_line(name: &str, e: &std::io::Error) -> String {
-    let os = e
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<BindContext>())
-        .map_or(e, |ctx| &ctx.source);
+    let os = bind_source(e);
     format!(
         "CAS: {name} bind {}: {}",
         epics_base_rs::runtime::log::erl_error(),
@@ -465,9 +462,7 @@ fn bind_single_responder(
                 // `tryBind` on `udpbcast` failing with EADDRINUSE reaches
                 // `goto cleanup` (`caservertask.c:703`): the interface is
                 // dropped whole, as for its primary socket.
-                Some((_, Err(epics_base_rs::error::CaError::Io(e))))
-                    if e.kind() == std::io::ErrorKind::AddrInUse =>
-                {
+                Some((_, Err(epics_base_rs::error::CaError::Io(e)))) if bind_was_held(&e) => {
                     return Err(epics_base_rs::error::CaError::Io(e));
                 }
                 // Any other error: `tryBind` prints and suspends the init
@@ -557,6 +552,21 @@ impl std::error::Error for BindContext {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
+}
+
+/// The socket's own error under the [`BindContext`] it travels in, which
+/// keeps only the kind: Winsock's `WSAEACCES` is a raw code.
+#[cfg(tokio_backend)]
+fn bind_source(e: &std::io::Error) -> &std::io::Error {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<BindContext>())
+        .map_or(e, |ctx| &ctx.source)
+}
+
+/// `tryBind`'s EADDRINUSE: another socket holds the number.
+#[cfg(tokio_backend)]
+fn bind_was_held(e: &std::io::Error) -> bool {
+    port_held(bind_source(e))
 }
 
 /// The origin of a bind on the set's number at `addr`. Only an address an
@@ -1389,8 +1399,7 @@ mod responder_bind_tests {
     fn bind_retrying_addr_in_use(mut bind: impl FnMut() -> CaResult<BoundUdp>) -> BoundUdp {
         for _ in 0..8 {
             match bind() {
-                Err(epics_base_rs::error::CaError::Io(e))
-                    if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(epics_base_rs::error::CaError::Io(e)) if bind_was_held(&e) => {}
                 r => return r.expect("bind responders"),
             }
         }
@@ -1400,7 +1409,7 @@ mod responder_bind_tests {
     /// The bundle-bind error path itself: a port another socket holds
     /// exclusively fails the bind, naming the address. Windows answers a
     /// `SO_REUSEADDR` bind on a held specific address with WSAEACCES, never
-    /// WSAEADDRINUSE, which C's `tryBind` treats as the fatal path too.
+    /// WSAEADDRINUSE.
     #[test]
     fn a_held_port_fails_the_responder_bind() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1431,9 +1440,6 @@ mod responder_bind_tests {
 
     /// `tryBind` drops one held interface and `rsrv_init` serves on the rest
     /// (`caservertask.c:136`, `:630`, `:745-752`); only an empty set fails.
-    /// Not on Windows: a `SO_REUSEADDR` bind there never gets WSAEADDRINUSE,
-    /// so C's drop has no trigger.
-    #[cfg(not(windows))]
     #[test]
     fn a_held_interface_is_dropped_and_the_others_serve() {
         let rt = tokio::runtime::Builder::new_current_thread()

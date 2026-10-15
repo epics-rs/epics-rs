@@ -1509,7 +1509,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::fanout::port_unavailable;
+    use crate::net::fanout::port_held;
 
     type BindHook = Box<dyn FnMut(Ipv4Addr, u16, bool)>;
 
@@ -1543,7 +1543,7 @@ mod tests {
         let holder = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("holder");
         let port = holder.local_addr().unwrap().port();
         let err = AsyncUdpV4::bind(port, PortUse::Shared, false).err();
-        assert!(err.as_ref().is_some_and(port_unavailable), "{err:?}");
+        assert!(err.as_ref().is_some_and(port_held), "{err:?}");
     }
 
     /// The same for a held broadcast address.
@@ -1855,7 +1855,7 @@ mod tests {
                 .expect("local addr")
                 .port();
             match extra.map(|ip| sock.ensure_iface_socket(ip, port, false)) {
-                Some(Err(e)) if port_unavailable(&e) && parked.len() < 8 => parked.push(sock),
+                Some(Err(e)) if port_held(&e) && parked.len() < 8 => parked.push(sock),
                 Some(Err(e)) => panic!("join the NIC to the bundle on {port}: {e}"),
                 _ => break (sock, port),
             }

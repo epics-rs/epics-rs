@@ -81,7 +81,7 @@ pub fn addr_in_use() -> &'static str {
     })
 }
 
-/// Every text an epics-rs binary prints for a bind [`crate::held_by_another`]
+/// Every text an epics-rs binary prints for a bind `epics_libcom_rs::net::port_held`
 /// reads as held: [`addr_in_use`], and on Windows std's text for WSAEACCES,
 /// which an `SO_REUSEADDR` bind over a held address gets.
 pub fn held_texts() -> &'static [String] {

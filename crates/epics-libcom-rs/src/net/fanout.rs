@@ -64,16 +64,29 @@ impl PortUse {
     }
 }
 
-/// Whether a failed `bind` means the number cannot be had here: EADDRINUSE or
-/// EACCES, the pair pvxs falls back on (`serverconn.cpp:437`). Winsock reports
-/// a port another socket holds as `WSAEACCES` whenever either side set
-/// `SO_REUSEADDR` or `SO_EXCLUSIVEADDRUSE`, so `AddrInUse` alone reads every
-/// such Windows collision as some other failure.
-pub fn port_unavailable(e: &io::Error) -> bool {
+/// Whether a refused TCP listener bind falls back to a dynamic port, as pvxs
+/// does on EADDRINUSE or EACCES on every platform (`serverconn.cpp:437`):
+/// the number cannot be had here, whoever or whatever refuses it.
+pub fn bind_falls_back(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
     )
+}
+
+/// Whether a refused bind says another socket holds the number: EADDRINUSE,
+/// and on Windows `WSAEACCES` too, which Winsock returns for a held number
+/// whenever either socket set `SO_REUSEADDR` or `SO_EXCLUSIVEADDRUSE`. A unix
+/// EACCES is a privileged port or a policy, never a holder.
+pub fn port_held(e: &io::Error) -> bool {
+    /// Winsock's `WSAEACCES`.
+    #[cfg(windows)]
+    const WSAEACCES: i32 = 10013;
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(WSAEACCES) {
+        return true;
+    }
+    e.kind() == io::ErrorKind::AddrInUse
 }
 
 /// Whose number a fanout socket binds.
@@ -113,6 +126,25 @@ pub fn bind_fanout(
         set_fanout()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+
+    /// An access refusal is a holder's answer only from Winsock; a unix EACCES
+    /// is a privileged port, which only the fallback reads as unavailable.
+    #[test]
+    fn an_access_refusal_is_held_only_on_windows() {
+        let in_use = io::Error::from(io::ErrorKind::AddrInUse);
+        assert!(port_held(&in_use) && bind_falls_back(&in_use));
+        #[cfg(windows)]
+        let refused = io::Error::from_raw_os_error(10013); // WSAEACCES
+        #[cfg(unix)]
+        let refused = io::Error::from_raw_os_error(13); // EACCES
+        assert!(bind_falls_back(&refused));
+        assert_eq!(port_held(&refused), cfg!(windows));
+    }
 }
 
 #[cfg(all(test, unix))]

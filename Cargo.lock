@@ -2431,6 +2431,7 @@ dependencies = [
 name = "named-port"
 version = "0.32.0"
 dependencies = [
+ "epics-libcom-rs",
  "libc",
  "socket2 0.5.10",
  "windows-sys 0.59.0",

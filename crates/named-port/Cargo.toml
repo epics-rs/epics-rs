@@ -12,10 +12,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# `net::port_held`: the one reading of "another socket holds this number".
+epics-libcom-rs = { workspace = true }
 socket2 = "0.5"
 
 # `SO_EXCLUSIVEADDRUSE` on the held-port probe (socket2 does not expose it)
-# and `WSAEACCES` in `held_by_another`.
+# and the `WSAEACCES` text in `verdict::held_texts`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
 

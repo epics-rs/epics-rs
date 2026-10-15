@@ -34,7 +34,9 @@ difference is either invisible to a client or is an improvement:
   range, so one collision is rare and 16 in a row means the bind is failing
   for another reason; the bound only keeps that case from looping). A
   requested port, any other error, or a collision with an address of the set
-  itself (a wildcard beside a specific entry, a duplicate) fails as in pvxs.
+  itself (a duplicate, or on unix a wildcard beside a specific entry) fails as
+  in pvxs. Windows binds a wildcard beside a specific entry, as pvxs does
+  there.
 - **CA server start returns an error where rsrv hangs.** C drops an interface
   whose UDP bind hits EADDRINUSE and serves on the rest (`caservertask.c:136`,
   `:630`, `:745-750`); so does epics-rs. When no interface is left, C ends in

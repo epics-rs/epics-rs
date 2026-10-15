@@ -1100,15 +1100,16 @@ const UDP_RECV_BUF: usize = 64 * 1024;
 
 /// Bind a blocking UDP SEARCH socket.
 ///
-/// Raw `libc` for the socket options rather than `socket2`, because `socket2`
-/// is one of the three crates that do not cross to RTEMS (`mod.rs`) — the
-/// same reason CA's blocking driver hand-rolls its bind.
+/// On unix, raw `libc` for the socket options rather than `socket2`, because
+/// `socket2` is one of the three crates that do not cross to RTEMS (`mod.rs`)
+/// — the same reason CA's blocking driver hand-rolls its bind. The Windows
+/// arm uses `socket2`.
 ///
 /// `SO_REUSEADDR` + `SO_REUSEPORT` are set on every port, 0 included, as pvxs
 /// does for every `UDPCollector` socket
 /// (`epicsSocketEnableAddressUseForDatagramFanout`, `udp_collector.cpp:136`;
 /// see `:140-151` for why the bind is wildcard rather than to the multicast
-/// address) — after the bind on 0
+/// address) — after the bind on 0 on unix, before it on Windows
 /// ([`epics_base_rs::net::bind_fanout`]). A pvxs client told an
 /// ephemeral port as its broadcast port binds its beacon receiver there with
 /// fanout, which a bare socket refuses. The cost pvxs accepts too: on a

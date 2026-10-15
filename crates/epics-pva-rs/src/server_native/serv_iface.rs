@@ -54,12 +54,14 @@ pub(crate) fn tcp_bind_addresses(
 ///
 /// deliberate deviation: when every requested port is 0, a held number
 /// (`port_held`) on a later interface releases the whole set and binds it
-/// again on a fresh ephemeral number. pvxs binds interface 1 on 0 and the rest on that number
-/// (`server.cpp:476-486`), so a number the kernel handed out but another
-/// socket already holds on a later address fails the start; with nothing
-/// asked for there is nothing to refuse. A non-zero request, any other
-/// error, or a collision with an address of the set itself (a wildcard
-/// beside a specific entry, a duplicate) behaves as pvxs: it fails.
+/// again on a fresh ephemeral number. pvxs binds interface 1 on 0 and the
+/// rest on that number (`server.cpp:476-486`), so a number the kernel handed
+/// out but another socket already holds on a later address fails the start;
+/// with nothing asked for there is nothing to refuse. A non-zero request, any
+/// other error, or a collision with an address of the set itself (a
+/// duplicate, or on unix a wildcard beside a specific entry) behaves as pvxs:
+/// it fails. Windows binds a wildcard beside a specific entry, as pvxs does
+/// there.
 pub(crate) fn bind_serv_ifaces(
     addrs: impl IntoIterator<Item = SocketAddr>,
     port: u16,

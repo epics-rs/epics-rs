@@ -152,10 +152,13 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
 /// `udp_collector.cpp:151`). So is the ORIGIN_TAG socket, which in pvxs is
 /// the v4 collector itself. v4 goes first: its ephemeral pick must come from
 /// the kernel, since a guessed number under the reuse flags would co-bind
-/// silently. On a chosen number the v6 socket binds before its fanout flags,
-/// so any v6 holder there is `EADDRINUSE`; on that error from either
-/// companion the set is dropped and the kernel asked again, which pvxs does
-/// not do.
+/// silently. On a chosen number the v6 socket binds before its fanout flags
+/// on unix, so any v6 holder there is `EADDRINUSE`; Windows sets the flags
+/// first and reports the holder as `WSAEACCES`. On either, read as
+/// [`epics_base_rs::net::port_held`] from either companion, the set is
+/// dropped and the kernel asked again. pvxs does not do this: the retry is
+/// rs's own deviation, and pvxs reading `SOCK_EACCES` in its TCP fallback
+/// (`serverconn.cpp:437`) is only an analogy for the Windows case.
 ///
 /// The ORIGIN_TAG socket is also the collector for every group of
 /// `interfaces` (see [`Collector`]).

@@ -59,9 +59,9 @@ pub(crate) fn tcp_bind_addresses(
 /// out but another socket already holds on a later address fails the start;
 /// with nothing asked for there is nothing to refuse. A non-zero request, any
 /// other error, or a collision with an address of the set itself (a
-/// duplicate, or on unix a wildcard beside a specific entry) behaves as pvxs:
-/// it fails. Windows binds a wildcard beside a specific entry, as pvxs does
-/// there.
+/// duplicate, or on Linux a wildcard beside a specific entry) behaves as
+/// pvxs: it fails. Windows and Darwin bind a wildcard beside a specific
+/// entry, as pvxs does there.
 pub(crate) fn bind_serv_ifaces(
     addrs: impl IntoIterator<Item = SocketAddr>,
     port: u16,
@@ -323,9 +323,9 @@ mod tests {
 
     /// A wildcard beside a specific entry collides with the set's own
     /// listener, which no other number cures.
-    // Not on Windows, where the wildcard binds beside it, as pvxs's does
-    // (`wildcard_entry_binds_after_a_specific_one`).
-    #[cfg(not(windows))]
+    // Linux only; on Windows and Darwin the wildcard binds beside it, as
+    // pvxs's does (`wildcard_entry_binds_after_a_specific_one`).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_wildcard_beside_a_specific_entry_fails_on_the_first_try() {
         let (r, tried) = bind_counting(&["127.0.0.1:0", "0.0.0.0:0"], 0, |_, _| {});

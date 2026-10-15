@@ -176,7 +176,9 @@ pub(crate) fn bind_udp_responders_with(
     // the number is ours, so a later socket that finds a fanout stranger on
     // it restarts the set on a fresh one rather than joining the stranger or
     // dropping the interface. Refused sets stay bound until the end, so
-    // `bind(0)` cannot hand the same number back.
+    // `bind(0)` cannot hand the same number back. On Windows a stranger that
+    // set `SO_REUSEADDR` is joined, as rsrv joins it there (`bind_fanout`
+    // sets the option first); only a refusal, WSAEACCES, restarts the set.
     let mut refused = Vec::new();
     let mut last = None;
     for _ in 0..16 {

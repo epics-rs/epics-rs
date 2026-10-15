@@ -82,7 +82,8 @@ pub fn getsockname_einval_shim(dir: &std::path::Path) -> std::path::PathBuf {
 /// is more useful than trying forever.
 pub const ATTEMPTS: usize = 16;
 
-/// Run `attempt` on candidate ports until one of them survives to the bind.
+/// Run `attempt` on candidate ports until one of them survives to the bind,
+/// never on the same number twice ([`Candidates`]).
 ///
 /// `attempt` returns `Some(value)` when the subject came up on the number it
 /// was given, and `None` **only** on evidence that this particular number was
@@ -97,23 +98,74 @@ pub fn on_a_named_port<T>(attempt: impl FnMut(u16) -> Option<T>) -> T {
 /// that needs more of the number than the same value free on TCP and UDP
 /// (see [`free_tcp_with_udp_successor`]).
 pub fn on_a_named_port_from<T>(
-    mut pick: impl FnMut() -> u16,
+    pick: impl FnMut() -> u16,
     mut attempt: impl FnMut(u16) -> Option<T>,
 ) -> T {
-    let mut tried = Vec::with_capacity(ATTEMPTS);
-    for _ in 0..ATTEMPTS {
-        let port = pick();
-        tried.push(port);
+    let mut candidates = Candidates::new(pick);
+    for port in candidates.by_ref() {
         if let Some(won) = attempt(port) {
             return won;
         }
     }
-    panic!(
-        "every one of {ATTEMPTS} candidate ports was taken before the subject \
-         could bind it: {tried:?}. That is no longer a lost race — something \
-         on this host is taking the numbers, or the subject is refusing every \
-         port for a reason its retry evidence is misreporting as a steal."
-    );
+    candidates.exhausted()
+}
+
+/// How many times [`Candidates`] re-draws a number the search already tried
+/// before it calls the pick broken.
+const REPICKS: usize = 64;
+
+/// The candidates of one search, each a number no earlier attempt of the
+/// search was given. A probe closes its socket before it returns, so the
+/// kernel can hand the same number back to the next probe; a repeat is
+/// drawn again here rather than retried.
+pub struct Candidates<P> {
+    pick: P,
+    tried: Vec<u16>,
+}
+
+impl<P: FnMut() -> u16> Candidates<P> {
+    pub fn new(pick: P) -> Self {
+        Self {
+            pick,
+            tried: Vec::with_capacity(ATTEMPTS),
+        }
+    }
+
+    /// Panic with every candidate given out: the search lost them all.
+    pub fn exhausted(&self) -> ! {
+        panic!(
+            "every one of {ATTEMPTS} candidate ports was taken before the subject \
+             could bind it: {:?}. That is no longer a lost race — something \
+             on this host is taking the numbers, or the subject is refusing every \
+             port for a reason its retry evidence is misreporting as a steal.",
+            self.tried
+        );
+    }
+}
+
+impl<P: FnMut() -> u16> Iterator for Candidates<P> {
+    type Item = u16;
+
+    /// The next untried candidate, `None` once [`ATTEMPTS`] have been given
+    /// out. Panics when `pick` returns only tried numbers 64 times
+    /// in a row.
+    fn next(&mut self) -> Option<u16> {
+        if self.tried.len() == ATTEMPTS {
+            return None;
+        }
+        for _ in 0..REPICKS {
+            let port = (self.pick)();
+            if !self.tried.contains(&port) {
+                self.tried.push(port);
+                return Some(port);
+            }
+        }
+        panic!(
+            "the candidate source returned only already-tried ports {REPICKS} times \
+             in a row; tried: {:?}",
+            self.tried
+        );
+    }
 }
 
 /// A port number that was free for both TCP and UDP a moment ago.
@@ -212,6 +264,29 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), seen.len(), "candidates repeated: {seen:?}");
+    }
+
+    /// A pick that hands back a number already tried — a closed probe's port
+    /// the kernel gave out again — is drawn again, never retried.
+    #[test]
+    fn a_repeated_pick_never_reaches_attempt_twice() {
+        let mut picks = [5, 5, 6, 5, 6, 7, 7, 8].into_iter();
+        let mut seen = Vec::new();
+        on_a_named_port_from(
+            || picks.next().unwrap(),
+            |p| {
+                seen.push(p);
+                (seen.len() == 4).then_some(())
+            },
+        );
+        assert_eq!(seen, [5, 6, 7, 8]);
+    }
+
+    /// A pick that only ever repeats is reported, not looped on.
+    #[test]
+    #[should_panic(expected = "returned only already-tried ports")]
+    fn a_pick_stuck_on_one_number_is_reached_loudly() {
+        on_a_named_port_from(|| 5, |_| -> Option<()> { None });
     }
 
     /// A subject that never wins is a failure, not an infinite loop — and the

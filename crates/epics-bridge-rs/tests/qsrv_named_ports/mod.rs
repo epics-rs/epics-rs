@@ -25,8 +25,8 @@ where
     F: Fn(u16) -> Fut,
     Fut: Future<Output = Option<T>>,
 {
-    for _ in 0..named_port::ATTEMPTS {
-        let tcp = named_port::free_tcp_with_udp_successor();
+    let mut candidates = named_port::Candidates::new(named_port::free_tcp_with_udp_successor);
+    for tcp in candidates.by_ref() {
         let mut child = Command::new(env!("CARGO_BIN_EXE_qsrv-rs"))
             .arg("--db-file")
             .arg(db)
@@ -80,8 +80,5 @@ where
             );
         }
     }
-    panic!(
-        "every one of {} candidate ports was taken",
-        named_port::ATTEMPTS
-    );
+    candidates.exhausted()
 }

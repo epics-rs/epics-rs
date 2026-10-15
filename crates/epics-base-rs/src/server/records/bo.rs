@@ -5,7 +5,7 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{
     DelayedCallbackOutcome, FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
 };
-use crate::types::{EpicsValue, PvString, Scalar};
+use crate::types::{EpicsValue, PvString};
 
 /// Binary output record matching C boRecord behavior.
 /// VAL is converted to RVAL using MASK before writing to hardware.
@@ -234,7 +234,7 @@ impl Record for BoRecord {
     }
 
     fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
-        Some(OutView::Num(Scalar::Int((self.rval as i32).into())))
+        Some(OutView::Num(CycleValue::Long(self.rval as i32)))
     }
 
     /// C `boRecord.c:230-238` (R7.0.10) is `prec->val = prec->ivov;` followed

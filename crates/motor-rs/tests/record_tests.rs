@@ -7944,10 +7944,9 @@ mod alarm_sub {
     use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
 
     fn common() -> CommonFields {
-        CommonFields {
-            udf: 0,
-            ..Default::default()
-        }
+        let mut common = CommonFields::default();
+        common.udf = 0;
+        common
     }
 
     // C 3372-3376: UDF raises UDF_ALARM/INVALID and short-circuits the

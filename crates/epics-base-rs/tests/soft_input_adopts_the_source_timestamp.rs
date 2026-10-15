@@ -165,7 +165,7 @@ record(ai, "DST")   { field(INP, "SRC") field(TSEL, "TSESRC") }
     proc(&db, "DST").await;
 
     assert_eq!(
-        db.get_record("DST").unwrap().read().common.tse,
+        db.get_record("DST").unwrap().read().common.tse(),
         -2,
         "the linked TSEL did load TSE"
     );

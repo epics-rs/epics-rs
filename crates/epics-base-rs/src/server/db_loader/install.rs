@@ -452,8 +452,21 @@ pub(crate) async fn install_records<H: InstallHost>(
                         &rec_arc,
                         None,
                     );
+                    let reached = {
+                        let mut inst = rec_arc.write();
+                        let reached = inst.run_init_pass0(&def.name.to_str_lossy());
+                        if reached {
+                            inst.run_add_record(&def.name.to_str_lossy(), input);
+                        }
+                        reached
+                    };
+                    // Pass 1's link reads take other records' locks, so they
+                    // run with this record's lock down, as the barrier's do.
+                    let mut reads = reached.then(|| host.db().read_init_links(&rec_arc));
                     let mut inst = rec_arc.write();
-                    inst.run_init_passes(&def.name.to_str_lossy(), input);
+                    if let Some(reads) = &mut reads {
+                        inst.run_init_pass1(&def.name.to_str_lossy(), reads);
+                    }
                     rec_arc.settle_string_typed(&inst);
                 }
             }
@@ -470,7 +483,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                 }
                 host.db().rec_gbl_init_constant_links(&rec_arc);
                 if is_merge {
-                    // A merge re-ran `run_init_passes` above against the new
+                    // A merge re-ran the init passes above against the new
                     // field set, so the rest of pass 1 owes a re-run too: a
                     // second block may have introduced SIML/SIOL or moved SDEL.
                     // A FRESH record takes both from the creation sink

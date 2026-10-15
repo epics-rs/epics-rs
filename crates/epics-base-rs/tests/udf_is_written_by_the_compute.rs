@@ -103,10 +103,8 @@ fn a_failed_input_fetch_freezes_calc_udf() {
 fn a_nan_calc_result_is_written_as_undefined() {
     let mut rec = CalcRecord::default();
     with_calc(&mut rec, "CALC", "0/0");
-    let mut common = CommonFields {
-        udf: 0,
-        ..Default::default()
-    };
+    let mut common = CommonFields::default();
+    common.udf = 0;
 
     cycle(&mut rec, &mut common);
     assert_eq!(common.udf, 1, "CALC=0/0 computes a NaN VAL: UDF back to 1");

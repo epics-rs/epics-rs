@@ -19,13 +19,14 @@ mod snapshot;
 
 pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
 pub(crate) use field_io::{PutSrc, render_for_string_target};
+pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
-    LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission, RemoteAlarm,
+    LinkMetadata, LinkOpen, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission, RemoteAlarm,
 };
 pub(crate) use links::{
-    ProcessTargetGate, multi_out_rows, multi_output_dispatch_owned, posts_software_event,
-    reads_sell, resolves_subroutine_from_link,
+    LinkAlarm, ProcessTargetGate, inherit_sevr_msg, multi_out_rows, multi_output_dispatch_owned,
+    posts_software_event, reads_sell, resolves_subroutine_from_link,
 };
 pub(crate) use processing::NotifiedRead;
 pub use processing::{
@@ -209,15 +210,25 @@ mod tsel_stamp {
                     return;
                 }
                 TselStamp::None => {}
-                TselStamp::Tse(tse) => common.tse = tse,
+                TselStamp::Tse(tse) => common.set_tse(tse),
                 TselStamp::Failed => {
                     crate::server::recgbl::rec_gbl_set_link_alarm(common, "TSEL");
                 }
             }
-            if common.tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
-                return device_time(common, simm_set);
+            match common.stamp_mode() {
+                crate::server::record::StampMode::Plain => {
+                    common.time = crate::runtime::general_time::get_current();
+                }
+                crate::server::record::StampMode::DeviceTime => device_time(common, simm_set),
+                // A TSEL link may just have loaded any TSE, -2 included.
+                crate::server::record::StampMode::Event
+                | crate::server::record::StampMode::FromTsel => {
+                    if common.tse() == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
+                        return device_time(common, simm_set);
+                    }
+                    apply_timestamp(name, common);
+                }
             }
-            apply_timestamp(name, common);
         }
     }
 
@@ -245,9 +256,9 @@ mod tsel_stamp {
     fn apply_timestamp(name: &[u8], common: &mut CommonFields) {
         // `stamp` has taken `TSE == -2` already, so this is `get_time_stamp`'s
         // other arm; the two share `recgbl::event_time` and cannot drift.
-        match crate::server::recgbl::event_time(common.tse) {
+        match crate::server::recgbl::event_time(common.tse()) {
             Some(t) => common.time = t,
-            None => tse_failed(name, common.tse),
+            None => tse_failed(name, common.tse()),
         }
     }
 
@@ -1991,9 +2002,9 @@ impl PvDatabase {
     /// opened keeps the first lset's handle: its slot is set once.
     pub async fn register_link_set(&self, scheme: &str, lset: link_set::DynLinkSet) {
         self.inner.link_sets.update(|r| r.register(scheme, lset));
-        // The links already loaded are opened now, as C opens them at link
-        // init with the lset in place.
-        self.bind_external_forwards();
+        // A forward link loaded after `iocInit` with no lset in place is
+        // opened now.
+        self.open_unopened_forwards();
     }
 
     /// Look up the lset for `scheme`, if any.
@@ -2220,7 +2231,11 @@ impl PvDatabase {
     /// setup, the init open pass, `dbcaxr`, the pvalink install scan — then
     /// sees one consistent answer to "is this link local or external"
     /// instead of each re-deriving it. `link_string` is still the verbatim
-    /// field text.
+    /// field text. An external link the record holds with no lset — removed,
+    /// or left so by its `openLink` — is the [`ParsedLink::Removed`] the
+    /// record holds, which no consumer opens, scans or counts.
+    ///
+    /// [`ParsedLink::Removed`]: crate::server::record::ParsedLink::Removed
     ///
     /// Each field is parsed for ITS OWN link-field type: C `dbPutFieldLink`
     /// passes `pfldDes->field_type` to `dbParseLink` (`dbAccess.c:1094`), which
@@ -2239,16 +2254,29 @@ impl PvDatabase {
             None => return Vec::new(),
         };
         // The texts leave the hold before any is parsed.
-        let texts = Self::link_field_texts(&rec.read());
+        let (texts, unbound) = {
+            let inst = rec.read();
+            let texts = Self::link_field_texts(&inst);
+            let unbound: Vec<_> = texts
+                .iter()
+                .map(|(field, _, _)| {
+                    inst.stored_link(field)
+                        .filter(|l| matches!(l, crate::server::record::ParsedLink::Removed(_)))
+                        .cloned()
+                })
+                .collect();
+            (texts, unbound)
+        };
         let (mut out, ftypes): (
             Vec<(String, PvString, crate::server::record::ParsedLink)>,
             Vec<_>,
         ) = texts
             .into_iter()
-            .filter(|(_, raw, _)| !raw.is_empty())
-            .map(|(field, raw, ftype)| {
+            .zip(unbound)
+            .filter(|((_, raw, _), _)| !raw.is_empty())
+            .map(|((field, raw, ftype), unbound)| {
                 let parsed = crate::server::record::parse_link_field(&raw, ftype);
-                ((field, raw, parsed), ftype)
+                ((field, raw, parsed), (ftype, unbound))
             })
             .filter(|((_, _, parsed), _)| {
                 !matches!(parsed, crate::server::record::ParsedLink::None)
@@ -2259,11 +2287,18 @@ impl PvDatabase {
         // guard: the locality query reads the database's record map, and
         // this is the only place that would otherwise hold an instance lock
         // across it.
-        for (entry, ftype) in out.iter_mut().zip(ftypes) {
+        for (entry, (ftype, unbound)) in out.iter_mut().zip(ftypes) {
             entry.2 = self.db_init_link_locality(
                 std::mem::replace(&mut entry.2, crate::server::record::ParsedLink::None),
                 ftype,
             );
+            // Only an external link: a removed local link keeps its parse
+            // here, which the lock-set walk reads.
+            if let Some(unbound) = unbound
+                && entry.2.external().is_some()
+            {
+                entry.2 = unbound;
+            }
         }
         out
     }
@@ -2291,18 +2326,22 @@ impl PvDatabase {
     /// C's open happens at record init rather than at
     /// first read, but in both designs the connect runs on the link task and
     /// the reading record takes LINK/INVALID until the cache is warm.
-    pub(crate) fn resolve_external_pv(&self, name: &[u8]) -> Option<EpicsValue> {
+    pub(crate) fn resolve_external_pv(
+        &self,
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> Option<EpicsValue> {
         // Try lsets first. We accept both "scheme://body" and the
         // bare body (stored in ParsedLink::Pva/Ca after the
         // dispatch in record/link.rs). `Any` tries every registered
         // lset in turn; the first one with a cached value wins.
+        let name = link.name;
         let (target, body) = Self::split_external_link_name(name);
-        for lset in link_put_queue::resolve_lsets(&self.inner, &target) {
-            if let Some(v) = lset.get_cached_value(body) {
-                return Some(v);
-            }
+        if let Some(v) =
+            link_put_queue::find_lset(&self.inner, &target, |lset| lset.get_cached_value(body))
+        {
+            return Some(v);
         }
-        self.stage_external_link_open_by_name(name);
+        self.stage_external_link_open(link);
         // Fall through to legacy resolver, which is addressed with the
         // caller's string verbatim (scheme prefix and all).
         let resolver = self
@@ -2323,59 +2362,48 @@ impl PvDatabase {
     /// Single owner of the `ca://` / `pva://` prefix convention: the
     /// cache-miss stage in `resolve_external_pv` and the iocInit
     /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
-    /// the same [`link_put_queue::LinkKey`] from the same link, or the
+    /// the same [`link_put_queue::Channel`] from the same link, or the
     /// queue's once-per-link open would fire twice under two spellings.
     fn split_external_link_name(name: &[u8]) -> (link_put_queue::LinkTarget, &[u8]) {
         if let Some(rest) = name.strip_prefix(b"pva://") {
-            (link_put_queue::LinkTarget::Scheme("pva".to_string()), rest)
+            (link_put_queue::LinkTarget::Scheme("pva"), rest)
         } else if let Some(rest) = name.strip_prefix(b"ca://") {
-            (link_put_queue::LinkTarget::Scheme("ca".to_string()), rest)
+            (link_put_queue::LinkTarget::Scheme("ca"), rest)
         } else {
             (link_put_queue::LinkTarget::Any, name)
         }
     }
 
-    /// Stage the open of the external link named `name` — the boundary
-    /// form of [`Self::stage_external_link_open`], which splits the
-    /// scheme prefix and applies the "an lset must exist" gate.
-    ///
-    /// The gate matters because the queue's open state is terminal: an
-    /// open staged while no lset is registered would be serviced against
-    /// an empty lset list and marked `Done`, burning the link's one and
-    /// only connect. Returns true when this call is the one that staged
-    /// it (false when already staged, or when no lset addresses it).
-    pub(crate) fn stage_external_link_open_by_name(&self, name: &[u8]) -> bool {
-        let (target, body) = Self::split_external_link_name(name);
-        if link_put_queue::resolve_lsets(&self.inner, &target).is_empty() {
-            return false;
-        }
-        self.stage_external_link_open(target, body)
-    }
-
-    /// How many staged writes to the external link `link_name` a later write
-    /// on the same link overwrote before it reached the wire — C's
-    /// `pca->nNoWrite`, which `dbcar` prints beside the link
-    /// (`dbCaTest.c:111-116`).
+    /// How many staged writes from `record`'s link `field` to the external
+    /// link `link_name` a later write on the same link overwrote before it
+    /// reached the wire — C's `pca->nNoWrite`, which `dbcar` prints beside
+    /// the link (`dbCaTest.c:111-116`).
     ///
     /// `link_name` is the link string as a record carries it, with or
     /// without a `ca://` / `pva://` prefix; it is split by
     /// `Self::split_external_link_name`, the same owner of that convention
     /// the write path stages under, so the two cannot key the counter
-    /// differently.
-    ///
-    /// C keeps this per `caLink`, i.e. per link FIELD: two records whose OUT
-    /// links name one PV have two `caLink`s and two counters. This port keeps
-    /// one queue entry per `(scheme, PV name)`, so both fields report the
-    /// shared count — the same aliasing `LinkSet` already applies to the
-    /// link's cache and connection state.
-    pub fn external_link_puts_coalesced_for(&self, link_name: impl AsRef<[u8]>) -> u64 {
+    /// differently. C keeps the count per `caLink`, i.e. per link field, and
+    /// so does the queue: two records whose OUT links name one PV have two
+    /// counters.
+    pub fn external_link_puts_coalesced_for(
+        &self,
+        record: impl AsRef<[u8]>,
+        field: &str,
+        link_name: impl AsRef<[u8]>,
+    ) -> u64 {
+        let Some(rec) = self.get_record(record) else {
+            return 0;
+        };
         let (target, body) = Self::split_external_link_name(link_name.as_ref());
-        self.inner
-            .link_puts
-            .coalesced_for(&link_put_queue::LinkKey {
+        self.inner.link_puts.coalesced_for(
+            rec.index(),
+            field,
+            &link_put_queue::Channel {
                 target,
                 name: body.into(),
-            })
+            },
+        )
     }
 
     /// C `dbCaLinkInit` (`dbCa.c:322-346`), which `iocBuild` calls before it
@@ -2409,13 +2437,26 @@ impl PvDatabase {
     /// Every caller routes through here so the open runs on the link work
     /// owner and nowhere else; no path may call
     /// [`link_set::LinkSet::connect_link`] directly from a record-processing
-    /// thread. Cheap and idempotent: the queue drops a repeat stage for a
-    /// link it has already opened.
+    /// thread. Once the queue holds the link's open, whoever staged it, the
+    /// link's latch says so, and from then on a cycle that misses reads the
+    /// latch and nothing else — C stages one `CA_CONNECT` per `caLink`.
     ///
-    /// Private to the `database` module, and reached only through
-    /// [`Self::stage_external_link_open_by_name`], so no caller can skip the
-    /// scheme split or the lset gate and mint a `LinkKey` of its own shape.
-    fn stage_external_link_open(&self, target: link_put_queue::LinkTarget, name: &[u8]) -> bool {
+    /// Gated on an lset existing for the link: the queue's open state is
+    /// terminal, so an open staged while no lset is registered would be
+    /// serviced against an empty lset list and marked `Done`, burning the
+    /// link's one connect. Returns true when this call is the one that staged
+    /// it (false when already staged, or when nothing could open it).
+    pub(crate) fn stage_external_link_open(
+        &self,
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> bool {
+        if link.open.is_some_and(|open| open.is_set()) {
+            return false;
+        }
+        let (target, body) = Self::split_external_link_name(link.name);
+        if link_put_queue::find_lset(&self.inner, &target, |_| Some(())).is_none() {
+            return false;
+        }
         // Nothing is staged that no owner can perform. A database built with
         // no tokio runtime captured no reactor, and `connect_link` has nowhere
         // to run (see `LinkPutQueue::network`) — so refuse here rather than
@@ -2429,10 +2470,14 @@ impl PvDatabase {
         self.inner
             .link_puts
             .ensure_owner(std::sync::Arc::downgrade(&self.inner));
-        self.inner.link_puts.stage_open(link_put_queue::LinkKey {
+        let staged = self.inner.link_puts.stage_open(link_put_queue::Channel {
             target,
-            name: name.into(),
-        })
+            name: body.into(),
+        });
+        if let Some(open) = link.open {
+            open.set();
+        }
+        staged
     }
 
     /// Number of external-link opens the work owner has completed —
@@ -2680,7 +2725,7 @@ impl PvDatabase {
     ///
     /// A record's first classification is issued from `set_async_context`,
     /// which [`Self::add_loaded_record`] calls *before* it inserts the record
-    /// into `records` — the handle has to exist for `run_init_passes` to use
+    /// into `records` — the handle has to exist for `run_init_pass0` to use
     /// it. So on the spawn-at-once paths the init would race its own record's
     /// registration and could post fields for a record the database does not
     /// have yet.
@@ -2985,8 +3030,18 @@ impl PvDatabase {
         // text that no longer exists. The common-field writer runs pass 1
         // itself; the declared-field writers do not.
         let put = if inst.common_link_text(field).is_some() {
-            inst.put_common_field_db_load_prepared(field, value, common)
-                .map(|_| ())
+            // A type that declares the field itself (throttle's OUT) owns the
+            // text, and `dbCommon` keeps the loader's mirror of it.
+            let owned = match declared {
+                Some(link) if inst.record.implements_field(field) => {
+                    inst.put_link_field(link, value.clone())
+                }
+                _ => Ok(()),
+            };
+            owned.and(
+                inst.put_common_field_db_load_prepared(field, value, common)
+                    .map(|_| ()),
+            )
         } else {
             let put = match declared {
                 Some(link) => inst.put_link_field(link, value),
@@ -3217,8 +3272,8 @@ impl PvDatabase {
     /// Taking the loaded fields here is what makes C's ordering hold by
     /// construction: there is no window in which the init passes can observe a
     /// record whose `.db` fields have not landed, because the record is not
-    /// reachable until they have. `RecordInstance::run_init_passes` is
-    /// crate-private for the same reason — the sink is the only caller.
+    /// reachable until they have. `RecordInstance::run_init_pass0` is
+    /// crate-private for the same reason.
     pub async fn add_loaded_record(
         &self,
         name: impl AsRef<[u8]>,
@@ -3232,7 +3287,7 @@ impl PvDatabase {
         // `dbLoadRecords`: `build_lock_sets` builds the whole graph at
         // `iocInit` instead. Declared ABOVE the gate: the relink takes lock
         // sets, which sit above L46, so it must run once the gate is down.
-        let _relink = self.lock_set_membership_change(&name);
+        let relink = self.lock_set_membership_change(&name);
         let gate = self.lock_registration("add_loaded_record");
         self.check_name_free(&name)?;
         let mut instance = RecordInstance::new_boxed(name.clone(), record);
@@ -3376,42 +3431,9 @@ impl PvDatabase {
         // AFTER `dbLoadRecords(NDStats.template)`). The record is still
         // published below so a name check, an alias and `dbInitRecordLinks` all
         // see it; only its device-support binding and passes wait for the
-        // barrier's drain of the records that owe an init. Outside the LOAD phase —
-        // programmatic creation, `dbCreateRecord` after `iocInit` — there is no
-        // barrier to defer to, so the record is initialised in place, as before.
+        // barrier's drain of the records that owe an init. Outside the LOAD
+        // phase the debt is paid below, once the record is published.
         let defer = self.is_load_deferring();
-        if !defer {
-            crate::server::ioc_app::attach_device_support(
-                &mut instance,
-                &name.to_str_lossy(),
-                self.inner.device_support_resolver.load().as_deref(),
-            );
-            // C `registryFunctionFind` reads a process-global registry from
-            // inside `init_record` pass 1, so the record is handed the registry
-            // rather than resolved against it from out here: the lookup's
-            // failure is an early return that the init tail must not run past,
-            // and only the init owner can honour that.
-            instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-            // No `add_record` channel: resolving INP's target here would take
-            // a record lock under L46.
-            instance.run_init_passes(&name.to_str_lossy(), None);
-
-            // The init-seed owner: every CONSTANT link the record declares
-            // (`Record::constant_init_links`) is loaded into its value field
-            // ONCE, here — a constant delivers NOTHING at process time
-            // (`dbConstLink.c:219-225`). `add_record` is the creation sink every
-            // path funnels through, so this covers a record built
-            // programmatically as well as one loaded from a .db;
-            // `IocBuilder`/`dbLoadRecords` call the owner again after
-            // `init_record(1)`, once the record's final NELM/FTVL buffer exists
-            // for an array constant to land in. Seeding twice is a no-op — both
-            // run before any client put.
-            super::database::processing::seed_constant_links(&mut instance);
-        }
-
-        let scan = instance.common.scan;
-        let phas = instance.common.phas;
-        let record_type = instance.record.record_type();
         // The record's load sequence — C `pnewnode->order =
         // pdbentry->pdbbase->no_records++` (`dbStaticLib.c:1704`) — drawn here,
         // where the node is built, so it is born with the record. Drawn before
@@ -3421,7 +3443,7 @@ impl PvDatabase {
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let index = self.inner.record_table.reserve();
-        let rec_arc = Arc::new(RecordCell::new(instance, seq, defer).indexed(index));
+        let rec_arc = Arc::new(RecordCell::new(instance, seq, true).indexed(index));
         self.inner.record_table.publish(index, rec_arc.clone());
         // C `createLockRecord` allocates the `lockRecord` INTO the record:
         // the registry's answer for this name is this record's own cell,
@@ -3439,41 +3461,28 @@ impl PvDatabase {
         if defer {
             // The dset binding, init passes, scan-index insert and the
             // `recGblInitSimm`/`wdogInit` tail are all owed to `ioc_init`. The
-            // record carries that debt itself (`RecordCell::init_owed`, set
-            // from `defer` above), so the barrier finds it by walking the
-            // database it is already going to walk.
+            // record carries that debt itself (`RecordCell::init_owed`), so the
+            // barrier finds it by walking the database it is already going to
+            // walk.
             return Ok(());
         }
 
-        self.add_to_scan_list(scan, phas, record_type, seq, &name);
-
-        // Registration is complete and the name is published, so the gate has
-        // nothing left to serialize. It is released HERE, before the tail
-        // below, and that is load-bearing rather than tidy:
-        // `recGblInitSimm` can swap SCAN, and a scan change is applied by
-        // `update_scan_index`, which takes this same `registration_mutex`
-        // itself as the single owner of a scan-index transition. Holding it
-        // across the call is a self-deadlock on a non-reentrant mutex — the
-        // record only has to carry a constant SIML and a periodic SCAN to
-        // reach it.
+        // Outside the LOAD phase — programmatic creation, `dbCreateRecord`
+        // after `iocInit` — there is no barrier to defer to, so the record
+        // pays its debt now, through the barrier's own code. Its pass-1 link
+        // reads take other records' locks, which sit above L46, so the gate
+        // and the lock-set relink go first. Until pass 1 ends the record is
+        // reachable in its LOAD-phase state (UDF, INVALID, PACT 0), as a C
+        // record is between `dbLoadRecords` and `iocInit`; a put landing then
+        // is overwritten by the init that follows it, as there. Unlike C, the
+        // CA server is already up during that window.
         drop(gate);
-
-        // The rest of C's `init_record` pass 1, which needs the record
-        // REGISTERED and so cannot run with `run_init_passes` above:
-        // `recGblInitSimm` plus its `recGblInitConstantLink(&siol, …, &sval)`
-        // (recGbl.c:439-446, from e.g. aiRecord.c:101), then `wdogInit`
-        // (histogramRecord.c:168). C reaches both through `iterateRecords`
-        // (`iocInit.c:562-586`), which visits every record in the database
-        // whatever created it; here they sat on the loader callers instead, so
-        // an inline or `dbCreateRecord` record got neither. Both are no-ops for
-        // a record type that declares no SIMM / no SDEL. Running them outside
-        // the gate is also what C does: `iterateRecords` is a separate pass
-        // over an already-built database, holding no registration lock.
-        self.rec_gbl_init_simm(&rec_arc);
-        self.arm_watchdog(&name);
+        drop(relink);
+        self.init_owed_records(vec![(name.clone(), rec_arc.clone())]);
         // A record added after `iocInit` initialises its own forward links;
         // one added before is swept by the barrier.
         if self.ioc_is_running() {
+            self.open_record_links(&rec_arc);
             self.init_record_forwards(&rec_arc);
         }
         Ok(())
@@ -3501,9 +3510,18 @@ impl PvDatabase {
     /// so a second call is a no-op — the build lifecycle calls this BEFORE
     /// `setup_io_intr`, and [`Self::ioc_init`] calls it again as a catch-all.
     pub(crate) fn drain_deferred_record_inits(&self) {
+        let records = self.iterate_records();
+        self.init_owed_records(records.clone());
+        for (_, rec_arc) in &records {
+            self.open_record_links(rec_arc);
+        }
+    }
+
+    /// [`Self::drain_deferred_record_inits`] over `records`: the debt of each
+    /// one this call claims is paid in C's three walks.
+    fn init_owed_records(&self, records: Vec<(RecordName, Arc<RecordCell>)>) {
         let resolver = self.inner.device_support_resolver.load();
-        let owed: Vec<_> = self
-            .iterate_records()
+        let owed: Vec<_> = records
             .into_iter()
             .filter(|(_, rec_arc)| rec_arc.claim_owed_init())
             .map(|(name, rec_arc)| {
@@ -3523,6 +3541,12 @@ impl PvDatabase {
                 (name, rec_arc, reached)
             })
             .collect();
+        // A record created before any load opens its links at the barrier
+        // ([`Self::drain_deferred_record_inits`]), once its lsets exist.
+        let open_links = !matches!(
+            *self.inner.init_phase.lock().unwrap(),
+            DbInitPhase::Unloaded
+        );
         for (name, rec_arc, reached) in &owed {
             if *reached {
                 let add_record_input =
@@ -3532,6 +3556,9 @@ impl PvDatabase {
                 rec_arc
                     .write()
                     .run_add_record(&name.to_str_lossy(), add_record_input);
+            }
+            if open_links {
+                self.open_record_links(rec_arc);
             }
         }
         for (name, rec_arc, reached) in &owed {
@@ -3567,21 +3594,12 @@ impl PvDatabase {
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
     fn init_deferred_record(&self, name: &RecordName, rec_arc: &Arc<RecordCell>, reached: bool) {
-        let init_reads = if reached {
-            self.read_init_links(rec_arc)
-        } else {
-            Vec::new()
-        };
+        let mut init_reads = reached.then(|| self.read_init_links(rec_arc));
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
             let instance = &mut *guard;
-            if reached {
-                for (field, value) in init_reads {
-                    if let Err(e) = instance.record.put_field_internal(field, value) {
-                        eprintln!("init link read into {name}.{field} failed: {e}");
-                    }
-                }
-                instance.run_init_pass1(&name.to_str_lossy());
+            if let Some(reads) = &mut init_reads {
+                instance.run_init_pass1(&name.to_str_lossy(), reads);
             }
             super::database::processing::seed_constant_links(instance);
             rec_arc.settle_string_typed(instance);
@@ -3607,27 +3625,52 @@ impl PvDatabase {
         self.rec_gbl_init_constant_links(rec_arc);
     }
 
-    /// The values of `rec_arc`'s [`Record::init_link_reads`], read with no
+    /// The answers to `rec_arc`'s [`Record::init_link_reads`], read with no
     /// lock of its own held, so a link to the record itself reads it too.
     ///
     /// [`Record::init_link_reads`]: crate::server::record::Record::init_link_reads
-    fn read_init_links(&self, rec_arc: &Arc<RecordCell>) -> Vec<(&'static str, EpicsValue)> {
+    pub(crate) fn read_init_links(
+        &self,
+        rec_arc: &Arc<RecordCell>,
+    ) -> crate::server::record::InitLinkReads {
         let links: Vec<_> = {
             let instance = rec_arc.read();
             instance
                 .record
                 .init_link_reads()
                 .iter()
-                .filter_map(|&(link, field)| Some((instance.link_text(link)?, field)))
+                .map(|&(field, read_as)| {
+                    // A link bound with no lset reads as one; any other is
+                    // read from its text.
+                    let unbound = instance
+                        .stored_link_shared(field)
+                        .filter(|link| {
+                            matches!(***link, crate::server::record::ParsedLink::Removed(_))
+                        })
+                        .cloned();
+                    (field, instance.link_text(field), read_as, unbound)
+                })
                 .collect()
         };
-        links
-            .into_iter()
-            .filter_map(|(text, field)| {
-                let link = crate::server::record::parse_link_v2(&text);
-                Some((field, self.read_link_at_init(&link)?))
-            })
-            .collect()
+        let reader = links::SourceId::of(rec_arc);
+        crate::server::record::InitLinkReads::new(
+            links
+                .into_iter()
+                .map(|(field, text, read_as, unbound)| {
+                    let read = match unbound {
+                        Some(link) => self.read_link_at_init(reader, &link, read_as),
+                        None => self.read_link_at_init(
+                            reader,
+                            &crate::server::record::parse_link_v2(
+                                text.as_ref().map_or(&b""[..], |t| t.as_bytes()),
+                            ),
+                            read_as,
+                        ),
+                    };
+                    (field, read)
+                })
+                .collect(),
+        )
     }
 
     /// Verify that `name` is not currently registered in any of the
@@ -3969,13 +4012,14 @@ impl PvDatabase {
         rec.declares_name(field) || self.has_record_type_attribute(rec.rdes().record_type, field)
     }
 
-    /// Internal: synchronous existence check without resolver.
+    /// Synchronous existence check without resolver, taking no record lock,
+    /// so an lset's [`LinkSet::open_link`] may ask it under a put's hold.
     ///
     /// C `dbChannelTest` (`dbChannel.c:331-342`): the record name up to the
     /// first `.`, then the field name's identifier prefix
     /// (`dbStaticLib.c:1800-1802`); what follows is not read, so
     /// `R.VAL$garbage` is found and refused at create.
-    fn has_name_no_resolve(&self, name: &[u8]) -> bool {
+    pub fn has_name_no_resolve(&self, name: &[u8]) -> bool {
         // A filtered simple PV (`SP.{"arr":...}`) answers by its base name.
         if self.simple_pv_named(&filters::split_channel_name(name).record_path) {
             return true;
@@ -4419,7 +4463,7 @@ mod tests {
         // Pre-populate `time` with a stale but non-epoch sentinel.
         let stale = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut common = CommonFields::default();
-        common.tse = -1;
+        common.set_tse(-1);
         common.time = stale;
 
         TselStamp::None.stamp(b"REC", &mut common, || false);
@@ -4444,7 +4488,7 @@ mod tests {
 
         let device_time = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
         let mut common = CommonFields::default();
-        common.tse = -2;
+        common.set_tse(-2);
         common.time = device_time;
 
         TselStamp::None.stamp(b"REC", &mut common, || false);
@@ -4498,7 +4542,7 @@ mod tests {
 
         let stale = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut common = CommonFields::default();
-        common.tse = -3;
+        common.set_tse(-3);
         common.time = stale;
 
         TselStamp::None.stamp(b"X", &mut common, || false);

@@ -273,3 +273,21 @@ async fn a_get_link_queued_by_special_reports_on_the_put() {
         )]
     );
 }
+
+/// A hardware link has no lset (`dbLink.c:112-113`), so `dbPutLink` fails
+/// `S_db_noLSET` before `setLinkAlarm` (`dbLink.c:440-441`): a failed put,
+/// no alarm.
+#[epics_macros_rs::epics_test]
+async fn a_write_through_a_hardware_link_fails_without_an_alarm() {
+    let run = cycle(Mode::WriteThenGet, "SRC.VAL", "#C0 S0").await;
+    assert_eq!(run.heard, [Heard::Wrote(false)]);
+    assert_eq!(run.sevr, AlarmSeverity::NoAlarm);
+}
+
+/// A constant link's `dbConstPutValue` answers 0 (`dbConstLink.c:228-232`).
+#[epics_macros_rs::epics_test]
+async fn a_write_through_a_constant_link_lands_as_a_no_op() {
+    let run = cycle(Mode::WriteThenGet, "SRC.VAL", "5").await;
+    assert_eq!(run.heard[0], Heard::Wrote(true));
+    assert_eq!(run.sevr, AlarmSeverity::NoAlarm);
+}

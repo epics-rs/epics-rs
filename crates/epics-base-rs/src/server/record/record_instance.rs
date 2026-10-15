@@ -1740,7 +1740,7 @@ mod link_cache {
     /// keeps after `dbRemoveLink`. Only a link with an lset is removed
     /// (`dbAccess.c:1150`), and a hardware link has none, so a slot never
     /// holds one here.
-    fn removed(old: &ParsedLink) -> Arc<ParsedLink> {
+    pub(super) fn removed(old: &ParsedLink) -> Arc<ParsedLink> {
         match old.db_link_type() {
             DbLinkType::Constant => SHARED[1].clone(),
             DbLinkType::JsonLink => SHARED[3].clone(),
@@ -1987,7 +1987,6 @@ mod link_cache {
             usize::from(row.0[i])
         }
 
-        #[cfg(debug_assertions)]
         pub(super) fn field_at(&self, i: usize) -> &'static str {
             self.0[i].field
         }
@@ -2447,6 +2446,10 @@ pub struct RecordCell {
     /// answer is the record's own, and the owed-ness cannot name a record
     /// that does not exist.
     init_owed: std::sync::atomic::AtomicBool,
+    /// This record's links still await C `doResolveLinks`' `openLink`
+    /// (`iocInit.c:576-577`): claimed once, so each link is opened once at
+    /// init however many init walks reach the record.
+    link_opens_owed: std::sync::atomic::AtomicBool,
     /// This record's slot in the database's record table, given at
     /// registration; `None` for a cell no database registered.
     index: Option<crate::server::database::RecordIdx>,
@@ -3389,6 +3392,7 @@ impl RecordCell {
             load_order,
             index: None,
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
+            link_opens_owed: std::sync::atomic::AtomicBool::new(true),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
@@ -3427,6 +3431,13 @@ impl RecordCell {
     /// barrier is crossed.
     pub(crate) fn claim_owed_init(&self) -> bool {
         self.init_owed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Claim the init-time `openLink` of this record's links: `true` to
+    /// exactly one caller ([`Self::link_opens_owed`]).
+    pub(crate) fn claim_link_opens(&self) -> bool {
+        self.link_opens_owed
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
@@ -4066,6 +4077,17 @@ impl ParsedInputLink {
         let entry = cell.as_mut()?;
         entry.generation = generation;
         Some(entry)
+    }
+
+    /// [`RecordInstance::bind_no_lset`]'s entry: `text` held with no lset.
+    fn unbound(text: crate::types::PvString, removed: Arc<ParsedLink>) -> ParsedInputLink {
+        ParsedInputLink {
+            text,
+            generation: None,
+            parsed: removed,
+            answers: None,
+            target: None,
+        }
     }
 
     /// A slot's entry for a text it has not held: the parse, with no target
@@ -4831,7 +4853,7 @@ pub struct RecordInstance {
     // Link parse cache
     pub parsed_inp: LinkCache,
     pub parsed_out: OutLinkCache,
-    pub parsed_tsel: LinkCache,
+    pub(crate) parsed_tsel: LinkCache,
     pub parsed_flnk: LinkCache,
     /// See [`MonitorHot`]. Last of the unmonitored run: past it, only a
     /// watched cycle reads on.
@@ -4883,9 +4905,9 @@ struct RecordCold {
     /// 1 will resolve INAM/SNAM against — C `registryFunctionFind`, reading a
     /// process-global table from inside `init_record`.
     ///
-    /// One meaning on every path: armed by the creation sink immediately
-    /// before [`Self::run_init_passes`], consumed (and cleared) by the pass
-    /// itself. It exists because the lookup's failure is an EARLY RETURN — the
+    /// One meaning on every path: armed by the init drain immediately
+    /// before [`RecordInstance::run_init_pass0`], consumed (and cleared) by
+    /// pass 1 itself. It exists because the lookup's failure is an EARLY RETURN — the
     /// init tail must not run past it — and only the init owner can honour
     /// that, while only the database holds the registry. Resolving from
     /// outside the passes, as both builders used to, put the lookup after the
@@ -5825,6 +5847,10 @@ impl RecordInstance {
             "FLNK" => self.parsed_flnk.swap(link),
             _ => return false,
         }
+        if field == "TSEL" {
+            let is_link = !self.parsed_tsel.is_constant();
+            self.common.set_tsel_link(is_link);
+        }
         self.invalidate_plan();
         true
     }
@@ -6086,7 +6112,7 @@ impl RecordInstance {
         let reads_double = || match self.parsed_inp.link() {
             ParsedLink::Db(db)
                 if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
-                    && self.common.tse != -2
+                    && self.common.tse() != -2
                     && self.common.dtyp.soft()
                         != Some(crate::server::device_support::SoftDtyp::Raw) =>
             {
@@ -6219,21 +6245,23 @@ impl RecordInstance {
     }
 
     /// [`Self::put_internal_field`] for one put of a batch whose link parses
-    /// were made before the hold.
+    /// were made before the hold; the link field it installed, if any, which
+    /// the caller opens
+    /// ([`PvDatabase::put_internal_field_opening`](crate::server::database::PvDatabase)).
     pub(crate) fn put_internal_field_of(
         &mut self,
         field: &str,
         value: EpicsValue,
         links: &mut PreparedLinks,
-    ) -> CaResult<()> {
+    ) -> CaResult<Option<&'static str>> {
         let Some(link) = links.take(field) else {
-            return self.put_internal_field(field, value);
+            return self.put_internal_field(field, value).map(|()| None);
         };
         let field = link.field();
         self.invalidate_plan_for(field);
         self.record.put_field_internal(field, value)?;
         self.link_slots.install(link);
-        Ok(())
+        Ok(Some(field))
     }
 
     /// A slotted link's text comes in through [`Self::put_link_field`]
@@ -6453,6 +6481,14 @@ impl RecordInstance {
     #[inline]
     pub(crate) fn out_row_link(&self, i: usize) -> &Arc<ParsedLink> {
         self.row_link(self.link_rows.0, i)
+    }
+
+    /// The field link `i` of the output row lives in.
+    pub(crate) fn out_row_field(&self, i: usize) -> &'static str {
+        match self.link_rows.0 {
+            Some(row) => self.link_slots.field_at(LinkSlots::row_slot(row, i)),
+            None => "",
+        }
     }
 
     /// Link `i` of seq's `DOLn` row; see [`Self::out_row_link`].
@@ -6729,20 +6765,12 @@ impl RecordInstance {
     /// `dbStaticLib.c:2653-2661`). The callers are the creation sink,
     /// [`crate::server::database::PvDatabase::add_loaded_record`], which takes
     /// the load and the record together so no path can init a half-loaded
-    /// record, and the `iocInit` drain, which runs the three halves as C's
-    /// three whole-database walks: [`Self::run_init_pass0`] over every record,
-    /// then [`Self::run_add_record`], then [`Self::run_init_pass1`].
-    pub(crate) fn run_init_passes(
-        &mut self,
-        name: &str,
-        add_record_input: Option<crate::server::builtin_devices::soft_callback::AddRecordInput>,
-    ) {
-        if self.run_init_pass0(name) {
-            self.run_add_record(name, add_record_input);
-            self.run_init_pass1(name);
-        }
-    }
-
+    /// record and hands it to the `iocInit` drain, and the loader's merge into
+    /// a live record. Both run the three halves as C's three whole-database
+    /// walks: this one, then [`Self::run_add_record`], then
+    /// [`Self::run_init_pass1`] against what
+    /// [`crate::server::database::PvDatabase::read_init_links`] read.
+    ///
     /// C `doInitRecord0`: the prologue and `init_record(prec, 0)`. Returns
     /// whether the record's `init_record` gets past its dset test, i.e.
     /// whether the two later walks have anything to do for it.
@@ -6807,11 +6835,16 @@ impl RecordInstance {
 
     /// C `doInitRecord1`: `init_record(prec, 1)` and the init tail, for a
     /// record pass 0 reached.
-    pub(crate) fn run_init_pass1(&mut self, name: &str) {
+    pub(crate) fn run_init_pass1(
+        &mut self,
+        name: &str,
+        reads: &mut crate::server::record::InitLinkReads,
+    ) {
         let _init = crate::server::database::InitPass::enter();
-        if let Err(e) = self.record.init_record(1) {
+        if let Err(e) = self.record.init_record_with_links(reads) {
             eprintln!("init_record(1) failed for {name}: {e}");
         }
+        reads.apply(&mut self.common);
         // C `pdset->common.init_record(prec)` — the driver's own init, which
         // every record type calls from INSIDE `init_record` once the dset test
         // above has passed (`aiRecord.c:115-124`, `aoRecord.c:121-133`). It
@@ -6914,6 +6947,16 @@ impl RecordInstance {
                     .or_else(|| self.record.output_link_value()),
             ),
             SoftDtyp::Plain | SoftDtyp::Async => Some(self.record.output_link_value()),
+        }
+    }
+
+    /// [`Self::soft_output_value`], borrowed: `Some(None)` is a soft dset
+    /// whose value has no view, which the caller materialises.
+    pub(crate) fn soft_output_view(&self) -> Option<Option<super::record_trait::OutView<'_>>> {
+        use crate::server::device_support::SoftDtyp;
+        match self.common.dtyp.soft()? {
+            SoftDtyp::Raw => Some(self.record.raw_soft_output_view()),
+            SoftDtyp::Plain | SoftDtyp::Async => Some(self.record.output_view()),
         }
     }
 
@@ -8988,7 +9031,7 @@ impl RecordInstance {
             // type's device menu, NOT the name. The name is what this port
             // stores and dispatches on; the index is what the wire carries.
             CommonField::Dtyp => Some(EpicsValue::Enum(self.dtyp_index())),
-            CommonField::Tse => Some(EpicsValue::Short(self.common.tse)),
+            CommonField::Tse => Some(EpicsValue::Short(self.common.tse())),
             CommonField::Tsel => Some(EpicsValue::String(self.common.text.tsel.clone().into())),
             // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
             // 64-bit value variant so values above i64::MAX round-trip.
@@ -9512,6 +9555,33 @@ impl RecordInstance {
         self.link_slots.remove(i);
     }
 
+    /// An `openLink` that left `field`'s link with no lset
+    /// (`pvalink_lset.cpp:70-75`): the [`ParsedLink::Removed`] C's
+    /// `dbRemoveLink` leaves, in every store the record reads the link from,
+    /// so its reads, puts and forward take the no-lset arms with nothing
+    /// asked per cycle. A later put of the field re-parses it, as C's
+    /// `dbPutFieldLink` re-adds it.
+    pub(crate) fn bind_no_lset(&mut self, field: &str) {
+        let Some(old) = self.stored_link_shared(field).cloned() else {
+            return;
+        };
+        let mut removed = link_cache::removed(&old);
+        if let Some(i) = self.link_slots.position(field) {
+            self.link_slots.remove(i);
+        }
+        if let Some(slot) = self
+            .record
+            .multi_input_links()
+            .iter()
+            .position(|(f, _)| *f == field)
+            && let Some(text) = link_text_of(&*self.record, field)
+        {
+            self.parsed_inputs[slot] = Some(ParsedInputLink::unbound(text, removed.clone()));
+        }
+        self.swap_link_cache(field, &mut removed);
+        self.invalidate_plan_for(field);
+    }
+
     /// The link puts whose `SPC_NOMOD` refusal waits for the hold: a device
     /// link's and [`Self::link_put_slot`]'s.
     pub(crate) fn refuses_link_put_under_hold(&self, field: &str) -> bool {
@@ -9757,7 +9827,7 @@ impl RecordInstance {
             },
             "TSE" => {
                 if let EpicsValue::Short(v) = value {
-                    self.common.tse = v;
+                    self.common.set_tse(v);
                 }
             }
             "TSEL" => {
@@ -11314,14 +11384,16 @@ impl RecordInstance {
     }
 
     /// The record's half of every field log a post makes now
-    /// (`db_create_field_log`, `dbEvent.c:704-713`).
+    /// (`db_create_field_log`, `dbEvent.c:704-713`). `always`: every
+    /// monitored post runs it, and out of line it cost +32 instr/cycle.
+    #[inline(always)]
     fn log_head(&self) -> crate::server::pv::LogHead {
         #[cfg(test)]
         HEADS.with(|n| n.set(n.get() + 1));
         crate::server::pv::LogHead {
             stat: self.common.stat,
             sevr: self.common.sevr as u16,
-            amsg: crate::server::pv::log_amsg(self.common.amsg.parts()),
+            amsg: crate::server::pv::log_record_amsg(&self.common.amsg),
             time: self.common.time,
             utag: self.common.utag as i32,
         }
@@ -12858,7 +12930,7 @@ mod record_cell_layout_tests {
             nsta,
             sevr,
             stat,
-            tse,
+            stamp,
             putf,
             tpro,
             rpro,
@@ -12926,6 +12998,7 @@ mod record_cell_layout_tests {
             cp_edges,
             // Not read by a process cycle from here on.
             init_owed,
+            link_opens_owed,
             index,
             rdes,
             slots,
@@ -13058,7 +13131,7 @@ mod device_menu_marking_tests {
         let mut inst = RecordInstance::new("X", AiRecord::default());
         inst.common.dtyp = "asynInt32".into();
         assert!(!inst.init_record_reaches_body());
-        inst.run_init_passes("X", None);
+        inst.run_init_pass0("X");
         inst.common.dtyp.set_name("Soft Channel");
         assert_eq!(inst.common.dtyp.soft(), None);
     }
@@ -15065,7 +15138,7 @@ mod common_field_dbload_tests {
         put(&mut inst, "PHAS", "1");
         assert_eq!(inst.common.phas, 1, "field(PHAS, \"1\")");
         put(&mut inst, "TSE", "-2");
-        assert_eq!(inst.common.tse, -2, "field(TSE, \"-2\")");
+        assert_eq!(inst.common.tse(), -2, "field(TSE, \"-2\")");
         put(&mut inst, "DISV", "1");
         assert_eq!(inst.common.disv, 1, "field(DISV, \"1\")");
         put(&mut inst, "DISA", "1");

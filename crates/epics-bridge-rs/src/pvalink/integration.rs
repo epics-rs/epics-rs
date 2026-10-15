@@ -18,7 +18,7 @@
 //! pvxs equivalent: `ioc/pvalink.cpp` + `ioc/pvalink_channel.cpp`
 //! (`pvalinkInit`, `pvalinkOpen`, `dbpvxr`).
 
-// RTEMS-EXEC-MODEL-ALLOW(37): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(38): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -1152,6 +1152,22 @@ impl LinkSet for PvaLinkResolver {
         value
     }
 
+    /// `pvaGetValue`'s `!self->valid()` arm, which raises `"%s Disconn"`
+    /// (`pvalink_lset.cpp:263-268`); a link never opened is not valid.
+    fn get_failure_disconn(&self, name: &[u8]) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let Some(full) = strip_scheme(name) else {
+            return false;
+        };
+        let cfg = self.inp_cfg_for(full);
+        !self
+            .registry
+            .try_get_inp(link_pv_name(full), cfg.pipeline, cfg.queue_size)
+            .is_some_and(|link| link.is_valid())
+    }
+
     /// C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:393`): open the monitor so
     /// later cached reads have something to serve. Runs on the database's
     /// link work owner, never on a record-processing thread.
@@ -1323,7 +1339,7 @@ impl LinkSet for PvaLinkResolver {
         .await;
     }
 
-    fn alarm_message(&self, name: &[u8]) -> Option<String> {
+    fn alarm_message(&self, name: &[u8]) -> Option<Arc<str>> {
         // parse the caller's full link config and apply the
         // caller's own `sevr` mode — `get_or_open` may return a
         // previously cached INP link whose `config.sevr` belongs to a
@@ -3527,7 +3543,7 @@ mod tests {
             other => panic!("expected PvaJson, got {other:?}"),
         };
         assert_eq!(
-            j,
+            *j,
             PvaJsonLink::new(
                 "TARGET:AI".to_string(),
                 vec![
@@ -3627,7 +3643,7 @@ mod tests {
             other => panic!("expected Pva, got {other:?}"),
         };
         assert_eq!(
-            stored, "TARGET:AI CPP MS",
+            &*stored, "TARGET:AI CPP MS",
             "epics-base must preserve the legacy suffix verbatim"
         );
 
@@ -3653,7 +3669,7 @@ mod tests {
         // inp_cfg_for keyed by the full suffix string returns the parsed
         // config — bare PV name, MS, CPP — not the default for a PV
         // literally named "TARGET:AI CPP MS".
-        let cfg = resolver.inp_cfg_for(stored.as_str());
+        let cfg = resolver.inp_cfg_for(&stored);
         assert_eq!(cfg.pv_name, "TARGET:AI");
         assert_eq!(
             cfg.sevr,
@@ -4291,8 +4307,8 @@ mod tests {
             "an MS caller must see MAJOR even though the cached link is NMS"
         );
         assert_eq!(
-            LinkSet::alarm_message(&resolver, ms_name.as_bytes()),
-            Some("HIGH".to_string()),
+            LinkSet::alarm_message(&resolver, ms_name.as_bytes()).as_deref(),
+            Some("HIGH"),
             "an MS caller must get the remote alarm message"
         );
         assert_eq!(
@@ -4314,7 +4330,7 @@ mod tests {
             .expect("connected link reports the initial INVALID snapshot");
         assert_eq!(pre.severity, 3, "pre-read snapshot is INVALID_ALARM");
         assert_eq!(pre.status, 14, "LINK_ALARM status");
-        assert_eq!(pre.message, "", "initial snapshot carries no message");
+        assert_eq!(&*pre.message, "", "initial snapshot carries no message");
 
         // A value read (the LinkSet `get_value` path = pvxs `dbGetLink` /
         // `pvaGetValue`) latches the snapshot.
@@ -4333,7 +4349,10 @@ mod tests {
             .expect("NMS caller still gets the ungated remote alarm snapshot");
         assert_eq!(snap.severity, 2, "ungated snapshot reports remote MAJOR");
         assert_eq!(snap.status, 14, "LINK_ALARM status derived from severity");
-        assert_eq!(snap.message, "HIGH", "ungated snapshot carries the message");
+        assert_eq!(
+            &*snap.message, "HIGH",
+            "ungated snapshot carries the message"
+        );
 
         // The shared cached link is time=false → a bare caller adopts
         // no timestamp. A caller asking `?time=true` must adopt it.
@@ -4780,5 +4799,155 @@ mod tests {
                 "Disconn".to_string(),
             )
         );
+    }
+}
+
+/// An alarmed remote is C's every-cycle `recGblSetSevrMsg(LINK_ALARM, sev,
+/// snap_message)` (`pvalink_lset.cpp:424-434`), a copy into the record's
+/// fixed `namsg`. Here the message is the `Arc<str>` the link latched when
+/// the text arrived, so the steady cycle allocates nothing and a changed
+/// remote text costs exactly the one allocation of the new text. Counted on
+/// a primed IOC thread with this binary's own allocator.
+#[cfg(test)]
+mod alarmed_remote_cycle_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+    use epics_base_rs::server::database::{ProcStack, PvDatabase};
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+
+    use super::{LinkDirection, PvaLink, PvaLinkConfig, PvaLinkResolver, install_pvalink_resolver};
+
+    thread_local! {
+        static COUNTING: Cell<bool> = const { Cell::new(false) };
+        static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct Counting;
+
+    // SAFETY: forwards every call to `System` unchanged; the counters are
+    // const-initialised thread-local `Cell`s, which never allocate.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if COUNTING.with(Cell::get) {
+                ALLOCS.with(|n| n.set(n.get() + 1));
+            }
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            if COUNTING.with(Cell::get) {
+                ALLOCS.with(|n| n.set(n.get() + 1));
+            }
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+
+    const DB: &str = r#"
+record(ai, "AR:AI") { field(INP, "pva://AR:PV?sevr=MS") }
+record(ai, "AR:JSON") { field(INP, {pva:{pv:"AR:PV", sevr:"MS"}}) }
+"#;
+
+    /// An NTScalar at MAJOR carrying `message`.
+    fn alarmed(message: &str) -> PvField {
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String(message.into())),
+        ));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.0))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        PvField::Structure(root)
+    }
+
+    /// Allocations `cycles` cycles of `rec` make on a primed scan thread,
+    /// after `before` ran there uncounted.
+    fn allocs(
+        db: Arc<PvDatabase>,
+        rec: &'static str,
+        cycles: usize,
+        before: impl FnOnce() + Send + 'static,
+    ) -> usize {
+        let (tx, rx) = std::sync::mpsc::channel();
+        MandatoryThread::new("scan-1", ThreadPriority::ScanLow, StackSizeClass::Big).spawn(
+            move || {
+                for _ in 0..3 {
+                    db.process_record_with_links_already_locked(rec, &mut ProcStack::new())
+                        .unwrap();
+                }
+                before();
+                let mut visited = ProcStack::new();
+                ALLOCS.with(|n| n.set(0));
+                COUNTING.with(|c| c.set(true));
+                for _ in 0..cycles {
+                    db.process_record_with_links_already_locked(rec, &mut visited)
+                        .unwrap();
+                }
+                COUNTING.with(|c| c.set(false));
+                tx.send(ALLOCS.with(Cell::get)).unwrap();
+            },
+        );
+        rx.recv().unwrap()
+    }
+
+    fn alarm_of(db: &PvDatabase, rec: &str) -> (String, String) {
+        let pv = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().to_string();
+        (pv("SEVR"), pv("AMSG"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alarmed_remote_cycle_allocates_only_for_a_new_text() {
+        let resolver: Arc<parking_lot::Mutex<Option<PvaLinkResolver>>> = Arc::default();
+        let installed = resolver.clone();
+        let (db, _) = IocBuilder::new()
+            .register_link_type("pva", move |db| {
+                let installed = installed.clone();
+                async move {
+                    *installed.lock() = Some(install_pvalink_resolver(&db).await);
+                    Vec::new()
+                }
+            })
+            .db_string(DB, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let cfg = PvaLinkConfig {
+            monitor: true,
+            ..PvaLinkConfig::defaults_for("AR:PV", LinkDirection::Inp)
+        };
+        let link = Arc::new(PvaLink::for_test(cfg.clone(), Some(alarmed("HIGH"))));
+        let resolver = resolver.lock().clone().expect("pva link type installed");
+        resolver.registry.insert_for_test(&cfg, link.clone());
+        db.ioc_init().await;
+
+        for rec in ["AR:AI", "AR:JSON"] {
+            assert_eq!(allocs(db.clone(), rec, 100, || ()), 0, "{rec} steady");
+            assert_eq!(alarm_of(&db, rec), ("2".into(), "HIGH".into()), "{rec}");
+        }
+        let changed = link.clone();
+        let one = allocs(db.clone(), "AR:AI", 1, move || {
+            changed.set_latest_for_test(alarmed("HIHI"));
+        });
+        assert_eq!(one, 1, "a new remote text is one allocation");
+        assert_eq!(alarm_of(&db, "AR:AI"), ("2".into(), "HIHI".into()));
+        assert_eq!(allocs(db.clone(), "AR:AI", 100, || ()), 0, "settled again");
     }
 }

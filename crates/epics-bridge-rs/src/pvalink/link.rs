@@ -295,7 +295,24 @@ pub struct PvaLink {
     /// `root[fieldName]` — each field root carries its own alarm, so each
     /// gets its own latch. An absent entry is the pvxs initial
     /// `INVALID_ALARM` / blank snapshot.
-    snap_alarm: Mutex<HashMap<String, (i32, String)>>,
+    snap_alarm: Mutex<HashMap<String, (i32, Arc<str>)>>,
+}
+
+/// The blank remote message, shared so a snapshot without one allocates
+/// nothing.
+fn no_text() -> Arc<str> {
+    static NONE: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from(""));
+    NONE.clone()
+}
+
+/// `text` as the `Arc<str>` a record's message store shares: `held` when it
+/// already says it, so only a changed remote message allocates.
+fn shared_text(held: Option<&Arc<str>>, text: &str) -> Arc<str> {
+    match held {
+        Some(held) if **held == *text => held.clone(),
+        _ if text.is_empty() => no_text(),
+        _ => Arc::from(text),
+    }
 }
 
 /// A queued OUT-link Put, preserving the caller's original value
@@ -672,14 +689,14 @@ impl PvaLink {
             if !self.is_connected() {
                 return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
             }
-            let cached = self.latest.lock().clone();
-            return match cached {
+            let cached = self.latest.lock();
+            return match cached.as_ref() {
                 Some(v) => {
                     // value-read latch: pvxs `pvaGetValue` copies the live
                     // `fld_severity` / `fld_message` into the snapshot on
                     // every connected read (`pvxs/ioc/pvalink_lset.cpp:412-422`).
-                    self.latch_alarm_snapshot(field, &v);
-                    Ok(select_link_value(&v, field).clone())
+                    self.latch_alarm_snapshot(field, v);
+                    Ok(select_link_value(v, field).clone())
                 }
                 // Connected flag set but the first event has not yet
                 // written `latest` (the callback stores the flag before
@@ -726,11 +743,12 @@ impl PvaLink {
         if !self.is_connected() {
             return None;
         }
-        let v = self.latest.lock().clone()?;
+        let cached = self.latest.lock();
+        let v = cached.as_ref()?;
         // value-read latch — same as `read_with_field` (pvxs
         // `pvaGetValue` snapshot, `pvxs/ioc/pvalink_lset.cpp:412-422`).
-        self.latch_alarm_snapshot(field, &v);
-        Some(read(select_link_value(&v, field)))
+        self.latch_alarm_snapshot(field, v);
+        Some(read(select_link_value(v, field)))
     }
 
     /// Convenience: read the value as f64.
@@ -1148,6 +1166,12 @@ impl PvaLink {
         }
     }
 
+    /// pvxs `pvaLink::valid`: connected, and a value has arrived
+    /// (`lchan->connected && lchan->root`, `pvalink_link.cpp:69-72`).
+    pub fn is_valid(&self) -> bool {
+        self.is_connected() && self.latest.lock().is_some()
+    }
+
     /// Raw remote NT `alarm.severity` of the latest cached value, read
     /// relative to the link's selected field root, in EPICS severity
     /// numbering (`0 = NO_ALARM` … `3 = INVALID`). `None` when no value
@@ -1160,8 +1184,8 @@ impl PvaLink {
     /// `pvxs/ioc/pvalink_lset.cpp:412-430`). `field=""` keeps the
     /// top-level root.
     fn remote_alarm_severity(&self, field: &str) -> Option<i32> {
-        let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = select_target(&v, field) else {
+        let cached = self.latest.lock();
+        let PvField::Structure(s) = select_target(cached.as_ref()?, field) else {
             return None;
         };
         let PvField::Structure(a) = s.get_field("alarm")? else {
@@ -1224,20 +1248,16 @@ impl PvaLink {
     /// exactly like pvxs `dbGetAlarm` before the first `dbGetLink`
     /// (`pvxs/test/testpvalink.cpp:373-375`). Called from the value-read
     /// path ([`Self::read_with_field`] / [`Self::try_read_cached_with_field`])
-    /// on a connected read. Reuses the existing key allocation in steady
-    /// state so a hot CP/CPP read does not allocate per process.
+    /// on a connected read. Reuses the existing key and the held message in
+    /// steady state, so a hot read allocates only when the remote message
+    /// text changes.
     fn latch_alarm_snapshot(&self, field: &str, value: &PvField) {
         let (severity, message) = Self::alarm_from_value(value, field);
         let mut g = self.snap_alarm.lock();
         match g.get_mut(field) {
-            // In place, so an unchanged or shorter message reuses the slot.
-            Some(slot) => {
-                slot.0 = severity;
-                slot.1.clear();
-                slot.1.push_str(&message);
-            }
+            Some(slot) => *slot = (severity, shared_text(Some(&slot.1), &message)),
             None => {
-                g.insert(field.to_string(), (severity, message.into_owned()));
+                g.insert(field.to_string(), (severity, shared_text(None, &message)));
             }
         }
     }
@@ -1285,7 +1305,7 @@ impl PvaLink {
             .lock()
             .get(field)
             .cloned()
-            .unwrap_or((INVALID_ALARM, String::new()));
+            .unwrap_or_else(|| (INVALID_ALARM, no_text()));
         Some(RemoteAlarm::from_severity_message(severity, message))
     }
 
@@ -1374,7 +1394,7 @@ impl PvaLink {
     /// When the remote NT structure has no `alarm.message` string but
     /// the severity does propagate, a synthetic message is returned so
     /// the alarm is still observable.
-    pub fn alarm_message(&self) -> Option<String> {
+    pub fn alarm_message(&self) -> Option<Arc<str>> {
         self.alarm_message_with(&self.config.field, self.config.sevr)
     }
 
@@ -1384,7 +1404,15 @@ impl PvaLink {
     /// same rationale as [`Self::link_alarm_severity_with`] —
     /// the alarm-message gate must use the caller's per-link `sevr`,
     /// not whichever cached link's mode happens to be shared.
-    pub fn alarm_message_with(&self, field: &str, sevr: super::config::SevrMode) -> Option<String> {
+    ///
+    /// The text is the snapshot's own `Arc` when the value read this cycle
+    /// latched the same message, so an alarmed link's steady cycle shares
+    /// it rather than allocating.
+    pub fn alarm_message_with(
+        &self,
+        field: &str,
+        sevr: super::config::SevrMode,
+    ) -> Option<Arc<str>> {
         // disconnect dominates — report the link failure,
         // not the stale remote alarm message. Pairs with the INVALID
         // severity `link_alarm_severity_with` returns for the same
@@ -1392,18 +1420,20 @@ impl PvaLink {
         // message rather than a misleading snapshot of the last remote
         // alarm string.
         if self.monitor_disconnected_stale() {
-            return Some("pvalink monitor disconnected".to_string());
+            static DISCONNECTED: std::sync::LazyLock<Arc<str>> =
+                std::sync::LazyLock::new(|| Arc::from("pvalink monitor disconnected"));
+            return Some(DISCONNECTED.clone());
         }
         // Severity gate first — NMS / sub-threshold links report
         // nothing.
-        let sev = self.link_alarm_severity_with(field, sevr)?;
-        let v = self.latest.lock().clone()?;
+        self.link_alarm_severity_with(field, sevr)?;
+        let cached = self.latest.lock();
         // Resolve the alarm string relative to the link's selected
         // field root, matching `remote_alarm_severity` — pvxs reads
         // `fld_message` from the same selected `root[fieldName]`
         // (`pvxs/ioc/pvalink_link.cpp:90-110`,
         // `pvxs/ioc/pvalink_lset.cpp:412-430`).
-        let PvField::Structure(s) = select_target(&v, field) else {
+        let PvField::Structure(s) = select_target(cached.as_ref()?, field) else {
             return None;
         };
         let msg = s.get_field("alarm").and_then(|alarm| {
@@ -1412,12 +1442,16 @@ impl PvaLink {
             };
             match a.get_field("message") {
                 Some(PvField::Scalar(ScalarValue::String(m))) if !m.is_empty() => {
-                    Some(m.to_string())
+                    Some(m.as_str_lossy())
                 }
                 _ => None,
             }
         });
-        Some(msg.unwrap_or_else(|| format!("remote severity {sev}")))
+        // No `alarm.message` leaves pvxs's `snap_message` empty
+        // (`pvalink_lset.cpp:423-427`).
+        let msg = msg?;
+        let held = self.snap_alarm.lock();
+        Some(shared_text(held.get(field).map(|(_, m)| m), &msg))
     }
 
     /// Latest cached NT value, if any. Returned as the raw [`PvField`]
@@ -1724,6 +1758,12 @@ impl PvaLink {
     #[cfg(test)]
     pub(crate) fn record_disconnect_time_for_test(&self, secs: i64, nsec: i32) {
         *self.disconnect_time.lock() = Some((secs, nsec));
+    }
+
+    /// Test-only: the monitor's delivery of `value`.
+    #[cfg(test)]
+    pub(crate) fn set_latest_for_test(&self, value: PvField) {
+        *self.latest.lock() = Some(Arc::new(value));
     }
 }
 
@@ -2610,7 +2650,7 @@ mod tests {
                 Some(nt_with_alarm(sev, Some("oops"))),
             );
             assert_eq!(link.link_alarm_severity(), Some(sev), "sev={sev}");
-            assert_eq!(link.alarm_message(), Some("oops".to_string()), "sev={sev}");
+            assert_eq!(link.alarm_message().as_deref(), Some("oops"), "sev={sev}");
         }
     }
 
@@ -2623,16 +2663,16 @@ mod tests {
         let invalid =
             PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(3, Some("dead"))));
         assert_eq!(invalid.link_alarm_severity(), Some(3));
-        assert_eq!(invalid.alarm_message(), Some("dead".to_string()));
+        assert_eq!(invalid.alarm_message().as_deref(), Some("dead"));
     }
 
     #[test]
-    fn b2_synthetic_message_when_no_alarm_message_field() {
+    fn b2_no_message_when_no_alarm_message_field() {
         // MS link, severity propagates, but the NT struct has no
-        // alarm.message — a synthetic message is returned.
+        // alarm.message — pvxs stores an empty snap_message.
         let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(2, None)));
         assert_eq!(link.link_alarm_severity(), Some(2));
-        assert_eq!(link.alarm_message(), Some("remote severity 2".to_string()));
+        assert_eq!(link.alarm_message(), None);
     }
 
     #[test]
@@ -2668,14 +2708,14 @@ mod tests {
         let pre = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(pre.severity, 3); // INVALID_ALARM
         assert_eq!(pre.status, 14); // LINK_ALARM
-        assert_eq!(pre.message, "");
+        assert_eq!(&*pre.message, "");
         // a value read latches the snapshot (pvxs pvaGetValue).
         assert!(link.try_read_cached_with_field("").is_some());
         // AFTER the read: remote MINOR(1) + LINK_ALARM(14) + message.
         let post = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(post.severity, 1);
         assert_eq!(post.status, 14); // LINK_ALARM
-        assert_eq!(post.message, "hi");
+        assert_eq!(&*post.message, "hi");
     }
 
     /// `MS` link with a remote MAJOR alarm: BOTH the gated owning-record
@@ -2694,7 +2734,7 @@ mod tests {
         let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(snap.severity, 2);
         assert_eq!(snap.status, 14); // LINK_ALARM
-        assert_eq!(snap.message, "oops");
+        assert_eq!(&*snap.message, "oops");
     }
 
     /// A NO_ALARM cached value yields a snapshot with severity 0, status
@@ -2713,7 +2753,7 @@ mod tests {
         let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(snap.severity, 0);
         assert_eq!(snap.status, 0); // NO_ALARM
-        assert_eq!(snap.message, "", "NO_ALARM snapshot carries no message");
+        assert_eq!(&*snap.message, "", "NO_ALARM snapshot carries no message");
     }
 
     /// CHECK_VALID: a disconnected-stale monitor link serves no snapshot

@@ -65,7 +65,7 @@ fn time_of(db: &PvDatabase, rec: &str) -> WallTime {
 }
 
 fn tse_of(db: &PvDatabase, rec: &str) -> i16 {
-    db.get_record(rec).unwrap().read().common.tse
+    db.get_record(rec).unwrap().read().common.tse()
 }
 
 /// `TSEL="TSP:SRC.TIME"` with `INPA="TSP:SRC.VAL PP"`: `fetch_values` restamps

@@ -151,6 +151,40 @@ pub fn register_device_menu(record_type: &str, menu: &'static [DevSup]) {
     publish_rows(record_type, menu);
 }
 
+/// The record types whose `.dbd` came with every `device()` line it has,
+/// none included: C's `devList`, known even when empty. Same publish rule as
+/// [`CONTRIBUTED`], for the same reader under the INP/OUT put hold.
+static DEVLIST_TYPES: AtomicPtr<Vec<&'static str>> = AtomicPtr::new(std::ptr::null_mut());
+
+fn devlist_types() -> &'static [&'static str] {
+    let types = DEVLIST_TYPES.load(Ordering::Acquire);
+    // SAFETY: a non-null pointer came from `Box::into_raw` and is never freed.
+    unsafe { types.as_ref() }.map_or(&[], Vec::as_slice)
+}
+
+/// [`register_device_menu`] for a record type a contributed `.dbd` declares,
+/// with all of that `.dbd`'s `device()` lines for it — `rows` may be empty,
+/// which says the type has no device support at all.
+pub fn register_dbd_devices(record_type: &'static str, rows: &'static [DevSup]) {
+    publish_rows(record_type, rows);
+    let _publish = PUBLISH.lock().expect("device-menu registry lock poisoned");
+    if devlist_types().contains(&record_type) {
+        return;
+    }
+    let mut next = devlist_types().to_vec();
+    next.push(record_type);
+    DEVLIST_TYPES.store(Box::into_raw(Box::new(next)), Ordering::Release);
+}
+
+/// C `ellCount(&rtyp->devList) == 0` where the port knows the whole list:
+/// base's declared types and the [`register_dbd_devices`] ones.
+pub(crate) fn has_no_device_support(record_type: &str) -> bool {
+    super::dbd_generated::device_menu(record_type).is_none()
+        && !has_contributed_device_menu(record_type)
+        && (super::dbd_generated::RECORD_TYPES.contains(&record_type)
+            || devlist_types().contains(&record_type))
+}
+
 /// The row a registered device support brings: appended to `record_type`'s
 /// menu unless the menu already lists its choice, so every support that can
 /// be bound is a `DTYP` choice by construction.

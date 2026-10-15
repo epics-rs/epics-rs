@@ -86,7 +86,7 @@ fn callback_dset(record_type: &str) -> Option<(&'static str, &'static str)> {
 /// `#C0 S0` hardware address — is one of C's other link types.
 fn pv_link_name(inp: &[u8]) -> Option<crate::types::RecordName> {
     match parse_link_v2(inp) {
-        ParsedLink::Db(link) => Some(link.pvname()),
+        ParsedLink::Db(link) => Some(link.pvname().clone()),
         ParsedLink::Ca(link) => Some(link.pv),
         _ => None,
     }

@@ -14,7 +14,7 @@ use crate::server::record::RecordCell;
 
 /// A record's index in the [`RecordTable`]: fixed at registration, never
 /// reused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RecordIdx(NonZeroU32);
 
 impl RecordIdx {

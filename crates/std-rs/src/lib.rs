@@ -83,9 +83,8 @@ pub fn register_std_dbd() {
     use records::dbd_generated::{DBD, RECORD_TYPES, devices};
     epics_base_rs::server::record::register_contributed_dbd(&DBD);
     for &record_type in RECORD_TYPES {
-        if let Some(rows) = devices(record_type) {
-            epics_base_rs::server::record::register_device_menu(record_type, rows);
-        }
+        let rows = devices(record_type).unwrap_or_default();
+        epics_base_rs::server::record::register_dbd_devices(record_type, rows);
     }
 }
 

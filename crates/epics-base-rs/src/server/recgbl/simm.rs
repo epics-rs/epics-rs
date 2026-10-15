@@ -195,6 +195,15 @@ pub fn has_const_lset(link: &crate::server::record::ParsedLink) -> bool {
     matches!(link, ParsedLink::None | ParsedLink::Constant(_))
 }
 
+/// Whether the link has no `lset`, so `dbTryGetLink` fails with
+/// `S_db_noLSET` (`dbLink.c:310-311`) and `dbGetLink` answers a silent -1
+/// (`dbLink.c:336-337`): a removed link, and a hardware link, which
+/// `dbInitLink` leaves without one (`dbLink.c:112-113`).
+pub fn has_no_lset(link: &crate::server::record::ParsedLink) -> bool {
+    use crate::server::record::ParsedLink;
+    matches!(link, ParsedLink::Removed(_) | ParsedLink::Hw(_))
+}
+
 /// The record types whose C `.dbd` declares `field(SSCN)` + `field(OLDSIMM)`
 /// and whose `special()` routes `SPC_MOD` on SIMM to
 /// `recGblSaveSimm`/`recGblCheckSimm` — i.e. the records that own a

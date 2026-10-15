@@ -737,7 +737,7 @@ fn describe(db: &PvDatabase, name: &str) -> String {
         inst.common.oldsimm,
         inst.common.sscn,
         inst.common.scan,
-        inst.common.tse,
+        inst.common.tse(),
         inst.common.time != crate::types::WallTime::UNIX_EPOCH,
     )
 }

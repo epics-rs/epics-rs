@@ -5,7 +5,7 @@ use crate::server::record::{AfterGate, PreparedCommonLink, PreparedLink, RecordI
 use crate::server::snapshot::Snapshot;
 use crate::types::{EpicsValue, PvString, RecordName};
 
-use super::PvDatabase;
+use super::{InFrame, PvDatabase};
 
 /// pvxs's `record._options.process` term (`ioc/iocsource.cpp:426-448`)
 /// as the database sees it: how much processing an EXTERNAL client put
@@ -1602,6 +1602,22 @@ fn dbput_post_put_field(
 pub(crate) enum PutSrc<'a> {
     Owned(EpicsValue),
     Value(&'a EpicsValue),
+    /// The writing record's numeric output, as C's
+    /// `dbPutLink(&prec->out, dbrType, &prec->oval, 1)` reads it. Built only
+    /// by [`Self::of_output`].
+    Num(crate::server::record::CycleValue),
+    /// The writing record's long string, C `dbPutLinkLS`'s source
+    /// (`lsoRecord.c:286`, `devLsoSoft.c:21`, `devPrintfSoft.c:19`). Built
+    /// only by [`Self::of_output`].
+    LongStr(crate::types::SharedArray<u8>),
+    /// The writing record's string output, read in place for the store.
+    /// `soft` takes the DTYP's soft dset value
+    /// ([`RecordInstance::soft_output_value`]) over the record's plain
+    /// output. Built only by [`Self::of_output`].
+    Field {
+        rec: InFrame<'a>,
+        soft: bool,
+    },
 }
 
 /// What [`PvDatabase::db_put_at`] stores: a [`PutSrc`], or C `dbPutLinkLS`'s
@@ -1627,25 +1643,52 @@ impl PutReq<'_> {
         }
     }
 
-    /// The request as one scalar element; `None` for an array or a value
-    /// with no numeric row.
+    /// The request as one scalar element; `None` for an array, a value
+    /// with no numeric row, or one still in its source record.
     fn element(&self) -> Option<crate::server::record::OutView<'_>> {
         use crate::server::record::OutView;
         match self {
             PutReq::Str(bytes) => Some(OutView::Str(bytes)),
-            PutReq::Src(src) => match src.value() {
+            PutReq::Src(PutSrc::Num(n)) => Some(OutView::Num(*n)),
+            PutReq::Src(src) => match src.value()? {
                 EpicsValue::String(s) => Some(OutView::Str(s.as_bytes())),
-                v => v.num().map(OutView::Num),
+                v => crate::server::record::CycleValue::from_epics(v).map(OutView::Num),
             },
         }
     }
 }
 
-impl PutSrc<'_> {
-    pub(crate) fn value(&self) -> &EpicsValue {
+impl<'a> PutSrc<'a> {
+    /// `rec`'s output as a put source: lent where it has a scalar view,
+    /// else the value itself. `None` when the record has nothing to write.
+    pub(crate) fn of_output(rec: InFrame<'a>, inst: &RecordInstance, soft: bool) -> Option<Self> {
+        use crate::server::record::OutView;
+        match output_view_of(inst, soft) {
+            Some(OutView::Num(n)) => Some(PutSrc::Num(n)),
+            Some(OutView::Str(_)) => Some(PutSrc::Field { rec, soft }),
+            Some(OutView::Chars(_)) => Some(match output_value_of(inst, soft)? {
+                EpicsValue::CharArray(c) => PutSrc::LongStr(c),
+                v => PutSrc::Owned(v),
+            }),
+            _ => output_value_of(inst, soft).map(PutSrc::Owned),
+        }
+    }
+
+    /// The value, unless it is still in the source record.
+    pub(crate) fn value(&self) -> Option<&EpicsValue> {
         match self {
-            PutSrc::Owned(v) => v,
-            PutSrc::Value(v) => v,
+            PutSrc::Owned(v) => Some(v),
+            PutSrc::Value(v) => Some(v),
+            PutSrc::Num(_) | PutSrc::LongStr(_) | PutSrc::Field { .. } => None,
+        }
+    }
+
+    /// The characters of a [`PutSrc::LongStr`].
+    #[inline(always)]
+    pub(crate) fn long_string(&self) -> Option<&crate::types::SharedArray<u8>> {
+        match self {
+            PutSrc::LongStr(c) => Some(c),
+            _ => None,
         }
     }
 
@@ -1653,7 +1696,91 @@ impl PutSrc<'_> {
         match self {
             PutSrc::Owned(v) => v,
             PutSrc::Value(v) => v.clone(),
+            PutSrc::Num(n) => n.into(),
+            PutSrc::LongStr(c) => EpicsValue::CharArray(c),
+            PutSrc::Field { rec, soft } => field_value(rec, soft),
         }
+    }
+}
+
+/// A [`PutSrc::Field`] materialised, for a route with no lean store.
+#[cold]
+#[inline(never)]
+fn field_value(rec: InFrame<'_>, soft: bool) -> EpicsValue {
+    output_value_of(&rec.read(), soft).expect("a record with an output view has its output value")
+}
+
+/// `dbPut` of a [`PutSrc::Field`] by the lean store: `None` when stored and
+/// posted, else the value the general arm takes. Out of line so the lent
+/// routes keep [`PvDatabase::db_put_at`]'s code as it was.
+#[inline(never)]
+fn put_lean_field(
+    source: InFrame<'_>,
+    soft: bool,
+    target: PutTarget<'_>,
+    held: Option<&super::SetGuard>,
+    origin: u64,
+) -> Option<EpicsValue> {
+    use crate::server::record::record_instance::PutFn;
+    let PutTarget { rec, field, at, .. } = target;
+    if !matches!(at.put(), PutFn::General) {
+        // Declared first: dropped, and delivered, after the target borrow.
+        let mut burst = PostBurst::new();
+        if let Some(mut instance) = store_lean_field(source, soft, rec, held, at.put()) {
+            finish_put(&mut instance, field, at, &None, origin, &mut burst);
+            return None;
+        }
+    }
+    Some(field_value(source, soft))
+}
+
+fn output_view_of(inst: &RecordInstance, soft: bool) -> Option<crate::server::record::OutView<'_>> {
+    if soft {
+        inst.soft_output_view().flatten()
+    } else {
+        inst.record.output_view()
+    }
+}
+
+fn output_value_of(inst: &RecordInstance, soft: bool) -> Option<EpicsValue> {
+    if soft {
+        inst.soft_output_value().flatten()
+    } else {
+        inst.record.output_link_value()
+    }
+}
+
+/// The lean store of a [`PutSrc::Field`], reading the source in place:
+/// `true` when stored. The string is lent across the store only into
+/// another record of the held set, so no source borrow meets a target
+/// borrow of its own cell or crosses an acquire (spec §1.4).
+#[inline(always)]
+fn store_lean_field<'r>(
+    source: InFrame<'_>,
+    soft: bool,
+    rec: &'r std::sync::Arc<crate::server::record::RecordCell>,
+    held: Option<&'r super::SetGuard>,
+    put: crate::server::record::record_instance::PutFn,
+) -> Option<crate::server::record::RecordMut<'r>> {
+    use crate::server::record::OutView;
+    let lent = source.read();
+    match output_view_of(&lent, soft) {
+        Some(OutView::Str(bytes)) if held.is_some_and(|h| h.holds(rec.lock_record())) => {
+            if std::sync::Arc::ptr_eq(source.unframed(), rec) {
+                // A self link: the string leaves the cell before it is written.
+                let mut copy = [0u8; 40];
+                let copy = copy.get_mut(..bytes.len())?;
+                copy.copy_from_slice(bytes);
+                drop(lent);
+                let mut instance = rec.write_under(held);
+                return store_lean_text(&mut *instance.record, put, copy).then_some(instance);
+            }
+            let mut instance = rec.write_under(held);
+            let stored = store_lean_text(&mut *instance.record, put, bytes);
+            drop(lent);
+            stored.then_some(instance)
+        }
+        _ => None,
     }
 }
 
@@ -1806,9 +1933,14 @@ fn store_lean(
     // store out of line.
     let bytes = match src {
         PutReq::Str(bytes) => *bytes,
+        PutReq::Src(PutSrc::Num(n)) => return store_lean_num(record, put, *n),
         PutReq::Src(src) => match src.value() {
-            EpicsValue::String(s) => s.as_bytes(),
-            v => return v.num().is_some_and(|n| store_lean_num(record, put, n)),
+            Some(EpicsValue::String(s)) => s.as_bytes(),
+            Some(v) => {
+                return crate::server::record::CycleValue::from_epics(v)
+                    .is_some_and(|n| store_lean_num(record, put, n));
+            }
+            None => return false,
         },
     };
     store_lean_text(record, put, bytes)
@@ -1861,7 +1993,8 @@ fn store_lean_parsed(
         return false;
     };
     match put_string("", target, text) {
-        Ok(Converted::Stored(v)) => v.num().is_some_and(|n| store_lean_num(record, put, n)),
+        Ok(Converted::Stored(v)) => crate::server::record::CycleValue::from_epics(&v)
+            .is_some_and(|n| store_lean_num(record, put, n)),
         Ok(Converted::Unchanged) => true,
         Err(_) => false,
     }
@@ -1871,7 +2004,7 @@ fn store_lean_parsed(
 fn store_lean_num(
     record: &mut dyn crate::server::record::Record,
     put: crate::server::record::record_instance::PutFn,
-    n: crate::types::Scalar,
+    n: crate::server::record::CycleValue,
 ) -> bool {
     use crate::server::record::SlotMut as M;
     use crate::server::record::record_instance::PutFn as F;
@@ -1899,7 +2032,7 @@ fn store_lean_num(
         F::I64(s) => store!(s, I64, to_i64),
         F::U64(s) => store!(s, U64, to_u64),
         F::Str { slot, cap } => {
-            let Some(text) = render_for_string_target(&*record, n) else {
+            let Some(text) = render_for_string_target(&*record, n.into()) else {
                 return false;
             };
             let text = text.as_bytes();
@@ -2635,6 +2768,14 @@ impl PvDatabase {
             field,
             at,
         } = target;
+        if let PutReq::Src(PutSrc::Field { rec: source, soft }) = src {
+            return match put_lean_field(source, soft, target, held, origin) {
+                Some(value) => {
+                    self.db_put_at(held, target, PutSrc::Owned(value).into(), origin, via, tail)
+                }
+                None => Ok(None),
+            };
+        }
         let mut burst = PostBurst::new();
         let mut instance = match &mut via {
             PutVia::DbPut => rec.write_under(held),
@@ -2659,6 +2800,11 @@ impl PvDatabase {
         }
 
         let value = src.into_value();
+        // `dbPutFieldLink`: the parses exist only for a link field's text.
+        let link_put = matches!(
+            &via,
+            PutVia::DbPutField { link, common, .. } if link.is_some() || common.is_some()
+        );
         // Refused before `dbPutSpecial(paddr, 0)` returns: neither pass runs.
         let pass0 = match &mut via {
             PutVia::DbPut => check_not_link_field(field, at.field().desc, &value, tail)
@@ -2736,6 +2882,9 @@ impl PvDatabase {
                 Ok(r) => common_result = r,
                 Err(e) => status = Err(e),
             }
+        }
+        if status.is_ok() && link_put {
+            self.open_put_link(&mut instance, field);
         }
         // What `special()` itself commits before any status diverts `dbPut`:
         // histogram SGNL's `add_count` alarm (`histogramRecord.c:329-334`,

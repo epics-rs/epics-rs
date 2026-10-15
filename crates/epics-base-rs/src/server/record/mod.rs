@@ -23,7 +23,7 @@ mod sparse_text;
 pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 pub(crate) use common_fields::StampBegun;
-pub use common_fields::{BkptFlag, CommonFields, CommonText, TimeLast};
+pub use common_fields::{BkptFlag, CommonFields, CommonText, StampMode, TimeLast};
 pub(crate) use constant_link::{constant_load_as, constant_load_scalar};
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use contributed_dbd::{ContributedDbd, register_contributed_dbd};
@@ -34,20 +34,22 @@ pub use declared_field_registry::{
     declared_field, declared_field_table, declared_fields, register_declared_fields,
 };
 pub use device_menu_registry::{
-    DevSup, Dset, register_device_menu, register_device_object_row, register_device_row,
+    DevSup, Dset, register_dbd_devices, register_device_menu, register_device_object_row,
+    register_device_row,
 };
 pub(crate) use device_menu_registry::{
     contributed_device_rows, dev_sup_of, device_menu_choices, has_contributed_device_menu,
-    has_device_object, merged_device_menu,
+    has_device_object, has_no_device_support, merged_device_menu,
 };
 pub use link::{
-    CaLink, CalcArg, CalcLink, ConstLoadError, ConstantLink, DbLink, DbLinkType, ExternalForward,
-    ForwardSlot, HwLink, HwLinkKind, JlinkValue, JsonLinkParse, LinkFieldType, LinkProcessPolicy,
-    LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaChannelLink, PvaJsonLink,
-    StateLink, StatePut, VxiAddr, ca_forward_flag, check_json_link_text, check_link_assignment,
-    check_link_text, declared_link_type, link_field_type, link_type_refusal, load_link_ls,
-    out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link_field, parse_link_v2,
-    parse_output_link_v2, pvajson_identity_key, pvajson_identity_parts,
+    CaLink, CalcArg, CalcLink, CalcVal, ConstLoadError, ConstantLink, DbLink, DbLinkType,
+    ExternalForward, ExternalRef, ForwardSlot, HwLink, HwLinkKind, JlinkValue, JsonLinkParse,
+    LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, OpenLatch,
+    PVAJSON_IDENTITY_SEP, ParsedLink, PvaChannelLink, PvaJsonLink, StateLink, StatePut, VxiAddr,
+    ca_forward_flag, check_json_link_text, check_link_assignment, check_link_text,
+    declared_link_type, link_field_type, link_type_refusal, load_link_ls, out_link_discards_cp,
+    parse_c_double, parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
+    pvajson_identity_key, pvajson_identity_parts,
 };
 pub(crate) use link::{
     DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif,
@@ -78,9 +80,9 @@ pub use record_trait::{
     ConstantInitLink, CycleCell, CycleHooks, CycleList, CycleMarks, CyclePostMask, CycleRead,
     CycleValue, DeadbandCells, DeclaredFields, DelayedCallbackOutcome,
     EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots, FORCE_GENERAL, FieldDeclaration, FieldDesc,
-    FieldMetadataOverride, FieldSlot, InputFetchPolicy, InputLinkRequest, LinkRead, LinkReadAs,
-    MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate, OutTarget, OutView, Pact,
-    PostName, PostTable, PostedValue, ProcessAction, ProcessActions, ProcessContext,
+    FieldMetadataOverride, FieldSlot, InitLinkReads, InputFetchPolicy, InputLinkRequest, LinkRead,
+    LinkReadAs, MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate, OutTarget, OutView,
+    Pact, PostName, PostTable, PostedValue, ProcessAction, ProcessActions, ProcessContext,
     ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks,
     SecondaryTake, SharedAfterWork, SimmCells, SlotMut, SlotRef, Special, SubroutineFn,
     ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
@@ -89,9 +91,10 @@ pub use record_trait::{
     monitor_deadband_classes, put_field_internal_default, put_value_in_field_shape,
     seed_input_links, uniform_post_table,
 };
+pub(crate) use record_trait::{InitGetFailure, InitRead};
 pub(crate) use record_trait::{
     SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, put_string_precision,
     seed_trackers_from_val, served_element_size,
 };
 pub use scan::{ScanList, ScanType, SimModeScan};
-pub use sparse_text::SparseText;
+pub use sparse_text::{AlarmText, SparseText};

@@ -3,8 +3,8 @@ use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     CycleHooks, CycleMarks, CyclePostMask, MENU_SIMM, ProcessOutcome, Record, uniform_post_table,
 };
+use crate::types::EpicsValue;
 use crate::types::PvString;
-use crate::types::{EpicsValue, Scalar};
 
 use super::mbbi_direct::BIT_NAMES;
 
@@ -173,7 +173,7 @@ impl Record for MbboDirectRecord {
     }
 
     fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
-        Some(OutView::Num(Scalar::Int((self.rval & self.mask).into())))
+        Some(OutView::Num(CycleValue::ULong(self.rval & self.mask)))
     }
 
     fn set_device_did_compute(&mut self, did: bool) {

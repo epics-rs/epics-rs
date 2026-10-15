@@ -26,13 +26,13 @@ pub struct ProcStack {
 
 /// A record cell's address, compared and never dereferenced. It stays unique
 /// while it is on the stack because the frame that claimed it holds the
-/// cell's `Arc` until it releases it.
+/// cell's `Arc` until it releases it. Non-zero, so `head` is one word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CellId(usize);
+struct CellId(std::num::NonZeroUsize);
 
 impl CellId {
     fn of(rec: &Arc<RecordCell>) -> Self {
-        CellId(Arc::as_ptr(rec) as usize)
+        CellId(std::ptr::NonNull::from(&**rec).addr())
     }
 }
 
@@ -59,7 +59,11 @@ impl ProcStack {
     /// Release what [`Self::claim`] took, on the frame's unwind.
     pub(crate) fn release(&mut self, rec: &Arc<RecordCell>) {
         let id = CellId::of(rec);
-        if let Some(i) = self.rest.iter().rposition(|n| *n == id) {
+        if self.rest.is_empty() {
+            if self.head == Some(id) {
+                self.head = None;
+            }
+        } else if let Some(i) = self.rest.iter().rposition(|n| *n == id) {
             self.rest.remove(i);
         } else if self.head == Some(id) {
             self.head = None;
@@ -555,7 +559,7 @@ impl AsyncDbHandle {
     /// Out-of-band field post under the caller's own event mask — see
     /// `PvDatabase::post_fields_with_mask`. Returns an empty `Vec` (no-op)
     /// if the database has been dropped.
-    pub fn post_fields_with_mask(
+    pub(crate) fn post_fields_with_mask(
         &self,
         name: impl AsRef<[u8]>,
         fields: Vec<(String, EpicsValue)>,
@@ -610,10 +614,10 @@ impl AsyncDbHandle {
                 if db.has_name_no_resolve(&target.target().record) {
                     return true;
                 }
-                db.external_put_admitted(target.pvname().as_bytes()).is_ok()
+                db.external_put_admitted(target.pvname()).is_ok()
             }
             other => match other.external_pv_name() {
-                Some(name) => db.external_put_admitted(&name).is_ok(),
+                Some(name) => db.external_put_admitted(name).is_ok(),
                 // Constant / empty: C's switch makes no put at all, so there is
                 // no status to read.
                 None => true,
@@ -1399,9 +1403,9 @@ impl InputLinkTexts {
                     .then(|| link.clone()),
                 // A dbCommon link (calcout's OUT) has its own cache, not a slot.
                 None => instance
-                    .stored_link(field)
-                    .filter(|link| !matches!(link, crate::server::record::ParsedLink::None))
-                    .map(|link| Arc::new(link.clone())),
+                    .stored_link_shared(field)
+                    .filter(|link| !matches!(***link, crate::server::record::ParsedLink::None))
+                    .map(Arc::clone),
             },
         }
     }
@@ -1484,10 +1488,10 @@ impl PvDatabase {
             alarm = None;
         }
         // C `dbGetLink` on failure: `recGblSetSevrMsg(LINK_ALARM)` — for the
-        // types whose fetch IS `dbGetLink`, and not for a link whose failure
-        // the type declares inert.
+        // types whose fetch IS `dbGetLink`, not for a link whose failure the
+        // type declares inert, and not for `S_db_noLSET` (`dbLink.c:335-336`).
         if read_failed && plan.multi_input_is_db_get_link && !link.failure_is_inert {
-            crate::server::recgbl::rec_gbl_set_link_alarm(common, link.link_field);
+            self.get_link_failed(common, link.parsed, link.link_field);
         }
         read_failed |= load_refused;
         // MS/NMS propagation from the source record, C `recGblInheritSevrMsg`
@@ -1976,26 +1980,6 @@ enum ProcessTarget<'a> {
     Resolved(&'a [u8], &'a Arc<RecordCell>),
 }
 
-/// The frame's record cell: borrowed from the caller's scan snapshot when the
-/// entry came resolved, owned when the frame looked it up — a sweep step
-/// otherwise pays an `Arc` refcount round trip per record per cycle for a
-/// cell the scan list already holds.
-enum FrameRec<'a> {
-    Borrowed(&'a Arc<RecordCell>),
-    Owned(Arc<RecordCell>),
-}
-
-impl std::ops::Deref for FrameRec<'_> {
-    type Target = Arc<RecordCell>;
-
-    fn deref(&self) -> &Arc<RecordCell> {
-        match self {
-            FrameRec::Borrowed(rec) => rec,
-            FrameRec::Owned(rec) => rec,
-        }
-    }
-}
-
 /// What the cycle prologue settled and [`PvDatabase::process_cycle`] consumes.
 struct CycleCtx<'c, 'a> {
     name: &'c [u8],
@@ -2155,7 +2139,7 @@ enum InpRead {
 fn pn_link(inp: &crate::server::record::ParsedLink) -> Option<crate::server::record::ParsedLink> {
     use crate::server::record::{DbLink, LinkProcessPolicy, ParsedLink};
     let (pv, ms) = match inp {
-        ParsedLink::Db(db) => (db.pvname(), db.monitor_switch),
+        ParsedLink::Db(db) => (db.pvname().clone(), db.monitor_switch),
         ParsedLink::Ca(ca) => (ca.pv.clone(), ca.monitor_switch),
         _ => return None,
     };
@@ -2305,15 +2289,22 @@ struct LinkInputs {
     dol_oif: i16,
     /// C's `if (status)` on the DOL read — kept past `dol_fetch`'s `take`.
     dol_read_failed: bool,
-    link_alarms: Vec<(
-        crate::server::record::MonitorSwitch,
-        super::links::LinkAlarm,
-    )>,
+    link_alarms: LinkAlarms,
     /// The reads only a closed-loop DOL, `sel`, a string-input type or `aSub`
     /// make. Boxed so the cycle that has none of them — every `ai` — drops
     /// one null pointer, not six owners.
     rare: Option<Box<RareInputs>>,
 }
+
+/// The input links' alarms a cycle folds under its hold, C's
+/// `recGblInheritSevrMsg` in each `dbGetLink`. Almost every alarmed cycle has
+/// one (its INP), held inline so an alarmed input allocates nothing.
+type LinkAlarms = smallvec::SmallVec<
+    [(
+        crate::server::record::MonitorSwitch,
+        super::links::LinkAlarm,
+    ); 1],
+>;
 
 /// See [`LinkInputs::rare`].
 struct RareInputs {
@@ -2348,7 +2339,7 @@ impl LinkInputs {
             dol_oif: 0,
             dol_read_failed: false,
             resolved_link_fields: Vec::new(),
-            link_alarms: Vec::new(),
+            link_alarms: LinkAlarms::new(),
         }
     }
 }
@@ -2604,7 +2595,7 @@ impl PvDatabase {
         // processes a link target under the lock set the caller already
         // owns, and re-acquiring would deadlock the non-reentrant gate.
         let record_gate = if acquire_gate {
-            FrameGate::Taken(self.lock_instance(&rec))
+            FrameGate::Taken(self.lock_instance(rec))
         } else {
             FrameGate::of_held(rec.lock_record())
         };
@@ -2637,7 +2628,7 @@ impl PvDatabase {
                 // C's `goto all_done`, which unwinds the same way the normal
                 // path does. `visited` was inserted by the prelude above and
                 // this frame owns it, so it comes out here as it would below.
-                visited.release(&rec);
+                visited.release(rec);
                 return Ok(());
             }
         }
@@ -2646,12 +2637,12 @@ impl PvDatabase {
         // live — see the module note on `process_record_with_links_body`.
         let result = self.process_record_with_links_body(
             name,
-            record_gate.frame(&rec),
+            record_gate.frame(rec),
             visited,
             is_continuation,
             device_callback,
         );
-        record_gate.frame(&rec).publish_hints();
+        record_gate.frame(rec).publish_hints();
 
         // Breakpoint auto-print, C `dbAccess.c:614-616` — after record
         // support, under the same `lset_stack_count` guard. Reloaded rather
@@ -2664,7 +2655,7 @@ impl PvDatabase {
         // The unwind. C `dbDbLink.c:521-526`, `if (claim_dst)
         // dbRec2Pvt(pdst)->procThread = NULL;` — after `dbProcess`, whatever
         // it returned.
-        visited.release(&rec);
+        visited.release(rec);
         result
     }
 
@@ -3165,7 +3156,7 @@ impl PvDatabase {
         let mut inst = rec.write();
         let mut written = Vec::with_capacity(post.writes.len());
         for (field, value) in post.writes {
-            inst.put_internal_field_of(&field, value, &mut links)?;
+            self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
             // Snapshot-cache contract: a metadata-class write must invalidate
             // the cache before the monitor snapshot below is built, or the
             // property event would carry the pre-change enum choices.
@@ -3228,7 +3219,7 @@ impl PvDatabase {
             if rule == PostRule::OnChange && inst.resolve_field(&field).as_ref() == Some(&value) {
                 continue;
             }
-            inst.put_internal_field_of(&field, value, &mut links)?;
+            self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
             // Snapshot-cache contract: a metadata-class write must
             // invalidate the cache before the monitor snapshot is built.
             inst.notify_field_written(&field);
@@ -3691,12 +3682,16 @@ impl PvDatabase {
     /// Every `Ok(None)` is built by [`Self::entry_did_not_run`], which is
     /// also where the put-notify wait-set is released, so a non-run cannot
     /// strand a CA `WRITE_NOTIFY`.
+    ///
+    /// A `Name` entry's lookup lands in the caller's `looked_up`, so both arms
+    /// hand the frame a plain borrow: a resolved sweep entry pays no refcount
+    /// and no per-use arm test.
     fn process_entry_prelude<'a>(
         &self,
         target: ProcessTarget<'a>,
-        looked_up: &'a mut Option<RecordName>,
+        looked_up: &'a mut Option<(RecordName, Arc<RecordCell>)>,
         visited: &mut ProcStack,
-    ) -> CaResult<Option<(&'a [u8], FrameRec<'a>)>> {
+    ) -> CaResult<Option<(&'a [u8], &'a Arc<RecordCell>)>> {
         // Normalise to the canonical record name once at entry — both
         // for cycle-detection (`visited` would otherwise treat alias
         // and canonical as distinct entries) and for the records-map
@@ -3713,9 +3708,12 @@ impl PvDatabase {
         // outlived its key answers `is_destroyed`; the body checks that under
         // the data lock it takes anyway and reports the record missing.
         let (name, rec) = match target {
-            ProcessTarget::Resolved(name, rec) => (name, FrameRec::Borrowed(rec)),
+            ProcessTarget::Resolved(name, rec) => (name, rec),
             ProcessTarget::Name(name) => match self.lookup_record(name) {
-                Some((name, rec)) => (&**looked_up.insert(name), FrameRec::Owned(rec)),
+                Some(found) => {
+                    let (name, rec) = looked_up.insert(found);
+                    (&**name, &*rec)
+                }
                 // Nothing is registered under the name — C `S_db_notFound`,
                 // which C reaches in `dbNameToAddr` before `dbProcess` is
                 // called at all. Answered BEFORE the marker goes in: this
@@ -3734,7 +3732,7 @@ impl PvDatabase {
             },
         };
 
-        if !visited.claim(&rec) {
+        if !visited.claim(rec) {
             // The name is already on the CURRENT STACK, so this is a genuine
             // cycle. C reaches the same decision through PACT: `processTarget`
             // forces `psrc->pact = TRUE` before it calls `dbProcess(pdst)`
@@ -3755,8 +3753,8 @@ impl PvDatabase {
             // its frame took its marker back out on unwind, so the diamond
             // processes twice exactly as C's unconditional
             // `dbProcess(pdst)` (`dbDbLink.c:512`) does.
-            self.with_frame(&rec, |frame| self.count_refused_active_entry(frame));
-            return self.entry_did_not_run(Some(&rec));
+            self.with_frame(rec, |frame| self.count_refused_active_entry(frame));
+            return self.entry_did_not_run(Some(rec));
         }
 
         Ok(Some((name, rec)))
@@ -3828,7 +3826,7 @@ impl PvDatabase {
     fn entry_did_not_run<'a>(
         &self,
         rec: Option<&Arc<RecordCell>>,
-    ) -> CaResult<Option<(&'a [u8], FrameRec<'a>)>> {
+    ) -> CaResult<Option<(&'a [u8], &'a Arc<RecordCell>)>> {
         if let Some(rec) = rec {
             let notify = {
                 let mut instance = rec.write();
@@ -3966,7 +3964,7 @@ impl PvDatabase {
     ) -> (super::TselStamp, SiolStamp) {
         let (link, own_tse) = {
             let instance = rec.read();
-            (Self::tsel_link(&instance), instance.common.tse)
+            (Self::tsel_link(&instance), instance.common.tse())
         };
         let tsel = match link {
             None => super::TselStamp::None,
@@ -3994,7 +3992,7 @@ impl PvDatabase {
             Some((time, utag)) => SiolStamp::From(time, utag),
             None => {
                 let pvname = match siol {
-                    crate::server::record::ParsedLink::Db(l) => l.pvname(),
+                    crate::server::record::ParsedLink::Db(l) => l.pvname().clone(),
                     crate::server::record::ParsedLink::Ca(ca) => ca.pv.clone(),
                     _ => crate::types::RecordName::from(""),
                 };
@@ -4050,8 +4048,9 @@ impl PvDatabase {
     /// decided under whatever guard the caller already holds. C `recGbl.c:315`
     /// wraps the whole TSEL read in `if (!dbLinkIsConstant(plink))`: a constant
     /// or unset TSEL is skipped outright and TSE keeps its own value.
-    fn tsel_link(instance: &RecordInstance) -> Option<crate::server::record::ParsedLink> {
-        (!instance.parsed_tsel.is_constant()).then(|| instance.parsed_tsel.clone())
+    fn tsel_link(instance: &RecordInstance) -> Option<Arc<crate::server::record::ParsedLink>> {
+        (instance.common.stamp_mode() == crate::server::record::StampMode::FromTsel)
+            .then(|| Arc::clone(instance.parsed_tsel.shared()))
     }
 
     /// The link half of [`Self::read_tsel`]. Takes other records' locks, so
@@ -4059,7 +4058,7 @@ impl PvDatabase {
     fn read_tsel_link(
         &self,
         rec: InFrame<'_>,
-        tsel_link: crate::server::record::ParsedLink,
+        tsel_link: Arc<crate::server::record::ParsedLink>,
     ) -> super::TselStamp {
         // A TSEL link pointing at a `.TIME` field copies that record's
         // timestamp+utag into `time`/`utag`, and the TSE→TIME half does not
@@ -4083,7 +4082,7 @@ impl PvDatabase {
         // leave that link as record `SRC.TIME[0]` with field `VAL`, which is
         // neither `.TIME` nor a record — the flag was never set and the
         // record stamped itself.
-        let tsel_is_time = match &tsel_link {
+        let tsel_is_time = match &*tsel_link {
             crate::server::record::ParsedLink::Db(link) => {
                 link.target().field.eq_ignore_ascii_case("TIME")
             }
@@ -4100,7 +4099,7 @@ impl PvDatabase {
             // DB-vs-CA decision (dbLink.c:115-118), so the link the
             // owner reads is the one addressing the source RECORD, not
             // its `.TIME` field.
-            let src_time = match &tsel_link {
+            let src_time = match &*tsel_link {
                 crate::server::record::ParsedLink::Db(_) => self.db_get_time_stamp_tag(&tsel_link),
                 crate::server::record::ParsedLink::Ca(ca) => match ca_tsel_time_record(&ca.pv) {
                     Some(rec_name) => self.db_get_time_stamp_tag(
@@ -4250,10 +4249,7 @@ impl PvDatabase {
         rec: InFrame<'_>,
         name: &[u8],
         visited: &mut ProcStack,
-        link_alarms: &mut Vec<(
-            crate::server::record::MonitorSwitch,
-            super::links::LinkAlarm,
-        )>,
+        link_alarms: &mut LinkAlarms,
     ) -> Vec<(String, EpicsValue)> {
         let link_info: Vec<(
             Arc<crate::server::record::ParsedLink>,
@@ -4366,7 +4362,8 @@ impl PvDatabase {
             // is CONSTANT, and a CONSTANT tsel is never loaded into TSE by
             // either — `recGbl.c:315` gates the `dbGetLink` on
             // `!dbLinkIsConstant` — so the two orders cannot disagree.
-            let wants_source_time = instance.common.tse == -2 && instance.parsed_tsel.is_constant();
+            let wants_source_time =
+                instance.common.stamp_mode() == crate::server::record::StampMode::DeviceTime;
 
             // DOL link info for the records that perform C's SCALAR
             // closed-loop DOL fetch. Which records those are is
@@ -4481,7 +4478,7 @@ impl PvDatabase {
                             visited,
                         );
                     }
-                    Some(instance.parsed_inp.clone())
+                    Some(instance.parsed_inp.shared().clone())
                 } else {
                     None
                 };
@@ -4646,7 +4643,7 @@ impl PvDatabase {
             {
                 match self.db_get_time_stamp_tag(inp_parsed) {
                     Some((t, tag))
-                        if matches!(inp_parsed, crate::server::record::ParsedLink::Calc(_)) =>
+                        if matches!(&**inp_parsed, crate::server::record::ParsedLink::Calc(_)) =>
                     {
                         (Some(t), Some(tag))
                     }
@@ -4696,9 +4693,11 @@ impl PvDatabase {
         // `pvxs/ioc/pvalink_lset.cpp:577-593`.
         let inp_link_remote_time: Option<(i64, i32, u64)> = inp
             .as_ref()
-            .filter(|inp_parsed| !matches!(inp_parsed, crate::server::record::ParsedLink::Db(_)))
+            .filter(|inp_parsed| {
+                !matches!(&***inp_parsed, crate::server::record::ParsedLink::Db(_))
+            })
             .and_then(|inp_parsed| inp_parsed.external_pv_name())
-            .and_then(|name| self.external_link_time(&name));
+            .and_then(|name| self.external_link_time(name));
 
         // Read DOL value. Through the input-fetch owner, so C's
         // `dbDbGetValue` inheritance tail runs on it like every other
@@ -4940,10 +4939,7 @@ impl PvDatabase {
         // `link_alarms` list the lock-section iterates over. Order doesn't
         // matter — `rec_gbl_set_sevr_msg` takes the maximum severity across
         // all sources.
-        let mut link_alarms: Vec<(
-            crate::server::record::MonitorSwitch,
-            super::links::LinkAlarm,
-        )> = Vec::new();
+        let mut link_alarms = LinkAlarms::new();
         if let Some(alarm) = inp_link_alarm {
             link_alarms.push(alarm);
         }
@@ -5177,7 +5173,7 @@ impl PvDatabase {
                 let sourced = !PLAIN && !instance.parsed_sdis.is_constant();
                 no_sim_pact_exit = instance.pact_exit_without_release();
                 (
-                    sourced.then(|| instance.parsed_sdis.clone()),
+                    sourced.then(|| Arc::clone(instance.parsed_sdis.shared())),
                     instance.common.disv,
                     instance.common.diss,
                     instance.common.disa,
@@ -5481,7 +5477,14 @@ impl PvDatabase {
         let stage_is_soft = stage_known || stage.is_soft;
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
-        let (flnk_name, process_actions, result_is_defer_output, restamps_after, posts) = 'epilogue: {
+        // The epilogue's results, each stored once by the arm that ends it
+        // rather than gathered into a tuple and moved out of the block.
+        let tail_flnk;
+        let tail_actions;
+        let tail_defers_output;
+        let tail_restamps;
+        let tail_posts;
+        'epilogue: {
             // One data guard for Segments A–E; each boundary below releases it
             // only across work that may lock another record.
             // Segment A (guarded): apply DOL/INP/multi-input values, run the
@@ -5684,7 +5687,8 @@ impl PvDatabase {
                             crate::server::record::AlarmSeverity::Invalid,
                         );
                     } else {
-                        crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "INP");
+                        let inst = &mut *instance;
+                        self.get_link_failed(&mut inst.common, &inst.parsed_inp, "INP");
                     }
                     // C's failure arm — `devAiSoft.c:92` drops the dset's
                     // "a read has completed" state so the next good reading is
@@ -6563,18 +6567,17 @@ impl PvDatabase {
                     let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
                     let snapshot = crate::server::record::ProcessSnapshot::new();
                     let posts = publish_cycle(instance, &snapshot, alarm_posts);
-                    break 'epilogue (
-                        // No forward link of EITHER kind: the comment above is
-                        // C's `return` before `recGblFwdLink`. The external
-                        // half used to escape it, because the tail re-derived
-                        // that half for itself out of the record instead of
-                        // taking the answer this arm hands it.
-                        crate::server::record::record_instance::ForwardTarget::None,
-                        crate::server::record::ProcessActions::new(),
-                        false,
-                        restamps_after,
-                        posts,
-                    );
+                    // No forward link of EITHER kind: the comment above is
+                    // C's `return` before `recGblFwdLink`. The external
+                    // half used to escape it, because the tail re-derived
+                    // that half for itself out of the record instead of
+                    // taking the answer this arm hands it.
+                    tail_flnk = crate::server::record::record_instance::ForwardTarget::None;
+                    tail_actions = crate::server::record::ProcessActions::new();
+                    tail_defers_output = false;
+                    tail_restamps = restamps_after;
+                    tail_posts = posts;
+                    break 'epilogue;
                 }
 
                 // **The IVOA owner** — the single site that decides what an INVALID
@@ -6824,7 +6827,7 @@ impl PvDatabase {
                             // soft OUT link (DB or external ca://`/`pva://`).
                             // Write OVAL to OUT when the record says should_output().
                             if record_should_output && instance.parsed_out.is_writable_out_link() {
-                                instance.record.output_link_value()
+                                super::PutSrc::of_output(rec, instance, false)
                             } else {
                                 None
                             }
@@ -6838,7 +6841,7 @@ impl PvDatabase {
                                 None
                             } else if instance.parsed_out.is_writable_out_link() {
                                 // Built only for an OUT link that will take it.
-                                instance.soft_output_value().flatten()
+                                super::PutSrc::of_output(rec, instance, true)
                             } else {
                                 None
                             }
@@ -6982,7 +6985,7 @@ impl PvDatabase {
                     field: "OUT",
                 };
                 if let Some((out, out_val)) = out_info {
-                    self.write_out(rec, out, super::PutSrc::Owned(out_val), src, visited);
+                    self.write_out(rec, out, out_val, src, visited);
                 }
                 // C `longoutRecord.c:492-493`, OUTSIDE `if (doDevSupWrite)`:
                 // the OOPT reference advances on a suppressed cycle too, which
@@ -6990,7 +6993,9 @@ impl PvDatabase {
                 if reached_conditional_write && plan.redecides_after_output {
                     rec.write().record.after_output_decision();
                 }
-                self.dispatch_multi_output_values(rec, src, skip_out, plan, visited);
+                if !skip_out && plan.dispatches_generic_multi_output {
+                    self.dispatch_multi_output_values(rec, src, skip_out, plan, visited);
+                }
                 // The multi-output records — dfanout `OUTn`, seq `LNKn`, fanout
                 // `LNKn` — dispatch HERE, with the record's other outputs, so
                 // the whole output stage sits between `checkAlarms` and the
@@ -7006,7 +7011,9 @@ impl PvDatabase {
                 } else {
                     super::links::MultiOutDispatch::default()
                 };
-                self.write_simulated_output_siol(rec, &sim_output, skip_out, src, visited);
+                if sim_output.is_some() {
+                    self.write_simulated_output_siol(rec, &sim_output, skip_out, src, visited);
+                }
                 if let Some(link_writes) = link_writes {
                     self.execute_process_actions_in(name, rec, link_writes, visited);
                 }
@@ -7042,7 +7049,7 @@ impl PvDatabase {
             }
 
             // Segment E (guarded): commit alarms, build the snapshot, resolve the
-            // FLNK target, and yield the `'epilogue` tuple. Re-acquire the data lock.
+            // FLNK target, and store the epilogue's results. Re-acquire the data lock.
             let instance = guard.hold();
             if let Some((stat, sevr)) = push_alarm {
                 crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
@@ -7073,16 +7080,12 @@ impl PvDatabase {
             // at the tail.
 
             // 3. Notify subscribers, still under the segment's own guard.
-            let posts = publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
-
-            (
-                flnk_name,
-                process_actions,
-                result_is_defer_output,
-                restamps_after,
-                posts,
-            )
-        };
+            tail_posts = publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
+            tail_flnk = flnk_name;
+            tail_actions = process_actions;
+            tail_defers_output = result_is_defer_output;
+            tail_restamps = restamps_after;
+        }
 
         // C `swaitRecord.c::process` (lines 425-481): `schedOutput` armed the
         // ODLY watchdog (`async=TRUE`), so `process` ran `monitor()` — the
@@ -7091,7 +7094,7 @@ impl PvDatabase {
         // pact=FALSE;}` tail. The OUT write / OEVT are already gated out this
         // cycle by `should_output()==false`; `recGblFwdLink` is NOT
         // should_output-gated, so the forward-link tail below is skipped when
-        // deferring (`result_is_defer_output`). The deferred `execOutput` — the
+        // deferring (`tail_defers_output`). The deferred `execOutput` — the
         // scheduled `ReprocessAfter` reprocess at delay-END — runs the OUT write
         // + OEVT + FLNK. Hold PACT across the wait so a foreign `dbProcess` bails
         // at the entry guard (C keeps the record ACTIVE on the watchdog,
@@ -7104,8 +7107,8 @@ impl PvDatabase {
         // stack in the deep-chain tests).
         // Holding `processing=true` also makes the tail's putf-clear (gated on
         // `!is_processing()`) a no-op, leaving putf for the continuation.
-        if result_is_defer_output {
-            let holds_pact_until_continuation = process_actions
+        if tail_defers_output {
+            let holds_pact_until_continuation = tail_actions
                 .iter()
                 .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
             if holds_pact_until_continuation {
@@ -7123,12 +7126,15 @@ impl PvDatabase {
         // and `recGblFwdLink` runs only at delay-END (C `execOutput`) — the
         // continuation drives the whole tail. The deferred-actions site below
         // still runs (it dispatches this cycle's `ReprocessAfter`).
-        if !result_is_defer_output {
+        if !tail_defers_output {
             self.run_forward_link_tail_with_putf(
                 name,
                 guard,
-                &flnk_name,
-                TailCtx { posts, plan },
+                &tail_flnk,
+                TailCtx {
+                    posts: tail_posts,
+                    plan,
+                },
                 visited,
             );
         }
@@ -7141,7 +7147,7 @@ impl PvDatabase {
         // BUSY post (sseq's out-of-band `post_fields`) and the next cycle. Soft
         // record (no device support), so `apply_timestamp` resolves TSE→TIME
         // the same as the pre-output site it replaces.
-        if restamps_after {
+        if tail_restamps {
             // Its own TSEL read, not the one Segment C took: C's stamp here is
             // a whole `recGblGetTimeStamp` running AFTER `recGblFwdLink`, so a
             // `.TIME` TSEL adopts whatever the forward-link chain just did to
@@ -7158,9 +7164,9 @@ impl PvDatabase {
         // output (C `transformRecord.c:605-621` / `scalerRecord.c:457-480`
         // put before `monitor()` + `recGblFwdLink()`), so a downstream FLNK
         // target still reads the freshly written value.
-        if !process_actions.is_empty() {
+        if !tail_actions.is_empty() {
             guard.release();
-            self.execute_process_actions_in(name, rec, process_actions, visited);
+            self.execute_process_actions_in(name, rec, tail_actions, visited);
         }
 
         // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
@@ -7456,12 +7462,17 @@ impl PvDatabase {
     pub(super) fn scan_forward_external(&self, rec: InFrame<'_>, link: ForwardLink) {
         let failed = {
             let instance = rec.read();
-            let link = match link {
-                ForwardLink::Flnk => instance.flnk(),
-                ForwardLink::Row(i) => instance.out_row_link(i),
+            let (field, link) = match link {
+                ForwardLink::Flnk => ("FLNK", instance.flnk()),
+                ForwardLink::Row(i) => (instance.out_row_field(i), &**instance.out_row_link(i)),
+            };
+            let id = super::LinkId {
+                rec: rec.unframed().index(),
+                field,
+                install: super::LinkInstall::of_field(&instance, field),
             };
             link.external_forward()
-                .is_some_and(|fwd| self.scan_forward_external_pv(fwd).is_err())
+                .is_some_and(|fwd| self.scan_forward_external_pv(id, fwd).is_err())
         };
         if failed {
             let mut instance = rec.write();
@@ -7604,7 +7615,7 @@ impl PvDatabase {
                 self.input_link_inheritance(rec, &parsed, source_alarm),
             ),
             LinkFetch::Failed => {
-                db_get_link_failed(rec, link_field, &parsed);
+                self.db_get_link_failed(rec, link_field, &parsed);
                 InputFetch::Failed
             }
         }
@@ -7715,10 +7726,10 @@ impl PvDatabase {
     /// resolves to [`OutTarget::UNRESOLVED`](crate::server::record::OutTarget::UNRESOLVED) and the record sees "no target",
     /// which is the answer C's `default:` arm acts on.
     fn resolve_out_target_into_record(&self, rec: InFrame<'_>, link_field: &'static str) {
-        let parsed = rec.read().stored_link(link_field).cloned();
+        let parsed = rec.read().stored_link_shared(link_field).cloned();
         let target = self.resolve_out_target(
             parsed
-                .as_ref()
+                .as_deref()
                 .unwrap_or(&crate::server::record::ParsedLink::None),
         );
         rec.write()
@@ -8240,7 +8251,7 @@ impl PvDatabase {
                 let can_dev_write = rec.process_plan().can_device_write;
                 // Same single owner of the DTYP -> soft dset mapping as the
                 // synchronous OUT stage (`RecordInstance::soft_output_value`).
-                let soft_out = instance.soft_output_value();
+                let soft_out = instance.has_soft_output();
                 let record_should_output = instance.should_output();
                 let out_value = if skip_out {
                     None
@@ -8248,13 +8259,13 @@ impl PvDatabase {
                     // Non-output records (calcout, etc.) with soft OUT link
                     // (DB or external `ca://`/`pva://`).
                     if record_should_output && instance.parsed_out.is_writable_out_link() {
-                        instance.record.output_link_value()
+                        super::PutSrc::of_output(rec, &instance, false)
                     } else {
                         None
                     }
-                } else if let Some(out_val) = soft_out {
+                } else if soft_out {
                     if instance.parsed_out.is_writable_out_link() {
-                        out_val
+                        super::PutSrc::of_output(rec, &instance, true)
                     } else {
                         None
                     }
@@ -8287,7 +8298,7 @@ impl PvDatabase {
                 field: "OUT",
             };
             if let Some((out, out_val)) = out_info {
-                self.write_out(rec, out, super::PutSrc::Owned(out_val), src, visited);
+                self.write_out(rec, out, out_val, src, visited);
             }
             // Same `conditional_write` epilogue as the synchronous stage. C
             // runs it on the async device's first pass as well (the record
@@ -8624,15 +8635,16 @@ impl PvDatabase {
                     .record
                     .get_field("RVAL")
                     .or_else(|| instance.record.val())
+                    .map(super::PutSrc::Owned)
             } else {
-                instance.record.output_link_value()
+                super::PutSrc::of_output(rec, &instance, false)
             }
         };
         if let Some(value) = value {
             self.write_out_link_value(
                 rec,
                 Arc::clone(siol),
-                super::PutSrc::Owned(value),
+                value,
                 super::links::OutLinkSrc {
                     field: "SIOL",
                     ..src
@@ -8764,9 +8776,21 @@ impl PvDatabase {
     ) {
         let (fetch, render) = self.db_try_get_link_rendered(reader, link, render);
         if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
-            db_get_link_failed(reader, link_field, link);
+            self.db_get_link_failed(reader, link_field, link);
         }
         (fetch, render)
+    }
+
+    /// [`Self::get_link_failed`] on `rec`'s own pending alarm.
+    #[cold]
+    fn db_get_link_failed(
+        &self,
+        rec: InFrame<'_>,
+        link_field: &'static str,
+        link: &crate::server::record::ParsedLink,
+    ) {
+        let mut instance = rec.write();
+        self.get_link_failed(&mut instance.common, link, link_field);
     }
 
     /// [`Self::db_get_link_in`] for an INPUT link — same classification, same
@@ -8969,7 +8993,7 @@ impl PvDatabase {
         let (fetch, alarm, store_raw) =
             self.db_try_get_link_deferred(rec, link_field, link, target, request);
         if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
-            db_get_link_failed(rec, link_field, link);
+            self.db_get_link_failed(rec, link_field, link);
         }
         (fetch, alarm, store_raw)
     }
@@ -9172,7 +9196,7 @@ impl PvDatabase {
                     // `busyRecord.c:399`, `swaitRecord.c:402` and
                     // `mcaRecord.c:1106` read SIML with a plain `dbGetLink`.
                     drop(instance);
-                    db_get_link_failed(rec, "SIML", siml);
+                    self.db_get_link_failed(rec, "SIML", siml);
                 } else {
                     // `recGblGetSimm` (recGbl.c:453-454):
                     //     if (status && !pcommon->nsev) pcommon->nsta = LINK_ALARM;
@@ -9180,6 +9204,9 @@ impl PvDatabase {
                     // DIRECT write of `nsta` — NOT `recGblSetSevr`. So the record
                     // publishes STAT=LINK_ALARM with SEVR still NO_ALARM. That
                     // asymmetry is C's, quirk and all; reproduce it exactly.
+                    // The lset's own message comes first, from inside
+                    // `dbTryGetLink`, and leaves `nsev` raised.
+                    self.lset_get_failed(&mut instance.common, siml, "SIML");
                     if instance.common.nsev == crate::server::record::AlarmSeverity::NoAlarm {
                         instance.common.nsta = crate::server::recgbl::alarm_status::LINK_ALARM;
                     }
@@ -10398,20 +10425,6 @@ impl Drop for CycleEndGuard<'_> {
             }
         }
     }
-}
-
-/// C `dbGetLink`'s failure tail (`dbLink.c:335-339`): a link with no lset is a
-/// silent -1, any other failed read `setLinkAlarm`.
-fn db_get_link_failed(
-    rec: InFrame<'_>,
-    link_field: &'static str,
-    link: &crate::server::record::ParsedLink,
-) {
-    if matches!(link, crate::server::record::ParsedLink::Removed(_)) {
-        return;
-    }
-    let mut instance = rec.write();
-    crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
 }
 
 /// C `CA_DBPROCESS` in one link's `pca->link_action` (`dbCa.c:132-161`):

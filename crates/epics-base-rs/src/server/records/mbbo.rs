@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{EpicsValue, PvString, Scalar};
+use crate::types::{EpicsValue, PvString};
 
 /// Multi-bit binary output record — manual Record impl for raw↔index conversion.
 pub struct MbboRecord {
@@ -539,7 +539,7 @@ impl Record for MbboRecord {
     }
 
     fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
-        Some(OutView::Num(Scalar::Int((self.rval & self.mask).into())))
+        Some(OutView::Num(CycleValue::ULong(self.rval & self.mask)))
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboRecord.dbd.pod:673-677`):

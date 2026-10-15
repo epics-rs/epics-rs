@@ -355,3 +355,30 @@ async fn a_refused_link_leaves_no_stale_classification_behind() {
         "OUTV must be Constant — calcout captures the common OUT in init_links"
     );
 }
+
+/// A record type with no `device()` line has no `devSup`, so its INP/OUT
+/// expects CONSTANT as every other link field does (`dbStaticLib.c:2187-2193`).
+/// The C `softIoc` on `record(compress,"T:C1"){ field(INP,"@instio parm") }`:
+///
+/// ```text
+/// ERROR: T:C1.INP: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_device_link_of_a_type_without_device_support_is_held_to_constant() {
+    let line = link_type_refusal("T:C1", "compress", None, "INP", "@instio parm")
+        .expect("compress has no device support: C refuses a hardware INP");
+    assert_eq!(
+        line,
+        "T:C1.INP: can't initialize link type CONSTANT with \"@instio parm\" (type INST_IO)"
+    );
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            "record(compress, \"T:C1\") {\n    field(INP, \"@instio parm\")\n}\n",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(db.get_record("T:C1").unwrap().read().common.text.inp, "");
+}

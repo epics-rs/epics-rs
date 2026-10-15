@@ -246,12 +246,12 @@ pub fn rec_gbl_set_sevr_msg(
     common: &mut CommonFields,
     stat: u16,
     sevr: AlarmSeverity,
-    msg: impl Into<SparseText>,
+    msg: impl crate::server::record::AlarmText,
 ) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
-        common.namsg = msg.into();
+        msg.store_into(&mut common.namsg);
         return true;
     }
     false

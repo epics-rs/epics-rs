@@ -306,10 +306,12 @@ pub(crate) struct LogHead {
 
 /// `amsg` as a log holds it: NUL-terminated, cut to `AMSG_SIZE - 1` bytes on
 /// a char boundary (`strncpy` + `pbuffer[DB_AMSG_SIZE-1] = '\0'`,
-/// `dbAccess.c:368-373`). A prefix and a remainder, as
+/// `dbAccess.c:368-373`). A prefix, a middle and a suffix, as
 /// [`SparseText`](crate::server::record::SparseText) holds a link failure's
-/// `"field %s"` without rendering it.
-pub(crate) fn log_amsg((prefix, text): (&'static str, &str)) -> [u8; AMSG_SIZE] {
+/// `"field %s"` or `"%s Disconn"` without rendering it.
+pub(crate) fn log_amsg(
+    (prefix, text, suffix): (&'static str, &str, &'static str),
+) -> [u8; AMSG_SIZE] {
     let mut amsg = [0u8; AMSG_SIZE];
     // C copies the rendered amsg once per log. The prefix is SparseText's
     // short ASCII constant, stored bytewise, so `text` is the one copy, and
@@ -325,8 +327,29 @@ pub(crate) fn log_amsg((prefix, text): (&'static str, &str)) -> [u8; AMSG_SIZE] 
     }
     if n != 0 {
         amsg[at..at + n].copy_from_slice(&text.as_bytes()[..n]);
+        at += n;
+    }
+    for (slot, byte) in amsg[at..AMSG_SIZE - 1].iter_mut().zip(suffix.bytes()) {
+        *slot = byte;
     }
     amsg
+}
+
+/// [`log_amsg`] of a record's `amsg`, which almost every post finds absent:
+/// only that test is inline, as in `SparseText`'s drop. Inline, the
+/// three-part render merged into the absent path at every post.
+#[inline(always)]
+pub(crate) fn log_record_amsg(amsg: &crate::server::record::SparseText) -> [u8; AMSG_SIZE] {
+    if amsg.is_empty() {
+        return [0; AMSG_SIZE];
+    }
+    log_present_amsg(amsg)
+}
+
+#[cold]
+#[inline(never)]
+fn log_present_amsg(amsg: &crate::server::record::SparseText) -> [u8; AMSG_SIZE] {
+    log_amsg(amsg.parts())
 }
 
 impl LogHead {
@@ -334,7 +357,7 @@ impl LogHead {
         Self {
             stat: snapshot.alarm.status,
             sevr: snapshot.alarm.severity,
-            amsg: log_amsg(("", &snapshot.alarm.amsg)),
+            amsg: log_amsg(("", &snapshot.alarm.amsg, "")),
             time: snapshot.timestamp,
             utag: snapshot.user_tag,
         }
@@ -1596,7 +1619,7 @@ impl Drop for PvSubscription {
 mod log_amsg_tests {
     use super::*;
 
-    fn logged(parts: (&'static str, &str)) -> String {
+    fn logged(parts: (&'static str, &str, &'static str)) -> String {
         let head = LogHead {
             stat: 0,
             sevr: 0,
@@ -1614,14 +1637,20 @@ mod log_amsg_tests {
     #[test]
     fn a_long_amsg_is_cut_to_39_bytes_on_a_char_boundary() {
         let a41 = "a".repeat(41);
-        assert_eq!(logged(("", &a41)), a41[..39]);
+        assert_eq!(logged(("", &a41, "")), a41[..39]);
         // `é` would take bytes 39 and 40: the cut drops it whole.
         let a38 = "a".repeat(38);
-        assert_eq!(logged(("", &format!("{a38}é"))), a38);
-        assert_eq!(logged(("", "")), "");
+        assert_eq!(logged(("", &format!("{a38}é"), "")), a38);
+        assert_eq!(logged(("", "", "")), "");
         let name = "N".repeat(40);
-        assert_eq!(logged(("field ", &name)), format!("field {}", &name[..33]));
-        assert_eq!(logged(("field ", "")), "field ");
+        assert_eq!(
+            logged(("field ", &name, "")),
+            format!("field {}", &name[..33])
+        );
+        assert_eq!(logged(("field ", "", "")), "field ");
+        assert_eq!(logged(("", "INP", " Disconn")), "INP Disconn");
+        let n35 = "N".repeat(35);
+        assert_eq!(logged(("", &n35, " Disconn")), format!("{n35} Dis"));
     }
 }
 

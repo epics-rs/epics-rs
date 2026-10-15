@@ -350,8 +350,18 @@ pub struct RemoteAlarm {
     pub status: i32,
     /// Remote `alarm.message`. Empty when the remote carried none or
     /// the severity is `NO_ALARM` (pvxs clears `snap_message` unless
-    /// `snap_severity != 0` — `pvxs/ioc/pvalink_lset.cpp:418-422`).
-    pub message: String,
+    /// `snap_severity != 0` — `pvxs/ioc/pvalink_lset.cpp:418-422`). Shared
+    /// with the lset's cache, as [`LinkSet::alarm_message`].
+    pub message: Arc<str>,
+}
+
+/// What an lset's [`LinkSet::open_link`] left the link with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkOpen {
+    /// The lset serves the link.
+    Lset,
+    /// The lset set `plink->lset = NULL` (`pvalink_lset.cpp:70-75`).
+    NoLset,
 }
 
 impl RemoteAlarm {
@@ -359,7 +369,7 @@ impl RemoteAlarm {
     /// exactly as pvxs `pvaGetAlarmMsg` (`pvxs/ioc/pvalink_lset.cpp:554`):
     /// `LINK_ALARM` when the remote severity is non-`NO_ALARM`, else
     /// `NO_ALARM`. status and severity cannot disagree by construction.
-    pub fn from_severity_message(severity: i32, message: String) -> Self {
+    pub fn from_severity_message(severity: i32, message: Arc<str>) -> Self {
         let status = if severity != 0 {
             crate::server::recgbl::alarm_status::LINK_ALARM as i32
         } else {
@@ -441,6 +451,39 @@ pub trait LinkSet: Send + Sync {
     fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
         let _ = name;
         None
+    }
+
+    /// Whether this lset's `getValue` raised `"<field> Disconn"` on the
+    /// reading record when its read of `name` failed, as pvalink's
+    /// `pvaGetValue` does on a link that is not valid
+    /// (`pvalink_lset.cpp:263-268`) — before `dbGetLink`'s `setLinkAlarm`,
+    /// whose equal severity then leaves the message alone (`recGbl.c:242`).
+    /// Asked only after a failed read; MUST NOT perform I/O.
+    ///
+    /// Default `false`: `dbCaGetLink` raises nothing itself
+    /// (`dbCa.c:459-463`).
+    fn get_failure_disconn(&self, name: &[u8]) -> bool {
+        let _ = name;
+        false
+    }
+
+    /// C `lset->openLink` (`dbLink.c:194-199`, from `dbJLinkInit`,
+    /// `dbJLink.c:459`): where the lset settles what `name` is, asked of a
+    /// link naming this lset's scheme (`pva://`, `{pva:…}`), once per
+    /// link at iocInit (`doResolveLinks`, ahead of `init_record` pass 1,
+    /// `iocInit.c:576-577`) and once per put of the link, under the put's
+    /// hold where `dbPutFieldLink` runs `dbAddLink` (`dbAccess.c:1208`).
+    /// Synchronous and MUST NOT perform I/O; it may allocate and post to
+    /// errlog, as pvalink's open does (`pvalink_lset.cpp:64-75`).
+    /// [`LinkOpen::NoLset`] leaves the link [`ParsedLink::Removed`], which
+    /// every path treats as C treats `plink->lset == NULL` (`dbLink.c:224`,
+    /// `:336`, `:440`, `:479`). A local-PV test answers through
+    /// [`PvDatabase::has_name_no_resolve`](super::PvDatabase::has_name_no_resolve).
+    ///
+    /// [`ParsedLink::Removed`]: crate::server::record::ParsedLink::Removed
+    fn open_link(&self, name: &[u8]) -> LinkOpen {
+        let _ = name;
+        LinkOpen::Lset
     }
 
     /// Open (subscribe / connect) `name` so later
@@ -550,7 +593,13 @@ pub trait LinkSet: Send + Sync {
 
     /// Most recent alarm message string from the upstream PV, when
     /// available. None means no alarm or no cache.
-    fn alarm_message(&self, _name: &[u8]) -> Option<String> {
+    ///
+    /// The lset hands out the text it cached when the remote value arrived:
+    /// an alarmed link's every cycle stores it into the record's `namsg`
+    /// (`recGblSetSevrMsg`, `pvalink_lset.cpp:432-434`), and a shared text
+    /// makes that store a pointer compare. A new text is allocated once per
+    /// change of the remote message, never per call.
+    fn alarm_message(&self, _name: &[u8]) -> Option<Arc<str>> {
         None
     }
 
@@ -697,7 +746,16 @@ impl LinkSetRegistry {
     /// Look up the lset for `scheme`. Returns `None` when nothing is
     /// registered under that scheme.
     pub fn get(&self, scheme: &str) -> Option<DynLinkSet> {
-        self.inner.get(scheme).cloned()
+        self.get_ref(scheme).cloned()
+    }
+
+    pub(crate) fn get_ref(&self, scheme: &str) -> Option<&DynLinkSet> {
+        self.inner.get(scheme)
+    }
+
+    /// Every registered lset, in [`Self::schemes`] order.
+    pub(crate) fn link_sets(&self) -> impl Iterator<Item = &DynLinkSet> {
+        self.inner.values()
     }
 
     /// Names of every registered scheme (`["pva", "ca", ...]`).

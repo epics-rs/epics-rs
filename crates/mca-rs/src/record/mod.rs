@@ -1162,10 +1162,9 @@ mod tests {
     /// `Default` is `udf = true` (the state a record is loaded in), which no
     /// record reaches this hook in.
     fn defined() -> CommonFields {
-        CommonFields {
-            udf: 0,
-            ..Default::default()
-        }
+        let mut common = CommonFields::default();
+        common.udf = 0;
+        common
     }
 
     fn status(acquiring: bool) -> McaStatus {
@@ -1629,10 +1628,8 @@ mod tests {
             hhsv: AlarmSeverity::Major as u16,
             ..Default::default()
         };
-        let mut common = CommonFields {
-            udf: 1,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 1;
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
         assert_eq!(rec.lalm, 0.0, "and the latch is not moved");

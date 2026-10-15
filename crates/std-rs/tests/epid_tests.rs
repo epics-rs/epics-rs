@@ -6,10 +6,9 @@ use std_rs::EpidRecord;
 
 /// The limit checks run only past `epidRecord.c:309`'s `udf == TRUE` return.
 fn defined_common() -> CommonFields {
-    CommonFields {
-        udf: 0,
-        ..CommonFields::default()
-    }
+    let mut common = CommonFields::default();
+    common.udf = 0;
+    common
 }
 use std_rs::device_support::epid_soft::EpidSoftDeviceSupport;
 

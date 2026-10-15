@@ -11,7 +11,7 @@ use crate::server::record::{
     RecordProcessResult,
 };
 use crate::types::PvString;
-use crate::types::{EpicsValue, Scalar, c_cast};
+use crate::types::{EpicsValue, c_cast};
 
 /// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
 /// (`INAV`..`INLV`), then `DOLV`, then `OUTV`. C keeps the statuses in one
@@ -921,7 +921,7 @@ impl Record for SwaitRecord {
     /// The same value; swait's OVAL is "Old Value", so the default view over
     /// OVAL would be wrong.
     fn output_view(&self) -> Option<OutView<'_>> {
-        Some(OutView::Num(Scalar::Float(self.out_value())))
+        Some(OutView::Num(CycleValue::Double(self.out_value())))
     }
 
     /// DOL is read at OUTPUT time, and only under DOPT="Use DOL" — C

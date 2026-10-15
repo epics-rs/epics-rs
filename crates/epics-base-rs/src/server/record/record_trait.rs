@@ -4946,7 +4946,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Almost no record does this: a not-yet-processed record is normally left
     /// in alarm so an `MS` consumer inherits `INVALID` at IOC startup (see
-    /// `RecordInstance::run_init_passes`). asyn does (`asynRecord.c:303-304`,
+    /// `RecordInstance::run_init_pass0`). asyn does (`asynRecord.c:303-304`,
     /// after `udf = 0`), and so does table, whose init-time `monitor()`
     /// (`tableRecord.c:405`) runs `recGblResetAlarms` (`:882`) with UDF left
     /// at 1. This hook is the alarm reset only; a record that also clears UDF
@@ -6466,7 +6466,7 @@ pub trait Record: Send + Sync + 'static {
             oval => oval,
         };
         match cell {
-            CycleRead::Value(v) => Some(OutView::Num(v.into())),
+            CycleRead::Value(v) => Some(OutView::Num(v)),
             CycleRead::Absent | CycleRead::ByName => None,
         }
     }
@@ -6862,14 +6862,20 @@ pub trait Record: Send + Sync + 'static {
     /// Additive, framework-set-hook pattern. Default: ignore.
     fn init_links(&mut self, _common: &crate::server::record::CommonFields) {}
 
-    /// The links C's `init_record(prec, 1)` reads with `dbGetLink`, as (link
-    /// field, value field) pairs. At `iocInit`, after every record's pass 0,
-    /// the framework reads each once without processing and stores it through
-    /// [`Self::put_field_internal`] before `init_record(1)`. Only a local DB
-    /// link delivers: a CA link is not connected yet at init in C either, and
-    /// a constant link's `getValue` writes nothing.
-    fn init_link_reads(&self) -> &'static [(&'static str, &'static str)] {
+    /// The links C's `init_record(prec, 1)` reads with `dbGetLink`, each with
+    /// the DBR type it requests. The framework reads them once at `iocInit`,
+    /// after every record's pass 0, and hands the answers to
+    /// [`Self::init_record_with_links`].
+    fn init_link_reads(&self) -> &'static [(&'static str, LinkReadAs)] {
         &[]
+    }
+
+    /// Pass 1 of `init_record`. A type that declares
+    /// [`Self::init_link_reads`] overrides this and runs its C loop over
+    /// `reads`: store, gate, zero or stop on each answer as its C
+    /// `init_record` does.
+    fn init_record_with_links(&mut self, _reads: &mut InitLinkReads) -> CaResult<()> {
+        self.init_record(1)
     }
 
     /// Called by the framework before process() to indicate whether device
@@ -7052,10 +7058,7 @@ fn put_value_in_shape<R: Record + ?Sized>(
     shape: StoredShape,
     value: EpicsValue,
 ) -> EpicsValue {
-    let Some(dest_is_array) = shape.renders(&value) else {
-        return value;
-    };
-    match (dest_is_array, value.is_array()) {
+    match (shape.is_array, value.is_array()) {
         // C's SCALAR arm: the clamp at `:1360` leaves one element.
         (false, true) => value.first_element().unwrap_or(value),
         // C's ARRAY arm at `nRequest == 1` — except into a long-string field.
@@ -7097,10 +7100,10 @@ pub fn link_value_in_field_shape<R: Record + ?Sized>(
     if !value.is_array() {
         return value;
     }
-    match StoredShape::of(record, field).renders(&value) {
-        Some(false) => value.first_element().unwrap_or(value),
-        _ => value,
+    if StoredShape::of(record, field).is_array {
+        return value;
     }
+    value.first_element().unwrap_or(value)
 }
 
 /// What a put asks of the value its destination field holds: the type it is
@@ -7109,6 +7112,10 @@ pub fn link_value_in_field_shape<R: Record + ?Sized>(
 #[derive(Clone, Copy)]
 pub(crate) struct StoredShape {
     ty: Option<DbFieldType>,
+    /// The field's CURRENT VALUE SHAPE, not
+    /// [`FieldDeclaration::field_is_dbaddr`]: `mbbo.VAL` is
+    /// `special(SPC_DBADDR)` and stored as a scalar, and wrapping a request to
+    /// it would put a one-element array in front of the menu row that owns it.
     is_array: bool,
 }
 
@@ -7130,23 +7137,6 @@ impl StoredShape {
 
     pub(crate) fn is_array(&self) -> bool {
         self.is_array
-    }
-
-    /// `Some(dest_is_array)` when this destination has a shape a request
-    /// may be rendered into, `None` when it must be left alone.
-    ///
-    /// The destination test is the field's CURRENT VALUE SHAPE, not
-    /// [`FieldDeclaration::field_is_dbaddr`]. `mbbo.VAL` is
-    /// `special(SPC_DBADDR)` and stored as a scalar; wrapping it would put a
-    /// one-element array in front of the menu row that owns that put.
-    ///
-    /// The exempt shape is a `CharArray` into a `DBF_STRING` field: that is
-    /// the dbChannel `$` char view of a string field, decoded by `convert_to`.
-    fn renders(&self, value: &EpicsValue) -> Option<bool> {
-        if matches!(value, EpicsValue::CharArray(_)) && self.ty == Some(DbFieldType::String) {
-            return None;
-        }
-        Some(self.is_array)
     }
 }
 
@@ -8882,13 +8872,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// `view`, materialised, is `value`. A `Num` carries no `DBR_*`, so it
-    /// is compared as the `Scalar` the value's carrier narrows through.
+    /// `view`, materialised, is `value`, its `DBR_*` included.
     fn view_is(view: OutView<'_>, value: &EpicsValue) -> bool {
         match view {
-            OutView::Num(n) => CycleValue::from_epics(value)
-                .map(Scalar::from)
-                .is_some_and(|v| format!("{v:?}") == format!("{n:?}")),
+            OutView::Num(n) => {
+                CycleValue::from_epics(value).is_some_and(|v| format!("{v:?}") == format!("{n:?}"))
+            }
             OutView::Str(b) => matches!(value, EpicsValue::String(v) if v.as_bytes() == b),
             OutView::Chars(b) => matches!(value, EpicsValue::CharArray(v) if v[..] == *b),
             OutView::Array(a) => owned(a) == *value,
@@ -9101,6 +9090,38 @@ pub(crate) mod tests {
                 format!("{:?}", Some(source.alarm_limit())),
                 format!("{:?}", AlarmLimit::from_stored(&wide)),
                 "{source:?} alarm_limit"
+            );
+            let n = Scalar::from(source);
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    (
+                        source.to_f32(),
+                        source.to_i8(),
+                        source.to_u8(),
+                        source.to_i16(),
+                        source.to_u16(),
+                        source.to_i32(),
+                        source.to_u32(),
+                        source.to_i64(),
+                        source.to_u64()
+                    )
+                ),
+                format!(
+                    "{:?}",
+                    (
+                        n.to_f32(),
+                        n.to_i8(),
+                        n.to_u8(),
+                        n.to_i16(),
+                        n.to_u16(),
+                        n.to_i32(),
+                        n.to_u32(),
+                        n.to_i64(),
+                        n.to_u64()
+                    )
+                ),
+                "{source:?} lean store"
             );
             for carrier in values {
                 let target = EpicsValue::from(carrier).db_field_type();
@@ -9377,6 +9398,44 @@ impl CycleValue {
             .unwrap_or_else(|| crate::types::c_cast::f64_to_i64(self.to_f64()))
     }
 
+    /// `self` stored into an `epicsFloat32` cell.
+    #[inline]
+    pub(crate) fn to_f32(self) -> f32 {
+        match self {
+            Self::Float(v) => v,
+            _ => crate::types::c_cast::f64_to_f32(self.to_f64()),
+        }
+    }
+}
+
+/// `self` stored into a cell of each remaining integer type, as
+/// [`CycleValue::to_i32`] is.
+macro_rules! cycle_value_to_int {
+    ($($to:ident: $t:ty = $cast:ident),* $(,)?) => {
+        impl CycleValue {
+            $(
+                #[inline]
+                pub(crate) fn $to(self) -> $t {
+                    self.as_int_i64().map_or_else(
+                        || crate::types::c_cast::$cast(self.to_f64()),
+                        |i| i as $t,
+                    )
+                }
+            )*
+        }
+    };
+}
+
+cycle_value_to_int!(
+    to_i8: i8 = f64_to_i8,
+    to_u8: u8 = f64_to_u8,
+    to_i16: i16 = f64_to_i16,
+    to_u16: u16 = f64_to_u16,
+    to_u32: u32 = f64_to_u32,
+    to_u64: u64 = f64_to_u64,
+);
+
+impl CycleValue {
     /// `self` stored into a cell that holds `carrier`'s variant — the
     /// scalar arms of [`EpicsValue::convert_to`], so `prec->lalm = val`
     /// lands in the cell's own type.
@@ -9474,8 +9533,8 @@ pub enum ValueView<'a> {
 /// ([`Record::output_view`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OutView<'a> {
-    /// A numeric field (OVAL, VAL, RVAL ...).
-    Num(Scalar),
+    /// A numeric field (OVAL, VAL, RVAL ...), in the `DBR_*` it goes out as.
+    Num(CycleValue),
     /// A `DBR_STRING` value, up to its NUL.
     Str(&'a [u8]),
     /// A `DBR_CHAR` array of `nRequest` elements (a long string).
@@ -9640,5 +9699,108 @@ pub(crate) fn seed_trackers_from_val<R: Record + ?Sized>(rec: &mut R) {
         };
         let coerced = seed.to_epics_value().into_type(current.db_field_type());
         let _ = rec.put_field(field, coerced);
+    }
+}
+
+/// The answers to a record's [`Record::init_link_reads`], as C's
+/// `dbGetLink` would have given them inside `init_record(prec, 1)`.
+pub struct InitLinkReads {
+    reads: Vec<(&'static str, InitRead)>,
+    /// What the reads the record took did to its pending alarm, in the order
+    /// it took them: `recGblSetSevr` keeps the first status of the highest
+    /// severity, so order decides which one wins a tie.
+    effects: Vec<InitReadEffect>,
+}
+
+/// One link's answer and what taking it does to the reader.
+pub(crate) struct InitRead {
+    pub(crate) fetch: crate::server::recgbl::simm::LinkFetch,
+    /// `recGblInheritSevrMsg` on a successful read (`dbDbLink.c:228-232`).
+    pub(crate) inherit: Option<(
+        crate::server::record::MonitorSwitch,
+        crate::server::database::LinkAlarm,
+    )>,
+    /// What `fetch` raises on the reader when it is `Failed`.
+    pub(crate) failure: InitGetFailure,
+}
+
+/// What a failed `dbGetLink` raises (`dbLink.c:335-339`).
+#[derive(Clone, Copy)]
+pub(crate) enum InitGetFailure {
+    /// `S_db_noLSET`: -1 with no `setLinkAlarm`.
+    NoLset,
+    /// `setLinkAlarm`'s `"field %s"`.
+    LinkAlarm,
+    /// The lset's own `"%s Disconn"` first, which `setLinkAlarm` then leaves
+    /// in place (`pvalink_lset.cpp:263-268`).
+    Disconn,
+}
+
+enum InitReadEffect {
+    Disconn(&'static str),
+    LinkAlarm(&'static str),
+    Inherit(
+        crate::server::record::MonitorSwitch,
+        crate::server::database::LinkAlarm,
+    ),
+}
+
+impl InitLinkReads {
+    /// The answers, by link field. A link absent from them reads as an
+    /// unset link: success, nothing written.
+    pub(crate) fn new(reads: Vec<(&'static str, InitRead)>) -> Self {
+        Self {
+            reads,
+            effects: Vec::new(),
+        }
+    }
+
+    /// `dbGetLink(&prec->link, ...)`. A failed read raises LINK/INVALID on the
+    /// record, as `dbGetLink`'s `setLinkAlarm` does (`dbLink.c:338-339`), and a
+    /// good one folds the source's alarm by the link's MS flag, but only for a
+    /// link the record actually reads.
+    pub fn get(&mut self, link: &str) -> crate::server::recgbl::simm::LinkFetch {
+        use crate::server::recgbl::simm::LinkFetch;
+        let Some((name, read)) = self.reads.iter().find(|(name, _)| *name == link) else {
+            return LinkFetch::NoData;
+        };
+        match (&read.fetch, &read.inherit) {
+            (LinkFetch::Failed, _) => match read.failure {
+                InitGetFailure::NoLset => {}
+                InitGetFailure::LinkAlarm => self.effects.push(InitReadEffect::LinkAlarm(name)),
+                InitGetFailure::Disconn => {
+                    self.effects.push(InitReadEffect::Disconn(name));
+                    self.effects.push(InitReadEffect::LinkAlarm(name));
+                }
+            },
+            (LinkFetch::Value(_), Some((ms, alarm))) => {
+                self.effects
+                    .push(InitReadEffect::Inherit(*ms, alarm.clone()));
+            }
+            _ => {}
+        }
+        read.fetch.clone()
+    }
+
+    /// Fold what the taken reads did into the record's pending alarm.
+    pub(crate) fn apply(&self, common: &mut crate::server::record::CommonFields) {
+        for effect in &self.effects {
+            match effect {
+                InitReadEffect::Disconn(field) => {
+                    crate::server::recgbl::rec_gbl_set_sevr_msg(
+                        common,
+                        crate::server::recgbl::alarm_status::LINK_ALARM,
+                        crate::server::record::AlarmSeverity::Invalid,
+                        crate::server::record::SparseText::link_disconn(field),
+                    );
+                }
+                InitReadEffect::LinkAlarm(field) => {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, field);
+                }
+                InitReadEffect::Inherit(ms, alarm) => {
+                    crate::server::database::inherit_sevr_msg(common, *ms, alarm);
+                }
+            }
+        }
     }
 }

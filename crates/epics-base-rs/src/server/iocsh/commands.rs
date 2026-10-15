@@ -6390,9 +6390,8 @@ fn cmd_dblsr() -> CommandDef {
 /// * **`nNoWrite` comes from the database, not from the lset.** C stages the
 ///   pending out-value on the `caLink` and counts the overwrite there
 ///   (`dbCa.c:548`, `:582`); this port stages it on
-///   [`PvDatabase::external_link_puts_coalesced_for`]'s queue, keyed by
-///   `(scheme, PV name)`. Two record fields naming one PV therefore share the
-///   count where C gives each its own.
+///   [`PvDatabase::external_link_puts_coalesced_for`]'s queue, keyed per
+///   link field as the `caLink` is.
 /// * **The `[IN IS ON OS]` columns.** `ON`/`OS` are dead at the pin — both
 ///   assignments sit inside `/* Disabled by ANJ ... */` (`dbCa.c:539-542`,
 ///   `:555-558`) — so C prints them blank too. `IS` needs C's second,
@@ -6483,7 +6482,9 @@ fn cmd_dbcar() -> CommandDef {
                     let diagnostics = ca_lset
                         .as_ref()
                         .and_then(|lset| ctx.block_on(lset.link_diagnostics(ca.pv.as_bytes())));
-                    let no_write = ctx.db().external_link_puts_coalesced_for(&ca.pv);
+                    let no_write = ctx
+                        .db()
+                        .external_link_puts_coalesced_for(&record, &field, &ca.pv);
                     match diagnostics {
                         Some(d) if d.connected => {
                             nconnected += 1;
@@ -7958,17 +7959,28 @@ mod tests {
         let (db, ctx, lset, _dir) = dbcar_ctx();
         lset.set("UP:PV", diag(true, true, true, 0));
         let entered = lset.hold_puts();
-        db.write_external_pv(b"UP:PV", EpicsValue::Double(1.0), None)
+        let inp = crate::server::database::LinkId {
+            rec: db.get_record("L:UP").unwrap().index(),
+            field: "INP",
+            install: crate::server::database::LinkInstall::Detached,
+        };
+        db.write_external_pv(inp.clone(), b"UP:PV", EpicsValue::Double(1.0), None)
             .unwrap();
         entered.recv().expect("the first write reached the lset");
         // Staged behind an in-flight write: restaged, nothing displaced.
-        db.write_external_pv(b"UP:PV", EpicsValue::Double(2.0), None)
+        db.write_external_pv(inp.clone(), b"UP:PV", EpicsValue::Double(2.0), None)
             .unwrap();
-        assert_eq!(db.external_link_puts_coalesced_for("UP:PV"), 0);
+        assert_eq!(
+            db.external_link_puts_coalesced_for("L:UP", "INP", "UP:PV"),
+            0
+        );
         // Now one IS displaced.
-        db.write_external_pv(b"UP:PV", EpicsValue::Double(3.0), None)
+        db.write_external_pv(inp.clone(), b"UP:PV", EpicsValue::Double(3.0), None)
             .unwrap();
-        assert_eq!(db.external_link_puts_coalesced_for("UP:PV"), 1);
+        assert_eq!(
+            db.external_link_puts_coalesced_for("L:UP", "INP", "UP:PV"),
+            1
+        );
         let out = run_cmd(&ctx, "dbcar", &["L:UP", "2"]);
         assert!(
             out.contains("==> UP:PV                         (0, 1)"),

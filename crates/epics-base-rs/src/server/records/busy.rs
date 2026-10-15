@@ -1033,10 +1033,8 @@ mod tests {
         rec.zsv = 1; // MINOR
         rec.val = 0;
         // Clear the default UDF to isolate the STATE path (as bo_state_alarm_osv).
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::Minor);
         assert_eq!(
@@ -1051,10 +1049,8 @@ mod tests {
         let mut rec = BusyRecord::new();
         rec.osv = 2; // MAJOR
         rec.val = 1;
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::Major);
         assert_eq!(
@@ -1098,20 +1094,16 @@ mod tests {
         // C `busyRecord.c:337` raises UDF_ALARM (at UDFS=INVALID) before COS;
         // `CommonFields::default()` has udf=1, so clear it to isolate the COS
         // path (as the bi/bo parity tests do).
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         // COS alarm fires and advances lalm.
         assert_eq!(rec.lalm, 1);
         assert_eq!(common.nsev, crate::server::record::AlarmSeverity::Minor);
 
         // Same val — no COS change.
-        let mut common2 = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common2 = CommonFields::default();
+        common2.udf = 0;
         rec.check_alarms(&mut common2);
         assert_eq!(rec.lalm, 1);
         assert_eq!(common2.nsev, crate::server::record::AlarmSeverity::NoAlarm);
@@ -1126,10 +1118,8 @@ mod tests {
         rec.lalm = 0;
         rec.val = 1;
         // Clear the default UDF to isolate STATE/COS.
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         // COS (Major) > OSV (Minor), so the raised severity is Major, at COS.
         assert_eq!(common.nsev, AlarmSeverity::Major);
@@ -1276,10 +1266,8 @@ mod tests {
         rec.val = 1;
         // Clear the default UDF (udf=1) to isolate the STATE path; the UDF-first
         // precedence is covered by `check_alarms_udf_precedes_state`.
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         // INVALID state severity propagates into common — the
         // framework's IVOA "Don't drive" then suppresses the OUT write.
@@ -1319,10 +1307,8 @@ mod tests {
         rec.val = 0;
         // Clear the default UDF (udf=1) so this exercises the "no severity set"
         // path rather than the UDF alarm.
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
     }

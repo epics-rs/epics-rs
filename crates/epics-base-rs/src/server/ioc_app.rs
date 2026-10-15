@@ -1573,7 +1573,7 @@ impl IocBuild {
         // C's `initDatabase` runs HERE, as a whole-database pass that binds each
         // record's dset and only then runs its `init_record`
         // (`drain_deferred_record_inits` → per record `attach_device_support`
-        // ahead of `run_init_passes`). The record was published at
+        // ahead of `run_init_pass0`). The record was published at
         // `dbLoadRecords` but its init deferred to this point, because a
         // record's device-support PORT can be configured by a startup command
         // AFTER the `dbLoadRecords` that created it (ADCore's
@@ -2773,7 +2773,7 @@ pub(crate) fn attach_device_support(
 /// Returns whether C's `init_record` REACHED ITS TAIL — `false` is C's `return
 /// S_db_BadSub` (either miss) and C's `prec->pact = TRUE; return 0` (an empty
 /// `sub` SNAM), both of which skip everything below them. The init owner
-/// ([`record::RecordInstance::run_init_passes`]) calls this from inside pass 1
+/// ([`record::RecordInstance::run_init_pass1`]) calls this from inside pass 1
 /// and honours the answer, so the tail is unreachable by construction rather
 /// than by a per-record-type opt-out.
 ///

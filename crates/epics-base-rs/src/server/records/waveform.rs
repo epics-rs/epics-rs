@@ -908,7 +908,7 @@ impl Record for WaveformRecord {
     fn put_primary_element0(&mut self, src: crate::server::record::OutView<'_>) -> bool {
         use crate::server::record::OutView;
         let n = match src {
-            OutView::Num(n) => n,
+            OutView::Num(n) => n.into(),
             OutView::Str(text) => {
                 let (Some(numeric), Ok(text)) = (
                     c_parse::NumericField::of(self.ftvl_element_type()),

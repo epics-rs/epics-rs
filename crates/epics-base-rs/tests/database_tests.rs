@@ -383,7 +383,7 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
         fn alarm_severity(&self, _: &[u8]) -> Option<i32> {
             Some(2) // MAJOR — as if the link's MS mode let it through
         }
-        fn alarm_message(&self, _: &[u8]) -> Option<String> {
+        fn alarm_message(&self, _: &[u8]) -> Option<Arc<str>> {
             Some("remote major".into())
         }
     }
@@ -6744,7 +6744,7 @@ async fn test_tse_minus1_always_overwrites_via_best_time() {
         epics_base_rs::types::WallTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
     if let Some(rec) = db.get_record("REC") {
         let mut inst = rec.write();
-        inst.common.tse = -1;
+        inst.common.set_tse(-1);
         inst.common.time = stale;
     }
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -6770,7 +6770,7 @@ async fn test_tse_minus2_keeps_time_unchanged() {
         epics_base_rs::types::WallTime::UNIX_EPOCH + std::time::Duration::from_secs(999);
     if let Some(rec) = db.get_record("REC") {
         let mut inst = rec.write();
-        inst.common.tse = -2;
+        inst.common.set_tse(-2);
         inst.common.time = fixed_time;
     }
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -6911,7 +6911,8 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
         "TSEL .TIME link must also adopt the source's utag (recGbl.c:317)"
     );
     assert_eq!(
-        inst.common.tse, 0,
+        inst.common.tse(),
+        0,
         "C returns before the TSE half (recGbl.c:321): TSE keeps its declared 0"
     );
 }
@@ -6984,7 +6985,8 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     );
     assert_eq!(inst.common.utag, 0, "CA wire carries no userTag");
     assert_eq!(
-        inst.common.tse, 0,
+        inst.common.tse(),
+        0,
         "C returns before the TSE half (recGbl.c:321): TSE keeps its declared 0"
     );
 }
@@ -7061,7 +7063,8 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
         "non-local Db TSEL .TIME link must adopt the remote .TIME via the CA path"
     );
     assert_eq!(
-        inst.common.tse, 0,
+        inst.common.tse(),
+        0,
         "C returns before the TSE half (recGbl.c:321): TSE keeps its declared 0"
     );
 }
@@ -8472,19 +8475,13 @@ async fn test_lnk_calc_parses_and_evaluates() {
         ParsedLink::Calc(c) => c,
         other => panic!("expected ParsedLink::Calc, got {other:?}"),
     };
-    assert_eq!(calc.expr, "A+B*2");
+    assert_eq!(calc.expr.as_deref(), Some("A+B*2"));
     assert_eq!(calc.args, vec![name_arg("pv_a"), name_arg("pv_b")]);
     assert_eq!(calc.time_source, Some('A'));
 
     // Parser without `time` field — time_source must be None.
     let no_time = parse_link_v2(r#"{calc:{"expr":"A","args":["pv_a"]}}"#);
-    assert!(matches!(
-        no_time,
-        ParsedLink::Calc(CalcLink {
-            time_source: None,
-            ..
-        })
-    ));
+    assert!(matches!(no_time, ParsedLink::Calc(c) if c.time_source.is_none()));
 
     // Parser refuses more than CALC_NARGS args — C `lnkCalc.c:135-139`
     // returns `jlif_stop`, it does not truncate. The 21/22 boundary itself
@@ -8511,11 +8508,15 @@ async fn test_lnk_calc_parses_and_evaluates() {
         .unwrap();
 
     let calc = CalcLink {
-        expr: "A+B*2".into(),
+        expr: Some("A+B*2".into()),
+        major: None,
+        minor: None,
+        out: None,
         args: vec![name_arg("pv_a"), name_arg("pv_b")],
         time_source: Some('A'),
+        val: Default::default(),
     };
-    let parsed = ParsedLink::Calc(calc);
+    let parsed = ParsedLink::Calc(Box::new(calc));
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     let value = db
         .read_link_value_soft(&parsed, true, &mut visited)
@@ -8576,18 +8577,22 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         .unwrap();
 
     let calc = CalcLink {
-        expr: "A+B*2".into(),
+        expr: Some("A+B*2".into()),
+        major: None,
+        minor: None,
+        out: None,
         args: vec![
             CalcArg::Link(Box::new(parse_link_v2("REMOTE:A"))),
             CalcArg::Link(Box::new(parse_link_v2("pv_b"))),
         ],
         time_source: Some('A'),
+        val: Default::default(),
     };
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     let value = db
         .read_link_value_soft(
-            &epics_base_rs::server::record::ParsedLink::Calc(calc),
+            &epics_base_rs::server::record::ParsedLink::Calc(Box::new(calc)),
             true,
             &mut visited,
         )

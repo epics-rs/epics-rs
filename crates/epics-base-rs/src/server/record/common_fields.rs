@@ -64,6 +64,42 @@ impl Default for TimeLast {
 #[must_use]
 pub(crate) struct StampBegun(());
 
+/// How `recGblGetTimeStampSimm` (`recGbl.c:310-342`) stamps this record,
+/// kept by the two writers of what decides it so a cycle tests one byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StampMode {
+    /// `TSE` 0, constant `TSEL`: the current time.
+    Plain,
+    /// Any other `TSE` but -2, constant `TSEL`: `epicsTimeGetEvent(tse)`.
+    Event,
+    /// `TSE` -2, constant `TSEL`: device support supplied the time.
+    DeviceTime,
+    /// A `TSEL` link: read it first, which may load `TSE` or the time itself.
+    FromTsel,
+}
+
+/// `TSE`, whether `TSEL` is a link, and the [`StampMode`] they decide, as
+/// one field whose own fields are private, so that only
+/// [`CommonFields::set_tse`] and [`CommonFields::set_tsel_link`] write them
+/// and each write recomputes the mode.
+#[derive(Clone, Copy, Debug)]
+pub struct Stamp {
+    tse: i16,
+    tsel_link: bool,
+    mode: StampMode,
+}
+
+impl StampMode {
+    fn of(tse: i16, tsel_link: bool) -> Self {
+        match (tsel_link, tse) {
+            (true, _) => StampMode::FromTsel,
+            (false, 0) => StampMode::Plain,
+            (false, super::EPICS_TIME_EVENT_DEVICE_TIME) => StampMode::DeviceTime,
+            (false, _) => StampMode::Event,
+        }
+    }
+}
+
 /// [`CommonFields`]' strings. A link field's text is served and re-parsed
 /// on a put; the cycle reads the parse cached on the instance, never these.
 #[derive(Clone, Debug, Default)]
@@ -187,7 +223,7 @@ pub struct CommonFields {
     // Alarm state (current/result)
     pub sevr: AlarmSeverity,
     pub stat: u16,
-    pub tse: i16,
+    pub(super) stamp: Stamp,
     // Process control
     pub putf: bool,
     /// `TPRO` (`DBF_UCHAR` in `dbCommon.dbd`) — trace-processing flag. C
@@ -261,7 +297,7 @@ impl CommonFields {
             udfs: AlarmSeverity::from_u16(self.udfs as u16),
             nsev: self.nsev,
             phas: self.phas,
-            tse: self.tse,
+            tse: self.stamp.tse,
             time: self.time,
             soft: self.dtyp.soft(),
             callback_priority: self.callback_priority(),
@@ -274,6 +310,32 @@ impl CommonFields {
     pub(crate) fn begin_stamp(&mut self) -> StampBegun {
         self.time_last = TimeLast(self.time);
         StampBegun(())
+    }
+
+    /// `TSE`.
+    #[inline(always)]
+    pub fn tse(&self) -> i16 {
+        self.stamp.tse
+    }
+
+    /// How this record stamps, as `TSE` and the `TSEL` link class decide.
+    #[inline(always)]
+    pub fn stamp_mode(&self) -> StampMode {
+        self.stamp.mode
+    }
+
+    /// Store `TSE`: a put, or what a `TSEL` link loaded (`recGbl.c:322`).
+    #[inline(always)]
+    pub fn set_tse(&mut self, tse: i16) {
+        self.stamp.tse = tse;
+        self.stamp.mode = StampMode::of(tse, self.stamp.tsel_link);
+    }
+
+    /// Record whether `TSEL` is a link rather than a constant
+    /// (`recGbl.c:315` `!dbLinkIsConstant`), on every install of its parse.
+    pub(crate) fn set_tsel_link(&mut self, is_link: bool) {
+        self.stamp.tsel_link = is_link;
+        self.stamp.mode = StampMode::of(self.stamp.tse, is_link);
     }
 
     /// The callback band this record's `PRIO` selects — C
@@ -291,7 +353,7 @@ impl Default for CommonFields {
             // (`dbCommon.dbd.pod:296-301`): a record is born UNDEFINED, not
             // NO_ALARM. SEVR has no `initial()` — it starts NO_ALARM and is
             // raised to UDFS by the init prologue
-            // (`RecordInstance::run_init_passes`, C `iocInit.c:521-523`), which
+            // (`RecordInstance::run_init_pass0`, C `iocInit.c:521-523`), which
             // keys off exactly this STAT value.
             stat: crate::server::recgbl::alarm_status::UDF_ALARM,
             amsg: SparseText::default(),
@@ -323,7 +385,11 @@ impl Default for CommonFields {
             // [`crate::runtime::general_time::epics_epoch`].
             time: crate::runtime::general_time::epics_epoch(),
             time_last: TimeLast::default(),
-            tse: 0,
+            stamp: Stamp {
+                tse: 0,
+                tsel_link: false,
+                mode: StampMode::Plain,
+            },
             utag: 0,
             analog_alarm: None,
             asl: 0,
@@ -340,6 +406,39 @@ impl Default for CommonFields {
             proc_field: 0,
             mlst: 0.0,
             alst: 0.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod stamp_mode_tests {
+    use super::{CommonFields, StampMode};
+
+    /// One case per boundary of `recGbl.c:315-327`: TSE 0, -2, every other
+    /// value either side of them, and a TSEL link over each.
+    #[test]
+    fn each_writer_keeps_the_mode_on_every_boundary() {
+        let mut c = CommonFields::default();
+        assert_eq!(c.stamp_mode(), StampMode::Plain);
+        for (tse, mode) in [
+            (-1, StampMode::Event),
+            (0, StampMode::Plain),
+            (-2, StampMode::DeviceTime),
+            (-3, StampMode::Event),
+            (1, StampMode::Event),
+            (i16::MIN, StampMode::Event),
+            (i16::MAX, StampMode::Event),
+        ] {
+            c.set_tse(tse);
+            assert_eq!((c.tse(), c.stamp_mode()), (tse, mode));
+            c.set_tsel_link(true);
+            assert_eq!(c.stamp_mode(), StampMode::FromTsel, "TSE {tse}");
+            // A TSE load under a link keeps the link's mode.
+            c.set_tse(0);
+            c.set_tse(tse);
+            assert_eq!(c.stamp_mode(), StampMode::FromTsel, "TSE {tse}");
+            c.set_tsel_link(false);
+            assert_eq!(c.stamp_mode(), mode, "TSE {tse}");
         }
     }
 }

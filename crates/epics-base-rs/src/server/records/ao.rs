@@ -4,7 +4,7 @@ use crate::server::record::{
     FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record, ValuePostGate,
 };
 use crate::server::records::convert_phase::ConvertPhase;
-use crate::types::{EpicsValue, PvString, Scalar};
+use crate::types::{EpicsValue, PvString};
 
 /// Choice labels for the output-increment-format menu, in index order.
 /// C `menu(aoOIF)` (`aoRecord.dbd.pod`): 0=Full, 1=Incremental. Selects
@@ -440,7 +440,7 @@ impl Record for AoRecord {
     }
 
     fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
-        Some(OutView::Num(Scalar::Int(self.rval.into())))
+        Some(OutView::Num(CycleValue::Long(self.rval)))
     }
 
     /// C `aoRecord.c:112-113`:

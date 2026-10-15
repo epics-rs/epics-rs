@@ -698,8 +698,18 @@ pub(crate) struct SearchListeners {
     /// Destinations another socket of this server is bound to and takes its
     /// datagrams at; a copy on the collector is dropped.
     taken: std::collections::HashSet<Ipv4Addr>,
-    /// Interface index to its address, pvxs `ifinfo.byIndex`.
-    by_index: std::collections::HashMap<u32, Ipv4Addr>,
+    /// Interface index to its addresses, pvxs `ifinfo.byIndex`.
+    by_index: std::collections::HashMap<u32, IfaceAddrs>,
+}
+
+/// One interface of [`SearchListeners::by_index`], pvxs `IfaceMap::Iface`:
+/// every address it carries, not one, since an aliased NIC or loopback has
+/// several; and each broadcast with the address that owns it.
+#[cfg(not(epics_embedded_target))]
+#[derive(Default)]
+struct IfaceAddrs {
+    addrs: Vec<Ipv4Addr>,
+    bcast: Vec<(Ipv4Addr, Ipv4Addr)>,
 }
 
 /// Where a datagram the collector socket received goes.
@@ -741,11 +751,15 @@ impl SearchListeners {
             listen,
             taken,
             // Index 0 is "none reported", on an interface and on a datagram alike.
-            by_index: ifaces
-                .iter()
-                .filter(|i| i.index != 0)
-                .map(|i| (i.index, i.ip))
-                .collect(),
+            by_index: ifaces.iter().filter(|i| i.index != 0).fold(
+                std::collections::HashMap::new(),
+                |mut map, i| {
+                    let entry: &mut IfaceAddrs = map.entry(i.index).or_default();
+                    entry.addrs.push(i.ip);
+                    entry.bcast.extend(i.broadcast.map(|b| (b, i.ip)));
+                    map
+                },
+            ),
         }
     }
 
@@ -763,22 +777,40 @@ impl SearchListeners {
         let Some((dest, ifindex)) = pktinfo else {
             return Arrival::OriginTag;
         };
-        let iface = self.by_index.get(&ifindex).copied();
+        let iface = self.by_index.get(&ifindex);
         if dest == ORIGIN_TAG_MCAST_GROUP {
             return match iface {
-                Some(ip) if ip.is_loopback() => Arrival::OriginTag,
+                Some(i) if i.addrs.iter().any(Ipv4Addr::is_loopback) => Arrival::OriginTag,
                 _ => Arrival::Drop,
             };
         }
         if self.taken.contains(&dest) || !self.listens_for(dest) {
             return Arrival::Drop;
         }
-        // `:286-318`: an interface address answers from itself, a broadcast
-        // or group from an address on the arrival interface.
-        if self.by_index.values().any(|&ip| ip == dest) {
+        // `:286-313`, against the arrival interface: its broadcast answers
+        // from the address owning it, its own address from itself, a group
+        // from its first address.
+        let Some(iface) = iface else {
+            // An index the start-time map does not know (pvxs re-reads its
+            // map and drops these, `:267-271`): any local address is unicast.
+            return if self.by_index.values().any(|i| i.addrs.contains(&dest)) {
+                Arrival::Unicast(dest)
+            } else {
+                Arrival::Broadcast(Ipv4Addr::UNSPECIFIED)
+            };
+        };
+        if let Some(&(_, ip)) = iface.bcast.iter().find(|&&(b, _)| b == dest) {
+            Arrival::Broadcast(ip)
+        } else if iface.addrs.contains(&dest) {
             Arrival::Unicast(dest)
         } else {
-            Arrival::Broadcast(iface.unwrap_or(Ipv4Addr::UNSPECIFIED))
+            Arrival::Broadcast(
+                iface
+                    .addrs
+                    .first()
+                    .copied()
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED),
+            )
         }
     }
 
@@ -1315,5 +1347,49 @@ mod tests {
         let got = ServerInterfaces::new(&[], &dests, true, &nics);
         assert_eq!(got.groups, vec![(group, nics[0]), (group, nics[1])]);
         assert!(got.addrs.is_empty() && got.any());
+    }
+
+    /// pvxs classifies against every address of the arrival interface
+    /// (`udp_collector.cpp:286-313`). An aliased interface carries several; a
+    /// map holding one of them read a SEARCH to another as broadcast, so it
+    /// was never forwarded to the servers sharing the port.
+    #[cfg(not(epics_embedded_target))]
+    #[test]
+    fn arrival_reads_every_address_of_the_arrival_interface() {
+        let nic = |index, ip: [u8; 4], broadcast: Option<[u8; 4]>| epics_base_rs::net::IfaceInfo {
+            index,
+            name: format!("if{index}"),
+            ip: ip.into(),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: broadcast.map(Into::into),
+            up_non_loopback: true,
+        };
+        let ifaces = [
+            nic(2, [10, 0, 0, 1], Some([10, 0, 0, 255])),
+            nic(2, [10, 0, 1, 1], Some([10, 0, 1, 255])),
+            nic(3, [10, 9, 0, 1], None),
+        ];
+        let listeners = SearchListeners::new(&ServerInterfaces::default(), HashSet::new(), &ifaces);
+        let on = |dest: [u8; 4], index| listeners.arrival(Some((dest.into(), index)));
+        let ip = |o: [u8; 4]| Ipv4Addr::from(o);
+        assert_eq!(on([10, 0, 0, 1], 2), Arrival::Unicast(ip([10, 0, 0, 1])));
+        assert_eq!(on([10, 0, 1, 1], 2), Arrival::Unicast(ip([10, 0, 1, 1])));
+        assert_eq!(
+            on([10, 0, 1, 255], 2),
+            Arrival::Broadcast(ip([10, 0, 1, 1]))
+        );
+        assert_eq!(
+            on([10, 0, 0, 255], 2),
+            Arrival::Broadcast(ip([10, 0, 0, 1]))
+        );
+        // Another interface's address arriving here is no unicast to it.
+        assert_eq!(on([10, 9, 0, 1], 2), Arrival::Broadcast(ip([10, 0, 0, 1])));
+        assert_eq!(on([10, 9, 0, 1], 3), Arrival::Unicast(ip([10, 9, 0, 1])));
+        // An index the map does not know: any local address is unicast.
+        assert_eq!(on([10, 0, 1, 1], 9), Arrival::Unicast(ip([10, 0, 1, 1])));
+        assert_eq!(
+            on([224, 0, 7, 7], 9),
+            Arrival::Broadcast(Ipv4Addr::UNSPECIFIED)
+        );
     }
 }

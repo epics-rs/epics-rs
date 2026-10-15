@@ -612,7 +612,7 @@ pub(crate) fn tokenize(line: &[u8]) -> Vec<IocshString> {
 }
 
 /// `arg` as line text that [`super::IocShell::execute_line`]'s expansion and
-/// [`tokenize`] hand back as exactly `arg`: for a caller holding a value C
+/// `tokenize` hand back as exactly `arg`: for a caller holding a value C
 /// would pass as a pointer, not as text. Inside a quote a backslash is data
 /// and nothing can be escaped; outside one it makes the next byte data for
 /// both passes (`macCore.c:741-743`, `iocsh.cpp:273-278`). Empty is `""`,

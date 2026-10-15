@@ -1360,7 +1360,7 @@ mod tests {
                     crate::runtime::task::ThreadPriority::ScanLow,
                 );
                 let mut policy = 0;
-                let mut param = libc::sched_param { sched_priority: 0 };
+                let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
                 // SAFETY: the calling thread, with stack-local out-params.
                 unsafe {
                     libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)

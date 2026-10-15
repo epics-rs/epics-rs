@@ -466,21 +466,17 @@ fn parse_record_def(
     Ok((record_name, record))
 }
 
-/// C's `-d` as the iocsh line it already is: `softMain.cpp:194-197` prints
-/// exactly this text under `-v`, and calls `dbLoadRecords(optarg, macros)`.
+/// C's `-d`: `softMain.cpp:194-197` prints `dbLoadRecords("<f>", "<m>")`
+/// under `-v` and calls `dbLoadRecords(optarg, macros)`.
 ///
 /// `-m`'s string is handed through as ONE argument because C never parses
 /// it, and is omitted when empty for the same reason C's own spelling
 /// omits it.
-fn db_load_records_line(file: &str, macros: &str) -> String {
+fn db_load_records_call(file: &str, macros: &str, on_error: String) -> PlannedCommand {
     if macros.is_empty() {
-        format!("dbLoadRecords(\"{}\")", iocsh_quote(file))
+        PlannedCommand::call("dbLoadRecords", &[file], on_error)
     } else {
-        format!(
-            "dbLoadRecords(\"{}\", \"{}\")",
-            iocsh_quote(file),
-            iocsh_quote(macros)
-        )
+        PlannedCommand::call("dbLoadRecords", &[file, macros], on_error)
     }
 }
 
@@ -530,8 +526,24 @@ struct StartupPlan {
 /// distinction out of a match on the command's spelling.
 #[derive(Debug, PartialEq, Eq)]
 struct PlannedCommand {
+    /// C's `-v` text: the arguments quoted and otherwise raw.
+    shown: String,
+    /// What the startup shell runs.
     line: String,
     on_error: String,
+}
+
+impl PlannedCommand {
+    /// `name(args…)`, each argument reaching the function byte for byte.
+    fn call(name: &str, args: &[&str], on_error: String) -> Self {
+        let join =
+            |f: &dyn Fn(&str) -> String| args.iter().map(|a| f(a)).collect::<Vec<_>>().join(", ");
+        PlannedCommand {
+            shown: format!("{name}({})", join(&|a| format!("\"{a}\""))),
+            line: format!("{name}({})", join(&iocsh_escape)),
+            on_error,
+        }
+    }
 }
 
 /// Walk [`Args::steps`] the way C walks argv.
@@ -553,10 +565,11 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
         }
         *loaded = true;
         if let Some(file) = dbd {
-            plan.lines.push(PlannedCommand {
-                line: format!("dbLoadDatabase(\"{}\")", iocsh_quote(file)),
-                on_error: format!("Failed to load DBD file: {file}"),
-            });
+            plan.lines.push(PlannedCommand::call(
+                "dbLoadDatabase",
+                &[file],
+                format!("Failed to load DBD file: {file}"),
+            ));
         }
     }
 
@@ -571,10 +584,8 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
             }
             Step::Db(file) => {
                 lazy_dbd(&mut plan, dbd, &mut dbd_loaded);
-                plan.lines.push(PlannedCommand {
-                    line: db_load_records_line(file, &macros),
-                    on_error: String::new(),
-                });
+                plan.lines
+                    .push(db_load_records_call(file, &macros, String::new()));
                 plan.loaded_db = true;
             }
             Step::ExitDb(prefix) => {
@@ -586,10 +597,11 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
                 // them, because those live on the database INSTANCE and
                 // only the loader fills it.
                 lazy_dbd(&mut plan, dbd, &mut dbd_loaded);
-                plan.lines.push(PlannedCommand {
-                    line: db_load_records_line(exit_db, &format!("IOC={prefix}")),
-                    on_error: String::new(),
-                });
+                plan.lines.push(db_load_records_call(
+                    exit_db,
+                    &format!("IOC={prefix}"),
+                    String::new(),
+                ));
                 plan.loads_exit_db = true;
                 plan.loaded_db = true;
             }
@@ -598,15 +610,17 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
                 // macros as they stand HERE: a later `-m` cannot reach an
                 // ACF whose substitutions were already recorded.
                 if !macros.is_empty() {
-                    plan.lines.push(PlannedCommand {
-                        line: format!("asSetSubstitutions(\"{}\")", iocsh_quote(&macros)),
-                        on_error: String::new(),
-                    });
+                    plan.lines.push(PlannedCommand::call(
+                        "asSetSubstitutions",
+                        &[&macros],
+                        String::new(),
+                    ));
                 }
-                plan.lines.push(PlannedCommand {
-                    line: format!("asSetFilename(\"{}\")", iocsh_quote(file)),
-                    on_error: String::new(),
-                });
+                plan.lines.push(PlannedCommand::call(
+                    "asSetFilename",
+                    &[file],
+                    String::new(),
+                ));
                 // No `asInit` line follows, as none follows in C: `-a` is
                 // `asSetFilename` plus `asSetSubstitutions` and nothing more
                 // (`softMain.cpp:174-185`), and `iocInit` is what reads the
@@ -819,15 +833,21 @@ fn blamed_option(e: &clap::Error) -> String {
         )
 }
 
-/// Escape what the iocsh tokenizer would otherwise read as structure
-/// (`iocsh.cpp:362-371`, and the port's own `registry` splitter, both of
-/// which unescape `\\` and `\"` inside a quoted argument).
+/// An argument as iocsh text that splits back into exactly its bytes.
 ///
-/// In C a filename and a substitution string are function arguments and
-/// never text; here they travel as text for the length of one line, so
-/// they have to survive the trip unchanged.
-fn iocsh_quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// C passes these as pointers; here they travel as a line, through
+/// `macDefExpand` and `split` (`iocsh.cpp:1184`, `:252-371`). Inside a quote
+/// a backslash is data and nothing can be escaped; outside one, a backslash
+/// makes the next byte data for both passes.
+fn iocsh_escape(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len());
+    for c in arg.chars() {
+        if c.is_ascii_whitespace() || "\\\"'(),$<>".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(tokio_backend)]
@@ -919,7 +939,7 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
     };
     for command in &plan.lines {
         if args.verbose {
-            verbose_out(ANSI_ESC_BOLD, &command.line);
+            verbose_out(ANSI_ESC_BOLD, &command.shown);
         }
         app = app.startup_line(&command.line);
     }
@@ -1363,7 +1383,8 @@ fn main() -> std::process::ExitCode {
 mod tests {
     use super::{
         AfterStartup, Args, CommandFactory, ERL_ERROR, Failure, SOFT_IOC_EXIT_DB, Step,
-        blamed_option, copt, db_load_records_line, parse_record_def, startup_plan, usage,
+        blamed_option, copt, db_load_records_call, iocsh_escape, parse_record_def, startup_plan,
+        usage,
     };
     #[cfg(tokio_backend)]
     use super::{ServerOptions, run_ioc_app};
@@ -1605,21 +1626,27 @@ mod tests {
     /// empty.
     #[test]
     fn a_db_flag_is_c_s_db_load_records_call() {
-        assert_eq!(db_load_records_line("x.db", ""), "dbLoadRecords(\"x.db\")");
+        let shown = |f, m| db_load_records_call(f, m, String::new()).shown;
+        assert_eq!(shown("x.db", ""), "dbLoadRecords(\"x.db\")");
         assert_eq!(
-            db_load_records_line("x.db", "P=A,R=B"),
+            shown("x.db", "P=A,R=B"),
             "dbLoadRecords(\"x.db\", \"P=A,R=B\")"
+        );
+        assert_eq!(
+            shown(r"C:\t\x.db", ""),
+            r#"dbLoadRecords("C:\t\x.db")"#,
+            "C prints optarg raw"
         );
     }
 
-    /// The line is text for exactly as long as it takes the shell to split
-    /// it, so a filename C would have passed as a pointer must come out
-    /// the other side unchanged.
+    /// Every byte the shell's two passes read as structure is escaped
+    /// outside a quote, where a backslash means the next byte is data; the
+    /// end-to-end proof is `tests/softioc_db_path_bytes.rs`.
     #[test]
-    fn a_quote_in_a_filename_survives_the_line() {
+    fn an_argument_is_escaped_outside_any_quote() {
         assert_eq!(
-            db_load_records_line(r#"od"d\.db"#, ""),
-            r#"dbLoadRecords("od\"d\\.db")"#
+            iocsh_escape(r#"C:\a b\"q"'$(X),<>.db"#),
+            r#"C:\\a\ b\\\"q\"\'\$\(X\)\,\<\>.db"#
         );
     }
 
@@ -1744,7 +1771,7 @@ mod tests {
         assert_eq!(
             plan.lines
                 .iter()
-                .map(|c| c.line.as_str())
+                .map(|c| c.shown.as_str())
                 .collect::<Vec<_>>(),
             vec![
                 r#"dbLoadRecords("/x/softIocExit.db", "IOC=XT")"#,
@@ -1966,7 +1993,7 @@ mod tests {
             "/x/softIocExit.db",
         )
         .expect("a plan without -D");
-        let lines: Vec<&str> = plan.lines.iter().map(|c| c.line.as_str()).collect();
+        let lines: Vec<&str> = plan.lines.iter().map(|c| c.shown.as_str()).collect();
         assert_eq!(
             lines,
             [
@@ -1992,7 +2019,7 @@ mod tests {
             "/x/softIocExit.db",
         )
         .expect("both -D options precede the first -d");
-        let lines: Vec<&str> = plan.lines.iter().map(|c| c.line.as_str()).collect();
+        let lines: Vec<&str> = plan.lines.iter().map(|c| c.shown.as_str()).collect();
         assert_eq!(
             lines,
             [
@@ -2026,7 +2053,7 @@ mod tests {
             "/x/softIocExit.db",
         )
         .expect("a plan without -D");
-        let lines: Vec<&str> = plan.lines.iter().map(|c| c.line.as_str()).collect();
+        let lines: Vec<&str> = plan.lines.iter().map(|c| c.shown.as_str()).collect();
         assert_eq!(
             lines,
             [

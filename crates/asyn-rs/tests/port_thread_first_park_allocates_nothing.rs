@@ -50,6 +50,9 @@ static GLOBAL: Counting = Counting;
 struct Device {
     base: PortDriverBase,
     gate: Arc<parking_lot::Mutex<()>>,
+    /// Told when connect is about to take `gate`, so the holder releases it
+    /// only after the port thread started, however long that took.
+    entered: std::sync::mpsc::Sender<()>,
     contended: Arc<AtomicBool>,
     allocs: Arc<AtomicU64>,
 }
@@ -63,6 +66,7 @@ impl PortDriver for Device {
     }
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let held = self.gate.try_lock().is_none();
+        let _ = self.entered.send(());
         let before = ALLOCS.with(Cell::get);
         drop(self.gate.lock());
         let allocs = ALLOCS.with(Cell::get) - before;
@@ -81,11 +85,14 @@ fn a_port_thread_s_first_contended_lock_allocates_nothing() {
         let contended = Arc::new(AtomicBool::new(false));
         let allocs = Arc::new(AtomicU64::new(u64::MAX));
         let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn({
             let gate = Arc::clone(&gate);
             move || {
                 let _gate = gate.lock();
                 held_tx.send(()).unwrap();
+                let _ = entered_rx.recv();
+                // Long enough for connect to park on the lock.
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
@@ -105,6 +112,7 @@ fn a_port_thread_s_first_contended_lock_allocates_nothing() {
             Device {
                 base,
                 gate,
+                entered,
                 contended: Arc::clone(&contended),
                 allocs: Arc::clone(&allocs),
             },

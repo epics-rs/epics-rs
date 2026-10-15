@@ -605,10 +605,12 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16, origin: PortOrigin) -> Ca
     // socket.
     //
     // Ephemeral ports included, as `rsrv_init` applies the helper whatever
-    // the port (`caservertask.c:628`, `:698`) — but on a number this server
-    // chooses, after the bind (`PortUse::bind`): set before, Linux may hand
-    // `bind(0)` a number a same-user fanout socket holds, and that socket's
-    // SO_REUSEPORT group then takes every SEARCH from a given client port.
+    // the port (`caservertask.c:628`, `:698`) — but on unix, on a number this
+    // server chooses, after the bind (`PortUse::bind`): set before, Linux may
+    // hand `bind(0)` a number a same-user fanout socket holds, and that
+    // socket's SO_REUSEPORT group then takes every SEARCH from a given client
+    // port. Windows sets them before every bind, as C: Winsock reads
+    // SO_REUSEADDR at bind time.
     // libcom commit 51191e6: Linux defaults IP_MULTICAST_ALL=1, which makes
     // a socket bound to 0.0.0.0 receive multicast for groups joined on ANY
     // socket on this host. Clear it so per-NIC search responders don't see

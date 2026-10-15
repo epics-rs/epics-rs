@@ -711,8 +711,16 @@ fn first_evidence(
 ) -> Option<String> {
     files.iter().find_map(|file| {
         let ev = spawn_evidence(&read(file), tokens)?;
-        let rel = file.strip_prefix(crate_dir).unwrap_or(file);
-        Some(format!("{}:{ev}", rel.display()))
+        // `/`-joined so the evidence reads the same on every host.
+        let rel = match file.strip_prefix(crate_dir) {
+            Ok(rel) => rel
+                .iter()
+                .map(|c| c.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+            Err(_) => file.display().to_string(),
+        };
+        Some(format!("{rel}:{ev}"))
     })
 }
 

@@ -53,7 +53,6 @@ pub mod verdict;
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 
-use epics_libcom_rs::net::port_unavailable;
 use socket2::{Domain, Socket, Type};
 
 /// Build `shim/getsockname_einval.c` into `dir` and return the `.so`: under
@@ -224,7 +223,7 @@ pub fn udp_port_is_held(port: u16) -> bool {
 /// Unix: `SO_REUSEADDR` on TCP, as std's `TcpListener` sets it, so a port
 /// left in TIME_WAIT reads free. Windows: `SO_EXCLUSIVEADDRUSE`, because a
 /// plain Winsock wildcard bind succeeds beside a socket holding the number
-/// on one address, and is refused only when the holder set the same option.
+/// on one address.
 fn port_is_held(ty: Type, port: u16) -> bool {
     let sock = Socket::new(Domain::IPV4, ty, None).expect("open a probe socket");
     #[cfg(unix)]
@@ -235,7 +234,19 @@ fn port_is_held(ty: Type, port: u16) -> bool {
     #[cfg(windows)]
     exclusive_address_use(&sock);
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-    matches!(sock.bind(&addr.into()), Err(e) if port_unavailable(&e))
+    matches!(sock.bind(&addr.into()), Err(e) if held_by_another(&e))
+}
+
+/// Whether a refused bind says another socket holds the number: EADDRINUSE,
+/// and on Windows WSAEACCES too, which Winsock returns for a held number
+/// whenever either socket set `SO_REUSEADDR` or `SO_EXCLUSIVEADDRUSE`. A unix
+/// EACCES is a privileged port or a policy, never a holder.
+pub fn held_by_another(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEACCES) {
+        return true;
+    }
+    e.kind() == std::io::ErrorKind::AddrInUse
 }
 
 #[cfg(windows)]
@@ -278,6 +289,19 @@ mod tests {
         assert!(tcp_port_is_held(t) && udp_port_is_held(u));
         drop((tcp, udp));
         assert!(!tcp_port_is_held(t) && !udp_port_is_held(u));
+    }
+
+    /// An access refusal is a holder's answer only from Winsock; a unix EACCES
+    /// is a privileged port or a policy.
+    #[test]
+    fn a_permission_refusal_is_held_only_on_windows() {
+        #[cfg(windows)]
+        assert!(held_by_another(&std::io::Error::from_raw_os_error(
+            windows_sys::Win32::Networking::WinSock::WSAEACCES
+        )));
+        #[cfg(unix)]
+        assert!(!held_by_another(&std::io::Error::from_raw_os_error(13))); // EACCES
+        assert!(held_by_another(&std::io::ErrorKind::AddrInUse.into()));
     }
 
     /// The winning attempt's value comes back, and no further candidate is

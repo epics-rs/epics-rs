@@ -81,6 +81,25 @@ pub fn addr_in_use() -> &'static str {
     })
 }
 
+/// Every text an epics-rs binary prints for a bind [`crate::held_by_another`]
+/// reads as held: [`addr_in_use`], and on Windows std's text for WSAEACCES,
+/// which an `SO_REUSEADDR` bind over a held address gets.
+pub fn held_texts() -> &'static [String] {
+    static TEXTS: OnceLock<Vec<String>> = OnceLock::new();
+    TEXTS.get_or_init(|| {
+        let in_use = addr_in_use().to_owned();
+        #[cfg(windows)]
+        let texts = vec![
+            in_use,
+            std::io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAEACCES)
+                .to_string(),
+        ];
+        #[cfg(not(windows))]
+        let texts = vec![in_use];
+        texts
+    })
+}
+
 /// An epics-rs IOC's report that `port` belonged to somebody else — the retry
 /// trigger for a test that names the port of `softioc-rs` or
 /// `realtime-ca-ioc`.
@@ -90,21 +109,23 @@ pub fn addr_in_use() -> &'static str {
 /// [`PORT_WAS_TAKEN`] for the TCP listener and serves on a dynamic one as C
 /// does, or names the address its search responder could not bind and exits
 /// 1; realtime-ca-ioc names the port on either bind arm and exits 1. On the
-/// lines that carry an error the cause must be [`addr_in_use`] and nothing
-/// else: realtime-ca-ioc's TCP arm also covers a `local_addr` failure, which
-/// is no steal.
+/// lines that carry an error the cause must be one of [`held_texts`] and
+/// nothing else: realtime-ca-ioc's TCP arm also covers a `local_addr`
+/// failure, which is no steal.
 pub fn rs_ioc_port_was_taken(console: &str, port: u16) -> bool {
-    let in_use = addr_in_use();
-    let udp = format!(":{port}: {in_use}");
     let rt_tcp = format!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: ");
     let rt_udp =
         format!("realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: ");
     console.lines().any(|l| {
         l.contains(PORT_WAS_TAKEN)
-            || (l.contains("CA server UDP search responder bind ") && l.ends_with(&udp))
-            || [&rt_tcp, &rt_udp]
-                .iter()
-                .any(|arm| l.strip_prefix(arm.as_str()) == Some(in_use))
+            || (l.contains("CA server UDP search responder bind ")
+                && held_texts()
+                    .iter()
+                    .any(|t| l.ends_with(&format!(":{port}: {t}"))))
+            || [&rt_tcp, &rt_udp].iter().any(|arm| {
+                l.strip_prefix(arm.as_str())
+                    .is_some_and(|cause| held_texts().iter().any(|t| t == cause))
+            })
     })
 }
 
@@ -114,15 +135,17 @@ pub fn rs_ioc_port_was_taken(console: &str, port: u16) -> bool {
 /// `Server unable to bind port {tcp}, falling back to …` (runtime.rs:929)
 /// and serves on another, which a client dialling `tcp` never finds. A taken
 /// UDP search port ends the process with `qsrv-rs: …` and the bind's own
-/// error, which names no number; it counts only when that error is
-/// [`addr_in_use`] and `udp_held`, the kernel's answer for `tcp + 1` after
+/// error, which names no number; it counts only when that error is one of
+/// [`held_texts`] and `udp_held`, the kernel's answer for `tcp + 1` after
 /// the child has exited. Both follow `iocRun`, so a test judges the console
 /// after its attempt.
 pub fn qsrv_rs_port_was_taken(console: &str, tcp: u16, udp_held: bool) -> bool {
     let fell_back = format!("Server unable to bind port {tcp},");
     console.lines().any(|l| {
         l.contains(&fell_back)
-            || (udp_held && l.starts_with("qsrv-rs: ") && l.ends_with(addr_in_use()))
+            || (udp_held
+                && l.starts_with("qsrv-rs: ")
+                && held_texts().iter().any(|t| l.ends_with(t.as_str())))
     })
 }
 
@@ -237,6 +260,29 @@ mod tests {
             "Starting iocInit\niocRun: All initialization complete\n",
             32961
         ));
+    }
+
+    /// Every text the platform reads as held is a steal on each arm, and of
+    /// its own number only — on Windows that includes WSAEACCES.
+    #[test]
+    fn every_held_text_is_a_stolen_port_on_each_arm() {
+        for t in held_texts() {
+            for console in [
+                format!("CA server UDP search responder bind 127.0.0.1:32961: {t}\n"),
+                format!("realtime-ca-ioc: cannot start the CA TCP server on port 32961: {t}\n"),
+                format!(
+                    "realtime-ca-ioc: cannot start the CA UDP search responder on port 32961: {t}\n"
+                ),
+            ] {
+                assert!(rs_ioc_port_was_taken(&console, 32961), "{console:?}");
+                assert!(!rs_ioc_port_was_taken(&console, 3296), "{console:?}");
+            }
+            assert!(qsrv_rs_port_was_taken(
+                &format!("qsrv-rs: I/O error: {t}\n"),
+                1,
+                true
+            ));
+        }
     }
 
     /// softioc-rs's TCP arm is C's line and serves on a dynamic port.

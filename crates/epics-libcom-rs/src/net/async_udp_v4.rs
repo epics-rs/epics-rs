@@ -1387,8 +1387,6 @@ fn bind_bcast_rx(
     let Some(bcast) = info.rx_broadcast() else {
         return Ok(None);
     };
-    #[cfg(test)]
-    tests::BEFORE_BCAST_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bcast, port)));
     bind_one_at(info, bcast, port, port_use, origin, broadcast, true).map(Some)
 }
 
@@ -1448,6 +1446,9 @@ fn bind_one_at(
     }
     sock.set_nonblocking(true)?;
     let bind_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(bind_ip, port));
+    #[cfg(test)]
+    tests::BEFORE_BIND
+        .with_borrow_mut(|hook| hook.as_mut().map(|h| h(bind_ip, port, rx_only_bcast)));
     port_use.bind(&sock, bind_addr, origin)?;
     let std_sock: std::net::UdpSocket = sock.into();
     let tokio_sock = UdpSocket::from_std(std_sock)?;
@@ -1510,16 +1511,21 @@ mod tests {
     use super::*;
     use crate::net::fanout::port_unavailable;
 
-    type BcastHook = Box<dyn FnMut(Ipv4Addr, u16)>;
+    type BindHook = Box<dyn FnMut(Ipv4Addr, u16, bool)>;
 
     thread_local! {
-        /// Called with each broadcast address and port `bind_bcast_rx` is
-        /// about to bind.
-        pub(super) static BEFORE_BCAST_BIND: std::cell::RefCell<Option<BcastHook>> =
+        /// Called with each address and port `bind_one_at` is about to bind,
+        /// and whether it is a broadcast-RX socket.
+        pub(super) static BEFORE_BIND: std::cell::RefCell<Option<BindHook>> =
             const { std::cell::RefCell::new(None) };
     }
 
+    // The broadcast-RX tests below are unix-only: Winsock delivers subnet
+    // broadcasts to the unicast socket and rsrv binds no broadcast socket on
+    // WIN32 (caservertask.c:670-710), so there is no such bind to hold.
+
     /// The broadcast-capable NICs, in the order the ephemeral bundle binds them.
+    #[cfg(not(windows))]
     fn bcast_nics() -> Vec<Ipv4Addr> {
         let map = IfaceMap::new().expect("iface map");
         let mut ifaces = select_ifaces(&map, None);
@@ -1541,6 +1547,7 @@ mod tests {
     }
 
     /// The same for a held broadcast address.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_held_broadcast_address_fails_a_fixed_port_bind() {
         let bcast = *bcast_nics().first().expect(
@@ -1558,11 +1565,15 @@ mod tests {
 
     /// Holds the `n`th broadcast address the bundle binds, at its port, as a
     /// stranger would; returns the binds seen and leaves the hook set.
+    #[cfg(not(windows))]
     fn hold_bcast_bind(n: usize) -> std::rc::Rc<std::cell::RefCell<Vec<(Ipv4Addr, u16)>>> {
         let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let log = seen.clone();
         let mut held = Vec::new();
-        BEFORE_BCAST_BIND.set(Some(Box::new(move |bcast, port| {
+        BEFORE_BIND.set(Some(Box::new(move |bcast, port, rx_only_bcast| {
+            if !rx_only_bcast {
+                return;
+            }
             log.borrow_mut().push((bcast, port));
             if log.borrow().len() == n {
                 held.push(std::net::UdpSocket::bind((bcast, port)).expect("hold"));
@@ -1573,6 +1584,7 @@ mod tests {
 
     /// A held broadcast address drops its NIC from the ephemeral attempt, so
     /// the bundle moves to a port it holds in full.
+    #[cfg(not(windows))]
     fn held_broadcast_retries_the_bundle(n: usize) {
         assert!(
             bcast_nics().len() >= n,
@@ -1581,7 +1593,7 @@ mod tests {
         );
         let seen = hold_bcast_bind(n);
         let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, true);
-        BEFORE_BCAST_BIND.take();
+        BEFORE_BIND.take();
         let sock = sock.expect("bundle");
         let (bcast, held_port) = seen.borrow()[n - 1];
         let port = sock.ifaces()[0].sock.local_addr().unwrap().port();
@@ -1594,82 +1606,102 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_held_broadcast_address_on_the_first_nic_retries_the_bundle() {
         held_broadcast_retries_the_bundle(1);
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_held_broadcast_address_on_a_later_nic_retries_the_bundle() {
         held_broadcast_retries_the_bundle(2);
     }
 
-    /// Holds `at(bcast, port)` with the fanout flags when the bundle is about
-    /// to bind its `n`th broadcast address; returns the ports seen and leaves
-    /// the hook set.
+    /// Holds the address `at` returns for one of the bundle's binds, with the
+    /// fanout flags, just before that bind; `at` sees each bind's address,
+    /// port and broadcast-RX flag. Returns the port held and leaves the hook
+    /// set.
     fn fanout_hold_at(
-        n: usize,
-        at: impl Fn(Ipv4Addr, u16) -> SocketAddr + 'static,
-    ) -> std::rc::Rc<std::cell::RefCell<Vec<u16>>> {
-        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let log = seen.clone();
-        let mut held = Vec::new();
-        BEFORE_BCAST_BIND.set(Some(Box::new(move |bcast, port| {
-            log.borrow_mut().push(port);
-            if log.borrow().len() == n {
-                let addr = at(bcast, port);
-                let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-                s.set_reuse_address(true).unwrap();
-                #[cfg(unix)]
-                s.set_reuse_port(true).unwrap();
-                s.bind(&addr.into())
-                    .unwrap_or_else(|e| panic!("fanout holder on {addr}: {e}"));
-                held.push(s);
+        mut at: impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> + 'static,
+    ) -> std::rc::Rc<std::cell::Cell<Option<u16>>> {
+        let held_port = std::rc::Rc::new(std::cell::Cell::new(None));
+        let log = held_port.clone();
+        let mut held = None;
+        BEFORE_BIND.set(Some(Box::new(move |ip, port, rx_only_bcast| {
+            if held.is_some() {
+                return;
             }
+            let Some(addr) = at(ip, port, rx_only_bcast) else {
+                return;
+            };
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&addr.into())
+                .unwrap_or_else(|e| panic!("fanout holder on {addr}: {e}"));
+            held = Some(s);
+            log.set(Some(port));
         })));
-        seen
+        held_port
     }
 
     /// A shared bundle's later binds are on the number it chose, so a fanout
     /// holder there is `EADDRINUSE` and moves the bundle, never a group the
     /// bundle silently joins.
     fn fanout_holder_moves_a_shared_bundle(
-        n: usize,
-        at: impl Fn(Ipv4Addr, u16) -> SocketAddr + 'static,
+        at: impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> + 'static,
     ) {
+        let held_port = fanout_hold_at(at);
+        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Shared, true);
+        BEFORE_BIND.take();
+        let sock = sock.expect("bundle");
+        let held_port = held_port
+            .get()
+            .expect("the bundle never reached the bind the holder was set for");
+        let port = sock.ifaces()[0].sock.local_addr().unwrap().port();
+        assert_ne!(port, held_port, "the bundle joined a fanout holder's group");
+    }
+
+    /// Holds the `n`th broadcast address the bundle binds, at its port.
+    #[cfg(not(windows))]
+    fn at_nth_bcast(n: usize) -> impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> {
         assert!(
             bcast_nics().len() >= n,
             "this host has {} broadcast-capable NIC(s), {n} needed; the run cannot be made here",
             bcast_nics().len()
         );
-        let seen = fanout_hold_at(n, at);
-        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Shared, true);
-        BEFORE_BCAST_BIND.take();
-        let sock = sock.expect("bundle");
-        let held_port = seen.borrow()[n - 1];
-        let port = sock.ifaces()[0].sock.local_addr().unwrap().port();
-        assert_ne!(port, held_port, "the bundle joined a fanout holder's group");
+        let mut seen = 0;
+        move |ip, port, rx_only_bcast| {
+            seen += usize::from(rx_only_bcast);
+            (rx_only_bcast && seen == n).then(|| (ip, port).into())
+        }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_fanout_holder_on_the_first_broadcast_address_moves_a_shared_bundle() {
-        fanout_holder_moves_a_shared_bundle(1, |bcast, port| (bcast, port).into());
+        fanout_holder_moves_a_shared_bundle(at_nth_bcast(1));
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_fanout_holder_on_a_later_broadcast_address_moves_a_shared_bundle() {
-        fanout_holder_moves_a_shared_bundle(2, |bcast, port| (bcast, port).into());
+        fanout_holder_moves_a_shared_bundle(at_nth_bcast(2));
     }
 
-    /// Held on the second NIC's unicast address, which the bundle binds after
-    /// the first NIC's broadcast address.
+    /// Held on the second NIC's unicast address at the chosen number, just
+    /// before the bundle binds it there.
     #[tokio::test]
     async fn a_fanout_holder_on_a_later_nic_moves_a_shared_bundle() {
         let map = IfaceMap::new().expect("iface map");
         let mut ifaces = select_ifaces(&map, None);
         ifaces.sort_by_key(|i| !i.up_non_loopback);
         let second = ifaces.get(1).expect("a second NIC").ip;
-        fanout_holder_moves_a_shared_bundle(1, move |_, port| (second, port).into());
+        fanout_holder_moves_a_shared_bundle(move |ip, port, rx_only_bcast| {
+            (ip == second && port != 0 && !rx_only_bcast).then(|| (ip, port).into())
+        });
     }
 
     /// A subnet-broadcast datagram reaches an ephemeral bundle as it reaches

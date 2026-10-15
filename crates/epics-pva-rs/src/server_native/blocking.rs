@@ -1266,9 +1266,14 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
 
 #[cfg(not(unix))]
 fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
-    // Non-Unix host: plain bind with no pre-bind reuse. RTEMS is Unix-family,
-    // so the arm above is the one that matters for the target.
-    UdpSocket::bind(addr)
+    // The same fanout as the Unix arm: on WIN32
+    // `epicsSocketEnableAddressUseForDatagramFanout` is `SO_REUSEADDR`
+    // (`osdSockAddrReuse.cpp`), and a plain bind refuses a second server.
+    use epics_base_rs::net::{PortOrigin, PortUse};
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    PortUse::Shared.bind(&socket, addr.into(), PortOrigin::Configured)?;
+    Ok(socket.into())
 }
 
 /// Receive one datagram, with the `(destination, interface index)` of its

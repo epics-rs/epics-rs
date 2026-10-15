@@ -11,5 +11,15 @@ repository.workspace = true
 # absence from crates.io is not a hole in anyone's dependency graph.
 publish = false
 
+[dependencies]
+# `net::port_unavailable`: one reading of a refused bind for the product and
+# the tests that judge it.
+epics-libcom-rs = { workspace = true }
+socket2 = "0.5"
+
+# `SO_EXCLUSIVEADDRUSE` on the held-port probe; socket2 does not expose it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

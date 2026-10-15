@@ -51,7 +51,10 @@
 pub mod port_holders;
 pub mod verdict;
 
-use std::net::{TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+
+use epics_libcom_rs::net::port_unavailable;
+use socket2::{Domain, Socket, Type};
 
 /// Build `shim/getsockname_einval.c` into `dir` and return the `.so`: under
 /// `LD_PRELOAD` it fails `getsockname` with EINVAL on a listening socket, as
@@ -207,19 +210,55 @@ pub fn free_tcp_with_udp_successor() -> u16 {
 /// which is the evidence a test needs before it calls a missing bind a lost
 /// race and not a regression. On every interface, as [`udp_port_is_held`].
 pub fn tcp_port_is_held(port: u16) -> bool {
-    matches!(
-        TcpListener::bind(("0.0.0.0", port)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
-    )
+    port_is_held(Type::STREAM, port)
 }
 
 /// [`tcp_port_is_held`] for UDP, on every interface as a PVA search socket
 /// binds it.
 pub fn udp_port_is_held(port: u16) -> bool {
-    matches!(
-        UdpSocket::bind(("0.0.0.0", port)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
-    )
+    port_is_held(Type::DGRAM, port)
+}
+
+/// A wildcard bind of `port` that only another socket on the number refuses.
+///
+/// Unix: `SO_REUSEADDR` on TCP, as std's `TcpListener` sets it, so a port
+/// left in TIME_WAIT reads free. Windows: `SO_EXCLUSIVEADDRUSE`, because a
+/// plain Winsock wildcard bind succeeds beside a socket holding the number
+/// on one address, and is refused only when the holder set the same option.
+fn port_is_held(ty: Type, port: u16) -> bool {
+    let sock = Socket::new(Domain::IPV4, ty, None).expect("open a probe socket");
+    #[cfg(unix)]
+    if ty == Type::STREAM {
+        sock.set_reuse_address(true)
+            .expect("SO_REUSEADDR on the probe");
+    }
+    #[cfg(windows)]
+    exclusive_address_use(&sock);
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    matches!(sock.bind(&addr.into()), Err(e) if port_unavailable(&e))
+}
+
+#[cfg(windows)]
+fn exclusive_address_use(sock: &Socket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SO_EXCLUSIVEADDRUSE, SOL_SOCKET, setsockopt};
+    let on: i32 = 1;
+    // SAFETY: a live socket handle, and `on` outlives the call.
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_socket() as _,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast(),
+            size_of::<i32>() as i32,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "SO_EXCLUSIVEADDRUSE on the probe: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 #[cfg(test)]

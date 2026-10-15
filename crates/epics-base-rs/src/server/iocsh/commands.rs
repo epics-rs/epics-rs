@@ -8861,8 +8861,9 @@ mod tests {
                         let hex_end = l[at + 6..]
                             .find(|c: char| !c.is_ascii_hexdigit())
                             .map_or(l.len(), |n| at + 6 + n);
-                        let pad = l.len() - hex_end;
-                        format!("{}PTR 0xADDR{}", &l[..at], " ".repeat(pad))
+                        // The tab stop, not the address, sets the line width.
+                        let masked = format!("{}PTR 0xADDR{}", &l[..at], l[hex_end..].trim_end());
+                        format!("{masked:<w$}", w = l.len())
                     }
                     None => l.to_string(),
                 })
@@ -8880,7 +8881,7 @@ mod tests {
             lgs[lgs.len() - 2..],
             [
                 "TSEL: CONSTANT      UDF : 0             UDFS: INVALID       ".to_string(),
-                "VAL : PTR 0xADDR                ".to_string(),
+                "VAL : PTR 0xADDR                        ".to_string(),
             ]
         );
     }

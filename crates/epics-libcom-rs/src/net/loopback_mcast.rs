@@ -139,9 +139,9 @@ pub fn bind_loopback_mcast(port: u16) -> std::io::Result<tokio::net::UdpSocket> 
     //
     // Set on an ephemeral port too: co-binding *is* the purpose of this
     // helper (one listener takes an ephemeral port and publishes it, the
-    // others join that same port). On 0 they go on after the bind, so the
-    // first listener cannot land in a stranger's reuse group; see
-    // `PortUse::bind`.
+    // others join that same port). On 0 they go on after the bind on unix, so
+    // the first listener cannot land in a stranger's reuse group; Windows sets
+    // them before, as C does. See `bind_fanout`.
 
     deny_unjoined_multicast(SockRef::from(&sock));
     sock.set_nonblocking(true)?;

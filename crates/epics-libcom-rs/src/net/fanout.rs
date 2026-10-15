@@ -19,8 +19,8 @@ pub enum PortUse {
     /// A `UDPCollector` socket — the PVA server search responder and the PVA
     /// client beacon listener — on any port, 0 included: `SO_REUSEADDR` +
     /// `SO_REUSEPORT`, as `epicsSocketEnableAddressUseForDatagramFanout`.
-    /// On a number of its own choosing they are set after the bind, see
-    /// [`bind_fanout`].
+    /// On unix, on a number of its own choosing, they are set after the bind;
+    /// Windows sets them before every bind. See [`bind_fanout`].
     Shared,
     /// The PVA client search socket and the CA client sockets: no reuse
     /// options, so a number somebody already holds is `EADDRINUSE` — a

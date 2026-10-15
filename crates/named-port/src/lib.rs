@@ -224,7 +224,8 @@ pub fn udp_port_is_held(port: u16) -> bool {
 /// Unix: `SO_REUSEADDR` on TCP, as std's `TcpListener` sets it, so a port
 /// left in TIME_WAIT reads free. Windows: `SO_EXCLUSIVEADDRUSE`, because a
 /// plain Winsock wildcard bind succeeds beside a socket holding the number
-/// on one address.
+/// on one address; it may read a port with connections left in TIME_WAIT as
+/// held, where unix reads it free.
 fn port_is_held(ty: Type, port: u16) -> bool {
     let sock = Socket::new(Domain::IPV4, ty, None).expect("open a probe socket");
     #[cfg(unix)]

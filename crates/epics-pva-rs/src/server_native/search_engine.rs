@@ -687,6 +687,258 @@ pub(crate) fn route_search_socket_datagram<'a>(
     }
 }
 
+/// pvxs's search listeners on the collector socket (`server.cpp:411-437`):
+/// one per [`ServerInterfaces`] address, each listed address's broadcasts,
+/// and each joined group. A wildcard entry, or none, is a listener that
+/// takes everything.
+#[cfg(not(epics_embedded_target))]
+pub(crate) struct SearchListeners {
+    any: bool,
+    listen: std::collections::HashSet<Ipv4Addr>,
+    /// Destinations another socket of this server is bound to and takes its
+    /// datagrams at; a copy on the collector is dropped.
+    taken: std::collections::HashSet<Ipv4Addr>,
+    /// Interface index to its address, pvxs `ifinfo.byIndex`.
+    by_index: std::collections::HashMap<u32, Ipv4Addr>,
+}
+
+/// Where a datagram the collector socket received goes.
+#[cfg(not(epics_embedded_target))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// The ORIGIN_TAG channel, or no `IP_PKTINFO` to tell: classify by the
+    /// first header.
+    OriginTag,
+    /// Sent to this interface address, pvxs `Forwarding`: a unicast-flagged
+    /// SEARCH is forwarded to local peers.
+    Unicast(Ipv4Addr),
+    /// Sent to a broadcast or group, pvxs `Broadcast`: answered from this
+    /// interface address, never forwarded.
+    Broadcast(Ipv4Addr),
+    /// No listener takes it, or another socket already has it.
+    Drop,
+}
+
+#[cfg(not(epics_embedded_target))]
+impl SearchListeners {
+    pub(crate) fn new(
+        server: &ServerInterfaces,
+        taken: std::collections::HashSet<Ipv4Addr>,
+        ifaces: &[epics_base_rs::net::IfaceInfo],
+    ) -> Self {
+        let interfaces = server.v4();
+        let mut listen: std::collections::HashSet<Ipv4Addr> = interfaces.iter().copied().collect();
+        // `server.cpp:433-437`: each listed interface's broadcasts.
+        listen.extend(
+            ifaces
+                .iter()
+                .filter(|i| interfaces.contains(&i.ip))
+                .filter_map(|i| i.broadcast),
+        );
+        listen.extend(server.groups.iter().map(|&(group, _)| group));
+        Self {
+            any: server.any(),
+            listen,
+            taken,
+            // Index 0 is "none reported", on an interface and on a datagram alike.
+            by_index: ifaces
+                .iter()
+                .filter(|i| i.index != 0)
+                .map(|i| (i.index, i.ip))
+                .collect(),
+        }
+    }
+
+    /// pvxs's listener predicate for a destination
+    /// (`L->dest.addr.isAny() || L->dest.addr==origDest`,
+    /// `udp_collector.cpp:451`): a forwarded datagram's is its tag's
+    /// address, or the wildcard when it carries none.
+    pub(crate) fn listens_for(&self, dest: Ipv4Addr) -> bool {
+        self.any || self.listen.contains(&dest)
+    }
+
+    /// Route a datagram by the `(destination, interface index)` its
+    /// `IP_PKTINFO` named; `None` where there is none.
+    pub(crate) fn arrival(&self, pktinfo: Option<(Ipv4Addr, u32)>) -> Arrival {
+        let Some((dest, ifindex)) = pktinfo else {
+            return Arrival::OriginTag;
+        };
+        let iface = self.by_index.get(&ifindex).copied();
+        if dest == ORIGIN_TAG_MCAST_GROUP {
+            return match iface {
+                Some(ip) if ip.is_loopback() => Arrival::OriginTag,
+                _ => Arrival::Drop,
+            };
+        }
+        if self.taken.contains(&dest) || !self.listens_for(dest) {
+            return Arrival::Drop;
+        }
+        // `:286-318`: an interface address answers from itself, a broadcast
+        // or group from an address on the arrival interface.
+        if self.by_index.values().any(|&ip| ip == dest) {
+            Arrival::Unicast(dest)
+        } else {
+            Arrival::Broadcast(iface.unwrap_or(Ipv4Addr::UNSPECIFIED))
+        }
+    }
+
+    /// A datagram on a driver's one search socket, routed by [`Self::arrival`]
+    /// and [`route_search_socket_datagram`]: the frame to decode, the NIC the
+    /// reply is pinned to, how it arrived, and whether a unicast-flagged
+    /// SEARCH may be forwarded. `None` is a datagram to drop.
+    ///
+    /// Through the group, the tag's address — or the wildcard, untagged — is
+    /// the destination a listener must match (`udp_collector.cpp:514-524`).
+    /// Without `IP_PKTINFO` only a tag says a datagram was forwarded.
+    pub(crate) fn route<'a>(
+        &self,
+        raw: &'a [u8],
+        local_v4: &std::collections::HashSet<Ipv4Addr>,
+        pktinfo: Option<(Ipv4Addr, u32)>,
+    ) -> Option<(&'a [u8], Ipv4Addr, Origin, bool)> {
+        // A direct datagram is answered, and a forward tagged, from the
+        // address pvxs takes as `replySrc` (`:286-318`).
+        let (via_group, reply_from, forward) = match self.arrival(pktinfo) {
+            Arrival::Drop => return None,
+            Arrival::OriginTag => (true, None, true),
+            Arrival::Unicast(ip) => (false, Some(ip), true),
+            // A group or broadcast SEARCH is answered, never forwarded.
+            Arrival::Broadcast(ip) => (false, Some(ip), false),
+        };
+        let (frame, dest, origin) = route_search_socket_datagram(raw, local_v4, via_group)?;
+        let forwarded = pktinfo.is_some() && via_group || origin == Origin::FromOriginTag;
+        (!forwarded || self.listens_for(dest)).then_some((
+            frame,
+            reply_from.unwrap_or(dest),
+            origin,
+            forward,
+        ))
+    }
+}
+
+/// The server's interface list after pvxs `server::Config::expand`
+/// (`config.cpp:488-523`), the one source every bind, listener, group join
+/// and beacon fan-out reads.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ServerInterfaces {
+    /// The non-multicast entries: the listed ones, then one per multicast
+    /// entry — its `@iface` address, else the wildcard (`:497-509`). Empty is
+    /// the unconfigured default.
+    pub(crate) addrs: Vec<SocketAddr>,
+    /// `(group, interface)` to join: the listed multicast entries, then
+    /// under `auto_beacon` the multicast beacon destinations (`addGroups`,
+    /// `:310-335`). The interface is `0.0.0.0` where pvxs joins on
+    /// `INADDR_ANY` (`SockEndpoint::resolve`, `:88-120`).
+    pub(crate) groups: Vec<(Ipv4Addr, Ipv4Addr)>,
+}
+
+impl ServerInterfaces {
+    /// [`Self::new`] against this host's NICs.
+    pub(crate) fn resolve(
+        interfaces: &[crate::config::Endpoint],
+        beacon_dests: &[crate::config::Endpoint],
+        auto_beacon: bool,
+    ) -> std::io::Result<Self> {
+        #[cfg(not(epics_embedded_target))]
+        let external: Vec<Ipv4Addr> = epics_base_rs::net::IfaceMap::new()?
+            .up_non_loopback()
+            .into_iter()
+            .map(|i| i.ip)
+            .collect();
+        #[cfg(epics_embedded_target)]
+        let external: Vec<Ipv4Addr> = epics_base_rs::net::iface_v4::enumerate()?
+            .into_iter()
+            .filter(|i| i.is_up() && !i.is_loopback())
+            .map(|i| i.ip)
+            .collect();
+        Ok(Self::new(interfaces, beacon_dests, auto_beacon, &external))
+    }
+
+    /// `external_nics` is pvxs `ifmap.all_external()`. An `@iface` that
+    /// does not resolve contributes neither an address nor a join (logged).
+    pub(crate) fn new(
+        interfaces: &[crate::config::Endpoint],
+        beacon_dests: &[crate::config::Endpoint],
+        auto_beacon: bool,
+        external_nics: &[Ipv4Addr],
+    ) -> Self {
+        let mut out = Self::default();
+        let iface_of =
+            |group: Ipv4Addr, spec: &str| match crate::config::env::resolve_iface_v4(spec) {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    tracing::warn!(
+                        "multicast {group}@{spec}: interface resolve failed: {e}; skipping"
+                    );
+                    None
+                }
+            };
+        let mut derived = Vec::new();
+        for ep in interfaces {
+            if !ep.addr.ip().is_multicast() {
+                out.addrs.push(ep.addr);
+                continue;
+            }
+            let SocketAddr::V4(group) = ep.addr else {
+                derived.push(SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0));
+                continue;
+            };
+            let iface = match ep.iface.as_deref() {
+                Some(spec) => match iface_of(*group.ip(), spec) {
+                    Some(ip) => ip,
+                    None => continue,
+                },
+                None => Ipv4Addr::UNSPECIFIED,
+            };
+            derived.push(SocketAddr::new(iface.into(), 0));
+            out.groups.push((*group.ip(), iface));
+        }
+        out.addrs.extend(derived);
+        if auto_beacon {
+            for ep in beacon_dests {
+                let group = match ep.addr {
+                    SocketAddr::V4(v4) if v4.ip().is_multicast() => *v4.ip(),
+                    _ => continue,
+                };
+                match ep.iface.as_deref() {
+                    Some(spec) => out
+                        .groups
+                        .extend(iface_of(group, spec).map(|ip| (group, ip))),
+                    None => out
+                        .groups
+                        .extend(external_nics.iter().map(|&ip| (group, ip))),
+                }
+            }
+        }
+        // pvxs `removeDups`: first appearance kept.
+        let mut seen = std::collections::HashSet::new();
+        out.addrs.retain(|a| seen.insert(*a));
+        let mut seen = std::collections::HashSet::new();
+        out.groups.retain(|g| seen.insert(*g));
+        out
+    }
+
+    /// The v4 entries, the wildcard included.
+    #[cfg(not(epics_embedded_target))]
+    pub(crate) fn v4(&self) -> Vec<Ipv4Addr> {
+        self.addrs
+            .iter()
+            .filter_map(|a| match a.ip() {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect()
+    }
+
+    /// pvxs `isAny` (`server.cpp:413-418`): no v4 entry, or a wildcard one,
+    /// so the v4 search listener takes every destination.
+    #[cfg(not(epics_embedded_target))]
+    pub(crate) fn any(&self) -> bool {
+        let v4 = self.v4();
+        v4.is_empty() || v4.contains(&Ipv4Addr::UNSPECIFIED)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,19 +1055,19 @@ mod tests {
             );
         }
         assert_eq!(
-            prod.matches("route_search_socket_datagram(").count(),
+            prod.matches("listeners.route(").count(),
             1,
             "the responder routes through one call"
         );
         assert!(
             prod.contains(
-                "#[cfg(not(epics_embedded_target))]\n        let routed = if origin_tag {"
+                "#[cfg(not(epics_embedded_target))]\n        let routed = match &listeners {"
             ),
             "the router call must sit under cfg(not(epics_embedded_target))"
         );
         assert!(
             prod.contains(
-                "#[cfg(epics_embedded_target)]\n        let routed = Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct));"
+                "#[cfg(epics_embedded_target)]\n        let routed = Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct, false));"
             ),
             "the embedded arm must route everything Direct"
         );
@@ -988,5 +1240,80 @@ mod tests {
                 "a non-SEARCH, non-ORIGIN_TAG first header must be dropped"
             );
         }
+    }
+
+    /// pvxs `Config::expand` (`config.cpp:497-509`) for
+    /// `EPICS_PVAS_INTF_ADDR_LIST=224.0.9.17`: the group adds the wildcard,
+    /// so every destination is listened for and joined on `INADDR_ANY`.
+    #[cfg(not(epics_embedded_target))]
+    #[test]
+    fn a_multicast_interface_without_iface_adds_the_wildcard() {
+        let group = Ipv4Addr::new(224, 0, 9, 17);
+        let intf = [crate::config::Endpoint::parse("224.0.9.17", 0).unwrap()];
+        let got = ServerInterfaces::new(&intf, &[], true, &[Ipv4Addr::new(10, 9, 0, 1)]);
+        assert_eq!(
+            got,
+            ServerInterfaces {
+                addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))],
+                groups: vec![(group, Ipv4Addr::UNSPECIFIED)],
+            }
+        );
+        assert!(got.any());
+    }
+
+    /// `127.0.0.1 224.0.9.17@<iface>`: the group adds its interface's
+    /// address, whose broadcast is then listened for, and is joined there.
+    #[cfg(not(epics_embedded_target))]
+    #[test]
+    fn a_multicast_interface_with_iface_adds_that_address() {
+        let (group, nic) = (Ipv4Addr::new(224, 0, 9, 17), Ipv4Addr::new(10, 9, 0, 1));
+        let intf: Vec<_> = ["127.0.0.1", "224.0.9.17@10.9.0.1", "224.0.9.18@no-such-nic"]
+            .iter()
+            .map(|t| crate::config::Endpoint::parse(t, 0).unwrap())
+            .collect();
+        let got = ServerInterfaces::new(&intf, &[], false, &[nic]);
+        assert_eq!(
+            got,
+            ServerInterfaces {
+                addrs: vec![
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                    SocketAddr::from((nic, 0)),
+                ],
+                groups: vec![(group, nic)],
+            }
+        );
+        assert!(!got.any());
+        let bcast = Ipv4Addr::new(10, 9, 0, 255);
+        let d0 = epics_base_rs::net::IfaceInfo {
+            index: 2,
+            name: "d0".into(),
+            ip: nic,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Some(bcast),
+            up_non_loopback: true,
+        };
+        let listeners = SearchListeners::new(&got, HashSet::new(), &[d0]);
+        for dest in [Ipv4Addr::LOCALHOST, nic, bcast, group] {
+            assert!(listeners.listens_for(dest), "{dest}");
+        }
+        assert!(!listeners.listens_for(Ipv4Addr::new(10, 8, 0, 1)));
+    }
+
+    /// `addGroups` (`config.cpp:310-335`) runs only under `auto_beacon`, and
+    /// a modifier-less beacon group is joined on every external NIC.
+    #[cfg(not(epics_embedded_target))]
+    #[test]
+    fn beacon_groups_join_only_under_auto_beacon() {
+        let nics = [Ipv4Addr::new(10, 9, 0, 1), Ipv4Addr::new(10, 8, 0, 1)];
+        let dests = [crate::config::Endpoint::parse("224.0.7.7", 5076).unwrap()];
+        let group = Ipv4Addr::new(224, 0, 7, 7);
+        assert!(
+            ServerInterfaces::new(&[], &dests, false, &nics)
+                .groups
+                .is_empty()
+        );
+        let got = ServerInterfaces::new(&[], &dests, true, &nics);
+        assert_eq!(got.groups, vec![(group, nics[0]), (group, nics[1])]);
+        assert!(got.addrs.is_empty() && got.any());
     }
 }

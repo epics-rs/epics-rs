@@ -4432,6 +4432,11 @@ pub(super) struct ConnInit {
     /// What the peer-silence watchdogs read time from: the `last_rx` stamps
     /// and the inactivity deadline.
     pub(super) liveness_clock: LivenessClock,
+    /// The port this connection was accepted on, which a TCP SEARCH reply
+    /// advertises: pvxs `iface->bind_addr.port()` (`serverchan.cpp:241`).
+    /// Listeners can differ in port, so the server-wide `tcp_port` cannot
+    /// stand in for it.
+    pub(super) local_port: u16,
 }
 
 pub(super) async fn handle_connection_io(
@@ -4450,6 +4455,7 @@ pub(super) async fn handle_connection_io(
         tx_limit_bytes,
         writer_reactor,
         liveness_clock,
+        local_port,
     } = init;
     let op_timeout = config.op_timeout;
     let idle_timeout = config.idle_timeout;
@@ -5514,7 +5520,7 @@ pub(super) async fn handle_connection_io(
                 // had no arm here and the frame fell through to
                 // the silent default — the redirector hung waiting
                 // for SEARCH_RESPONSE.
-                handle_tcp_search(&source, &frame, &tx, &config, peer).await?;
+                handle_tcp_search(&source, &frame, &tx, &config, peer, local_port).await?;
             }
             Some(Command::DestroyRequest) => {
                 handle_destroy_request(&frame, &mut channels)?;
@@ -7659,6 +7665,7 @@ async fn handle_tcp_search(
     tx: &SrvTx,
     config: &PvaServerConfig,
     peer: SocketAddr,
+    local_port: u16,
 ) -> PvaResult<()> {
     // Rebuild the raw frame bytes so the UDP parser sees the same
     // shape (header + payload). `parse_search_request` reads from
@@ -7689,14 +7696,14 @@ async fn handle_tcp_search(
     // Default protocol on TCP is "tcp" (or "tls" when TLS is in use); it
     // names the transport advertised back in the SEARCH_RESPONSE.
     let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
-    // Port advertised for `protocol`: pvxs returns `tls_port` for a
-    // protoTLS reply and `tcp_port` otherwise (src/server.cpp:849-857), so a
-    // TLS server steers the client to its dedicated TLS listener. The
-    // runtime stamps `config.tls_port` to the bound TLS port at start().
+    // Port advertised for `protocol`: a TLS server steers the client to its
+    // TLS listener (`config.tls_port`, stamped to the bound port at start()),
+    // as pvxs-tls does; plain TCP names the port this connection came in on,
+    // as pvxs 1.5.3 does (`iface->bind_addr.port()`, serverchan.cpp:241).
     let advertised_port = if config.tls.is_some() {
         config.tls_port
     } else {
-        config.tcp_port
+        local_port
     };
     // Match WITHOUT the UDP protocol gate. pvxs `handle_SEARCH` parses the
     // SEARCH protocol strings into `foundtcp` but never consults it before
@@ -16502,7 +16509,7 @@ mod tests {
         let body = build_search_body(order, 7, 0x00, &["tls"], &[(42, "MY:PV")]);
         let frame = synth_frame(Command::Search, order, body);
         let (tx, mut rx) = test_srv_tx(8);
-        handle_tcp_search(&source, &frame, &tx, &config, peer)
+        handle_tcp_search(&source, &frame, &tx, &config, peer, 5075)
             .await
             .expect("handle_tcp_search must succeed");
         let raw = rx
@@ -16523,7 +16530,7 @@ mod tests {
         let body = build_search_body(order, 9, 0x01, &["tls"], &[(43, "MY:PV")]);
         let frame = synth_frame(Command::Search, order, body);
         let (tx, mut rx) = test_srv_tx(8);
-        handle_tcp_search(&source, &frame, &tx, &config, peer)
+        handle_tcp_search(&source, &frame, &tx, &config, peer, 5075)
             .await
             .expect("handle_tcp_search must succeed");
         let raw = rx
@@ -16562,7 +16569,7 @@ mod tests {
         let body = build_search_body(order, 11, 0x00, &["tls"], &[(50, "OTHER:PV")]);
         let frame = synth_frame(Command::Search, order, body);
         let (tx, mut rx) = test_srv_tx(8);
-        handle_tcp_search(&source, &frame, &tx, &config, peer)
+        handle_tcp_search(&source, &frame, &tx, &config, peer, 5075)
             .await
             .expect("handle_tcp_search must succeed");
         assert!(

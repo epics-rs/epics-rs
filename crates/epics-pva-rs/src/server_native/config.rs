@@ -225,8 +225,12 @@ pub struct PvaServerConfig {
     /// Interfaces to bind the TCP listeners and UDP responder on. When empty,
     /// bind `bind_ip`. Each TCP listener binds its own entry's port; a port
     /// of 0 takes `tcp_port`, then the first listener's bound port
-    /// (`server.cpp:476-486`). From `EPICS_PVAS_INTF_ADDR_LIST`.
-    pub interfaces: Vec<std::net::SocketAddr>,
+    /// (`server.cpp:476-486`). A multicast entry is a search group, joined on
+    /// its `@iface` (else the default route), and adds that interface's
+    /// address (else the wildcard) as pvxs `Config::expand` does
+    /// (`config.cpp:497-509`). From `EPICS_PVAS_INTF_ADDR_LIST`; a plain
+    /// `SocketAddr` converts via `.into()`.
+    pub interfaces: Vec<crate::config::Endpoint>,
     /// PVX-82: deferred config error set by [`Self::with_env`] when
     /// `EPICS_PVAS_INTF_ADDR_LIST` named interface(s) that all failed to
     /// resolve. `PvaServer::start` refuses to bind in that case rather than

@@ -91,6 +91,8 @@ pub mod pvdata;
 pub mod server;
 pub mod server_native;
 pub mod service;
+#[cfg(all(not(epics_embedded_target), any(unix, windows)))]
+pub(crate) mod udp_rx;
 pub mod util;
 
 pub use error::{PvaError, PvaResult};

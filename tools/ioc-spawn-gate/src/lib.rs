@@ -63,19 +63,31 @@ to see what the sources say.";
 /// *derived* from the workspace's own bin targets rather than listed here —
 /// any `[[bin]]` whose name contains `ioc` counts. That is the half that would
 /// otherwise rot: a new `foo-ioc` binary joins the token set the moment its
-/// target exists, without anybody remembering this file.
+/// target exists, without anybody remembering this file. A bin whose root
+/// source builds an `IocApplication` counts whatever its name: `qsrv-rs` boots
+/// an IOC and has no `ioc` in it.
 pub fn ioc_program_tokens(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     out.insert("softioc".to_string());
     for dir in workspace_crates(root) {
         for bin in bin_targets(&dir) {
             let lower = bin.name.to_ascii_lowercase();
-            if lower.ends_with("ioc") || lower.ends_with("ioc-rs") || lower.ends_with("ioc_rs") {
+            if lower.ends_with("ioc")
+                || lower.ends_with("ioc-rs")
+                || lower.ends_with("ioc_rs")
+                || builds_an_ioc_application(&read(&dir.join(&bin.path)))
+            {
                 out.insert(lower);
             }
         }
     }
     out
+}
+
+fn builds_an_ioc_application(text: &str) -> bool {
+    let mut in_block = false;
+    text.lines()
+        .any(|raw| code_only(raw, &mut in_block).contains("IocApplication"))
 }
 
 /// One bin target, and the source cargo compiles for it.
@@ -1486,6 +1498,17 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect()
+    }
+
+    /// A bin is an IOC by what its root builds, not by a comment naming it.
+    #[test]
+    fn a_bin_building_an_ioc_application_is_an_ioc_program() {
+        assert!(builds_an_ioc_application(
+            "use epics_base_rs::server::ioc_app::IocApplication;\n"
+        ));
+        assert!(!builds_an_ioc_application(
+            "// unlike an IocApplication, this only forwards\nfn main() {}\n"
+        ));
     }
 
     fn spawn_call() -> &'static str {

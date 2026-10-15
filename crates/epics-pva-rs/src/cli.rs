@@ -454,7 +454,8 @@ pub fn effective_server_config_string() -> String {
     // pvxs prints each entry with the server port filled in.
     let interfaces = config::server_intf_addr_list()
         .into_iter()
-        .map(|mut a| {
+        .map(|ep| {
+            let mut a = ep.addr;
             if a.port() == 0 {
                 a.set_port(config::env::pvas_server_port());
             }

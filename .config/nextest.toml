@@ -279,6 +279,12 @@ test-group = 'ca_softioc'
 #                                        time at host load 10-13; the
 #                                        child's port is bound-and-released
 #                                        by the test, the client retries.
+#   binary(qsrv_rs_resolves_a_ca_link)
+#   binary(qsrv_rs_resolves_a_pva_link)
+#                                      — 0 failures in 20 runs, 2 at a
+#                                        time at host load 4-8; the same
+#                                        `qsrv_named_ports` helper, which
+#                                        retries a lost port.
 #   binary(softioc_ioc_init_starts_scanning)
 #   binary(softioc_prompt_ioc_init_starts_the_ca_server)
 #                                      — 0 failures in 20 runs, 5 at a
@@ -293,7 +299,7 @@ test-group = 'ca_softioc'
 #                                        would cost wall time and buy
 #                                        nothing.
 [[profile.default.overrides]]
-filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | package(c-ca-tools) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(qsrv_rs_sources) | binary(interop_pvxs) | binary(softioc_boot_stream_split) | binary(softioc_iocinit_line_precedes_init_record) | binary(softioc_pini_order) | binary(events_per_chan_clamp_is_reported_at_server_start) | binary(softioc_ioc_init_starts_scanning) | binary(softioc_prompt_ioc_init_starts_the_ca_server)'
+filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | package(c-ca-tools) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(qsrv_rs_sources) | binary(qsrv_rs_resolves_a_ca_link) | binary(qsrv_rs_resolves_a_pva_link) | binary(interop_pvxs) | binary(softioc_boot_stream_split) | binary(softioc_iocinit_line_precedes_init_record) | binary(softioc_pini_order) | binary(events_per_chan_clamp_is_reported_at_server_start) | binary(softioc_ioc_init_starts_scanning) | binary(softioc_prompt_ioc_init_starts_the_ca_server)'
 test-group = 'ioc_unthrottled'
 
 # Capped because nobody has measured them unthrottled.

@@ -540,36 +540,48 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(epics_env)]
     async fn search_port_is_the_broadcast_port_not_tcp_plus_one() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let udp = std::net::UdpSocket::bind("0.0.0.0:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        // SAFETY: `serial(epics_env)` holds every env-touching test off.
-        unsafe { std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string()) };
-        let server = PvaServer::from_parts(
-            Arc::new(PvDatabase::new()),
-            Some(tcp),
-            epics_base_rs::server::access_security::new_acf_cell(None),
-            None,
-            None,
-        );
-        let (tx, mut rx) = watch::channel(None);
-        let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
-        let report = loop {
-            if let Some(h) = rx.borrow_and_update().clone() {
-                break h.report();
+        // Both numbers are named and bound on every NIC, so a lost one is a
+        // retry: TCP falls back to another port (`bind_serv_iface` does that
+        // only on a refused bind), UDP fails the start while still held.
+        for _ in 0..named_port::ATTEMPTS {
+            let tcp = named_port::free_for_tcp_and_udp();
+            let udp = named_port::free_for_tcp_and_udp();
+            // SAFETY: `serial(epics_env)` holds every env-touching test off.
+            unsafe { std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string()) };
+            let server = PvaServer::from_parts(
+                Arc::new(PvDatabase::new()),
+                Some(tcp),
+                epics_base_rs::server::access_security::new_acf_cell(None),
+                None,
+                None,
+            );
+            let (tx, mut rx) = watch::channel(None);
+            let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
+            let report = loop {
+                if let Some(h) = rx.borrow_and_update().clone() {
+                    break Some(h.report());
+                }
+                if rx.changed().await.is_err() {
+                    break None;
+                }
+            };
+            run.abort();
+            let ended = run.await;
+            unsafe { std::env::remove_var("EPICS_PVAS_BROADCAST_PORT") };
+            match report {
+                Some(report) if report.tcp_port != tcp => continue,
+                Some(report) => {
+                    assert_eq!((report.tcp_port, report.udp_port), (tcp, udp));
+                    return;
+                }
+                None if named_port::udp_port_is_held(udp) => continue,
+                None => panic!("the server never reported: {ended:?}"),
             }
-            rx.changed().await.expect("server reports its ports");
-        };
-        run.abort();
-        unsafe { std::env::remove_var("EPICS_PVAS_BROADCAST_PORT") };
-        assert_eq!((report.tcp_port, report.udp_port), (tcp, udp));
+        }
+        panic!(
+            "every one of {} candidate ports was taken",
+            named_port::ATTEMPTS
+        );
     }
 
     /// `EPICS_PVAS_SERVER_PORT=0` makes the TCP port ephemeral and nothing

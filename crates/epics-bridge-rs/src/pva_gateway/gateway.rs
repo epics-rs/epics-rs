@@ -539,7 +539,12 @@ mod tests {
     #[tokio::test]
     async fn downstream_bind_failure_names_the_downstream_side() {
         let mut cfg = isolated_cfg();
-        cfg.server_config.interfaces = vec!["192.0.2.1:0".parse().unwrap()];
+        cfg.server_config.interfaces = vec![
+            "192.0.2.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        ];
         let err = PvaGateway::start(&crate::test_reactor(), cfg)
             .err()
             .expect("an unassigned interface must fail the downstream bind");

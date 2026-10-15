@@ -921,16 +921,16 @@ mod tests {
             .expect("parse");
             downstream_config(&cfg.servers[0])
         };
-        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let ep = |s: &str| epics_pva_rs::config::Endpoint::parse(s, 0).unwrap();
         assert_eq!(
             config("192.0.2.1 127.0.0.1").unwrap().interfaces,
-            vec![addr("127.0.0.1:0"), addr("192.0.2.1:0")]
+            vec![ep("127.0.0.1"), ep("192.0.2.1")]
         );
         assert_eq!(
             config("localhost 127.0.0.1:5393 224.0.2.3,5@lo")
                 .unwrap()
                 .interfaces,
-            vec![addr("127.0.0.1:0"), addr("224.0.2.3:0")]
+            vec![ep("127.0.0.1"), ep("224.0.2.3,5@lo")]
         );
         assert!(config("").unwrap().interfaces.is_empty());
         assert!(config("no-such-nic.invalid").is_err());
@@ -951,8 +951,8 @@ mod tests {
         assert_eq!(
             config.interfaces,
             vec![
-                "0.0.0.0:7000".parse::<SocketAddr>().unwrap(),
-                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+                "0.0.0.0:7000".parse::<SocketAddr>().unwrap().into(),
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap().into(),
             ]
         );
         assert_eq!(config.tcp_port, 5385);

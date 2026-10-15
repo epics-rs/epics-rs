@@ -13,11 +13,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Run `qsrv-rs --db-file db` with `env(tcp)` on candidate ports until
-/// `probe(tcp)` returns `Some` — the subject answered on the number it was
+/// Run `qsrv-rs --db-file db` plus `args(tcp)` with `env(tcp)` on candidate
+/// ports until `probe(tcp)` returns `Some` — the subject answered on the number it was
 /// told. The probe runs after `iocRun`.
 pub async fn on_a_qsrv_port<T, F, Fut>(
     db: &Path,
+    args: impl Fn(u16) -> Vec<String>,
     env: impl Fn(u16) -> Vec<(&'static str, String)>,
     probe: F,
 ) -> T
@@ -30,6 +31,7 @@ where
         let mut child = Command::new(env!("CARGO_BIN_EXE_qsrv-rs"))
             .arg("--db-file")
             .arg(db)
+            .args(args(tcp))
             .envs(env(tcp))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

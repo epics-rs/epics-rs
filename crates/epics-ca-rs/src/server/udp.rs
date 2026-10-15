@@ -1467,11 +1467,26 @@ mod responder_bind_tests {
         // none of; plain std sockets set no reuse option, so ours cannot
         // co-bind it.
         let (ip, bcast) = (Ipv4Addr::new(127, 0, 0, 3), Ipv4Addr::new(127, 0, 0, 2));
-        let held = std::net::UdpSocket::bind((bcast, 0)).expect("hold the broadcast address");
-        let port = held.local_addr().unwrap().port();
         let lookup = |i: Ipv4Addr| (i == ip).then_some(bcast);
 
-        let bound = bind_udp_responders_with(port, vec![Ipv4Addr::LOCALHOST, ip], &[], 0, &lookup)
+        // A stranger may hold the picked number on 127.0.0.1 as well; that
+        // pick says nothing about the rule, so take another, the failed hold
+        // parked so the kernel does not hand its number back.
+        let mut parked = Vec::new();
+        let (_held, port, bound) = (0..8)
+            .find_map(|_| {
+                let held =
+                    std::net::UdpSocket::bind((bcast, 0)).expect("hold the broadcast address");
+                let port = held.local_addr().unwrap().port();
+                match bind_udp_responders_with(port, vec![Ipv4Addr::LOCALHOST, ip], &[], 0, &lookup)
+                {
+                    Ok(bound) => Some((held, port, bound)),
+                    Err(_) => {
+                        parked.push(held);
+                        None
+                    }
+                }
+            })
             .expect("the other interface serves");
         assert_eq!(bound.interfaces(), [Ipv4Addr::LOCALHOST]);
         assert!(bind_udp_responders_with(port, vec![ip], &[], 0, &lookup).is_err());

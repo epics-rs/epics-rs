@@ -174,11 +174,14 @@ impl<P: FnMut() -> u16> Iterator for Candidates<P> {
 /// socket on the same number, so probing one leaves the other free to
 /// collide. A hint, never a reservation — both probe sockets are closed
 /// before this returns, and they must be, or the subject could not bind.
+///
+/// Probed on the wildcard: a subject binds every NIC, and a number free on
+/// 127.0.0.1 can already be held on one of them.
 pub fn free_for_tcp_and_udp() -> u16 {
     for _ in 0..64 {
-        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
+        let tcp = TcpListener::bind("0.0.0.0:0").expect("bind an ephemeral TCP port");
         let port = tcp.local_addr().expect("read the ephemeral port").port();
-        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+        if UdpSocket::bind(("0.0.0.0", port)).is_ok() {
             return port;
         }
     }
@@ -191,7 +194,7 @@ pub fn free_for_tcp_and_udp() -> u16 {
 /// [`free_for_tcp_and_udp`] is.
 pub fn free_tcp_with_udp_successor() -> u16 {
     for _ in 0..64 {
-        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
+        let tcp = TcpListener::bind("0.0.0.0:0").expect("bind an ephemeral TCP port");
         let port = tcp.local_addr().expect("read the ephemeral port").port();
         if port < u16::MAX && UdpSocket::bind(("0.0.0.0", port + 1)).is_ok() {
             return port;
@@ -202,10 +205,10 @@ pub fn free_tcp_with_udp_successor() -> u16 {
 
 /// Whether another socket holds `port` on TCP now: the kernel's own answer,
 /// which is the evidence a test needs before it calls a missing bind a lost
-/// race and not a regression.
+/// race and not a regression. On every interface, as [`udp_port_is_held`].
 pub fn tcp_port_is_held(port: u16) -> bool {
     matches!(
-        TcpListener::bind(("127.0.0.1", port)),
+        TcpListener::bind(("0.0.0.0", port)),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
     )
 }

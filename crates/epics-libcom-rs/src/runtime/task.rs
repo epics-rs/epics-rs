@@ -3313,6 +3313,35 @@ where
         })
 }
 
+/// [`spawn_dedicated_thread`] on a [`std::thread::Scope`], for a body that
+/// borrows from the thread that spawns it.
+pub fn spawn_dedicated_thread_scoped<'scope, F>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, ()>>
+where
+    F: FnOnce() + Send + 'scope,
+{
+    if let Some(refused) = fifo_attr_refusal(priority) {
+        return Err(refused);
+    }
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
+    let ambient = InheritedRuntime::capture();
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(stack.bytes())
+        .spawn_scoped(scope, move || {
+            let _charge = charge;
+            ambient.run(move || {
+                let _ = enter_ioc_thread(priority);
+                f()
+            })
+        })
+}
+
 /// RTEMS: no thread enters a runtime, so a pool worker is a dedicated thread.
 #[cfg(exec_backend)]
 pub(crate) fn spawn_pool_worker<F>(
@@ -5100,7 +5129,8 @@ mod tests {
                 .skip(1)
                 .enumerate()
             {
-                let (_, body) = after.split_once(".spawn(").unwrap_or((after, ""));
+                // `.spawn(` and `.spawn_scoped(` both.
+                let (_, body) = after.split_once(".spawn").unwrap_or((after, ""));
                 checked += 1;
                 // The prologue is the closure's first work, so look at the
                 // closure, not the builder chain.
@@ -5110,13 +5140,13 @@ mod tests {
             }
         }
 
-        // Three: `spawn_dedicated_thread`'s two `cfg` arms and
-        // `MandatoryThread::try_spawn`, all of which run the prologue for the
-        // caller. The floor was five until the three background facilities
+        // Four: `spawn_dedicated_thread`'s two `cfg` arms,
+        // `spawn_dedicated_thread_scoped` and `MandatoryThread::try_spawn`, all
+        // of which run the prologue for the caller. The floor was five until the three background facilities
         // moved onto `MandatoryThread`, whose constructor takes the band —
         // `every_background_facility_thread_is_mandatory` covers those files.
         assert!(
-            checked >= 3,
+            checked >= 4,
             "expected to find the crate's Builder sites, found {checked} — \
              did a file move? update this guard's file list"
         );

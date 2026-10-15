@@ -339,8 +339,8 @@ async fn tls_listener_on_every_interface_uses_tls_port() {
         let (tcp, tls) = (pick(), pick());
         let cfg = PvaServerConfig {
             interfaces: vec![
-                std::net::SocketAddr::from(([127, 0, 0, 1], tcp)),
-                std::net::SocketAddr::from(([127, 0, 0, 2], tcp)),
+                std::net::SocketAddr::from(([127, 0, 0, 1], tcp)).into(),
+                std::net::SocketAddr::from(([127, 0, 0, 2], tcp)).into(),
             ],
             tls_port: tls,
             tls: Some(server_tls.clone()),

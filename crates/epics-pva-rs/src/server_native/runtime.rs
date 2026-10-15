@@ -1,12 +1,14 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-// RTEMS-EXEC-MODEL-ALLOW(16): this file does not build on the exec backend -
+// RTEMS-EXEC-MODEL-ALLOW(17): this file does not build on the exec backend -
 // server_native/mod.rs declares it under #[cfg(tokio_backend)] mod runtime;.
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::error::{PvaError, PvaResult};
 
+use super::search_engine::ServerInterfaces;
+use super::serv_iface::tcp_bind_addresses;
 use super::source::{ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource};
 use super::udp::{random_guid, run_udp_responder_on_socket, run_udp_responder_v6};
 
@@ -59,119 +61,19 @@ where
     server.wait().await
 }
 
-/// Resolve the TCP listener bind addresses from the server interface
-/// list.
-///
-/// `EPICS_PVAS_INTF_ADDR_LIST` (`interfaces`) is the address set the
-/// server binds to; when empty it falls back to the single `bind_ip`
-/// wildcard default (pvxs `src/server.cpp:407-487` derives the TCP listener
-/// set from `effective.interfaces`). One listener is bound per specific
-/// address, in list order, so each interface is constrained at the kernel.
-/// A listed entry with no port takes `port`, the server's resolved TCP port,
-/// as pvxs writes it into every interface string (`config.cpp:166-168`).
-/// A multicast entry is a search group, never a TCP listener
-/// (`server.cpp:413-418`). Any wildcard entries become one wildcard listener
-/// after the specific ones, on port 0 whatever port the entry named
-/// (`server.cpp:413-459`); with a specific listener already on that port it
-/// fails to bind, and pvxs fails the same way.
-fn tcp_bind_addresses(interfaces: &[SocketAddr], bind_ip: IpAddr, port: u16) -> Vec<SocketAddr> {
-    let mut addrs: Vec<SocketAddr> = interfaces
-        .iter()
-        .filter(|a| !a.ip().is_multicast() && !a.ip().is_unspecified())
-        .map(|a| match a.port() {
-            0 => SocketAddr::new(a.ip(), port),
-            _ => *a,
-        })
-        .collect();
-    if let Some(wildcard) = interfaces.iter().find(|a| a.ip().is_unspecified()) {
-        addrs.push(SocketAddr::new(wildcard.ip(), 0));
-    }
-    if addrs.is_empty() {
-        addrs.push(SocketAddr::new(bind_ip, 0));
-    }
-    addrs
-}
-
-/// Bind one listener per address, pvxs `server.cpp:476-486`: an address
-/// keeps its own port and only a 0 takes `port`, which becomes the first
-/// listener's bound port. Returns the listeners and that port.
-///
-/// deliberate deviation: when every requested port is 0, an `AddrInUse` on a
-/// later interface releases the whole set and binds it again on a fresh
-/// ephemeral number. pvxs binds interface 1 on 0 and the rest on that number
-/// (`server.cpp:476-486`), so a number the kernel handed out but another
-/// socket already holds on a later address fails the start; with nothing
-/// asked for there is nothing to refuse. A non-zero request, any other
-/// error, or a collision with an address of the set itself (a wildcard
-/// beside a specific entry, a duplicate) behaves as pvxs: it fails.
+/// [`super::serv_iface::bind_serv_ifaces`], registered with tokio.
 fn bind_serv_ifaces(
     addrs: impl IntoIterator<Item = SocketAddr>,
     port: u16,
 ) -> PvaResult<(Vec<tokio::net::TcpListener>, u16)> {
-    bind_serv_ifaces_with(addrs, port, &mut |_| {})
-}
-
-/// [`bind_serv_ifaces`], calling `after_first` with the number the first
-/// interface bound before the others try it.
-fn bind_serv_ifaces_with(
-    addrs: impl IntoIterator<Item = SocketAddr>,
-    port: u16,
-    after_first: &mut dyn FnMut(u16),
-) -> PvaResult<(Vec<tokio::net::TcpListener>, u16)> {
-    const EPHEMERAL_TRIES: usize = 16;
-    let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
-    let all_ephemeral = port == 0 && addrs.iter().all(|a| a.port() == 0);
-    let mut tries = 1;
-    loop {
-        match bind_serv_ifaces_once(&addrs, port, after_first) {
-            Err((at, PvaError::Io(e)))
-                if all_ephemeral
-                    && e.kind() == std::io::ErrorKind::AddrInUse
-                    && tries < EPHEMERAL_TRIES
-                    && !addrs[..at].iter().any(|a| addresses_overlap(a, &addrs[at])) =>
-            {
-                tracing::warn!(
-                    "ephemeral server port is held on a later interface; choosing another"
-                );
-                tries += 1;
-            }
-            Err((_, e)) => return Err(e),
-            Ok(bound) => return Ok(bound),
-        }
-    }
-}
-
-/// Whether a socket on `a` and one on `b`, on one port, cannot both listen:
-/// the same address, or either one a wildcard.
-fn addresses_overlap(a: &SocketAddr, b: &SocketAddr) -> bool {
-    a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified()
-}
-
-/// One pass over the set; on failure, the index of the address that failed.
-fn bind_serv_ifaces_once(
-    addrs: &[SocketAddr],
-    mut port: u16,
-    after_first: &mut dyn FnMut(u16),
-) -> Result<(Vec<tokio::net::TcpListener>, u16), (usize, PvaError)> {
-    let mut listeners = Vec::new();
-    for (at, &(mut addr)) in addrs.iter().enumerate() {
-        if addr.port() == 0 {
-            addr.set_port(port);
-        }
-        let first = listeners.is_empty();
-        let listener = bind_serv_iface(addr, first).map_err(|e| (at, e))?;
-        let register = || -> PvaResult<_> {
-            listener.set_nonblocking(true)?;
-            let bound = listener.local_addr()?.port();
-            Ok((tokio::net::TcpListener::from_std(listener)?, bound))
-        };
-        let (tokio_listener, bound) = register().map_err(|e| (at, e))?;
-        if first {
-            port = bound;
-            after_first(port);
-        }
-        listeners.push(tokio_listener);
-    }
+    let (listeners, port) = super::serv_iface::bind_serv_ifaces(addrs, port)?;
+    let listeners = listeners
+        .into_iter()
+        .map(|l| {
+            l.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(l)
+        })
+        .collect::<std::io::Result<_>>()?;
     Ok((listeners, port))
 }
 
@@ -361,9 +263,14 @@ impl PvaServer {
         let channel_invalidator = ChannelInvalidator::new();
         dyn_source.set_channel_invalidator(channel_invalidator.clone());
 
-        // TCP bind addresses derived from `EPICS_PVAS_INTF_ADDR_LIST`
-        // (empty → single `bind_ip` default); see [`tcp_bind_addresses`].
-        let tcp_bind = tcp_bind_addresses(&config.interfaces, config.bind_ip, config.tcp_port);
+        // `EPICS_PVAS_INTF_ADDR_LIST` expanded once, for TCP, UDP and beacons.
+        let interfaces = ServerInterfaces::resolve(
+            &config.interfaces,
+            &config.beacon_destinations,
+            config.auto_beacon,
+        )?;
+        // Empty → single `bind_ip` default; see [`tcp_bind_addresses`].
+        let tcp_bind = tcp_bind_addresses(&interfaces.addrs, config.bind_ip, config.tcp_port);
 
         // Robustness: bind the TCP listener(s) synchronously here so the
         // actually-bound port is observable to client_config() before
@@ -443,18 +350,6 @@ impl PvaServer {
             config.tls_port = bound_tls_port;
         }
 
-        // v4 entries of the interface list constrain the UDP search
-        // responder bind; v6 entries (rare) are handled by the wildcard
-        // v6 responder below and are not part of the per-NIC v4 set.
-        let udp_interfaces: Vec<Ipv4Addr> = config
-            .interfaces
-            .iter()
-            .filter_map(|a| match a.ip() {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(_) => None,
-            })
-            .collect();
-
         let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
         // The port advertised for `protocol` in SEARCH replies / beacons.
         // pvxs returns `tls_port` for a protoTLS reply and `tcp_port`
@@ -477,14 +372,13 @@ impl PvaServer {
         // number, so a start that cannot hold both families fails here.
         let bound = crate::server_native::udp::bind_udp(
             config.udp_port,
-            &udp_interfaces,
-            &config.beacon_destinations,
+            &interfaces,
             config.enable_ipv6_udp,
         )?;
         config.udp_port = bound.port;
         let udp_handle = tokio::spawn(run_udp_responder_on_socket(
             bound.v4,
-            bound.lo_mcast,
+            bound.collector,
             bound.port,
             dyn_source.clone(),
             advertised_tcp_port,
@@ -497,6 +391,7 @@ impl PvaServer {
             config.auto_beacon,
             config.ignore_addrs.clone(),
             config.enable_ipv6_udp,
+            interfaces.v4(),
         ));
         // PR #205 IPv6 Stage 2: optional companion responder bound
         // to `[::]:udp_port` that answers v6 SEARCH packets. Shares
@@ -914,53 +809,6 @@ impl ServerReportHandle {
     }
 }
 
-/// Bind one server interface as pvxs `ServIface::ServIface` does
-/// (`serverconn.cpp:405-466`): with `fallback` (the first interface), a taken
-/// or forbidden port falls back once to an OS-picked one; a bind that is not
-/// recovered logs pvxs's ERR line before failing.
-fn bind_serv_iface(addr: SocketAddr, mut fallback: bool) -> PvaResult<std::net::TcpListener> {
-    let mut bind_addr = addr;
-    loop {
-        match std::net::TcpListener::bind(bind_addr) {
-            Ok(listener) => {
-                let name = listener.local_addr()?;
-                if addr.port() != 0 && name.port() != addr.port() {
-                    tracing::warn!(
-                        "Server unable to bind port {}, falling back to {name}",
-                        addr.port()
-                    );
-                }
-                return Ok(listener);
-            }
-            Err(e)
-                if fallback
-                    && matches!(
-                        e.kind(),
-                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
-                    ) =>
-            {
-                tracing::debug!(
-                    "Address {} in use or not permitted: {e}",
-                    crate::config::env::sock_addr_text(bind_addr)
-                );
-                bind_addr.set_port(0);
-                fallback = false;
-            }
-            Err(e) => {
-                // pvxs's suffix tracks the flag, so an interface bound
-                // without a fallback says "after fallback" too.
-                tracing::error!(
-                    "Bind to {} fails{} with {}",
-                    crate::config::env::sock_addr_text(bind_addr),
-                    if fallback { "" } else { " after fallback" },
-                    e.raw_os_error().unwrap_or(0)
-                );
-                return Err(PvaError::Io(e));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tcp_fallback_tests {
     //! pvxs parity for multi-server-on-one-host: when the requested
@@ -970,6 +818,7 @@ mod tcp_fallback_tests {
     //! single retry).
     use super::*;
     use crate::server_native::SharedSource;
+    use std::net::{IpAddr, Ipv4Addr};
     // `Duration` left this module with `PvaServerConfig` (now `super::config`);
     // the config-building tests below still spell it out.
     use std::time::Duration;
@@ -1016,6 +865,35 @@ mod tcp_fallback_tests {
 
         drop(server);
         drop(blocker);
+    }
+
+    /// pvxs `serverchan.cpp:241`: a TCP SEARCH reply names the port of the
+    /// listener the connection came in on, not one server-wide number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tcp_search_reply_names_the_port_it_arrived_on() {
+        use crate::server_native::SharedPV;
+        use crate::server_native::blocking::tests::{tcp_search_port, two_port_config};
+        let (server, other) = named_port::on_a_named_port(|other| {
+            let config = PvaServerConfig {
+                udp_port: 0,
+                ..two_port_config(other)
+            };
+            let source = SharedSource::new();
+            source.add("dut", SharedPV::new());
+            match PvaServer::start(Arc::new(source), config) {
+                Ok(server) => Some((server, other)),
+                Err(PvaError::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(e) => panic!("start the PVA server: {e}"),
+            }
+        });
+        let first = server.report().tcp_port;
+        assert_ne!(first, other);
+        for (ip, port) in [
+            (Ipv4Addr::LOCALHOST, first),
+            (Ipv4Addr::new(127, 0, 0, 2), other),
+        ] {
+            assert_eq!(tcp_search_port(SocketAddr::from((ip, port))), port);
+        }
     }
 
     /// The fallback says so in pvxs's words, at WARN: softIocPVX 1.5.3 on a
@@ -1073,7 +951,7 @@ mod tcp_fallback_tests {
                 tcp_port: port,
                 udp_port: 0,
                 bind_ip: unassigned,
-                interfaces,
+                interfaces: interfaces.into_iter().map(Into::into).collect(),
                 auto_beacon: false,
                 beacon_destinations: Vec::new(),
                 ..Default::default()
@@ -1719,7 +1597,7 @@ mod tcp_fallback_tests {
             tcp_port: 0,
             udp_port: 0,
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            interfaces: vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)],
+            interfaces: vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0).into()],
             auto_beacon: false,
             beacon_destinations: Vec::new(),
             ..Default::default()
@@ -1822,7 +1700,7 @@ mod tcp_fallback_tests {
             tcp_port: 0,
             udp_port: 0,
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            interfaces: vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)],
+            interfaces: vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0).into()],
             auto_beacon: false,
             beacon_destinations: Vec::new(),
             ..Default::default()
@@ -2201,92 +2079,5 @@ mod ports_are_read_back_not_probed {
         let cfg = super::PvaServerConfig::isolated();
         assert_eq!(cfg.tcp_port, 0);
         assert_eq!(cfg.udp_port, 0);
-    }
-}
-
-#[cfg(test)]
-#[cfg(tokio_backend)]
-mod serv_iface_tests {
-    use super::*;
-
-    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
-        list.iter().map(|a| a.parse().unwrap()).collect()
-    }
-
-    /// Binds with `held` called on each first-picked number; returns the
-    /// result and every number tried.
-    fn bind_counting(
-        list: &[&str],
-        port: u16,
-        mut held: impl FnMut(usize, u16),
-    ) -> (PvaResult<(Vec<tokio::net::TcpListener>, u16)>, Vec<u16>) {
-        let mut tried = Vec::new();
-        let r = bind_serv_ifaces_with(addrs(list), port, &mut |p| {
-            held(tried.len(), p);
-            tried.push(p);
-        });
-        (r, tried)
-    }
-
-    fn io_kind(r: PvaResult<(Vec<tokio::net::TcpListener>, u16)>) -> std::io::ErrorKind {
-        match r {
-            Err(PvaError::Io(e)) => e.kind(),
-            other => panic!("{:?}", other.map(|(_, p)| p)),
-        }
-    }
-
-    #[tokio::test]
-    async fn an_ephemeral_number_held_on_a_later_interface_is_chosen_again() {
-        let mut held = Vec::new();
-        let mut held_ports = Vec::new();
-        let (r, tried) = bind_counting(&["127.0.0.1:0", "127.0.0.2:0"], 0, |n, port| {
-            if n < 2 {
-                // A number the kernel hands out twice is already held.
-                if let Ok(l) = std::net::TcpListener::bind(("127.0.0.2", port)) {
-                    held.push(l);
-                }
-                held_ports.push(port);
-            }
-        });
-        let (listeners, port) = r.expect("bind");
-        assert!(tried.len() >= 3, "{tried:?}");
-        assert_eq!(*tried.last().unwrap(), port);
-        assert!(!held_ports.contains(&port), "{held_ports:?} {port}");
-        let bound: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-        assert_eq!(
-            bound,
-            ["127.0.0.1", "127.0.0.2"].map(|a| SocketAddr::new(a.parse().unwrap(), port))
-        );
-    }
-
-    /// A requested number is never replaced: the later interface fails the
-    /// start on the first try, as in pvxs.
-    #[tokio::test]
-    async fn a_requested_number_held_on_a_later_interface_fails_the_start() {
-        let held = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
-        let port = held.local_addr().unwrap().port();
-        let list = [format!("127.0.0.1:{port}"), format!("127.0.0.2:{port}")];
-        let (r, tried) = bind_counting(&[&list[0], &list[1]], port, |_, _| {});
-        assert_eq!(io_kind(r), std::io::ErrorKind::AddrInUse);
-        assert_eq!(tried.len(), 1, "{tried:?}");
-    }
-
-    /// Only a collision with a stranger is retried: anything else a later
-    /// interface reports ends the start at once.
-    #[tokio::test]
-    async fn another_error_on_a_later_interface_is_not_retried() {
-        // 192.0.2.1 (TEST-NET-1) is on no interface of this host.
-        let (r, tried) = bind_counting(&["127.0.0.1:0", "192.0.2.1:0"], 0, |_, _| {});
-        assert_eq!(io_kind(r), std::io::ErrorKind::AddrNotAvailable);
-        assert_eq!(tried.len(), 1, "{tried:?}");
-    }
-
-    /// A wildcard beside a specific entry collides with the set's own
-    /// listener, which no other number cures.
-    #[tokio::test]
-    async fn a_wildcard_beside_a_specific_entry_fails_on_the_first_try() {
-        let (r, tried) = bind_counting(&["127.0.0.1:0", "0.0.0.0:0"], 0, |_, _| {});
-        assert_eq!(io_kind(r), std::io::ErrorKind::AddrInUse);
-        assert_eq!(tried.len(), 1, "{tried:?}");
     }
 }

@@ -161,13 +161,18 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
     let local_v4 = local_non_loopback_v4()
         .expect("no non-loopback IPv4 on this host; the pvxs beacon test needs one");
 
-    // Pick an ephemeral UDP port to act as the agreed beacon /
-    // search broadcast port between pvxs and the Rust client.
-    let beacon_port: u16 = {
-        let s = std::net::UdpSocket::bind((local_v4, 0)).unwrap();
-        let p = s.local_addr().unwrap().port();
-        drop(s);
-        p
+    // The agreed beacon / search broadcast port between pvxs and the Rust
+    // client, which binds it on every non-loopback NIC: owned on the
+    // wildcard and opened to that fanout co-bind, so nobody else can take
+    // it on any of them before the client has.
+    let (beacon_holder, beacon_port) = {
+        use epics_base_rs::net::{PortOrigin, PortUse};
+        use socket2::{Domain, Protocol, Socket, Type};
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let any = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
+        PortUse::Shared.bind(&s, any, PortOrigin::Chosen).unwrap();
+        let p = s.local_addr().unwrap().as_socket().unwrap().port();
+        (s, p)
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("beacon.db");
@@ -240,6 +245,9 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
     // Listening before softIocPVX starts: pvxs sends one beacon at start
     // and the next 15 s later (server.cpp beaconIntervalShort).
     let mut rx = client.discover().await.expect("client.discover()");
+    // The client holds the number now; the holder would take a share of the
+    // beacons.
+    drop(beacon_holder);
 
     let (ioc, tcp_addr) =
         match super::interop_helpers::start_pvxs(&logs, build, super::interop_helpers::ioc_ready) {

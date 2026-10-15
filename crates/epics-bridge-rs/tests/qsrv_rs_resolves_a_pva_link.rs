@@ -44,6 +44,7 @@ async fn qsrv_rs_resolves_a_pva_link_as_soft_ioc_pva() {
     .unwrap();
     let got = qsrv_named_ports::on_a_qsrv_port(
         &db,
+        |_| Vec::new(),
         |tcp| {
             let udp = tcp + 1;
             vec![

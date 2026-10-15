@@ -8,8 +8,9 @@
 //! ```
 #![cfg(all(feature = "qsrv-bin", unix, tokio_backend))]
 
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::process::{Command, Stdio};
+mod qsrv_named_ports;
+
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use epics_pva_rs::client::PvaClient;
@@ -42,57 +43,44 @@ async fn a_single_record_and_a_group_answer_as_softiocpvx() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.db");
     std::fs::write(&db, DB).unwrap();
-    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_qsrv-rs"))
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--db-file")
-        .arg(&db)
-        .env("EPICS_PVAS_BROADCAST_PORT", "0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn qsrv-rs");
-    let server = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let client = PvaClient::builder()
-        .server_addr(server)
-        .timeout(Duration::from_secs(2))
-        .build();
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let group = loop {
-        match client.pvget_from("G", server).await {
-            Ok(v) => break v,
-            Err(e) if std::time::Instant::now() > deadline => {
-                let _ = child.kill();
-                panic!("qsrv-rs never served G: {e}");
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    };
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let sub = client
-        .pvmonitor_handle_from(
-            "A",
-            server,
-            move |_, v| {
-                let _ = tx.send(v.clone());
-            },
-            |_| {},
-        )
-        .await
-        .expect("monitor A");
-    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-    drop(sub);
-    let _ = child.kill();
-    let _ = child.wait();
-    let first = first.expect("no monitor event on A").unwrap();
+    // qsrv-rs binds the named port on every NIC; a loss is a retry only on
+    // the console's evidence (`qsrv_named_ports`).
+    let (group, first) = qsrv_named_ports::on_a_qsrv_port(
+        &db,
+        |tcp| vec!["--port".into(), tcp.to_string()],
+        |_| vec![("EPICS_PVAS_BROADCAST_PORT", "0".into())],
+        |tcp| async move {
+            let server = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp));
+            let client = PvaClient::builder()
+                .server_addr(server)
+                .timeout(Duration::from_secs(2))
+                .build();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let group = loop {
+                match client.pvget_from("G", server).await {
+                    Ok(v) => break v,
+                    Err(_) if std::time::Instant::now() > deadline => return None,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let sub = client
+                .pvmonitor_handle_from(
+                    "A",
+                    server,
+                    move |_, v| {
+                        let _ = tx.send(v.clone());
+                    },
+                    |_| {},
+                )
+                .await
+                .expect("monitor A");
+            let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            drop(sub);
+            Some((group, first.expect("no monitor event on A").unwrap()))
+        },
+    )
+    .await;
 
     assert_eq!(leaf(&first, "value"), &ScalarValue::Double(1.5));
     assert_eq!(leaf(&first, "alarm.status"), &ScalarValue::Int(2));

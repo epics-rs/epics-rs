@@ -5437,21 +5437,32 @@ mod tests {
     /// with the default v6 multicast group joined. Confirms the
     /// plumbing — without it the recv arm in `run_engine` never
     /// fires for v6 beacons.
+    /// A v6 number this test owns on `[::]`, where the beacon socket binds:
+    /// picked by the kernel, then opened to the beacon socket's fanout
+    /// co-bind, so nobody else can take it while the test hands it over.
+    #[cfg(tokio_backend)]
+    fn hold_v6_beacon_port() -> (socket2::Socket, u16) {
+        use epics_base_rs::net::{PortOrigin, PortUse};
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("v6 socket");
+        s.set_only_v6(true).expect("v6 only");
+        let any = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+        PortUse::Shared
+            .bind(&s, any, PortOrigin::Chosen)
+            .expect("v6 holder bind");
+        let port = s.local_addr().unwrap().as_socket().unwrap().port();
+        (s, port)
+    }
+
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(epics_env)]
     async fn v6_beacon_socket_binds_and_joins_default_group() {
         // Use a unique broadcast port for this test so we don't fight
         // a parallel test or a local pva-rs IOC for the well-known
-        // 5076 socket. Picks via OS-coordinated probe, drops, then
-        // passes the port directly to `bind_beacon_udp_v6`.
-        let pick_port = || {
-            let s = std::net::UdpSocket::bind("[::1]:0").expect("v6 probe bind");
-            let p = s.local_addr().unwrap().port();
-            drop(s);
-            p
-        };
-        let port = pick_port();
+        // 5076 socket.
+        let (_holder, port) = hold_v6_beacon_port();
 
         let sock = bind_beacon_udp_v6(port)
             .expect("v6 beacon socket must bind on a host with IPv6 enabled");
@@ -5479,15 +5490,9 @@ mod tests {
     async fn v6_beacon_arriving_at_engine_is_observed_by_tracker() {
         use crate::proto::{ByteOrder, Command, PvaHeader, WriteExt};
 
-        // Pick a free v6 UDP port. The engine's v6 beacon socket and
-        // our sender both target this port.
-        let pick_port = || {
-            let s = std::net::UdpSocket::bind("[::1]:0").expect("probe");
-            let p = s.local_addr().unwrap().port();
-            drop(s);
-            p
-        };
-        let port = pick_port();
+        // The engine's v6 beacon socket and our sender both target this
+        // port.
+        let (holder, port) = hold_v6_beacon_port();
         let port_str = port.to_string();
         // Suppress v4 search destinations so the engine's broadcast
         // loop has nothing useful to fire.
@@ -5500,6 +5505,9 @@ mod tests {
         let engine = SearchEngine::spawn(&crate::test_reactor(), Vec::new(), Vec::new())
             .await
             .expect("spawn engine");
+        // The engine holds the number now; the holder would take a share of
+        // the beacons.
+        drop(holder);
         // Give the engine a moment to bind sockets and enter its
         // select loop.
         tokio::time::sleep(Duration::from_millis(50)).await;

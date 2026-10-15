@@ -147,7 +147,7 @@
 //! exist is not, yet. The hosted build joins the group on its one search socket
 //! ([`bind_udp_search`]).
 
-// RTEMS-EXEC-MODEL-ALLOW(20): checked - all 20 run and pass in the
+// RTEMS-EXEC-MODEL-ALLOW(22): checked - all 22 run and pass in the
 // exec-backend suite. The three inactivity-deadline tests were added to the
 // count after running them there: the deadline they exercise lives in the
 // writer task, which is the same task on both backends. So was the
@@ -182,7 +182,8 @@ use super::search_engine::{
     Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
 };
 #[cfg(not(epics_embedded_target))]
-use super::search_engine::{local_v4_addrs, route_search_socket_datagram};
+use super::search_engine::{SearchListeners, ServerInterfaces, local_v4_addrs};
+use super::serv_iface::ServListeners;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, TX_LIMIT_FALLBACK, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
@@ -665,13 +666,12 @@ pub(super) fn serve_connection_blocking(
 /// connection is registered with `tls = false` and authenticates through
 /// CONNECTION_VALIDATION.
 pub struct BlockingPvaServer {
-    listener: TcpListener,
+    listeners: ServListeners,
     source: DynSource,
     config: PvaServerConfig,
     peers: Arc<PeerRegistry>,
     channel_invalidator: ChannelInvalidator,
     connections: Arc<ConnRegistry>,
-    tcp_port: u16,
     active: Arc<AtomicUsize>,
     /// The connection's three threads — connection body, reader pump, writer
     /// pump — are borrowed from this pool as one set, never created per accept.
@@ -723,25 +723,16 @@ impl BlockingPvaServer {
     /// constructed server *is* a listening server: [`tcp_port`](Self::tcp_port)
     /// is answerable before any thread exists, and the port is never probed,
     /// released and re-bound.
+    ///
+    /// One listener per entry of `config.interfaces` after pvxs expansion
+    /// (`ServListeners::bind`); `addr` is the listener when that list is
+    /// empty and the port an entry without one takes.
     pub fn bind<A: ToSocketAddrs>(
         addr: A,
         source: DynSource,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        // Same reason as the CA blocking driver's `bind`: on RTEMS `bind`
-        // succeeds and `local_addr` fails (libc omits the BSD `sin_len`
-        // byte), so these two failures must stay distinguishable rather than
-        // both surfacing as "cannot bind".
-        let tcp_port = listener
-            .local_addr()
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("bind() succeeded; local_addr() on the listener failed: {e}"),
-                )
-            })?
-            .port();
+        let listeners = ServListeners::bind(addr, &config)?;
         // One GUID per server, stamped here for the same reason the hosted
         // runtime stamps it in `start()` (`runtime.rs:224-229`): the
         // TCP-circuit SEARCH handler reads it out of its per-connection config
@@ -758,6 +749,9 @@ impl BlockingPvaServer {
         // moment the problem is visible at all.
         let mut config = config;
         config.guid = random_guid()?;
+        // The bound port, after any fallback, as the hosted runtime stamps it:
+        // `config` is the one record of it, read by the UDP responder.
+        config.tcp_port = listeners.port();
         // The reserved `__server` composition, identical to the one
         // `PvaServer::start` performs — this driver used to bind the user
         // source directly, which left it with no server meta-channel and made
@@ -780,13 +774,12 @@ impl BlockingPvaServer {
         let task_exec = pva_executor(PVA_TASK_EXECUTOR)?;
         let writer_exec = pva_executor(PVA_WRITER_EXECUTOR)?;
         Ok(Self {
-            listener,
+            listeners,
             source,
             config,
             peers: PeerRegistry::new(),
             channel_invalidator,
             connections: Arc::new(ConnRegistry::new()),
-            tcp_port,
             active: Arc::new(AtomicUsize::new(0)),
             // `PVAS`: RTEMS truncates thread names at 16 bytes, and the pool
             // appends `-{suffix} {index}` (e.g. `PVAS-reader 3`). Capacity is
@@ -801,12 +794,12 @@ impl BlockingPvaServer {
     /// The actual bound address — the value to use when the configured port
     /// was 0.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listeners.local_addr()
     }
 
     /// The bound TCP port, as SEARCH replies must advertise it.
     pub fn tcp_port(&self) -> u16 {
-        self.tcp_port
+        self.config.tcp_port
     }
 
     /// This server's GUID, as both SEARCH paths advertise it.
@@ -840,7 +833,7 @@ impl BlockingPvaServer {
             socket,
             &self.source,
             &self.config,
-            self.tcp_port,
+            self.config.tcp_port,
             &self.shutdown,
         )
     }
@@ -878,13 +871,19 @@ impl BlockingPvaServer {
     /// give it a thread of its own rather than calling it on a thread that has
     /// other work.
     pub fn serve(&self, reactor: &epics_base_rs::runtime::task::Reactor) {
-        let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
         // From here down `reactor` is the server's own — see the reactor
         // driver's `serve`. It carries the per-connection writer task, which
         // is this driver's one spawned future.
         let reactor = &self.conn_reactor(reactor);
+        self.listeners
+            .serve(|listener| self.accept_loop(listener, reactor));
+    }
+
+    /// One listener's accept loop, on its own thread.
+    fn accept_loop(&self, listener: &TcpListener, reactor: &epics_base_rs::runtime::task::Reactor) {
+        let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
         let mut backoff = AcceptBackoff::new();
-        for stream in self.listener.incoming() {
+        for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     backoff.accepted();
@@ -949,6 +948,7 @@ impl BlockingPvaServer {
         stream: TcpStream,
         peer: SocketAddr,
     ) -> io::Result<()> {
+        let local_port = stream.local_addr()?.port();
         // One atomic borrow of all three roles — connection body, reader pump,
         // writer pump — so a server at capacity can never hold a partial set and
         // block for the rest.
@@ -1018,6 +1018,7 @@ impl BlockingPvaServer {
             tx_limit_bytes: tx_limit_bytes(&stream),
             writer_reactor: self.writer_reactor(reactor),
             liveness_clock: LivenessClock::System,
+            local_port,
         };
         let conn_reactor = reactor.clone();
         conn_worker.run_detached(format!("PVA connection {peer}"), move || {
@@ -1062,9 +1063,7 @@ impl BlockingPvaServer {
     /// observe them gone watches [`active_connections`](Self::active_connections).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Ok(addr) = self.listener.local_addr() {
-            let _ = TcpStream::connect(addr);
-        }
+        self.listeners.wake();
         self.connections.stop();
     }
 }
@@ -1136,8 +1135,8 @@ pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<SearchSocket> {
     #[cfg(not(epics_embedded_target))]
     if origin_tag {
         epics_base_rs::net::enable_loopback_mcast(socket2::SockRef::from(&socket));
-        #[cfg(target_os = "linux")]
-        enable_recv_pktinfo(&socket)?;
+        #[cfg(any(unix, windows))]
+        crate::udp_rx::enable(&socket, false)?;
     }
     Ok(SearchSocket { socket, origin_tag })
 }
@@ -1272,102 +1271,27 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     UdpSocket::bind(addr)
 }
 
-/// Ask for each datagram's destination address and arrival interface, which
-/// [`recv_search_datagram`] reads (pvxs `sock.enable_IP_PKTINFO()`).
-#[cfg(target_os = "linux")]
-fn enable_recv_pktinfo(socket: &UdpSocket) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let on: libc::c_int = 1;
-    // SAFETY: `on` outlives the call and the length is its size.
-    let rc = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_PKTINFO,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Receive one datagram, and whether it came in on loopback addressed to the
-/// ORIGIN_TAG group: the only way pvxs honours a tag (`origin = Forwarded` at
-/// `udp_collector.cpp:278`; any other `CMD_ORIGIN_TAG` is ignored, `:522`).
+/// Receive one datagram, with the `(destination, interface index)` of its
+/// arrival ([`crate::udp_rx`]) — what pvxs reads to tell a forward from a
+/// direct datagram (`origin = Forwarded` at `udp_collector.cpp:278`; any other
+/// `CMD_ORIGIN_TAG` is ignored, `:522`) and which listener takes it.
 ///
-/// Linux reads it from the `IP_PKTINFO` that [`bind_udp_search`] enabled. A
-/// platform without that receive path cannot tell, and reports every datagram
-/// as having come through the group, so a tag sent to the unicast port is
+/// Only the ORIGIN_TAG socket asked for it ([`bind_udp_search`]); a datagram
+/// with none is read as the group's, so a tag sent to the unicast port is
 /// honoured there.
 fn recv_search_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
     origin_tag: bool,
-) -> io::Result<(usize, SocketAddr, bool)> {
-    #[cfg(target_os = "linux")]
+) -> io::Result<(usize, SocketAddr, Option<(Ipv4Addr, u32)>)> {
+    #[cfg(all(not(epics_embedded_target), any(unix, windows)))]
     if origin_tag {
-        return recv_with_pktinfo(socket, buf);
+        let d = crate::udp_rx::recv(socket, buf)?;
+        return Ok((d.len, d.src, d.v4_pktinfo()));
     }
-    #[cfg(not(target_os = "linux"))]
     let _ = origin_tag;
     let (len, src) = socket.recv_from(buf)?;
-    Ok((len, src, true))
-}
-
-#[cfg(target_os = "linux")]
-fn recv_with_pktinfo(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, bool)> {
-    use std::mem::{size_of, zeroed};
-    use std::os::fd::AsRawFd;
-    use std::sync::OnceLock;
-
-    static LOOPBACK_IFINDEX: OnceLock<u32> = OnceLock::new();
-    // SAFETY: `c"lo"` is NUL-terminated.
-    let lo = *LOOPBACK_IFINDEX.get_or_init(|| unsafe { libc::if_nametoindex(c"lo".as_ptr()) });
-
-    // SAFETY: every pointer handed to `recvmsg` points at a local that outlives
-    // the call, `control` is `CMSG_SPACE` of the one `in_pktinfo` expected and
-    // 8-aligned for `cmsghdr`, and the cmsg walk stays inside `msg_controllen`.
-    unsafe {
-        let mut addr: libc::sockaddr_in = zeroed();
-        let mut iov = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let cmsg_space = libc::CMSG_SPACE(size_of::<libc::in_pktinfo>() as u32) as usize;
-        let mut control = vec![0u64; cmsg_space.div_ceil(size_of::<u64>())];
-        let mut msg: libc::msghdr = zeroed();
-        msg.msg_name = &mut addr as *mut _ as *mut libc::c_void;
-        msg.msg_namelen = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_space as _;
-        let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut via_group = false;
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_PKTINFO {
-                let info = std::ptr::read(libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo);
-                let dst = Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr));
-                via_group = lo != 0
-                    && info.ipi_ifindex as u32 == lo
-                    && dst == epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP;
-            }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
-        let src = SocketAddr::from((
-            Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
-            u16::from_be(addr.sin_port),
-        ));
-        Ok((n as usize, src, via_group))
-    }
+    Ok((len, src, None))
 }
 
 /// Send a SEARCH reply from `socket`, with `iface_ip` as its source address
@@ -1498,13 +1422,19 @@ fn answer_udp_search(
     socket
         .set_read_timeout(Some(UDP_STOP_TICK))
         .map_err(PvaError::Io)?;
+    #[cfg(not(epics_embedded_target))]
+    let listeners = if origin_tag {
+        Some(search_listeners(&socket, config).map_err(PvaError::Io)?)
+    } else {
+        None
+    };
     let _ = enter_ioc_thread(PVA_UDP_PRIORITY);
     let mut buf = vec![0u8; UDP_RECV_BUF];
     #[cfg(epics_embedded_target)]
     let _ = &local_v4;
 
     while !shutdown.load(Ordering::Acquire) {
-        let (len, src, via_group) = match recv_search_datagram(&socket, &mut buf, origin_tag) {
+        let (len, src, pktinfo) = match recv_search_datagram(&socket, &mut buf, origin_tag) {
             Ok(v) => v,
             // The stop tick fired; nothing arrived. Re-check the flag.
             Err(ref e) if is_socket_timeout(e.kind()) => continue,
@@ -1527,17 +1457,16 @@ fn answer_udp_search(
         }
 
         #[cfg(not(epics_embedded_target))]
-        let routed = if origin_tag {
-            route_search_socket_datagram(&buf[..len], &local_v4, via_group)
-        } else {
-            Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct))
+        let routed = match &listeners {
+            Some(listeners) => listeners.route(&buf[..len], &local_v4, pktinfo),
+            None => Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct, false)),
         };
         // An embedded build has no ORIGIN_TAG, so nothing asks where it arrived.
         #[cfg(epics_embedded_target)]
-        let _ = via_group;
+        let _ = pktinfo;
         #[cfg(epics_embedded_target)]
-        let routed = Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct));
-        let Some((frame, reply_iface_ip, origin)) = routed else {
+        let routed = Some((&buf[..len], Ipv4Addr::UNSPECIFIED, Origin::Direct, false));
+        let Some((frame, reply_iface_ip, origin, forward)) = routed else {
             continue;
         };
 
@@ -1546,7 +1475,7 @@ fn answer_udp_search(
         // same, since this loop owns its thread outright.
         let outputs = match block_on_sync(process_search_datagram(
             source,
-            origin_tag,
+            forward,
             config.udp_port,
             frame,
             src,
@@ -1588,6 +1517,28 @@ fn answer_udp_search(
         }
     }
     Ok(())
+}
+
+/// The collector's listeners for `config`, with its beacon groups joined on
+/// `socket` — the tokio backend's `bind_udp` plan on one wildcard socket.
+#[cfg(not(epics_embedded_target))]
+fn search_listeners(socket: &UdpSocket, config: &PvaServerConfig) -> io::Result<SearchListeners> {
+    let interfaces = ServerInterfaces::resolve(
+        &config.interfaces,
+        &config.beacon_destinations,
+        config.auto_beacon,
+    )?;
+    let sock = socket2::SockRef::from(socket);
+    for &(group, iface) in &interfaces.groups {
+        if let Err(e) = sock.join_multicast_v4(&group, &iface) {
+            debug!("join {group}@{iface} failed: {e}");
+        }
+    }
+    Ok(SearchListeners::new(
+        &interfaces,
+        Default::default(),
+        &epics_base_rs::net::IfaceMap::new()?.all(),
+    ))
 }
 
 #[cfg(test)]
@@ -1654,7 +1605,7 @@ pub(super) mod tests {
             ("server_native/accept.rs", include_str!("accept.rs")),
             ("server_native/reactor.rs", include_str!("reactor.rs")),
         ] {
-            let loops = src.matches(concat!("self.listener.inco", "ming()")).count()
+            let loops = src.matches(concat!("listener.inco", "ming()")).count()
                 + src
                     .matches(concat!("res = listener.acc", "ept() => res,"))
                     .count();
@@ -1910,6 +1861,7 @@ pub(super) mod tests {
                         tx_limit_bytes: TX_LIMIT_FALLBACK,
                         writer_reactor: crate::test_reactor(),
                         liveness_clock,
+                        local_port: 5075,
                     },
                     &registry,
                 )
@@ -1956,6 +1908,29 @@ pub(super) mod tests {
         PvaServerConfig {
             wire_byte_order: ByteOrder::Little,
             ..PvaServerConfig::isolated()
+        }
+    }
+
+    /// The port a TCP SEARCH for `dut`, sent over a connection to `addr`, is
+    /// told to connect to.
+    pub(crate) fn tcp_search_port(addr: SocketAddr) -> u16 {
+        let mut client = TestClient::connect(addr);
+        let codec = crate::codec::PvaCodec { big_endian: false };
+        client.send(&codec.build_search(1, 7, "dut", [0; 4], 0, true));
+        let body = client.read_until(Command::SearchResponse);
+        client.close();
+        // GUID (12), seq (4), server address (16), then the port.
+        u16::from_le_bytes([body[32], body[33]])
+    }
+
+    /// Two interfaces on two ports: the first ephemeral, the second the
+    /// named `other`.
+    pub(crate) fn two_port_config(other: u16) -> PvaServerConfig {
+        PvaServerConfig {
+            interfaces: ["127.0.0.1:0".to_string(), format!("127.0.0.2:{other}")]
+                .map(|a| a.parse::<SocketAddr>().unwrap().into())
+                .to_vec(),
+            ..isolated_config()
         }
     }
 
@@ -2226,6 +2201,7 @@ pub(super) mod tests {
                 tx_limit_bytes: TX_LIMIT_FALLBACK,
                 writer_reactor: crate::test_reactor(),
                 liveness_clock: LivenessClock::System,
+                local_port: 5075,
             },
             &ConnRegistry::new(),
         )
@@ -3513,6 +3489,79 @@ pub(super) mod tests {
         stop_and_join(&server, accept);
     }
 
+    /// pvxs binds one listener per expanded interface and never the bind
+    /// address beside them (`server.cpp:476-486`): each listed address
+    /// serves, the wildcard stays free, and shutdown wakes every accept loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_listed_interface_gets_a_listener_and_nothing_else() {
+        let config = PvaServerConfig {
+            interfaces: ["127.0.0.1:0", "127.0.0.2:0"]
+                .map(|a| a.parse::<SocketAddr>().unwrap().into())
+                .to_vec(),
+            ..isolated_config()
+        };
+        let server = Arc::new(
+            BlockingPvaServer::bind((Ipv4Addr::UNSPECIFIED, 0), test_source(), config)
+                .expect("bind the blocking PVA server"),
+        );
+        let port = server.tcp_port();
+        TcpListener::bind((Ipv4Addr::new(127, 0, 0, 3), port))
+            .expect("the wildcard must not be bound beside the listed interfaces");
+        let serving = server.clone();
+        let accept = spawn_dedicated_thread(
+            "test-PVAS-accept".into(),
+            PVA_SERVER_PRIORITY,
+            StackSizeClass::Medium,
+            move || serving.serve(&harness_reactor()),
+        )
+        .expect("accept thread spawned");
+        for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)] {
+            let client = TestClient::connect(SocketAddr::from((ip, port)));
+            eventually("the connection is served", || {
+                server.active_connections() == 1
+            });
+            client.close();
+            eventually("the connection is gone", || {
+                server.active_connections() == 0
+            });
+        }
+        stop_and_join(&server, accept);
+    }
+
+    /// pvxs `serverchan.cpp:241`: a TCP SEARCH reply names the port of the
+    /// listener the connection came in on, not one server-wide number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tcp_search_reply_names_the_port_it_arrived_on() {
+        let (server, other) = named_port::on_a_named_port(|other| {
+            match BlockingPvaServer::bind(
+                (Ipv4Addr::UNSPECIFIED, 0),
+                test_source(),
+                two_port_config(other),
+            ) {
+                Ok(server) => Some((Arc::new(server), other)),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => None,
+                Err(e) => panic!("bind the blocking PVA server: {e}"),
+            }
+        });
+        let first = server.tcp_port();
+        assert_ne!(first, other);
+        let serving = server.clone();
+        let accept = spawn_dedicated_thread(
+            "test-PVAS-accept".into(),
+            PVA_SERVER_PRIORITY,
+            StackSizeClass::Medium,
+            move || serving.serve(&harness_reactor()),
+        )
+        .expect("accept thread spawned");
+        for (ip, port) in [
+            (Ipv4Addr::LOCALHOST, first),
+            (Ipv4Addr::new(127, 0, 0, 2), other),
+        ] {
+            assert_eq!(tcp_search_port(SocketAddr::from((ip, port))), port);
+        }
+        stop_and_join(&server, accept);
+    }
+
     /// Boundary: shutdown with a live connection that is not going anywhere by
     /// itself. This is the half CA's blocking server still lacks — stopping
     /// the accept loop leaves its clients running — and the reason the server
@@ -3709,7 +3758,7 @@ pub(super) mod tests {
                     socket,
                     &responding.source,
                     &responding.config,
-                    responding.tcp_port,
+                    responding.tcp_port(),
                     &responding.shutdown,
                     locals,
                 )
@@ -3820,6 +3869,69 @@ pub(super) mod tests {
         assert_eq!(replies, expected);
         stop_all(&server_a, accept_a, udp_a);
         stop_all(&server_b, accept_b, udp_b);
+    }
+
+    /// Start a wildcard responder on `config` and send a unicast-flagged
+    /// SEARCH to `dest` on its port, out of loopback; whether it answered.
+    /// Resent while unanswered: the responder thread joins the groups.
+    #[cfg(target_os = "linux")]
+    fn answers_search_to(config: PvaServerConfig, dest: Ipv4Addr) -> bool {
+        let (socket, port) = wildcard_search_socket();
+        let (server, accept, udp) = start_udp_responder_on(socket, config);
+        let client = group_client();
+        client
+            .0
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("requester read timeout");
+        let codec = PvaCodec { big_endian: false };
+        let frame = codec.build_search(3, 9, "dut", [127, 0, 0, 1], client.port(), true);
+        let mut buf = [0u8; 1500];
+        let answered = (0..5).any(|_| {
+            client.send(&frame, SocketAddr::from((dest, port)));
+            client.0.recv_from(&mut buf).is_ok()
+        });
+        stop_all(&server, accept, udp);
+        answered
+    }
+
+    /// pvxs joins a beacon group on the collector and listens on it only
+    /// under `auto_beacon` (`config.cpp:512-519`). A SEARCH sent to it is
+    /// answered from the arrival interface, never forwarded, so a server not
+    /// listing that interface answers it too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_search_is_answered_only_with_auto_beacon() {
+        let group = Ipv4Addr::new(224, 0, 9, 17);
+        let config = |auto_beacon, iface: Ipv4Addr| PvaServerConfig {
+            auto_beacon,
+            beacon_destinations: vec![
+                crate::config::env::Endpoint::parse("224.0.9.17@127.0.0.1", 5076).unwrap(),
+            ],
+            interfaces: vec![SocketAddr::from((iface, 0)).into()],
+            ..isolated_config()
+        };
+        assert!(answers_search_to(config(true, Ipv4Addr::LOCALHOST), group));
+        assert!(!answers_search_to(
+            config(false, Ipv4Addr::LOCALHOST),
+            group
+        ));
+        assert!(answers_search_to(
+            config(true, Ipv4Addr::new(127, 0, 0, 2)),
+            group
+        ));
+    }
+
+    /// A unicast SEARCH to a local address outside `EPICS_PVAS_INTF_ADDR_LIST`
+    /// finds no pvxs listener.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_search_to_an_unlisted_address_is_not_answered() {
+        let config = || PvaServerConfig {
+            interfaces: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into()],
+            ..isolated_config()
+        };
+        assert!(answers_search_to(config(), Ipv4Addr::LOCALHOST));
+        assert!(!answers_search_to(config(), Ipv4Addr::new(127, 0, 0, 2)));
     }
 
     /// A requester that sends to the group over loopback, as a forwarding

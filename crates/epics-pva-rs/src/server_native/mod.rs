@@ -66,6 +66,8 @@ pub mod search;
 // holds no socket either — [`udp`] is the async caller, the blocking RTEMS
 // responder is the other.
 pub mod search_engine;
+// The TCP listener set every driver binds, from the expanded interface list.
+pub(crate) mod serv_iface;
 pub mod server_info;
 pub mod shared_pv;
 pub mod source;

@@ -201,6 +201,13 @@ pub async fn run_tcp_server_on_listener(
                             _ => super::tcp::TX_LIMIT_FALLBACK,
                         }
                     };
+                    let local_port = match stream.local_addr() {
+                        Ok(local) => local.port(),
+                        Err(e) => {
+                            debug!(?peer, "local_addr failed, dropping connection: {e}");
+                            return;
+                        }
+                    };
 
                     // TLS-NAMESERVER: peek the first byte to dispatch
                     // TLS vs plain PVA on a single port.
@@ -323,6 +330,7 @@ pub async fn run_tcp_server_on_listener(
                                             tx_limit_bytes,
                                             writer_reactor,
                                             liveness_clock: LivenessClock::System,
+                                            local_port,
                                         },
                                     )
                                     .await
@@ -359,6 +367,7 @@ pub async fn run_tcp_server_on_listener(
                                     tx_limit_bytes,
                                     writer_reactor,
                                     liveness_clock: LivenessClock::System,
+                                    local_port,
                                 },
                             )
                             .await

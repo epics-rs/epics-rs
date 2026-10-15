@@ -244,7 +244,6 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-ca-rs",
         "tests/zero_length_array_write_is_not_a_short_frame.rs",
     ),
-    ("epics-pva-rs", "src/server_native/runtime.rs"),
     ("epics-pva-rs", "tests/channel_array.rs"),
     ("epics-pva-rs", "tests/create_channel_backpressure.rs"),
     ("epics-pva-rs", "tests/heartbeat_echo.rs"),

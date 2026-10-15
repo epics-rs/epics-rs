@@ -1369,10 +1369,9 @@ fn select_ifaces(map: &IfaceMap, only: Option<&[Ipv4Addr]>) -> Vec<IfaceInfo> {
 /// broadcast address are delivered ONLY to a socket bound to the broadcast
 /// address itself or to INADDR_ANY. Mirror EPICS-base rsrv
 /// (`caservertask.c:671-709`) and bind a second RX-only socket to each NIC's
-/// broadcast address so PVA/CA SEARCH bursts sent to e.g.
-/// `192.168.1.255:5076` reach the responder. pvxs does the same at the port
-/// the interface resolved, whether configured or ephemeral
-/// (`server.cpp:421-437`). Windows: Winsock delivers subnet broadcasts to the
+/// [`IfaceInfo::rx_broadcast`] so PVA/CA SEARCH bursts sent to e.g.
+/// `192.168.1.255:5076` reach the responder; pvxs instead takes them on its
+/// wildcard collector (`udp_collector.cpp:140-151`). Windows: Winsock delivers subnet broadcasts to the
 /// unicast-bound socket, so the extra bind is unnecessary and skipped.
 /// Loopback has no broadcast. A failure is the caller's: pvxs's broadcast
 /// listener rides the collector's one wildcard socket, whose failed bind
@@ -1385,12 +1384,9 @@ fn bind_bcast_rx(
     origin: PortOrigin,
     broadcast: bool,
 ) -> io::Result<Option<NicSocket>> {
-    let Some(bcast) = info.broadcast else {
+    let Some(bcast) = info.rx_broadcast() else {
         return Ok(None);
     };
-    if info.ip.is_loopback() || bcast.is_unspecified() {
-        return Ok(None);
-    }
     #[cfg(test)]
     tests::BEFORE_BCAST_BIND.with_borrow_mut(|hook| hook.as_mut().map(|h| h(bcast, port)));
     bind_one_at(info, bcast, port, port_use, origin, broadcast, true).map(Some)
@@ -1529,8 +1525,7 @@ mod tests {
         ifaces.sort_by_key(|i| !i.up_non_loopback);
         ifaces
             .into_iter()
-            .filter(|i| !i.ip.is_loopback() && i.broadcast.is_some_and(|b| !b.is_unspecified()))
-            .filter_map(|i| i.broadcast)
+            .filter_map(|i| i.rx_broadcast())
             .collect()
     }
 
@@ -1717,7 +1712,7 @@ mod tests {
         let targets: Vec<_> = map
             .all()
             .into_iter()
-            .filter(|i| !i.ip.is_loopback() && i.broadcast.is_some_and(|b| !b.is_unspecified()))
+            .filter(|i| i.rx_broadcast().is_some())
             .collect();
         assert!(
             !targets.is_empty(),
@@ -1727,7 +1722,7 @@ mod tests {
         let sender = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("sender");
         sender.set_broadcast(true).expect("SO_BROADCAST");
         for info in targets {
-            let bcast = info.broadcast.unwrap();
+            let bcast = info.rx_broadcast().unwrap();
             sender
                 .send_to(b"bcast-search", (bcast, port))
                 .unwrap_or_else(|e| panic!("send to {bcast}:{port}: {e}"));
@@ -1806,18 +1801,6 @@ mod tests {
     /// The bundle's recorded `port_use` is what keeps them exclusive.
     #[tokio::test]
     async fn a_nic_joined_after_the_bind_inherits_the_bundle_port_use() {
-        let mut sock = AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(
-            &[std::net::Ipv4Addr::LOCALHOST],
-            PortUse::Exclusive,
-            false,
-        )
-        .expect("bind loopback-only bundle");
-        let port = sock.ifaces()[0]
-            .sock
-            .local_addr()
-            .expect("local addr")
-            .port();
-
         // The first up non-loopback NIC, if the host has one — that is the
         // interface `join_beacon_multicast_groups` would add. With none, the
         // check reduces to re-asserting loopback's exclusivity.
@@ -1826,10 +1809,30 @@ mod tests {
             .into_iter()
             .find(|i| i.is_up() && !i.is_loopback() && !i.ip.is_unspecified())
             .map(|i| i.ip);
-        if let Some(ip) = extra {
-            sock.ensure_iface_socket(ip, port, false)
-                .expect("join the NIC to the bundle");
-        }
+        // The number is picked on loopback alone, so a stranger may hold it on
+        // the NIC: a pick the join cannot own is retried whole, the failed
+        // bundle parked so the kernel does not hand its number back.
+        let mut parked = Vec::new();
+        let (sock, port) = loop {
+            let mut sock = AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(
+                &[std::net::Ipv4Addr::LOCALHOST],
+                PortUse::Exclusive,
+                false,
+            )
+            .expect("bind loopback-only bundle");
+            let port = sock.ifaces()[0]
+                .sock
+                .local_addr()
+                .expect("local addr")
+                .port();
+            match extra.map(|ip| sock.ensure_iface_socket(ip, port, false)) {
+                Some(Err(e)) if e.kind() == io::ErrorKind::AddrInUse && parked.len() < 8 => {
+                    parked.push(sock)
+                }
+                Some(Err(e)) => panic!("join the NIC to the bundle on {port}: {e}"),
+                _ => break (sock, port),
+            }
+        };
 
         for n in sock.ifaces() {
             let intruder =

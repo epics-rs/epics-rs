@@ -56,6 +56,7 @@ async fn qsrv_rs_resolves_a_ca_link_as_soft_ioc() {
     .unwrap();
     let got = qsrv_named_ports::on_a_qsrv_port(
         &db,
+        |_| Vec::new(),
         |tcp| {
             vec![
                 ("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{ca_port}")),

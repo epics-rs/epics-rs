@@ -118,6 +118,9 @@ jobs:
         run: |
           sudo ifconfig lo0 alias 127.0.0.2 up
           sudo ifconfig lo0 alias 127.0.0.4 up
+          # A second broadcast-capable address for the multi-NIC broadcast
+          # bundle tests; the hosted image has one.
+          sudo ifconfig en0 alias 198.18.0.2 netmask 255.255.255.0 broadcast 198.18.0.255
 
       - name: Test prerequisites (::1, external NIC) - Windows
         if: runner.os == 'Windows'

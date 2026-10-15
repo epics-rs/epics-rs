@@ -1398,9 +1398,11 @@ mod responder_bind_tests {
     }
 
     /// The bundle-bind error path itself: a port another socket holds
-    /// exclusively fails the bind with EADDRINUSE, naming the address.
+    /// exclusively fails the bind, naming the address. Windows answers a
+    /// `SO_REUSEADDR` bind on a held specific address with WSAEACCES, never
+    /// WSAEADDRINUSE, which C's `tryBind` treats as the fatal path too.
     #[test]
-    fn a_held_port_fails_the_responder_bind_with_addr_in_use() {
+    fn a_held_port_fails_the_responder_bind() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1411,19 +1413,27 @@ mod responder_bind_tests {
         let port = held.local_addr().expect("held addr").port();
         match bind_udp_responders(port, vec![Ipv4Addr::LOCALHOST], &[]) {
             Err(epics_base_rs::error::CaError::Io(e)) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+                let held = if cfg!(windows) {
+                    std::io::ErrorKind::PermissionDenied
+                } else {
+                    std::io::ErrorKind::AddrInUse
+                };
+                assert_eq!(e.kind(), held, "{e}");
                 assert!(
                     e.to_string().contains(&format!("127.0.0.1:{port}")),
                     "the error names the address: {e}"
                 );
             }
-            Err(e) => panic!("expected EADDRINUSE, got {e}"),
+            Err(e) => panic!("expected an I/O error, got {e}"),
             Ok(_) => panic!("a port held exclusively must not bind"),
         }
     }
 
     /// `tryBind` drops one held interface and `rsrv_init` serves on the rest
     /// (`caservertask.c:136`, `:630`, `:745-752`); only an empty set fails.
+    /// Not on Windows: a `SO_REUSEADDR` bind there never gets WSAEADDRINUSE,
+    /// so C's drop has no trigger.
+    #[cfg(not(windows))]
     #[test]
     fn a_held_interface_is_dropped_and_the_others_serve() {
         let rt = tokio::runtime::Builder::new_current_thread()

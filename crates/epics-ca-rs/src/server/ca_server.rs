@@ -1907,7 +1907,9 @@ mod bind_sockets_tests {
     use super::*;
 
     /// A held UDP port on one of two interfaces drops that interface's TCP
-    /// listener too, as `rsrv_init`'s `cleanup:` does.
+    /// listener too, as `rsrv_init`'s `cleanup:` does. Not on Windows, where
+    /// the held bind is WSAEACCES and C's `tryBind` never reaches `cleanup:`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn an_interface_whose_udp_bind_failed_loses_its_tcp_listener() {
         let lo2 = std::net::Ipv4Addr::new(127, 0, 0, 2);

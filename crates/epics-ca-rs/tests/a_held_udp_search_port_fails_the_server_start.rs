@@ -12,8 +12,9 @@ use std::sync::Arc;
 #[tokio::test]
 async fn a_held_udp_search_port_fails_from_parts_instead_of_hanging() {
     // Held for the whole test, with no reuse flag, so the server's bind cannot
-    // share it.
-    let held = std::net::UdpSocket::bind("0.0.0.0:0").expect("take a UDP port");
+    // share it. On the server's own address: Windows lets a `SO_REUSEADDR`
+    // bind on a specific address share a port held on the wildcard.
+    let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("take a UDP port");
     let port = held.local_addr().unwrap().port();
     // SAFETY: nextest runs this test alone in its process.
     unsafe {

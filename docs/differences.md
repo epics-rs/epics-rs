@@ -47,7 +47,10 @@ difference is either invisible to a client or is an improvement:
   tries where C loops without end, for the reason given for the PVA ephemeral
   port retry above. An address that is no interface of this host leaves the
   list before any UDP bind, and a held broadcast-address socket drops its
-  interface whole (`:703`), both as in C.
+  interface whole (`:703`), both as in C. On Windows a held number answers
+  the `SO_REUSEADDR` bind with WSAEACCES, never WSAEADDRINUSE; epics-rs drops
+  that interface as for EADDRINUSE, where C, checking only `SOCK_EADDRINUSE`,
+  takes the fatal path. Signed off 2026-10-16.
 - **Fanout options on a chosen UDP port.** pvxs sets `SO_REUSEADDR` and
   `SO_REUSEPORT` before every collector bind, port 0 included, and rsrv before
   every search responder bind (`caservertask.c:628`, `:698`). Linux then may

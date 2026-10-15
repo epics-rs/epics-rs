@@ -577,12 +577,14 @@ fn extract_pva_double(f: &epics_pva_rs::PvField) -> Option<f64> {
 /// the switch bite in both directions. Must run as root (or with CAP_SYS_NICE)
 /// for the YES arm to actually obtain SCHED_FIFO.
 fn rt_policy() {
-    use epics_base_rs::runtime::task::{RtPolicy, ThreadPriority, enter_ioc_thread};
-    let raw = std::env::var(epics_base_rs::runtime::task::RT_PRIORITY_ENV).ok();
+    use epics_base_rs::runtime::task::{
+        C_RT_PRIORITY_ENV, RT_PRIORITY_ENV, RtPolicy, ThreadPriority, enter_ioc_thread,
+    };
+    // Both switches: C's decides whenever it is set, the alias only when not.
     println!(
-        "rt-policy: {}={:?} -> RtPolicy::{:?}",
-        epics_base_rs::runtime::task::RT_PRIORITY_ENV,
-        raw,
+        "rt-policy: {C_RT_PRIORITY_ENV}={:?} {RT_PRIORITY_ENV}={:?} -> RtPolicy::{:?}",
+        std::env::var_os(C_RT_PRIORITY_ENV),
+        std::env::var_os(RT_PRIORITY_ENV),
         RtPolicy::current()
     );
     let handle = std::thread::spawn(|| {

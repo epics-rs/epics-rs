@@ -5700,7 +5700,7 @@ fn db_load_records(
 /// names: `dbLoadTemplate.y:362-370` tries a bare `fopen(sub_file)`
 /// first and only falls back to the path list when that fails and the
 /// name is not absolute. The templates themselves go through
-/// `dbLoadRecords`, i.e. [`resolve_db_file`]'s rule.
+/// `dbLoadRecords`, i.e. `resolve_db_file`'s rule.
 ///
 /// `search_path` is the command's third argument, which C substitutes
 /// for `EPICS_DB_INCLUDE_PATH` when it is non-empty (`:365-368`). It

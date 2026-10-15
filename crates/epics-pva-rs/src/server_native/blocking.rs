@@ -1272,7 +1272,7 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
 }
 
 /// Receive one datagram, with the `(destination, interface index)` of its
-/// arrival ([`crate::udp_rx`]) — what pvxs reads to tell a forward from a
+/// arrival (`udp_rx`) — what pvxs reads to tell a forward from a
 /// direct datagram (`origin = Forwarded` at `udp_collector.cpp:278`; any other
 /// `CMD_ORIGIN_TAG` is ignored, `:522`) and which listener takes it.
 ///

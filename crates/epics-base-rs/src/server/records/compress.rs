@@ -99,7 +99,7 @@ pub struct CompressRecord {
     /// source array is re-shaped).
     inpn: usize,
     /// The posts of the `monitor()` an SPC_RESET `special()` ran, a bit per
-    /// [`RESET_POSTS`] entry, until the put drains them.
+    /// `RESET_POSTS` entry, until the put drains them.
     reset_posts: u64,
     /// This cycle's `monitor()` found `nuse != ouse` (`compressRecord.c:105`).
     nuse_moved: bool,

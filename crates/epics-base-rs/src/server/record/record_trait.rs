@@ -6871,7 +6871,7 @@ pub trait Record: Send + Sync + 'static {
     /// Framework init hook: called once at record load *after* the common
     /// link fields (`INP`/`OUT`/`FLNK`/...) have been resolved and the
     /// `init_record` passes have run, with the record's resolved
-    /// [`CommonFields`](crate::server::record::CommonFields).
+    /// [`CommonFields`].
     ///
     /// This is the seam for records that classify their links into status
     /// diagnostics at init the way C `init_record` does (e.g. calcout's

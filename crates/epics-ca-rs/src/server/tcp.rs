@@ -6487,7 +6487,7 @@ pub(crate) struct ReplyContext {
 
 /// One async monitor's delivery context — C `user_sub`/`user_arg` — handed
 /// to the circuit's event task with each queued entry
-/// ([`EventReader::enable`](epics_base_rs::server::event_queue::EventReader::enable)).
+/// ([`attach_with`](epics_base_rs::server::event_queue::attach_with)).
 ///
 /// The one owner of the subscription's gate and access flag: the channel, the
 /// circuit's registry and the cancel path hold this `Arc`, not copies of them.

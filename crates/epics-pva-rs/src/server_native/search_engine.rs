@@ -528,7 +528,7 @@ pub(crate) async fn search_matched_cids(
 /// build has it on both backends: `super::udp` joins `224.0.0.128` on
 /// loopback with a socket of its own and classifies what arrives there, and
 /// the blocking responder does the same on its one search socket
-/// ([`route_search_socket_datagram`]), where a bare SEARCH cannot be told
+/// (`route_search_socket_datagram`), where a bare SEARCH cannot be told
 /// from a direct one — so `Forwarded` is the tokio backend's alone. An
 /// embedded target has neither — its
 /// responder serves one plain `std::net::UdpSocket`, passes

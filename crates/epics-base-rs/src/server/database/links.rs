@@ -51,7 +51,7 @@ pub(super) fn local_name(record: &[u8], field: &str) -> Vec<u8> {
 /// (`dbConstLink.c:219-225`) — status 0, `*pnRequest = 0`, buffer untouched —
 /// while any other link that produced nothing FAILED and owes the reader a LINK
 /// alarm. Every process-time reader ends here ([`PvDatabase::read_link_with_alarm`]
-/// for the input-fetch/control-link paths, [`PvDatabase::read_link_value_as`] for
+/// for the input-fetch/control-link paths, [`PvDatabase::read_link_value_as_with_alarm`] for
 /// the `ReadDbLink` executor), so a constant cannot be no-data on one path and a
 /// live value on another.
 /// C `dbDbGetValue`'s filter arm, and its NULL-log fallback to the raw
@@ -888,7 +888,7 @@ impl PvDatabase {
     }
 
     /// C's `dbAddr` for `db`: resolved by name once per name-map revision
-    /// and held in the link ([`DbLink::local_addr`](crate::server::record::DbLink::local_addr)), so the cycle's read
+    /// and held in the link's `addr` cell ([`DbLink`](crate::server::record::DbLink)), so the cycle's read
     /// hashes no name. `None` for a target that is not a local record.
     pub(crate) fn db_link_addr(
         &self,
@@ -1255,7 +1255,7 @@ impl PvDatabase {
         self.resolve_external_pv(link.external()?)
     }
 
-    /// [`Self::read_link_value`] and the source's alarm off the SAME read —
+    /// A link's value and the source's alarm off the SAME read —
     /// C `dbGetLink`, whose `dbDbGetValue` tail folds the source's severity in
     /// from the cell the value was just read from (`dbDbLink.c:220-232`).
     ///
@@ -1314,7 +1314,7 @@ impl PvDatabase {
     /// be one `Option` here, which is how the `ReadDbLink` executor came to
     /// re-deliver a constant on every cycle while the multi-input fetch (same
     /// links, same records) correctly ignored it.
-    /// [`Self::read_link_value_as`] and the source's alarm off the SAME read —
+    /// The value at `read_as` and the source's alarm off the SAME read —
     /// see [`Self::read_link_value_and_alarm_at_source`].
     ///
     /// A conversion failure carries no alarm, which is where the separate-read
@@ -1404,7 +1404,7 @@ impl PvDatabase {
         }
     }
 
-    /// [`LinkReadAs::Array`]: an array source keeps its first `n_request`
+    /// [`LinkReadAs::Array`](crate::server::record::LinkReadAs::Array): an array source keeps its first `n_request`
     /// elements, each converted to `dbr`; a scalar source converts as the
     /// matching scalar request does.
     fn array_read_of(
@@ -1597,7 +1597,7 @@ impl PvDatabase {
     /// (DB / CA / PVA / constant / lnkCalc) and never processes the
     /// target record.
     ///
-    /// Distinct from [`Self::read_link_value`], which threads
+    /// Distinct from [`Self::read_link_value_and_alarm_at_source`], which threads
     /// `visited` to PP-process a Passive DB source before reading
     /// (the INPUT-link path). `dbGetLink` does no such processing, so the
     /// DB arm here reads with a plain `get_pv` exactly as the pre-fix
@@ -3784,7 +3784,7 @@ impl PvDatabase {
     /// `src.field` names the link field for the alarm message, as C's
     /// `setLinkAlarm` does (`"field %s"`, `dbLinkFieldName(plink)`).
     ///
-    /// This is also the OUTPUT-side counterpart of [`Self::read_link_value`]'s
+    /// This is also the OUTPUT-side counterpart of [`Self::read_link_value_and_alarm_at_source`]'s
     /// scheme dispatch: the OUT-link write stage in `processing.rs`
     /// must route a `ParsedLink::Ca`/`Pva` through the link set, not
     /// only handle `ParsedLink::Db`.

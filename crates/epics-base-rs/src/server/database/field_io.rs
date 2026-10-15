@@ -3292,8 +3292,7 @@ impl PvDatabase {
 
     /// What a put owes once its gate is down: the errlog line a refused put
     /// still carries, a written link's CP connect
-    /// ([`Self::relink_cp_link`]), the CP links reading a field only a put
-    /// posts ([`Self::dispatch_put_cp_targets`]), and the work its
+    /// ([`Self::relink_cp_link`]), and the work its
     /// `special()` left ([`AfterGate`]). `link_text` is whether the value
     /// could be a link's text, so any other put asks no relink.
     fn after_put_gate<T>(

@@ -1,6 +1,6 @@
 //! Time for the peer-silence watchdogs of both connection sides: the server's
 //! inactivity deadline (`server_native::tcp`) and the client's heartbeat
-//! (`client_native::server_conn`). A test drives [`ManualClock`] so a deadline
+//! (`client_native::server_conn`). A test drives `ManualClock` so a deadline
 //! assertion does not race the scheduler: on the wall clock, a sleep that load
 //! stretches past the deadline is real silence.
 

@@ -2604,7 +2604,7 @@ impl<'a> MonitorQueue<'a> {
     }
 }
 
-/// Inputs to [`spawn_monitor_subscriber`]. A cohesive bundle of the per-op
+/// Inputs to [`monitor_subscriber`]. A cohesive bundle of the per-op
 /// monitor state captured at INIT (read out of the just-inserted `OpState`)
 /// plus the connection-scope handles the subscriber task needs — one struct
 /// keeps the INIT call site and the helper signature readable.

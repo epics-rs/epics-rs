@@ -108,7 +108,7 @@ pub struct PvaLinkResolver {
     /// carried, [`Self::detach`] removes it, so no open can leave a holder
     /// scanned by a channel it no longer links.
     holders: Arc<parking_lot::Mutex<std::collections::HashMap<Holder, Attached>>>,
-    /// Source of [`Attached::id`].
+    /// Source of the id in [`Attachment::Open`].
     next_attach: Arc<std::sync::atomic::AtomicU64>,
     /// B4 `local`: optional handle to the QSRV provider's name
     /// registry. When the IOC also runs QSRV (the common dual-server

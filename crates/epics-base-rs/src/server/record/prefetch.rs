@@ -90,7 +90,7 @@ mod word {
 
 impl Hint {
     /// Name the lines of the `len` bytes at `p`, which is aligned to `align`:
-    /// [`cover`]'s count from `p`'s line, every line of the object and at
+    /// `cover`'s count from `p`'s line, every line of the object and at
     /// most one past it.
     #[inline(always)]
     pub(crate) fn set(&self, p: *const u8, len: usize, align: usize) {

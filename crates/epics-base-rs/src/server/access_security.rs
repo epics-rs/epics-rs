@@ -2451,7 +2451,7 @@ struct AcfScanner<'a> {
     src: &'a [u8],
     /// Byte offset of the next character. The text stays addressable behind
     /// the cursor so a diagnostic can quote what the operator wrote without
-    /// consuming it — see [`Self::offending`].
+    /// consuming it.
     pos: usize,
     /// 1-based, counting every `\n` consumed.
     line: u32,

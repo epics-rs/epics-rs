@@ -667,7 +667,7 @@ pub(crate) struct MetadataSnapshot {
     pub alarm: (f64, f64, f64, f64),
 }
 
-/// Does a write to this field make [`RecordInstance::metadata_cache`] stale?
+/// Does a write to this field make the record's metadata cache stale?
 ///
 /// **Cache bookkeeping only** — NOT the `DBE_PROPERTY` gate, which is the
 /// field's own `prop(YES)` declaration ([`RecordInstance::field_posts_property`]).
@@ -2498,7 +2498,7 @@ fn string_typed_mask(inst: &RecordInstance) -> u64 {
 pub(crate) struct RecordDesc {
     pub(crate) record_type: &'static str,
     pub(crate) fields: &'static [FieldDesc],
-    /// [`Record::noaccess_names`].
+    /// [`FieldDeclaration::noaccess_names`].
     noaccess: &'static [&'static str],
     /// [`Record::primary_field`] and [`Record::process_passive_fields`].
     primary_field: &'static str,
@@ -3008,7 +3008,7 @@ mod posted {
             self.lists & SWEPT != 0
         }
 
-        /// [`AuxPostMask::mask_for`] the field.
+        /// [`AuxPostMask::mask_of_class`] of the field's class.
         pub(super) fn aux_mask(
             &self,
             alarm_bits: EventMask,
@@ -3709,7 +3709,7 @@ impl RecordCell {
     ///
     /// # Panics
     ///
-    /// If a borrow of this record is live, or as [`LockSet::unheld`].
+    /// If a borrow of this record is live, or as the lock set's `unheld`.
     #[cold]
     pub(crate) fn unheld<R>(&self, f: impl FnOnce() -> R) -> R {
         assert_eq!(
@@ -3864,8 +3864,7 @@ impl std::ops::DerefMut for HeldMut<'_> {
 }
 
 impl<'a> HeldMut<'a> {
-    /// The instance and the set guard it is held under, apart — as
-    /// [`RecordMut::split`].
+    /// The instance and the set guard it is held under, apart.
     #[inline]
     pub(crate) fn split(&mut self) -> (&mut RecordInstance, &'a crate::server::database::SetGuard) {
         // SAFETY: as `deref_mut`; the set guard is a separate borrow.
@@ -4321,7 +4320,7 @@ pub struct FieldSubscriber {
     name: SubName,
     pub ix: FieldIx,
     /// [`RecordInstance::declared_field_type`] and
-    /// [`RecordInstance::field_is_long_string`] of the field, both static,
+    /// [`RecordCell::field_is_long_string`] of the field, both static,
     /// so a post projects its log without a name lookup.
     declared: Option<DbFieldType>,
     long_string: bool,
@@ -4873,7 +4872,7 @@ struct RecordCold {
     /// outside the passes, as both builders used to, put the lookup after the
     /// tail it is supposed to skip.
     init_subroutines: Option<Arc<HashMap<String, Arc<SubroutineFn>>>>,
-    /// Published values for the fields [`Self::collect_subscriber_posts`]'s
+    /// Published values for the fields [`RecordInstance::collect_subscriber_posts`]'s
     /// change-detection walk SKIPS whatever happens — the deadband field, the
     /// `recGblResetAlarms` set, `UDF`, and the record's event-posted fields.
     /// They are not walk input, so they must not be in `last_posted`: the
@@ -4887,7 +4886,7 @@ struct RecordCold {
     skipped_posted: SkippedLog,
     /// The live store for a field the record's `.dbd` DECLARES but the record
     /// struct has no `put_field` arm / no storage for — the WRITE analog of the
-    /// read-side [`Self::declared_default`] fallback.
+    /// read-side [`RecordInstance::declared_default`] fallback.
     ///
     /// C makes every `.dbd` field not just readable but WRITABLE: `dbPutField`
     /// resolves the field from its `dbFldDes` and `dbPut` writes the incoming
@@ -4895,7 +4894,7 @@ struct RecordCold {
     /// back — a `caput dfanout.HOPR 10` sticks even though `dfanoutRecord.c`
     /// never touches HOPR. A Rust record models only the fields it has
     /// behaviour for, so a field it declares but never stores had nowhere for a
-    /// put to land: [`Self::put_common_field`]'s catch-all reported
+    /// put to land: [`RecordInstance::put_common_field`]'s catch-all reported
     /// `S_dbLib_fieldNotFound` and the client's put was refused, while a READ of
     /// the same field succeeded through `declared_default`. This map is that
     /// missing storage — one uniform mechanism for the whole family, not a
@@ -4903,7 +4902,7 @@ struct RecordCold {
     ///
     /// Keyed by upper-case field name, holding the value already coerced to the
     /// field's C-declared DBF type (the same projection `declared_default` and
-    /// the read path serve). [`Self::resolve_field`] reads it BEFORE
+    /// the read path serve). [`RecordInstance::resolve_field`] reads it BEFORE
     /// `declared_default`, so a read reflects a prior write and an untouched
     /// field still reads its `.dbd` initial. Empty for a record whose declared
     /// fields are all modeled.
@@ -5136,7 +5135,7 @@ pub(crate) struct MonitorPlan {
     hash_desc: Option<&'static FieldDesc>,
     /// The `VAL` field's declaration, C's `indvalFlddes`.
     val_desc: Option<&'static FieldDesc>,
-    /// [`Record::field_list`], which [`FieldIx`] indexes past `dbCommon`.
+    /// [`FieldDeclaration::field_list`], which [`FieldIx`] indexes past `dbCommon`.
     fields: &'static [FieldDesc],
     /// Each declared field's [`FieldRead`], by [`FieldIx`].
     reads: Box<[FieldRead]>,
@@ -5829,16 +5828,16 @@ impl RecordInstance {
         &self.cold.link_backed_metadata_input_slot
     }
 
-    /// The record type's [`Record::cycle_hooks`](crate::server::record::Record::cycle_hooks),
+    /// The record type's [`Record::cycle_hooks`],
     /// as asked once at load.
     #[inline(always)]
     pub(crate) fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         self.monitor_plan.hooks
     }
 
-    /// The record's context push, [`Record::process`](crate::server::record::Record::process)
+    /// The record's context push, [`Record::process`]
     /// and the drain of what it posted
-    /// ([`Record::take_process_posted_fields`](crate::server::record::Record::take_process_posted_fields)),
+    /// ([`Record::take_process_posted_fields`]),
     /// as one step: a cycle path calls this, never `record.process()` alone,
     /// so a `PROCESS_POSTED` type cannot process without its posts being
     /// taken, before the cycle stamps the record or resets its alarm.
@@ -5891,7 +5890,7 @@ impl RecordInstance {
         }
     }
 
-    /// [`Record::apply_invalid_output_value`](crate::server::record::Record::apply_invalid_output_value)
+    /// [`Record::apply_invalid_output_value`]
     /// and the drain of what it posted. A record's hook may re-run its own
     /// `process()` (ao's IVOA=Set_output_to_IVOV does, to reproduce C's
     /// `convert()`), so the hook is as much a processing step as
@@ -6687,7 +6686,7 @@ impl RecordInstance {
         }
     }
 
-    /// [`crate::server::record::ProcessAction::PutAfterEpilogue`]: store
+    /// The [`crate::server::record::ProcessAction::PutAfterEpilogue`] action: store
     /// `field` and post it with `DBE_VALUE | reset`, `reset` being this cycle's
     /// `recGblResetAlarms` return.
     pub(crate) fn put_after_epilogue(
@@ -9484,7 +9483,7 @@ impl RecordInstance {
     /// (`dsxt`): `S_db_noSupport`, silent, before the link moves, so the link
     /// and the bound dset stay. Run ahead of the store whichever writer owns
     /// the field: scaler keeps OUT itself. The devSup row answers it
-    /// ([`DevSup::has_dsxt`]), whichever crate registered it. A DTYP with no
+    /// ([`DevSup::has_dsxt`](crate::server::record::DevSup::has_dsxt)), whichever crate registered it. A DTYP with no
     /// row, which only a dynamic device support can bind and C cannot
     /// express, is not judged.
     ///
@@ -10457,7 +10456,7 @@ impl RecordInstance {
     /// calls this; none of them may reimplement the rules, because a rule that
     /// holds on one path and not another is a monitor that fires on a scan cycle
     /// but not on an async completion. The per-field mask resolvers
-    /// ([`AuxPostMask`], [`crate::server::record::value_gate`]) were already
+    /// ([`AuxPostMask`], [`MonitorValueGate`](crate::server::record::MonitorValueGate)) were already
     /// single-owned for the same reason — this is the loop around them.
     ///
     /// It also UPDATES `last_posted` for every post the cycle makes — including
@@ -10477,7 +10476,7 @@ impl RecordInstance {
     ///   fields a process cycle may post at all.
     /// * A secondary value field ([`Record::fields_posted_with_value_mask`])
     ///   carries VAL's monitor mask, gated per its [`ValuePostGate`](super::ValuePostGate).
-    /// * A CHANGED field carries [`AuxPostMask::mask_for`] — unless it is a
+    /// * A CHANGED field carries [`AuxPostMask::mask_of_class`] of its class — unless it is a
     ///   [`Record::fields_posted_only_when_marked`] field, which C never
     ///   change-detects (aCalcout AA..LL) and which therefore posts from its
     ///   mark alone.
@@ -12409,7 +12408,7 @@ impl RecordInstance {
         );
     }
 
-    /// [`Self::notify_field_backed`] for a settled put target, into the
+    /// [`Self::notify_field_with_origin_in`] for a settled put target, into the
     /// put's `burst`; `field` is upper-case.
     pub(crate) fn notify_field_at(
         &mut self,

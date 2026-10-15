@@ -410,7 +410,7 @@ pub struct SseqRecord {
     /// the C `db_post_events` call site that made it (see `mark_value_write`).
     /// Drained by [`Record::take_cycle_posted_fields`] — on a put by the put
     /// path, on a process cycle by the monitor loop.
-    /// A bit per [`VALUE_WRITE_POSTS`] entry.
+    /// A bit per `VALUE_WRITE_POSTS` entry.
     pending_posts: u64,
     /// Monotonic generation guarding `refresh_link_status`. Each refresh
     /// classifies a *snapshot* of the `DOLn`/`LNKn`/`WAITn` link state

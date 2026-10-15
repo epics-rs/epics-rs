@@ -2098,7 +2098,7 @@ fn pn_link(inp: &crate::server::record::ParsedLink) -> Option<crate::server::rec
     )))
 }
 
-/// The cycle's slot for the INP value [`CyclePlan::DbSoftIn`] read, present in
+/// The cycle's slot for the INP value [`CyclePlan::DbSoftIn`](crate::server::record::record_instance::CyclePlan::DbSoftIn) read, present in
 /// the arm that reads one and a zero-sized nothing in every other, so those
 /// arms carry no drop glue. The slot means one thing: the value to apply.
 struct Arm<const DB_INP: bool>;
@@ -4165,7 +4165,7 @@ impl PvDatabase {
         Some(value)
     }
 
-    /// `fetch_input_stage` for [`CyclePlan::ConstSoftIn`]: INP constant, no
+    /// `fetch_input_stage` for [`CyclePlan::ConstSoftIn`](crate::server::record::record_instance::CyclePlan::ConstSoftIn): INP constant, no
     /// other read, soft DTYP — the stage's own early return, taken without
     /// asking.
     #[inline(always)]
@@ -5039,7 +5039,7 @@ impl PvDatabase {
         }
     }
 
-    /// The cycle past the prologue, once per [`CyclePlan`] arm. `PLAIN` is a
+    /// The cycle past the prologue, once per [`CyclePlan`](crate::server::record::record_instance::CyclePlan) arm. `PLAIN` is a
     /// compile-time fact: the arm's gates are folded away, so it is the one
     /// source of the cycle and not a second copy that could drift from it.
     #[inline(always)]

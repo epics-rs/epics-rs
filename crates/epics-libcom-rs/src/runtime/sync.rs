@@ -542,8 +542,8 @@ mod pi_mutex {
 /// **Invariant:** a listed backend's address is valid for as long as its entry
 /// is listed, and its owner's `Drop` removes the entry under the list lock
 /// before the backend's memory goes. The two mutex types differ only in what
-/// keeps the address valid: [`MovableEpicsMutex`] holds the backend behind an
-/// `Arc`, so the owner can move freely; [`PinnedEpicsMutex`] holds it inline
+/// keeps the address valid: [`MovableEpicsMutex`](epics_mutex::MovableEpicsMutex) holds the backend behind an
+/// `Arc`, so the owner can move freely; [`PinnedEpicsMutex`](epics_mutex::PinnedEpicsMutex) holds it inline
 /// and lists it only through `Pin<&Self>`, whose drop guarantee is that the
 /// memory is neither moved nor reused before `Drop` runs.
 mod epics_mutex {

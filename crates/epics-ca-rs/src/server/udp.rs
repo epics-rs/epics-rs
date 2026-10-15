@@ -1485,8 +1485,8 @@ mod responder_bind_tests {
 
         // 127.0.0.2 stands in for the broadcast address, which loopback has
         // none of; plain std sockets set no reuse option, so ours cannot
-        // co-bind it.
-        let (ip, bcast) = (Ipv4Addr::new(127, 0, 0, 3), Ipv4Addr::new(127, 0, 0, 2));
+        // co-bind it. Darwin's lo0 holds only what CI aliases, .2 and .4.
+        let (ip, bcast) = (Ipv4Addr::new(127, 0, 0, 4), Ipv4Addr::new(127, 0, 0, 2));
         let lookup = |i: Ipv4Addr| (i == ip).then_some(bcast);
 
         // A stranger may hold the picked number on 127.0.0.1 as well; that
@@ -1525,8 +1525,9 @@ mod responder_bind_tests {
         let _g = rt.enter();
 
         // 192.0.2.1 (TEST-NET-1) is no address of this host: EADDRNOTAVAIL.
+        // The interface must bind, or its own EADDRNOTAVAIL passes this.
         let lookup = |_: Ipv4Addr| Some(Ipv4Addr::new(192, 0, 2, 1));
-        match bind_udp_responders_with(0, vec![Ipv4Addr::new(127, 0, 0, 3)], &[], 0, &lookup) {
+        match bind_udp_responders_with(0, vec![Ipv4Addr::new(127, 0, 0, 4)], &[], 0, &lookup) {
             Err(epics_base_rs::error::CaError::Io(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::AddrNotAvailable, "{e}");
                 // strerror alone, not the address-carrying chain.

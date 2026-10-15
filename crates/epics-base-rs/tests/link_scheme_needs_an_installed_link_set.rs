@@ -83,7 +83,11 @@ impl LinkSet for SpyLset {
         ));
         Some(EpicsValue::Long(3))
     }
-    async fn connect_link(&self, name: &[u8]) {
+    async fn connect_link(
+        &self,
+        name: &[u8],
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
         self.asked.lock().push(format!(
             "{}:open:{}",
             self.scheme,

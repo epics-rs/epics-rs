@@ -4,6 +4,8 @@
 //! the processes; every number is C softIoc's `dbgf` on the same database
 //! (R7.0.10-146), after init and after `dbpf X 1`.
 
+mod calink_ioc;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -52,10 +54,20 @@ fn counts(db: &PvDatabase) -> Counts {
         .collect()
 }
 
+/// Wait for X's pass to reach `HTWOCPP.INPB`, X's last edge, so every edge
+/// before it has been decided; XP's own pass is waited for by `HPINI`.
+async fn settle(db: &PvDatabase, after_put: bool) {
+    let last = if after_put { 4.0 } else { 2.0 };
+    let num = |pv| db.get_pv(pv).unwrap().to_f64().unwrap();
+    calink_ioc::until("X's pass reaches its last edge", || num("HTWOCPP") == last).await;
+    calink_ioc::until("XP's pass processes HPINI", || num("HPINI") == 1.0).await;
+}
+
 async fn put_x_and_settle(db: &PvDatabase) {
     db.put_record_field_from_ca("X", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
+    settle(db, true).await;
 }
 
 fn assert_counts(got: &Counts, after_put: bool) {
@@ -85,6 +97,7 @@ async fn the_scan_owner_processes_each_cp_holder_once_on_connect() {
     db.setup_cp_links().await;
     let _owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
     db.wait_for_pini().await;
+    settle(&db, false).await;
     assert_counts(&counts(&db), false);
     put_x_and_settle(&db).await;
     assert_counts(&counts(&db), true);
@@ -102,6 +115,7 @@ async fn ioc_init_processes_each_cp_holder_once_on_connect() {
         .port(0)
         .startup_line(&format!("dbLoadRecords(\"{}\")", path.display()))
         .run(move |config| async move {
+            settle(&config.db, false).await;
             let init = counts(&config.db);
             put_x_and_settle(&config.db).await;
             *out.lock().unwrap() = Some((init, counts(&config.db)));

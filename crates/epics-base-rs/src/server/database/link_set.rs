@@ -544,11 +544,28 @@ pub trait LinkSet: Send + Sync {
     /// runtime as a reason to open the channel synchronously on the
     /// caller — there is no caller thread that may block that way.
     ///
+    /// `init` is set for a local CA link opened before `dbCaRun`, which
+    /// waits until every clone of it drops: an lset that serves the link
+    /// from a local channel holds it until the first event's process has
+    /// run (C `CA_INIT_READY`, `dbCa.c:1323-1330`).
+    ///
     /// Default: drive the lset's own lazy open by reading through
     /// [`Self::get_value`] and discarding the result — correct for every
     /// existing lset, and it runs off the record-processing thread.
-    async fn connect_link(&self, name: &[u8]) {
+    async fn connect_link(&self, name: &[u8], init: Option<super::CaLinkInit>) {
+        drop(init);
         let _ = self.get_value(name).await;
+    }
+
+    /// A CP/CPP link of `holder` was added after iocInit to `name`. C gives
+    /// the new link its own `caLink`, whose first event processes `holder`
+    /// (`dbCa.c:958-962`); an lset sharing one channel per name must
+    /// request that process itself when the channel has already delivered
+    /// its first event, and leave it to that event otherwise.
+    ///
+    /// Default: nothing — an lset with a channel per link gets the event.
+    fn cp_link_added(&self, name: &[u8], holder: super::CpTarget) {
+        let _ = (name, holder);
     }
 
     /// Non-blocking admission gate for an OUT-link write, asked on the

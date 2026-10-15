@@ -146,7 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epics_oracle_rs::scaler_soft_ports().configure(port, *chans, &template)?;
     }
 
+    // The network half of C's dbCa, libca, for names this IOC does not serve.
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("main runs on the IOC's reactor");
     let ioc = match port_ioc_builder()
+        .register_link_type("ca", move |db| {
+            epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
         .with_database(boot_db)
         .db_file(&db_path, &macros)?
         .build_ioc()

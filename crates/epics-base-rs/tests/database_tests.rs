@@ -1,5 +1,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(3): three multi-thread-flavored tokio tests; run and pass in the exec-backend suite.
 #![allow(unused_imports, clippy::all)]
+mod calink_ioc;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1177,12 +1179,21 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
             .unwrap();
     }
 
+    calink_ioc::connect(&db).await;
+
     // Drive SRC's process directly. The CP dispatch enumerates TGT
     // and would (pre-fix) set TGT.common.putf=true before processing.
+    db.put_pv_no_process("SRC", EpicsValue::Double(3.0))
+        .await
+        .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
+    calink_ioc::until("SRC's post processes TGT", || {
+        db.get_pv("TGT").unwrap().to_f64() == Some(3.0)
+    })
+    .await;
 
     let tgt = db.get_record("TGT").expect("TGT exists");
     let inst = tgt.read();
@@ -3489,21 +3500,20 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
         inst.common.sevr = AlarmSeverity::NoAlarm;
         inst.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
     }
-    // iocInit's CP scan is what puts the edge in the registry the dispatch
-    // reads; without it `get_cp_targets` is empty and nothing is dispatched.
-    db.setup_cp_links().await;
-    db.process_cp_links_on_connect().await;
+    calink_ioc::connect(&db).await;
     // The connect processed the holder once (C `dbCaRun`); finish that cycle
     // so the bursts start on an idle target.
+    calink_ioc::until("the connect's write", || writes.lock().unwrap().len() == 1).await;
     db.complete_async_record("CPB_TGT").await.unwrap();
     assert_eq!(*writes.lock().unwrap(), vec![0.0], "the connect's write");
     writes.lock().unwrap().clear();
 
     // Every burst moves CPB_SRC's value, because the CP trigger is the
     // source's `DBE_VALUE|DBE_ALARM` POST, not the fact that it processed
-    // (`CyclePosts` / C `dbCa.c:1225-1229`). A repeated identical value posts
-    // nothing past `MDEL = 0` and would dispatch nothing at all, leaving every
-    // assertion below vacuous.
+    // (C `dbCa.c:1225-1229`). A repeated identical value posts nothing past
+    // `MDEL = 0` and would dispatch nothing at all, leaving every assertion
+    // below vacuous. Each burst waits for its own dispatch, because requests
+    // made before the worker takes one merge into it.
     let burst = |db: PvDatabase, v: f64| async move {
         {
             let rec = db.get_record("CPB_SRC").unwrap();
@@ -3519,6 +3529,10 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
     // Burst 1: target is idle, so the CP dispatch processes it — one device
     // write, and the target goes PACT.
     burst(db.clone(), 1.0).await;
+    calink_ioc::until("burst 1 reaches the device", || {
+        writes.lock().unwrap().len() == 1
+    })
+    .await;
     {
         let inst = db.get_record("CPB_TGT").unwrap();
         let inst = inst.read();
@@ -3539,6 +3553,11 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
     // Bursts 2..=11: the target is PACT. MAX_LOCK = 10 of them bail silently.
     for i in 1..=10 {
         burst(db.clone(), 1.0 + i as f64).await;
+        let tgt = db.get_record("CPB_TGT").unwrap();
+        calink_ioc::until(&format!("burst {i} lands on the PACT target"), || {
+            tgt.read().common.lcnt == i as i16
+        })
+        .await;
         let inst = db.get_record("CPB_TGT").unwrap();
         let inst = inst.read();
         assert_eq!(
@@ -3563,6 +3582,11 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
 
     // Burst 12: lcnt is MAX_LOCK before the increment, so the alarm fires.
     burst(db.clone(), 12.0).await;
+    let tgt = db.get_record("CPB_TGT").unwrap();
+    calink_ioc::until("burst 12 raises the alarm", || {
+        tgt.read().common.sevr == AlarmSeverity::Invalid
+    })
+    .await;
     {
         let inst = db.get_record("CPB_TGT").unwrap();
         let inst = inst.read();
@@ -3578,12 +3602,6 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
     // The device round trip finally completes. No RPRO was ever set, so the
     // completion tail queues no reprocess and the device sees no second write.
     db.complete_async_record("CPB_TGT").await.unwrap();
-    for _ in 0..20 {
-        if writes.lock().unwrap().len() > 1 {
-            break;
-        }
-        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
-    }
     assert_eq!(
         *writes.lock().unwrap(),
         vec![1.0],
@@ -3591,8 +3609,14 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
     );
 
     // The target is idle again: the next CP dispatch runs the body and resets
-    // lcnt, C's `else { precord->lcnt = 0; }`.
+    // lcnt, C's `else { precord->lcnt = 0; }`. It leaves the target PACT, so a
+    // reprocess queued by the release could no longer write either.
     burst(db.clone(), 13.0).await;
+    calink_ioc::until("burst 13 reaches the device", || {
+        writes.lock().unwrap().len() == 2
+    })
+    .await;
+    assert_eq!(*writes.lock().unwrap(), vec![1.0, 13.0]);
     let inst = db.get_record("CPB_TGT").unwrap();
     let inst = inst.read();
     assert_eq!(inst.common.lcnt, 0, "an idle target resets lcnt");
@@ -6418,10 +6442,28 @@ async fn test_dol_cp_link_registration() {
     db.add_record("MOTOR_POS", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    let targets = db.get_cp_targets("MTR");
+    let targets = db.get_external_cp_targets(b"MTR");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "MOTOR_POS");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
+}
+
+/// Connect `SRC`'s CP links, wait for the connect pass to read SRC's 10 into
+/// `last`, SRC's last processed edge, then move SRC to 20 with a process
+/// that posts it.
+async fn connect_and_move_src(db: &PvDatabase, last: &str) {
+    calink_ioc::connect(db).await;
+    calink_ioc::until("the connect pass reads SRC", || {
+        db.get_pv(last).unwrap().to_f64() == Some(10.0)
+    })
+    .await;
+    db.put_pv_no_process("SRC", EpicsValue::Double(20.0))
+        .await
+        .unwrap();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
+    db.process_record_with_links("SRC", &mut visited)
+        .await
+        .unwrap();
 }
 
 #[epics_macros_rs::epics_test]
@@ -6434,21 +6476,11 @@ async fn test_dol_cp_link_triggers_processing() {
     ao.omsl = 1;
     ao.dol = "SRC CP".into();
     db.add_record("DST", Box::new(ao)).await.unwrap();
-    db.setup_cp_links().await;
-    db.process_cp_links_on_connect().await;
-    // The connect already read 10; move the source so the dispatch shows.
-    db.put_pv_no_process("SRC", EpicsValue::Double(20.0))
-        .await
-        .unwrap();
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("SRC", &mut visited)
-        .await
-        .unwrap();
-    let val = db.get_pv("DST").unwrap();
-    match val {
-        EpicsValue::Double(v) => assert!((v - 20.0).abs() < 1e-10),
-        other => panic!("expected Double(20.0), got {:?}", other),
-    }
+    connect_and_move_src(&db, "DST").await;
+    calink_ioc::until("SRC's post processes DST", || {
+        db.get_pv("DST").unwrap().to_f64() == Some(20.0)
+    })
+    .await;
 }
 
 /// R6-4 — an `OUT` link is a `DBF_OUTLINK`, and C's `dbParseLink` discards its
@@ -6484,7 +6516,7 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
 
-    let targets = db.get_cp_targets("CPOUT_TGT");
+    let targets = db.get_external_cp_targets(b"CPOUT_TGT");
     assert_eq!(
         targets.len(),
         1,
@@ -6522,7 +6554,7 @@ async fn test_cpp_link_registration_is_passive_only() {
     db.add_record("DST", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    let targets = db.get_cp_targets("SRC");
+    let targets = db.get_external_cp_targets(b"SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "DST");
     assert!(
@@ -6548,12 +6580,16 @@ async fn test_cpp_link_skips_nonpassive_target() {
     if let Some(rec_arc) = db.get_record("DST") {
         rec_arc.write().common.scan = ScanType::SEC1;
     }
-    db.setup_cp_links().await;
-    db.process_cp_links_on_connect().await;
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("SRC", &mut visited)
-        .await
-        .unwrap();
+    // The witness is SRC's last edge: the pass that processes it decided DST.
+    let mut wit = AoRecord::new(0.0);
+    wit.omsl = 1;
+    wit.dol = "SRC CP".into();
+    db.add_record("WIT", Box::new(wit)).await.unwrap();
+    connect_and_move_src(&db, "WIT").await;
+    calink_ioc::until("SRC's post processes the witness", || {
+        db.get_pv("WIT").unwrap().to_f64() == Some(20.0)
+    })
+    .await;
     let val = db.get_pv("DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
@@ -6577,24 +6613,11 @@ async fn test_cpp_link_processes_passive_target() {
     ao.dol = "SRC CPP".into();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     // DST keeps the default Passive SCAN.
-    db.setup_cp_links().await;
-    db.process_cp_links_on_connect().await;
-    // The connect already read 10; move the source so the dispatch shows.
-    db.put_pv_no_process("SRC", EpicsValue::Double(20.0))
-        .await
-        .unwrap();
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("SRC", &mut visited)
-        .await
-        .unwrap();
-    let val = db.get_pv("DST").unwrap();
-    match val {
-        EpicsValue::Double(v) => assert!(
-            (v - 20.0).abs() < 1e-10,
-            "Passive CPP target was not processed (VAL={v})"
-        ),
-        other => panic!("expected Double, got {:?}", other),
-    }
+    connect_and_move_src(&db, "DST").await;
+    calink_ioc::until("SRC's post processes the Passive CPP target", || {
+        db.get_pv("DST").unwrap().to_f64() == Some(20.0)
+    })
+    .await;
 }
 
 /// CP (not CPP) processes the link-holder regardless of its SCAN
@@ -6613,24 +6636,11 @@ async fn test_cp_link_processes_nonpassive_target() {
     if let Some(rec_arc) = db.get_record("DST") {
         rec_arc.write().common.scan = ScanType::SEC1;
     }
-    db.setup_cp_links().await;
-    db.process_cp_links_on_connect().await;
-    // The connect already read 10; move the source so the dispatch shows.
-    db.put_pv_no_process("SRC", EpicsValue::Double(20.0))
-        .await
-        .unwrap();
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("SRC", &mut visited)
-        .await
-        .unwrap();
-    let val = db.get_pv("DST").unwrap();
-    match val {
-        EpicsValue::Double(v) => assert!(
-            (v - 20.0).abs() < 1e-10,
-            "non-Passive CP target was not processed (VAL={v}); CP must always process"
-        ),
-        other => panic!("expected Double, got {:?}", other),
-    }
+    connect_and_move_src(&db, "DST").await;
+    calink_ioc::until("CP processes its non-Passive holder", || {
+        db.get_pv("DST").unwrap().to_f64() == Some(20.0)
+    })
+    .await;
 }
 
 /// A CP and a CPP link from one source on one holder are two edges, each
@@ -6653,7 +6663,7 @@ record(calc, "DST") { field(INPA, "SRC CP") field(INPB, "SRC CPP") }
         .0;
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    let targets = db.get_cp_targets("SRC");
+    let targets = db.get_external_cp_targets(b"SRC");
     let mut gates: Vec<_> = targets
         .iter()
         .map(|t| (t.record.to_string(), t.passive_only))
@@ -6677,7 +6687,7 @@ async fn test_seq_dol_cp_link_registration() {
     db.add_record("MY_SEQ", Box::new(seq)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    let targets = db.get_cp_targets("SENSOR");
+    let targets = db.get_external_cp_targets(b"SENSOR");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "MY_SEQ");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6695,7 +6705,7 @@ async fn test_sel_nvl_cp_link_registration() {
     db.add_record("MY_SEL", Box::new(sel)).await.unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    let targets = db.get_cp_targets("INDEX_SRC");
+    let targets = db.get_external_cp_targets(b"INDEX_SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "MY_SEL");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6715,7 +6725,7 @@ async fn test_sdis_cp_link_registration() {
     }
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    let targets = db.get_cp_targets("DISABLE_SRC");
+    let targets = db.get_external_cp_targets(b"DISABLE_SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "GUARDED");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6851,7 +6861,7 @@ async fn test_tsel_cp_link_registration() {
     }
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    let targets = db.get_cp_targets("TSE_SRC");
+    let targets = db.get_external_cp_targets(b"TSE_SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "TARGET");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");

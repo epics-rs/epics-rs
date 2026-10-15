@@ -395,6 +395,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // iocInit step: registers the external CP edge AND warms (opens) the
     // monitor for the Passive holder's source PV.
     db.setup_cp_links().await;
+    // C `dbCaRun`, which releases the processor.
+    db.process_cp_links_on_connect().await;
 
     // (1) The warm's first monitor event must drive the holder to process
     // and read the remote value (5.0) into VAL — with NO explicit

@@ -75,7 +75,7 @@ impl LinkSet for CountingLset {
 
     async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.network_reads.fetch_add(1, Ordering::SeqCst);
-        self.connect_link(name).await;
+        self.connect_link(name, None).await;
         self.cache
             .lock()
             .get(std::str::from_utf8(name).unwrap())
@@ -89,7 +89,11 @@ impl LinkSet for CountingLset {
             .cloned()
     }
 
-    async fn connect_link(&self, name: &[u8]) {
+    async fn connect_link(
+        &self,
+        name: &[u8],
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
         self.opened
             .lock()
             .push(String::from_utf8_lossy(name).into_owned());
@@ -545,7 +549,7 @@ async fn forward_link_never_registers_a_cp_holder() {
 
     db.setup_cp_links().await;
     assert!(
-        db.get_cp_targets("CP_SRC").is_empty(),
+        db.get_external_cp_targets(b"CP_SRC").is_empty(),
         "a forward link's CP modifier is masked off, so no holder edge exists"
     );
 }

@@ -832,6 +832,8 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
         }
         let mut visited = super::ProcStack::new();
         let r = db.process_record_with_links("T", &mut visited).await;
+        // C's holder of `T CP` processes on the dbCa worker.
+        db.ca_sync().await;
         out.push(format!(
             "step {i} process: {:?}",
             r.map_err(|e| e.to_string())

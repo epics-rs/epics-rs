@@ -149,7 +149,12 @@ async fn main() -> ExitCode {
     // receive `Arc<PvDatabase>` clones — a caput on the CA side is
     // immediately visible through PVA monitors and vice versa.
     let macros = parse_macros(&args.macros);
-    let mut builder = IocBuilder::new();
+    // The network half of C's dbCa, libca, for names this IOC does not serve.
+    let mut builder = IocBuilder::new().register_link_type("ca", {
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("main runs on the IOC's reactor");
+        move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+    });
 
     // Startup progress goes to the subscriber, not to stderr. An IOC that
     // loaded a database says nothing about it: C `softIoc -d file.db` is

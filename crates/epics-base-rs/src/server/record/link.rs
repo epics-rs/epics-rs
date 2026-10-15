@@ -1542,20 +1542,11 @@ impl DbLink {
 pub struct CaLink {
     pub pv: crate::types::RecordName,
     pub monitor_switch: MonitorSwitch,
-    /// Link-processing policy carried by this link's parsed modifier,
-    /// exactly as [`DbLink::policy`] does. When it is `CP`/`CPP`, the dbCa
-    /// equivalent (`calink`) must subscribe a monitor and process the
-    /// link-holder on every remote change (C `dbCa.c:958-962`
-    /// `CA_DBPROCESS`); `cp_passive_only()` reads it identically to the local
-    /// DB path.
-    ///
-    /// A `CP`/`CPP` `CaLink` arises from the `ca://` scheme
-    /// (`"ca://OTHER:PV CPP"`) or from `classify_cp_link` re-routing a
-    /// `CP`/`CPP` link whose target is not a local record. It does **not**
-    /// arise from a plaintext ` CA` modifier: `CA` is a process *class* in C's
-    /// single `else if` chain (`dbStaticLib.c:2369-2373`), mutually exclusive
-    /// with `CP`/`CPP` and matched *before* `CP`, so `"OTHER:PV CP CA"` is
-    /// `pvlOptCA` alone — a plain CA link whose holder never processes.
+    /// Link-processing policy carried by this link's parsed modifier. When
+    /// it is `CP`/`CPP` the link set processes the holder on each monitor
+    /// event (C `dbCa.c:958-962` `CA_DBPROCESS`); every `CP`/`CPP` PV link is
+    /// a `CaLink`, local target or not (`dbLink.c:118-122`). `"OTHER:PV CP
+    /// CA"` is `pvlOptCA` alone (`dbStaticLib.c:2369-2373`): no CP policy.
     pub policy: LinkProcessPolicy,
     /// C `pvlOptFWD`: a `DBF_FWDLINK` whose PV names a PROC field, the only
     /// CA forward link dbCa's `scanForward` puts through (`dbLink.c:131-136`,
@@ -2117,13 +2108,7 @@ impl ParsedLink {
             // `pva://X` — this port's scheme extension, which C would parse
             // as a `PV_LINK` naming no local record.
             ParsedLink::Pva(_) | ParsedLink::Ca(_) => DbLinkType::CaLink,
-            ParsedLink::Db(link) => {
-                if link.policy.cp_passive_only().is_some() {
-                    DbLinkType::CaLink
-                } else {
-                    DbLinkType::DbLink
-                }
-            }
+            ParsedLink::Db(_) => DbLinkType::DbLink,
             // `dbInitLink` leaves a hardware link's type exactly as the parse
             // set it (`dbLink.c:92-130` only re-types `PV_LINK`), so the bus
             // the identifier letters named is what `dbpr` prints.
@@ -3973,15 +3958,16 @@ enum ProcessClass {
 
 impl ProcessClass {
     /// `(policy, force_ca)` — how this class lands in the port's link model.
-    /// Only `pvlOptCA` makes the link an *external* CA channel; `CP`/`CPP`
-    /// keep the local-DB shape and are routed by `classify_cp_link`.
+    /// `CA`, `CP` and `CPP` all make it a CA link whatever its target: C
+    /// `dbInitLink` tries `dbDbInitLink` only when none of the three is set
+    /// (`dbLink.c:118-122`), so a local target is served by `dbContext`.
     fn resolve(self) -> (LinkProcessPolicy, bool) {
         match self {
             Self::Npp => (LinkProcessPolicy::NoProcess, false),
-            Self::Cpp => (LinkProcessPolicy::ChannelProcessPassive, false),
+            Self::Cpp => (LinkProcessPolicy::ChannelProcessPassive, true),
             Self::Pp => (LinkProcessPolicy::ProcessPassive, false),
             Self::Ca => (LinkProcessPolicy::NoProcess, true),
-            Self::Cp => (LinkProcessPolicy::ChannelProcess, false),
+            Self::Cp => (LinkProcessPolicy::ChannelProcess, true),
         }
     }
 
@@ -4340,19 +4326,13 @@ fn parse_name_link(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
     // Isolate the target from its modifiers — see [`split_link_modifiers`].
     let (link_part, policy, ms, force_ca) = split_link_modifiers(s, ftype);
 
-    // A `CA` modifier forces the link to be a CA link (C
-    // `dbStaticLib.c:2372` — `pinfo->modifiers = pvlOptCA`, and
-    // `dbAccess.c:1104` routes a link with any of `CA|CP|CPP` away from
-    // `dbDbInitLink`). `dbParseLink` reaches the modifier scan only after the
-    // constant test (`dbStaticLib.c:2347`) has failed, so a CA-forced link is
-    // always a `PV_LINK` — never a Constant or local Db link.
+    // `CA`, `CP` or `CPP` makes the link a CA link, local target or not
+    // (`dbLink.c:118-122`, `dbAccess.c:1104`). `dbParseLink` reaches the
+    // modifier scan only after the constant test (`dbStaticLib.c:2347`) has
+    // failed, so it is always a `PV_LINK`. The class chain assigns one of
+    // the three, so `"OTHER:PV CP CA"` is `pvlOptCA` alone: a CA link that
+    // never processes its holder.
     if force_ca {
-        // `CA` is a *process class*, so it is mutually exclusive with
-        // `CP`/`CPP` and the class chain has already resolved the policy to
-        // `NoProcess`: `"OTHER:PV CP CA"` matches "CA" before "CP" in C and
-        // yields `pvlOptCA` alone — a plain CA link that never processes its
-        // holder. The maximize-severity switch is a *separate* chain and does
-        // ride along (`REC.VAL CA MS` keeps its MS gate).
         return ParsedLink::Ca(CaLink {
             pv: link_part.into(),
             monitor_switch: ms,
@@ -5115,11 +5095,11 @@ mod json_link_tests {
         // CPP is matched before PP, and CP only after CA.
         assert!(matches!(
             parse_link_v2("REC CPP"),
-            ParsedLink::Db(l) if l.policy == LinkProcessPolicy::ChannelProcessPassive
+            ParsedLink::Ca(l) if l.policy == LinkProcessPolicy::ChannelProcessPassive
         ));
         assert!(matches!(
             parse_link_v2("REC CP"),
-            ParsedLink::Db(l) if l.policy == LinkProcessPolicy::ChannelProcess
+            ParsedLink::Ca(l) if l.policy == LinkProcessPolicy::ChannelProcess
         ));
         // Exactly one class: a modifier-less link is NPP.
         assert!(matches!(
@@ -5136,11 +5116,13 @@ mod json_link_tests {
     fn modifiers_are_substring_matched_not_space_delimited() {
         assert_eq!(
             parse_link_v2("REC QQCPPXMSITT"),
-            ParsedLink::db(DbLink::new(
-                "REC",
-                LinkProcessPolicy::ChannelProcessPassive,
-                MonitorSwitch::MaximizeIfInvalid,
-            ))
+            ParsedLink::Ca(CaLink {
+                pv: "REC".into(),
+                monitor_switch: MonitorSwitch::MaximizeIfInvalid,
+                policy: LinkProcessPolicy::ChannelProcessPassive,
+                fwd: false,
+                open: OpenLatch::default(),
+            })
         );
     }
 
@@ -5460,19 +5442,23 @@ mod json_link_tests {
         }
     }
 
-    /// CP and CPP must parse to distinct policies — collapsing CPP into
-    /// `ChannelProcess` loses C's `precord->scan == 0` gate (`dbCa.c:825`, `:959`, `:1034`).
+    /// CP and CPP parse to CA links (`dbLink.c:118-122`) with distinct
+    /// policies — collapsing CPP into `ChannelProcess` loses C's
+    /// `precord->scan == 0` gate (`dbCa.c:825`, `:959`, `:1034`).
     #[test]
     fn parse_cp_and_cpp_are_distinct_policies() {
         match parse_link_v2("SRC.VAL CP") {
-            ParsedLink::Db(db) => assert_eq!(db.policy, LinkProcessPolicy::ChannelProcess),
-            other => panic!("expected Db link for CP, got {other:?}"),
+            ParsedLink::Ca(ca) => {
+                assert_eq!(ca.pv, "SRC.VAL");
+                assert_eq!(ca.policy, LinkProcessPolicy::ChannelProcess)
+            }
+            other => panic!("expected Ca link for CP, got {other:?}"),
         }
         match parse_link_v2("SRC.VAL CPP") {
-            ParsedLink::Db(db) => {
-                assert_eq!(db.policy, LinkProcessPolicy::ChannelProcessPassive)
+            ParsedLink::Ca(ca) => {
+                assert_eq!(ca.policy, LinkProcessPolicy::ChannelProcessPassive)
             }
-            other => panic!("expected Db link for CPP, got {other:?}"),
+            other => panic!("expected Ca link for CPP, got {other:?}"),
         }
     }
 

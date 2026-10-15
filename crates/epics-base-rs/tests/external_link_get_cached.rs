@@ -80,7 +80,7 @@ impl LinkSet for LazyLset {
     /// no longer call.
     async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.network_reads.fetch_add(1, Ordering::SeqCst);
-        self.connect_link(name).await;
+        self.connect_link(name, None).await;
         self.cache
             .lock()
             .get(std::str::from_utf8(name).unwrap())
@@ -94,7 +94,11 @@ impl LinkSet for LazyLset {
             .cloned()
     }
 
-    async fn connect_link(&self, name: &[u8]) {
+    async fn connect_link(
+        &self,
+        name: &[u8],
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
         self.opens.fetch_add(1, Ordering::SeqCst);
         if let Some(v) = self.on_open.clone() {
             self.cache

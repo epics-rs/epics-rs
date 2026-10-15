@@ -3,6 +3,8 @@
 //! hold, and a link put connects its CP edge then. The line is softIoc's for
 //! `dbpf SO zz` with `SO.OUT` = `MS.VAL`, a `dbPut` into `MS` (R7.0.10-146).
 
+mod calink_ioc;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -28,8 +30,7 @@ async fn connected_ioc() -> Arc<PvDatabase> {
         .unwrap()
         .0;
     db.initialize_link_locality().await;
-    db.setup_cp_links().await;
-    db.process_cp_links_on_connect().await;
+    calink_ioc::connect(&db).await;
     db
 }
 
@@ -111,12 +112,15 @@ async fn a_held_link_put_connects_its_cp_edge_once_its_gate_drops() {
     let held = db.lock_for_put("H", "INPA", &text);
     db.put_record_field_from_ca_already_locked(held, text.clone())
         .unwrap();
-    assert_eq!(val(&db, "H"), 1.0, "the new CP link processes H on connect");
+    calink_ioc::until("the new CP link processes H on connect", || {
+        val(&db, "H") == 1.0
+    })
+    .await;
 
     db.put_record_field_from_ca("X", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
-    assert_eq!(val(&db, "H"), 2.0, "X now drives H through its CP edge");
+    calink_ioc::until("X drives H through its CP edge", || val(&db, "H") == 2.0).await;
 }
 
 /// A panic in `put_many_locked`'s body still settles the puts it made: the
@@ -135,10 +139,13 @@ async fn a_held_link_put_settles_when_the_body_panics() {
         })
     }));
     assert!(unwound.is_err());
-    assert_eq!(val(&db, "H"), 1.0, "the new CP link processes H on connect");
+    calink_ioc::until("the new CP link processes H on connect", || {
+        val(&db, "H") == 1.0
+    })
+    .await;
 
     db.put_record_field_from_ca("X", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
-    assert_eq!(val(&db, "H"), 2.0, "X now drives H through its CP edge");
+    calink_ioc::until("X drives H through its CP edge", || val(&db, "H") == 2.0).await;
 }

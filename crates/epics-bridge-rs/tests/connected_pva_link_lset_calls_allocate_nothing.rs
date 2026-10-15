@@ -166,7 +166,7 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
                     json.as_str(),
                     "pva://T:H?sevr=MS",
                 ] {
-                    resolver.connect_link(name.as_bytes()).await;
+                    resolver.connect_link(name.as_bytes(), None).await;
                     let deadline = Instant::now() + Duration::from_secs(20);
                     while !(resolver.is_connected(name.as_bytes())
                         && resolver.get_cached_value(name.as_bytes()).is_some())

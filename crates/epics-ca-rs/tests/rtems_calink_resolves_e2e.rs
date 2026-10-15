@@ -156,6 +156,8 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
         downstream.initialize_link_locality().await;
         downstream.setup_cp_links().await;
         downstream.setup_external_link_opens().await;
+        // C `dbCaRun`, which releases the processor.
+        downstream.process_cp_links_on_connect().await;
     })
     .expect("no async runtime entered on this test thread");
 

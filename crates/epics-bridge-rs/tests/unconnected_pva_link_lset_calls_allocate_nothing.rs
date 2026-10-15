@@ -113,7 +113,7 @@ fn unconnected_pva_link_lset_calls_allocate_nothing() {
                     "pva://T:NONE?sevr=MS&field=value",
                     json.as_str(),
                 ] {
-                    resolver.connect_link(name.as_bytes()).await;
+                    resolver.connect_link(name.as_bytes(), None).await;
                     let forward = resolver.forward_handle(name.as_bytes());
                     let n = allocs(|| unconnected_calls(&resolver, name.as_bytes(), &*forward));
                     assert_eq!(n, 0, "{name}");

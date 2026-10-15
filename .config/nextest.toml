@@ -104,6 +104,7 @@ default-filter = """
   binary(discovery_mdns) |
   binary(stress_load) |
   binary(calink_rights_match_softioc) |
+  binary(local_cp_link_matches_softioc) |
   binary(gw_upstream_unresponsive_window) |
   (package(c-ca-tools) & test(=tests::a_held_udp_port_spends_the_candidate)) |
   (package(epics-pva-rs) & test(/^auth::tls::tests::(pkcs12_loads_leaf_and_key_with_password|pkcs12_wrong_password_is_rejected|pkcs12_with_ca_chain_splits_leaf_from_ca|pkcs12_pbes2_openssl3_default_loads_leaf_and_key|pkcs12_pbes2_with_ca_chain_splits_leaf_from_ca|pkcs12_pbes2_wrong_password_is_rejected|server_config_loads_from_pkcs12_env|server_default_requests_client_cert|server_config_inline_keychain_password_splits_at_semicolon|server_config_inline_keychain_password_beats_env_fallback|server_config_pkcs12_wrong_password_env_errors|server_honors_pvas_only_tls_options_require|server_falls_back_to_shared_pva_keychain)$/))
@@ -208,7 +209,7 @@ test-group = 'pva_listener'
 # confined to one test too. The cap is retained on the evidence of the
 # runs behind it, not on that reason.
 [[profile.default.overrides]]
-filter = 'binary(interop_rust_client_c_ioc) | binary(interop_c_client_rust_ioc) | binary(stress_load) | binary(differential_libca) | binary(calink_rights_match_softioc)'
+filter = 'binary(interop_rust_client_c_ioc) | binary(interop_c_client_rust_ioc) | binary(stress_load) | binary(differential_libca) | binary(calink_rights_match_softioc) | binary(local_cp_link_matches_softioc)'
 test-group = 'ca_softioc'
 
 # IOC spawners that have been measured NOT to need serialising. Declared

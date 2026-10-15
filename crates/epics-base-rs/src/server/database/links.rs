@@ -866,16 +866,10 @@ pub(super) enum LinkTarget {
 #[inline(never)]
 fn link_source_render(
     instance: &crate::server::record::RecordInstance,
-    db: &crate::server::record::DbLink,
     field: &str,
     v: &EpicsValue,
 ) -> crate::server::record::record_instance::SourceRender {
-    let render = instance.source_render_of(field, v);
-    // C makes a CP/CPP link a `CA_LINK` whatever its target.
-    match db.policy.cp_passive_only() {
-        Some(_) => render.through_ca(),
-        None => render,
-    }
+    instance.source_render_of(field, v)
 }
 
 impl PvDatabase {
@@ -1096,7 +1090,7 @@ impl PvDatabase {
                         && !target.string_view
                         && !matches!(v, EpicsValue::String(_) | EpicsValue::StringArray(_)) =>
                 {
-                    Some(link_source_render(&instance, db, &target.field, v))
+                    Some(link_source_render(&instance, &target.field, v))
                 }
                 _ => None,
             };
@@ -3237,7 +3231,7 @@ impl PvDatabase {
         // accepting write wins (mirrors `resolve_external_pv`'s bare-name
         // path).
         let (target, body) = Self::split_external_link_name(name);
-        if find_lset(&self.inner, &target, |_| Some(())).is_none() {
+        if !self.link_addressable(&target, body) {
             return Err(ExternalPutRefusal::Unserviceable(match target {
                 LinkTarget::Scheme(scheme) => {
                     format!("no '{scheme}' link set registered for '{shown}'")
@@ -4625,112 +4619,18 @@ impl PvDatabase {
         );
     }
 
-    /// Register a CP link: when source_record changes, process target_record.
-    ///
-    /// Both names are normalised to canonical form so the cp_links
-    /// map's key/value always match the canonical record name that
-    /// `dispatch_cp_targets` uses for lookup. Without this, a user
-    /// who wrote `INP="ALIAS_NAME CP"` in their .db file would
-    /// register the CP edge under the alias key and then never see
-    /// the target processed (the source record's canonical-name
-    /// dispatch would miss).
-    /// `passive_only` is `true` for a CPP edge (process the target only when
-    /// its `SCAN` is Passive) and `false` for CP (always process). One call
-    /// is one link and one edge, never merged: C gives each link its own
-    /// `caLink` and monitor, so two `X CP` inputs on one record process it
-    /// twice per post, and a CP beside a CPP keeps the CPP's own gate. The
-    /// edge belongs to `target_record`'s link `field`: registering that link
-    /// again replaces it.
-    pub async fn register_cp_link(
-        &self,
-        source_record: impl AsRef<[u8]>,
-        target_record: impl AsRef<[u8]>,
-        field: &str,
-        passive_only: bool,
-    ) {
-        let source = self.canonical_name(source_record);
-        let holder = self.canonical_name(target_record);
-        self.inner.cp_links.update(|cp| {
-            cp.set_link(
-                &holder,
-                field,
-                Some(super::CpSource {
-                    record: source,
-                    put_field: None,
-                    passive_only,
-                }),
-            )
-        });
-    }
-
     fn canonical_name(&self, name: impl AsRef<[u8]>) -> RecordName {
         let name = name.as_ref();
         self.resolve_alias(name)
             .unwrap_or_else(|| RecordName::from(name))
     }
 
-    /// Whether any CP/CPP edge names this record as its source — the gate
-    /// [`Self::dispatch_cp_targets`] asks before it looks the edges up.
-    ///
-    /// The registry is keyed by record name, so the direct question costs a
-    /// hash of that name on every cycle of every record, and answers `false`
-    /// for all of them in an IOC that wires no CP link. The record caches the
-    /// answer against the registry's revision instead: an edit to `cp_links`
-    /// goes through [`SnapshotCell::update`](super::snapshot::SnapshotCell),
-    /// which moves that revision, so no cached `false` can outlive the
-    /// registration that makes it wrong.
-    #[inline(always)]
-    pub(crate) fn sources_cp_edges(&self, source_record: &[u8], rec: InFrame<'_>) -> bool {
-        // The cache is atomics on the cell, outside the data the frame guards.
-        let rec = rec.unframed();
-        // Revision first, map second — see `SnapshotCell::revision`.
-        let revision = self.inner.cp_links.revision();
-        match rec.cached_cp_edges(revision) {
-            Some(cached) => cached,
-            None => self.sources_cp_edges_uncached(source_record, rec, revision),
-        }
-    }
-
-    /// [`Self::sources_cp_edges`] on a cache miss, out of line so the hit
-    /// every steady cycle takes pays a branch and not this frame.
-    fn sources_cp_edges_uncached(
-        &self,
-        source_record: &[u8],
-        rec: &Arc<super::RecordCell>,
-        revision: u64,
-    ) -> bool {
-        // Non-EMPTY, not merely present: dropping a holder record retains
-        // the source's key with an empty target list (`PvDatabase::
-        // remove_record`), and a source whose every holder is gone owes the
-        // dispatch nothing.
-        let present = self
-            .inner
-            .cp_links
-            .load()
-            .targets(source_record)
-            .is_some_and(|targets| !targets.is_empty());
-        rec.cache_cp_edges(revision, present);
-        present
-    }
-
-    /// Get target edges to process when `source_record` changes (CP/CPP links).
-    pub fn get_cp_targets(&self, source_record: impl AsRef<[u8]>) -> Vec<super::CpTarget> {
-        let source_record = source_record.as_ref();
-        self.inner
-            .cp_links
-            .load()
-            .targets(source_record)
-            .cloned()
-            .unwrap_or_default()
-    }
-
     /// Register an EXTERNAL CP/CPP link: when the remote PV `external_pv`
     /// (a cross-IOC CA/PVA source, e.g. `OTHER:PV` from
     /// `INP="OTHER:PV CP"`) changes, process `target_record`.
     ///
-    /// Twin of [`Self::register_cp_link`] for cross-IOC sources. The key is
-    /// the **scheme-stripped external PV name** — it is not a local record,
-    /// so it is NOT alias-resolved. It MUST equal the name the calink/pvalink
+    /// The key is the **scheme-stripped PV name** — a channel name, so it is
+    /// NOT alias-resolved. It MUST equal the name the calink/pvalink
     /// monitor dispatches under: that monitor is opened through the lset,
     /// which strips the `ca://` / `pva://` scheme first, so its `pv_name`
     /// (passed to [`super::ExternalCpProcess::new`]) is the bare PV.
@@ -4738,7 +4638,7 @@ impl PvDatabase {
     /// already knows — guarantees the registry key and the dispatch key can
     /// never diverge. The `target_record` (the local holder) IS alias-resolved
     /// so the dispatch processes the canonical record. One edge per link,
-    /// keyed by the holder's link `field`, identical to the local path.
+    /// keyed by the holder's link `field`.
     pub async fn register_external_cp_link(
         &self,
         external_pv: impl AsRef<[u8]>,
@@ -4754,7 +4654,6 @@ impl PvDatabase {
                 field,
                 Some(super::CpSource {
                     record: key,
-                    put_field: None,
                     passive_only,
                 }),
             )
@@ -4839,16 +4738,6 @@ impl PvDatabase {
     /// direction-agnostic: it is the one locality decision, not a CP-only
     /// one. Restricting it to CP/CPP left every plain non-local `Db` link
     /// unconverted and unopened.
-    ///
-    /// **Deviation, deliberate.** Because C skips `dbDbInitLink` for a
-    /// `CA`/`CP`/`CPP` link, C makes a CP link to a LOCAL record a CA link
-    /// too. This function does not: it leaves a local CP target as `Db`,
-    /// because the `ca` link set lives in `epics-ca-rs` and an IOC built on
-    /// `epics-base-rs` alone would be left with a local CP link that resolves
-    /// nowhere. What C buys with that conversion — a holder processed only on
-    /// a `DBE_VALUE|DBE_ALARM` post, never on a bare source process — is paid
-    /// for instead at the trigger, by the `CyclePosts` gate in
-    /// `PvDatabase::dispatch_cp_targets`.
     ///
     /// **Decided once.** C sets `DBLINK_FLAG_INITIALIZED` on entry and
     /// returns early on every later call (`dbLink.c:96-100`), so a record
@@ -5141,38 +5030,18 @@ impl PvDatabase {
         converted
     }
 
-    /// Classify one parsed CP/CPP link into the local or the external CP
-    /// trigger registry.
+    /// The CP/CPP edge one parsed link makes, if it makes one.
     ///
-    /// A link with no CP/CPP policy (`cp_passive_only() == None`), and
-    /// every non-`Db`/`Ca` variant, is ignored.
-    ///
-    /// `Ca`: an external `ca://OTHER CP` holder always drives the cross-IOC
-    /// path — C `dbCa.c` `eventCallback` adds `CA_DBPROCESS` for every CP link
-    /// (`dbCa.c:958-962`). Note `OTHER CP CA` is NOT such a link: `CA` and `CP`
-    /// are mutually exclusive process classes and `CA` is matched first
-    /// (`dbStaticLib.c:2369-2373`), so it is a plain CA link with no CP policy.
-    ///
-    /// `Db`: a *local* target only. The locality decision is not made here —
-    /// [`super::PvDatabase::record_link_fields`] has already mapped every
-    /// enumerated link through [`Self::db_init_link_locality`], so a CP/CPP
-    /// link to a non-local target arrives at the `Ca` arm above and lands in
-    /// `ext_links` by the same route an explicit `ca://OTHER CP` does. That
-    /// rule used to live in this method, which is why it applied to CP/CPP
-    /// links only.
+    /// Only a `Ca` link can: C makes every CP/CPP link a CA link whatever its
+    /// target (`dbLink.c:118-122`), and `eventCallback` adds `CA_DBPROCESS`
+    /// for each one (`dbCa.c:958-962`). `OTHER CP CA` is not such a link: `CA`
+    /// and `CP` are one process class and `CA` is matched first
+    /// (`dbStaticLib.c:2369-2373`).
     fn classify_cp_link(parsed: crate::server::record::ParsedLink) -> Option<CpEdge> {
         match parsed {
-            crate::server::record::ParsedLink::Db(db) => {
-                db.policy.cp_passive_only().map(|passive_only| CpEdge {
-                    source: CpEdgeSource::Local(db.target().record.clone()),
-                    put_field: super::put_posted_field(&db.target().field),
-                    passive_only,
-                })
-            }
             crate::server::record::ParsedLink::Ca(ca) => {
                 ca.policy.cp_passive_only().map(|passive_only| CpEdge {
-                    source: CpEdgeSource::External(ca.pv.into()),
-                    put_field: None,
+                    pv: ca.pv.into(),
                     passive_only,
                 })
             }
@@ -5189,10 +5058,8 @@ impl PvDatabase {
         for holder in holders {
             // Enumerated through the single shared owner (`record_link_fields`)
             // so this and the pvalink install scan never diverge on which
-            // fields count as links. That owner already applies C
-            // `dbInitLink`'s locality fallthrough
-            // (`Self::db_init_link_locality`), so a CP/CPP link to a
-            // non-local target arrives here as `Ca`.
+            // fields count as links. A CP/CPP link is `Ca` whatever its
+            // target (`dbLink.c:118-127`).
             for (field, _raw, parsed) in self.record_link_fields(&holder) {
                 if let Some(edge) = Self::classify_cp_link(parsed) {
                     out.push((holder.clone(), field, edge));
@@ -5202,139 +5069,86 @@ impl PvDatabase {
         out
     }
 
-    /// Publish `links`' edges — local or external per `external` — in one
-    /// registry update, each replacing its link's previous edge.
-    fn set_cp_links<'a>(
-        &self,
-        external: bool,
-        links: impl IntoIterator<Item = &'a (RecordName, String, CpEdge)>,
-    ) {
+    /// Publish `links`' edges in one registry update, each replacing its
+    /// link's previous edge.
+    fn set_cp_links<'a>(&self, links: impl IntoIterator<Item = &'a (RecordName, String, CpEdge)>) {
         let edges: Vec<(RecordName, &str, super::CpSource)> = links
             .into_iter()
-            .filter(|(_, _, edge)| edge.external() == external)
             .map(|(holder, field, edge)| {
                 (
                     self.canonical_name(holder),
                     field.as_str(),
-                    self.cp_source(edge),
+                    Self::cp_source(edge),
                 )
             })
             .collect();
-        let registry = if external {
-            &self.inner.external_cp_links
-        } else {
-            &self.inner.cp_links
-        };
-        registry.update(|cp| {
+        self.inner.external_cp_links.update(|cp| {
             for (holder, field, source) in edges {
                 cp.set_link(&holder, field, Some(source));
             }
         });
     }
 
-    /// `edge` as its registry keys it: an external source by the PV its
-    /// monitor dispatches under, a local one by its canonical record.
-    fn cp_source(&self, edge: &CpEdge) -> super::CpSource {
+    /// `edge` as the registry keys it: by the PV its monitor dispatches under.
+    fn cp_source(edge: &CpEdge) -> super::CpSource {
         super::CpSource {
-            record: match &edge.source {
-                CpEdgeSource::External(pv) => RecordName::from(external_cp_key(pv)),
-                CpEdgeSource::Local(record) => self.canonical_name(record),
-            },
-            put_field: edge.put_field,
+            record: RecordName::from(external_cp_key(&edge.pv)),
             passive_only: edge.passive_only,
         }
     }
 
-    /// Scan all records for CP/CPP input links and register them. Local
-    /// `Db` links land in the local CP registry; external `Ca` links land
-    /// in the external CP registry, whose holders are processed by the
-    /// calink monitor callback.
+    /// Scan all records for CP/CPP links, register them, and open each one's
+    /// channel. A Passive holder is never scanned, so its link would never
+    /// open lazily and the monitor that drives it would never exist; C's
+    /// `dbInitLink` → `dbCaAddLink` adds every CA link at init. A no-op
+    /// open when no matching link set is installed.
     pub async fn setup_cp_links(&self) {
         let names = self.all_record_names().await;
         let links = self.cp_links_of(names);
-        // The local edges are registered by `process_cp_links_on_connect`,
-        // C's connect: a source processed before it (PINI) reaches no holder.
-        let ext_count = links.iter().filter(|(_, _, e)| e.external()).count();
-        let db_count = links.len() - ext_count;
-        self.set_cp_links(true, &links);
-        if db_count > 0 {
-            tracing::debug!("iocInit: {db_count} CP link subscriptions");
-        }
-        // Warm external CP/CPP links. A Passive holder of an external CP
-        // link is never scanned, so its link never opens lazily and the
-        // calink monitor that drives its `ExternalCpProcess` is never
-        // created (chicken-and-egg). Open each external CP PV now so its
-        // monitor is live at iocInit — the C `dbCa.c` "add the link at init"
-        // analogue (`dbCaAddLink`). `resolve_external_pv` routes through the
-        // registered lset's lazy-open path (the same path a record read
-        // uses); a no-op when no matching lset is installed (calink off).
-        if ext_count > 0 {
-            let ext_pvs = self.external_cp_pv_names().await;
-            for pv in &ext_pvs {
+        self.set_cp_links(&links);
+        if !links.is_empty() {
+            let pvs = self.external_cp_pv_names().await;
+            for pv in &pvs {
                 let _ = self.resolve_external_pv(crate::server::record::ExternalRef::unlatched(pv));
             }
             tracing::debug!(
-                "iocInit: {ext_count} external CP link subscriptions ({} PVs warmed)",
-                ext_pvs.len()
+                "iocInit: {} CP link subscriptions ({} PVs opened)",
+                links.len(),
+                pvs.len()
             );
         }
     }
 
-    /// The first monitor event of every CP/CPP link to a record in this IOC.
-    ///
-    /// C serves these as CA links whose `CA_CONNECT` waits in the paused
-    /// `dbCaTask` until `dbCaRun` (`iocInit.c:260`, after `scanRun` and the
-    /// PINI=YES pass); the connect's first `eventCallback` adds
-    /// `CA_DBPROCESS` (`dbCa.c:1005-1012`), so each such link processes its
-    /// holder once, a CPP holder only while Passive. The port's local CP
-    /// edge never connects, so this pass is that event — once per link, not
-    /// per holder, as C's two `X CP` inputs on one record process it twice.
+    /// C `dbCaRun` (`iocInit.c:260`, after `scanRun` and the PINI=YES pass):
+    /// the CP/CPP processing the links' monitors requested while `dbCaTask`
+    /// was paused runs from here, so a holder's connect-time process follows
+    /// PINI. From here a relinked CP link also opens its own channel.
     pub async fn process_cp_links_on_connect(&self) {
-        let links = self.cp_links_of(self.iterate_records().into_iter().map(|(h, _)| h));
-        self.set_cp_links(false, &links);
-        self.inner.cp_links.update(|cp| cp.mark_connected());
-        for (holder, _, edge) in links.iter().filter(|(_, _, e)| !e.external()) {
-            self.cp_event(holder, edge.passive_only);
-        }
+        self.inner
+            .external_cp_links
+            .update(|cp| cp.mark_connected());
+        self.inner.ca_run.run().await;
     }
 
-    /// A put of `record.field` posted that field: every local CP/CPP link
-    /// reading it gets its monitor event. Called once the put's gate is down.
-    pub(crate) fn dispatch_put_cp_targets(&self, record: &[u8], field: &'static str) {
-        let source = self.canonical_name(record);
-        let holders: Vec<super::CpTarget> = self
-            .inner
-            .cp_links
-            .load()
-            .put_targets(&source, field)
-            .cloned()
-            .collect();
-        for holder in holders {
-            self.cp_event(&holder.record, holder.passive_only);
-        }
+    /// C `dbCaSync`, after `dbCaRun`: return once every event posted to a
+    /// local CA link before the call has run its CP/CPP processing.
+    pub async fn ca_sync(&self) {
+        self.inner.ca_links.sync().await;
     }
 
-    /// One local CP/CPP link's monitor event (its connect is the first),
-    /// which processes the holder, a CPP holder only while Passive.
-    fn cp_event(&self, holder: &[u8], passive_only: bool) {
-        let Some((name, rec)) = self.lookup_record(holder) else {
-            return;
-        };
-        if passive_only && rec.read().common.scan != ScanType::Passive {
-            return;
-        }
-        let mut visited = ProcStack::new();
-        let _ = self.process_record_with_links_resolved(&name, &rec, &mut visited);
+    /// The CP/CPP worker's wait for [`Self::process_cp_links_on_connect`].
+    pub(crate) async fn ca_run_reached(&self) {
+        self.inner.ca_run.reached().await;
     }
 
-    /// A put to `holder`'s link `field` after the connect pass: C
-    /// `dbPutFieldLink` drops the old `caLink` and opens a new one —
-    /// `dbCaAddLink` stages its `CA_CONNECT` for every external link, as
-    /// [`Self::setup_external_link_opens`] does at iocInit — whose connect
-    /// processes a CP holder like the connect pass. A link the put removed
-    /// and never added opens nothing. Called once the put's gate is down.
+    /// A put to `holder`'s link `field` after `dbCaRun`: C `dbPutFieldLink`
+    /// drops the old `caLink` and opens a new one — `dbCaAddLink` stages its
+    /// `CA_CONNECT`, as [`Self::setup_external_link_opens`] does at iocInit —
+    /// whose first monitor event processes a CP holder. A link the put
+    /// removed and never added opens nothing. Called once the put's gate is
+    /// down.
     pub(crate) fn relink_cp_link(&self, holder: &[u8], field: &str) {
-        if !self.inner.cp_links.load().connected() {
+        if !self.inner.external_cp_links.load().connected() {
             return;
         }
         let holder = self.canonical_name(holder);
@@ -5355,29 +5169,22 @@ impl PvDatabase {
             || crate::server::record::record_instance::upper_field(field),
             |rec| rec.canonical_field(field),
         );
-        for external in [false, true] {
-            let keyed = edge
-                .as_ref()
-                .filter(|e| e.external() == external)
-                .map(|e| self.cp_source(e));
-            let registry = if external {
-                &self.inner.external_cp_links
-            } else {
-                &self.inner.cp_links
+        let keyed = edge.as_ref().map(Self::cp_source);
+        self.inner
+            .external_cp_links
+            .update(|cp| cp.set_link(&holder, &field, keyed));
+        if let Some(edge) = edge {
+            let pv = external_cp_key(&edge.pv);
+            let (target, body) = Self::split_external_link_name(pv);
+            let holder = super::CpTarget {
+                record: holder,
+                passive_only: edge.passive_only,
             };
-            registry.update(|cp| cp.set_link(&holder, &field, keyed));
-        }
-        match edge {
-            Some(CpEdge {
-                source: CpEdgeSource::External(pv),
-                ..
-            }) => {
-                let _ = self.resolve_external_pv(crate::server::record::ExternalRef::unlatched(
-                    external_cp_key(&pv),
-                ));
-            }
-            Some(e) => self.cp_event(&holder, e.passive_only),
-            None => {}
+            super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+                lset.cp_link_added(body, holder.clone());
+                None::<()>
+            });
+            let _ = self.resolve_external_pv(crate::server::record::ExternalRef::unlatched(pv));
         }
     }
 
@@ -6010,163 +5817,44 @@ mod cp_link_locality_tests {
     use crate::server::record::ParsedLink;
     use crate::server::records::ai::AiRecord;
 
-    /// A CP/CPP link with no explicit `CA` modifier whose target is NOT a
-    /// local record must be served as an external (CA) link — both the
-    /// trigger and the value read. C `dbInitLink` (`dbLink.c:118-122`) tests
-    /// the `CA`/`CP`/`CPP` modifier FIRST and skips `dbDbInitLink` entirely
-    /// when one is present, so in C a CP link is a CA link whether or not the
-    /// named record is local; `dbLink.c:128` computes `isLocal` only to pick
-    /// the init-callback hint. The port keeps a LOCAL CP target as a `Db`
-    /// link instead (see `cp_link_to_local_target_stays_db`) and restores the
-    /// C semantics at the trigger, so only the non-local case converts here.
-    ///
-    /// Here `INP="OTHER:PV CP"` parses to `ParsedLink::Db` (bare name, no
-    /// `CA`), but `OTHER:PV` is not local. The holder's `parsed_inp` must be
-    /// rewritten to `ParsedLink::Ca` (so the read routes through
-    /// `resolve_external_pv`) and `OTHER:PV` must be registered as an
-    /// external CP trigger.
-    ///
-    /// The two halves now have two owners, matching C's two calls:
-    /// `initialize_link_locality` is `dbInitLink`'s conversion and applies to
-    /// EVERY link, CP or not; `setup_cp_links` only registers the trigger.
-    /// The rewrite used to live inside `setup_cp_links`, which is why it
-    /// reached CP/CPP links alone.
+    /// C `dbInitLink` (`dbLink.c:118-122`) tests `CA`/`CP`/`CPP` before
+    /// locality and skips `dbDbInitLink` when one is set, so a CP link is a
+    /// CA link whether its record is here (`SRC`) or not (`OTHER:PV`), and
+    /// each is registered as the trigger of its holder.
     #[epics_macros_rs::epics_test]
-    async fn cp_link_to_nonlocal_target_forced_external() {
+    async fn a_cp_link_is_a_ca_link_whatever_its_target() {
         let db = PvDatabase::new();
-        db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
-            .await
-            .unwrap();
-        {
-            let rec = db.get_record("HOLDER").unwrap();
-            rec.write().common.text.inp = "OTHER:PV CP".into();
-        }
-
-        db.initialize_link_locality().await;
-        db.setup_cp_links().await;
-        db.process_cp_links_on_connect().await;
-
-        let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
-        match inp {
-            ParsedLink::Ca(ca) => assert_eq!(
-                ca.pv, "OTHER:PV",
-                "non-local CP link must carry the verbatim PV name"
-            ),
-            other => panic!("non-local CP link must be forced to Ca, got {other:?}"),
-        }
-        assert!(
-            db.external_cp_pv_names()
+        for name in ["SRC", "LOCAL", "REMOTE"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
                 .await
-                .iter()
-                .any(|n| n == "OTHER:PV"),
-            "non-local CP link must be registered as an external CP trigger"
-        );
-    }
-
-    /// A CP link whose target IS a local record keeps the `Db` SHAPE — and
-    /// that is a deliberate port DEVIATION, not C parity.
-    ///
-    /// C `dbInitLink` (`dbLink.c:118-122`) would make this link a CA link:
-    /// the modifier test precedes and short-circuits `dbDbInitLink`, so `SRC`
-    /// being local changes nothing about the link's class. The port cannot
-    /// follow that literally — the `ca` link set lives in `epics-ca-rs`, which
-    /// `epics-base-rs` does not depend on, so converting a local CP link to
-    /// `Ca` would leave it unresolvable (and its holder never processed) in a
-    /// bare `epics-base-rs` IOC.
-    ///
-    /// What this test therefore pins is the deviation TOGETHER with what
-    /// compensates for it: the link keeps the `Db` shape, it is NOT an
-    /// external CP trigger, and it IS registered in the LOCAL CP registry —
-    /// the registry `PvDatabase::dispatch_cp_targets` drives, and which since
-    /// the `CyclePosts` gate fires only on a `DBE_VALUE|DBE_ALARM` post from
-    /// `SRC`, exactly as C's CA subscription would (`dbCa.c:1225-1229` →
-    /// `cadef.h:2010-2011`). The observable rule is proven by
-    /// `tests/cp_link_trigger_is_a_post.rs`; a `Db` shape with no local
-    /// registration would satisfy the old assertion and still never process
-    /// the holder.
-    #[epics_macros_rs::epics_test]
-    async fn cp_link_to_local_target_stays_db() {
-        let db = PvDatabase::new();
-        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
-            .await
-            .unwrap();
-        db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
-            .await
-            .unwrap();
-        {
-            let rec = db.get_record("HOLDER").unwrap();
+                .unwrap();
+        }
+        for (holder, inp) in [("LOCAL", "SRC CP"), ("REMOTE", "OTHER:PV CPP")] {
+            let rec = db.get_record(holder).unwrap();
             let mut inst = rec.write();
-            inst.common.text.inp = "SRC CP".into();
-            // Seed the parse cache as load would, so the assertion proves
-            // setup_cp_links leaves a local CP link untouched.
+            inst.common.text.inp = inp.into();
             inst.install_link_cache(
                 "INP",
-                std::sync::Arc::new(crate::server::record::parse_link_v2("SRC CP")),
+                std::sync::Arc::new(crate::server::record::parse_link_v2(inp)),
             )
             .expect("INP is a common link");
         }
 
         db.initialize_link_locality().await;
         db.setup_cp_links().await;
-        db.process_cp_links_on_connect().await;
 
-        let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
-        assert!(
-            matches!(inp, ParsedLink::Db(_)),
-            "the port keeps a local CP link in the Db shape (C would make it a \
-             CA link); got {inp:?}"
-        );
-        assert!(
-            !db.external_cp_pv_names().await.iter().any(|n| n == "SRC"),
-            "a local CP target must not be registered as an external CP link"
-        );
-        assert!(
-            db.get_cp_targets("SRC")
-                .iter()
-                .any(|t| t.record == "HOLDER" && !t.passive_only),
-            "the Db shape is only sound because the edge lands in the LOCAL CP \
-             registry, where the post gate drives it"
-        );
-    }
-
-    /// The gate's two boundaries: a record with no CP holder answers `false`
-    /// from its own cache after the first ask, and a registration made AFTER
-    /// that cache was filled still reaches it — the registry's revision is
-    /// what expires the cached answer, so nothing has to remember to.
-    #[epics_macros_rs::epics_test]
-    async fn cached_cp_edge_gate_expires_on_registration() {
-        use crate::server::records::ai::AiRecord;
-
-        let db = PvDatabase::new();
-        for name in ["SRC", "HOLDER"] {
-            db.add_record(name, Box::new(AiRecord::new(0.0)))
-                .await
-                .unwrap();
+        for (holder, pv) in [("LOCAL", "SRC"), ("REMOTE", "OTHER:PV")] {
+            let inp = db.get_record(holder).unwrap().read().parsed_inp.clone();
+            match inp {
+                ParsedLink::Ca(ca) => assert_eq!(ca.pv, pv),
+                other => panic!("{holder}: a CP link is a CA link, got {other:?}"),
+            }
+            let targets = db.get_external_cp_targets(pv.as_bytes());
+            assert_eq!(targets.len(), 1, "{holder}");
+            assert_eq!(targets[0].record, holder);
         }
-        let src = db.get_record("SRC").unwrap();
-
-        assert!(
-            !db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
-            "no CP edge names SRC yet"
-        );
-        assert!(
-            !db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
-            "the second ask is the cached one and must answer the same"
-        );
-
-        db.register_cp_link("SRC", "HOLDER", "INP", false).await;
-        assert!(
-            db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
-            "the registration moved the registry revision, so the cached \
-             `false` must not have survived it"
-        );
-
-        db.remove_record("HOLDER").await;
-        assert!(
-            !db.with_frame(&src, |f| db.sources_cp_edges(b"SRC", f)),
-            "removing the holder drops the edge, and the same revision gate \
-             must expire the cached `true`"
-        );
+        assert!(!db.get_external_cp_targets(b"SRC")[0].passive_only);
+        assert!(db.get_external_cp_targets(b"OTHER:PV")[0].passive_only);
     }
 }
 
@@ -6204,13 +5892,14 @@ mod external_link_pv_name_tests {
         db.get_record("IN2").unwrap().write().common.text.inp = "ca://UP:ZED CP".into();
         // An OUT link reaches `dbCaAddLink` in C exactly as an IN link does.
         db.get_record("OUT1").unwrap().write().common.text.out = "ca://UP:ALPHA".into();
-        // A link to a record this IOC does have is local and must not count.
+        // A link to a record this IOC does have is local and must not count
+        // (a CP one would: it is a CA link, `dbLink.c:118-122`).
         db.get_record("LOCAL_HOLDER")
             .unwrap()
             .write()
             .common
             .text
-            .inp = "LOCAL_SRC CP".into();
+            .inp = "LOCAL_SRC PP".into();
 
         db.initialize_link_locality().await;
 
@@ -7218,27 +6907,11 @@ mod record_link_uses_tests {
     }
 }
 
-/// One CP/CPP link's trigger: the source it watches, and whether that source
-/// is served here or by a link set.
+/// One CP/CPP link's trigger: the channel it watches and CPP's gate.
 struct CpEdge {
-    source: CpEdgeSource,
-    /// The put-posted source field it reads ([`super::put_posted_field`]).
-    put_field: Option<&'static str>,
+    /// The link's PV text.
+    pv: RecordName,
     passive_only: bool,
-}
-
-/// Where a [`CpEdge`]'s source is served.
-enum CpEdgeSource {
-    /// A record here, by the bytes its link names.
-    Local(RecordName),
-    /// A link set's channel, by its link text.
-    External(RecordName),
-}
-
-impl CpEdge {
-    fn external(&self) -> bool {
-        matches!(self.source, CpEdgeSource::External(_))
-    }
 }
 
 /// The external registry's key: the PV the calink/pvalink monitor dispatches

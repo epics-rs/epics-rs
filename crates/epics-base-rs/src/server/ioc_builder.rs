@@ -345,10 +345,22 @@ impl IocBuilder {
     /// caller can start the autosave loop).
     ///
     /// The database has no IOC lifecycle: `iocState` is not touched and
-    /// nothing of `iocBuild` is said. An IOC process builds with
-    /// [`Self::build_ioc`] instead.
+    /// nothing of `iocBuild` is said, and its links are left as loaded for
+    /// the caller to open. An IOC process builds with [`Self::build_ioc`]
+    /// instead; a server over this database, with [`Self::build_served`].
     pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
         let (db, autosave_config, ()) = self.build_through(|| Some(()), LinkInit::Caller).await?;
+        Ok((db, autosave_config))
+    }
+
+    /// [`Self::build`] with C `initDatabase`'s link pass, so every link a
+    /// server's database holds is open when it returns, a local CP link
+    /// among them. The caller starts the `ScanOwner`, whose `dbCaRun`
+    /// releases those links' connect-time processing.
+    pub async fn build_served(
+        self,
+    ) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
+        let (db, autosave_config, ()) = self.build_through(|| Some(()), LinkInit::Build).await?;
         Ok((db, autosave_config))
     }
 

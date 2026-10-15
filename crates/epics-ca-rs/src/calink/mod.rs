@@ -13,6 +13,10 @@
 //! (`dbCa.c:891`) — a CA link is **monitor-backed**, served from
 //! cache, never a synchronous per-read fetch.
 //!
+//! This is the network half only. A name the IOC's own database serves is
+//! answered in process by the database's `ca` link set, as C `dbContext`
+//! answers it ahead of libca, and never reaches this module.
+//!
 //! ## Why this lives in `epics-ca-rs`
 //!
 //! A CA-link resolver needs both halves: the database-side
@@ -47,7 +51,6 @@
 //! first CA link open, so an IOC with no CA links never spins one up.
 
 mod iocsh;
-mod local;
 mod resolver;
 
 use std::sync::Arc;

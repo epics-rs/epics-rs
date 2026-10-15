@@ -247,7 +247,7 @@ struct QueueInner {
     links: HashMap<LinkKey, LinkState>,
     ready: VecDeque<LinkKey>,
     opens: HashMap<Channel, OpenState>,
-    ready_opens: VecDeque<Channel>,
+    ready_opens: VecDeque<(Channel, Option<super::CaLinkInit>)>,
     /// Per-link count of staged values a later put on the same link
     /// overwrote — C's `pca->nNoWrite` (`dbCa.c:548`, `:582`), which lives on
     /// the `caLink` and is therefore per link, not per IOC. Keyed rather than
@@ -505,15 +505,21 @@ impl LinkPutQueue {
     /// attempt, not ten per second. Reconnection is the lset's job, as it is
     /// libca's in C.
     ///
-    /// Returns true when this call is the one that staged it.
-    pub(crate) fn stage_open(&self, key: Channel) -> bool {
+    /// Returns true when this call is the one that staged it. `init` runs
+    /// only then, before the owner can see the open, and what it returns
+    /// rides with the open to the lsets.
+    pub(crate) fn stage_open(
+        &self,
+        key: Channel,
+        init: impl FnOnce() -> Option<super::CaLinkInit>,
+    ) -> bool {
         let staged = {
             let mut inner = self.inner.lock();
             if inner.opens.contains_key(&key) {
                 false
             } else {
                 inner.opens.insert(key.clone(), OpenState::Queued);
-                inner.ready_opens.push_back(key);
+                inner.ready_opens.push_back((key, init()));
                 true
             }
         };
@@ -524,14 +530,14 @@ impl LinkPutQueue {
     }
 
     /// Owner-only: take the next link to open, `Queued` → `InFlight`.
-    fn take_ready_open(&self) -> Option<Channel> {
+    fn take_ready_open(&self) -> Option<(Channel, Option<super::CaLinkInit>)> {
         let mut inner = self.inner.lock();
         loop {
-            let key = inner.ready_opens.pop_front()?;
+            let (key, init) = inner.ready_opens.pop_front()?;
             match inner.opens.get_mut(&key) {
                 Some(state @ OpenState::Queued) => {
                     *state = OpenState::InFlight;
-                    return Some(key);
+                    return Some((key, init));
                 }
                 // Only `Queued` is ever in the deque.
                 _ => continue,
@@ -687,15 +693,16 @@ async fn owner_loop(
                     // is waiting on, and C services `CA_CONNECT` on the same
                     // task ahead of that link's other actions
                     // (`dbCa.c:1133-1160`).
-                    while let Some(key) = q.take_ready_open() {
+                    while let Some((key, init)) = q.take_ready_open() {
                         let Some(inner) = db.upgrade() else { return };
                         let lsets = resolve_lsets(&inner, &key.target);
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
                             for lset in &lsets {
-                                lset.connect_link(&key.name).await;
+                                lset.connect_link(&key.name, init.clone()).await;
                             }
+                            drop(init);
                             q2.finish_open(key);
                         });
                     }
@@ -718,7 +725,7 @@ async fn owner_loop(
                 // bypassed the gate still gets its completion resolved rather
                 // than left pending until teardown.
                 None => {
-                    while let Some(key) = q.take_ready_open() {
+                    while let Some((key, _init)) = q.take_ready_open() {
                         q.finish_open(key);
                     }
                     while let Some((key, staged)) = q.take_ready() {

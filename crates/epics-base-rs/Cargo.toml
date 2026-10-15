@@ -112,6 +112,7 @@ source-guard = { path = "../source-guard" }
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 record-seam-gate = { path = "../../tools/record-seam-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
+fact-budget = { path = "../fact-budget" }
 tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }

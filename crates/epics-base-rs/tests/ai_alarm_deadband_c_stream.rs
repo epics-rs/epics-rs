@@ -5,6 +5,8 @@
 //! `-m l` monitor, then each `caput`), and the streams softIoc served,
 //! connect events included. The port must serve the same lines byte for byte.
 
+mod calink_ioc;
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -48,9 +50,12 @@ async fn softioc_pin(case: &str) {
     // softIoc's CP link connects at iocInit and processes X once.
     db.ioc_init().await;
     db.initialize_link_locality().await;
-    db.setup_cp_links().await;
-    db.process_cp_links_on_connect().await;
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+    calink_ioc::connect(&db).await;
+    let x = db.get_record("X").unwrap();
+    let cp = db.get_record("SRC").is_some();
+    if cp {
+        calink_ioc::until("the connect processes X", || x.read().common.udf == 0).await;
+    }
     let steps = read("steps.txt");
     let mut lines = steps.lines();
     let monitor = lines.next().unwrap().strip_prefix("monitor ").unwrap();
@@ -89,7 +94,13 @@ async fn softioc_pin(case: &str) {
             .await
             .unwrap();
         // The CP target processes off the put; let it land before the next.
-        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
+        if rec == "SRC" {
+            let want: f64 = value.parse().unwrap();
+            calink_ioc::until(&format!("X reads SRC {value}"), || {
+                x.read().record.val().and_then(|v| v.to_f64()) == Some(want)
+            })
+            .await;
+        }
     }
     let mut got = String::new();
     for (pv, mut out, mut rx, enums) in subs {

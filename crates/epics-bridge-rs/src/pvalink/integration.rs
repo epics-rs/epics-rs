@@ -1380,7 +1380,11 @@ impl LinkSet for PvaLinkResolver {
     /// C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:393`): open the monitor so
     /// later cached reads have something to serve. Runs on the database's
     /// link work owner, never on a record-processing thread.
-    async fn connect_link(&self, name: &[u8]) {
+    async fn connect_link(
+        &self,
+        name: &[u8],
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
         if !self.is_enabled() {
             return;
         }

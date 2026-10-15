@@ -1,9 +1,11 @@
 pub(crate) mod breakpoint;
+mod ca_link;
 pub mod channel_io;
 pub mod char_view;
 #[cfg(test)]
 mod cycle_plan_tests;
 pub mod db_access;
+pub mod dbr_delivery;
 mod field_io;
 pub mod filters;
 mod link_put_queue;
@@ -18,6 +20,7 @@ mod record_table;
 pub(crate) mod scan_index;
 mod snapshot;
 
+pub use ca_link::CA_LINK_EVENT_MASK;
 pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
 pub(crate) use field_io::{PutSrc, render_for_string_target};
 pub(crate) use link_put_queue::{LinkId, LinkInstall};
@@ -32,8 +35,8 @@ pub(crate) use links::{
 };
 pub(crate) use processing::NotifiedRead;
 pub use processing::{
-    AsyncDbHandle, AsyncToken, ExternalCpProcess, InputLinkTexts, PostItem, PostRule, ProcStack,
-    ProcessCallback, TokenWatch, WriteDone, WriteDoneSource,
+    AsyncDbHandle, AsyncToken, CaLinkInit, ExternalCpProcess, InputLinkTexts, PostItem, PostRule,
+    ProcStack, ProcessCallback, TokenWatch, WriteDone, WriteDoneSource,
 };
 pub(crate) use record_lock::{CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard};
 pub use record_lock::{
@@ -388,42 +391,24 @@ pub type ExistenceGate = Arc<
 /// `get_record` first OR run the canonical-normalisation snippet
 /// at function entry. Direct `inner.records` access is reserved
 /// for the alias-management primitives listed above.
-/// One CP/CPP edge in the `PvDatabaseInner::cp_links` index: the record
-/// to (re)process when the source record changes.
+/// One CP/CPP edge in the `PvDatabaseInner::external_cp_links` index: the
+/// record to (re)process when the link's channel posts.
 ///
 /// `passive_only` distinguishes CPP from CP. C adds the `CA_DBPROCESS`
 /// action for a CP link unconditionally, but for a CPP link only when the
 /// link-holding record's `SCAN` is Passive (`dbCa.c:825`, `:959`, `:1034`). CP
-/// edges clear the flag; CPP edges set it, and `dispatch_cp_targets`
+/// edges clear the flag; CPP edges set it, and `process_one_cp_target`
 /// honours it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CpTarget {
     pub record: RecordName,
     pub passive_only: bool,
 }
 
-/// The dbCommon fields a process cycle never posts: only a put of the field
-/// posts it, so a CP/CPP link reading one fires on that put and not when its
-/// record processes (C's `caLink` monitor fires on the field's own post).
-const PUT_POSTED_FIELDS: &[&str] = &[
-    "DESC", "ASG", "SCAN", "PINI", "PHAS", "EVNT", "TSE", "TSEL", "DTYP", "DISV", "DISA", "SDIS",
-    "DISP", "ACKT", "DISS", "PRIO", "TPRO", "UDFS", "FLNK",
-];
-
-/// `field` as [`PUT_POSTED_FIELDS`] spells it, if it is one.
-pub(crate) fn put_posted_field(field: &str) -> Option<&'static str> {
-    PUT_POSTED_FIELDS
-        .iter()
-        .copied()
-        .find(|f| f.eq_ignore_ascii_case(field))
-}
-
-/// What one CP/CPP link watches: its source record, the put-posted source
-/// field it reads if it reads one ([`put_posted_field`]), and CPP's gate.
+/// What one CP/CPP link watches: the channel it names, and CPP's gate.
 #[derive(Clone, Debug)]
 pub(crate) struct CpSource {
     pub(crate) record: RecordName,
-    pub(crate) put_field: Option<&'static str>,
     pub(crate) passive_only: bool,
 }
 
@@ -433,10 +418,8 @@ pub(crate) struct CpSource {
 /// moves the edge, never adds a second.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CpRegistry {
-    /// Edges fired when the source processes.
+    /// Edges fired when the source posts.
     by_source: HashMap<RecordName, Vec<CpTarget>>,
-    /// Edges fired by a put of their source field.
-    by_put: HashMap<RecordName, Vec<(&'static str, CpTarget)>>,
     /// (holder, link field) → that link's edge.
     by_link: HashMap<(RecordName, String), CpSource>,
     /// The connect pass has run: from here a relink connects its own link.
@@ -446,20 +429,6 @@ pub(crate) struct CpRegistry {
 impl CpRegistry {
     pub(crate) fn targets(&self, source: &[u8]) -> Option<&Vec<CpTarget>> {
         self.by_source.get(source)
-    }
-
-    /// The edges a put of `source.field` fires.
-    pub(crate) fn put_targets<'a>(
-        &'a self,
-        source: &[u8],
-        field: &'static str,
-    ) -> impl Iterator<Item = &'a CpTarget> {
-        self.by_put
-            .get(source)
-            .into_iter()
-            .flatten()
-            .filter(move |(f, _)| *f == field)
-            .map(|(_, t)| t)
     }
 
     pub(crate) fn sources(&self) -> impl Iterator<Item = &RecordName> {
@@ -479,29 +448,14 @@ impl CpRegistry {
     pub(crate) fn set_link(&mut self, holder: &[u8], field: &str, edge: Option<CpSource>) {
         let key = (RecordName::from(holder), field.to_string());
         if let Some(old) = self.by_link.remove(&key) {
-            let is_old = |t: &CpTarget| *t.record == *holder && t.passive_only == old.passive_only;
-            match old.put_field {
-                None => {
-                    if let Some(edges) = self.by_source.get_mut(&old.record) {
-                        if let Some(i) = edges.iter().position(is_old) {
-                            edges.remove(i);
-                        }
-                        if edges.is_empty() {
-                            self.by_source.remove(&old.record);
-                        }
-                    }
+            if let Some(edges) = self.by_source.get_mut(&old.record) {
+                let is_old =
+                    |t: &CpTarget| *t.record == *holder && t.passive_only == old.passive_only;
+                if let Some(i) = edges.iter().position(is_old) {
+                    edges.remove(i);
                 }
-                Some(put_field) => {
-                    if let Some(edges) = self.by_put.get_mut(&old.record) {
-                        if let Some(i) =
-                            edges.iter().position(|(f, t)| *f == put_field && is_old(t))
-                        {
-                            edges.remove(i);
-                        }
-                        if edges.is_empty() {
-                            self.by_put.remove(&old.record);
-                        }
-                    }
+                if edges.is_empty() {
+                    self.by_source.remove(&old.record);
                 }
             }
         }
@@ -510,18 +464,10 @@ impl CpRegistry {
                 record: key.0.clone(),
                 passive_only: edge.passive_only,
             };
-            match edge.put_field {
-                None => self
-                    .by_source
-                    .entry(edge.record.clone())
-                    .or_default()
-                    .push(target),
-                Some(f) => self
-                    .by_put
-                    .entry(edge.record.clone())
-                    .or_default()
-                    .push((f, target)),
-            }
+            self.by_source
+                .entry(edge.record.clone())
+                .or_default()
+                .push(target);
             self.by_link.insert(key, edge);
         }
     }
@@ -529,15 +475,10 @@ impl CpRegistry {
     /// Every edge `name` holds or sources.
     pub(crate) fn remove_record(&mut self, name: &[u8]) {
         self.by_source.remove(name);
-        self.by_put.remove(name);
         for edges in self.by_source.values_mut() {
             edges.retain(|e| *e.record != *name);
         }
-        for edges in self.by_put.values_mut() {
-            edges.retain(|(_, e)| *e.record != *name);
-        }
         self.by_source.retain(|_, edges| !edges.is_empty());
-        self.by_put.retain(|_, edges| !edges.is_empty());
         self.by_link
             .retain(|(holder, _), edge| **holder != *name && *edge.record != *name);
     }
@@ -779,28 +720,19 @@ struct PvDatabaseInner {
     /// A sequence is now a field of the node it belongs to, so neither is
     /// representable.
     load_order_counter: std::sync::atomic::AtomicU64,
-    /// CP/CPP link index: maps source_record → target edges to process when
-    /// the source changes. Each edge carries the CP-vs-CPP distinction (see
-    /// [`CpTarget`]).
-    ///
-    /// Read-modify-write cell with **two writers that share no other gate**:
-    /// `CpRegistry::set_link` takes no
-    /// [`Self::registration_mutex`], `remove_record` (`mod.rs:2056`) does. The
-    /// `RwLock`'s write exclusion was the only thing serialising them, so the
-    /// [`SnapshotCell`] writer gate here is required, not defensive.
-    cp_links: SnapshotCell<CpRegistry>,
-    /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
-    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
-    /// → holder edges to process when that remote PV changes. The local
-    /// [`Self::cp_links`] index is keyed by a local source RECORD that
-    /// processes here; a cross-IOC source never processes locally, so its
-    /// only trigger is the calink/pvalink CA monitor callback, which requests
-    /// it through an [`ExternalCpProcess`]. Parity with C
+    /// CP/CPP link index: maps the PV a link set serves (`OTHER:PV` from
+    /// `INP="OTHER:PV CP"`, a local record's name included, since C makes
+    /// every CP/CPP link a CA link) → holder edges to process when that
+    /// channel posts. The only trigger is the calink/pvalink monitor
+    /// callback, which requests it through an [`ExternalCpProcess`] — C
     /// `dbCa.c:958-962` `eventCallback` adding `CA_DBPROCESS`.
     ///
-    /// Read-modify-write cell; sole writer `CpRegistry::set_link`, so
-    /// concurrent registrations need the [`SnapshotCell`] writer gate.
+    /// Read-modify-write cell with **two writers that share no other gate**:
+    /// `CpRegistry::set_link` takes no [`Self::registration_mutex`],
+    /// `remove_record` does, so the [`SnapshotCell`] writer gate is required.
     external_cp_links: SnapshotCell<CpRegistry>,
+    /// C `dbCaRun`'s gate over the CP/CPP workers.
+    ca_run: std::sync::Arc<processing::CaRunGate>,
     /// Alias map: alternate-name → the [`AliasNode`] it names. Mirrors
     /// epics-base PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
@@ -934,6 +866,9 @@ struct PvDatabaseInner {
     /// deliberate discipline documented at `links.rs:951-952` — so a coherent
     /// snapshot is what the read paths already assumed.
     link_sets: SnapshotCell<link_set::LinkSetRegistry>,
+    /// The `ca` scheme's entry in `link_sets`, which the network lset
+    /// registered under `ca` sits behind.
+    ca_links: Arc<ca_link::CaLinks>,
     /// Pending external OUT-link writes — the `dbCa` `workList` analogue.
     /// Record processing stages a write here and returns; the queue's single
     /// owner task performs the `ca://`/`pva://` network write off the
@@ -1544,45 +1479,53 @@ impl PvDatabase {
 
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(PvDatabaseInner {
-                simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(
-                    HashMap::new(),
-                    crate::runtime::sync::CMutex::PvdBucket,
-                ),
-                simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
-                pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
-                external_resolver: ArcSwapOption::empty(),
-                breakpoints: ArcSwapOption::empty(),
-                debugging: std::sync::atomic::AtomicBool::new(false),
-                search_resolver: ArcSwapOption::empty(),
-                existence_gate: ArcSwapOption::empty(),
-                link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
-                link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
-                records: RecursiveReadLock::new(HashMap::new()),
-                record_table: record_table::RecordTable::default(),
-                scan_index: scan_index::ScanIndex::new(),
-                load_order_counter: std::sync::atomic::AtomicU64::new(0),
-                cp_links: SnapshotCell::new(CpRegistry::default()),
-                external_cp_links: SnapshotCell::new(CpRegistry::default()),
-                aliases: RecursiveReadLock::new(HashMap::new()),
-                registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
-                init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
-                record_init_waiting: std::sync::Mutex::new(HashMap::new()),
-                empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
-                after_ioc_running: std::sync::Mutex::new(Vec::new()),
-                scan_ctl: Arc::new(crate::server::scan::ScanControl::new()),
-                pini_done: std::sync::atomic::AtomicBool::new(false),
-                pini_notify: tokio::sync::Notify::new(),
-                record_locks: record_lock::RecordLockRegistry::default(),
-                record_attributes: ArcSwap::from_pointee(seeded_record_attributes()),
-                record_attributes_write:
-                    crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
-                subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
-                device_support_resolver: ArcSwapOption::empty(),
-                breaktable_registry: SnapshotCell::new(
-                    crate::server::cvt_bpt::BreakTableRegistry::new(),
-                ),
-                link_list: SnapshotCell::new(crate::server::record::LinkList::base()),
+            inner: Arc::new_cyclic(|weak| {
+                let ca_links = Arc::new(ca_link::CaLinks::new(weak.clone()));
+                let mut link_sets = link_set::LinkSetRegistry::new();
+                link_sets.register("ca", ca_links.clone());
+                PvDatabaseInner {
+                    simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(
+                        HashMap::new(),
+                        crate::runtime::sync::CMutex::PvdBucket,
+                    ),
+                    simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
+                    pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
+                    external_resolver: ArcSwapOption::empty(),
+                    breakpoints: ArcSwapOption::empty(),
+                    debugging: std::sync::atomic::AtomicBool::new(false),
+                    search_resolver: ArcSwapOption::empty(),
+                    existence_gate: ArcSwapOption::empty(),
+                    link_sets: SnapshotCell::new(link_sets),
+                    ca_links,
+                    link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
+                    records: RecursiveReadLock::new(HashMap::new()),
+                    record_table: record_table::RecordTable::default(),
+                    scan_index: scan_index::ScanIndex::new(),
+                    load_order_counter: std::sync::atomic::AtomicU64::new(0),
+                    external_cp_links: SnapshotCell::new(CpRegistry::default()),
+                    ca_run: Default::default(),
+                    aliases: RecursiveReadLock::new(HashMap::new()),
+                    registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(
+                        (),
+                    ),
+                    init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
+                    record_init_waiting: std::sync::Mutex::new(HashMap::new()),
+                    empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
+                    after_ioc_running: std::sync::Mutex::new(Vec::new()),
+                    scan_ctl: Arc::new(crate::server::scan::ScanControl::new()),
+                    pini_done: std::sync::atomic::AtomicBool::new(false),
+                    pini_notify: tokio::sync::Notify::new(),
+                    record_locks: record_lock::RecordLockRegistry::default(),
+                    record_attributes: ArcSwap::from_pointee(seeded_record_attributes()),
+                    record_attributes_write:
+                        crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
+                    subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
+                    device_support_resolver: ArcSwapOption::empty(),
+                    breaktable_registry: SnapshotCell::new(
+                        crate::server::cvt_bpt::BreakTableRegistry::new(),
+                    ),
+                    link_list: SnapshotCell::new(crate::server::record::LinkList::base()),
+                }
             }),
         }
     }
@@ -2002,8 +1945,16 @@ impl PvDatabase {
     /// the legacy [`ExternalPvResolver`]. A later call for the same
     /// scheme replaces it for reads and writes, but a forward link already
     /// opened keeps the first lset's handle: its slot is set once.
+    ///
+    /// The `ca` scheme is this database's own link set, which serves every
+    /// name the database does: an lset registered as `ca` becomes its
+    /// network half, reached only for the names it does not.
     pub async fn register_link_set(&self, scheme: &str, lset: link_set::DynLinkSet) {
-        self.inner.link_sets.update(|r| r.register(scheme, lset));
+        if scheme == "ca" {
+            self.inner.ca_links.set_network(lset);
+        } else {
+            self.inner.link_sets.update(|r| r.register(scheme, lset));
+        }
         // A forward link loaded after `iocInit` with no lset in place is
         // opened now.
         self.open_unopened_forwards();
@@ -2376,6 +2327,23 @@ impl PvDatabase {
         }
     }
 
+    /// Whether any lset can take a link to `body` under `target`: the `ca`
+    /// set only for a name it can connect ([`ca_link::CaLinks::addresses`]).
+    pub(crate) fn link_addressable(
+        &self,
+        target: &link_put_queue::LinkTarget,
+        body: &[u8],
+    ) -> bool {
+        let registry = self.inner.link_sets.load();
+        match target {
+            link_put_queue::LinkTarget::Scheme("ca") => self.inner.ca_links.addresses(body),
+            link_put_queue::LinkTarget::Scheme(s) => registry.get_ref(s).is_some(),
+            link_put_queue::LinkTarget::Any => {
+                registry.len() > 1 || self.inner.ca_links.addresses(body)
+            }
+        }
+    }
+
     /// How many staged writes from `record`'s link `field` to the external
     /// link `link_name` a later write on the same link overwrote before it
     /// reached the wire — C's `pca->nNoWrite`, which `dbcar` prints beside
@@ -2456,7 +2424,7 @@ impl PvDatabase {
             return false;
         }
         let (target, body) = Self::split_external_link_name(link.name);
-        if link_put_queue::find_lset(&self.inner, &target, |_| Some(())).is_none() {
+        if !self.link_addressable(&target, body) {
             return false;
         }
         // Nothing is staged that no owner can perform. A database built with
@@ -2472,10 +2440,19 @@ impl PvDatabase {
         self.inner
             .link_puts
             .ensure_owner(std::sync::Arc::downgrade(&self.inner));
-        let staged = self.inner.link_puts.stage_open(link_put_queue::Channel {
-            target,
-            name: body.into(),
-        });
+        // C `dbInitLink` adds a local CA link with `DBCA_CALLBACK_INIT_START`
+        // (`dbLink.c:127-129`), which `dbCaRun` waits for. Registered as the
+        // open is queued, so nothing the open does can report it first.
+        let local_ca = (matches!(target, link_put_queue::LinkTarget::Any)
+            || matches!(target, link_put_queue::LinkTarget::Scheme("ca")))
+            && self.has_name_no_resolve(body);
+        let staged = self.inner.link_puts.stage_open(
+            link_put_queue::Channel {
+                target,
+                name: body.into(),
+            },
+            || local_ca.then(|| self.inner.ca_run.register()).flatten(),
+        );
         if let Some(open) = link.open {
             open.set();
         }
@@ -3766,10 +3743,10 @@ impl PvDatabase {
         // 1) Remove from main map.
         self.inner.records.write().remove(name);
 
-        // 2) Drop from CP-link tables. Removed both as source (channel
-        // change → trigger targets) and as target (other channels'
-        // CP lists may still reference this name).
-        self.inner.cp_links.update(|cp| cp.remove_record(name));
+        // 2) Drop the CP/CPP edges the record held.
+        self.inner
+            .external_cp_links
+            .update(|cp| cp.remove_record(name));
 
         // 3) Purge aliases that pointed AT the
         // removed record. Otherwise `find_pv("ALT")` returns None
@@ -5161,41 +5138,6 @@ mod tests {
             db.get_record_no_resolve("ALIAS").is_none(),
             "get_record_no_resolve must not follow alias table"
         );
-    }
-
-    #[epics_macros_rs::epics_test]
-    async fn register_cp_link_normalises_alias_to_canonical() {
-        // Regression: CP link registration must store the
-        // canonical record names. dispatch_cp_targets looks up by
-        // canonical, so an alias-keyed entry is functionally dead.
-        let db = PvDatabase::new();
-        db.add_record(
-            "SRC_REAL",
-            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
-        )
-        .await
-        .unwrap();
-        db.add_record(
-            "DST_REAL",
-            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
-        )
-        .await
-        .unwrap();
-        db.add_alias("SRC_ALIAS", "SRC_REAL").await.unwrap();
-        db.add_alias("DST_ALIAS", "DST_REAL").await.unwrap();
-
-        // Register using the alias forms (CP edge: passive_only = false).
-        db.register_cp_link("SRC_ALIAS", "DST_ALIAS", "INP", false)
-            .await;
-
-        // Lookup must succeed via the canonical source name.
-        let targets = db.get_cp_targets("SRC_REAL");
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].record, "DST_REAL");
-        assert!(!targets[0].passive_only);
-        // Alias-keyed lookup must NOT have been registered.
-        let alias_lookup = db.get_cp_targets("SRC_ALIAS");
-        assert!(alias_lookup.is_empty());
     }
 
     #[epics_macros_rs::epics_test]

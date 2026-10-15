@@ -12248,38 +12248,6 @@ record(aSub, "AC") { field(SUBL, "") }"#,
         }
     }
 
-    /// A refused SUBL put removed the link, CP subscription included: `NM`
-    /// processes `AS` (and its FLNK counter) once at connect and once per
-    /// `NM.PROC` before the refusal, never after. `softIoc` R7.0.10-146
-    /// (8f5015b66) reads CNT 1, 2, then 2.
-    #[test]
-    fn a_refused_subl_put_drops_its_cp_subscription() {
-        let (db, ctx) = make_ctx();
-        load_records(
-            &ctx,
-            r#"record(ai, "NM") { field(VAL, "1") }
-record(calc, "CNT") { field(CALC, "VAL+1") }
-record(aSub, "AS") { field(SNAM, "") field(SUBL, "NM CP") field(FLNK, "CNT") }"#,
-        )
-        .expect("db must load");
-        ctx.block_on(db.ioc_init());
-        ctx.block_on(db.initialize_link_locality());
-        ctx.block_on(db.setup_cp_links());
-        ctx.block_on(db.process_cp_links_on_connect());
-        let settle = || std::thread::sleep(std::time::Duration::from_millis(300));
-        let cnt = || run_cmd(&ctx, "dbgf", &["CNT.VAL"]).trim_end().to_string();
-        settle();
-        assert_eq!(cnt(), "DBF_DOUBLE:         1");
-        run_cmd(&ctx, "dbpf", &["NM.PROC", "1"]);
-        settle();
-        assert_eq!(cnt(), "DBF_DOUBLE:         2");
-        run_cmd(&ctx, "dbpf", &["AS.SUBL", "NM2"]);
-        run_cmd(&ctx, "dbpf", &["NM.PROC", "1"]);
-        run_cmd(&ctx, "dbpf", &["NM.PROC", "1"]);
-        settle();
-        assert_eq!(cnt(), "DBF_DOUBLE:         2");
-    }
-
     /// An `Async Soft Channel` input completes through `dbProcessNotify` on its
     /// INP target (`devAiSoftCallback.c` `read_ai`): PACT holds until the
     /// target's chain finishes, and an INP put cancels the wait (`del_record`

@@ -122,7 +122,7 @@ impl RegressionIoc {
             .register_record_type(motor_type, motor_record_factory)
             .register_dynamic_device_support(motor_factory)
             .db_string(db_text, &macros)?
-            .build()
+            .build_served()
             .await?;
 
         // Arm motor polling after iocInit (C arms the poller post-PINI).

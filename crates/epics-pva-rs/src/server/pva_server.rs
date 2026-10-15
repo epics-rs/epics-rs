@@ -85,7 +85,7 @@ impl PvaServerBuilder {
     }
 
     pub async fn build(self) -> CaResult<PvaServer> {
-        let (db, autosave_config) = self.ioc.build().await?;
+        let (db, autosave_config) = self.ioc.build_served().await?;
         let acf = epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
         Ok(PvaServer {
             db,

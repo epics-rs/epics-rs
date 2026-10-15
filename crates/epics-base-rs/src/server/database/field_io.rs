@@ -3343,11 +3343,6 @@ impl PvDatabase {
             use crate::server::record::ScanType;
             self.update_scan_index(record_name, ScanType::IoIntr, ScanType::Passive, 0, 0);
         }
-        if ok {
-            if let Some(field) = super::put_posted_field(field) {
-                self.dispatch_put_cp_targets(record_name, field);
-            }
-        }
         if let Some(work) = tail.after {
             work.run(self);
         }

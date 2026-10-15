@@ -63,7 +63,8 @@ impl LinkSet for CounterLset {
         self.value()
     }
 
-    async fn connect_link(&self, _: &[u8]) {}
+    async fn connect_link(&self, _: &[u8], _: Option<epics_base_rs::server::database::CaLinkInit>) {
+    }
 }
 
 async fn holder_db(lset: Arc<CounterLset>) -> PvDatabase {
@@ -86,6 +87,8 @@ async fn holder_db(lset: Arc<CounterLset>) -> PvDatabase {
     }
     db.initialize_link_locality().await;
     db.setup_cp_links().await;
+    // C `dbCaRun`: the CP workers run from here.
+    db.process_cp_links_on_connect().await;
     db
 }
 

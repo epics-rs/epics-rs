@@ -2416,24 +2416,9 @@ pub struct RecordCell {
     /// Fixed by the type, like `rdes`, so it is reachable without a borrow
     /// of the record.
     plan: ProcessPlan,
-    /// Which published `cp_links` map `PvDatabase::sources_cp_edges` was resolved
-    /// from, or 0 before it ever was.
-    ///
-    /// The question the cache answers — "does any CP/CPP edge name this
-    /// record as its source?" — is asked once per process cycle by
-    /// `PvDatabase::dispatch_cp_targets`, and the registry that holds the
-    /// answer is keyed by record NAME. Asking it directly costs a hash of the
-    /// name and a map probe every cycle to hear `false`, which is what every
-    /// record with no CP holder hears forever. The registry moves its
-    /// revision on every edit, so a record that has heard the answer once may
-    /// keep it until it does.
-    cp_edges_revision: std::sync::atomic::AtomicU64,
     /// C `dbCommon::name`, fixed at construction like `rdes`, so a message
     /// naming the record is built with no borrow of it held.
     name: crate::types::RecordName,
-    /// The cached answer, valid only while [`Self::cp_edges_revision`] still
-    /// matches the registry's.
-    cp_edges: std::sync::atomic::AtomicBool,
     /// This record's `init_record` is still OWED to `iocInit` — it was created
     /// during the LOAD phase, which defers the whole init half (C runs
     /// `dbLoadRecords` and `initDatabase` as two passes).
@@ -3376,8 +3361,6 @@ impl RecordCell {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
             bkpt: instance.common.bkpt.share(),
-            cp_edges_revision: std::sync::atomic::AtomicU64::new(0),
-            cp_edges: std::sync::atomic::AtomicBool::new(false),
             rdes: RecordDesc::of(&*instance.record),
             name: instance.name.clone(),
             put_facts: put_facts(&mut instance, &slots),
@@ -3719,27 +3702,6 @@ impl RecordCell {
         HeldMut { cell: self, held }
     }
 
-    /// The answer this record cached for `registry_revision`, or `None` when
-    /// it has not heard one for that revision.
-    ///
-    /// Only `PvDatabase::sources_cp_edges` reads or writes the pair, so the
-    /// two atomics move as one: the flag is stored first and the revision
-    /// second, which is the order that makes a matching revision proof that
-    /// the flag beside it belongs to that revision.
-    pub(crate) fn cached_cp_edges(&self, registry_revision: u64) -> Option<bool> {
-        use std::sync::atomic::Ordering;
-        (self.cp_edges_revision.load(Ordering::Acquire) == registry_revision)
-            .then(|| self.cp_edges.load(Ordering::Relaxed))
-    }
-
-    /// File `present` as this record's answer for `registry_revision`.
-    pub(crate) fn cache_cp_edges(&self, registry_revision: u64, present: bool) {
-        use std::sync::atomic::Ordering;
-        self.cp_edges.store(present, Ordering::Relaxed);
-        self.cp_edges_revision
-            .store(registry_revision, Ordering::Release);
-    }
-
     /// Give up this record's lock set for the duration of `f` — the
     /// breakpoint park. Cold, so it checks what the set cannot see:
     /// [`HeldMut`] and [`Self::read_held`] add no depth, and a borrow of
@@ -3772,14 +3734,12 @@ impl RecordCell {
 
     /// The cell's bytes a process cycle reads: the run
     /// `the_cycle_read_fields_stay_one_run` pins, from the instance's
-    /// `subscribers` through the cell's `cp_edges`.
+    /// `subscribers` through the cell's `name`.
     const CYCLE_RUN: core::ops::Range<usize> = {
         let start = std::mem::offset_of!(RecordCell, data)
             + std::mem::offset_of!(LockSetGuarded<RecordInstance>, 0)
             + std::mem::offset_of!(RecordInstance, subscribers);
-        start
-            ..std::mem::offset_of!(RecordCell, cp_edges)
-                + size_of::<std::sync::atomic::AtomicBool>()
+        start..std::mem::offset_of!(RecordCell, name) + size_of::<crate::types::RecordName>()
     };
 
     /// Hint the lines of the cell's cycle run.
@@ -5673,14 +5633,6 @@ pub(crate) struct SourceRender {
 }
 
 impl SourceRender {
-    /// The render through a CA link (`dbCa.c:504-506`, `:519-524`): the
-    /// conversion has no source address, so a float takes the default 6
-    /// digits; an ENUM channel still delivers its label (`:465-482`).
-    pub(crate) fn through_ca(mut self) -> Self {
-        self.precision = None;
-        self
-    }
-
     /// The value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it: one
     /// element, so an array source converts its element 0 (none, at NORD 0,
     /// is a failed read).
@@ -13065,9 +13017,7 @@ mod record_cell_layout_tests {
             lock_record,
             borrow,
             plan,
-            cp_edges_revision,
             name,
-            cp_edges,
             // Not read by a process cycle from here on.
             init_owed,
             link_opens_owed,
@@ -13090,7 +13040,7 @@ mod record_cell_layout_tests {
             (f.1, f.2)
         }
         let (first, _) = field(&instance.3, "subscribers");
-        let (last, last_size) = field(&cell.3, "cp_edges");
+        let (last, last_size) = field(&cell.3, "name");
         assert_eq!(RecordCell::CYCLE_RUN, first..last + last_size);
         assert!(
             instance
@@ -14920,10 +14870,13 @@ mod metadata_cache_tests {
     fn sim_link_modifier_mask_follows_the_field_type() {
         let mut input = ai_instance();
         put_siol(&mut input, "OTHER.VAL CP");
-        assert_eq!(
-            db_link(input.sim_link(SimLink::Siol)).policy,
-            crate::server::record::LinkProcessPolicy::ChannelProcess
-        );
+        match input.sim_link(SimLink::Siol).as_ref() {
+            ParsedLink::Ca(ca) => assert_eq!(
+                ca.policy,
+                crate::server::record::LinkProcessPolicy::ChannelProcess
+            ),
+            other => panic!("a CP SIOL is a CA link, got {other:?}"),
+        }
         let mut output = RecordInstance::new("AO", crate::server::records::ao::AoRecord::default());
         put_siol(&mut output, "OTHER.VAL CP");
         assert_eq!(

@@ -192,7 +192,7 @@ fn a_nomod_inp_put_detaches_the_dset_as_in_c() {
 #[test]
 fn a_nomod_inp_put_drops_its_cp_subscription() {
     let (rt, db, shell) = build(&DB.replace(r#"field(INP, "WF")"#, r#"field(INP, "WF CP")"#));
-    assert!(!db.get_cp_targets("WF").is_empty(), "CP is armed");
+    assert!(!db.get_external_cp_targets(b"WF").is_empty(), "CP is armed");
     let gf = |pv: &str| run(&shell, &format!("dbgf {pv}")).trim_end().to_string();
     assert_eq!(gf("MA.INP"), r#"DBF_STRING:         "WF CP NMS""#);
     run(&shell, "dbpf MA.INP WF2");

@@ -323,7 +323,7 @@ impl CaServerBuilder {
         // side it came from.
         let (db, acf, autosave_config, autosave_manager) = match self.served {
             None => {
-                let (db, autosave_config) = self.ioc.build().await?;
+                let (db, autosave_config) = self.ioc.build_served().await?;
                 let acf =
                     epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
                 (db, acf, autosave_config, None)

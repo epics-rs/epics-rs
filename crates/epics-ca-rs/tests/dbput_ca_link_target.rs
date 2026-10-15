@@ -1,6 +1,6 @@
 //! Spec §5 test 15: an OUT link that is a CA link takes none of the dbPut
-//! path. A local target named with `CA` is written through the IOC's own
-//! CA server and processed with its own alarm; an unresolved one (`CA`, or
+//! path. A local target named with `CA` is written in-process and
+//! processed with its own alarm; an unresolved one (`CA`, or
 //! a bare unknown name, which C makes a CA link) alarms the source
 //! LINK/INVALID "field OUT" (`dbCa.c:558-560`, `dbLink.c:443-446`). Pinned
 //! to oracleStdIoc (C ground truth §5.15, its DB verbatim).
@@ -97,7 +97,9 @@ async fn a_ca_out_link_writes_a_local_target_and_alarms_on_an_unresolved_one() {
     assert_eq!(alarm(&db, "SC"), (0.0, 0.0));
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while resolver.link_count() < 3 {
+    // TT is served by the database's own `ca` entry; only NOPE and NOPE2
+    // reach the network half.
+    while resolver.link_count() < 2 {
         assert!(Instant::now() < deadline, "the CA link opens never ran");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

@@ -942,8 +942,7 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (crate::types::WallTime, 
 /// client: it carries C's `dbAccess.c:586-593` mask, not
 /// `recGblResetAlarms`'.)
 /// The publication half of a process cycle: post the alarm fields under their
-/// individual C masks, fan the snapshot out to subscribers, and report which
-/// classes the cycle emitted.
+/// individual C masks and fan the snapshot out to subscribers.
 ///
 /// Takes the guard the segment already holds. C publishes from inside
 /// `monitor()`, which runs under the same `dbScanLock` that built the values
@@ -954,16 +953,13 @@ fn publish_cycle(
     instance: &mut RecordInstance,
     snapshot: &crate::server::record::ProcessSnapshot,
     alarm_posts: AlarmPosts,
-) -> CyclePosts {
-    let posts = CyclePosts::of(snapshot).with(alarm_posts.mask());
-    // The cycle with no alarm movement makes one call and keeps nothing but
-    // `posts` live across it.
+) {
+    // The cycle with no alarm movement makes one call.
     if alarm_posts.mask().is_empty() {
         instance.notify_from_snapshot(snapshot);
     } else {
         publish_alarm_cycle(instance, snapshot, alarm_posts);
     }
-    posts
 }
 
 /// C `monitor()` opens with `recGblResetAlarms`, so SEVR/STAT/AMSG/ACKS reach
@@ -1072,55 +1068,16 @@ impl AlarmPosts {
     }
 }
 
-/// What one process cycle hands to its forward-link tail.
-///
-/// The CP/CPP dispatch at the tail needs what the cycle PUBLISHED (see
-/// [`CyclePosts`]); the FLNK's own PUTF and put-notify wait-set ride inside
-/// the [`ForwardTarget`](crate::server::record::record_instance::ForwardTarget)
+/// What one process cycle hands to its forward-link tail. The FLNK's own
+/// PUTF and put-notify wait-set ride inside the
+/// [`ForwardTarget`](crate::server::record::record_instance::ForwardTarget)
 /// the tail is handed, so only the target that needs them carries them.
 #[derive(Clone, Copy)]
 struct TailCtx<'a> {
-    posts: CyclePosts,
     /// The cycle's `ProcessPlan`, so the tail's two type-static
     /// dispatchers can be skipped without re-taking the record's lock to ask
     /// what type it is.
     plan: &'a crate::server::record::record_instance::ProcessPlan,
-}
-
-/// What one process cycle published to monitors: the union of every `DBE_*`
-/// class it posted, across the value snapshot and the `recGblResetAlarms`
-/// fields.
-///
-/// This exists so the CP/CPP trigger reads a *post*, never a *process*. C
-/// serves every CP/CPP link — local target or not — through a CA
-/// subscription taken with `DBE_VALUE | DBE_ALARM` (`dbCa.c:1225-1229` →
-/// `cadef.h:2010-2011`), and only its `eventCallback` adds `CA_DBPROCESS`
-/// (`dbCa.c:955-963`, run at `:1249-1257`). A cycle that posts nothing —
-/// an unchanged value inside `MDEL`, no alarm movement — therefore leaves
-/// the holder unprocessed. Passing this value into the forward-link tail is
-/// what makes "dispatch a CP edge without a post" unrepresentable at the
-/// call site: there is no argument-less way to reach
-/// [`PvDatabase::dispatch_cp_targets`].
-#[derive(Clone, Copy)]
-struct CyclePosts(crate::server::recgbl::EventMask);
-
-impl CyclePosts {
-    /// The classes a value snapshot published.
-    fn of(snapshot: &crate::server::record::ProcessSnapshot) -> Self {
-        Self(snapshot.published_mask())
-    }
-
-    /// Fold in one more posted field (the `recGblResetAlarms` posts, which
-    /// are emitted outside the snapshot).
-    fn with(self, mask: crate::server::recgbl::EventMask) -> Self {
-        Self(self.0 | mask)
-    }
-
-    /// True when this cycle published a class a CP/CPP subscription selects.
-    fn triggers_cp(self) -> bool {
-        use crate::server::recgbl::EventMask;
-        self.0.intersects(EventMask::VALUE | EventMask::ALARM)
-    }
 }
 
 /// Result of the simulation-mode check.
@@ -1142,13 +1099,9 @@ enum SimOutcome {
     NotSimulated,
     /// Simulated INPUT record: the SIOL read + convert already ran here
     /// (`readValue` precedes the body). The caller must still run the
-    /// forward-link / CP / RPRO tail exactly as `recGblFwdLink` does for a
+    /// forward-link / RPRO tail exactly as `recGblFwdLink` does for a
     /// real process cycle, but skips the (already-substituted) body.
-    ///
-    /// Carries the cycle's [`CyclePosts`] because `sim_process_tail` already
-    /// published this cycle's monitors here; only this arm has a post set to
-    /// report, which is why it is on the variant rather than on the tuple.
-    Simulated(CyclePosts),
+    Simulated,
     /// Simulated record whose simulation replaces only the INPUT STAGE of its
     /// body ([`Record::simulation_substitutes_input_stage`](crate::server::record::Record::simulation_substitutes_input_stage)) — swait. The SIOL
     /// read, the `VAL = SVAL` / `UDF = FALSE` write and the SIMM_ALARM raise
@@ -2962,8 +2915,7 @@ impl PvDatabase {
         };
         // `recGblFwdLink` (`:578`) runs ahead of `valuePut`'s stamp and reset.
         if forward {
-            let posts = CyclePosts(crate::server::recgbl::EventMask::default());
-            self.run_forward_link_tail(name, rec, posts, visited);
+            self.run_forward_link_tail(name, rec, visited);
             finish_cycle(&mut rec.write());
         }
         // `checkAlarms` (`:604`) on both arms, ahead of the reset; the stamp
@@ -5360,8 +5312,8 @@ impl PvDatabase {
         cycle_end.merge_in(sim_pact_exit);
         let sim_output = match sim_outcome {
             SimOutcome::NotSimulated => None,
-            SimOutcome::Simulated(posts) => {
-                self.run_forward_link_tail(name, rec, posts, visited);
+            SimOutcome::Simulated => {
+                self.run_forward_link_tail(name, rec, visited);
                 self.end_process_cycle(name, rec, cycle_end.take());
                 return Ok(());
             }
@@ -5388,11 +5340,17 @@ impl PvDatabase {
                         Some(siol) => self.read_sim_stamp(rec, siol),
                         None => (self.read_tsel(rec), SiolStamp::Keep),
                     };
-                    let posts = {
+                    {
                         let mut instance = rec.write();
-                        sim_process_tail(&mut instance, tsel, siol_stamp, false, rec.process_plan())
-                    };
-                    self.run_forward_link_tail(name, rec, posts, visited);
+                        sim_process_tail(
+                            &mut instance,
+                            tsel,
+                            siol_stamp,
+                            false,
+                            rec.process_plan(),
+                        );
+                    }
+                    self.run_forward_link_tail(name, rec, visited);
                     self.end_process_cycle(name, rec, cycle_end.take());
                     return Ok(());
                 }
@@ -5467,7 +5425,6 @@ impl PvDatabase {
         let tail_actions;
         let tail_defers_output;
         let tail_restamps;
-        let tail_posts;
         'epilogue: {
             // One data guard for Segments A–E; each boundary below releases it
             // only across work that may lock another record.
@@ -6550,7 +6507,7 @@ impl PvDatabase {
                         crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
                     let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
                     let snapshot = crate::server::record::ProcessSnapshot::new();
-                    let posts = publish_cycle(instance, &snapshot, alarm_posts);
+                    publish_cycle(instance, &snapshot, alarm_posts);
                     // No forward link of EITHER kind: the comment above is
                     // C's `return` before `recGblFwdLink`. The external
                     // half used to escape it, because the tail re-derived
@@ -6560,7 +6517,6 @@ impl PvDatabase {
                     tail_actions = crate::server::record::ProcessActions::new();
                     tail_defers_output = false;
                     tail_restamps = restamps_after;
-                    tail_posts = posts;
                     break 'epilogue;
                 }
 
@@ -7064,7 +7020,7 @@ impl PvDatabase {
             // at the tail.
 
             // 3. Notify subscribers, still under the segment's own guard.
-            tail_posts = publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
+            publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
             tail_flnk = flnk_name;
             tail_actions = process_actions;
             tail_defers_output = result_is_defer_output;
@@ -7115,10 +7071,7 @@ impl PvDatabase {
                 name,
                 guard,
                 &tail_flnk,
-                TailCtx {
-                    posts: tail_posts,
-                    plan,
-                },
+                TailCtx { plan },
                 visited,
             );
         }
@@ -7253,13 +7206,7 @@ impl PvDatabase {
     /// fresh from the record (a simulated cycle does not change FLNK,
     /// and SIOL reads/writes do not carry a foreign PUTF into the
     /// chain).
-    fn run_forward_link_tail(
-        &self,
-        name: &[u8],
-        rec: InFrame<'_>,
-        posts: CyclePosts,
-        visited: &mut ProcStack,
-    ) {
+    fn run_forward_link_tail(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
         let flnk_name = rec.read().forward_target();
         let plan = rec.process_plan();
         let mut guard = DataGuard::new(rec);
@@ -7267,13 +7214,13 @@ impl PvDatabase {
             name,
             &mut guard,
             &flnk_name,
-            TailCtx { posts, plan },
+            TailCtx { plan },
             visited,
         );
     }
 
     /// Steps 4.55 - 7 of the process chain: event-record posting, generic OUTA..OUTP links, FLNK forward
-    /// link, CP-target dispatch, and RPRO reprocess. Shared by the
+    /// link, and RPRO reprocess. Shared by the
     /// main process path and the simulation-mode path so both run the
     /// identical `recGblFwdLink` equivalent.
     #[inline(always)]
@@ -7311,14 +7258,6 @@ impl PvDatabase {
         ) {
             guard.release();
             self.scan_forward_target(rec, flnk, visited);
-        }
-
-        // 6. CP link targets -- holders of a CP/CPP link on this record,
-        // driven by what this cycle POSTED (see `CyclePosts`), not by the
-        // fact that it processed.
-        if src.posts.triggers_cp() && self.sources_cp_edges(name, rec) {
-            guard.release();
-            self.dispatch_cp_targets(name, rec, src.posts, visited);
         }
 
         // 7. RPRO: if reprocess requested, clear flag and queue a
@@ -8073,7 +8012,7 @@ impl PvDatabase {
         // `recGblGetTimeStampSimm` again — TSEL read included, before the guard.
         let tsel = self.read_tsel(rec);
 
-        let (flnk_name, pact_exit, posts) = {
+        let (flnk_name, pact_exit) = {
             // Phase 1 — first write guard, confined to this scope so the
             // (!Send) parking_lot guard is released before the async OUT
             // writes below. Yields the output work plus the put-notify
@@ -8324,7 +8263,7 @@ impl PvDatabase {
             let flnk_name = instance.forward_target();
 
             // Notify subscribers, still under this segment's own guard.
-            let posts = publish_cycle(&mut instance, &cycle_snapshot, cycle_alarm_posts);
+            publish_cycle(&mut instance, &cycle_snapshot, cycle_alarm_posts);
 
             // The FLNK's PUTF rides in `flnk_name` and its put-notify wait-set
             // is read at dispatch (see `ForwardTarget::Db`). On the
@@ -8333,7 +8272,7 @@ impl PvDatabase {
             // membership) must propagate through the (now-completing) FLNK
             // chain so an async target reached here also defers
             // WRITE_NOTIFY completion.
-            (flnk_name, pact_exit, posts)
+            (flnk_name, pact_exit)
         };
 
         // The record's own OUT link and its generic multi-output pairs were
@@ -8358,10 +8297,6 @@ impl PvDatabase {
         // `dbScanPassive` for a DB target, → lset `scanForward` for an
         // external one).
         self.scan_forward_target(rec, &flnk_name, visited);
-
-        // CP link targets — gated on what this cycle posted, as on the
-        // synchronous tail.
-        self.dispatch_cp_targets(name, rec, posts, visited);
 
         // RPRO: C `recGblFwdLink` consumes a pending reprocess via
         // `scanOnce` — queued, not recursed. Mirror the synchronous
@@ -8436,61 +8371,7 @@ impl PvDatabase {
         Ok(())
     }
 
-    /// Dispatch CP-link targets that take a CP/CPP input link from `name`,
-    /// when this cycle published a class the CP subscription selects.
-    ///
-    /// **The trigger is a monitor post, never a process.** C serves every
-    /// CP/CPP link as a CA link — `dbInitLink` tests the modifier BEFORE
-    /// locality and short-circuits `dbDbInitLink` entirely, so a CP link to a
-    /// record in this very IOC is still a CA link (`dbLink.c:118-122`; the
-    /// `isLocal` at `:128` is computed only to pick the init-callback hint).
-    /// That subscription is taken with `DBE_VALUE | DBE_ALARM`
-    /// (`dbCa.c:1225-1229` → `cadef.h:2010-2011`), and only its
-    /// `eventCallback` adds `CA_DBPROCESS` (`dbCa.c:955-963`), which the
-    /// worker runs as a bare `db_process` (`:1249-1257`). A source cycle that
-    /// posts nothing — an unchanged value inside `MDEL`, no alarm movement —
-    /// therefore leaves every CP holder unprocessed.
-    ///
-    /// The port keeps a local CP target as a `Db` link rather than routing it
-    /// through the CA client (the `ca` link set lives in another crate and is
-    /// optional, so C's literal structure would silently disable local CP
-    /// links in a bare `epics-base-rs` IOC). `posts` is what restores the C
-    /// rule on top of that shape: the same `DBE_VALUE|DBE_ALARM` gate the
-    /// cross-IOC path gets from its remote monitor
-    /// (`Self::dispatch_external_cp_targets`), so "CP dispatch" means one
-    /// thing on both paths.
-    ///
-    /// The dispatch itself is the moral equivalent of dbCaTask's
-    /// `CA_DBPROCESS` handler invoking `db_process(prec)` and nothing else —
-    /// no PUTF, no RPRO. Already-visited targets (current process chain) are
-    /// skipped via the `visited` cycle guard.
-    fn dispatch_cp_targets(
-        &self,
-        name: &[u8],
-        rec: InFrame<'_>,
-        posts: CyclePosts,
-        visited: &mut ProcStack,
-    ) {
-        if !posts.triggers_cp() {
-            return;
-        }
-        // Whether this record has a CP holder at all is the record's own
-        // state, not something to re-derive from a name-keyed map on every
-        // cycle — see `PvDatabase::sources_cp_edges`.
-        if !self.sources_cp_edges(name, rec) {
-            return;
-        }
-        let cp_targets = self.get_cp_targets(name);
-        for target in cp_targets {
-            self.process_one_cp_target(&target, visited);
-        }
-    }
-
     /// Process a single CP/CPP target edge, applying the CPP passive gate.
-    /// This is the single owner of the scan-time CP-dispatch decision, shared
-    /// by the local-source path ([`Self::dispatch_cp_targets`]) and the
-    /// cross-IOC path (`Self::dispatch_external_cp_targets`) so both honour
-    /// the same `dbCa.c` semantics.
     ///
     /// The passive gate is the ONLY thing decided here. C's `CA_DBPROCESS`
     /// worker (`dbCa.c:1249-1257`) is bare `dbScanLock` / `db_process` /
@@ -8531,15 +8412,12 @@ impl PvDatabase {
         };
     }
 
-    /// Process every holder of an EXTERNAL CP/CPP link to `external_pv` —
-    /// the cross-IOC twin of `Self::dispatch_cp_targets`. Called by the
-    /// calink/pvalink CA monitor callback on every remote change, this is
-    /// the Rust equivalent of C `dbCa.c eventCallback` adding
-    /// `CA_DBPROCESS` for a CP (or Passive CPP) link (`dbCa.c:958-962`)
-    /// and the worker thread running `db_process(prec)` (`dbCa.c:1255`).
-    /// A cross-IOC source never processes locally, so this callback is the
-    /// only trigger; without it a `CP`/`CPP` link's holder never processes
-    /// on a remote change.
+    /// Process every holder of a CP/CPP link to `external_pv`, the channel a
+    /// link set serves (a local record's included). Requested by the
+    /// calink/pvalink monitor callback, this is C `dbCa.c eventCallback`
+    /// adding `CA_DBPROCESS` for a CP (or Passive CPP) link
+    /// (`dbCa.c:958-962`) and the worker running `db_process(prec)`
+    /// (`dbCa.c:1255`) — the only trigger a CP holder has.
     ///
     /// A fresh `visited` set starts a new process chain —
     /// the monitor event is an independent external trigger, like a scan,
@@ -8547,14 +8425,20 @@ impl PvDatabase {
     ///
     /// Private: [`ExternalCpProcess::run_worker`] is the only caller, so a
     /// link callback can request a process but never run one inline.
-    fn dispatch_external_cp_targets(&self, external_pv: &[u8]) {
+    ///
+    /// `only` narrows the pass to the links that requested their first
+    /// event alone; one removed since is skipped, as `dbCaRemoveLink`
+    /// cancels the removed link's pending action.
+    fn dispatch_external_cp_targets(&self, external_pv: &[u8], only: Option<&[super::CpTarget]>) {
         let targets = self.get_external_cp_targets(external_pv);
         if targets.is_empty() {
             return;
         }
         let mut visited = ProcStack::new();
         for target in targets {
-            self.process_one_cp_target(&target, &mut visited);
+            if only.is_none_or(|only| only.contains(&target)) {
+                self.process_one_cp_target(&target, &mut visited);
+            }
         }
     }
 
@@ -9977,7 +9861,7 @@ impl PvDatabase {
         // write follows the body), so only an INPUT record reaches here — its
         // `readValue` precedes the body, so the SIOL read + convert are done
         // in place and the caller short-circuits.
-        let sim_posts = {
+        {
             // C `readValue` raises the SIMM severity at the TOP of the
             // `case menuYesNoYES:` arm — BEFORE the SIOL read
             // (`longinRecord.c:414` `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`,
@@ -10179,8 +10063,8 @@ impl PvDatabase {
                 siol_stamp,
                 fetch_ok,
                 rec.process_plan(),
-            )
-        };
+            );
+        }
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
         // (`prec->pact = FALSE`, aiRecord.c:496 / aoRecord.c:578). On the
@@ -10197,7 +10081,7 @@ impl PvDatabase {
             rec.read().pact_exit_without_release()
         };
 
-        (SimOutcome::Simulated(sim_posts), exit)
+        (SimOutcome::Simulated, exit)
     }
 }
 
@@ -10292,7 +10176,7 @@ fn sim_process_tail(
     siol_stamp: SiolStamp,
     clear_udf: bool,
     plan: &crate::server::record::record_instance::ProcessPlan,
-) -> CyclePosts {
+) {
     let alarms_first = plan.alarms_before_stamp;
     debug_assert_eq!(alarms_first, instance.record.alarms_before_stamp());
     // `read_sim_stamp` already returned `Keep` for a `.TIME` TSEL
@@ -10325,7 +10209,7 @@ fn sim_process_tail(
     }
     let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
     let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
-    publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts)
+    publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
 }
 
 /// The single finalizer for a process cycle, for every path that can end one.
@@ -10433,15 +10317,53 @@ impl Drop for CycleEndGuard<'_> {
 /// ```
 pub struct ExternalCpProcess {
     pending: std::sync::atomic::AtomicBool,
+    /// Links added to the already-served channel, each owed the process
+    /// its own first event would have requested ([`Self::request_holder`]).
+    holders: parking_lot::Mutex<Vec<super::CpTarget>>,
+    /// Requests made, counted after each is recorded: `dbCaSync`'s mark.
+    requested: std::sync::atomic::AtomicU64,
+    /// The `requested` count the last finished pass had seen before it took
+    /// the requests: every request up to it has been served.
+    served: std::sync::atomic::AtomicU64,
+    /// Signalled after each pass and each event handed in, for `dbCaSync`.
+    settled: crate::runtime::sync::Notify,
+    /// C `CA_INIT_READY`: report the link ready after this pass.
+    init_ready: std::sync::atomic::AtomicBool,
+    /// The `dbCaRun` waits riding on this channel's first event.
+    init: parking_lot::Mutex<InitWait>,
     /// The `workListEvent` signal (`dbCa.c:160`), sent on the 0→1 edge only.
     wake: crate::runtime::sync::Notify,
     external_pv: RecordName,
 }
 
+/// Whether a channel's first event has been processed, and the links
+/// `dbCaRun` waits on until it is. Never returns to `Waiting`.
+enum InitWait {
+    Waiting(Vec<CaLinkInit>),
+    Passed,
+}
+
 impl ExternalCpProcess {
+    /// A channel no `dbCaRun` waits on: a link joining it is ready at once.
     pub fn new(external_pv: impl Into<RecordName>) -> Self {
+        Self::with_init(external_pv, InitWait::Passed)
+    }
+
+    /// A local channel, whose first event's pass readies every link that
+    /// joined it before the pass ([`Self::adopt_init`]).
+    pub fn awaiting_first_event(external_pv: impl Into<RecordName>) -> Self {
+        Self::with_init(external_pv, InitWait::Waiting(Vec::new()))
+    }
+
+    fn with_init(external_pv: impl Into<RecordName>, init: InitWait) -> Self {
         Self {
             pending: std::sync::atomic::AtomicBool::new(false),
+            holders: parking_lot::Mutex::new(Vec::new()),
+            requested: std::sync::atomic::AtomicU64::new(0),
+            served: std::sync::atomic::AtomicU64::new(0),
+            settled: crate::runtime::sync::Notify::new(),
+            init_ready: std::sync::atomic::AtomicBool::new(false),
+            init: parking_lot::Mutex::new(init),
             wake: crate::runtime::sync::Notify::new(),
             external_pv: external_pv.into(),
         }
@@ -10450,9 +10372,38 @@ impl ExternalCpProcess {
     /// Request a process. A request made while one is pending merges into
     /// it, as the OR into `link_action` does.
     pub fn request(&self) {
-        if !self.pending.swap(true, Ordering::AcqRel) {
+        let merged = self.pending.swap(true, Ordering::AcqRel);
+        self.requested.fetch_add(1, Ordering::SeqCst);
+        if !merged {
             self.wake.notify_one();
         }
+    }
+
+    /// Request the process of `holder` alone: C gives every CP/CPP link its
+    /// own `caLink`, whose first event processes only that link's record
+    /// (`dbCa.c:958-962`). A link added to a channel that already delivered
+    /// its first event gets none from the shared channel, so it asks here.
+    /// A pending [`Self::request`] already covers it.
+    pub fn request_holder(&self, holder: super::CpTarget) {
+        self.holders.lock().push(holder);
+        self.requested.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    /// Hold `init` until this channel's first event has been processed;
+    /// released at once if it already has.
+    pub fn adopt_init(&self, init: CaLinkInit) {
+        if let InitWait::Waiting(held) = &mut *self.init.lock() {
+            held.push(init);
+        }
+    }
+
+    /// C `CA_INIT_READY` after the first event: once the pass serving the
+    /// requests made before this one has run, `dbCaRun` stops waiting for
+    /// the links held here. Request the first event's process before this.
+    pub fn request_init_ready(&self) {
+        self.init_ready.store(true, Ordering::Release);
+        self.wake.notify_one();
     }
 
     /// The link's worker: wait for a request, then process the holders in
@@ -10460,6 +10411,10 @@ impl ExternalCpProcess {
     pub async fn run_worker(&self, db: impl Fn() -> Option<PvDatabase>) {
         loop {
             self.wake.notified().await;
+            // C queues `CA_DBPROCESS` on a `dbCaTask` paused until `dbCaRun`.
+            if let Some(db) = db() {
+                db.ca_run_reached().await;
+            }
             self.run_pending(db().as_ref());
         }
     }
@@ -10467,12 +10422,144 @@ impl ExternalCpProcess {
     /// Take the pending request and, if there was one, process the holders
     /// in `db`.
     fn run_pending(&self, db: Option<&PvDatabase>) {
-        if !self.pending.swap(false, Ordering::AcqRel) {
-            return;
+        // Counted before the requests are taken, so every request counted
+        // here is taken by this pass or an earlier one.
+        let seen = self.requested.load(Ordering::SeqCst);
+        self.run_requests(db);
+        self.served.fetch_max(seen, Ordering::SeqCst);
+        self.settled.notify_waiters();
+        // A request merged into one this pass took, counted after `seen`,
+        // was served but not counted: one more pass counts it.
+        if self.requested.load(Ordering::SeqCst) != seen {
+            self.wake.notify_one();
         }
-        if let Some(db) = db {
-            db.dispatch_external_cp_targets(&self.external_pv);
+    }
+
+    /// Wake [`Self::until_settled`] waiters to re-check their condition.
+    pub(crate) fn notify_settled(&self) {
+        self.settled.notify_waiters();
+    }
+
+    /// Wait until `settled()` holds, re-checked after each signal.
+    pub(crate) async fn until_settled(&self, settled: impl Fn() -> bool) {
+        loop {
+            let signal = self.settled.notified();
+            let mut signal = std::pin::pin!(signal);
+            signal.as_mut().enable();
+            if settled() {
+                return;
+            }
+            signal.await;
         }
+    }
+
+    /// The `dbCaSync` mark: every request made so far.
+    pub(crate) fn request_mark(&self) -> u64 {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    /// Whether every request up to `mark` has been served.
+    pub(crate) fn served_through(&self, mark: u64) -> bool {
+        self.served.load(Ordering::SeqCst) >= mark
+    }
+
+    fn run_requests(&self, db: Option<&PvDatabase>) {
+        // Taken before the request it follows, so a ready seen here has its
+        // first event's request seen too.
+        let init_ready = self.init_ready.swap(false, Ordering::AcqRel);
+        let holders = std::mem::take(&mut *self.holders.lock());
+        let all = self.pending.swap(false, Ordering::AcqRel);
+        let Some(db) = db else { return };
+        if all || !holders.is_empty() {
+            db.dispatch_external_cp_targets(
+                &self.external_pv,
+                (!all).then_some(holders.as_slice()),
+            );
+        }
+        if init_ready {
+            let held = std::mem::replace(&mut *self.init.lock(), InitWait::Passed);
+            drop(held);
+        }
+    }
+}
+
+/// C `dbCaCtl`'s pause and `initOutstanding` (`dbCa.c:68`, `:370-380`).
+/// `dbCaTask` services nothing queued before `dbCaRun`, and `dbCaRun`
+/// returns once every local link added before it has run its first event's
+/// process.
+#[derive(Default)]
+pub(crate) struct CaRunGate {
+    state: parking_lot::Mutex<GateState>,
+    notify: crate::runtime::sync::Notify,
+    settled: crate::runtime::sync::Notify,
+}
+
+#[derive(Default)]
+struct GateState {
+    running: bool,
+    outstanding: usize,
+}
+
+impl CaRunGate {
+    /// `dbCaRun`.
+    pub(crate) async fn run(&self) {
+        self.state.lock().running = true;
+        self.notify.notify_waiters();
+        loop {
+            let settled = self.settled.notified();
+            let mut settled = std::pin::pin!(settled);
+            settled.as_mut().enable();
+            if self.state.lock().outstanding == 0 {
+                return;
+            }
+            settled.await;
+        }
+    }
+
+    pub(crate) async fn reached(&self) {
+        let notified = self.notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        if !self.state.lock().running {
+            notified.await;
+        }
+    }
+
+    /// `initOutstanding++` for a local link added before `dbCaRun`; none
+    /// after it.
+    pub(crate) fn register(self: &std::sync::Arc<Self>) -> Option<CaLinkInit> {
+        let mut state = self.state.lock();
+        if state.running {
+            return None;
+        }
+        state.outstanding += 1;
+        Some(CaLinkInit {
+            _claim: std::sync::Arc::new(InitClaim(self.clone())),
+        })
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock();
+        state.outstanding -= 1;
+        if state.outstanding == 0 {
+            self.settled.notify_waiters();
+        }
+    }
+}
+
+/// One local CA link `dbCaRun` waits for. Only staging the link's open
+/// creates one, and the wait ends when the last clone drops — the link's
+/// `CA_INIT_READY` — so no report can precede the registration or repeat.
+#[derive(Clone)]
+pub struct CaLinkInit {
+    _claim: std::sync::Arc<InitClaim>,
+}
+
+struct InitClaim(std::sync::Arc<CaRunGate>);
+
+impl Drop for InitClaim {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 

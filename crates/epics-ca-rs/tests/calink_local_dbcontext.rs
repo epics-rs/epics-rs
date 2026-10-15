@@ -1,12 +1,13 @@
 //! A CA link to a name the IOC's own database serves resolves in-process,
 //! as C `dbCa` does through `dbContext` (`dbContext.cpp:87-121`): no search,
-//! no circuit, and no CA client at all.
+//! no circuit, and no CA client at all. The database's own `ca` entry serves
+//! it; the installed resolver is the network half and never sees the name.
 #![cfg(feature = "client-core")]
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, PvDatabase};
 use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver, register_calink_commands};
@@ -85,8 +86,12 @@ async fn a_ca_link_to_a_local_record_connects_with_no_server_reachable() {
         "record(ai, \"RPRO:B\") { field(VAL, \"5\") }\n\
          record(ai, \"RPRO:A\") { field(INP, \"RPRO:B CA\") }\n",
         |db, resolver| async move {
-            let link = resolver.open("RPRO:B").await.expect("open the local link");
-            until("the local CA link never connected", || link.is_connected()).await;
+            let ca = db.link_set("ca").await.expect("ca entry");
+            ca.connect_link(b"RPRO:B", None).await;
+            until("the local CA link never connected", || {
+                ca.is_connected(b"RPRO:B")
+            })
+            .await;
             db.process_record("RPRO:A").await.expect("process RPRO:A");
             assert_eq!(val(&db, "RPRO:A"), Some(5.0));
             assert_eq!(sevr(&db, "RPRO:A"), 0, "RPRO:A must carry no LINK alarm");
@@ -110,11 +115,9 @@ async fn a_local_ca_link_follows_the_source_through_the_in_process_monitor() {
     with_ioc(
         "record(ai, \"LMON:SRC\") { field(VAL, \"1\") }\n",
         |db, resolver| async move {
-            let link = resolver
-                .open("LMON:SRC")
-                .await
-                .expect("open the local link");
-            let value = || link.value().and_then(|v| v.to_f64());
+            let ca = db.link_set("ca").await.expect("ca entry");
+            ca.connect_link(b"LMON:SRC", None).await;
+            let value = || ca.get_cached_value(b"LMON:SRC").and_then(|v| v.to_f64());
             until("the first event never arrived", || value() == Some(1.0)).await;
             for v in [7.0, 11.0] {
                 db.put_pv_and_post("LMON:SRC", EpicsValue::Double(v))
@@ -136,17 +139,12 @@ async fn a_local_ca_put_writes_the_target_plain_and_with_callback() {
     with_ioc(
         "record(ao, \"LPUT:TGT\") { field(VAL, \"0\") }\n",
         |db, resolver| async move {
-            resolver
-                .open("LPUT:TGT")
-                .await
-                .expect("open the local link");
-            resolver
-                .put_value(b"LPUT:TGT", EpicsValue::Double(3.0), LinkPutOp::Plain)
+            let ca = db.link_set("ca").await.expect("ca entry");
+            ca.put_value(b"LPUT:TGT", EpicsValue::Double(3.0), LinkPutOp::Plain)
                 .await
                 .expect("plain put");
             assert_eq!(val(&db, "LPUT:TGT"), Some(3.0));
-            resolver
-                .put_value(b"LPUT:TGT", EpicsValue::Double(9.0), LinkPutOp::Async)
+            ca.put_value(b"LPUT:TGT", EpicsValue::Double(9.0), LinkPutOp::Async)
                 .await
                 .expect("put callback");
             assert_eq!(val(&db, "LPUT:TGT"), Some(9.0));
@@ -154,4 +152,69 @@ async fn a_local_ca_put_writes_the_target_plain_and_with_callback() {
         },
     )
     .await;
+}
+
+/// A CP link put on `RL:H` after iocRun, to a name `RL:HP`'s link already
+/// serves: C opens the new link its own `caLink`, whose first event
+/// processes `RL:H` once (`dbCa.c:958-962`). The port shares the channel,
+/// so that process is requested for `RL:H` alone.
+#[epics_macros_rs::epics_test]
+#[serial(epics_env)]
+async fn a_cp_link_added_to_a_served_name_processes_its_holder_once() {
+    with_ioc(
+        "record(ao, \"RL:X\") {}\n\
+         record(calc, \"RL:HP\") { field(INPA, \"ca://RL:X CP\") field(CALC, \"VAL+1\") }\n\
+         record(calc, \"RL:H\") { field(CALC, \"VAL+1\") }\n",
+        |db, _resolver| async move {
+            until("RL:HP never processed on connect", || {
+                val(&db, "RL:HP") == Some(1.0)
+            })
+            .await;
+            db.put_record_field_from_ca("RL:H", "INPA", EpicsValue::String("ca://RL:X CP".into()))
+                .await
+                .expect("put RL:H.INPA");
+            until("RL:H never processed on its link's add", || {
+                val(&db, "RL:H") == Some(1.0)
+            })
+            .await;
+            db.put_record_field_from_ca("RL:X", "VAL", EpicsValue::Double(1.0))
+                .await
+                .expect("put RL:X");
+            // RL:H's edge is RL:X's last, so this pass decided RL:HP's.
+            until("RL:X's post never processed RL:H", || {
+                val(&db, "RL:H") == Some(2.0)
+            })
+            .await;
+            assert_eq!(val(&db, "RL:HP"), Some(2.0), "RL:HP once per post");
+        },
+    )
+    .await;
+}
+
+/// `dbCaRun` returns for links that never become local channels or that
+/// join one already open: `RI:R.VAL$x` names a local record but
+/// `dbChannel_create` refuses it, so its link takes the network path, and
+/// `RI:X` is opened by two links, `RI:X CP` and `ca://RI:X CP`.
+#[epics_macros_rs::epics_test]
+#[serial(epics_env)]
+async fn iocinit_completes_over_refused_and_shared_local_names() {
+    let ioc = with_ioc(
+        "record(ao, \"RI:R\") {}\n\
+         record(ao, \"RI:X\") { field(VAL, \"4\") }\n\
+         record(calc, \"RI:HR\") { field(INPA, \"RI:R.VAL$x CP\") field(CALC, \"A\") }\n\
+         record(calc, \"RI:H1\") { field(INPA, \"RI:X CP\") field(CALC, \"A\") }\n\
+         record(calc, \"RI:H2\") { field(INPA, \"ca://RI:X CP\") field(CALC, \"A\") }\n",
+        |db, resolver| async move {
+            assert!(
+                resolver.client_connection_count().await.is_some(),
+                "RI:R.VAL$x took the network path"
+            );
+            // dbCaRun returned after both holders' first event.
+            assert_eq!(val(&db, "RI:H1"), Some(4.0));
+            assert_eq!(val(&db, "RI:H2"), Some(4.0));
+        },
+    );
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, ioc)
+        .await
+        .expect("iocInit's dbCaRun returned");
 }

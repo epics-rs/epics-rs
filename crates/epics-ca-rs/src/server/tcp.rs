@@ -248,6 +248,7 @@ pub enum ServerConnectionEvent {
 use super::LongStringMode;
 use crate::protocol::*;
 use crate::server::outbox::{FrameSink, Outbox};
+pub(crate) use epics_base_rs::server::database::dbr_delivery::prepare_read;
 // The accumulator is shared with the blocking driver, but this file's only
 // user of it is the async `handle_client`; same gate as that fn, which is
 // `tokio_backend` and not the target. Every reactor-free build reaches the
@@ -6260,67 +6261,6 @@ enum ReadReplyError {
     /// [`Self::BadType`], which is a request the server can never serve and
     /// which tears the connection down.
     GetFail,
-}
-
-/// The value C's `dbChannel_get` reads off an open channel for a
-/// `requested_type` request of `requested_count` elements (0 = autosize):
-/// the read chain, the post stage and the options `getOptions` takes from
-/// the record (`dbAccess.c:361-362`). rsrv's READ and the in-process CA link
-/// channel both read through it.
-pub(crate) fn prepare_read(
-    target: &ChannelTarget,
-    chain: epics_base_rs::server::database::filters::FilterChain,
-    long_string_mode: LongStringMode,
-    field_element_count: u32,
-    requested_type: u16,
-    requested_count: u32,
-    mut snapshot: epics_base_rs::server::snapshot::Snapshot,
-) -> epics_base_rs::server::snapshot::Snapshot {
-    let (read_chain, post_chain) = chain.split();
-    if !read_chain.is_empty() {
-        if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
-            snapshot.value = v;
-        }
-    }
-    // convert String → CharArray of exactly 40 elements BEFORE the
-    // requested-count clamp. C read_reply sizes the payload to
-    // dbr_size_n(DBR_CHAR, request_count) after the channel reports
-    // no_elements=40; the clamp must see the 40-element array so
-    // `caget -# N PV.DESC$` trims to N chars (not the pre-convert
-    // count of 1 that EpicsValue::String::count() returns).
-    // `NativeString` is the inverse — a long-string record field
-    // (printf/lsi/lso) decoded from its CHAR carrier to a scalar
-    // string so plain access ships one DBR_STRING (C cvt_dbaddr).
-    let stage = super::DeliveryStage::new(post_chain, long_string_mode, field_element_count);
-    if !stage.is_identity() {
-        // The post chain drops nothing (`arr`, `ts`), so `None` is
-        // unreachable; it keeps the value as read.
-        let mut read = snapshot.clone();
-        if stage.prepare_snapshot(&mut read, requested_count, 0) {
-            snapshot = read;
-        }
-    }
-    // Respect client's requested element count (e.g. caget -# 10)
-    if requested_count > 0 && requested_count < snapshot.value.count() {
-        snapshot.value.truncate(requested_count as usize);
-    }
-
-    if requested_type == epics_base_rs::types::DBR_STSACK_STRING {
-        read_ack_state(target, &mut snapshot.alarm);
-    }
-
-    // For DBR_CLASS_NAME (38) substitute the record's recordType
-    // into the response. SimplePv channels have no record-type
-    // identity so they receive an empty string (which matches
-    // what the C IOC does for in-process DBR_CLASS_NAME reads
-    // against synthetic channels).
-    if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-        if let ChannelTarget::RecordField { record, .. } = target {
-            let inst = record.read();
-            snapshot.class_name = Some(inst.record.record_type().to_string());
-        }
-    }
-    snapshot
 }
 
 /// Sans-io core of the READ / READ_NOTIFY reply: turn a fully-materialized

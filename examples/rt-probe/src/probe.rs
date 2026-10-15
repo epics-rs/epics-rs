@@ -189,7 +189,7 @@ async fn boot_ioc_on(ca_port: u16) -> Result<Ioc, Box<dyn std::error::Error>> {
     let macros = std::collections::HashMap::new();
     let (db, _autosave) = IocBuilder::new()
         .db_string(FAST_DB, &macros)?
-        .build()
+        .build_served()
         .await?;
     let scan = ScanOwner::start(db.clone());
     let ca_server = CaServer::from_parts(

@@ -3702,6 +3702,33 @@ mod tests {
         unsafe { std::env::remove_var("R3_PREFIX") };
     }
 
+    /// An escaped argument survives the shell's one expansion and its split
+    /// byte for byte, whichever structural byte it holds.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn an_escaped_argument_reaches_the_command_unchanged() {
+        let shell = make_shell();
+        // SAFETY: serial(epics_env) serialises env-mutating tests.
+        unsafe { std::env::set_var("R3_ESCAPED", "expanded") };
+        for arg in [
+            r#"C:\Users\RUNNER~1\j.db"#,
+            r#"a b\t"c" 'd' $(R3_ESCAPED) ${R3_ESCAPED},(e)<f>2>g"#,
+            "P=A:,R=B é\t\\",
+            "",
+            "\\",
+        ] {
+            let line = format!("dbLoadRecords({}, x)", registry::escape_arg(arg));
+            let expanded = shell.expand_line(line.as_bytes()).unwrap();
+            assert_eq!(
+                registry::tokenize(&expanded),
+                vec!["dbLoadRecords", arg, "x"],
+                "{line}"
+            );
+            assert_eq!(registry::lint_line(&expanded), None, "{line}");
+        }
+        unsafe { std::env::remove_var("R3_ESCAPED") };
+    }
+
     /// A macro value carrying token separators is re-tokenized because
     /// the single expansion runs over the WHOLE line before `split`
     /// (C `iocsh.cpp:1184` then `:1215`). Guards against re-introducing

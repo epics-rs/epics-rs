@@ -8,6 +8,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::log::{ANSI_ESC_BLUE, ANSI_ESC_BOLD, ANSI_ESC_RESET, ERL_ERROR};
 use epics_base_rs::server::ioc_app::{IocInitDecision, IocRunFailure};
+use epics_base_rs::server::iocsh::registry::escape_arg;
 use epics_base_rs::server::iocsh::use_ansi_color;
 use epics_base_rs::server::records::{
     ai::AiRecord, ao::AoRecord, bi::BiRecord, bo::BoRecord, longin::LonginRecord,
@@ -540,7 +541,7 @@ impl PlannedCommand {
             |f: &dyn Fn(&str) -> String| args.iter().map(|a| f(a)).collect::<Vec<_>>().join(", ");
         PlannedCommand {
             shown: format!("{name}({})", join(&|a| format!("\"{a}\""))),
-            line: format!("{name}({})", join(&iocsh_escape)),
+            line: format!("{name}({})", join(&escape_arg)),
             on_error,
         }
     }
@@ -831,23 +832,6 @@ fn blamed_option(e: &clap::Error) -> String {
             },
             |c| c.to_string(),
         )
-}
-
-/// An argument as iocsh text that splits back into exactly its bytes.
-///
-/// C passes these as pointers; here they travel as a line, through
-/// `macDefExpand` and `split` (`iocsh.cpp:1184`, `:252-371`). Inside a quote
-/// a backslash is data and nothing can be escaped; outside one, a backslash
-/// makes the next byte data for both passes.
-fn iocsh_escape(arg: &str) -> String {
-    let mut out = String::with_capacity(arg.len());
-    for c in arg.chars() {
-        if c.is_ascii_whitespace() || "\\\"'(),$<>".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 #[cfg(tokio_backend)]
@@ -1383,8 +1367,7 @@ fn main() -> std::process::ExitCode {
 mod tests {
     use super::{
         AfterStartup, Args, CommandFactory, ERL_ERROR, Failure, SOFT_IOC_EXIT_DB, Step,
-        blamed_option, copt, db_load_records_call, iocsh_escape, parse_record_def, startup_plan,
-        usage,
+        blamed_option, copt, db_load_records_call, parse_record_def, startup_plan, usage,
     };
     #[cfg(tokio_backend)]
     use super::{ServerOptions, run_ioc_app};
@@ -1636,17 +1619,6 @@ mod tests {
             shown(r"C:\t\x.db", ""),
             r#"dbLoadRecords("C:\t\x.db")"#,
             "C prints optarg raw"
-        );
-    }
-
-    /// Every byte the shell's two passes read as structure is escaped
-    /// outside a quote, where a backslash means the next byte is data; the
-    /// end-to-end proof is `tests/softioc_db_path_bytes.rs`.
-    #[test]
-    fn an_argument_is_escaped_outside_any_quote() {
-        assert_eq!(
-            iocsh_escape(r#"C:\a b\"q"'$(X),<>.db"#),
-            r#"C:\\a\ b\\\"q\"\'\$\(X\)\,\<\>.db"#
         );
     }
 

@@ -611,6 +611,26 @@ pub(crate) fn tokenize(line: &[u8]) -> Vec<IocshString> {
     tokens
 }
 
+/// `arg` as line text that [`super::IocShell::execute_line`]'s expansion and
+/// [`tokenize`] hand back as exactly `arg`: for a caller holding a value C
+/// would pass as a pointer, not as text. Inside a quote a backslash is data
+/// and nothing can be escaped; outside one it makes the next byte data for
+/// both passes (`macCore.c:741-743`, `iocsh.cpp:273-278`). Empty is `""`,
+/// which `split` keeps as an empty word (`:345-346`).
+pub fn escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_owned();
+    }
+    let mut out = String::with_capacity(arg.len());
+    for c in arg.chars() {
+        if c.is_ascii_whitespace() || "\\\"'(),$<>".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Scan a command line for the malformed-input conditions C
 /// `iocsh.cpp` `split()` (lines 362-371) flags: an unbalanced quote
 /// (`"` or `'`) and a trailing backslash. Returns a human-readable

@@ -769,7 +769,7 @@ impl ModbusPortDriver {
         self.base.trace_print(
             TraceMask::ERROR,
             format_args!(
-                "drvModbusAsyn::readPoller port {} offset {addr} {what}\n",
+                "drvModbusAsyn::readPoller port {} offset {addr} {what}",
                 self.base.port_name
             ),
         );
@@ -1538,7 +1538,7 @@ impl PortDriver for ModbusPortDriver {
                 self.base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
-                        "drvModbusAsyn::readPoller port {} poll cycle failed: {e}\n",
+                        "drvModbusAsyn::readPoller port {} poll cycle failed: {e}",
                         self.base.port_name
                     ),
                 );

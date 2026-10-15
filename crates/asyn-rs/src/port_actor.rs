@@ -2108,7 +2108,7 @@ impl PortActor {
                     if let Err(e) = outcome {
                         base.trace_print(
                             crate::trace::TraceMask::ERROR,
-                            format_args!("callParamCallbacks: param set failed: {e}\n"),
+                            format_args!("callParamCallbacks: param set failed: {e}"),
                         );
                         failed.get_or_insert(e);
                     }

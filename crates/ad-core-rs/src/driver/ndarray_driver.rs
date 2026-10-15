@@ -919,7 +919,7 @@ fn expand_attribute_macros(port_base: &PortDriverBase, xml: String, macros: &str
     if expansion.errored() {
         port_base.trace_print(
             asyn_rs::trace::TraceMask::ERROR,
-            format_args!("asynNDArrayDriver::readNDAttributesFile, error expanding macros\n"),
+            format_args!("asynNDArrayDriver::readNDAttributesFile, error expanding macros"),
         );
         return xml;
     }

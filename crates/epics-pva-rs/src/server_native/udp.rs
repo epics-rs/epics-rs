@@ -1768,13 +1768,14 @@ mod tests {
 
     /// A reply carrying an `iface_hint` leaves from that NIC's socket, not
     /// from whichever one `send_to` picks for the destination. The bundle
-    /// holds two loopback addresses that are not enumerated NICs, so the
-    /// source address the requester sees names the socket used.
+    /// holds two loopback addresses, so the source address the requester sees
+    /// names the socket used. 127.0.0.2 and .4 because Darwin's lo0 carries
+    /// only the addresses CI aliases.
     #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn a_reply_with_an_iface_hint_leaves_from_that_nics_socket() {
         let first = Ipv4Addr::new(127, 0, 0, 2);
-        let second = Ipv4Addr::new(127, 0, 0, 3);
+        let second = Ipv4Addr::new(127, 0, 0, 4);
         let bundle = AsyncUdpV4::bind_on_interfaces(&[first, second], 0, PortUse::Shared, false)
             .expect("bundle on two loopback addresses");
         let requester = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))

@@ -3511,8 +3511,11 @@ pub(super) mod tests {
                 .expect("bind the blocking PVA server"),
         );
         let port = server.tcp_port();
-        TcpListener::bind((Ipv4Addr::new(127, 0, 0, 3), port))
-            .expect("the wildcard must not be bound beside the listed interfaces");
+        // A connect, not a bind: Darwin and Windows bind a specific address
+        // beside a wildcard listener. 127.0.0.4: Darwin's lo0 carries only
+        // the addresses CI aliases.
+        TcpStream::connect((Ipv4Addr::new(127, 0, 0, 4), port))
+            .expect_err("the wildcard must not be bound beside the listed interfaces");
         let serving = server.clone();
         let accept = spawn_dedicated_thread(
             "test-PVAS-accept".into(),

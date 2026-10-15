@@ -658,8 +658,11 @@ mod tests {
         };
         let (server, accept) = start_server_on(Ipv4Addr::UNSPECIFIED, config);
         let port = server.tcp_port();
-        std::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 3), port))
-            .expect("the wildcard must not be bound beside the listed interfaces");
+        // A connect, not a bind: Darwin and Windows bind a specific address
+        // beside a wildcard listener. 127.0.0.4: Darwin's lo0 carries only
+        // the addresses CI aliases.
+        std::net::TcpStream::connect((Ipv4Addr::new(127, 0, 0, 4), port))
+            .expect_err("the wildcard must not be bound beside the listed interfaces");
         for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)] {
             let client = TestClient::connect(SocketAddr::from((ip, port)));
             eventually("the connection is served", || {

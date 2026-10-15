@@ -78,7 +78,11 @@ pub async fn mqtt_event_loop(
     // left half-advanced if the future is dropped mid-poll), so we must never
     // drive it inside a `tokio::select!`. Instead, outbound publishes are
     // forwarded on a dedicated task, and the main loop only awaits `poll()`.
-    tokio::spawn(publish_task(client.clone(), publish_rx));
+    tokio::spawn(publish_task(
+        client.clone(),
+        publish_rx,
+        port_handle.clone(),
+    ));
 
     // MQ4 shutdown. C's `~MqttClient` calls `disconnect()`
     // (mqttClient.cpp:37-41), which sends a DISCONNECT and waits for the packet
@@ -148,6 +152,9 @@ pub async fn mqtt_event_loop(
     // to flip it back). Any inbound packet (`Publish`, `PingResp`) is direct
     // proof the session is alive, so we use it as a fallback recovery signal.
     let mut is_connected = false;
+    // C `onConnectCb` tells a reconnect from the first connect
+    // (drvMqtt.cpp:196-204).
+    let mut was_connected = false;
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::Publish(publish))) => {
@@ -168,12 +175,29 @@ pub async fn mqtt_event_loop(
                         handle_incoming_message(topic, &publish.payload, &topic_map, &port_handle)
                             .await;
                     }
-                    Err(e) => tracing::warn!("Non-UTF8 MQTT topic: {e}"),
+                    Err(e) => asyn_print(
+                        &port_handle,
+                        TraceMask::ERROR,
+                        format_args!("MqttDriver::onMessageCb: Non-UTF8 MQTT topic: {e}"),
+                    ),
                 }
             }
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 mark_connected(&port_handle, connected_param, &connected).await;
                 is_connected = true;
+                if was_connected {
+                    asyn_print(
+                        &port_handle,
+                        TraceMask::IO_DRIVER | TraceMask::ERROR,
+                        format_args!("MqttDriver::onConnectCb: Reconnected."),
+                    );
+                }
+                was_connected = true;
+                asyn_print(
+                    &port_handle,
+                    TraceMask::IO_DRIVER,
+                    format_args!("MqttDriver::onConnectCb: Connected to broker"),
+                );
                 // C parity: `onConnectCb` subscribes only the topics of records
                 // bound by `I/O Intr` / `asyn:READBACK` — the live
                 // interrupt-variable set (`getInterruptVariables()`,
@@ -183,17 +207,14 @@ pub async fn mqtt_event_loop(
                     &reason_to_topic,
                     &port_handle.interrupts().subscribed_bindings(),
                 );
-                tracing::info!(
-                    "MQTT connected, subscribing to {} topic(s)",
-                    sub_topics.len()
-                );
                 // Spawn subscribe so we return to `poll()` immediately — the
                 // event loop is the only thing that drains rumqttc's command
                 // channel, so awaiting subscribe inline risks stalling.
                 let sub_client = client.clone();
                 let sub_qos = config.qos;
+                let sub_port = port_handle.clone();
                 tokio::spawn(async move {
-                    subscribe_all(&sub_client, &sub_topics, sub_qos).await;
+                    subscribe_all(&sub_client, &sub_topics, sub_qos, &sub_port).await;
                 });
             }
             Ok(Event::Incoming(Incoming::PingResp(_))) => {
@@ -217,7 +238,25 @@ pub async fn mqtt_event_loop(
                     tracing::info!("MQTT event loop exiting while disconnected: {e}");
                     break;
                 }
-                tracing::error!("MQTT connection error: {e}");
+                // C reports the loss of a live session from `onDisconnectCb`
+                // (drvMqtt.cpp:219-220) and each failed reconnect attempt from
+                // `onFailCb` (drvMqtt.cpp:234-235). The rumqttc error is kept:
+                // its variant tells a network failure from a state error.
+                if is_connected {
+                    asyn_print(
+                        &port_handle,
+                        TraceMask::ERROR,
+                        format_args!(
+                            "MqttDriver::onDisconnectCb: Connection lost. Reconnecting... ({e})"
+                        ),
+                    );
+                } else {
+                    asyn_print(
+                        &port_handle,
+                        TraceMask::ERROR,
+                        format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
+                    );
+                }
                 // Close the publish gate first so a concurrent write fails fast
                 // (C: publish throws while disconnected) instead of buffering.
                 connected.store(false, Ordering::Release);
@@ -263,6 +302,7 @@ async fn mark_connected(port_handle: &PortHandle, connected_param: usize, connec
 async fn publish_task(
     client: AsyncClient,
     mut publish_rx: mpsc::UnboundedReceiver<PublishRequest>,
+    port_handle: PortHandle,
 ) {
     while let Some(req) = publish_rx.recv().await {
         let PublishRequest {
@@ -275,8 +315,19 @@ async fn publish_task(
         // v5 publish wants `P: Into<Bytes>`; the owned `Vec<u8>` payload
         // satisfies it directly (no borrow held across the await), carrying raw
         // non-UTF-8 octet bytes through unchanged.
-        if let Err(e) = client.publish(&topic, qos, retained, payload).await {
-            tracing::warn!("MQTT publish to '{topic}' failed: {e}");
+        // C prints these from `onPublishCb` / `onFailCb` (drvMqtt.cpp:234,
+        // :241); here the success line marks the request handed to the client.
+        match client.publish(&topic, qos, retained, payload).await {
+            Ok(()) => asyn_print(
+                &port_handle,
+                TraceMask::IO_DRIVER,
+                format_args!("MqttDriver::onPublishCb: Published to topic '{topic}'"),
+            ),
+            Err(e) => asyn_print(
+                &port_handle,
+                TraceMask::ERROR,
+                format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
+            ),
         }
     }
 }
@@ -474,13 +525,36 @@ fn subscribe_topics(
     topics
 }
 
-async fn subscribe_all(client: &AsyncClient, topics: &[String], qos: crate::config::QoS) {
+async fn subscribe_all(
+    client: &AsyncClient,
+    topics: &[String],
+    qos: crate::config::QoS,
+    port_handle: &PortHandle,
+) {
     let rqos: rumqttc::v5::mqttbytes::QoS = qos.into();
     for topic in topics {
-        if let Err(e) = client.subscribe(topic, rqos).await {
-            tracing::warn!("MQTT subscribe to '{topic}' failed: {e}");
+        // C: `onSubscribeCb` / `onFailCb` (drvMqtt.cpp:227, :234).
+        match client.subscribe(topic, rqos).await {
+            Ok(()) => asyn_print(
+                port_handle,
+                TraceMask::IO_DRIVER,
+                format_args!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'"),
+            ),
+            Err(e) => asyn_print(
+                port_handle,
+                TraceMask::ERROR,
+                format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
+            ),
         }
     }
+}
+
+/// C `asynPrint(pasynUserSelf, mask, ...)`: gated by this port's
+/// `asynSetTraceMask`, written to its trace file.
+fn asyn_print(port_handle: &PortHandle, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+    port_handle
+        .trace()
+        .print(Some(port_handle.port_name()), None, 0, mask, args);
 }
 
 async fn handle_incoming_message(
@@ -510,9 +584,8 @@ async fn handle_incoming_message(
 
     // C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`: on by default and
     // governed by this port's `asynSetTraceMask`.
-    let (trace, port) = (port_handle.trace(), port_handle.port_name());
     let mut report =
-        |args: std::fmt::Arguments<'_>| trace.print(Some(port), None, 0, TraceMask::ERROR, args);
+        |args: std::fmt::Arguments<'_>| asyn_print(port_handle, TraceMask::ERROR, args);
     let batch_updates =
         decode_for_subscribers(payload, subscribers, &bound_reasons, topic, &mut report);
 
@@ -869,6 +942,128 @@ mod tests {
             .await
             .expect("event loop did not exit after DISCONNECT")
             .unwrap();
+    }
+
+    /// C prints the session's edges through `asynPrint` (drvMqtt.cpp:202-205,
+    /// :219, :234): one boundary each — the first ConnAck is not a reconnect,
+    /// an error on a live session is a loss, an error while already down is a
+    /// failed attempt, and a ConnAck after a loss is `Reconnected.`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_edges_print_c_s_trace_lines() {
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+        use tokio::io::AsyncWriteExt;
+
+        const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = MqttConfig {
+            broker_host: "127.0.0.1".into(),
+            broker_port: addr.port(),
+            client_id: "edges-test".into(),
+            keep_alive_secs: 3600,
+            ..MqttConfig::default()
+        };
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let mut driver = crate::driver::MqttDriver::new(
+            "MQEDGE",
+            &config,
+            Vec::new(),
+            publish_tx,
+            connected.clone(),
+        );
+        let topic_map = driver.topic_map();
+        let connected_param = driver.connected_param;
+        let shutdown = driver.shutdown_signal();
+        let teardown_done = driver.teardown_ack();
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _jh) = asyn_rs::runtime::port::create_port_runtime(
+            driver,
+            RuntimeConfig {
+                services,
+                ..RuntimeConfig::default()
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("mqedge-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("MQEDGE"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some("MQEDGE"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        async fn wait_for(path: &std::path::Path, needle: &str) {
+            for _ in 0..100 {
+                if std::fs::read_to_string(path).unwrap().contains(needle) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!(
+                "no '{needle}' in:\n{}",
+                std::fs::read_to_string(path).unwrap()
+            );
+        }
+
+        let port_handle = runtime.port_handle().clone();
+        let start = Arc::new(Notify::new());
+        let loop_start = start.clone();
+        let ev = tokio::spawn(async move {
+            mqtt_event_loop(
+                config,
+                topic_map,
+                port_handle,
+                publish_rx,
+                connected_param,
+                connected,
+                Lifecycle {
+                    start: loop_start,
+                    shutdown,
+                    done: teardown_done,
+                },
+            )
+            .await;
+        });
+        start.notify_one();
+
+        // First session, then the broker goes away entirely.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        sock.write_all(&CONNACK).await.unwrap();
+        wait_for(&path, "onConnectCb: Connected to broker").await;
+        drop(listener);
+        drop(sock);
+        wait_for(&path, "onDisconnectCb: Connection lost. Reconnecting...").await;
+        wait_for(&path, "onFailCb: MQTT Operation error: 'Error: ").await;
+
+        // The broker is back.
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let (mut sock, _) = listener.accept().await.unwrap();
+        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        sock.write_all(&CONNACK).await.unwrap();
+        wait_for(&path, "onConnectCb: Reconnected.").await;
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let n = |needle: &str| text.matches(needle).count();
+        assert_eq!(n("Connected to broker"), 2, "{text}");
+        assert_eq!(n("Reconnected."), 1, "{text}");
+        assert_eq!(n("Connection lost"), 1, "{text}");
+        assert!(
+            text.find("Connection lost").unwrap() < text.find("Operation error").unwrap(),
+            "{text}"
+        );
+
+        runtime.shutdown();
+        assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
+        tokio::time::timeout(Duration::from_secs(10), ev)
+            .await
+            .expect("event loop did not exit")
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The other side of the `start` boundary: an IOC told to exit *before*

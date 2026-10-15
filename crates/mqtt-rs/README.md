@@ -207,19 +207,23 @@ restore the PV to `1`.
 
 ## Logging
 
-mqtt-rs emits `tracing` events; they are silent unless your binary installs a
-subscriber. The `mqtt-ioc` example does this via `tracing_subscriber::fmt`;
-for your own IOC add the same (or any subscriber) to see mqtt-rs output:
+Driver diagnostics go through the port's asyn trace, with C `drvMqtt`'s text
+and masks, so `asynSetTraceMask` / `asynSetTraceFile` govern them:
 
-| Event | Level | Message |
-|-------|-------|---------|
-| Reconnect handshake | `info` | `MQTT connected, subscribing to N topics` |
-| `poll()` error | `error` | `MQTT connection error: <ConnectionError variant>` |
-| Connected=1 restored from Publish/PingResp | `debug` | `MQTT {Publish,PingResp} received while Connected=0 — restoring Connected=1` |
+| Event | Mask | Message |
+|-------|------|---------|
+| Live session lost | `ERROR` | `MqttDriver::onDisconnectCb: Connection lost. Reconnecting... (<error>)` |
+| Reconnect attempt, subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` |
+| ConnAck after a loss | `ERROR\|DRIVER` | `MqttDriver::onConnectCb: Reconnected.` |
+| Every ConnAck | `DRIVER` | `MqttDriver::onConnectCb: Connected to broker` |
+| Subscribe / publish handed to the client | `DRIVER` | `MqttDriver::onSubscribeCb: Subscribed to topic '<t>'` / `MqttDriver::onPublishCb: Published to topic '<t>'` |
+| Inbound payload a record cannot take | `ERROR` | `MqttDriver::onMessageCb: ...` |
+| Write failed | `ERROR` | `MqttDriver::<x>Write: Failed to set value for topic '<t>': ...` |
 
-With the default filter `info` you see reconnects and errors. Use
-`RUST_LOG=info,mqtt_rs=debug` to additionally see the recovery path (useful
-when diagnosing why the Connected PV moved).
+The Connected PV recovery path (`MQTT {Publish,PingResp} received while
+Connected=0 — restoring Connected=1`) and the shutdown lines are `tracing`
+events at `debug`/`info`; they are silent unless your binary installs a
+subscriber, as the `mqtt-ioc` example does.
 
 ## Dependencies
 

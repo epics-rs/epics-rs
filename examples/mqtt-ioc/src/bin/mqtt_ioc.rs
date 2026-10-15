@@ -13,9 +13,9 @@ use epics_ca_rs::server::ioc_app::IocApplication;
 #[cfg(tokio_backend)]
 #[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
-    // Install a tracing subscriber so mqtt-rs log lines (e.g.,
-    // "MQTT connection error: ...", "MQTT connected, subscribing ...")
-    // actually reach stdout. Controlled via `RUST_LOG` (defaults to info).
+    // Install a tracing subscriber for the mqtt-rs lines that are not asyn
+    // trace (Connected PV recovery, shutdown). Controlled via `RUST_LOG`
+    // (defaults to info).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

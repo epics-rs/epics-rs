@@ -223,6 +223,73 @@ impl From<SetupError> for TcpConnectError {
     }
 }
 
+/// Which readiness [`poll_ready`] waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    Readable,
+    Writable,
+}
+
+/// A socket [`poll_ready`] can wait on: anything that lends its descriptor.
+#[cfg(unix)]
+pub trait Pollable: std::os::fd::AsFd {}
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd> Pollable for T {}
+/// A socket [`poll_ready`] can wait on: anything that lends its `SOCKET`.
+#[cfg(windows)]
+pub trait Pollable: std::os::windows::io::AsSocket {}
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsSocket> Pollable for T {}
+
+/// One C `poll` of `socket` for `want` under `USE_POLL`, which is `WSAPoll` on
+/// WIN32 (drvAsynIPPort.c:77-79): `Ok(true)` ready, `Ok(false)` the `ms`
+/// interval expired, `ms < 0` waits without bound. An `EINTR` is returned, not
+/// retried — whether a signal ends the wait is the caller's rule.
+#[cfg(unix)]
+pub fn poll_ready(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let mut pfd = libc::pollfd {
+        fd: socket.as_fd().as_raw_fd(),
+        events: match want {
+            Readiness::Readable => libc::POLLIN,
+            Readiness::Writable => libc::POLLOUT,
+        },
+        revents: 0,
+    };
+    // SAFETY: a one-element `pollfd` array, matching the count passed; the fd
+    // is borrowed from `socket` for the call.
+    match unsafe { libc::poll(&mut pfd, 1, ms) } {
+        0 => Ok(false),
+        n if n > 0 => Ok(true),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// See the unix [`poll_ready`].
+#[cfg(windows)]
+pub fn poll_ready(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLOUT, WSAPOLLFD, WSAPoll};
+
+    let mut pfd = WSAPOLLFD {
+        fd: socket.as_socket().as_raw_socket() as usize,
+        events: match want {
+            Readiness::Readable => POLLIN,
+            Readiness::Writable => POLLOUT,
+        },
+        revents: 0,
+    };
+    // SAFETY: a one-element `WSAPOLLFD` array, matching the count passed; the
+    // socket is borrowed for the call.
+    match unsafe { WSAPoll(&mut pfd, 1, ms) } {
+        0 => Ok(false),
+        n if n > 0 => Ok(true),
+        // `WSAGetLastError` is the `GetLastError` `last_os_error` reads.
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
 /// Open a TCP socket, apply `opts`, optionally bind it to `local`, and connect
 /// it to `remote` within `timeout`.
 ///
@@ -481,66 +548,22 @@ mod sys {
 
     #[cfg(unix)]
     const EINPROGRESS: i32 = libc::EINPROGRESS;
-    /// `WSAEINPROGRESS`, C's `SOCK_EINPROGRESS` on WIN32.
+    /// C's `SOCK_EINPROGRESS` on WIN32.
     #[cfg(windows)]
-    const EINPROGRESS: i32 = 10036;
+    const EINPROGRESS: i32 = windows_sys::Win32::Networking::WinSock::WSAEINPROGRESS;
 
     /// The poll half of [`connect_within`]: `Ok` once `SO_ERROR` is clear.
     fn await_connect(socket: &socket2::Socket, timeout: Duration) -> io::Result<()> {
         let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         // One poll, no EINTR retry: C fails the connect on any return but 1
         // (drvAsynIPPort.c:555), a signal included.
-        match poll_writable(socket, ms) {
-            1 => {}
-            0 => return Err(io::ErrorKind::TimedOut.into()),
-            _ => return Err(io::Error::last_os_error()),
+        if !super::poll_ready(socket, super::Readiness::Writable, ms)? {
+            return Err(io::ErrorKind::TimedOut.into());
         }
         match socket.take_error()? {
             None => Ok(()),
             Some(cause) => Err(cause),
         }
-    }
-
-    #[cfg(unix)]
-    fn poll_writable(socket: &socket2::Socket, ms: i32) -> i32 {
-        use std::os::fd::AsRawFd;
-
-        let mut pfd = libc::pollfd {
-            fd: socket.as_raw_fd(),
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: a one-element `pollfd` array, matching the count passed.
-        unsafe { libc::poll(&mut pfd, 1, ms) }
-    }
-
-    #[cfg(windows)]
-    fn poll_writable(socket: &socket2::Socket, ms: i32) -> i32 {
-        use std::os::windows::io::AsRawSocket;
-
-        /// `WSAPOLLFD`; `fd` is a `SOCKET`, pointer-sized.
-        #[repr(C)]
-        struct WsaPollFd {
-            fd: usize,
-            events: i16,
-            revents: i16,
-        }
-        /// `POLLWRNORM`, which `POLLOUT` is on WIN32.
-        const POLLOUT: i16 = 0x0010;
-        // std links ws2_32 for its own sockets; this crate carries no
-        // `windows-sys` for one call.
-        #[link(name = "ws2_32")]
-        unsafe extern "system" {
-            fn WSAPoll(fdarray: *mut WsaPollFd, fds: u32, timeout: i32) -> i32;
-        }
-        let mut pfd = WsaPollFd {
-            fd: socket.as_raw_socket() as usize,
-            events: POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: a one-element `WSAPOLLFD` array, matching the count passed;
-        // `WSAGetLastError` is the `GetLastError` `last_os_error` reads.
-        unsafe { WSAPoll(&mut pfd, 1, ms) }
     }
 
     pub(super) fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
@@ -571,6 +594,14 @@ mod sys {
     /// its own descriptor leak, which is the bug the two hand-written copies of
     /// this sequence each had to avoid by hand.
     struct OwnedFd(RawFd);
+
+    impl std::os::fd::AsFd for OwnedFd {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            // SAFETY: `self.0` stays open until `self` drops, which the
+            // borrow cannot outlive.
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
+        }
+    }
 
     impl Drop for OwnedFd {
         fn drop(&mut self) {
@@ -848,17 +879,7 @@ mod sys {
     #[cfg(target_os = "vxworks")]
     fn await_connect(owned: &OwnedFd, timeout: Duration) -> io::Result<()> {
         let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        let mut pfd = libc::pollfd {
-            fd: owned.0,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: a one-element `pollfd` array, matching the count passed.
-        let n = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, ms) };
-        if n < 0 {
-            return Err(last_error());
-        }
-        if n == 0 {
+        if !super::poll_ready(owned, super::Readiness::Writable, ms)? {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
         }
 

@@ -70,6 +70,10 @@ tokio = { version = "1", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `runtime::socket::poll_ready`'s `WSAPoll`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 # VxWorks only: `runtime::task::enter_ioc_thread` announces each IOC thread to
 # the statistics funnel's thread census. VxWorks 7 gives an RTP no task
 # enumerator at all (`taskIdListGet` and `taskEach` are kernel-mode only), so

@@ -296,25 +296,16 @@ enum IpIoInner {
     Unix(std::os::unix::net::UnixStream),
 }
 
-/// The libbsd values RTEMS's own headers give, pinned here rather than taken
-/// from `libc` — the `POLLOUT_EVENT` precedent in
+/// The libbsd value RTEMS's own headers give, pinned here rather than taken
+/// from `libc` — the `SEND_DONTWAIT` precedent in
 /// `epics-libcom-rs/src/runtime/blocking_io.rs`, which carries the full
 /// reason. That is a choice, not a workaround: the `newlib/arm` versus
-/// `newlib/rtems` glob collision that once made a bare `libc::POLLOUT`
+/// `newlib/rtems` glob collision that once made a bare `libc::MSG_DONTWAIT`
 /// ambiguous on `armv7-rtems-eabihf` was removed by the pinned `libc` fork in
-/// `6f64e70d`, so the bare names compile and are correct there today.
-/// VxWorks 7 defines all three at these same values (`libc`
-/// `src/vxworks/mod.rs:1200`, `:1198` and `:1031`).
-#[cfg(target_os = "rtems")]
-const POLLOUT_EVENT: libc::c_short = 0x0004;
-#[cfg(target_os = "rtems")]
-const POLLIN_EVENT: libc::c_short = 0x0001;
+/// `6f64e70d`, so the bare name compiles and is correct there today.
+/// VxWorks 7 defines it at this same value (`libc` `src/vxworks/mod.rs:1031`).
 #[cfg(target_os = "rtems")]
 const SEND_DONTWAIT: libc::c_int = 0x0080;
-#[cfg(all(unix, not(target_os = "rtems")))]
-const POLLOUT_EVENT: libc::c_short = libc::POLLOUT;
-#[cfg(all(unix, not(target_os = "rtems")))]
-const POLLIN_EVENT: libc::c_short = libc::POLLIN;
 #[cfg(all(unix, not(target_os = "rtems")))]
 const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 
@@ -393,65 +384,6 @@ pub(super) trait SendWithoutParking {
 /// `setNonBlock` there and bounds each transfer by `SO_*TIMEO`.
 pub(super) const OWNED_NONBLOCKING: bool = true;
 
-/// Which readiness [`PollSocket::poll_socket`] waits for.
-#[derive(Clone, Copy)]
-pub(super) enum Readiness {
-    Readable,
-    Writable,
-}
-
-/// One C `poll` of this socket for `want`: `Ok(true)` ready, `Ok(false)` the
-/// interval expired. `ms < 0` waits without bound. `WSAPoll` on Windows, as C
-/// `#define`s it (drvAsynIPPort.c:77-79).
-pub(super) trait PollSocket {
-    fn poll_socket(&self, want: Readiness, ms: i32) -> std::io::Result<bool>;
-}
-
-#[cfg(unix)]
-impl<T: std::os::fd::AsRawFd> PollSocket for T {
-    fn poll_socket(&self, want: Readiness, ms: i32) -> std::io::Result<bool> {
-        let mut fds = libc::pollfd {
-            fd: self.as_raw_fd(),
-            events: match want {
-                Readiness::Readable => POLLIN_EVENT,
-                Readiness::Writable => POLLOUT_EVENT,
-            },
-            revents: 0,
-        };
-        // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
-        // and stays open for the call; `poll` reads `fd`/`events` and writes
-        // only `revents`.
-        match unsafe { libc::poll(&mut fds, 1, ms) } {
-            0 => Ok(false),
-            rc if rc > 0 => Ok(true),
-            _ => Err(std::io::Error::last_os_error()),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl<T: std::os::windows::io::AsRawSocket> PollSocket for T {
-    fn poll_socket(&self, want: Readiness, ms: i32) -> std::io::Result<bool> {
-        use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLOUT, WSAPOLLFD, WSAPoll};
-        let mut fds = WSAPOLLFD {
-            fd: self.as_raw_socket() as usize,
-            events: match want {
-                Readiness::Readable => POLLIN,
-                Readiness::Writable => POLLOUT,
-            },
-            revents: 0,
-        };
-        // SAFETY: one initialised `WSAPOLLFD` whose `fd` is this borrowed
-        // socket's and stays open for the call; `WSAPoll` writes only `revents`.
-        match unsafe { WSAPoll(&mut fds, 1, ms) } {
-            0 => Ok(false),
-            rc if rc > 0 => Ok(true),
-            // `WSAGetLastError` is `GetLastError`, which `last_os_error` reads.
-            _ => Err(std::io::Error::last_os_error()),
-        }
-    }
-}
-
 /// [`wait_millis`] as `poll`'s interval; `None` is its own `-1`.
 fn poll_millis(timeout: Option<Duration>) -> i32 {
     match timeout {
@@ -480,15 +412,15 @@ pub(super) trait BoundNextRead {
     fn bound_next_read(&self, timeout: Option<Duration>);
 }
 
-impl<T: PollSocket> BoundNextRead for T {
+impl<T: socket::Pollable> BoundNextRead for T {
     fn bound_next_read(&self, timeout: Option<Duration>) {
         // `None` is C's negative timeout: `readPollmsec = -1`
         // (drvAsynIPPort.c:794), which is `poll`'s own "no timeout".
-        let _ = self.poll_socket(Readiness::Readable, poll_millis(timeout));
+        let _ = socket::poll_ready(self, socket::Readiness::Readable, poll_millis(timeout));
     }
 }
 
-impl<T: PollSocket> WaitWritable for T {
+impl<T: socket::Pollable> WaitWritable for T {
     fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
         loop {
             let remaining = match deadline {
@@ -501,7 +433,7 @@ impl<T: PollSocket> WaitWritable for T {
                 }
                 None => None,
             };
-            match self.poll_socket(Readiness::Writable, poll_millis(remaining)) {
+            match socket::poll_ready(self, socket::Readiness::Writable, poll_millis(remaining)) {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 outcome => return outcome,
             }

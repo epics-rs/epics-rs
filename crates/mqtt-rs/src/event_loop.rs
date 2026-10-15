@@ -152,6 +152,7 @@ pub async fn mqtt_event_loop(
     // to flip it back). Any inbound packet (`Publish`, `PingResp`) is direct
     // proof the session is alive, so we use it as a fallback recovery signal.
     let mut session = Session::Booting;
+    let mut backoff = Backoff::default();
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::Publish(publish))) => {
@@ -181,6 +182,7 @@ pub async fn mqtt_event_loop(
             }
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 mark_connected(&port_handle, connected_param, &connected).await;
+                backoff.connected();
                 if session == Session::Lost {
                     asyn_print(
                         &port_handle,
@@ -234,6 +236,14 @@ pub async fn mqtt_event_loop(
                     tracing::info!("MQTT event loop exiting while disconnected: {e}");
                     break;
                 }
+                // `onDisconnectCb`'s `reconnect()` retries a lost session at
+                // once; every failed attempt waits out paho's backoff.
+                let wait = if session == Session::Up {
+                    backoff.lost();
+                    None
+                } else {
+                    Some(backoff.failed())
+                };
                 // C reports the loss of a live session from `onDisconnectCb`
                 // (drvMqtt.cpp:219-220) and a failed attempt of the initHook
                 // connect from `onFailCb` (drvMqtt.cpp:234-235). The rumqttc
@@ -266,7 +276,17 @@ pub async fn mqtt_event_loop(
                         vec![ParamSetValue::new(connected_param, 0, ParamValue::Int32(0))],
                     )
                     .await;
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Some(wait) = wait {
+                    // `poll()` is not running, so this `select!` drops nothing
+                    // half-done; a shutdown cannot wait out a 72 s retry.
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = abort.notified() => {
+                            tracing::info!("MQTT event loop exiting while disconnected");
+                            break;
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -296,6 +316,57 @@ enum Session {
     /// (:2173-2174), so a failed retry prints nothing and the next ConnAck is
     /// `Reconnected.`.
     Lost,
+}
+
+/// paho's `automaticReconnect` retry interval with the v5 connect-option
+/// defaults C builds (`minRetryInterval` 1 s, `maxRetryInterval` 60 s,
+/// MQTTAsync.h:1394).
+#[derive(Default)]
+struct Backoff {
+    /// `currentIntervalBase` in seconds; `None` while not `retrying`.
+    base: Option<u32>,
+}
+
+const RETRY_MIN_SECS: u32 = 1;
+const RETRY_MAX_SECS: u32 = 60;
+
+impl Backoff {
+    /// `MQTTAsync_startConnectRetry` (MQTTAsyncUtils.c:951-967) after a failed
+    /// attempt: the base doubles up to the maximum, and the wait is a whole
+    /// second drawn around it.
+    fn failed(&mut self) -> Duration {
+        let base = self
+            .base
+            .map_or(RETRY_MIN_SECS, |b| (b * 2).min(RETRY_MAX_SECS));
+        self.base = Some(base);
+        let draw =
+            std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), base);
+        Duration::from_secs(u64::from(jitter_secs(base, draw)))
+    }
+
+    /// The loss of a live session: `onDisconnectCb`'s `reconnect()` resets the
+    /// base to the minimum (MQTTAsync.c:956-964) and paho's own
+    /// `startConnectRetry` then doubles it (MQTTAsyncUtils.c:1714-1719).
+    fn lost(&mut self) {
+        self.base = Some(RETRY_MIN_SECS * 2);
+    }
+
+    /// A ConnAck clears `retrying` (MQTTAsyncUtils.c:2014).
+    fn connected(&mut self) {
+        self.base = None;
+    }
+}
+
+/// `MQTTAsync_randomJitter` (MQTTAsyncUtils.c:124-153): a whole number of
+/// seconds in `[max(min, base) / 1.2, min(max, base) * 1.2]`, truncated as C's
+/// `(int)` casts truncate.
+fn jitter_secs(base: u32, draw: u64) -> u32 {
+    let hi = (f64::from(base.min(RETRY_MAX_SECS)) * 1.2) as u32;
+    let lo = (f64::from(base.max(RETRY_MIN_SECS)) / 1.2) as u32;
+    if lo >= hi {
+        return lo;
+    }
+    lo + (draw % u64::from(hi - lo + 1)) as u32
 }
 
 /// Mark the session up: raise the internal publish-gate flag and the
@@ -1177,6 +1248,92 @@ mod tests {
         .unwrap();
     }
 
+    /// A shutdown that lands while the loop waits out a retry interval (here
+    /// the third, 3-4 s) releases the driver at once, not after the wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_during_a_retry_wait_releases_the_driver() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        let config = MqttConfig {
+            broker_host: "127.0.0.1".into(),
+            // Nothing listens here: every attempt is refused.
+            broker_port: 1,
+            client_id: "mq-backoff-exit".into(),
+            ..MqttConfig::default()
+        };
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let mut driver = crate::driver::MqttDriver::new(
+            "MQBACKOFF",
+            &config,
+            Vec::new(),
+            publish_tx,
+            connected.clone(),
+        );
+        let topic_map = driver.topic_map();
+        let connected_param = driver.connected_param;
+        let shutdown = driver.shutdown_signal();
+        let teardown_done = driver.teardown_ack();
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+            driver,
+            asyn_rs::runtime::config::RuntimeConfig {
+                services,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("mqbackoff-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("MQBACKOFF"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let port_handle = runtime.port_handle().clone();
+        let start = Arc::new(Notify::new());
+        let loop_start = start.clone();
+        let ev = tokio::spawn(async move {
+            mqtt_event_loop(
+                config,
+                topic_map,
+                port_handle,
+                publish_rx,
+                connected_param,
+                connected,
+                Lifecycle {
+                    start: loop_start,
+                    shutdown,
+                    done: teardown_done,
+                },
+            )
+            .await;
+        });
+        start.notify_one();
+
+        let failures = || {
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("Operation error")
+                .count()
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while failures() < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("three refused attempts");
+
+        runtime.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), ev)
+            .await
+            .expect("the event loop must not wait out the retry interval")
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn subscribe_topics_skips_binding_without_topic() {
         // An interrupt binding on a reason that maps to no topic (e.g. the
@@ -1234,5 +1391,46 @@ mod tests {
         assert!(
             lines[0].contains("Failed to parse JSON payload for topic 'dev', field 'temperature'")
         );
+    }
+
+    /// paho's jitter window per base, at both ends of the draw: base 1 may
+    /// wait 0 s, the cap reaches 72 s.
+    #[test]
+    fn jitter_matches_paho_random_jitter_windows() {
+        for (base, lo, hi) in [
+            (1, 0, 1),
+            (2, 1, 2),
+            (4, 3, 4),
+            (8, 6, 9),
+            (32, 26, 38),
+            (60, 50, 72),
+        ] {
+            assert_eq!(jitter_secs(base, 0), lo, "base {base}");
+            assert_eq!(jitter_secs(base, u64::from(hi - lo)), hi, "base {base}");
+            assert_eq!(jitter_secs(base, u64::from(hi - lo + 1)), lo, "base {base}");
+        }
+    }
+
+    /// The base after each transition: a failed boot starts at the minimum,
+    /// a loss retries at once from base 2, failures double to the cap, and a
+    /// ConnAck clears it.
+    #[test]
+    fn backoff_follows_paho_start_connect_retry() {
+        let mut b = Backoff::default();
+        let bases = |b: &mut Backoff, n| {
+            (0..n)
+                .map(|_| {
+                    b.failed();
+                    b.base.unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bases(&mut b, 8), [1, 2, 4, 8, 16, 32, 60, 60]);
+        b.connected();
+        assert_eq!(b.base, None);
+        b.lost();
+        assert_eq!(bases(&mut b, 2), [4, 8]);
+        let wait = b.failed();
+        assert!((13..=19).contains(&wait.as_secs()), "{wait:?}");
     }
 }

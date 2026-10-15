@@ -4,13 +4,26 @@ const LINE: usize = 64;
 
 /// The lines of the `len` bytes at `start`, as the first and a count: every
 /// line from `start`'s to the last byte's, and none for an empty span.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-#[inline(always)]
+#[cfg(test)]
 fn span(start: usize, len: usize) -> (usize, usize) {
     let first = start & !(LINE - 1);
     match len.checked_sub(1) {
         Some(last) => (first, (start + last) / LINE - start / LINE + 1),
         None => (first, 0),
+    }
+}
+
+/// The lines an object of `len` bytes aligned to `align` spans from its worst
+/// start in a line. A hint names this many from its first line, so the walk's
+/// prefetch loop runs a trip count fixed by the type, not by where the
+/// allocator put the object: with an exact count, a longout body moving from
+/// three lines to four moved the scan walk by 6 instr/cycle.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+#[inline(always)]
+fn cover(len: usize, align: usize) -> usize {
+    match len.checked_sub(1) {
+        Some(last) => (LINE - align.min(LINE) + last) / LINE + 1,
+        None => 0,
     }
 }
 
@@ -76,19 +89,20 @@ mod word {
 }
 
 impl Hint {
-    /// Name the lines of the `len` bytes at `p`.
+    /// Name the lines of the `len` bytes at `p`, which is aligned to `align`:
+    /// [`cover`]'s count from `p`'s line, every line of the object and at
+    /// most one past it.
     #[inline(always)]
-    pub(crate) fn set(&self, p: *const u8, len: usize) {
+    pub(crate) fn set(&self, p: *const u8, len: usize, align: usize) {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            let (first, lines) = span(p.addr(), len);
             self.0.store(
-                word::pack(first, lines),
+                word::pack(p.addr() & !(LINE - 1), cover(len, align)),
                 core::sync::atomic::Ordering::Relaxed,
             );
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = (p, len);
+        let _ = (p, len, align);
     }
 
     /// Name `a`'s value and the reference counts `Arc` keeps just before it.
@@ -109,13 +123,14 @@ impl Hint {
         self.set(
             body.cast::<u8>().wrapping_sub(COUNTS),
             std::mem::size_of::<T>() + COUNTS,
+            std::mem::align_of::<T>().max(std::mem::align_of::<usize>()),
         );
     }
 
     /// Name nothing.
     #[inline(always)]
     pub(crate) fn clear(&self) {
-        self.set(core::ptr::null(), 0);
+        self.set(core::ptr::null(), 0, 1);
     }
 
     /// The `(first line, line count)` last named.
@@ -131,10 +146,33 @@ impl Hint {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
             let (first, lines) = word::unpack(self.0.load(core::sync::atomic::Ordering::Relaxed));
-            for k in 0..lines {
-                prefetch_line(core::ptr::without_provenance(first + k * LINE));
-            }
+            each_line(first, lines, |a| {
+                prefetch_line(core::ptr::without_provenance(a))
+            });
         }
+    }
+}
+
+/// Call `f` with each of the `lines` lines from `at`. Most hints name nothing
+/// (a record without monitors), so they leave first; the rest run in blocks
+/// of four and a two- and one-line tail, because a counted loop's remainder
+/// trip cost four instructions a line, more than the line [`cover`] adds.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+#[inline(always)]
+fn each_line(mut at: usize, lines: usize, mut f: impl FnMut(usize)) {
+    if lines == 0 {
+        return;
+    }
+    for _ in 0..lines / 4 {
+        (0..4).for_each(|k| f(at + k * LINE));
+        at += 4 * LINE;
+    }
+    if lines & 2 != 0 {
+        (0..2).for_each(|k| f(at + k * LINE));
+        at += 2 * LINE;
+    }
+    if lines & 1 != 0 {
+        f(at);
     }
 }
 
@@ -202,7 +240,7 @@ mod tests {
     #[test]
     fn a_cleared_hint_names_no_line() {
         let h = super::Hint::default();
-        h.set(0x1010 as *const u8, 8);
+        h.set(0x1010 as *const u8, 8, 8);
         h.clear();
         assert_eq!(h.named().1, 0);
     }
@@ -236,11 +274,45 @@ mod tests {
         }
     }
 
+    /// Every aligned start of every size up to three lines: a hint names the
+    /// same count wherever the object sits, and that count covers its lines.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn a_hint_names_the_same_count_at_every_start() {
+        for align in [1, 8, 16, 64, 128] {
+            for size in (0..=192).filter(|n| n % align == 0) {
+                let mut counts = Vec::new();
+                for start in (0x1000..0x1080).step_by(align) {
+                    let h = super::Hint::default();
+                    h.set(start as *const u8, size, align);
+                    let (first, lines) = h.named();
+                    let exact = set(start, size);
+                    assert_eq!(first, start & !63, "start {start:#x} size {size}");
+                    assert!(lines >= exact.len(), "start {start:#x} size {size}");
+                    assert!(lines <= exact.len() + 1, "start {start:#x} size {size}");
+                    counts.push(lines);
+                }
+                counts.dedup();
+                assert_eq!(counts.len(), 1, "align {align} size {size}: {counts:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_line_visits_every_named_line_once() {
+        for lines in 0..=13 {
+            let mut got = Vec::new();
+            super::each_line(0x1000, lines, |a| got.push(a));
+            let want: Vec<usize> = (0..lines).map(|k| 0x1000 + k * 64).collect();
+            assert_eq!(got, want, "lines {lines}");
+        }
+    }
+
     #[test]
     fn prefetch_of_a_live_object_runs() {
         let v = [0u8; 200];
         let h = super::Hint::default();
-        h.set(v[3..].as_ptr(), 197);
+        h.set(v[3..].as_ptr(), 197, 1);
         h.prefetch();
         super::prefetch_val(&v);
     }

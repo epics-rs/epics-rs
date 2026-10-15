@@ -3406,6 +3406,7 @@ impl RecordCell {
         self.lock_record.hints().body.set(
             (body as *const dyn super::Record).cast(),
             std::mem::size_of_val(body),
+            std::mem::align_of_val(body),
         );
         self
     }

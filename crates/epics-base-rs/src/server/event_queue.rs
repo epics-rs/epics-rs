@@ -1476,7 +1476,11 @@ impl EventSink {
         const SLOT: usize = std::mem::size_of::<Option<SubQ>>();
         que.set_pin_arc(&self.que);
         let at = self.que.slab + usize::from(self.id.slot()) * SLOT;
-        slot.set(std::ptr::without_provenance(at), SLOT);
+        slot.set(
+            std::ptr::without_provenance(at),
+            SLOT,
+            std::mem::align_of::<Option<SubQ>>(),
+        );
     }
 
     /// C `db_queue_event_log` for this subscription: append, or replace this

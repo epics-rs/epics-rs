@@ -1095,14 +1095,14 @@ mod tests {
         let body = (&*t.read().record as *const dyn crate::server::record::Record)
             .cast::<u8>()
             .addr();
-        let named = |p: usize, len| {
+        let named = |p: usize, len, align| {
             let h = crate::server::record::Hint::default();
-            h.set(core::ptr::without_provenance(p), len);
+            h.set(core::ptr::without_provenance(p), len, align);
             h.named()
         };
         assert_eq!(
             h.body.named().0,
-            named(body, 1).0,
+            named(body, 1, 1).0,
             "registration names the body"
         );
 
@@ -1120,7 +1120,11 @@ mod tests {
             let at = std::sync::Arc::as_ptr(link).cast::<u8>().addr() - COUNTS;
             assert_eq!(
                 h.out[1].named(),
-                named(at, std::mem::size_of::<DbLink>() + COUNTS)
+                named(
+                    at,
+                    std::mem::size_of::<DbLink>() + COUNTS,
+                    std::mem::align_of::<DbLink>().max(std::mem::align_of::<usize>())
+                )
             );
         }
         assert_ne!(h.posts[0][0].named().1, 0, "the monitor's queue");

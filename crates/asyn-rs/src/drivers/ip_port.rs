@@ -1167,6 +1167,51 @@ fn setup_failure_text(device: &str, e: &socket::SetupError) -> String {
     }
 }
 
+/// Write to `sock` until the kernel refuses, leaving it stalled.
+///
+/// The stalled-write tests of both IP ports need a peer whose pipe cannot take
+/// another byte, and they used to infer one from a size — a fixed 1 MiB payload
+/// against buffers pinned to the minimum, later the measured capacity of a
+/// throwaway connection. Neither inference holds: how much a "minimum"
+/// buffer accepts is the kernel's own business, and on Darwin it is not
+/// even the same answer for two sockets set up the same way. The fixed
+/// 1 MiB fitted, and so did four times a sibling socket's measured
+/// capacity — the slot write returned in 156 µs against the 200 ms
+/// deadline it was supposed to spend.
+///
+/// "Until this socket says `WouldBlock`" needs no size and is the same
+/// statement on every kernel — Winsock's loopback took a whole 8 MiB write in
+/// one call — so each test stalls the socket it is about to write to and none
+/// of them names a byte count.
+#[cfg(test)]
+pub(crate) fn fill_until_refused(sock: &TcpStream) {
+    use std::io::Write;
+
+    sock.set_nonblocking(true)
+        .expect("nonblocking for the fill");
+    let block = vec![0xa5u8; 64 * 1024];
+    let mut total = 0usize;
+    // Only a runaway guard: 256 MiB is far past any socket buffer, and a
+    // kernel that never refused would otherwise hang the suite.
+    while total < 256 << 20 {
+        let taken = match (&*sock).write(&block) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A socket that will not take another byte is refusing, which
+            // is the condition this function exists to find. `Ok(0)` says
+            // the same thing without an error, so both leave the same way.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) => panic!("filling the pipe failed: {e}"),
+        };
+        if taken == 0 {
+            assert!(total > 0, "the socket refused the very first byte");
+            return;
+        }
+        total += taken;
+    }
+    panic!("the socket accepted {total} bytes without ever refusing");
+}
+
 /// What C's `epicsSocketConvertErrnoToString` prints for the errno a timed-out
 /// read leaves on the non-blocking socket: `EWOULDBLOCK`'s `strerror`, or
 /// `WSAEWOULDBLOCK`'s system message on WIN32.
@@ -3306,10 +3351,9 @@ mod tests {
     #[test]
     fn a_stalled_write_bounds_itself_without_arming_so_sndtimeo() {
         let (listener, port) = start_echo_server();
-        // The peer accepts and never reads, so the send buffers fill and the
-        // write stalls part-way. It must hold the connection open until the
-        // write has run: a dropped socket would make the write fail with EPIPE
-        // instead of stalling.
+        // The peer accepts and never reads. It must hold the connection open
+        // until the write has run: a dropped socket would make the write fail
+        // with EPIPE instead of stalling.
         let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
@@ -3319,8 +3363,14 @@ mod tests {
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         drv.connect(&AsynUser::default()).unwrap();
+        // Stalled by refusal, not by size: a payload sized to outrun the
+        // buffers fitted whole into Winsock's loopback.
+        let Some(IpIoInner::Tcp(stream)) = drv.io.inner.as_ref() else {
+            panic!("a TCP connect installs the TCP arm");
+        };
+        fill_until_refused(stream);
 
-        let payload = vec![0x5Au8; 8 * 1024 * 1024];
+        let payload = vec![0x5Au8; 64 * 1024];
         let timeout = Duration::from_millis(200);
         let mut user = AsynUser::new(0).with_timeout(timeout);
         let start = std::time::Instant::now();
@@ -3331,7 +3381,7 @@ mod tests {
             Err(e) => e,
             other => panic!("a peer that never reads must stall the write, got {other:?}"),
         };
-        let AsynError::PartialWrite { source, nbytes } = &err else {
+        let AsynError::PartialWrite { source, .. } = &err else {
             panic!(
                 "C reports *nbytesTransferred with the timeout status \
                  (drvAsynIPPort.c:712-719), got {err:?}"
@@ -3348,11 +3398,11 @@ mod tests {
             "C `writeIt` returns asynTimeout when its POLLOUT wait expires \
              (drvAsynIPPort.c:697-701), got {source:?}"
         );
-        // …and some of the 8 MiB did go out before the stall, so this is the
-        // send loop reaching its deadline and not an instant refusal.
+        // The deadline was waited out, not refused at once. The accepted count
+        // is the kernel's (Linux zero, Darwin some), so it is not asserted.
         assert!(
-            *nbytes > 0,
-            "the send loop must have moved bytes before the deadline"
+            elapsed >= timeout - Duration::from_millis(50),
+            "the write must wait its deadline ({timeout:?}), took {elapsed:?}"
         );
         // The wait is what bounds the call. A blocking `write` on a stream
         // socket does not return short when the send buffer fills — it waits

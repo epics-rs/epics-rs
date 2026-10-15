@@ -3465,7 +3465,8 @@ mod tests {
     /// The size is a request, not a setting — every kernel clamps it to its own
     /// minimum. What the call is really for is the side effect both `SO_SNDBUF`
     /// and `SO_RCVBUF` share: an explicit size turns auto-tuning off, so the
-    /// window a [`fill_until_refused`] measured stays the window.
+    /// window a [`fill_until_refused`](crate::drivers::ip_port::fill_until_refused)
+    /// measured stays the window.
     #[cfg(unix)]
     fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
         let size: libc::c_int = 1;
@@ -3480,50 +3481,6 @@ mod tests {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
-    }
-
-    /// Write to `sock` until the kernel refuses, leaving it stalled.
-    ///
-    /// Both slot-write tests below need a peer whose pipe cannot take another
-    /// byte, and they used to infer one from a size — a fixed 1 MiB payload
-    /// against buffers pinned to the minimum, later the measured capacity of a
-    /// throwaway connection. Neither inference holds: how much a "minimum"
-    /// buffer accepts is the kernel's own business, and on Darwin it is not
-    /// even the same answer for two sockets set up the same way. The fixed
-    /// 1 MiB fitted, and so did four times a sibling socket's measured
-    /// capacity — the slot write returned in 156 µs against the 200 ms
-    /// deadline it was supposed to spend.
-    ///
-    /// "Until this socket says `WouldBlock`" needs no size and is the same
-    /// statement on every kernel, so both tests stall the socket they are
-    /// about to write to and none of them names a byte count.
-    #[cfg(unix)]
-    fn fill_until_refused(sock: &TcpStream) {
-        use std::io::Write;
-
-        sock.set_nonblocking(true)
-            .expect("nonblocking for the fill");
-        let block = vec![0xa5u8; 64 * 1024];
-        let mut total = 0usize;
-        // Only a runaway guard: 256 MiB is far past any socket buffer, and a
-        // kernel that never refused would otherwise hang the suite.
-        while total < 256 << 20 {
-            let taken = match (&*sock).write(&block) {
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // A socket that will not take another byte is refusing, which
-                // is the condition this function exists to find. `Ok(0)` says
-                // the same thing without an error, so both leave the same way.
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-                Err(e) => panic!("filling the pipe failed: {e}"),
-            };
-            if taken == 0 {
-                assert!(total > 0, "the socket refused the very first byte");
-                return;
-            }
-            total += taken;
-        }
-        panic!("the socket accepted {total} bytes without ever refusing");
     }
 
     /// F1 regression: a slot write against a peer that has stopped reading.
@@ -3564,7 +3521,7 @@ mod tests {
 
         // `client` is never read from, so nothing reopens the window inside
         // the deadline and the payload only has to be non-empty.
-        fill_until_refused(&server_side);
+        crate::drivers::ip_port::fill_until_refused(&server_side);
         const PAYLOAD: usize = 64 << 10;
         let payload = vec![0x5au8; PAYLOAD];
 
@@ -3678,7 +3635,7 @@ mod tests {
             pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
             let (server_side, peer) = listener.accept().unwrap();
             pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
-            fill_until_refused(&server_side);
+            crate::drivers::ip_port::fill_until_refused(&server_side);
             slot.assign(server_side, peer, "test").unwrap();
             clients.push(client);
         }

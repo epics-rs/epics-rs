@@ -233,10 +233,6 @@ impl From<SetupError> for TcpConnectError {
 /// `poll(POLLOUT)` deadline, leaving a plain blocking `connect()`. This
 /// reproduces that. On every other target the deadline is enforced, as it is in
 /// C.
-///
-/// On Windows the deadline is `socket2`'s, which reports only its outcome, so
-/// just the timeout is known to be [`TcpConnectError::Deferred`]; a refusal the
-/// poll found there reads as [`TcpConnectError::Connect`].
 pub fn tcp_connect(
     remote: SocketAddr,
     local: Option<SocketAddr>,
@@ -452,10 +448,10 @@ mod sys {
     }
 
     /// C's `USE_POLL` connect (`drvAsynIPPort.c:516-566`): non-blocking
-    /// `connect()`, then `poll(POLLOUT)` and `SO_ERROR`. Only `SO_ERROR` decides
-    /// success, as in C — a POLLHUP from a peer that FINs straight after the
-    /// accept (macOS) is still a completed handshake.
-    #[cfg(unix)]
+    /// `connect()`, then `poll(POLLOUT)` and `SO_ERROR` — `WSAPoll` on WIN32
+    /// (:77-79). Only `SO_ERROR` decides success, as in C — a POLLHUP from a
+    /// peer that FINs straight after the accept (macOS) is still a completed
+    /// handshake.
     fn connect_within(
         socket: &socket2::Socket,
         remote: SocketAddr,
@@ -465,7 +461,9 @@ mod sys {
             .set_nonblocking(true)
             .map_err(SetupError::at(SetupStep::NonBlocking))?;
         if let Err(e) = socket.connect(&remote.into()) {
-            if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            // C's `SOCK_EWOULDBLOCK || SOCK_EINPROGRESS` (:541); WIN32's
+            // non-blocking connect leaves the first.
+            if e.kind() != io::ErrorKind::WouldBlock && e.raw_os_error() != Some(EINPROGRESS) {
                 return Err(TcpConnectError::Connect(e));
             }
             if let Err(cause) = await_connect(socket, timeout) {
@@ -481,21 +479,18 @@ mod sys {
         Ok(())
     }
 
-    /// The poll half of [`connect_within`]: `Ok` once `SO_ERROR` is clear.
     #[cfg(unix)]
-    fn await_connect(socket: &socket2::Socket, timeout: Duration) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
+    const EINPROGRESS: i32 = libc::EINPROGRESS;
+    /// `WSAEINPROGRESS`, C's `SOCK_EINPROGRESS` on WIN32.
+    #[cfg(windows)]
+    const EINPROGRESS: i32 = 10036;
 
+    /// The poll half of [`connect_within`]: `Ok` once `SO_ERROR` is clear.
+    fn await_connect(socket: &socket2::Socket, timeout: Duration) -> io::Result<()> {
         let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        let mut pfd = libc::pollfd {
-            fd: socket.as_raw_fd(),
-            events: libc::POLLOUT,
-            revents: 0,
-        };
         // One poll, no EINTR retry: C fails the connect on any return but 1
         // (drvAsynIPPort.c:555), a signal included.
-        // SAFETY: a one-element `pollfd` array, matching the count passed.
-        match unsafe { libc::poll(&mut pfd, 1, ms) } {
+        match poll_writable(socket, ms) {
             1 => {}
             0 => return Err(io::ErrorKind::TimedOut.into()),
             _ => return Err(io::Error::last_os_error()),
@@ -506,27 +501,46 @@ mod sys {
         }
     }
 
+    #[cfg(unix)]
+    fn poll_writable(socket: &socket2::Socket, ms: i32) -> i32 {
+        use std::os::fd::AsRawFd;
+
+        let mut pfd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: a one-element `pollfd` array, matching the count passed.
+        unsafe { libc::poll(&mut pfd, 1, ms) }
+    }
+
     #[cfg(windows)]
-    fn connect_within(
-        socket: &socket2::Socket,
-        remote: SocketAddr,
-        timeout: Duration,
-    ) -> Result<(), TcpConnectError> {
-        match socket.connect_timeout(&remote.into(), timeout) {
-            Ok(()) => Ok(()),
-            // socket2 rejects a POLLHUP even when SO_ERROR is clear; C looks at
-            // SO_ERROR alone, so a socket that is in fact connected succeeded.
-            Err(_) if socket.peer_addr().is_ok() => Ok(()),
-            // Only a pending connect can time out: `connect()` itself left
-            // WSAEWOULDBLOCK (C's `SOCK_EWOULDBLOCK`, `:541`).
-            Err(cause) if cause.kind() == io::ErrorKind::TimedOut => {
-                Err(TcpConnectError::Deferred {
-                    in_progress: io::Error::from_raw_os_error(10035),
-                    cause,
-                })
-            }
-            Err(e) => Err(TcpConnectError::Connect(e)),
+    fn poll_writable(socket: &socket2::Socket, ms: i32) -> i32 {
+        use std::os::windows::io::AsRawSocket;
+
+        /// `WSAPOLLFD`; `fd` is a `SOCKET`, pointer-sized.
+        #[repr(C)]
+        struct WsaPollFd {
+            fd: usize,
+            events: i16,
+            revents: i16,
         }
+        /// `POLLWRNORM`, which `POLLOUT` is on WIN32.
+        const POLLOUT: i16 = 0x0010;
+        // std links ws2_32 for its own sockets; this crate carries no
+        // `windows-sys` for one call.
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn WSAPoll(fdarray: *mut WsaPollFd, fds: u32, timeout: i32) -> i32;
+        }
+        let mut pfd = WsaPollFd {
+            fd: socket.as_raw_socket() as usize,
+            events: POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: a one-element `WSAPOLLFD` array, matching the count passed;
+        // `WSAGetLastError` is the `GetLastError` `last_os_error` reads.
+        unsafe { WSAPoll(&mut pfd, 1, ms) }
     }
 
     pub(super) fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {

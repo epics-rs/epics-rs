@@ -52,10 +52,12 @@ difference is either invisible to a client or is an improvement:
   `SO_REUSEPORT` before every collector bind, port 0 included, and rsrv before
   every search responder bind (`caservertask.c:628`, `:698`). Linux then may
   hand `bind(0)` a number that another same-user fanout socket holds, and the
-  two share unicasts at random. On a number it picks, epics-rs binds first and
-  sets the options after, so a later fanout socket can still co-bind but the
-  pick is never a stranger's; a stranger on that number at a later interface
-  restarts the set, at most 16 times. A configured number is unchanged.
+  two share unicasts at random. On a number it picks, epics-rs on unix binds
+  first and sets the options after, so a later fanout socket can still
+  co-bind but the pick is never a stranger's; a stranger on that number at a
+  later interface restarts the set, at most 16 times. A configured number is
+  unchanged. Windows sets them first on every bind, as C: Winsock reads
+  `SO_REUSEADDR` at bind time, so set after it no fanout socket can co-bind.
 
 Each one carries its reasoning in a comment at the site, not in a list here.
 Find them with `deliberate deviation` or `deliberate divergence`.

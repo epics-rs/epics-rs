@@ -110,14 +110,16 @@ pub enum PortOrigin {
 /// then load-balances unicasts between the two. Set after the bind they still
 /// let a later fanout socket — a pvxs client's beacon receiver — co-bind.
 /// pvxs sets them first on every port (`udp_collector.cpp:136`); deliberate
-/// deviation, see `docs/differences.md`.
+/// deviation on unix only, see `docs/differences.md`. Winsock reads
+/// `SO_REUSEADDR` at bind time, so set after it the socket refuses every
+/// co-binder with WSAEACCES; Windows sets them first on every port, as C.
 pub fn bind_fanout(
     port: u16,
     origin: PortOrigin,
     mut set_fanout: impl FnMut() -> io::Result<()>,
     bind: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    let shared_number = origin == PortOrigin::Configured && port != 0;
+    let shared_number = cfg!(windows) || (origin == PortOrigin::Configured && port != 0);
     if shared_number {
         set_fanout()?;
     }

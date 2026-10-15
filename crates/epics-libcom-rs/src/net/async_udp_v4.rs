@@ -1622,6 +1622,7 @@ mod tests {
     /// fanout flags, just before that bind; `at` sees each bind's address,
     /// port and broadcast-RX flag. Returns the port held and leaves the hook
     /// set.
+    #[cfg(not(windows))]
     fn fanout_hold_at(
         mut at: impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> + 'static,
     ) -> std::rc::Rc<std::cell::Cell<Option<u16>>> {
@@ -1650,6 +1651,7 @@ mod tests {
     /// A shared bundle's later binds are on the number it chose, so a fanout
     /// holder there is `EADDRINUSE` and moves the bundle, never a group the
     /// bundle silently joins.
+    #[cfg(not(windows))]
     fn fanout_holder_moves_a_shared_bundle(
         at: impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> + 'static,
     ) {
@@ -1692,7 +1694,9 @@ mod tests {
     }
 
     /// Held on the second NIC's unicast address at the chosen number, just
-    /// before the bundle binds it there.
+    /// before the bundle binds it there. Unix only: Windows sets the fanout
+    /// options before every bind, as C does, so the bundle joins the holder.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_fanout_holder_on_a_later_nic_moves_a_shared_bundle() {
         let map = IfaceMap::new().expect("iface map");

@@ -41,7 +41,9 @@ env:
   # Under R7.0.8 `softIocPVX` therefore died in `dbLoadRecords` for every
   # db holding a calc record, which is what `pipeline_r1` loads.
   EPICS_BASE_VERSION: R7.0.10
-  PVXS_VERSION: 1.3.3
+  # The oracle's ground truth. 1.5.2 changed what softIocPVX sends under
+  # DBE=ALARM (pvxs ef7ef0f), so an older tag fails monitor_seed_mask.
+  PVXS_VERSION: 1.5.3
   # upstream epics-base/pvxs branch `tls` (TLS build, libpvxs.so.1.5)
   PVXS_TLS_COMMIT: b3a10bf0222ef72d29e1f25e18dd54ac8b26ab1e
 
@@ -166,21 +168,22 @@ jobs:
         sudo apt-get install -y libevent-dev libssl-dev
         sudo mkdir -p /opt/pvxs
         sudo chown $USER /opt/pvxs
-        cd /tmp
+        # Built where it is cached, as the TLS tree is: its binaries find
+        # their libpvxs by RUNPATH, never by the loader path.
         git clone --depth 1 --branch ${{ env.PVXS_VERSION }} \
-          https://github.com/epics-base/pvxs.git
-        cd pvxs
+          https://github.com/epics-base/pvxs.git /opt/pvxs
+        cd /opt/pvxs
         echo "EPICS_BASE=/opt/epics-base" > configure/RELEASE.local
         make -j2
-        cp -r . /opt/pvxs/
 
     # ── TLS-capable pvxs ───────────────────────────────────────
-    # pvxs 1.3.3 and the 1.5.x tags have no TLS (`pvxinfo -D` lacks
+    # The 1.5.x tags have no TLS (`pvxinfo -D` lacks
     # EPICS_PVA_TLS_KEYCHAIN); it lives on upstream's `tls` branch. Pinned to
     # the commit the local `~/work/pvxs-tls` checkout is built from, so a
     # branch move cannot change what `interop_tls_*` verify. Both tests fail,
-    # not skip, without it. Its libpvxs SONAME differs from 1.3.3's, so the
-    # two lib dirs coexist on the loader path.
+    # not skip, without it. Its libpvxs SONAME is 1.5.3's, so neither lib
+    # dir may go on LD_LIBRARY_PATH or into ldconfig: the first one listed
+    # would hand both trees' binaries its own libpvxs.
     - name: Restore TLS pvxs cache
       id: cache-pvxs-tls
       uses: actions/cache@v4
@@ -230,8 +233,7 @@ jobs:
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
         echo "/opt/epics-base/bin/${HOST_ARCH}" >> "$GITHUB_PATH"
         echo "/opt/pvxs/bin/${HOST_ARCH}" >> "$GITHUB_PATH"
-        echo "LD_LIBRARY_PATH=/opt/epics-base/lib/${HOST_ARCH}:/opt/pvxs/lib/${HOST_ARCH}:/opt/pvxs-tls/lib/${HOST_ARCH}" \
-          >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=/opt/epics-base/lib/${HOST_ARCH}" >> "$GITHUB_ENV"
         if [ ! -x "/opt/pvxs-tls/bin/${HOST_ARCH}/pvxget" ]; then
           echo "::error::/opt/pvxs-tls has no pvxget — the TLS pvxs cache is incomplete"
           exit 1
@@ -249,34 +251,27 @@ jobs:
         echo "EPICS_BASE=/opt/epics-base" >> "$GITHUB_ENV"
 
     # ── Dynamic-linker registration ────────────────────────────
-    # The reference binaries link libpvxs.so.1.3 / libca.so by SONAME.
+    # The reference binaries link libca.so by SONAME (libpvxs comes from
+    # each pvxs tree's RUNPATH, see the TLS step).
     # LD_LIBRARY_PATH set above reaches nextest's direct children, but a
     # reference binary spawned as a *grandchild* (test process ->
     # pvxget) is not guaranteed to inherit it. Register the lib dirs
-    # with the system loader so SONAME resolution works regardless, and
-    # fail loudly HERE (with a directory listing) if libpvxs is still
-    # absent — that turns a broken cache into an obvious infra error
-    # instead of 11 cryptic "cannot open shared object file" test fails.
-    - name: Register EPICS/pvxs libs with ldconfig
+    # with the system loader so SONAME resolution works regardless.
+    - name: Register EPICS libs with ldconfig
       run: |
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
         echo "/opt/epics-base/lib/${HOST_ARCH}" | sudo tee /etc/ld.so.conf.d/epics.conf
-        echo "/opt/pvxs/lib/${HOST_ARCH}" | sudo tee -a /etc/ld.so.conf.d/epics.conf
-        echo "/opt/pvxs-tls/lib/${HOST_ARCH}" | sudo tee -a /etc/ld.so.conf.d/epics.conf
         sudo ldconfig
-        if ! ldconfig -p | grep -q 'libpvxs\.so'; then
-          echo "::error::libpvxs SONAME not registered — /opt/pvxs cache is incomplete"
-          ls -l "/opt/pvxs/lib/${HOST_ARCH}" || true
-          exit 1
-        fi
 
     # A cache that restores but cannot load is an infra error, not twelve
-    # failing tests: run each pvxs CLI once. `-x` and the libpvxs grep above
-    # pass on a tree whose libevent RUNPATH dangles.
+    # failing tests: run each pvxs CLI once, and check each tree loads its
+    # own libpvxs. `-x` passes on a tree whose RUNPATH dangles.
     - name: Smoke-run the reference binaries
       run: |
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
         /opt/pvxs/bin/${HOST_ARCH}/pvxget -h > /dev/null
+        ldd /opt/pvxs/bin/${HOST_ARCH}/pvxget | grep -q '/opt/pvxs/lib/'
+        ldd /opt/pvxs-tls/bin/${HOST_ARCH}/pvxget | grep -q '/opt/pvxs-tls/lib/'
         /opt/pvxs-tls/bin/${HOST_ARCH}/pvxget -h > /dev/null
         /opt/pvxs-tls/bin/${HOST_ARCH}/pvxinfo -D | grep -q EPICS_PVA_TLS_KEYCHAIN
 

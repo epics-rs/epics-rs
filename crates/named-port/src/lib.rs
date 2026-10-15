@@ -221,14 +221,16 @@ pub fn udp_port_is_held(port: u16) -> bool {
 
 /// A wildcard bind of `port` that only another socket on the number refuses.
 ///
-/// Unix: `SO_REUSEADDR` on TCP, as std's `TcpListener` sets it, so a port
-/// left in TIME_WAIT reads free. Windows: `SO_EXCLUSIVEADDRUSE`, because a
-/// plain Winsock wildcard bind succeeds beside a socket holding the number
-/// on one address; it may read a port with connections left in TIME_WAIT as
-/// held, where unix reads it free.
+/// Linux: `SO_REUSEADDR` on TCP, as std's `TcpListener` sets it, so a port
+/// left in TIME_WAIT reads free; Linux still refuses it beside a listener on
+/// any address. Darwin and the BSDs: none, because there `SO_REUSEADDR` lets
+/// a wildcard bind share the number with a socket on one address
+/// (`in_pcbbind`). Windows: `SO_EXCLUSIVEADDRUSE`, because a plain Winsock
+/// wildcard bind succeeds beside such a socket. Off Linux a port with
+/// connections left in TIME_WAIT may therefore read held.
 fn port_is_held(ty: Type, port: u16) -> bool {
     let sock = Socket::new(Domain::IPV4, ty, None).expect("open a probe socket");
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if ty == Type::STREAM {
         sock.set_reuse_address(true)
             .expect("SO_REUSEADDR on the probe");

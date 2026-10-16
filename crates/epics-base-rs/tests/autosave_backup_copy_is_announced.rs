@@ -76,16 +76,18 @@ fn savb_only() -> BackupConfig {
 }
 
 async fn one_pv_manager(save_path: std::path::PathBuf) -> AutosaveBuilder {
-    AutosaveBuilder::new().add_set(SaveSetConfig {
-        name: "set".into(),
-        save_path,
-        strategy: SaveStrategy::Manual,
-        request_file: None,
-        request_pvs: vec!["TEMP".into()],
-        backup: savb_only(),
-        macros: HashMap::new(),
-        search_paths: Vec::new(),
-    })
+    AutosaveBuilder::new().add_set(
+        SaveSetConfig {
+            name: "set".into(),
+            save_path,
+            request_file: None,
+            request_pvs: vec!["TEMP".into()],
+            backup: savb_only(),
+            macros: HashMap::new(),
+            search_paths: Vec::new(),
+        },
+        SaveStrategy::Manual,
+    )
 }
 
 async fn one_pv_db() -> Arc<PvDatabase> {

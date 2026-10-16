@@ -123,7 +123,7 @@ pub struct PvaServer {
     /// observe the bump on their next event and tear down
     /// subscriptions that the new policy denies.
     acl_version: Arc<std::sync::atomic::AtomicU64>,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
 }
 
@@ -145,7 +145,7 @@ impl PvaServer {
         db: Arc<PvDatabase>,
         port: Option<u16>,
         acf: epics_base_rs::server::access_security::AcfCell,
-        autosave_config: Option<autosave::SaveSetConfig>,
+        autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> Self {
         Self {
@@ -292,8 +292,8 @@ impl PvaServer {
             .expect("the PVA server's run loop is awaited on an executor");
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
             Some(mgr.clone().start(&reactor, self.db.clone()))
-        } else if let Some(ref cfg) = self.autosave_config {
-            let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
+        } else if let Some((cfg, method)) = self.autosave_config.clone() {
+            let builder = autosave::AutosaveBuilder::new().add_set(cfg, method);
             // `build` cannot fail: a set it could not construct is reported
             // on the error log and carried as that set's error status, so
             // there is nothing left here to abandon the autosave task for.

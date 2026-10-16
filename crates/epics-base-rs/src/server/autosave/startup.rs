@@ -9,70 +9,60 @@ use crate::server::iocsh::registry::{
 };
 
 use super::backup::BackupConfig;
+use super::error::AutosaveError;
 use super::format::CompatMode;
 use super::macros::MacroContext;
 use super::manager::{AutosaveBuilder, AutosaveManager};
-use super::save_set::{SaveSetConfig, SaveStrategy, TriggerMode};
+use super::save_set::{SaveMethods, SaveSetConfig, SaveStrategy};
 
-/// Definition of a monitor save set from st.cmd (`create_monitor_set`).
+/// One request file's set from st.cmd, before `iocInit`: C's `chlist`,
+/// which each `create_*_set` naming the file gives one more method
+/// (`create_data_set`, save_restore.c:2367-2392). The first call's macros
+/// are the set's.
 #[derive(Debug, Clone)]
-pub struct MonitorSetDef {
+pub struct SetDef {
     pub filename: String,
-    /// The save period. Always a legal interval: build it with
-    /// [`MonitorSetDef::poll_period`].
-    pub period: Duration,
     pub macros: String,
+    pub methods: SaveMethods,
 }
 
-/// Definition of a triggered save set from st.cmd
-/// (`create_triggered_set`).
-///
-/// The trigger PV is not optional, here or in C: `create_triggered_set`
-/// refuses the call outright when the trigger-channel argument is
-/// missing or does not begin with a legal PV-name character
-/// (`save_restore.c:2296-2303` at `R6-0-20-g186f467`), so a triggered
-/// set that saves on something other than its trigger cannot be built.
-/// This used to be a `MonitorSetDef` with an `Option`, and the `None`
-/// arm silently became `OnChange` polling of every member PV — a set
-/// saving at times the operator never asked for.
-#[derive(Debug, Clone)]
-pub struct TriggeredSetDef {
-    pub filename: String,
-    pub trigger_pv: String,
-    pub macros: String,
-}
-
-/// How often the trigger watcher looks at its trigger PV.
-///
-/// C needs no such number — it puts a CA monitor on the trigger channel
-/// (`save_restore.c:1440-1452`) — and `create_triggered_set` accordingly
-/// takes no period argument, so this is the port's own polling interval
-/// and not something a site can set to a different meaning.
-const TRIGGER_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-impl MonitorSetDef {
-    /// Turn the `period` argument of `create_monitor_set` into an
-    /// interval that is legal on both task backends.
-    ///
-    /// The iocsh argument is an `i64` and both ends of it were unsafe.
-    /// Zero panics tokio's `interval` on the async backend and
-    /// busy-rewrites the `.sav` forever on the blocking one, which does
-    /// not assert; a negative value cast to `u32` became 4294967295
-    /// seconds, so the set never saved again while `fdblist` reported it
-    /// idle. One second is the floor already used for the trigger
-    /// debounce.
-    ///
-    /// The clamp belongs here and not in `into_builder`, which used the
-    /// number raw, so one `u32` came to mean both "what the operator
-    /// typed" and "the interval to run at".
-    pub fn poll_period(seconds: i64) -> Duration {
-        Duration::from_secs(seconds.max(1) as u64)
+impl SetDef {
+    /// The set the first `create_*_set` naming `filename` makes.
+    pub fn new(filename: String, macros: String, method: SaveStrategy) -> Self {
+        let mut methods = SaveMethods::default();
+        let _ = methods.add(method.creating_list());
+        Self {
+            filename,
+            macros,
+            methods,
+        }
     }
+}
+
+/// A `create_*_set` period argument. C keeps the `int` raw on a method
+/// added to a list, and a timer delay below zero expires at once, as
+/// zero does. Only the method that makes the list is floored.
+pub fn period_arg(seconds: i64) -> Duration {
+    Duration::from_secs(seconds.max(0) as u64)
+}
+
+/// The method `create_monitor_set` adds: C's MONITORED, a save when a
+/// member changed during a `period` window, not every period.
+pub fn monitor_method(period: Duration) -> SaveStrategy {
+    SaveStrategy::OnChange {
+        min_interval: period,
+    }
+}
+
+/// The method `create_triggered_set` adds: a save on each monitor event
+/// of the trigger PV.
+pub fn triggered_method(trigger_pv: String) -> SaveStrategy {
+    SaveStrategy::Triggered { trigger_pv }
 }
 
 /// C's `isValid1stPVChar` (`save_restore.c:495-499`), which is what
 /// `create_triggered_set` tests its trigger-channel argument with.
-fn is_valid_first_pv_char(name: &str) -> bool {
+pub(super) fn is_valid_first_pv_char(name: &str) -> bool {
     name.chars().next().is_some_and(|c| {
         c.is_ascii_alphanumeric()
             || matches!(c, '_' | '-' | '+' | ':' | '[' | ']' | '<' | '>' | ';')
@@ -95,8 +85,9 @@ pub struct AutosaveStartupConfig {
     pub request_file_paths: Vec<PathBuf>,
     pub save_file_path: Option<PathBuf>,
     pub status_prefix: Option<String>,
-    pub monitor_sets: Vec<MonitorSetDef>,
-    pub triggered_sets: Vec<TriggeredSetDef>,
+    /// The sets the `create_*_set` commands made before `iocInit`, one per
+    /// request file, in creation order.
+    pub sets: Vec<SetDef>,
     pub pass0_restores: Vec<RestoreDef>,
     pub pass1_restores: Vec<RestoreDef>,
     /// On-disk save-file format. Default [`CompatMode::Native`]; set
@@ -104,9 +95,9 @@ pub struct AutosaveStartupConfig {
     /// iocsh command) so a C IOC can read the produced `.sav` files.
     pub compat: CompatMode,
     /// The manager `iocInit` built from this config. Set by `iocInit`;
-    /// from then on `create_monitor_set` / `create_triggered_set` add
-    /// their set to it instead of to the lists above, which C's
-    /// `create_data_set` does at any time (`save_restore.c`).
+    /// from then on the `create_*_set` commands add their set to it
+    /// instead of to `sets`, which C's `create_data_set` does at
+    /// any time (`save_restore.c`).
     pub manager: Option<Arc<AutosaveManager>>,
 }
 
@@ -129,42 +120,8 @@ impl AutosaveStartupConfig {
         }
     }
 
-    /// The set a `create_monitor_set` line describes (periodic strategy).
-    pub fn monitor_set_config(&self, def: &MonitorSetDef) -> SaveSetConfig {
-        self.set_config(
-            def.filename.clone(),
-            &def.filename,
-            &def.macros,
-            SaveStrategy::Periodic {
-                interval: def.period,
-            },
-        )
-    }
-
-    /// The set a `create_triggered_set` line describes. C-autosave
-    /// `create_triggered_set` saves the set whenever its trigger PV
-    /// changes — mapped to the real `SaveStrategy::Triggered` (trigger-PV
-    /// watcher), NOT `OnChange` polling of every member PV.
-    pub fn triggered_set_config(&self, def: &TriggeredSetDef) -> SaveSetConfig {
-        self.set_config(
-            format!("{}_triggered", def.filename),
-            &def.filename,
-            &def.macros,
-            SaveStrategy::Triggered {
-                trigger_pv: def.trigger_pv.clone(),
-                mode: TriggerMode::AnyChange,
-                poll_interval: TRIGGER_POLL_INTERVAL,
-            },
-        )
-    }
-
-    fn set_config(
-        &self,
-        name: String,
-        filename: &str,
-        macros: &str,
-        strategy: SaveStrategy,
-    ) -> SaveSetConfig {
+    /// The set a request file describes, named by the file as C's lists are.
+    pub fn set_config(&self, filename: &str, macros: &str) -> SaveSetConfig {
         // The NAME, not a pre-resolved path.
         // `SaveSet::load_entries` hands it to
         // `load_request_file_with_search_paths`, which searches
@@ -184,9 +141,8 @@ impl AutosaveStartupConfig {
             MacroContext::parse_inline(macros)
         };
         SaveSetConfig {
-            name,
+            name: filename.to_string(),
             save_path,
-            strategy,
             request_file,
             request_pvs: Vec::new(),
             backup: BackupConfig::default(),
@@ -203,38 +159,62 @@ impl AutosaveStartupConfig {
             builder = builder.status_prefix(prefix);
         }
 
-        for def in &self.monitor_sets {
-            builder = builder.add_set(self.monitor_set_config(def));
-        }
-        for def in &self.triggered_sets {
-            builder = builder.add_set(self.triggered_set_config(def));
+        for def in &self.sets {
+            for method in def.methods.iter() {
+                builder =
+                    builder.add_set(self.set_config(&def.filename, &def.macros), method.clone());
+            }
         }
 
         builder
     }
 
-    /// `create_monitor_set` / `create_triggered_set` after `iocInit`:
-    /// the set goes straight to the running manager, as C's
-    /// `create_data_set` appends to its live list. Before `iocInit` the
-    /// caller keeps the definition for `into_builder`.
-    fn add_to_running(
+    /// C `create_data_set` for a `create_*_set` command: `method` joins the
+    /// set built from `filename`, or makes it. After `iocInit` the set is
+    /// the running manager's, as C's live list is; before, it is kept for
+    /// `into_builder`. A method the set already has is refused on the error
+    /// log only, as C's iocsh wrappers ignore the status.
+    fn create_data_set(
         holder: &Mutex<Self>,
         ctx: &CommandContext,
-        config: impl FnOnce(&Self) -> SaveSetConfig,
-    ) -> Result<bool, String> {
+        filename: String,
+        macros: String,
+        method: SaveStrategy,
+    ) -> Result<CommandOutcome, String> {
+        // save_restore.c:2357-2362
+        if filename.is_empty() {
+            return Ok(CommandOutcome::Continue);
+        }
         let (mgr, cfg) = {
-            let cfg = holder.lock().unwrap();
+            let mut cfg = holder.lock().unwrap();
             match cfg.manager.clone() {
-                Some(mgr) => (mgr, config(&cfg)),
-                None => return Ok(false),
+                Some(mgr) => {
+                    let set = cfg.set_config(&filename, &macros);
+                    (mgr, set)
+                }
+                None => {
+                    match cfg.sets.iter_mut().find(|d| d.filename == filename) {
+                        Some(def) => {
+                            if let Err(bit) = def.methods.add(method) {
+                                let refusal = AutosaveError::AlreadyInMode {
+                                    request_file: filename,
+                                    bit,
+                                };
+                                crate::runtime::log::errlog_vprintf(format_args!("{refusal}\n"));
+                            }
+                        }
+                        None => cfg.sets.push(SetDef::new(filename, macros, method)),
+                    }
+                    return Ok(CommandOutcome::Continue);
+                }
             }
         };
-        ctx.block_on(mgr.add_set(cfg))
-            .map(|()| true)
-            .map_err(|e| e.to_string())
+        // Already reported; C's iocsh wrappers ignore the status.
+        let _ = ctx.block_on(mgr.create_data_set(cfg, method));
+        Ok(CommandOutcome::Continue)
     }
 
-    /// Register the 7 autosave iocsh commands that populate this config.
+    /// Register the autosave iocsh commands that populate this config.
     pub fn register_startup_commands(holder: Arc<Mutex<Self>>) -> Vec<CommandDef> {
         let mut commands = Vec::new();
 
@@ -302,11 +282,23 @@ impl AutosaveStartupConfig {
             ));
         }
 
-        // create_monitor_set(filename, period, macrostring)
-        {
+        // create_periodic_set / create_monitor_set(filename, period, macrostring)
+        let period_sets: [(&str, &str, fn(Duration) -> SaveStrategy); 2] = [
+            (
+                "create_periodic_set",
+                "create_periodic_set(filename, period, macrostring) - Create save set saved every period",
+                |interval| SaveStrategy::Periodic { interval },
+            ),
+            (
+                "create_monitor_set",
+                "create_monitor_set(filename, period, macrostring) - Create save set saved on change",
+                monitor_method,
+            ),
+        ];
+        for (name, usage, method) in period_sets {
             let h = holder.clone();
             commands.push(CommandDef::new(
-                "create_monitor_set",
+                name,
                 vec![
                     ArgDesc {
                         name: "filename",
@@ -321,29 +313,21 @@ impl AutosaveStartupConfig {
                         arg_type: ArgType::String,
                     },
                 ],
-                "create_monitor_set(filename, period, macrostring) - Create periodic save set",
+                usage,
                 move |args: &[ArgValue], ctx: &CommandContext| {
                     let filename = match &args[0] {
                         ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("filename argument required".into()),
                     };
                     let period = match &args[1] {
-                        ArgValue::Int(n) => MonitorSetDef::poll_period(*n),
+                        ArgValue::Int(n) => period_arg(*n),
                         _ => return Err("period argument required".into()),
                     };
                     let macros = match args.get(2) {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    let def = MonitorSetDef {
-                        filename,
-                        period,
-                        macros,
-                    };
-                    if !Self::add_to_running(&h, ctx, |cfg| cfg.monitor_set_config(&def))? {
-                        h.lock().unwrap().monitor_sets.push(def);
-                    }
-                    Ok(CommandOutcome::Continue)
+                    Self::create_data_set(&h, ctx, filename, macros, method(period))
                 },
             ));
         }
@@ -398,15 +382,43 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    let def = TriggeredSetDef {
+                    Self::create_data_set(
+                        &h,
+                        ctx,
                         filename,
-                        trigger_pv: trigger_channel,
                         macros,
+                        triggered_method(trigger_channel),
+                    )
+                },
+            ));
+        }
+
+        // create_manual_set(filename, macrostring)
+        {
+            let h = holder.clone();
+            commands.push(CommandDef::new(
+                "create_manual_set",
+                vec![
+                    ArgDesc {
+                        name: "filename",
+                        arg_type: ArgType::String,
+                    },
+                    ArgDesc {
+                        name: "macrostring",
+                        arg_type: ArgType::String,
+                    },
+                ],
+                "create_manual_set(filename, macrostring) - Create save set saved only on request",
+                move |args: &[ArgValue], ctx: &CommandContext| {
+                    let filename = match args.first() {
+                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
+                        _ => String::new(),
                     };
-                    if !Self::add_to_running(&h, ctx, |cfg| cfg.triggered_set_config(&def))? {
-                        h.lock().unwrap().triggered_sets.push(def);
-                    }
-                    Ok(CommandOutcome::Continue)
+                    let macros = match args.get(1) {
+                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
+                        _ => String::new(),
+                    };
+                    Self::create_data_set(&h, ctx, filename, macros, SaveStrategy::Manual)
                 },
             ));
         }
@@ -540,8 +552,7 @@ impl AutosaveStartupConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::autosave::save_set::{SaveStrategy, TriggerMode};
-    use std::time::Duration;
+    use crate::server::autosave::save_set::SaveStrategy;
 
     /// M3 regression: a triggered save set must build as a real
     /// `SaveStrategy::Triggered` (trigger-PV watcher), NOT
@@ -564,11 +575,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = AutosaveStartupConfig::new();
         with_request_file(&mut cfg, &dir);
-        cfg.triggered_sets.push(TriggeredSetDef {
-            filename: "settings.req".to_string(),
-            trigger_pv: "IOC:saveTrigger".to_string(),
-            macros: String::new(),
-        });
+        cfg.sets.push(SetDef::new(
+            "settings.req".to_string(),
+            String::new(),
+            triggered_method("IOC:saveTrigger".to_string()),
+        ));
 
         let builder = cfg.into_builder();
         // The builder owns the configs; rebuild to inspect the set.
@@ -581,16 +592,9 @@ mod tests {
         let mgr = rt.block_on(builder.build());
         let sets = mgr.sets();
         assert_eq!(sets.len(), 1, "one triggered set expected");
-        match &sets[0].0.config().strategy {
-            SaveStrategy::Triggered {
-                trigger_pv,
-                mode,
-                poll_interval,
-            } => {
+        match &sets[0].0.methods()[..] {
+            [SaveStrategy::Triggered { trigger_pv }] => {
                 assert_eq!(trigger_pv.as_str(), "IOC:saveTrigger");
-                assert_eq!(*mode, TriggerMode::AnyChange);
-                // period 0 clamped to a 1s debounce.
-                assert_eq!(*poll_interval, Duration::from_secs(1));
             }
             other => panic!("expected SaveStrategy::Triggered, got {other:?}"),
         }
@@ -630,7 +634,7 @@ mod tests {
             assert!(err.contains("trigger-channel name is required"), "{err}");
         }
         assert!(
-            holder.lock().unwrap().triggered_sets.is_empty(),
+            holder.lock().unwrap().sets.is_empty(),
             "a refused call must leave no set behind"
         );
     }

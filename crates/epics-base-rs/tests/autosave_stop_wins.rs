@@ -13,7 +13,6 @@ use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ao::AoRecord;
-use epics_base_rs::types::EpicsValue;
 
 const PERIOD: Duration = Duration::from_millis(20);
 
@@ -23,7 +22,7 @@ async fn sleep(d: Duration) {
 
 /// The test holds the set lock the way a slow save does, lets the strategy's
 /// pass queue behind it, drops the manager, then lets the lock go.
-async fn saves_after_the_manager_drops(strategy: SaveStrategy, change: bool) -> (u64, bool) {
+async fn saves_after_the_manager_drops(strategy: SaveStrategy) -> (u64, bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEMP", Box::new(AoRecord::new(25.5)))
@@ -31,22 +30,24 @@ async fn saves_after_the_manager_drops(strategy: SaveStrategy, change: bool) -> 
         .unwrap();
     let mgr = Arc::new(
         AutosaveBuilder::new()
-            .add_set(SaveSetConfig {
-                name: "stop".into(),
-                save_path: dir.path().join("stop.sav"),
-                strategy,
-                request_file: None,
-                request_pvs: vec!["TEMP".into()],
-                backup: BackupConfig {
-                    enable_savb: false,
-                    num_seq_files: 0,
-                    seq_period: Duration::from_secs(60),
-                    enable_dated: false,
-                    dated_interval: Duration::from_secs(3600),
+            .add_set(
+                SaveSetConfig {
+                    name: "stop".into(),
+                    save_path: dir.path().join("stop.sav"),
+                    request_file: None,
+                    request_pvs: vec!["TEMP".into()],
+                    backup: BackupConfig {
+                        enable_savb: false,
+                        num_seq_files: 0,
+                        seq_period: Duration::from_secs(60),
+                        enable_dated: false,
+                        dated_interval: Duration::from_secs(3600),
+                    },
+                    macros: HashMap::new(),
+                    search_paths: Vec::new(),
                 },
-                macros: HashMap::new(),
-                search_paths: Vec::new(),
-            })
+                strategy,
+            )
             .build()
             .await,
     );
@@ -56,16 +57,11 @@ async fn saves_after_the_manager_drops(strategy: SaveStrategy, change: bool) -> 
             .expect("the test driver enters an executor"),
         db.clone(),
     );
-    if change {
-        sleep(Duration::from_millis(150)).await; // baseline poll
-    }
     let guard = lock.clone().lock_owned().await;
-    if change {
-        db.put_pv_no_process("TEMP", EpicsValue::Double(30.0))
-            .await
-            .unwrap();
-    }
-    sleep(Duration::from_millis(200)).await; // the pass is now behind the lock
+    let before = set.stats().save_count.load(Ordering::Relaxed);
+    // The second pass, a second after the first, owes a save and is now
+    // behind the lock.
+    sleep(Duration::from_millis(1500)).await;
     handle.abort();
     drop(mgr);
     drop(guard);
@@ -80,26 +76,25 @@ async fn saves_after_the_manager_drops(strategy: SaveStrategy, change: bool) -> 
         }
         sleep(Duration::from_millis(10)).await;
     };
-    (set.stats().save_count.load(Ordering::Relaxed), ended)
+    (
+        set.stats().save_count.load(Ordering::Relaxed) - before,
+        ended,
+    )
 }
 
 #[epics_macros_rs::epics_test]
 async fn a_periodic_pass_queued_behind_a_slow_save_does_not_save_after_the_drop() {
     let (saves, ended) =
-        saves_after_the_manager_drops(SaveStrategy::Periodic { interval: PERIOD }, false).await;
+        saves_after_the_manager_drops(SaveStrategy::Periodic { interval: PERIOD }).await;
     assert_eq!(saves, 0, "a save started after the manager dropped");
     assert!(ended, "the set task outlived its manager");
 }
 
 #[epics_macros_rs::epics_test]
 async fn an_onchange_save_queued_behind_a_slow_save_does_not_save_after_the_drop() {
-    let (saves, ended) = saves_after_the_manager_drops(
-        SaveStrategy::OnChange {
-            min_interval: PERIOD,
-            float_epsilon: 0.0,
-        },
-        true,
-    )
+    let (saves, ended) = saves_after_the_manager_drops(SaveStrategy::OnChange {
+        min_interval: PERIOD,
+    })
     .await;
     assert_eq!(saves, 0, "a save started after the manager dropped");
     assert!(ended, "the set task outlived its manager");

@@ -603,7 +603,7 @@ pub struct IocRunConfig {
     /// the config in a fresh cell — so a later `asInit`/ACF reload
     /// reaches all of them at once.
     pub acf: access_security::AcfCell,
-    pub autosave_config: Option<autosave::SaveSetConfig>,
+    pub autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     pub autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     pub shell_commands: Vec<CommandDef>,
     /// Retained for API compatibility. [`IocApplication::run`] now
@@ -906,7 +906,7 @@ struct ProtocolStart {
     port: u16,
     tcp_port: Option<u16>,
     acf: access_security::AcfCell,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     runner: ProtocolRunner,
 }
 
@@ -1019,7 +1019,7 @@ impl Drop for ArmedLifecycle {
 struct IocBuild {
     db: Arc<PvDatabase>,
     acf: access_security::AcfCell,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
     link_set_installers: Vec<LinkSetInstaller>,
     after_init_database_hooks: Vec<AfterInitDatabaseHook>,
@@ -1408,7 +1408,7 @@ impl IocBuild {
         {
             let db_p1 = db.clone();
             let files = pass1_files.clone();
-            let cfg_path = autosave_config.as_ref().map(|c| c.save_path.clone());
+            let cfg_path = autosave_config.as_ref().map(|(c, _)| c.save_path.clone());
             lifecycle_hooks.push((
                 InitHookState::AfterInitDatabase,
                 Box::new(move || {
@@ -1802,7 +1802,7 @@ pub struct IocApplication {
     record_factories: HashMap<String, super::RecordFactory>,
     subroutine_registry: HashMap<String, Arc<Subroutine>>,
     acf: Option<access_security::AccessSecurityConfig>,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
     /// Every iocsh command this application contributes, in registration
     /// order. One list because there is one command table: the two public
@@ -2122,9 +2122,13 @@ impl IocApplication {
         self
     }
 
-    /// Configure autosave with a save set configuration.
-    pub fn autosave(mut self, config: autosave::SaveSetConfig) -> Self {
-        self.autosave_config = Some(config);
+    /// Configure autosave with one save set and its save method.
+    pub fn autosave(
+        mut self,
+        config: autosave::SaveSetConfig,
+        method: autosave::SaveStrategy,
+    ) -> Self {
+        self.autosave_config = Some((config, method));
         self
     }
 
@@ -3023,10 +3027,17 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                         continue;
                     }
                     // Process if the device drives SCAN-independently,
-                    // or the record is still on I/O Intr scan.
-                    let process = independent || {
-                        let inst = rec_arc_clone.read();
-                        inst.common.scan == record::ScanType::IoIntr
+                    // or the record is still on I/O Intr scan, and the
+                    // device's own callback asks for it. A device out for
+                    // processing has no callback to run.
+                    let process = {
+                        let mut guard = rec_arc_clone.write();
+                        let inst = &mut *guard;
+                        (independent || inst.common.scan == record::ScanType::IoIntr)
+                            && inst.device.as_mut().is_none_or(|d| {
+                                d.io_intr_callback(&mut *inst.record, &mut inst.common)
+                                    == crate::server::device_support::IoIntrAction::Process
+                            })
                     };
                     if !process {
                         continue;
@@ -3195,6 +3206,96 @@ mod io_intr_scan_add_tests {
             );
         }
         assert!(db.records_for_scan(ScanType::IoIntr).await.is_empty());
+    }
+
+    /// A device's I/O Intr callback runs on every pulse under the record's
+    /// lock, and a pulse it answers [`IoIntrAction::Skip`] processes nothing,
+    /// as devEtherIP's `check_ao_callback` leaves an unchanged value
+    /// without `scanOnce` (devEtherIP.c:432-434).
+    #[epics_macros_rs::epics_test]
+    async fn a_pulse_the_device_callback_skips_does_not_process() {
+        use crate::error::CaResult;
+        use crate::runtime::sync::mpsc;
+        use crate::server::device_support::{
+            DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
+        };
+        use crate::server::record::{CommonFields, Record};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Seen {
+            callbacks: AtomicUsize,
+            reads: AtomicUsize,
+            process: AtomicBool,
+        }
+        struct CallbackDev {
+            seen: Arc<Seen>,
+            pulses: Option<mpsc::Receiver<()>>,
+        }
+        impl DeviceSupport for CallbackDev {
+            fn dtyp(&self) -> &str {
+                "Callback"
+            }
+            fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
+                self.pulses.take()
+            }
+            fn io_intr_scan_independent(&self) -> bool {
+                true
+            }
+            fn io_intr_callback(
+                &mut self,
+                _record: &mut dyn Record,
+                _common: &mut CommonFields,
+            ) -> IoIntrAction {
+                self.seen.callbacks.fetch_add(1, Ordering::SeqCst);
+                if self.seen.process.load(Ordering::SeqCst) {
+                    IoIntrAction::Process
+                } else {
+                    IoIntrAction::Skip
+                }
+            }
+            fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+                self.seen.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+            }
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                Ok(())
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("CB", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let seen = Arc::new(Seen::default());
+        let (pulse, pulses) = mpsc::channel(1);
+        {
+            let rec = db.get_record("CB").unwrap();
+            let mut inst = rec.write();
+            inst.common.dtyp = "Callback".into();
+            inst.device = Some(Box::new(CallbackDev {
+                seen: seen.clone(),
+                pulses: Some(pulses),
+            }));
+        }
+        assert_eq!(setup_io_intr(db.clone()).await, 1);
+        db.scan_control().run();
+
+        pulse.send(()).await.unwrap();
+        while seen.callbacks.load(Ordering::SeqCst) < 1 {
+            crate::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        seen.process.store(true, Ordering::SeqCst);
+        pulse.send(()).await.unwrap();
+        while seen.reads.load(Ordering::SeqCst) < 1 {
+            crate::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(seen.callbacks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            seen.reads.load(Ordering::SeqCst),
+            1,
+            "the skipped pulse read"
+        );
     }
 
     /// The demotion is scoped to the failure exits: a record that was never on

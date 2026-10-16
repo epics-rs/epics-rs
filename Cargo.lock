@@ -2650,6 +2650,7 @@ dependencies = [
  "epics-ca-rs",
  "libm",
  "motor-rs",
+ "named-port",
  "parking_lot",
  "rand 0.9.3",
  "sim-detector",

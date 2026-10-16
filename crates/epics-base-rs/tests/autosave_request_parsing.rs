@@ -2,7 +2,23 @@ use std::path::PathBuf;
 
 use epics_base_rs::server::autosave::error::AutosaveError;
 use epics_base_rs::server::autosave::macros::MacroContext;
-use epics_base_rs::server::autosave::request::{self, dedup_entries, load_request_file, pv_names};
+use epics_base_rs::server::autosave::request::{
+    self, RequestEntry, dedup_entries, load_request_file_with_search_paths, pv_names,
+};
+
+/// Load `name` with `dir` as the one `set_requestfile_path`, where C
+/// `openReqFile` finds the top-level file and every include.
+async fn load(
+    dir: &std::path::Path,
+    name: &str,
+    ctx: &MacroContext,
+) -> Result<Vec<RequestEntry>, AutosaveError> {
+    Ok(
+        load_request_file_with_search_paths(name, &[dir.to_path_buf()], ctx)
+            .await?
+            .entries,
+    )
+}
 
 #[test]
 fn test_simple_pvs() {
@@ -38,7 +54,7 @@ async fn test_file_include_relative_path() {
     std::fs::write(&main_req, "OUTER_PV\nfile sub/inner.req\nOUTER_PV2\n").unwrap();
 
     let ctx = MacroContext::new();
-    let entries = load_request_file(&main_req, &ctx).await.unwrap();
+    let entries = load(dir.path(), "main.req", &ctx).await.unwrap();
     let names = pv_names(&entries);
     assert_eq!(
         names,
@@ -59,9 +75,7 @@ async fn test_nested_include() {
     std::fs::write(dir.path().join("main.req"), "MAIN_PV\nfile level1.req\n").unwrap();
 
     let ctx = MacroContext::new();
-    let entries = load_request_file(&dir.path().join("main.req"), &ctx)
-        .await
-        .unwrap();
+    let entries = load(dir.path(), "main.req", &ctx).await.unwrap();
     let names = pv_names(&entries);
     assert_eq!(names, vec!["MAIN_PV", "LEVEL1_PV", "LEVEL2_PV"]);
 }
@@ -81,7 +95,7 @@ async fn test_depth_limit() {
     }
 
     let ctx = MacroContext::new();
-    let result = load_request_file(&dir.path().join("level0.req"), &ctx).await;
+    let result = load(dir.path(), "level0.req", &ctx).await;
     assert!(matches!(
         result,
         Err(AutosaveError::IncludeDepthExceeded(_))
@@ -96,7 +110,7 @@ async fn test_circular_include() {
     std::fs::write(dir.path().join("b.req"), "PV_B\nfile a.req\n").unwrap();
 
     let ctx = MacroContext::new();
-    let result = load_request_file(&dir.path().join("a.req"), &ctx).await;
+    let result = load(dir.path(), "a.req", &ctx).await;
     assert!(matches!(result, Err(AutosaveError::IncludeCycle { .. })));
 }
 
@@ -138,9 +152,7 @@ async fn test_include_with_macros() {
     std::fs::write(dir.path().join("main.req"), "file inner.req P=TEST:\n").unwrap();
 
     let ctx = MacroContext::new();
-    let entries = load_request_file(&dir.path().join("main.req"), &ctx)
-        .await
-        .unwrap();
+    let entries = load(dir.path(), "main.req", &ctx).await.unwrap();
     let names = pv_names(&entries);
     assert_eq!(names, vec!["TEST:pv1", "TEST:pv2"]);
 }

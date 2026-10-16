@@ -2,7 +2,7 @@
 //! coverage with it.
 //!
 //! `AutosaveBuilder::build` used to `?` out of the loop that constructs
-//! the sets, so a single `.req` line naming an undefined macro discarded
+//! the sets, so a single `.req` that could not be read discarded
 //! every set already constructed and the IOC came up saving nothing at
 //! all — with `fdblist` listing nothing to say which set was at fault.
 
@@ -31,7 +31,6 @@ fn manual_set(name: &str, save_path: std::path::PathBuf, req: std::path::PathBuf
     SaveSetConfig {
         name: name.into(),
         save_path,
-        strategy: SaveStrategy::Manual,
         request_file: Some(req),
         request_pvs: Vec::new(),
         backup: no_backup(),
@@ -41,9 +40,7 @@ fn manual_set(name: &str, save_path: std::path::PathBuf, req: std::path::PathBuf
 }
 
 /// The valid set is built, saves, and reports `Idle`; the set whose
-/// `.req` names an undefined macro is dropped on its own and reports
-/// `Error`. Both halves matter: the first is the coverage that used to
-/// be lost, the second is the operator's only way to learn it was.
+/// `.req` includes itself is dropped on its own.
 #[epics_macros_rs::epics_test]
 async fn a_failing_save_set_does_not_take_the_others_with_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -52,10 +49,9 @@ async fn a_failing_save_set_does_not_take_the_others_with_it() {
     epics_base_rs::runtime::fs::write(&good_req, "TEMP\n")
         .await
         .unwrap();
-    // `expand` falls back to the environment before it calls a macro
-    // undefined, so the key has to be one no environment defines.
+    // A request file that includes itself does not build.
     let bad_req = dir.path().join("auto_positions.req");
-    epics_base_rs::runtime::fs::write(&bad_req, "$(AUTOSAVE_ISOLATION_UNDEFINED)mtr1.RBV\n")
+    epics_base_rs::runtime::fs::write(&bad_req, format!("file {}\n", bad_req.display()))
         .await
         .unwrap();
 
@@ -69,12 +65,18 @@ async fn a_failing_save_set_does_not_take_the_others_with_it() {
     // Valid set first, so a build that abandons the collection on the
     // first failure discards a set it had already constructed.
     let mgr = AutosaveBuilder::new()
-        .add_set(manual_set("auto_settings", good_sav.clone(), good_req))
-        .add_set(manual_set(
-            "auto_positions",
-            dir.path().join("auto_positions.sav"),
-            bad_req,
-        ))
+        .add_set(
+            manual_set("auto_settings", good_sav.clone(), good_req),
+            SaveStrategy::Manual,
+        )
+        .add_set(
+            manual_set(
+                "auto_positions",
+                dir.path().join("auto_positions.sav"),
+                bad_req,
+            ),
+            SaveStrategy::Manual,
+        )
         .build()
         .await;
 
@@ -93,23 +95,16 @@ async fn a_failing_save_set_does_not_take_the_others_with_it() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].pv_name, "TEMP");
 
-    // `fdblist` and `asStatus` both read `status_all`, so this is what an
-    // operator sees.
+    // C frees a list that did not build (save_restore.c:2460-2462), so
+    // `fdblist`, which reads `status_all`, lists only the built one.
     let statuses = mgr.status_all().await;
     let names: Vec<&str> = statuses.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, vec!["auto_settings", "auto_positions"]);
+    assert_eq!(names, vec!["auto_settings"]);
     assert!(
         matches!(statuses[0].1, SaveSetStatus::Idle),
         "built set: {:?}",
         statuses[0].1
     );
-    match &statuses[1].1 {
-        SaveSetStatus::Error(reason) => assert!(
-            reason.contains("AUTOSAVE_ISOLATION_UNDEFINED"),
-            "the reason must name the macro that failed: {reason}"
-        ),
-        other => panic!("the unbuilt set must report an error status, got {other:?}"),
-    }
 }
 
 /// The set that failed has no state, so it must not be reachable through
@@ -119,13 +114,16 @@ async fn a_failing_save_set_does_not_take_the_others_with_it() {
 async fn an_unbuilt_save_set_is_not_savable_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let bad_req = dir.path().join("bad.req");
-    epics_base_rs::runtime::fs::write(&bad_req, "$(AUTOSAVE_ISOLATION_UNDEFINED)x\n")
+    epics_base_rs::runtime::fs::write(&bad_req, format!("file {}\n", bad_req.display()))
         .await
         .unwrap();
 
     let db = Arc::new(PvDatabase::new());
     let mgr = AutosaveBuilder::new()
-        .add_set(manual_set("bad", dir.path().join("bad.sav"), bad_req))
+        .add_set(
+            manual_set("bad", dir.path().join("bad.sav"), bad_req),
+            SaveStrategy::Manual,
+        )
         .build()
         .await;
 

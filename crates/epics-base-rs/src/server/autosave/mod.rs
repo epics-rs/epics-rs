@@ -10,14 +10,13 @@ pub mod save_file;
 pub mod save_set;
 pub mod startup;
 pub mod verify;
-mod watermark;
 
 pub use backup::BackupConfig;
 pub use error::{AutosaveError, AutosaveResult};
 pub use format::CompatMode;
 pub use manager::{AutosaveBuilder, AutosaveManager};
 pub use save_set::{
-    RestoreMode, RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode,
+    RestoreMode, RestoreResult, SaveMethods, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy,
 };
 pub use startup::AutosaveStartupConfig;
 

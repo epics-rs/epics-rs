@@ -99,7 +99,7 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(XRT_BEAMLINE)/db:$(ADCORE)/db")
 dbLoadRecords("$(XRT_BEAMLINE)/db/xrt_detector.template", "P=$(PREFIX),R=cam1:,IOC=bl:,BL=bl:,PORT=XRT")
 
 # Load standard areaDetector plugins
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Restore top-level prefix
 epicsEnvSet("PREFIX", "bl:")

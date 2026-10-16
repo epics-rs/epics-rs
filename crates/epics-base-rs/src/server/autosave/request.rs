@@ -1,9 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::MAX_INCLUDE_DEPTH;
 use super::macros::MacroContext;
+use super::startup::is_valid_first_pv_char;
 
 /// A single entry parsed from a .req file.
 #[derive(Debug, Clone)]
@@ -15,93 +16,108 @@ pub struct RequestEntry {
     pub expanded_from: Option<String>,
 }
 
+/// A parsed request file: its entries, and whether a `file` include in it
+/// could not be opened.
+///
+/// C `readReqFile` (save_restore.c:3553-3559) skips such an include, the
+/// list keeping every other PV, and leaves the list's status FAIL "Can't
+/// open .req file" until its first write.
+#[derive(Debug, Clone)]
+pub struct RequestList {
+    pub entries: Vec<RequestEntry>,
+    pub include_unopened: bool,
+}
+
 /// Load and parse a .req file, resolving includes and macros.
 pub async fn load_request_file(
     path: &Path,
     macros: &MacroContext,
 ) -> AutosaveResult<Vec<RequestEntry>> {
-    load_request_file_with_search_paths(&path.to_string_lossy(), &[], macros).await
+    Ok(
+        load_request_file_with_search_paths(&path.to_string_lossy(), &[], macros)
+            .await?
+            .entries,
+    )
 }
 
 /// Load a .req file by searching multiple directories.
 ///
-/// Search order for the top-level file:
-/// 1. Absolute path (if the filename is absolute)
-/// 2. Each directory in `search_paths`
-/// 3. Current directory
-///
-/// For `file` includes within .req files, the search order is:
-/// 1. Directory of the including file
-/// 2. Each directory in `search_paths`
+/// The top-level file and every `file` include are found as C
+/// `openReqFile` (save_restore.c:3481-3534) finds them: in each of
+/// `search_paths` in order when there is one, else as named from the
+/// current directory. The including file's directory is not searched.
 pub async fn load_request_file_with_search_paths(
     filename: &str,
     search_paths: &[PathBuf],
     macros: &MacroContext,
-) -> AutosaveResult<Vec<RequestEntry>> {
-    let path = PathBuf::from(filename);
-
-    // Resolve the file location
-    let resolved = if path.is_absolute() && path.exists() {
-        path
-    } else if path.is_absolute() {
-        return Err(AutosaveError::RequestFile {
-            path: filename.to_string(),
-            message: "file not found".to_string(),
-        });
-    } else {
-        resolve_in_search_paths(filename, search_paths).ok_or_else(|| {
-            AutosaveError::RequestFile {
-                path: filename.to_string(),
-                message: format!(
-                    "file not found in search paths: {}",
-                    search_paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }
-        })?
-    };
-
-    let canonical = crate::runtime::fs::canonicalize(&resolved)
-        .await
-        .map_err(|e| AutosaveError::RequestFile {
-            path: resolved.display().to_string(),
-            message: format!("cannot resolve path: {e}"),
-        })?;
-    let content = crate::runtime::fs::read_to_string(&canonical)
-        .await
-        .map_err(|e| AutosaveError::RequestFile {
-            path: resolved.display().to_string(),
-            message: e.to_string(),
-        })?;
-    let base_dir = canonical.parent().unwrap_or(Path::new("."));
-    let mut include_stack = vec![canonical.clone()];
-    parse_request_inner(
-        &content,
-        base_dir,
-        macros,
-        0,
-        &mut include_stack,
-        &canonical,
-        search_paths,
-    )
-}
-
-/// Resolve a filename by searching directories, then current directory.
-fn resolve_in_search_paths(filename: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
-    for dir in search_paths {
-        let candidate = dir.join(filename);
-        if candidate.exists() {
-            return Some(candidate);
+) -> AutosaveResult<RequestList> {
+    let mut opened = None;
+    for path in req_file_candidates(filename, search_paths) {
+        if let Ok(content) = crate::runtime::fs::read_to_string(&path).await {
+            opened = Some((path, content));
+            break;
         }
     }
-    let path = PathBuf::from(filename);
-    if path.exists() {
-        return Some(path);
+    let Some((path, content)) = opened else {
+        println!("save_restore:readReqFile: unable to open file {filename}. Exiting.");
+        return Err(AutosaveError::ReqFileUnopened(filename.to_string()));
+    };
+    let canonical = crate::runtime::fs::canonicalize(&path)
+        .await
+        .unwrap_or(path);
+    let mut walk = IncludeWalk {
+        stack: vec![canonical.clone()],
+        search_paths,
+        unopened: false,
+    };
+    let entries = parse_request_inner(&content, macros, 0, &canonical, &mut walk)?;
+    Ok(RequestList {
+        entries,
+        include_unopened: walk.unopened,
+    })
+}
+
+/// State one request file's include tree shares across its levels.
+struct IncludeWalk<'a> {
+    /// The files being read, outermost first, for cycle detection.
+    stack: Vec<PathBuf>,
+    search_paths: &'a [PathBuf],
+    unopened: bool,
+}
+
+/// The paths C `openReqFile` tries for `name`, in order.
+fn req_file_candidates(name: &str, search_paths: &[PathBuf]) -> Vec<PathBuf> {
+    if search_paths.is_empty() {
+        return vec![PathBuf::from(name)];
     }
-    None
+    search_paths
+        .iter()
+        .map(|dir| concatenate_paths(&dir.to_string_lossy(), name).into())
+        .collect()
+}
+
+/// C `concatenate_paths` (save_restore.c:750-768): one `/` between the
+/// two, so an absolute `s2` lands UNDER `s1` rather than replacing it.
+fn concatenate_paths(s1: &str, s2: &str) -> String {
+    let mut dest = s1.to_string();
+    if !s2.is_empty() && !s2.starts_with('/') && !dest.is_empty() && !dest.ends_with('/') {
+        dest.push('/');
+    }
+    match s2.strip_prefix('/') {
+        Some(rest) if dest.ends_with('/') => dest.push_str(rest),
+        _ => dest.push_str(s2),
+    }
+    dest
+}
+
+/// [`load_request_file_with_search_paths`]'s include opener.
+fn open_include(name: &str, search_paths: &[PathBuf]) -> Option<(PathBuf, String)> {
+    req_file_candidates(name, search_paths)
+        .into_iter()
+        .find_map(|path| {
+            let content = std::fs::read_to_string(&path).ok()?;
+            Some((std::fs::canonicalize(&path).unwrap_or(path), content))
+        })
 }
 
 /// Load a .req file from a string (for testing without filesystem).
@@ -112,12 +128,11 @@ pub fn parse_request_string(
 ) -> AutosaveResult<Vec<RequestEntry>> {
     let source = PathBuf::from(source_name);
     let mut entries = Vec::new();
-    let source_str = source_name;
 
     for (idx, raw_line) in content.lines().enumerate() {
         let line_no = idx + 1;
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
             continue;
         }
         if line.starts_with("file ") || line.starts_with("file\t") {
@@ -130,17 +145,15 @@ pub fn parse_request_string(
             });
         }
 
-        let expanded = macros.expand(line, source_str, line_no)?;
-        let expanded_from = if expanded != line {
-            Some(line.to_string())
-        } else {
-            None
+        let expanded = macros.expand(line);
+        let Some(name) = request_pv_name(&expanded) else {
+            continue;
         };
         entries.push(RequestEntry {
-            pv_name: expanded,
+            pv_name: name.to_string(),
+            expanded_from: (name != line).then(|| line.to_string()),
             source_file: source.clone(),
             line_no,
-            expanded_from,
         });
     }
     Ok(entries)
@@ -148,25 +161,22 @@ pub fn parse_request_string(
 
 fn parse_request_inner(
     content: &str,
-    base_dir: &Path,
     macros: &MacroContext,
     depth: usize,
-    include_stack: &mut Vec<PathBuf>,
     source_path: &Path,
-    search_paths: &[PathBuf],
+    walk: &mut IncludeWalk,
 ) -> AutosaveResult<Vec<RequestEntry>> {
     if depth > MAX_INCLUDE_DEPTH {
         return Err(AutosaveError::IncludeDepthExceeded(MAX_INCLUDE_DEPTH));
     }
 
     let mut entries = Vec::new();
-    let source_str = source_path.display().to_string();
 
     for (idx, raw_line) in content.lines().enumerate() {
         let line_no = idx + 1;
         let line = raw_line.trim();
 
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
             continue;
         }
 
@@ -174,8 +184,7 @@ fn parse_request_inner(
             let rest = line[4..].trim();
             let (file_path, inline_macros) = parse_file_directive(rest);
 
-            // Expand macros in file path
-            let expanded_path = macros.expand(&file_path, &source_str, line_no)?;
+            let expanded_path = macros.expand(&file_path);
 
             // Merge inline macros in macLib's order: split the RAW text into
             // definitions, THEN expand each value through the parent context
@@ -185,83 +194,66 @@ fn parse_request_inner(
             // as a separator: with a parent `SUB=a,b`, `file "sub.req",
             // P=$(P), S=$(SUB)` became `P=IOC:,S=a,b` and then `S=a`, with
             // the bare `b` dropped and no message.
-            let child_macros = if inline_macros.is_empty() {
-                macros.clone()
-            } else {
-                let mut overrides = HashMap::new();
-                for (name, raw) in MacroContext::parse_inline(&inline_macros) {
-                    overrides.insert(name, macros.expand(&raw, &source_str, line_no)?);
-                }
-                macros.with_overrides(&overrides)
-            };
+            // The included file sees only its own line's definitions, as C
+            // hands `readReqFile` the include's macro string and nothing
+            // else (save_restore.c:3640). Each value is expanded through
+            // this level after the split, so a comma from inside a value
+            // does not end a definition the way C's whole-line expansion
+            // lets it.
+            let child_macros = MacroContext::from_map(
+                MacroContext::parse_inline(&inline_macros)
+                    .into_iter()
+                    .map(|(name, raw)| (name, macros.expand(&raw)))
+                    .collect(),
+            );
 
-            // Resolve: first try relative to including file's directory,
-            // then search paths (matching C autosave behavior)
-            let include_path = if Path::new(&expanded_path).is_absolute() {
-                PathBuf::from(&expanded_path)
-            } else {
-                let relative = base_dir.join(&expanded_path);
-                if relative.exists() {
-                    relative
-                } else {
-                    // Fall back to search paths
-                    resolve_in_search_paths(&expanded_path, search_paths).unwrap_or(relative) // use original for error message
-                }
+            let Some((canonical, inc_content)) = open_include(&expanded_path, walk.search_paths)
+            else {
+                println!("save_restore:readReqFile: unable to open file {expanded_path}. Exiting.");
+                walk.unopened = true;
+                continue;
             };
-
-            let canonical =
-                std::fs::canonicalize(&include_path).map_err(|e| AutosaveError::RequestFile {
-                    path: include_path.display().to_string(),
-                    message: format!("cannot resolve include: {e}"),
-                })?;
 
             // Cycle detection
-            if include_stack.contains(&canonical) {
-                let mut chain: Vec<String> = include_stack
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect();
+            if walk.stack.contains(&canonical) {
+                let mut chain: Vec<String> =
+                    walk.stack.iter().map(|p| p.display().to_string()).collect();
                 chain.push(canonical.display().to_string());
                 return Err(AutosaveError::IncludeCycle { chain });
             }
 
-            include_stack.push(canonical.clone());
-            let inc_content =
-                std::fs::read_to_string(&canonical).map_err(|e| AutosaveError::RequestFile {
-                    path: canonical.display().to_string(),
-                    message: e.to_string(),
-                })?;
-            let inc_dir = canonical.parent().unwrap_or(Path::new("."));
-            let sub_entries = parse_request_inner(
-                &inc_content,
-                inc_dir,
-                &child_macros,
-                depth + 1,
-                include_stack,
-                &canonical,
-                search_paths,
-            )?;
+            walk.stack.push(canonical.clone());
+            let sub_entries =
+                parse_request_inner(&inc_content, &child_macros, depth + 1, &canonical, walk)?;
             entries.extend(sub_entries);
-            include_stack.pop();
+            walk.stack.pop();
             continue;
         }
 
         // Regular PV line
-        let expanded = macros.expand(line, &source_str, line_no)?;
-        let expanded_from = if expanded != line {
-            Some(line.to_string())
-        } else {
-            None
+        let expanded = macros.expand(line);
+        let Some(name) = request_pv_name(&expanded) else {
+            continue;
         };
         entries.push(RequestEntry {
-            pv_name: expanded,
+            pv_name: name.to_string(),
+            expanded_from: (name != line).then(|| line.to_string()),
             source_file: source_path.to_path_buf(),
             line_no,
-            expanded_from,
         });
     }
 
     Ok(entries)
+}
+
+/// C `readReqFile`'s channel name (save_restore.c:3605-3650): the expanded
+/// line's first token, kept only when it starts with a PV character or `$`,
+/// so a `#` token is a comment and anything after the name is ignored.
+fn request_pv_name(expanded: &str) -> Option<&str> {
+    let name = expanded
+        .split([' ', '\t', '\n', '\x0B', '\x0C', '\r'])
+        .find(|t| !t.is_empty())?;
+    (is_valid_first_pv_char(name) || name.starts_with('$')).then_some(name)
 }
 
 /// Parse a file directive: `file <path>[,] [macros]`
@@ -297,6 +289,20 @@ fn parse_file_directive(rest: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_names_its_first_token_if_c_would_take_it() {
+        let macros = MacroContext::from_map(
+            [("P", "IOC:"), ("C", "#")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into(),
+        );
+        let entries =
+            parse_request_string("$(P)a 0.5\n*bad\n$(C) note\n$(UNDEF)x\n", &macros, "t.req")
+                .unwrap();
+        assert_eq!(pv_names(&entries), ["IOC:a", "$(UNDEF,undefined)x"]);
+        assert_eq!(entries[0].expanded_from.as_deref(), Some("$(P)a 0.5"));
+    }
 
     #[test]
     fn test_parse_file_directive_quoted_with_comma() {

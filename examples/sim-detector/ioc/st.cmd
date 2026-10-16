@@ -36,7 +36,7 @@ simDetectorConfig("$(PORT)", 1024, 1024, 1, 0, 50000000)
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Load all common plugins (includes image1 StdArrays)
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Autosave monitor sets (after all records are loaded)
 create_monitor_set("simDetector_settings.req", 5, "P=$(PREFIX),R=$(CAM)")

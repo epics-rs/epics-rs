@@ -108,7 +108,7 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(MINI_BEAMLINE)/db:$(ADCORE)/db")
 dbLoadRecords("$(MINI_BEAMLINE)/db/moving_dot.template", "P=$(PREFIX),R=cam1:,IOC=mini:,PORT=DOT")
 
 # Load standard areaDetector plugins for MovingDot
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Restore top-level prefix
 epicsEnvSet("PREFIX", "mini:")

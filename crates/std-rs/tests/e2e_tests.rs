@@ -376,22 +376,24 @@ record(epid, "TEST:PID") {
     };
 
     let mgr = AutosaveBuilder::new()
-        .add_set(SaveSetConfig {
-            name: "test".into(),
-            save_path: dir.path().join("epid.sav"),
-            strategy: SaveStrategy::Manual,
-            request_file: Some(req_path),
-            request_pvs: vec![],
-            backup: BackupConfig {
-                enable_savb: false,
-                num_seq_files: 0,
-                seq_period: Duration::from_secs(60),
-                enable_dated: false,
-                dated_interval: Duration::from_secs(3600),
+        .add_set(
+            SaveSetConfig {
+                name: "test".into(),
+                save_path: dir.path().join("epid.sav"),
+                request_file: Some(req_path),
+                request_pvs: vec![],
+                backup: BackupConfig {
+                    enable_savb: false,
+                    num_seq_files: 0,
+                    seq_period: Duration::from_secs(60),
+                    enable_dated: false,
+                    dated_interval: Duration::from_secs(3600),
+                },
+                macros: HashMap::new(),
+                search_paths: vec![],
             },
-            macros: HashMap::new(),
-            search_paths: vec![],
-        })
+            SaveStrategy::Manual,
+        )
         .build()
         .await;
 

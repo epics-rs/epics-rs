@@ -196,9 +196,7 @@ async fn a_failed_dated_publish_leaves_its_watermark_alone() {
 async fn a_failed_rotation_fails_and_records_the_save_cycle() {
     use std::sync::atomic::Ordering;
 
-    use epics_base_rs::server::autosave::save_set::{
-        SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy,
-    };
+    use epics_base_rs::server::autosave::save_set::{SaveSet, SaveSetConfig, SaveSetStatus};
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::records::ao::AoRecord;
 
@@ -213,9 +211,6 @@ async fn a_failed_rotation_fails_and_records_the_save_cycle() {
     let set = SaveSet::new(SaveSetConfig {
         name: "s".into(),
         save_path: sav.clone(),
-        strategy: SaveStrategy::Periodic {
-            interval: Duration::from_secs(60),
-        },
         request_file: None,
         request_pvs: vec!["PV1".into()],
         backup: seq_only(),

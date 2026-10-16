@@ -183,16 +183,18 @@ async fn holder_with_set(dir: &std::path::Path) -> Arc<Mutex<AutosaveStartupConf
     std::fs::write(dir.join("CFGMenu.req"), "TGT\nXMenu:currDesc\n").unwrap();
     let mgr = AutosaveBuilder::new()
         .compat(CompatMode::CRead)
-        .add_set(SaveSetConfig {
-            name: "CFGMenu".into(),
-            save_path: dir.join("CFGMenu.sav"),
-            strategy: SaveStrategy::Manual,
-            request_file: Some("CFGMenu.req".into()),
-            request_pvs: Vec::new(),
-            backup: BackupConfig::default(),
-            macros: HashMap::new(),
-            search_paths: vec![dir.to_path_buf()],
-        })
+        .add_set(
+            SaveSetConfig {
+                name: "CFGMenu".into(),
+                save_path: dir.join("CFGMenu.sav"),
+                request_file: Some("CFGMenu.req".into()),
+                request_pvs: Vec::new(),
+                backup: BackupConfig::default(),
+                macros: HashMap::new(),
+                search_paths: vec![dir.to_path_buf()],
+            },
+            SaveStrategy::Manual,
+        )
         .build()
         .await;
     let h = holder(dir);

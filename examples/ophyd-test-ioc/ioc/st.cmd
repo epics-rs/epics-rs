@@ -55,11 +55,11 @@ epicsEnvSet("CBUFFS",     "500")
 epicsEnvSet("NELEMENTS",  "307200")
 epicsEnvSet("FTVL",       "SHORT")
 epicsEnvSet("TYPE",       "Int16")
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Also load with ADSIM: prefix for ophyd test compatibility.
 # The Configure lines fail here as in C (the ports exist); only the
 # record templates load with the new prefix.
 epicsEnvSet("PREFIX", "ADSIM:")
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=ADSIM:,R=cam1:,PORT=SIM,ADDR=0,TIMEOUT=1")
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd

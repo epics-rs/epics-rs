@@ -1091,7 +1091,7 @@ impl AdIoc {
         // that parity (no 5000 floor, no sscanf leniency, no diagnostics).
         let mut app = IocApplication::new();
 
-        // `$(ADCORE)` resolves `$(ADCORE)/ioc/commonPlugins.cmd` and the
+        // `$(ADCORE)` resolves `$(ADCORE)/iocBoot/commonPlugins.cmd` and the
         // `$(ADCORE)/db` templates. Take the path from ad-core-rs itself rather
         // than guessing a sibling of this crate: only the owning crate can name
         // its own directory under a version-suffixed registry checkout.

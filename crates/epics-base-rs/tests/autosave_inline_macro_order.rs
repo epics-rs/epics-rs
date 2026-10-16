@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use epics_base_rs::server::autosave::macros::MacroContext;
-use epics_base_rs::server::autosave::request::{load_request_file, pv_names};
+use epics_base_rs::server::autosave::request::{load_request_file_with_search_paths, pv_names};
 
 /// Build a two-file request set: `main.req` includes `sub.req`, passing
 /// `defns` through as its inline macro text.
@@ -40,10 +40,13 @@ async fn members(main: &std::path::Path, parent: &[(&str, &str)]) -> Vec<String>
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    let entries = load_request_file(main, &MacroContext::from_map(map))
-        .await
-        .expect("request file must load");
-    pv_names(&entries)
+    // C `openReqFile` finds the include on the request path only.
+    let dir = main.parent().unwrap().to_path_buf();
+    let list =
+        load_request_file_with_search_paths("main.req", &[dir], &MacroContext::from_map(map))
+            .await
+            .expect("request file must load");
+    pv_names(&list.entries)
 }
 
 #[epics_macros_rs::epics_test]

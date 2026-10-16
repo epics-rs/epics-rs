@@ -45,7 +45,7 @@ fn ad_ioc_publishes_only_paths_that_exist() {
         .iter()
         .find(|(name, _)| name == "ADCORE")
         .map(|(_, value)| value.as_str())
-        .expect("AdIoc::new() must publish ADCORE for `< $(ADCORE)/ioc/commonPlugins.cmd`");
+        .expect("AdIoc::new() must publish ADCORE for `< $(ADCORE)/iocBoot/commonPlugins.cmd`");
 
     assert_eq!(
         adcore,
@@ -60,11 +60,20 @@ fn ad_ioc_publishes_only_paths_that_exist() {
             .is_file(),
         "every AD db template does `include \"ADBase.template\"` from $(ADCORE)/db"
     );
+    // C sites keep it at $(ADCORE)/iocBoot/commonPlugins.cmd, the path
+    // quadEM's iocBoot/quadEM_Plugins.cmd names verbatim.
     assert!(
         Path::new(adcore)
-            .join("ioc")
+            .join("iocBoot")
             .join("commonPlugins.cmd")
             .is_file(),
-        "st.cmd aborts before iocInit() if `< $(ADCORE)/ioc/commonPlugins.cmd` is missing"
+        "st.cmd aborts before iocInit() if `< $(ADCORE)/iocBoot/commonPlugins.cmd` is missing"
+    );
+    // The port's earlier path still leads there.
+    let old = std::fs::read_to_string(Path::new(adcore).join("ioc").join("commonPlugins.cmd"))
+        .expect("$(ADCORE)/ioc/commonPlugins.cmd is kept");
+    assert!(
+        old.contains("< $(ADCORE)/iocBoot/commonPlugins.cmd"),
+        "{old}"
     );
 }

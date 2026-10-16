@@ -10,11 +10,11 @@
 //! while `fdblist` reported it idle.
 //!
 //! Both `into_builder` loops now read one already-legal `Duration`
-//! produced by `MonitorSetDef::poll_period`, so the monitor path cannot
+//! produced by `startup::period_arg`, so the monitor path cannot
 //! drift from the triggered path the way it had.
 //!
-//! No C reference: synApps `save_restore.c` is not present on this
-//! machine, so these pin the port's own stated invariant.
+//! The floor is C's `MIN_PERIOD` (save_restore.c:394): `create_data_set`
+//! stores `MAX(mon_period, MIN_PERIOD)`, 4 s.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,9 +78,9 @@ fn monitor_interval(period: i64) -> Duration {
         .expect("create_monitor_set must accept the period the shell parsed");
 
     let mgr = build(&rt, &holder);
-    match &mgr.sets()[0].0.config().strategy {
-        SaveStrategy::Periodic { interval } => *interval,
-        other => panic!("expected a periodic set, got {other:?}"),
+    match &mgr.sets()[0].0.methods()[..] {
+        [SaveStrategy::OnChange { min_interval, .. }] => *min_interval,
+        other => panic!("expected a monitored set, got {other:?}"),
     }
 }
 
@@ -88,13 +88,20 @@ fn monitor_interval(period: i64) -> Duration {
 /// is the value that panics the timer.
 #[test]
 fn a_zero_period_monitor_set_gets_a_legal_interval() {
-    assert_eq!(monitor_interval(0), Duration::from_secs(1));
+    assert_eq!(monitor_interval(0), Duration::from_secs(4));
+}
+
+/// Below C's floor: `MAX(3, MIN_PERIOD)`.
+#[test]
+fn a_period_below_min_period_is_raised_to_it() {
+    assert_eq!(monitor_interval(3), Duration::from_secs(4));
+    assert_eq!(monitor_interval(4), Duration::from_secs(4));
 }
 
 /// The other end: a negative period must not become an unsigned age.
 #[test]
 fn a_negative_period_monitor_set_gets_a_legal_interval() {
-    assert_eq!(monitor_interval(-1), Duration::from_secs(1));
+    assert_eq!(monitor_interval(-1), Duration::from_secs(4));
 }
 
 /// A period the operator meant is passed through untouched — the clamp
@@ -104,11 +111,8 @@ fn a_sane_period_monitor_set_is_left_alone() {
     assert_eq!(monitor_interval(30), Duration::from_secs(30));
 }
 
-/// The second loop no longer reads that field at all.
-/// `create_triggered_set` takes no period in C either — the trigger is a
-/// CA monitor — so the watcher interval is a constant and cannot be the
-/// monitor set's number under another meaning, which is what one shared
-/// `period` field made it.
+/// `create_triggered_set` takes no period in C — the trigger is a CA
+/// monitor — so the triggered method carries none.
 #[test]
 fn the_triggered_loop_takes_no_period() {
     let dir = tempfile::tempdir().unwrap();
@@ -137,24 +141,18 @@ fn the_triggered_loop_takes_no_period() {
 
     let mgr = build(&rt, &holder);
     let sets = mgr.sets();
-    assert_eq!(sets.len(), 2, "one monitor set and one triggered set");
+    assert_eq!(sets.len(), 1, "one request file, one set");
 
-    let periodic = match &sets[0].0.config().strategy {
-        SaveStrategy::Periodic { interval } => *interval,
-        other => panic!("expected the monitor set first, got {other:?}"),
-    };
-    let debounce = match &sets[1].0.config().strategy {
-        SaveStrategy::Triggered { poll_interval, .. } => *poll_interval,
-        other => panic!("expected the triggered set second, got {other:?}"),
+    let periodic = match &sets[0].0.methods()[..] {
+        [
+            SaveStrategy::OnChange { min_interval },
+            SaveStrategy::Triggered { .. },
+        ] => *min_interval,
+        other => panic!("expected the monitor method then the triggered one, got {other:?}"),
     };
     assert_eq!(
         periodic,
         Duration::from_secs(30),
         "the monitor set keeps the period the operator typed"
-    );
-    assert_eq!(
-        debounce,
-        Duration::from_secs(1),
-        "the trigger watcher's interval is its own, not the monitor period"
     );
 }

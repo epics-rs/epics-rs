@@ -24,3 +24,7 @@ epics-ca-rs = { workspace = true, optional = true }
 name = "ophyd-test-ioc"
 path = "src/bin/ophyd_test_ioc.rs"
 required-features = ["ioc"]
+
+[dev-dependencies]
+# The boot test names its CA port; the retry rule lives in one place.
+named-port = { path = "../../crates/named-port" }

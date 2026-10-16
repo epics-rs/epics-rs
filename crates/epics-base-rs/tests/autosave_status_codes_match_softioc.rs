@@ -113,16 +113,18 @@ impl Rig {
         let list = sub("T:SR_0_Status");
         let mut builder = AutosaveBuilder::new().status_prefix("T:");
         for (name, save_path, backup) in sets {
-            builder = builder.add_set(SaveSetConfig {
-                name: name.into(),
-                save_path,
-                strategy: SaveStrategy::Manual,
-                request_file: None,
-                request_pvs: vec!["T:SAVED".into()],
-                backup,
-                macros: HashMap::new(),
-                search_paths: Vec::new(),
-            });
+            builder = builder.add_set(
+                SaveSetConfig {
+                    name: name.into(),
+                    save_path,
+                    request_file: None,
+                    request_pvs: vec!["T:SAVED".into()],
+                    backup,
+                    macros: HashMap::new(),
+                    search_paths: Vec::new(),
+                },
+                SaveStrategy::Manual,
+            );
         }
         let mgr = Arc::new(builder.build().await);
         let handle = Some(mgr.clone().start(

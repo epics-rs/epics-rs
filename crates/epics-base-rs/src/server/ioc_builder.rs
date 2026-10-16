@@ -45,7 +45,7 @@ pub struct IocBuilder {
     dynamic_device_factory: Option<DynamicDeviceSupportFactory>,
     record_factories: HashMap<String, RecordFactory>,
     subroutine_registry: HashMap<String, Arc<Subroutine>>,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     link_set_installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
     /// The link types those installers serve ([`Self::register_link_type`]).
     json_link_types: Vec<String>,
@@ -319,9 +319,13 @@ impl IocBuilder {
         self
     }
 
-    /// Configure autosave with a save set configuration.
-    pub fn autosave(mut self, config: autosave::SaveSetConfig) -> Self {
-        self.autosave_config = Some(config);
+    /// Configure autosave with one save set and its save method.
+    pub fn autosave(
+        mut self,
+        config: autosave::SaveSetConfig,
+        method: autosave::SaveStrategy,
+    ) -> Self {
+        self.autosave_config = Some((config, method));
         self
     }
 
@@ -368,7 +372,12 @@ impl IocBuilder {
     /// nothing of `iocBuild` is said, and its links are left as loaded for
     /// the caller to open. An IOC process builds with [`Self::build_ioc`]
     /// instead; a server over this database, with [`Self::build_served`].
-    pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
+    pub async fn build(
+        self,
+    ) -> CaResult<(
+        Arc<PvDatabase>,
+        Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
+    )> {
         let (db, autosave_config, ()) = self.build_through(|| Some(()), LinkInit::Caller).await?;
         Ok((db, autosave_config))
     }
@@ -379,7 +388,10 @@ impl IocBuilder {
     /// releases those links' connect-time processing.
     pub async fn build_served(
         self,
-    ) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
+    ) -> CaResult<(
+        Arc<PvDatabase>,
+        Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
+    )> {
         let (db, autosave_config, ()) = self.build_through(|| Some(()), LinkInit::Build).await?;
         Ok((db, autosave_config))
     }
@@ -410,7 +422,11 @@ impl IocBuilder {
         self,
         iocinit_begins: impl FnOnce() -> Option<T>,
         link_init: LinkInit,
-    ) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>, T)> {
+    ) -> CaResult<(
+        Arc<PvDatabase>,
+        Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
+        T,
+    )> {
         let db = self
             .database
             .clone()
@@ -517,7 +533,7 @@ impl IocBuilder {
         crate::server::ioc_app::ca_link_init(&db, self.link_set_installers).await;
 
         // 4. Autosave restore
-        if let Some(ref autosave_cfg) = self.autosave_config {
+        if let Some((ref autosave_cfg, _)) = self.autosave_config {
             autosave::restore_from_file(&db, &autosave_cfg.save_path).await?;
         }
 
@@ -556,7 +572,7 @@ impl IocBuilder {
 /// An IOC [`IocBuilder::build_ioc`] built: C's `iocBuilt`, quiescent.
 pub struct BareIoc {
     db: Arc<PvDatabase>,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
 }
 
 impl BareIoc {
@@ -565,7 +581,7 @@ impl BareIoc {
     }
 
     pub fn autosave_config(&self) -> Option<&autosave::SaveSetConfig> {
-        self.autosave_config.as_ref()
+        self.autosave_config.as_ref().map(|(c, _)| c)
     }
 
     /// C `iocRun` (`iocInit.c:246-276`): opens the scan gate the build's

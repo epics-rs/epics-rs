@@ -124,7 +124,7 @@ simDetectorConfig("SIM1", 1024, 1024, 1, 0, 50000000)
 dbLoadRecords("$(SIM_DETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=SIM1")
 
 # Standard areaDetector plugins
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 ```
 
 ## Autosave

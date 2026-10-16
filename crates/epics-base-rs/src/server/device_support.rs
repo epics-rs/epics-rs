@@ -765,6 +765,16 @@ pub struct PropertyPost {
     pub post_field: String,
 }
 
+/// What a device's own I/O Intr callback decided about one pulse
+/// ([`DeviceSupport::io_intr_callback`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoIntrAction {
+    /// Process the record, as `scanIoRequest`/`scanOnce` would.
+    Process,
+    /// Leave it: the callback returned without requesting a scan.
+    Skip,
+}
+
 /// The alarm a device raises after a transfer: C's
 /// `recGblSetSevrMsg(prec, stat, sevr, msg)`, with an empty `msg` for a
 /// plain `recGblSetSevr`.
@@ -964,6 +974,19 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// `scanIoRequest`, which honors scan-list membership.
     fn io_intr_scan_independent(&self) -> bool {
         false
+    }
+
+    /// The device's callback for one I/O Intr pulse, run under the record's
+    /// lock before the pulse may process it. devEtherIP's
+    /// `check_ao_callback` copies the PLC's value into the record and calls
+    /// `scanOnce` only when it changed, and not at all when the get failed
+    /// (devEtherIP.c:326-437). Default: [`IoIntrAction::Process`].
+    fn io_intr_callback(
+        &mut self,
+        _record: &mut dyn Record,
+        _common: &mut crate::server::record::CommonFields,
+    ) -> IoIntrAction {
+        IoIntrAction::Process
     }
 
     /// Whether a pulse stands for the device's own `dbProcess` rather than

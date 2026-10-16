@@ -102,7 +102,7 @@ names.
 - **Array calc** — element-wise operations, statistics (mean, sigma, min, max, median)
 
 ### Autosave
-- C-compatible iocsh commands: `set_requestfile_path`, `set_savefile_path`, `create_monitor_set`, `create_triggered_set`, `set_pass0_restoreFile`, `set_pass1_restoreFile`, `save_restoreSet_status_prefix`, `fdbsave`, `fdbrestore`, `fdblist`
+- C-compatible iocsh commands: `set_requestfile_path`, `set_savefile_path`, `create_monitor_set`, `create_triggered_set`, `create_manual_set`, `set_pass0_restoreFile`, `set_pass1_restoreFile`, `save_restoreSet_status_prefix`, `fdbsave`, `fdbrestore`, `fdblist`
 - Pass0 (before device support init) and Pass1 (after) restore stages
 - `.req` file parsing with `file` includes, macro expansion, search path resolution, cycle detection
 - Periodic / triggered / on-change / manual save strategies

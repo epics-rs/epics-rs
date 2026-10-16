@@ -52,7 +52,7 @@
 )]
 
 /// Filesystem root of the `ad-core-rs` crate, holding the `db/` templates and
-/// `ioc/commonPlugins.cmd` that AD startup scripts reach through `$(ADCORE)`.
+/// `iocBoot/commonPlugins.cmd` that AD startup scripts reach through `$(ADCORE)`.
 ///
 /// `env!` is evaluated here, inside the crate that owns the assets, so the path
 /// is correct whether `ad-core-rs` is a sibling path dependency or a registry

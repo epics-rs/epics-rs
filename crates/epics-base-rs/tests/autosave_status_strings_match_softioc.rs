@@ -10,7 +10,7 @@
 //! T:SR_statusStr                  Ok
 //! ```
 //!
-//! The texts are C's: "Initializing list" (:2442), "Ok" (:904, :2013),
+//! The texts are C's: "Enabling list..." (:1431, the first pass), "Ok" (:904, :2013),
 //! "Can't write .sav file" (:2102), "list '%s' enabled" (:1485),
 //! "Wrote '%s'" (:2134), "Can't write '%s'" (:2104), "Manual restore
 //! succeeded" (:3261), "Manual restore failed" (:3284).
@@ -76,22 +76,24 @@ impl Rig {
         let mgr = Arc::new(
             AutosaveBuilder::new()
                 .status_prefix("T:")
-                .add_set(SaveSetConfig {
-                    name: "s".into(),
-                    save_path,
-                    strategy: SaveStrategy::Manual,
-                    request_file: None,
-                    request_pvs: vec!["T:SAVED".into()],
-                    backup: BackupConfig {
-                        enable_savb: false,
-                        num_seq_files: 0,
-                        seq_period: Duration::from_secs(60),
-                        enable_dated: false,
-                        dated_interval: Duration::from_secs(3600),
+                .add_set(
+                    SaveSetConfig {
+                        name: "s".into(),
+                        save_path,
+                        request_file: None,
+                        request_pvs: vec!["T:SAVED".into()],
+                        backup: BackupConfig {
+                            enable_savb: false,
+                            num_seq_files: 0,
+                            seq_period: Duration::from_secs(60),
+                            enable_dated: false,
+                            dated_interval: Duration::from_secs(3600),
+                        },
+                        macros: HashMap::new(),
+                        search_paths: Vec::new(),
                     },
-                    macros: HashMap::new(),
-                    search_paths: Vec::new(),
-                })
+                    SaveStrategy::Manual,
+                )
                 .build()
                 .await,
         );
@@ -143,7 +145,7 @@ async fn a_clean_save_reports_ok_and_wrote() {
     let mut rig = Rig::new(dir.path().join("s.sav")).await;
     assert_eq!(
         rig.pass().await,
-        (one("Initializing list"), one("list 's.sav' enabled"))
+        (one("Enabling list..."), one("list 's.sav' enabled"))
     );
     rig.mgr.manual_save("s", &rig.db).await.unwrap();
     assert_eq!(rig.pass().await, (one("Ok"), one("Wrote 's.sav'")));

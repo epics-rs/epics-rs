@@ -22,37 +22,105 @@ pub enum SaveStrategy {
     Periodic {
         interval: Duration,
     },
+    /// C TRIGGERED: a save on each monitor event of `trigger_pv`, the
+    /// first of which is its value when the list is enabled.
     Triggered {
         trigger_pv: String,
-        mode: TriggerMode,
-        poll_interval: Duration,
     },
+    /// C MONITORED: a save once `min_interval` has run out and a member
+    /// posted an event, the first being each member's value at enable.
     OnChange {
         min_interval: Duration,
-        float_epsilon: f64,
     },
     Manual,
 }
 
-/// Trigger mode for triggered save sets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TriggerMode {
-    AnyChange,
-    NonZero,
+impl SaveStrategy {
+    /// C's `save_method` bits (save_restore.c:205-210).
+    pub const PERIODIC: u32 = 0x01;
+    pub const TRIGGERED: u32 = 0x02;
+    /// C `MONITORED`, `TIMER | CHANGE`.
+    pub const MONITORED: u32 = 0x0c;
+    pub const MANUAL: u32 = 0x10;
+
+    /// This method's `save_method` bits.
+    pub fn method_bit(&self) -> u32 {
+        match self {
+            Self::Periodic { .. } => Self::PERIODIC,
+            Self::Triggered { .. } => Self::TRIGGERED,
+            Self::OnChange { .. } => Self::MONITORED,
+            Self::Manual => Self::MANUAL,
+        }
+    }
+
+    /// The method that makes a list, as C `create_data_set` stores it:
+    /// `MAX(period, MIN_PERIOD)` (save_restore.c:394, 2422, 2433). A method
+    /// added to an existing list keeps its period raw (:2384-2389).
+    pub(crate) fn creating_list(self) -> Self {
+        const MIN_PERIOD: Duration = Duration::from_secs(4);
+        match self {
+            Self::Periodic { interval } => Self::Periodic {
+                interval: interval.max(MIN_PERIOD),
+            },
+            Self::OnChange { min_interval } => Self::OnChange {
+                min_interval: min_interval.max(MIN_PERIOD),
+            },
+            m => m,
+        }
+    }
 }
 
-/// Configuration for a save set.
+/// Configuration for a save set: what C's `chlist` is built from. How the
+/// set is saved is not part of it — a set gains its methods one
+/// `create_*_set` at a time ([`SaveSet::methods`]).
 #[derive(Debug, Clone)]
 pub struct SaveSetConfig {
     pub name: String,
     pub save_path: PathBuf,
-    pub strategy: SaveStrategy,
     pub request_file: Option<PathBuf>,
     pub request_pvs: Vec<String>,
     pub backup: BackupConfig,
     pub macros: HashMap<String, String>,
     /// Search paths for resolving `file` includes within .req files.
     pub search_paths: Vec<PathBuf>,
+}
+
+impl SaveSetConfig {
+    /// What identifies the set: C matches `plist->reqFile` against the
+    /// filename (save_restore.c:2369). A set of inline PVs has only its name.
+    pub fn key(&self) -> String {
+        match &self.request_file {
+            Some(f) => f.to_string_lossy().into_owned(),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// A set's save methods, at most one of each kind: C's `save_method` mask
+/// plus each method's parameters.
+#[derive(Debug, Clone, Default)]
+pub struct SaveMethods(Vec<SaveStrategy>);
+
+impl SaveMethods {
+    /// Add `method`, or refuse it with its bit when the set already has
+    /// one of that kind (save_restore.c:2370-2375).
+    pub fn add(&mut self, method: SaveStrategy) -> Result<(), u32> {
+        let bit = method.method_bit();
+        if self.mask() & bit != 0 {
+            return Err(bit);
+        }
+        self.0.push(method);
+        Ok(())
+    }
+
+    /// C `plist->save_method`.
+    pub fn mask(&self) -> u32 {
+        self.0.iter().fold(0, |m, s| m | s.method_bit())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SaveStrategy> {
+        self.0.iter()
+    }
 }
 
 /// Runtime status of a save set.
@@ -149,6 +217,10 @@ pub struct SaveSet {
     list_status: std::sync::Mutex<ListStatus>,
     save_time: std::sync::Mutex<chrono::DateTime<chrono::Local>>,
     recent: std::sync::Mutex<Option<(std::time::Instant, String)>>,
+    methods: std::sync::Mutex<SaveMethods>,
+    /// When C's `create_data_set` stamped `callback_time` and
+    /// `save_attempt_time` (save_restore.c:2436, :2472).
+    created_at: std::time::Instant,
     /// On-disk save-file format used by [`SaveSet::save_once`].
     /// [`CompatMode::Native`] by default; [`CompatMode::CRead`]
     /// writes `.sav` files a C IOC can read.
@@ -167,41 +239,33 @@ impl SaveSet {
     /// Use [`CompatMode::CRead`] when the produced `.sav` files must
     /// be readable by a C IOC (mixed Rust + C IOC site).
     pub async fn new_with_mode(config: SaveSetConfig, compat: CompatMode) -> AutosaveResult<Self> {
-        let entries = Self::load_entries(&config).await?;
+        let (entries, list_status) = Self::load_entries(&config).await?;
         Ok(Self {
             config,
             entries,
             status: RwLock::new(SaveSetStatus::Idle),
             stats: SaveSetStats::default(),
             backup_state: RwLock::new(BackupState::default()),
-            list_status: std::sync::Mutex::new(ListStatus::new(
-                SrStatus::Init,
-                "Initializing list",
-            )),
+            list_status: std::sync::Mutex::new(list_status),
             save_time: std::sync::Mutex::new(chrono::Local::now()),
             recent: std::sync::Mutex::new(None),
+            methods: std::sync::Mutex::new(SaveMethods::default()),
+            created_at: std::time::Instant::now(),
             compat,
         })
     }
 
-    /// Build the set's member list - and the one place an empty one is
-    /// refused.
+    /// Build the set's member list. An empty one is a list C builds and
+    /// saves like any other (save_restore.c:998-1004).
     ///
-    /// A set with no members cannot save anything, but `save_once` would
-    /// still run for it: the backup rotation copies the previous `.sav`
-    /// into the sequence slots and then on to `.savB`, and
-    /// `write_save_file_with_mode` renames a header-plus-`<END>` file
-    /// over the `.sav` itself, so
-    /// within `num_seq_files` periods every generation of a real save set
-    /// is gone and the next boot restores nothing while reporting
-    /// success. Refusing the set here keeps it out of `SaveSet` entirely,
-    /// where `AutosaveBuilder::build` drops it like any other unbuildable
-    /// set and keeps it in `status_all` as an error, so no strategy needs
-    /// its own emptiness check before calling `save_once` and
-    /// `reload_request` cannot empty a set that is already running.
-    async fn load_entries(config: &SaveSetConfig) -> AutosaveResult<Vec<RequestEntry>> {
+    /// Also returns the list status C's `create_data_set` leaves: the code
+    /// `readReqFile` set, the text "Ready to connect..." (save_restore.c:2481).
+    async fn load_entries(
+        config: &SaveSetConfig,
+    ) -> AutosaveResult<(Vec<RequestEntry>, ListStatus)> {
         let macros = MacroContext::from_map(config.macros.clone());
         let mut entries = Vec::new();
+        let mut code = SrStatus::Init;
 
         if let Some(ref req_file) = config.request_file {
             let req_entries = request::load_request_file_with_search_paths(
@@ -210,7 +274,10 @@ impl SaveSet {
                 &macros,
             )
             .await?;
-            entries.extend(req_entries);
+            if req_entries.include_unopened {
+                code = SrStatus::Fail;
+            }
+            entries.extend(req_entries.entries);
         }
 
         // Add inline PVs
@@ -224,16 +291,7 @@ impl SaveSet {
         }
 
         entries = request::dedup_entries(entries);
-        if entries.is_empty() {
-            return Err(AutosaveError::EmptySaveSet {
-                name: config.name.clone(),
-                reason: match &config.request_file {
-                    Some(f) => format!("'{}' declared no PVs", f.display()),
-                    None => "no request file, and no inline PVs".to_string(),
-                },
-            });
-        }
-        Ok(entries)
+        Ok((entries, ListStatus::new(code, "Ready to connect...")))
     }
 
     /// Every member's current value in this set's file encoding, an
@@ -439,7 +497,9 @@ impl SaveSet {
 
     /// Reload request file.
     pub async fn reload_request(&mut self) -> AutosaveResult<()> {
-        self.entries = Self::load_entries(&self.config).await?;
+        let (entries, status) = Self::load_entries(&self.config).await?;
+        self.entries = entries;
+        *self.list_status.lock().unwrap() = status;
         Ok(())
     }
 
@@ -449,6 +509,73 @@ impl SaveSet {
 
     pub fn stats(&self) -> &SaveSetStats {
         &self.stats
+    }
+
+    /// The methods the set saves by, in the order they were added.
+    pub fn methods(&self) -> Vec<SaveStrategy> {
+        self.methods.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub(super) fn created_at(&self) -> std::time::Instant {
+        self.created_at
+    }
+
+    /// C `plist->period`, which only a PERIODIC set reads.
+    pub(super) fn period(&self) -> Duration {
+        self.methods
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|m| match m {
+                SaveStrategy::Periodic { interval } => Some(*interval),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// C `plist->monitor_period`, which only a MONITORED set reads.
+    pub(super) fn monitor_period(&self) -> Duration {
+        self.methods
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|m| match m {
+                SaveStrategy::OnChange { min_interval } => Some(*min_interval),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// C `plist->trigger_channel`.
+    pub(super) fn trigger_channel(&self) -> Option<String> {
+        self.methods.lock().unwrap().iter().find_map(|m| match m {
+            SaveStrategy::Triggered { trigger_pv } => Some(trigger_pv.clone()),
+            _ => None,
+        })
+    }
+
+    /// `strNcpy(plist->statusStr, ...)` without a status code change, as
+    /// `enable_list` reports itself (save_restore.c:1431).
+    pub(super) fn set_status_text(&self, text: &str) {
+        self.list_status.lock().unwrap().text = text.to_string();
+    }
+
+    /// C `plist->save_method`.
+    pub fn save_method(&self) -> u32 {
+        self.methods.lock().unwrap().mask()
+    }
+
+    /// Add one method; only the manager does, so a method and the task
+    /// that serves it are added together.
+    pub(super) fn add_method(&self, method: SaveStrategy) -> AutosaveResult<()> {
+        self.methods
+            .lock()
+            .unwrap()
+            .add(method)
+            .map_err(|bit| AutosaveError::AlreadyInMode {
+                request_file: self.config.key(),
+                bit,
+            })
     }
 
     pub fn config(&self) -> &SaveSetConfig {

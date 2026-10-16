@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crate::server::database::PvDatabase;
 use crate::types::EpicsValue;
@@ -9,16 +9,17 @@ use crate::runtime::task::TaskHandle;
 
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
-use super::save_file;
 use super::save_set::{
     ListStatus, RestoreMode, RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy,
-    SrStatus, TriggerMode,
+    SrStatus,
 };
-use super::watermark::{ChangeWatermark, Tick};
+use crate::server::database::db_access::DbSubscription;
+use crate::server::recgbl::EventMask;
+use std::time::{Duration, Instant};
 
 /// Builder for constructing an AutosaveManager.
 pub struct AutosaveBuilder {
-    save_sets: Vec<SaveSetConfig>,
+    save_sets: Vec<(SaveSetConfig, SaveStrategy)>,
     global_macros: HashMap<String, String>,
     status_prefix: Option<String>,
     compat: CompatMode,
@@ -34,8 +35,10 @@ impl AutosaveBuilder {
         }
     }
 
-    pub fn add_set(mut self, config: SaveSetConfig) -> Self {
-        self.save_sets.push(config);
+    /// One `create_*_set` call: `method` joins the set built from the same
+    /// request file, if there is one.
+    pub fn add_set(mut self, config: SaveSetConfig, method: SaveStrategy) -> Self {
+        self.save_sets.push((config, method));
         self
     }
 
@@ -72,17 +75,16 @@ impl AutosaveBuilder {
         let (shutdown_tx, _) = watch::channel(false);
         let manager = AutosaveManager {
             sets: Mutex::new(Vec::new()),
-            failed: Mutex::new(Vec::new()),
+            adding: tokio::sync::Mutex::new(()),
             status_prefix: self.status_prefix,
             shutdown: shutdown_tx,
             compat: self.compat,
             global_macros: self.global_macros,
-            runtime: OnceLock::new(),
             recent: Mutex::new(None),
         };
-        for cfg in self.save_sets {
+        for (cfg, method) in self.save_sets {
             // Announced and recorded by `add_set`; nothing is left to say.
-            let _ = manager.add_set(cfg).await;
+            let _ = manager.add_set(cfg, method).await;
         }
         manager
     }
@@ -90,12 +92,6 @@ impl AutosaveBuilder {
 
 /// A built save set and the lock that serialises its saves.
 type SetEntry = (Arc<SaveSet>, Arc<tokio::sync::Mutex<()>>);
-
-/// What a set's task needs, captured once by [`AutosaveManager::start`].
-struct Runtime {
-    reactor: crate::runtime::task::Reactor,
-    db: Arc<PvDatabase>,
-}
 
 /// Manages multiple save sets with task orchestration.
 ///
@@ -107,16 +103,13 @@ struct Runtime {
 /// spawned onto the runtime `start` captured.
 pub struct AutosaveManager {
     sets: Mutex<Vec<SetEntry>>,
-    /// The configured sets that never became a [`SaveSet`], by name and
-    /// reason. They hold no state to save or restore, so they exist only
-    /// to be counted: [`Self::status_all`] is the one place a set that
-    /// failed and a set that is working are listed together.
-    failed: Mutex<Vec<(String, String)>>,
+    /// Serialises [`Self::add_set`]: the lookup by request file and the
+    /// push of a new set are one step, across the build's awaits.
+    adding: tokio::sync::Mutex<()>,
     status_prefix: Option<String>,
     shutdown: watch::Sender<bool>,
     compat: CompatMode,
     global_macros: HashMap<String, String>,
-    runtime: OnceLock<Runtime>,
     /// The manager's own latest SR_recentlyStr event; see [`SaveSet::recent`].
     recent: Mutex<Option<(std::time::Instant, String)>>,
 }
@@ -125,43 +118,77 @@ impl std::fmt::Debug for AutosaveManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutosaveManager")
             .field("sets", &self.set_names())
-            .field("started", &self.runtime.get().is_some())
             .finish()
     }
 }
 
 impl AutosaveManager {
-    /// Build one more save set and, once [`Self::start`] has run, start
-    /// its task. C `create_data_set`.
+    /// C `create_data_set`: add `method` to the set built from the same
+    /// request file, or build that set; once [`Self::start`] has run, the
+    /// method's task starts too.
     ///
-    /// A set that cannot be built is announced on the error log and kept
-    /// as [`SaveSetStatus::Error`] for `fdblist`, exactly as one that failed
-    /// at build time; the error is also returned so an iocsh caller can
-    /// print it.
-    pub async fn add_set(&self, mut cfg: SaveSetConfig) -> AutosaveResult<()> {
+    /// A second method of a kind the set already has is refused with C's
+    /// "already in %x mode" line. A set that cannot be built is not kept,
+    /// as C frees the list `readReqFile` failed (save_restore.c:2460-2462),
+    /// so a later call for the file starts over. Either error is also
+    /// returned, already reported.
+    pub async fn add_set(&self, cfg: SaveSetConfig, method: SaveStrategy) -> AutosaveResult<()> {
+        self.add(cfg, method, false).await
+    }
+
+    /// [`Self::add_set`] for a `create_*_set` command: a method that makes
+    /// the list is held to C's `MIN_PERIOD` floor, one that joins it is not.
+    pub(super) async fn create_data_set(
+        &self,
+        cfg: SaveSetConfig,
+        method: SaveStrategy,
+    ) -> AutosaveResult<()> {
+        self.add(cfg, method, true).await
+    }
+
+    async fn add(
+        &self,
+        mut cfg: SaveSetConfig,
+        method: SaveStrategy,
+        from_iocsh: bool,
+    ) -> AutosaveResult<()> {
+        let _adding = self.adding.lock().await;
+        let key = cfg.key();
+        let existing = self
+            .sets
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(s, _)| s.config().key() == key)
+            .cloned();
+        if let Some((set, _)) = existing {
+            set.add_method(method).inspect_err(report)?;
+            return Ok(());
+        }
         // Merge global macros (config overrides globals)
         for (k, v) in &self.global_macros {
             cfg.macros.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        let method = if from_iocsh {
+            method.creating_list()
+        } else {
+            method
+        };
         let name = cfg.name.clone();
         let set = match SaveSet::new_with_mode(cfg, self.compat).await {
             Ok(set) => Arc::new(set),
+            // `readReqFile` printed C's own line for this one.
+            Err(e @ AutosaveError::ReqFileUnopened(_)) => return Err(e),
             Err(e) => {
                 crate::runtime::log::errlog_vprintf(format_args!(
                     "autosave: save set '{name}' not built: {e} - its PVs are not saved\n"
                 ));
-                self.failed.lock().unwrap().push((name, e.to_string()));
                 return Err(e);
             }
         };
+        set.add_method(method)?;
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        self.sets.lock().unwrap().push((set.clone(), lock.clone()));
-        if let Some(rt) = self.runtime.get() {
-            // Detached like the tasks `start` spawns: only `shutdown` ends
-            // a set's task, and the outer join `start` returned is the
-            // servers' abort target, not the set tasks' owner.
-            let _ = self.spawn_set_task(&rt.reactor, set, lock, rt.db.clone());
-        }
+        self.sets.lock().unwrap().push((set, lock));
         Ok(())
     }
 
@@ -179,208 +206,106 @@ impl AutosaveManager {
         results
     }
 
-    /// Start all periodic/triggered/onchange tasks. Returns a join handle.
+    /// Start C's save_restore task (save_restore.c:782-1260): one task
+    /// serves every set's methods, so a set's events land in one
+    /// `save_state` and cost it one save a pass.
     ///
     /// Takes the [`Reactor`](crate::runtime::task::Reactor), unlike every
-    /// deferred record tail: each strategy is a poller on
-    /// `runtime::task::interval`, which is `tokio::time` on a hosted build. Autosave is started from
-    /// `IocApplication::run`, which owns that runtime; it is not on the
-    /// synchronous record-processing chain that reaches a runtime-less
-    /// connection thread. The parameter is what says so for the *spawns*,
-    /// which used to rest on this paragraph alone and which a caller could
-    /// not be stopped from ignoring.
-    ///
-    /// It does not retire the census waiver, and this comment claimed
-    /// otherwise until it was checked. The three `runtime::task::interval`
-    /// tickers below (`:161`, `:191`, `:221`) still name the ambient seam,
-    /// `interval` is on `record_seam_gate::BANNED`, and `EXEMPT` in
-    /// `server/mod.rs` is still what lets this file past
-    /// `a_deferred_record_tail_never_uses_the_ambient_seam`. Retiring it
-    /// needs the delay half carried on the capability too, not another
-    /// sentence here.
+    /// deferred record tail: autosave is started from `IocApplication::run`,
+    /// which owns that runtime; it is not on the synchronous
+    /// record-processing chain that reaches a runtime-less connection
+    /// thread. `EXEMPT` in `server/mod.rs` is still what lets this file
+    /// past `a_deferred_record_tail_never_uses_the_ambient_seam`: the pass
+    /// delay is the ambient `runtime::task::sleep`.
     pub fn start(
         self: Arc<Self>,
         reactor: &crate::runtime::task::Reactor,
         db: Arc<PvDatabase>,
     ) -> TaskHandle<()> {
-        // The first `start` owns the runtime the set tasks spawn onto; a
-        // set added after this point is started from `add_set` with it.
-        let _ = self.runtime.set(Runtime {
-            reactor: reactor.clone(),
-            db: db.clone(),
-        });
-        let outer = reactor.clone();
-        reactor.spawn(async move {
-            let mut handles: Vec<_> = self
-                .sets()
-                .into_iter()
-                .filter_map(|(set, lock)| self.spawn_set_task(&outer, set, lock, db.clone()))
-                .collect();
-            if let Some(prefix) = self.status_prefix.clone() {
-                let me = self.clone();
-                let db = db.clone();
-                handles.push(outer.spawn(async move { me.report_status(&db, &prefix).await }));
-            }
-
-            // Wait for all tasks to complete
-            for h in handles {
-                let _ = h.await;
-            }
-        })
+        reactor.spawn(async move { self.save_task(&db).await })
     }
 
-    /// The tail of each pass of C's save_restore loop (save_restore.c:1059-1121),
-    /// once per `MIN_DELAY` (1 s, :395): SR_status is the worst list status,
-    /// starting from OK (:903, :1044).
-    async fn report_status(&self, db: &PvDatabase, prefix: &str) {
+    /// The task's loop: a pass over every set, then the status PVs, at
+    /// most once per `MIN_DELAY`.
+    async fn save_task(&self, db: &PvDatabase) {
         let mut shutdown_rx = self.shutdown.subscribe();
+        let mut lists: Vec<ListState> = Vec::new();
         let mut heartbeat = 0i16;
         loop {
-            // The first pass is immediate, as C's loop runs before it waits.
             if is_stopped(&shutdown_rx) {
                 return;
             }
-            let sets = self.sets();
-            let statuses: Vec<_> = sets.iter().map(|(set, _)| set.list_status()).collect();
-            // `<=`: of equally bad lists the later one's text wins (:1043-1046).
-            let mut worst = ListStatus {
-                code: SrStatus::Ok,
-                text: "Ok".into(),
-            };
-            for status in &statuses {
-                if status.code <= worst.code {
-                    worst = status.clone();
+            let now = Instant::now();
+            // A set created since the last pass, before or after iocInit,
+            // joins here, as C's `lptr` list is walked afresh each pass.
+            for (set, lock) in self.sets() {
+                if !lists.iter().any(|l| Arc::ptr_eq(&l.set, &set)) {
+                    lists.push(ListState::new(set, lock));
                 }
             }
-            let recently = sets
-                .iter()
-                .filter_map(|(set, _)| set.recent())
-                .chain(self.recent.lock().unwrap().clone())
-                .max_by_key(|(at, _)| *at)
-                .map(|(_, text)| text)
-                .unwrap_or_default();
-            let _ = ca_put(
-                db,
-                &format!("{prefix}SR_status"),
-                EpicsValue::Long(worst.code as i32),
-            )
-            .await;
-            heartbeat = (heartbeat + 1) % 2;
-            let _ = ca_put(
-                db,
-                &format!("{prefix}SR_heartbeat"),
-                EpicsValue::Short(heartbeat),
-            )
-            .await;
-            let _ = ca_put_str(db, &format!("{prefix}SR_statusStr"), &worst.text).await;
-            let _ = ca_put_str(db, &format!("{prefix}SR_recentlyStr"), &recently).await;
-            // The first NUM_STATUS_PV_SETS lists, in creation order
-            // (save_restore.c:2466-2470); a set is never removed.
-            for (index, ((set, _), status)) in sets.iter().zip(statuses).enumerate().take(8) {
-                report_list(db, &format!("{prefix}SR_{index}_"), set, status).await;
+            for list in &mut lists {
+                if !list.pass(db, now, &shutdown_rx, self).await {
+                    return;
+                }
+            }
+            if let Some(prefix) = &self.status_prefix {
+                heartbeat = (heartbeat + 1) % 2;
+                self.report_status(db, prefix, &lists, heartbeat).await;
             }
             tokio::select! {
                 biased;
                 _ = stopped(&mut shutdown_rx) => return,
-                _ = crate::runtime::task::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = crate::runtime::task::sleep(MIN_DELAY.saturating_sub(now.elapsed())) => {}
             }
         }
     }
 
-    /// Spawn the poller for one set; `None` for a [`SaveStrategy::Manual`]
-    /// set, which has no task.
-    fn spawn_set_task(
+    /// The tail of each pass (save_restore.c:1059-1121): SR_status is the
+    /// worst list status, starting from OK (:903, :1044).
+    async fn report_status(
         &self,
-        reactor: &crate::runtime::task::Reactor,
-        set: Arc<SaveSet>,
-        lock: Arc<tokio::sync::Mutex<()>>,
-        db: Arc<PvDatabase>,
-    ) -> Option<TaskHandle<()>> {
-        let outer = reactor;
-        // C `enable_list` (save_restore.c:1485), every list's first pass.
-        self.note_recent(format!("list '{}' enabled", set.save_file()));
-        let mut shutdown_rx = self.shutdown.subscribe();
-
-        let handle = match set.config().strategy.clone() {
-            SaveStrategy::Periodic { interval } => {
-                outer.spawn(async move {
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = stopped(&mut shutdown_rx) => break,
-                            _ = crate::runtime::task::sleep(interval) => {
-                                // No watermark to gate: a Periodic set
-                                // re-saves the whole set every interval,
-                                // so the next pass retries a failed save
-                                // by construction.
-                                let _guard = lock.lock().await;
-                                if is_stopped(&shutdown_rx) {
-                                    break;
-                                }
-                                let _ = set.save_once(&db).await;
-                            }
-                        }
-                    }
-                })
-            }
-            SaveStrategy::Triggered {
-                trigger_pv,
-                mode,
-                poll_interval,
-            } => {
-                outer.spawn(async move {
-                    let mut watermark = ChangeWatermark::new(
-                        TriggerState {
-                            last_value: None,
-                            armed: true, // For NonZero: armed when last was 0
-                        },
-                        set,
-                        lock,
-                        db,
-                        shutdown_rx.clone(),
-                    );
-
-                    // The first poll is immediate: it is the baseline.
-                    loop {
-                        if is_stopped(&shutdown_rx) {
-                            break;
-                        }
-                        triggered_poll(&mut watermark, &trigger_pv, mode).await;
-                        tokio::select! {
-                            biased;
-                            _ = stopped(&mut shutdown_rx) => break,
-                            _ = crate::runtime::task::sleep(poll_interval) => {}
-                        }
-                    }
-                })
-            }
-            SaveStrategy::OnChange {
-                min_interval,
-                float_epsilon,
-            } => outer.spawn(async move {
-                let mut watermark =
-                    ChangeWatermark::new(HashMap::new(), set, lock, db, shutdown_rx.clone());
-
-                // The first poll is immediate: it is the baseline.
-                loop {
-                    if is_stopped(&shutdown_rx) {
-                        break;
-                    }
-                    onchange_poll(&mut watermark, float_epsilon).await;
-                    tokio::select! {
-                        biased;
-                        _ = stopped(&mut shutdown_rx) => break,
-                        _ = crate::runtime::task::sleep(min_interval) => {}
-                    }
-                }
-            }),
-            SaveStrategy::Manual => {
-                // No background task for manual sets
-                return None;
-            }
+        db: &PvDatabase,
+        prefix: &str,
+        lists: &[ListState],
+        heartbeat: i16,
+    ) {
+        let statuses: Vec<_> = lists.iter().map(|l| l.set.list_status()).collect();
+        // `<=`: of equally bad lists the later one's text wins (:1043-1046).
+        let mut worst = ListStatus {
+            code: SrStatus::Ok,
+            text: "Ok".into(),
         };
-
-        Some(handle)
+        for status in &statuses {
+            if status.code <= worst.code {
+                worst = status.clone();
+            }
+        }
+        let recently = lists
+            .iter()
+            .filter_map(|l| l.set.recent())
+            .chain(self.recent.lock().unwrap().clone())
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, text)| text)
+            .unwrap_or_default();
+        let _ = ca_put(
+            db,
+            &format!("{prefix}SR_status"),
+            EpicsValue::Long(worst.code as i32),
+        )
+        .await;
+        let _ = ca_put(
+            db,
+            &format!("{prefix}SR_heartbeat"),
+            EpicsValue::Short(heartbeat),
+        )
+        .await;
+        let _ = ca_put_str(db, &format!("{prefix}SR_statusStr"), &worst.text).await;
+        let _ = ca_put_str(db, &format!("{prefix}SR_recentlyStr"), &recently).await;
+        // The first NUM_STATUS_PV_SETS lists, in creation order
+        // (save_restore.c:2466-2470); a set is never removed.
+        for (index, (list, status)) in lists.iter().zip(statuses).enumerate().take(8) {
+            report_list(db, &format!("{prefix}SR_{index}_"), list, status).await;
+        }
     }
 
     /// Manual save for a specific set.
@@ -418,18 +343,11 @@ impl AutosaveManager {
         *self.recent.lock().unwrap() = Some((std::time::Instant::now(), text));
     }
 
-    /// Get status of all save sets, built and unbuilt alike.
-    ///
-    /// A set whose construction failed reports [`SaveSetStatus::Error`]
-    /// permanently - nothing retries it, and omitting it is what let an
-    /// IOC that had dropped a save set read as a healthy one.
+    /// Get status of all save sets.
     pub async fn status_all(&self) -> Vec<(String, SaveSetStatus)> {
         let mut results = Vec::new();
         for (set, _) in self.sets() {
             results.push((set.config().name.clone(), set.status().await));
-        }
-        for (name, reason) in self.failed.lock().unwrap().iter() {
-            results.push((name.clone(), SaveSetStatus::Error(reason.clone())));
         }
         results
     }
@@ -481,6 +399,11 @@ impl AutosaveManager {
     }
 }
 
+/// Print a refusal [`AutosaveManager::add_set`] returns as C's errlog line.
+fn report(e: &AutosaveError) {
+    crate::runtime::log::errlog_vprintf(format_args!("{e}\n"));
+}
+
 /// Resolve once `shutdown` has been called, or the manager is gone. A task
 /// subscribes when it starts, which can be after `shutdown`; a late receiver
 /// has already seen `true`, so this cannot be `changed()`, and `shutdown`
@@ -498,116 +421,9 @@ pub(super) fn is_stopped(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow() || rx.has_changed().is_err()
 }
 
-/// Compare two stringified values with float epsilon tolerance.
-fn values_equal_str(a: &str, b: &str, epsilon: f64) -> bool {
-    if a == b {
-        return true;
-    }
-    // Try numeric comparison with epsilon
-    if let (Ok(fa), Ok(fb)) = (a.parse::<f64>(), b.parse::<f64>()) {
-        return (fa - fb).abs() <= epsilon;
-    }
-    false
-}
-
-/// The `Triggered` arm's watermark: the trigger reading that has been
-/// accounted for, plus — for [`TriggerMode::NonZero`] — whether the
-/// next non-zero reading is a rising edge.
-struct TriggerState {
-    last_value: Option<String>,
-    armed: bool,
-}
-
-/// One poll of a `Triggered` save set.
-async fn triggered_poll(
-    watermark: &mut ChangeWatermark<TriggerState>,
-    trigger_pv: &str,
-    mode: TriggerMode,
-) {
-    let current = watermark.db().get_pv(trigger_pv).ok();
-    let current_str = current.as_ref().map(|v| v.to_string());
-
-    let tick = match mode {
-        TriggerMode::AnyChange => {
-            // L5: the first poll only establishes the baseline
-            // (`last_value` is `None`), so no save fires until the
-            // trigger PV is next seen to change. This is intentional —
-            // it avoids a spurious save at IOC startup — and the
-            // latency is bounded by `poll_interval` (1s by default for
-            // a `create_triggered_set`).
-            let changed = watermark.state().last_value.as_ref() != current_str.as_ref()
-                && watermark.state().last_value.is_some();
-            let next = TriggerState {
-                last_value: current_str,
-                armed: watermark.state().armed,
-            };
-            if changed {
-                Tick::Changed(next)
-            } else {
-                Tick::Unchanged(next)
-            }
-        }
-        TriggerMode::NonZero => {
-            let is_nonzero = current
-                .as_ref()
-                .and_then(|v| v.to_f64())
-                .is_some_and(|v| v != 0.0);
-            if !is_nonzero {
-                Tick::Unchanged(TriggerState {
-                    last_value: current_str,
-                    armed: true,
-                })
-            } else if watermark.state().armed && watermark.state().last_value.is_some() {
-                Tick::Changed(TriggerState {
-                    last_value: current_str,
-                    armed: false,
-                })
-            } else {
-                Tick::Unchanged(TriggerState {
-                    last_value: current_str,
-                    armed: watermark.state().armed,
-                })
-            }
-        }
-    };
-
-    watermark.advance(tick).await;
-}
-
-/// One poll of an `OnChange` save set.
-async fn onchange_poll(
-    watermark: &mut ChangeWatermark<HashMap<String, String>>,
-    float_epsilon: f64,
-) {
-    let pv_names = watermark.set().pv_names();
-    let mut current_snapshot = HashMap::new();
-    let mut changed = false;
-
-    for pv in &pv_names {
-        if let Ok(val) = watermark.db().get_pv(pv) {
-            let val_str = save_file::value_to_save_str(&val);
-            if let Some(old_str) = watermark.state().get(pv)
-                && !values_equal_str(old_str, &val_str, float_epsilon)
-            {
-                changed = true;
-            }
-            current_snapshot.insert(pv.clone(), val_str);
-        }
-    }
-
-    // An empty watermark is the pre-baseline state of a freshly
-    // started set, not a set whose PVs all vanished.
-    let tick = if changed && !watermark.state().is_empty() {
-        Tick::Changed(current_snapshot)
-    } else {
-        Tick::Unchanged(current_snapshot)
-    };
-
-    watermark.advance(tick).await;
-}
-
 /// One list's status PVs, as save_restore.c:1109-1121 writes them.
-async fn report_list(db: &PvDatabase, pv: &str, set: &SaveSet, status: ListStatus) {
+async fn report_list(db: &PvDatabase, pv: &str, list: &ListState, status: ListStatus) {
+    let set = &list.set;
     let _ = ca_put(
         db,
         &format!("{pv}Status"),
@@ -620,11 +436,13 @@ async fn report_list(db: &PvDatabase, pv: &str, set: &SaveSet, status: ListStatu
         name.truncate(dot);
     }
     let _ = ca_put_str(db, &format!("{pv}Name"), &name).await;
-    // C's `save_state` once the pass has cleared the events it served,
-    // which leaves nothing for these strategies.
-    if !matches!(set.config().strategy, SaveStrategy::OnChange { .. }) {
-        let _ = ca_put(db, &format!("{pv}State"), EpicsValue::Long(0)).await;
-    }
+    // C's `save_state` once the pass has cleared the events it served.
+    let _ = ca_put(
+        db,
+        &format!("{pv}State"),
+        EpicsValue::Long(list.save_state as i32),
+    )
+    .await;
     let _ = ca_put_str(db, &format!("{pv}StatusStr"), &status.text).await;
     if status.code >= SrStatus::Warn {
         let time = set.save_time().format("%a %b %d %H:%M:%S").to_string();
@@ -646,4 +464,214 @@ async fn ca_put(db: &PvDatabase, name: &str, value: EpicsValue) -> crate::error:
 async fn ca_put_str(db: &PvDatabase, name: &str, text: &str) -> crate::error::CaResult<()> {
     let text: String = text.chars().take(39).collect();
     ca_put(db, name, EpicsValue::String(text.into())).await
+}
+
+/// C `MIN_DELAY` (save_restore.c:395): the save task makes at most one
+/// pass a second.
+const MIN_DELAY: Duration = Duration::from_secs(1);
+/// C `save_restoreRetrySeconds` (:378): a failed list's next attempt.
+const RETRY_SECONDS: Duration = Duration::from_secs(60);
+/// C `save_restoreCallbackTimeout` (:382-383): a periodic or monitored
+/// list that no timer has re-armed for this long saves anyway.
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
+/// C `save_state` bits (save_restore.c:205-212): MONITORED is
+/// `TIMER | CHANGE`, and a save clears the SINGLE_EVENTS.
+const TIMER: u32 = 0x04;
+const CHANGE: u32 = 0x08;
+const SINGLE_EVENTS: u32 = SaveStrategy::PERIODIC | SaveStrategy::TRIGGERED | SaveStrategy::MANUAL;
+/// `ca_add_event`'s mask 0: DBE_VALUE | DBE_ALARM.
+const CA_DEFAULT_MASK: u16 = EventMask::VALUE.bits() | EventMask::ALARM.bits();
+
+/// The save task's half of C's `chlist`. Only the task holds it: each
+/// method's timer or monitor sets a bit in `save_state`, and the pass
+/// is the one place a bit becomes a save.
+struct ListState {
+    set: Arc<SaveSet>,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    /// C `enabled_method`.
+    enabled: u32,
+    /// C `save_state`.
+    save_state: u32,
+    /// The pending `periodicCb` / `monitorCb`.
+    periodic_due: Option<Instant>,
+    monitor_due: Option<Instant>,
+    callback_time: Instant,
+    save_attempt_time: Instant,
+    /// `triggered_save`'s and `on_change_save`'s monitors.
+    trigger: Option<DbSubscription>,
+    members: Vec<DbSubscription>,
+}
+
+impl ListState {
+    fn new(set: Arc<SaveSet>, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        let created = set.created_at();
+        Self {
+            set,
+            lock,
+            enabled: 0,
+            save_state: 0,
+            periodic_due: None,
+            monitor_due: None,
+            callback_time: created,
+            save_attempt_time: created,
+            trigger: None,
+            members: Vec::new(),
+        }
+    }
+
+    /// One list's share of a pass (save_restore.c:929-1047). `false` once
+    /// the manager has stopped: no save starts after that.
+    async fn pass(
+        &mut self,
+        db: &PvDatabase,
+        now: Instant,
+        stop: &watch::Receiver<bool>,
+        mgr: &AutosaveManager,
+    ) -> bool {
+        let method = self.set.save_method();
+        if self.enabled == 0 {
+            self.connect(db, mgr);
+        }
+        if self.enabled != method {
+            self.enable(db, now, mgr).await;
+        }
+        self.take_events(now);
+
+        if (method & SaveStrategy::PERIODIC != 0
+            || method & SaveStrategy::MONITORED == SaveStrategy::MONITORED)
+            && now.duration_since(self.callback_time) > CALLBACK_TIMEOUT
+        {
+            self.save_state = method;
+        }
+
+        let save_needed = self.save_state & SINGLE_EVENTS != 0
+            || self.save_state & SaveStrategy::MONITORED == SaveStrategy::MONITORED
+            || (self.set.list_status().code <= SrStatus::Fail
+                && now.duration_since(self.save_attempt_time) > RETRY_SECONDS);
+        if save_needed {
+            let lock = self.lock.clone();
+            let _guard = lock.lock().await;
+            if is_stopped(stop) {
+                return false;
+            }
+            self.save_attempt_time = now;
+            let _ = self.set.save_once(db).await;
+            // Monitor events delivered while the values were fetched are
+            // cleared with the rest, as C's preemptive callbacks are.
+            self.take_events(now);
+        }
+
+        if self.save_state & SaveStrategy::PERIODIC != 0 {
+            self.periodic_due = Some(now + self.set.period());
+            self.callback_time = now;
+        }
+        self.save_state &= !SINGLE_EVENTS;
+        if self.save_state & SaveStrategy::MONITORED == SaveStrategy::MONITORED {
+            self.monitor_due = Some(now + self.set.monitor_period());
+            self.save_state &= !SaveStrategy::MONITORED;
+            self.callback_time = now;
+        }
+        true
+    }
+
+    /// C `connect_list(plist, 1)` (save_restore.c:1276-1374), run while no
+    /// method is enabled. Members are database names, so a member is
+    /// connected when it resolves, as [`SaveSet::save_once`] reads it.
+    fn connect(&self, db: &PvDatabase, mgr: &AutosaveManager) {
+        self.set.set_status_text("Connecting PVs...");
+        let names = self.set.pv_names();
+        let failed: Vec<&String> = names
+            .iter()
+            .filter(|n| db.get_pv(n.as_str()).is_err())
+            .collect();
+        if !failed.is_empty() {
+            println!("save_restore:connect_list: not all searches successful");
+            for name in &failed {
+                println!("save_restore: connect failed for channel '{name}'");
+            }
+        }
+        let line = format!(
+            "{}: {} of {} PV's connected",
+            self.set.save_file(),
+            names.len() - failed.len(),
+            names.len()
+        );
+        println!("{line}");
+        mgr.note_recent(line);
+    }
+
+    /// C `enable_list` (save_restore.c:1425-1487): start what each method
+    /// not yet enabled needs. A trigger that cannot be monitored stays
+    /// disabled, and the next pass tries again.
+    async fn enable(&mut self, db: &PvDatabase, now: Instant, mgr: &AutosaveManager) {
+        let method = self.set.save_method();
+        self.set.set_status_text("Enabling list...");
+        if method & SaveStrategy::PERIODIC != 0 && self.enabled & SaveStrategy::PERIODIC == 0 {
+            self.periodic_due = Some(now + self.set.period());
+            self.enabled |= SaveStrategy::PERIODIC;
+            self.callback_time = now;
+        }
+        if method & SaveStrategy::TRIGGERED != 0 && self.enabled & SaveStrategy::TRIGGERED == 0 {
+            if let Some(name) = self.set.trigger_channel() {
+                // A name no record answers is C's `ca_pend_io` timeout.
+                match DbSubscription::subscribe_with_mask(db, &name, 0, CA_DEFAULT_MASK).await {
+                    Ok(sub) => {
+                        // `ca_add_event`'s first callback carries the
+                        // current value.
+                        sub.activation_handle().enable(db).await;
+                        self.trigger = Some(sub);
+                        self.enabled |= SaveStrategy::TRIGGERED;
+                    }
+                    Err(_) => {
+                        println!("save_restore:enable_list: timeout on search of {name}");
+                    }
+                }
+            }
+        }
+        if method & SaveStrategy::MONITORED != 0 && self.enabled & SaveStrategy::MONITORED == 0 {
+            for name in self.set.pv_names() {
+                // An unconnected channel's `ca_add_event` succeeds and
+                // waits; a member with no record raises no event here.
+                if let Ok(sub) =
+                    DbSubscription::subscribe_with_mask(db, &name, 0, CA_DEFAULT_MASK).await
+                {
+                    sub.activation_handle().enable(db).await;
+                    self.members.push(sub);
+                }
+            }
+            self.monitor_due = Some(now + self.set.monitor_period());
+            self.enabled |= SaveStrategy::MONITORED;
+            self.callback_time = now;
+        }
+        if method & SaveStrategy::MANUAL != 0 {
+            self.enabled |= SaveStrategy::MANUAL;
+        }
+        mgr.note_recent(format!("list '{}' enabled", self.set.save_file()));
+    }
+
+    /// The callbacks since the last look: `triggered_save` on a trigger
+    /// event that carries a value, `on_change_save` on any member event,
+    /// and the expired timers.
+    fn take_events(&mut self, now: Instant) {
+        if let Some(trigger) = &mut self.trigger {
+            while let Ok(event) = trigger.try_recv_event() {
+                if event.value().as_value().is_some() {
+                    self.save_state |= SaveStrategy::TRIGGERED;
+                }
+            }
+        }
+        for member in &mut self.members {
+            while member.try_recv_event().is_ok() {
+                self.save_state |= CHANGE;
+            }
+        }
+        if self.periodic_due.is_some_and(|due| due <= now) {
+            self.periodic_due = None;
+            self.save_state |= SaveStrategy::PERIODIC;
+        }
+        if self.monitor_due.is_some_and(|due| due <= now) {
+            self.monitor_due = None;
+            self.save_state |= TIMER;
+        }
+    }
 }

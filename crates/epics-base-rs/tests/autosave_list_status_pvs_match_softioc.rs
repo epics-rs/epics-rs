@@ -17,7 +17,7 @@
 //! T:SR_0_Time                     Sun Oct 11 14:00:00
 //! ```
 //!
-//! The texts are C's: "Initializing list" (:2442), "Ok" (:2013),
+//! The texts are C's: "Enabling list..." (:1431, the first pass), "Ok" (:2013),
 //! "%d %s not saved" (:2130), and Time is `TIMEFMT_noY` (:214) of the last
 //! save, written only from SR_STATUS_WARN up (:1118).
 
@@ -65,7 +65,6 @@ fn set(name: &str, save_path: PathBuf, pv: &str) -> SaveSetConfig {
     SaveSetConfig {
         name: name.into(),
         save_path,
-        strategy: SaveStrategy::Manual,
         request_file: None,
         request_pvs: vec![pv.into()],
         backup: BackupConfig {
@@ -134,8 +133,14 @@ async fn a_clean_save_fills_its_list_records_in_creation_order() {
     let mgr = Arc::new(
         AutosaveBuilder::new()
             .status_prefix("T:")
-            .add_set(set("first", dir.path().join("s.sav"), "T:SAVED"))
-            .add_set(set("second", dir.path().join("t.sav"), "T:SAVED"))
+            .add_set(
+                set("first", dir.path().join("s.sav"), "T:SAVED"),
+                SaveStrategy::Manual,
+            )
+            .add_set(
+                set("second", dir.path().join("t.sav"), "T:SAVED"),
+                SaveStrategy::Manual,
+            )
             .build()
             .await,
     );
@@ -162,7 +167,7 @@ async fn a_clean_save_fills_its_list_records_in_creation_order() {
         [
             one("s"),
             one("0"),
-            one("Initializing list"),
+            one("Enabling list..."),
             vec![],
             one("t")
         ],
@@ -188,7 +193,10 @@ async fn a_value_it_could_not_fetch_is_counted_in_statusstr() {
     let mgr = Arc::new(
         AutosaveBuilder::new()
             .status_prefix("T:")
-            .add_set(set("first", dir.path().join("s.sav"), "T:ABSENT"))
+            .add_set(
+                set("first", dir.path().join("s.sav"), "T:ABSENT"),
+                SaveStrategy::Manual,
+            )
             .build()
             .await,
     );

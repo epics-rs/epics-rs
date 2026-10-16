@@ -90,7 +90,7 @@ pub struct CaServerBuilder {
 struct AdoptedDatabase {
     db: Arc<PvDatabase>,
     acf: epics_base_rs::server::access_security::AcfCell,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
 }
 
@@ -299,9 +299,13 @@ impl CaServerBuilder {
         self
     }
 
-    /// Configure autosave with a save set configuration.
-    pub fn autosave(mut self, config: autosave::SaveSetConfig) -> Self {
-        self.ioc = self.ioc.autosave(config);
+    /// Configure autosave with one save set and its save method.
+    pub fn autosave(
+        mut self,
+        config: autosave::SaveSetConfig,
+        method: autosave::SaveStrategy,
+    ) -> Self {
+        self.ioc = self.ioc.autosave(config, method);
         self
     }
 
@@ -420,7 +424,7 @@ impl CaServerBuilder {
     pub fn serving(
         db: Arc<PvDatabase>,
         acf: epics_base_rs::server::access_security::AcfCell,
-        autosave_config: Option<autosave::SaveSetConfig>,
+        autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> Self {
         Self {
@@ -557,7 +561,7 @@ pub struct CaServer {
     /// after a config swap and by [`Self::notify_access_change`] for
     /// programmatic access-state changes the server cannot detect.
     acf_reload_tx: tokio::sync::broadcast::Sender<()>,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     /// Optional broadcast channel for connection lifecycle events.
     /// Subscribers (e.g. ca-gateway) get one event per accept/disconnect.
@@ -662,7 +666,7 @@ impl CaServer {
         port: u16,
         tcp_port: Option<u16>,
         acf: epics_base_rs::server::access_security::AcfCell,
-        autosave_config: Option<autosave::SaveSetConfig>,
+        autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> CaResult<Self> {
         let mut builder =
@@ -1167,8 +1171,8 @@ impl CaServer {
             let mgr = mgr.clone();
             let db_save = self.db.clone();
             Some(mgr.start(&seam_reactor, db_save))
-        } else if let Some(ref cfg) = self.autosave_config {
-            let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
+        } else if let Some((cfg, method)) = self.autosave_config.clone() {
+            let builder = autosave::AutosaveBuilder::new().add_set(cfg, method);
             // `build` cannot fail: a set it could not construct is reported
             // on the error log and carried as that set's error status, so
             // there is nothing left here to abandon the autosave task for.

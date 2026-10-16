@@ -169,7 +169,7 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
                     let cfg = set.config();
                     eprintln!("Save set: {}", cfg.name);
                     eprintln!("  Save path: {}", cfg.save_path.display());
-                    eprintln!("  Strategy: {:?}", cfg.strategy);
+                    eprintln!("  Methods: {:?}", set.methods());
                     if let Some(ref req) = cfg.request_file {
                         eprintln!("  Request file: {}", req.display());
                     }

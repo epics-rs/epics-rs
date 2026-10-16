@@ -68,11 +68,10 @@ record(mbbo, "T:SR_status") {
 }
 "#;
 
-fn set_config(save_path: PathBuf, strategy: SaveStrategy) -> SaveSetConfig {
+fn set_config(save_path: PathBuf) -> SaveSetConfig {
     SaveSetConfig {
         name: "s".into(),
         save_path,
-        strategy,
         request_file: None,
         request_pvs: vec!["T:SR_status".into()],
         backup: BackupConfig {
@@ -142,7 +141,7 @@ async fn three_heartbeats_toggle_the_bo_as_ca_put_does() {
     let mgr = Arc::new(
         AutosaveBuilder::new()
             .status_prefix("T:")
-            .add_set(set_config(dir.path().join("s.sav"), SaveStrategy::Manual))
+            .add_set(set_config(dir.path().join("s.sav")), SaveStrategy::Manual)
             .build()
             .await,
     );
@@ -211,7 +210,7 @@ async fn a_manual_restore_processes_as_ca_put_does() {
     .await
     .unwrap();
     let mgr = AutosaveBuilder::new()
-        .add_set(set_config(path, SaveStrategy::Manual))
+        .add_set(set_config(path), SaveStrategy::Manual)
         .build()
         .await;
 

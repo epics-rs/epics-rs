@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::save_file::{read_save_file, validate_save_file};
-use epics_base_rs::server::autosave::save_set::{SaveSet, SaveSetConfig, SaveStrategy};
+use epics_base_rs::server::autosave::save_set::{SaveSet, SaveSetConfig};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
@@ -36,9 +36,6 @@ async fn one_pv_set(sav: &std::path::Path, backup: BackupConfig) -> SaveSet {
     SaveSet::new(SaveSetConfig {
         name: "s".into(),
         save_path: sav.to_path_buf(),
-        strategy: SaveStrategy::Periodic {
-            interval: Duration::from_secs(60),
-        },
         request_file: None,
         request_pvs: vec!["PV1".into()],
         backup,

@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 asyn-rs = { workspace = true }
-rumqttc = "0.24"
+rumqttc = { version = "0.25", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"

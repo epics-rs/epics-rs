@@ -8,6 +8,7 @@ use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
 use rumqttc::Outgoing;
+use rumqttc::v5::mqttbytes::v5::{PubAckReason, PubCompReason, PubRecReason, SubscribeReasonCode};
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
 use tokio::sync::{Notify, mpsc};
 
@@ -90,7 +91,7 @@ pub async fn mqtt_event_loop(
     // cancel-safe, so the signal cannot be `select!`ed against it; it is routed
     // through rumqttc's command channel instead. The watcher enqueues a
     // Disconnect request, `poll()` writes AND FLUSHES the packet before it
-    // yields `Outgoing::Disconnect` (rumqttc v5 eventloop.rs:213-215), and the
+    // yields `Outgoing::Disconnect` (rumqttc v5 eventloop.rs:226-231), and the
     // loop breaks on that event — so the break happens after the bytes are on
     // the wire, which is what `disconnect()->wait()` guarantees in C.
     //
@@ -224,6 +225,12 @@ pub async fn mqtt_event_loop(
                     session = Session::Up;
                 }
             }
+            Ok(Event::Incoming(ack)) if ack_refused(&ack) => asyn_print(
+                &port_handle,
+                TraceMask::ERROR,
+                // paho hands `onFailure5` no message, so C's text is empty.
+                format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: '"),
+            ),
             Ok(Event::Outgoing(Outgoing::Disconnect)) => {
                 tracing::info!("MQTT DISCONNECT sent; event loop exiting");
                 break;
@@ -299,6 +306,29 @@ pub async fn mqtt_event_loop(
     // release it too; sending first is what lets the far side tell a loop that
     // ended from a task that died.
     let _ = done.send(());
+}
+
+/// A broker refusal paho reports through the operation's `onFailure5`, with
+/// the session left up: a one-filter SUBACK (C subscribes a topic at a time)
+/// or a PUBACK/PUBREC/PUBCOMP whose reason is 0x80 or above
+/// (MQTTAsyncUtils.c:2234-2248, :3199-3209).
+fn ack_refused(incoming: &Incoming) -> bool {
+    match incoming {
+        Incoming::SubAck(ack) => matches!(
+            ack.return_codes.as_slice(),
+            [code] if !matches!(code, SubscribeReasonCode::Success(_))
+        ),
+        Incoming::PubAck(ack) => !matches!(
+            ack.reason,
+            PubAckReason::Success | PubAckReason::NoMatchingSubscribers
+        ),
+        Incoming::PubRec(ack) => !matches!(
+            ack.reason,
+            PubRecReason::Success | PubRecReason::NoMatchingSubscribers
+        ),
+        Incoming::PubComp(ack) => ack.reason != PubCompReason::Success,
+        _ => false,
+    }
 }
 
 /// The session as paho's connect token sees it.
@@ -899,6 +929,12 @@ mod tests {
     /// Framing only — the variable header and payload are skipped, so a 0xE0
     /// byte *inside* a packet cannot be mistaken for a DISCONNECT.
     async fn read_packet_type(sock: &mut tokio::net::TcpStream) -> Option<u8> {
+        read_packet(sock).await.map(|(kind, _)| kind)
+    }
+
+    /// One MQTT control packet: its type nibble and everything after the
+    /// fixed header.
+    async fn read_packet(sock: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8>)> {
         use tokio::io::AsyncReadExt;
         let first = sock.read_u8().await.ok()?;
         let mut remaining = 0usize;
@@ -913,7 +949,7 @@ mod tests {
         }
         let mut body = vec![0u8; remaining];
         sock.read_exact(&mut body).await.ok()?;
-        Some(first >> 4)
+        Some((first >> 4, body))
     }
 
     /// MQ4: at teardown the broker must receive an MQTT DISCONNECT packet
@@ -1330,6 +1366,134 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), ev)
             .await
             .expect("the event loop must not wait out the retry interval")
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A broker that refuses a subscription gets C's `onFailCb` line and the
+    /// session stays up: no reconnect, and a later PUBLISH on the same
+    /// connection still lands in the param (MQTTAsyncUtils.c:2234-2248).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_subscribe_is_reported_and_the_session_stays_up() {
+        use asyn_rs::interrupt::InterruptFilter;
+        use asyn_rs::port::PortDriver;
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+        use tokio::io::AsyncWriteExt;
+
+        const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = MqttConfig {
+            broker_host: "127.0.0.1".into(),
+            broker_port: listener.local_addr().unwrap().port(),
+            client_id: "suback-refused".into(),
+            keep_alive_secs: 3600,
+            ..MqttConfig::default()
+        };
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let mut driver = crate::driver::MqttDriver::new(
+            "MQSUBACK",
+            &config,
+            Vec::new(),
+            publish_tx,
+            connected.clone(),
+        );
+        let reason = driver
+            .drv_user_create(&asyn_rs::port::DrvUserRequest::new("FLAT:INT dev/t", 0))
+            .unwrap()
+            .reason;
+        let topic_map = driver.topic_map();
+        let connected_param = driver.connected_param;
+        let shutdown = driver.shutdown_signal();
+        let teardown_done = driver.teardown_ack();
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+            driver,
+            asyn_rs::runtime::config::RuntimeConfig {
+                services,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("mqsuback-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("MQSUBACK"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        // An `I/O Intr` binding on the topic, so the ConnAck subscribes it.
+        let _binding = runtime.port_handle().interrupts().register_sync_callback(
+            InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                ..Default::default()
+            },
+            |_| {},
+        );
+
+        let port_handle = runtime.port_handle().clone();
+        let start = Arc::new(Notify::new());
+        let loop_start = start.clone();
+        let ev = tokio::spawn(async move {
+            mqtt_event_loop(
+                config,
+                topic_map,
+                port_handle,
+                publish_rx,
+                connected_param,
+                connected,
+                Lifecycle {
+                    start: loop_start,
+                    shutdown,
+                    done: teardown_done,
+                },
+            )
+            .await;
+        });
+        start.notify_one();
+
+        let (mut sock, _) = listener.accept().await.unwrap();
+        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        sock.write_all(&CONNACK).await.unwrap();
+        let (kind, body) = read_packet(&mut sock).await.unwrap();
+        assert_eq!(kind, 8, "SUBSCRIBE");
+        // SUBACK: packet id, no properties, reason 0x87 Not authorized.
+        sock.write_all(&[0x90, 0x04, body[0], body[1], 0x00, 0x87])
+            .await
+            .unwrap();
+
+        let log = || std::fs::read_to_string(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !log().contains("MqttDriver::onFailCb: MQTT Operation error: 'Error: '") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no onFailCb line in:\n{}", log()));
+
+        // The same connection still delivers: PUBLISH dev/t "5", QoS 0.
+        sock.write_all(&[
+            0x30, 0x09, 0x00, 0x05, b'd', b'e', b'v', b'/', b't', 0x00, b'5',
+        ])
+        .await
+        .unwrap();
+        let reader = runtime.port_handle().clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reader.read_int32(reason, 0).await.ok() != Some(5) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the PUBLISH after the refusal never landed:\n{}", log()));
+        assert!(!log().contains("Connection lost"), "{}", log());
+
+        runtime.shutdown();
+        assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
+        tokio::time::timeout(Duration::from_secs(10), ev)
+            .await
+            .expect("event loop did not exit")
             .unwrap();
         let _ = std::fs::remove_file(&path);
     }

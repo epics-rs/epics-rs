@@ -446,12 +446,16 @@ pub(crate) struct LinkPutParses {
 ///
 /// `field` must already be upper-cased.
 pub(crate) fn put_drives_processing_of(
+    rec: &crate::server::record::RecordCell,
     instance: &crate::server::record::RecordInstance,
     field: &str,
 ) -> bool {
     field == "PROC"
         || (instance.common.scan == crate::server::record::ScanType::Passive
-            && (field == "UDF" || instance.record.processes_after_put(field)))
+            && (field == "UDF"
+                || instance
+                    .record
+                    .processes_after_put(field, rec.rdes().is_pp(field))))
 }
 
 /// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`](crate::server::record::Record::take_cycle_posted_fields))
@@ -2123,13 +2127,18 @@ pub(crate) fn render_for_string_target<R: crate::server::record::Record + ?Sized
 
 /// The notify route's answer to a refused `dbPut`: whether the put still
 /// processes the record (`db_put_process` returns 1, `db_access.c:1025-1043`).
-fn set_refused_processes(via: &mut PutVia<'_>, instance: &RecordInstance, field: &str) {
+fn set_refused_processes(
+    via: &mut PutVia<'_>,
+    rec: &crate::server::record::RecordCell,
+    instance: &RecordInstance,
+    field: &str,
+) {
     if let PutVia::DbPutField {
         refused_processes: Some(processes),
         ..
     } = via
     {
-        **processes = put_drives_processing_of(instance, field);
+        **processes = put_drives_processing_of(rec, instance, field);
     }
 }
 
@@ -2664,7 +2673,7 @@ impl PvDatabase {
         };
         let (field_upper, _) = rec.put_name(field);
         let instance = rec.read();
-        put_drives_processing_of(&instance, &field_upper)
+        put_drives_processing_of(&rec, &instance, &field_upper)
     }
 
     /// Is `record_name.field` a DBF link field (INLINK/OUTLINK/FWDLINK)?
@@ -2863,7 +2872,7 @@ impl PvDatabase {
         .and_then(|()| instance.record.special(field, false));
         if let Err(e) = pass0 {
             self.remove_put_link(&instance, field, before);
-            set_refused_processes(&mut via, &instance, field);
+            set_refused_processes(&mut via, rec, &instance, field);
             return Err(e);
         }
         special_before_put(&mut instance, field);
@@ -2950,7 +2959,7 @@ impl PvDatabase {
             instance.common.udf = 0;
         }
         if status.is_err() {
-            set_refused_processes(&mut via, &instance, field);
+            set_refused_processes(&mut via, rec, &instance, field);
         }
 
         let (frame, links) = partition_special_actions(actions);
@@ -3542,7 +3551,7 @@ impl PvDatabase {
             ProcessMode::Force => true,
             ProcessMode::Passive => self
                 .get_record(record_name)
-                .is_some_and(|rec| put_drives_processing_of(&rec.read(), field)),
+                .is_some_and(|rec| put_drives_processing_of(&rec, &rec.read(), field)),
         };
         if drive {
             self.put_driven_process(record_name).await
@@ -4353,12 +4362,12 @@ impl PvDatabase {
         // double-process scanned records and spuriously process puts to
         // non-`pp` fields (extra FLNK / monitors / device writes /
         // timestamps). `process_passive_fields()` is total and fail-safe: an
-        // unmodeled type returns `&[]` (and warns once), so it processes on
+        // undeclared type returns `&[]`, so it processes on
         // `PROC` only — spurious processing is opt-in (a type must declare its
         // pp set), never the default.
         let should_process = {
             let instance = rec.read();
-            put_drives_processing_of(&instance, &field)
+            put_drives_processing_of(&rec, &instance, &field)
         };
 
         if !should_process {

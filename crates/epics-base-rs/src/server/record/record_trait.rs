@@ -3756,33 +3756,32 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// Field names declared `pp(TRUE)` in this record type's DBD (empty if
-    /// none, e.g. `event`/`histogram`, or if the type is unmodeled).
+    /// none, e.g. `event`/`histogram`, or if the type has no declaration).
     ///
     /// Drives the `dbPutField` processing gate: C `dbAccess.c:1263`
     /// re-processes a record on a put only when the put field is `PROC` or it
-    /// is `pp(TRUE)` **and** `SCAN == Passive`. The table is total and
-    /// fail-safe — an unmodeled type returns `&[]` (and warns once), so its
-    /// field puts never auto-process (only `PROC` does). The default consults
-    /// the central DBD-sourced table keyed by [`Record::record_type`]; record
-    /// types can override.
+    /// is `pp(TRUE)` **and** `SCAN == Passive`. The default reads `pp` from
+    /// [`FieldDeclaration::field_list`], so a downstream type's generated
+    /// `declared_fields` carries it; only a synthetic type with no
+    /// declaration overrides this.
     fn process_passive_fields(&self) -> &'static [&'static str] {
-        super::process_passive::pp_fields_for(self.record_type())
+        super::process_passive::pp_fields_of(self.field_list())
     }
 
-    /// Whether a put to `field` should reprocess this Passive record.
+    /// Whether a put to `field` should reprocess this Passive record, given
+    /// `pp`: whether `field` is in [`Self::process_passive_fields`], which the
+    /// put gate reads from the set its cell cached at creation.
     ///
-    /// The default is pure `pp(TRUE)` membership — the put gate's
-    /// `field in process_passive_fields()` test. A record type overrides this
+    /// The default is `pp` itself. A record type overrides this
     /// when its C `special()` conditionally returns ERROR to suppress the
     /// reprocess for a `pp(TRUE)` field on certain values (e.g. motor STUP:
     /// only a `STUP == ON` put runs the status-update process; any other value
     /// is clamped to OFF and C returns ERROR so no process runs). Modeling that
     /// here keeps the suppression at the same gate as the pp test, with no
     /// per-put one-shot state — the post-clamp field value is deterministic.
-    fn processes_after_put(&self, field: &str) -> bool {
-        self.process_passive_fields()
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(field))
+    fn processes_after_put(&self, field: &str, pp: bool) -> bool {
+        let _ = field;
+        pp
     }
 
     /// The record's `DBF_ENUM` state strings — the C rset slot

@@ -2525,6 +2525,12 @@ pub(crate) struct RecordDesc {
 }
 
 impl RecordDesc {
+    /// Whether `field` is in [`Record::process_passive_fields`].
+    #[inline]
+    pub(crate) fn is_pp(&self, field: &str) -> bool {
+        self.pp_fields.iter().any(|f| f.eq_ignore_ascii_case(field))
+    }
+
     /// Whether `field` is the type's [`Record::primary_field`]. `record` is
     /// the cell's own record, asked only by a debug build to check the fact.
     #[inline]
@@ -2910,8 +2916,7 @@ impl PutAddr {
             watched: is_metadata_cache_source(field)
                 || RecordInstance::field_posts_property(addr.desc),
             cache_source: is_metadata_cache_source(field),
-            post_suppressed: field == rdes.primary_field
-                && rdes.pp_fields.iter().any(|f| f.eq_ignore_ascii_case(field)),
+            post_suppressed: field == rdes.primary_field && rdes.is_pp(field),
             field: addr,
         }
     }

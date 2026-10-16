@@ -754,13 +754,11 @@ impl Record for MotorRecord {
     /// for any non-ON put by the time this gate runs, so the post-clamp value
     /// is the deterministic discriminator. Every other pp(TRUE) field
     /// reprocesses normally (default membership test).
-    fn processes_after_put(&self, field: &str) -> bool {
+    fn processes_after_put(&self, field: &str, pp: bool) -> bool {
         if field.eq_ignore_ascii_case("STUP") {
             return self.stat.stup == 1;
         }
-        self.process_passive_fields()
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(field))
+        pp
     }
 
     /// C never derives the motor's UDF from VAL. `motorRecord.cc` touches
@@ -913,16 +911,17 @@ mod tests {
         let mut on = MotorRecord::new();
         on.put_field("STUP", EpicsValue::Short(1)).unwrap();
         assert_eq!(on.stat.stup, 1);
-        assert!(on.processes_after_put("STUP"));
+        assert!(on.processes_after_put("STUP", true));
 
         // STUP == BUSY -> clamped to OFF, no reprocess (C return ERROR).
         let mut off = MotorRecord::new();
         off.put_field("STUP", EpicsValue::Short(2)).unwrap();
         assert_eq!(off.stat.stup, 0);
-        assert!(!off.processes_after_put("STUP"));
+        assert!(!off.processes_after_put("STUP", true));
 
-        // A non-pp(TRUE) config field never reprocesses (default membership).
-        assert!(!off.processes_after_put("VELO"));
+        // Every other field takes the declared pp bit.
+        assert!(off.processes_after_put("VAL", true));
+        assert!(!off.processes_after_put("VELO", false));
     }
 
     // C motorRecord.cc:1495 — every process pass fires the RLNK readback

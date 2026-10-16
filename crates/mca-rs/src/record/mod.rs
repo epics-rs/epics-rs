@@ -44,7 +44,6 @@ pub mod dbd_generated;
 mod roi;
 
 use std::any::Any;
-use std::sync::OnceLock;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
@@ -873,26 +872,6 @@ impl Record for McaRecord {
             self.nuse = self.nmax;
         }
         Ok(())
-    }
-
-    /// The `pp(TRUE)` set, read off the SAME generated table the field
-    /// declaration comes from.
-    ///
-    /// The framework's default consults a central table keyed by record type,
-    /// which base builds from base's own `.dbd` set and which therefore does not
-    /// know `mca` — it would answer `&[]`, and a `caput STRT Acquire` would
-    /// never process the record. The declaration already carries `pp`, so this
-    /// answers from it rather than from a second list that could disagree with
-    /// the `.dbd`.
-    fn process_passive_fields(&self) -> &'static [&'static str] {
-        static PP: OnceLock<Vec<&'static str>> = OnceLock::new();
-        PP.get_or_init(|| {
-            dbd_generated::MCA_FIELDS
-                .iter()
-                .filter(|f| f.pp)
-                .map(|f| f.name)
-                .collect()
-        })
     }
 
     /// C `special` (`mcaRecord.c:1045-1094`) — a put to a setup field records
@@ -2430,11 +2409,13 @@ mod tests {
     #[test]
     fn the_process_passive_set_is_the_dbds_pp_set() {
         let rec = McaRecord::default();
-        assert!(rec.processes_after_put("STRT"));
-        assert!(rec.processes_after_put("READ"));
-        assert!(rec.processes_after_put("PRTM"));
-        assert!(!rec.processes_after_put("CALO"));
-        assert!(!rec.processes_after_put("HIHI"));
+        let pp = rec.process_passive_fields();
+        for field in ["STRT", "READ", "PRTM"] {
+            assert!(pp.contains(&field), "{field}");
+        }
+        for field in ["CALO", "HIHI"] {
+            assert!(!pp.contains(&field), "{field}");
+        }
 
         let declared: Vec<&str> = rec
             .field_list()

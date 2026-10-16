@@ -7,6 +7,8 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::port_handle::PortHandle;
 
+use ad_core_rs::driver::{snapshot_float64, snapshot_int32, undefined_as_zero};
+
 use crate::compute::{Gains, PeakParams, SineParams, SineWave};
 use crate::types::{SimMode, SineOperation};
 
@@ -130,77 +132,77 @@ impl SimConfigSnapshot {
         ad: &ADBaseParams,
         sim: &SimDetectorParams,
     ) -> AsynResult<Self> {
-        let dt_ord = handle.read_int32(ad.base.data_type, 0).await? as u8;
+        let dt_ord = snapshot_int32(handle, ad.base.data_type, 0).await? as u8;
         let data_type = NDDataType::from_ordinal(dt_ord).unwrap_or(NDDataType::UInt8);
 
-        let cm = handle.read_int32(ad.base.color_mode, 0).await?;
+        let cm = snapshot_int32(handle, ad.base.color_mode, 0).await?;
         let color_mode = sim_color_mode(cm);
 
         Ok(Self {
-            sim_mode: SimMode::from_i32(handle.read_int32(sim.sim_mode, 0).await?),
+            sim_mode: SimMode::from_i32(snapshot_int32(handle, sim.sim_mode, 0).await?),
             gains: Gains {
-                gain: handle.read_float64(ad.gain, 0).await?,
-                gain_x: handle.read_float64(sim.gain_x, 0).await?,
-                gain_y: handle.read_float64(sim.gain_y, 0).await?,
-                gain_red: handle.read_float64(sim.gain_red, 0).await?,
-                gain_green: handle.read_float64(sim.gain_green, 0).await?,
-                gain_blue: handle.read_float64(sim.gain_blue, 0).await?,
+                gain: snapshot_float64(handle, ad.gain, 0).await?,
+                gain_x: snapshot_float64(handle, sim.gain_x, 0).await?,
+                gain_y: snapshot_float64(handle, sim.gain_y, 0).await?,
+                gain_red: snapshot_float64(handle, sim.gain_red, 0).await?,
+                gain_green: snapshot_float64(handle, sim.gain_green, 0).await?,
+                gain_blue: snapshot_float64(handle, sim.gain_blue, 0).await?,
             },
             peak: PeakParams {
-                start_x: handle.read_int32(sim.peak_start_x, 0).await?,
-                start_y: handle.read_int32(sim.peak_start_y, 0).await?,
-                width_x: handle.read_int32(sim.peak_width_x, 0).await?,
-                width_y: handle.read_int32(sim.peak_width_y, 0).await?,
-                num_x: handle.read_int32(sim.peak_num_x, 0).await?,
-                num_y: handle.read_int32(sim.peak_num_y, 0).await?,
-                step_x: handle.read_int32(sim.peak_step_x, 0).await?,
-                step_y: handle.read_int32(sim.peak_step_y, 0).await?,
-                height_variation: handle.read_float64(sim.peak_height_variation, 0).await?,
+                start_x: snapshot_int32(handle, sim.peak_start_x, 0).await?,
+                start_y: snapshot_int32(handle, sim.peak_start_y, 0).await?,
+                width_x: snapshot_int32(handle, sim.peak_width_x, 0).await?,
+                width_y: snapshot_int32(handle, sim.peak_width_y, 0).await?,
+                num_x: snapshot_int32(handle, sim.peak_num_x, 0).await?,
+                num_y: snapshot_int32(handle, sim.peak_num_y, 0).await?,
+                step_x: snapshot_int32(handle, sim.peak_step_x, 0).await?,
+                step_y: snapshot_int32(handle, sim.peak_step_y, 0).await?,
+                height_variation: snapshot_float64(handle, sim.peak_height_variation, 0).await?,
             },
             sine: SineParams {
                 x_sine1: SineWave {
-                    amplitude: handle.read_float64(sim.x_sine1_amplitude, 0).await?,
-                    frequency: handle.read_float64(sim.x_sine1_frequency, 0).await?,
-                    phase: handle.read_float64(sim.x_sine1_phase, 0).await?,
+                    amplitude: snapshot_float64(handle, sim.x_sine1_amplitude, 0).await?,
+                    frequency: snapshot_float64(handle, sim.x_sine1_frequency, 0).await?,
+                    phase: snapshot_float64(handle, sim.x_sine1_phase, 0).await?,
                 },
                 x_sine2: SineWave {
-                    amplitude: handle.read_float64(sim.x_sine2_amplitude, 0).await?,
-                    frequency: handle.read_float64(sim.x_sine2_frequency, 0).await?,
-                    phase: handle.read_float64(sim.x_sine2_phase, 0).await?,
+                    amplitude: snapshot_float64(handle, sim.x_sine2_amplitude, 0).await?,
+                    frequency: snapshot_float64(handle, sim.x_sine2_frequency, 0).await?,
+                    phase: snapshot_float64(handle, sim.x_sine2_phase, 0).await?,
                 },
                 y_sine1: SineWave {
-                    amplitude: handle.read_float64(sim.y_sine1_amplitude, 0).await?,
-                    frequency: handle.read_float64(sim.y_sine1_frequency, 0).await?,
-                    phase: handle.read_float64(sim.y_sine1_phase, 0).await?,
+                    amplitude: snapshot_float64(handle, sim.y_sine1_amplitude, 0).await?,
+                    frequency: snapshot_float64(handle, sim.y_sine1_frequency, 0).await?,
+                    phase: snapshot_float64(handle, sim.y_sine1_phase, 0).await?,
                 },
                 y_sine2: SineWave {
-                    amplitude: handle.read_float64(sim.y_sine2_amplitude, 0).await?,
-                    frequency: handle.read_float64(sim.y_sine2_frequency, 0).await?,
-                    phase: handle.read_float64(sim.y_sine2_phase, 0).await?,
+                    amplitude: snapshot_float64(handle, sim.y_sine2_amplitude, 0).await?,
+                    frequency: snapshot_float64(handle, sim.y_sine2_frequency, 0).await?,
+                    phase: snapshot_float64(handle, sim.y_sine2_phase, 0).await?,
                 },
-                x_op: SineOperation::from_i32(handle.read_int32(sim.x_sine_operation, 0).await?),
-                y_op: SineOperation::from_i32(handle.read_int32(sim.y_sine_operation, 0).await?),
+                x_op: SineOperation::from_i32(
+                    snapshot_int32(handle, sim.x_sine_operation, 0).await?,
+                ),
+                y_op: SineOperation::from_i32(
+                    snapshot_int32(handle, sim.y_sine_operation, 0).await?,
+                ),
             },
-            offset: handle.read_float64(sim.offset, 0).await?,
-            noise: handle.read_float64(sim.noise, 0).await?,
+            offset: snapshot_float64(handle, sim.offset, 0).await?,
+            noise: snapshot_float64(handle, sim.noise, 0).await?,
             data_type,
             color_mode,
-            max_size_x: handle.read_int32(ad.max_size_x, 0).await? as usize,
-            max_size_y: handle.read_int32(ad.max_size_y, 0).await? as usize,
-            size_x: handle.read_int32(ad.size_x, 0).await? as usize,
-            size_y: handle.read_int32(ad.size_y, 0).await? as usize,
-            min_x: handle.read_int32(ad.min_x, 0).await.unwrap_or(0) as usize,
-            min_y: handle.read_int32(ad.min_y, 0).await.unwrap_or(0) as usize,
-            acquire_time: handle.read_float64(ad.acquire_time, 0).await?,
-            acquire_period: handle.read_float64(ad.acquire_period, 0).await?,
-            image_mode: ImageMode::from_i32(handle.read_int32(ad.image_mode, 0).await?),
-            num_images: handle.read_int32(ad.num_images, 0).await?,
-            array_callbacks: handle.read_int32(ad.base.array_callbacks, 0).await? != 0,
-            wait_for_plugins: handle
-                .read_int32(ad.base.wait_for_plugins, 0)
-                .await
-                .unwrap_or(0)
-                != 0,
+            max_size_x: snapshot_int32(handle, ad.max_size_x, 0).await? as usize,
+            max_size_y: snapshot_int32(handle, ad.max_size_y, 0).await? as usize,
+            size_x: snapshot_int32(handle, ad.size_x, 0).await? as usize,
+            size_y: snapshot_int32(handle, ad.size_y, 0).await? as usize,
+            min_x: snapshot_int32(handle, ad.min_x, 0).await? as usize,
+            min_y: snapshot_int32(handle, ad.min_y, 0).await? as usize,
+            acquire_time: snapshot_float64(handle, ad.acquire_time, 0).await?,
+            acquire_period: snapshot_float64(handle, ad.acquire_period, 0).await?,
+            image_mode: ImageMode::from_i32(snapshot_int32(handle, ad.image_mode, 0).await?),
+            num_images: snapshot_int32(handle, ad.num_images, 0).await?,
+            array_callbacks: snapshot_int32(handle, ad.base.array_callbacks, 0).await? != 0,
+            wait_for_plugins: snapshot_int32(handle, ad.base.wait_for_plugins, 0).await? != 0,
         })
     }
 
@@ -209,72 +211,83 @@ impl SimConfigSnapshot {
         ad: &ADBaseParams,
         sim: &SimDetectorParams,
     ) -> AsynResult<Self> {
-        let dt_ord = base.get_int32_param(ad.base.data_type, 0)? as u8;
+        let dt_ord = undefined_as_zero(base.get_int32_param(ad.base.data_type, 0))? as u8;
         let data_type = NDDataType::from_ordinal(dt_ord).unwrap_or(NDDataType::UInt8);
 
-        let cm = base.get_int32_param(ad.base.color_mode, 0)?;
+        let cm = undefined_as_zero(base.get_int32_param(ad.base.color_mode, 0))?;
         let color_mode = sim_color_mode(cm);
 
         Ok(Self {
-            sim_mode: SimMode::from_i32(base.get_int32_param(sim.sim_mode, 0)?),
+            sim_mode: SimMode::from_i32(undefined_as_zero(base.get_int32_param(sim.sim_mode, 0))?),
             gains: Gains {
-                gain: base.get_float64_param(ad.gain, 0)?,
-                gain_x: base.get_float64_param(sim.gain_x, 0)?,
-                gain_y: base.get_float64_param(sim.gain_y, 0)?,
-                gain_red: base.get_float64_param(sim.gain_red, 0)?,
-                gain_green: base.get_float64_param(sim.gain_green, 0)?,
-                gain_blue: base.get_float64_param(sim.gain_blue, 0)?,
+                gain: undefined_as_zero(base.get_float64_param(ad.gain, 0))?,
+                gain_x: undefined_as_zero(base.get_float64_param(sim.gain_x, 0))?,
+                gain_y: undefined_as_zero(base.get_float64_param(sim.gain_y, 0))?,
+                gain_red: undefined_as_zero(base.get_float64_param(sim.gain_red, 0))?,
+                gain_green: undefined_as_zero(base.get_float64_param(sim.gain_green, 0))?,
+                gain_blue: undefined_as_zero(base.get_float64_param(sim.gain_blue, 0))?,
             },
             peak: PeakParams {
-                start_x: base.get_int32_param(sim.peak_start_x, 0)?,
-                start_y: base.get_int32_param(sim.peak_start_y, 0)?,
-                width_x: base.get_int32_param(sim.peak_width_x, 0)?,
-                width_y: base.get_int32_param(sim.peak_width_y, 0)?,
-                num_x: base.get_int32_param(sim.peak_num_x, 0)?,
-                num_y: base.get_int32_param(sim.peak_num_y, 0)?,
-                step_x: base.get_int32_param(sim.peak_step_x, 0)?,
-                step_y: base.get_int32_param(sim.peak_step_y, 0)?,
-                height_variation: base.get_float64_param(sim.peak_height_variation, 0)?,
+                start_x: undefined_as_zero(base.get_int32_param(sim.peak_start_x, 0))?,
+                start_y: undefined_as_zero(base.get_int32_param(sim.peak_start_y, 0))?,
+                width_x: undefined_as_zero(base.get_int32_param(sim.peak_width_x, 0))?,
+                width_y: undefined_as_zero(base.get_int32_param(sim.peak_width_y, 0))?,
+                num_x: undefined_as_zero(base.get_int32_param(sim.peak_num_x, 0))?,
+                num_y: undefined_as_zero(base.get_int32_param(sim.peak_num_y, 0))?,
+                step_x: undefined_as_zero(base.get_int32_param(sim.peak_step_x, 0))?,
+                step_y: undefined_as_zero(base.get_int32_param(sim.peak_step_y, 0))?,
+                height_variation: undefined_as_zero(
+                    base.get_float64_param(sim.peak_height_variation, 0),
+                )?,
             },
             sine: SineParams {
                 x_sine1: SineWave {
-                    amplitude: base.get_float64_param(sim.x_sine1_amplitude, 0)?,
-                    frequency: base.get_float64_param(sim.x_sine1_frequency, 0)?,
-                    phase: base.get_float64_param(sim.x_sine1_phase, 0)?,
+                    amplitude: undefined_as_zero(base.get_float64_param(sim.x_sine1_amplitude, 0))?,
+                    frequency: undefined_as_zero(base.get_float64_param(sim.x_sine1_frequency, 0))?,
+                    phase: undefined_as_zero(base.get_float64_param(sim.x_sine1_phase, 0))?,
                 },
                 x_sine2: SineWave {
-                    amplitude: base.get_float64_param(sim.x_sine2_amplitude, 0)?,
-                    frequency: base.get_float64_param(sim.x_sine2_frequency, 0)?,
-                    phase: base.get_float64_param(sim.x_sine2_phase, 0)?,
+                    amplitude: undefined_as_zero(base.get_float64_param(sim.x_sine2_amplitude, 0))?,
+                    frequency: undefined_as_zero(base.get_float64_param(sim.x_sine2_frequency, 0))?,
+                    phase: undefined_as_zero(base.get_float64_param(sim.x_sine2_phase, 0))?,
                 },
                 y_sine1: SineWave {
-                    amplitude: base.get_float64_param(sim.y_sine1_amplitude, 0)?,
-                    frequency: base.get_float64_param(sim.y_sine1_frequency, 0)?,
-                    phase: base.get_float64_param(sim.y_sine1_phase, 0)?,
+                    amplitude: undefined_as_zero(base.get_float64_param(sim.y_sine1_amplitude, 0))?,
+                    frequency: undefined_as_zero(base.get_float64_param(sim.y_sine1_frequency, 0))?,
+                    phase: undefined_as_zero(base.get_float64_param(sim.y_sine1_phase, 0))?,
                 },
                 y_sine2: SineWave {
-                    amplitude: base.get_float64_param(sim.y_sine2_amplitude, 0)?,
-                    frequency: base.get_float64_param(sim.y_sine2_frequency, 0)?,
-                    phase: base.get_float64_param(sim.y_sine2_phase, 0)?,
+                    amplitude: undefined_as_zero(base.get_float64_param(sim.y_sine2_amplitude, 0))?,
+                    frequency: undefined_as_zero(base.get_float64_param(sim.y_sine2_frequency, 0))?,
+                    phase: undefined_as_zero(base.get_float64_param(sim.y_sine2_phase, 0))?,
                 },
-                x_op: SineOperation::from_i32(base.get_int32_param(sim.x_sine_operation, 0)?),
-                y_op: SineOperation::from_i32(base.get_int32_param(sim.y_sine_operation, 0)?),
+                x_op: SineOperation::from_i32(undefined_as_zero(
+                    base.get_int32_param(sim.x_sine_operation, 0),
+                )?),
+                y_op: SineOperation::from_i32(undefined_as_zero(
+                    base.get_int32_param(sim.y_sine_operation, 0),
+                )?),
             },
-            offset: base.get_float64_param(sim.offset, 0)?,
-            noise: base.get_float64_param(sim.noise, 0)?,
+            offset: undefined_as_zero(base.get_float64_param(sim.offset, 0))?,
+            noise: undefined_as_zero(base.get_float64_param(sim.noise, 0))?,
             data_type,
             color_mode,
-            max_size_x: base.get_int32_param(ad.max_size_x, 0)? as usize,
-            max_size_y: base.get_int32_param(ad.max_size_y, 0)? as usize,
-            size_x: base.get_int32_param(ad.size_x, 0)? as usize,
-            size_y: base.get_int32_param(ad.size_y, 0)? as usize,
+            max_size_x: undefined_as_zero(base.get_int32_param(ad.max_size_x, 0))? as usize,
+            max_size_y: undefined_as_zero(base.get_int32_param(ad.max_size_y, 0))? as usize,
+            size_x: undefined_as_zero(base.get_int32_param(ad.size_x, 0))? as usize,
+            size_y: undefined_as_zero(base.get_int32_param(ad.size_y, 0))? as usize,
             min_x: base.get_int32_param(ad.min_x, 0).unwrap_or(0) as usize,
             min_y: base.get_int32_param(ad.min_y, 0).unwrap_or(0) as usize,
-            acquire_time: base.get_float64_param(ad.acquire_time, 0)?,
-            acquire_period: base.get_float64_param(ad.acquire_period, 0)?,
-            image_mode: ImageMode::from_i32(base.get_int32_param(ad.image_mode, 0)?),
-            num_images: base.get_int32_param(ad.num_images, 0)?,
-            array_callbacks: base.get_int32_param(ad.base.array_callbacks, 0)? != 0,
+            acquire_time: undefined_as_zero(base.get_float64_param(ad.acquire_time, 0))?,
+            acquire_period: undefined_as_zero(base.get_float64_param(ad.acquire_period, 0))?,
+            image_mode: ImageMode::from_i32(undefined_as_zero(
+                base.get_int32_param(ad.image_mode, 0),
+            )?),
+            num_images: undefined_as_zero(base.get_int32_param(ad.num_images, 0))?,
+            array_callbacks: base
+                .get_int32_param(ad.base.array_callbacks, 0)
+                .unwrap_or(0)
+                != 0,
             wait_for_plugins: base
                 .get_int32_param(ad.base.wait_for_plugins, 0)
                 .unwrap_or(0)

@@ -63,6 +63,11 @@ fn test_driver_to_stats_pipeline() {
     params_applied(&stats_handle);
 
     let mut driver = ADDriverBase::new("SIM1", 1, 64, 64, 10_000_000, ASYN_CANBLOCK).unwrap();
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    driver
+        .port_base
+        .set_int32_param(driver.params.base.array_callbacks, 0, 1)
+        .unwrap();
     driver.connect_downstream(stats_handle.array_sender().clone());
 
     let mut arr = driver
@@ -116,6 +121,11 @@ fn test_driver_to_std_arrays_pipeline() {
     params_applied(&image_handle);
 
     let mut driver = ADDriverBase::new("SIM1", 1, 32, 32, 10_000_000, ASYN_CANBLOCK).unwrap();
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    driver
+        .port_base
+        .set_int32_param(driver.params.base.array_callbacks, 0, 1)
+        .unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
     let arr = driver
@@ -726,7 +736,8 @@ fn test_attribute_plugin_value_extraction() {
     use ad_plugins_rs::attribute::AttributeProcessor;
 
     let pool = NDArrayPool::new(1_000_000);
-    let proc = AttributeProcessor::new("exposure", 8);
+    let proc = AttributeProcessor::new(8);
+    proc.set_attr_name("exposure");
 
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.attributes.add(NDAttribute::new_static(
@@ -810,6 +821,11 @@ fn test_process_and_publish_writes_array_size_params() {
         ASYN_CANBLOCK,
     )
     .unwrap();
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    driver
+        .port_base
+        .set_int32_param(driver.params.base.array_callbacks, 0, 1)
+        .unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
     let mut arr = NDArray::new(

@@ -1,4 +1,5 @@
 use ad_core_rs::driver::ImageMode;
+use ad_core_rs::ndarray::NDDataType;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use sim_detector::create_sim_detector;
 
@@ -10,6 +11,7 @@ fn main() {
         &asyn_rs::registry::claim_port("SIM_DEMO").unwrap(),
         256,
         256,
+        NDDataType::UInt8 as i32,
         50_000_000,
         NDArrayOutput::new(),
     )

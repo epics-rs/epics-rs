@@ -38,7 +38,7 @@ dbLoadRecords("$(OPHYD_TEST_IOC)/db/sensor.template", "P=XF:31IDA-BI{Dev:5},R=E-
 dbLoadRecords("$(OPHYD_TEST_IOC)/db/sensor.template", "P=XF:31IDA-BI{Dev:6},R=E-I")
 
 # ===== SimDetector AreaDetector =====
-simDetectorConfig("SIM", 640, 480, 50000000)
+simDetectorConfig("SIM", 640, 480, 1, 0, 50000000)
 
 # Load SimDetector records with XF:31IDA-BI{Cam:Tbl}: prefix
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADSIMDETECTOR)/db:$(ADCORE)/db")

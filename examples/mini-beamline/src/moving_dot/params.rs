@@ -3,6 +3,8 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::port_handle::PortHandle;
 
+use ad_core_rs::driver::{snapshot_float64, snapshot_int32};
+
 use ad_core_rs::driver::ImageMode;
 use ad_core_rs::params::ADBaseParams;
 
@@ -64,28 +66,24 @@ impl MovingDotConfigSnapshot {
         dot: &MovingDotParams,
     ) -> AsynResult<Self> {
         Ok(Self {
-            motor_x: handle.read_float64(dot.motor_x_pos, 0).await?,
-            motor_y: handle.read_float64(dot.motor_y_pos, 0).await?,
-            beam_current: handle.read_float64(dot.beam_current, 0).await?,
-            shutter_open: handle.read_int32(dot.shutter_open, 0).await? != 0,
-            acquire_time: handle.read_float64(ad.acquire_time, 0).await?,
-            acquire_period: handle.read_float64(ad.acquire_period, 0).await?,
-            image_mode: ImageMode::from_i32(handle.read_int32(ad.image_mode, 0).await?),
-            num_images: handle.read_int32(ad.num_images, 0).await?,
-            array_callbacks: handle.read_int32(ad.base.array_callbacks, 0).await? != 0,
-            wait_for_plugins: handle
-                .read_int32(ad.base.wait_for_plugins, 0)
-                .await
-                .unwrap_or(0)
-                != 0,
-            size_x: handle.read_int32(ad.size_x, 0).await? as usize,
-            size_y: handle.read_int32(ad.size_y, 0).await? as usize,
-            bin_x: (handle.read_int32(ad.bin_x, 0).await?).max(1) as usize,
-            bin_y: (handle.read_int32(ad.bin_y, 0).await?).max(1) as usize,
-            slit_left: handle.read_float64(dot.slit_left, 0).await?,
-            slit_right: handle.read_float64(dot.slit_right, 0).await?,
-            slit_top: handle.read_float64(dot.slit_top, 0).await?,
-            slit_bottom: handle.read_float64(dot.slit_bottom, 0).await?,
+            motor_x: snapshot_float64(handle, dot.motor_x_pos, 0).await?,
+            motor_y: snapshot_float64(handle, dot.motor_y_pos, 0).await?,
+            beam_current: snapshot_float64(handle, dot.beam_current, 0).await?,
+            shutter_open: snapshot_int32(handle, dot.shutter_open, 0).await? != 0,
+            acquire_time: snapshot_float64(handle, ad.acquire_time, 0).await?,
+            acquire_period: snapshot_float64(handle, ad.acquire_period, 0).await?,
+            image_mode: ImageMode::from_i32(snapshot_int32(handle, ad.image_mode, 0).await?),
+            num_images: snapshot_int32(handle, ad.num_images, 0).await?,
+            array_callbacks: snapshot_int32(handle, ad.base.array_callbacks, 0).await? != 0,
+            wait_for_plugins: snapshot_int32(handle, ad.base.wait_for_plugins, 0).await? != 0,
+            size_x: snapshot_int32(handle, ad.size_x, 0).await? as usize,
+            size_y: snapshot_int32(handle, ad.size_y, 0).await? as usize,
+            bin_x: (snapshot_int32(handle, ad.bin_x, 0).await?).max(1) as usize,
+            bin_y: (snapshot_int32(handle, ad.bin_y, 0).await?).max(1) as usize,
+            slit_left: snapshot_float64(handle, dot.slit_left, 0).await?,
+            slit_right: snapshot_float64(handle, dot.slit_right, 0).await?,
+            slit_top: snapshot_float64(handle, dot.slit_top, 0).await?,
+            slit_bottom: snapshot_float64(handle, dot.slit_bottom, 0).await?,
         })
     }
 }

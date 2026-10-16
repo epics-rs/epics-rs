@@ -1012,9 +1012,13 @@ impl NDPluginProcess for ColorConvertProcessor {
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
-        base.create_param("COLOR_MODE_OUT", ParamType::Int32)?;
+        let color_mode_out = base.create_param("COLOR_MODE_OUT", ParamType::Int32)?;
         base.create_param("FALSE_COLOR", ParamType::Int32)?;
-        self.color_mode_out_idx = base.find_param("COLOR_MODE_OUT");
+        // The param reads the mode the processor converts to; the IOC builds
+        // Mono, as NDPluginColorConvert.cpp:661 seeds it.
+        let target = self.config.lock().target_mode;
+        base.set_int32_param(color_mode_out, 0, target as i32)?;
+        self.color_mode_out_idx = Some(color_mode_out);
         self.false_color_idx = base.find_param("FALSE_COLOR");
         Ok(())
     }
@@ -1508,6 +1512,28 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_register_params_seeds_the_processor_color_mode_out() {
+        // NDPluginColorConvert.cpp:661 seeds ColorModeOut; FalseColor stays
+        // undefined.
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        for target_mode in [NDColorMode::Mono, NDColorMode::RGB1] {
+            let mut base = PortDriverBase::new("CC_INIT", 1, PortFlags::default());
+            let mut proc = ColorConvertProcessor::new(ColorConvertConfig {
+                target_mode,
+                bayer_pattern: NDBayerPattern::RGGB,
+                false_color: 0,
+            });
+            proc.register_params(&mut base).unwrap();
+            let reason = |name: &str| base.find_param(name).unwrap();
+            assert_eq!(
+                base.get_int32_param(reason("COLOR_MODE_OUT"), 0).unwrap(),
+                target_mode as i32
+            );
+            assert!(base.get_int32_param(reason("FALSE_COLOR"), 0).is_err());
         }
     }
 

@@ -661,15 +661,9 @@ impl NDPluginProcess for TimeSeriesProcessor {
         // Per-signal parameter (NDPluginTimeSeries.cpp:82); read at addr == signal.
         state.p.ts_time_series = base.create_param("TS_TIME_SERIES", ParamType::Float64Array)?;
 
-        // Initial values (C constructor: setIntegerParam(P_TSNumPoints, 2048),
-        // numAverage_ == 1, acquireMode_ == Fixed, etc.).
+        // NDPluginTimeSeries.cpp:87 and acquireReset (:143) set only these two.
         base.set_int32_param(state.p.ts_num_points, 0, state.num_time_points as i32)?;
-        base.set_int32_param(state.p.ts_num_average, 0, state.num_average as i32)?;
-        base.set_int32_param(state.p.ts_acquire, 0, 0)?;
-        base.set_int32_param(state.p.ts_acquire_mode, 0, 0)?;
         base.set_int32_param(state.p.ts_current_point, 0, 0)?;
-        base.set_float64_param(state.p.ts_averaging_time, 0, state.averaging_time_actual)?;
-        base.set_float64_param(state.p.ts_time_per_point, 0, state.time_per_point)?;
 
         // Initial Fixed-mode time axis (C constructor allocateArrays -> createAxisArray).
         let axis: Vec<f64> = (0..state.num_time_points)
@@ -788,6 +782,23 @@ mod tests {
     fn test_averaged_value_numaverage_one_is_passthrough() {
         assert_eq!(averaged_value(200.0, 1, NDDataType::UInt8), 200.0);
         assert_eq!(averaged_value(-50.0, 1, NDDataType::Int8), -50.0);
+    }
+
+    #[test]
+    fn test_register_params_seeds_only_what_the_c_constructor_sets() {
+        let mut proc = TimeSeriesProcessor::new(2, NDArrayPool::new(0));
+        let mut base = PortDriverBase::new("TS_INIT", 3, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+        let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
+        let dbl = |name: &str| base.get_float64_param(base.find_param(name).unwrap(), 0);
+        assert_eq!(int("TS_NUM_POINTS").unwrap(), 2048);
+        assert_eq!(int("TS_CURRENT_POINT").unwrap(), 0);
+        for name in ["TS_ACQUIRE", "TS_ACQUIRE_MODE", "TS_NUM_AVERAGE"] {
+            assert!(int(name).is_err(), "{name}");
+        }
+        for name in ["TS_AVERAGING_TIME", "TS_TIME_PER_POINT"] {
+            assert!(dbl(name).is_err(), "{name}");
+        }
     }
 
     // ---- process_array end-to-end ----

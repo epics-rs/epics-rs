@@ -208,7 +208,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            AttributeProcessor::new("attr", 1).array_callbacks_seed(),
+            AttributeProcessor::new(1).array_callbacks_seed(),
             Some(false)
         );
         assert_eq!(Hdf5FileProcessor::new().array_callbacks_seed(), Some(false));

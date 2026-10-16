@@ -74,10 +74,10 @@ pub struct AttributeProcessor {
 
 impl AttributeProcessor {
     /// `num_channels` is C `maxAttributes_` (the per-frame channel count, floored
-    /// to >=1; NDPluginAttribute.cpp:184). Channel 0 is seeded with `attr_name`.
-    pub fn new(attr_name: &str, num_channels: usize) -> Self {
-        let mut channels = vec![AttrChannel::default(); num_channels.max(1)];
-        channels[0].name = attr_name.to_string();
+    /// to >=1; NDPluginAttribute.cpp:184). Every channel starts with no
+    /// attribute name, as NDPluginAttribute.cpp:197 seeds AttrName "".
+    pub fn new(num_channels: usize) -> Self {
+        let channels = vec![AttrChannel::default(); num_channels.max(1)];
         Self {
             channels: Mutex::new(channels),
             params: AttributeParams::default(),
@@ -170,6 +170,13 @@ impl NDPluginProcess for AttributeProcessor {
         self.params.value = base.create_param("ATTR_VAL", ParamType::Float64)?;
         self.params.value_sum = base.create_param("ATTR_VAL_SUM", ParamType::Float64)?;
         self.params.reset = base.create_param("ATTR_RESET", ParamType::Int32)?;
+        // NDPluginAttribute.cpp:194-198 seeds every channel; Reset stays undefined.
+        for (i, ch) in self.channels.lock().iter().enumerate() {
+            let a = i as i32;
+            base.set_float64_param(self.params.value, a, 0.0)?;
+            base.set_float64_param(self.params.value_sum, a, 0.0)?;
+            base.set_string_param(self.params.attr_name, a, &ch.name)?;
+        }
         Ok(())
     }
 
@@ -237,7 +244,7 @@ pub fn create_attribute_runtime(
     let num_channels = max_attributes.max(1) as usize;
     let num_addr = max_attributes.max(2) as usize;
 
-    let processor = AttributeProcessor::new("", num_channels);
+    let processor = AttributeProcessor::new(num_channels);
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
         claim, processor, pool, queue_size, source, wiring, num_addr, threads,
@@ -254,7 +261,7 @@ mod tests {
     #[test]
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = AttributeProcessor::new("", 8);
+        let proc = AttributeProcessor::new(8);
         let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -281,8 +288,24 @@ mod tests {
     }
 
     #[test]
+    fn test_register_params_seeds_every_channel() {
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("ATTR_INIT", 3, PortFlags::default());
+        let mut proc = AttributeProcessor::new(3);
+        proc.register_params(&mut base).unwrap();
+        let p = *proc.params();
+        for a in 0..3 {
+            assert_eq!(base.get_float64_param(p.value, a).unwrap(), 0.0);
+            assert_eq!(base.get_float64_param(p.value_sum, a).unwrap(), 0.0);
+            assert_eq!(base.get_string_param(p.attr_name, a).unwrap(), b"");
+        }
+        assert!(base.get_int32_param(p.reset, 0).is_err());
+    }
+
+    #[test]
     fn test_extract_named_attribute() {
-        let proc = AttributeProcessor::new("Temperature", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("Temperature");
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_array_with_attr("Temperature", 25.5, 1);
@@ -298,7 +321,8 @@ mod tests {
 
     #[test]
     fn test_sum_accumulation() {
-        let proc = AttributeProcessor::new("Intensity", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("Intensity");
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Intensity", 10.0, 1);
@@ -316,7 +340,8 @@ mod tests {
     #[test]
     fn reset_zeros_every_channel_inside_the_write_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::{SideParam, WriteVerdict};
-        let mut proc = AttributeProcessor::new("Count", 2);
+        let mut proc = AttributeProcessor::new(2);
+        proc.set_attr_name("Count");
         let mut base = PortDriverBase::new("T", 2, Default::default());
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);
@@ -344,7 +369,8 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let proc = AttributeProcessor::new("Count", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("Count");
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Count", 100.0, 1);
@@ -358,7 +384,8 @@ mod tests {
 
     #[test]
     fn test_special_attr_unique_id() {
-        let proc = AttributeProcessor::new("NDArrayUniqueId", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("NDArrayUniqueId");
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -373,7 +400,8 @@ mod tests {
         // C `NDPluginAttribute.cpp:63`: the NDArrayTimeStamp channel reads
         // `pArray->timeStamp`. A driver that derives it from epicsTS (the
         // `updateTimeStamps` path) sees the two agree.
-        let proc = AttributeProcessor::new("NDArrayTimeStamp", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("NDArrayTimeStamp");
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -402,7 +430,9 @@ mod tests {
         // Hardware time base, deliberately unrelated to epicsTS.
         arr.time_stamp = 7.25;
 
-        let ts = AttributeProcessor::new("NDArrayTimeStamp", 8);
+        let ts = AttributeProcessor::new(8);
+
+        ts.set_attr_name("NDArrayTimeStamp");
         let arr = Arc::new(arr);
         ts.process_array(&arr, &pool);
         assert!(
@@ -411,18 +441,23 @@ mod tests {
             ts.value()
         );
 
-        let sec = AttributeProcessor::new("NDArrayEpicsTSSec", 8);
+        let sec = AttributeProcessor::new(8);
+
+        sec.set_attr_name("NDArrayEpicsTSSec");
         sec.process_array(&arr, &pool);
         assert!((sec.value() - 100.0).abs() < 1e-9);
 
-        let nsec = AttributeProcessor::new("NDArrayEpicsTSnSec", 8);
+        let nsec = AttributeProcessor::new(8);
+
+        nsec.set_attr_name("NDArrayEpicsTSnSec");
         nsec.process_array(&arr, &pool);
         assert!((nsec.value() - 500_000_000.0).abs() < 1e-9);
     }
 
     #[test]
     fn test_missing_attribute() {
-        let proc = AttributeProcessor::new("NonExistent", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("NonExistent");
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -434,7 +469,8 @@ mod tests {
 
     #[test]
     fn test_string_attribute_ignored() {
-        let proc = AttributeProcessor::new("Label", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("Label");
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -451,7 +487,8 @@ mod tests {
 
     #[test]
     fn test_int32_attribute() {
-        let proc = AttributeProcessor::new("Counter", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("Counter");
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -471,7 +508,9 @@ mod tests {
         // C maxAttributes_ sizes the per-frame channel loop and the TS NDArray
         // length (NDPluginAttribute.cpp:55,98,184); neither is fixed at 8.
 
-        let mut proc = AttributeProcessor::new("Temp", 16);
+        let mut proc = AttributeProcessor::new(16);
+
+        proc.set_attr_name("Temp");
         proc.params.value = 2;
         proc.params.value_sum = 3;
         proc.channels.lock()[15].name = "High".to_string();
@@ -515,7 +554,8 @@ mod tests {
     fn test_missing_attribute_skips_post() {
         // C `continue`s (no setDoubleParam / callParamCallbacks) for a channel
         // whose attribute is absent this frame (NDPluginAttribute.cpp:72-80).
-        let mut proc = AttributeProcessor::new("Temp", 8);
+        let mut proc = AttributeProcessor::new(8);
+        proc.set_attr_name("Temp");
         proc.params.value = 2;
         proc.params.value_sum = 3;
         let pool = NDArrayPool::new(1_000_000);
@@ -542,7 +582,8 @@ mod tests {
 
     #[test]
     fn test_set_attr_name() {
-        let proc = AttributeProcessor::new("A", 8);
+        let proc = AttributeProcessor::new(8);
+        proc.set_attr_name("A");
         assert_eq!(proc.attr_name(), "A");
 
         proc.set_attr_name("B");

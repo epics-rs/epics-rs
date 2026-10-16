@@ -1,4 +1,5 @@
 use ad_core_rs::driver::{ColorMode, ImageMode};
+use ad_core_rs::ndarray::NDDataType;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use sim_detector::create_sim_detector;
 
@@ -8,6 +9,7 @@ fn test_single_mode_one_frame() {
         &asyn_rs::registry::claim_port("INT_SINGLE").unwrap(),
         64,
         64,
+        NDDataType::UInt8 as i32,
         10_000_000,
         NDArrayOutput::new(),
     )
@@ -45,6 +47,7 @@ fn test_mode_switch_during_continuous() {
         &asyn_rs::registry::claim_port("INT_SWITCH").unwrap(),
         32,
         32,
+        NDDataType::UInt8 as i32,
         10_000_000,
         NDArrayOutput::new(),
     )
@@ -102,6 +105,7 @@ fn test_rgb1_mode_acquisition() {
         &asyn_rs::registry::claim_port("INT_RGB").unwrap(),
         16,
         16,
+        NDDataType::UInt8 as i32,
         10_000_000,
         NDArrayOutput::new(),
     )

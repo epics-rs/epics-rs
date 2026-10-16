@@ -69,7 +69,7 @@ cargo run -p sim-detector --features ioc --bin sim-ioc -- \
 epicsEnvSet("PREFIX", "SIM1:")
 epicsEnvSet("CAM",    "cam1:")
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/ADApp/Db")
-simDetectorConfig("SIM1", 256, 256, 50000000)
+simDetectorConfig("SIM1", 256, 256, 1, 0, 50000000)
 dbLoadRecords("$(ADSIMDETECTOR)/simDetectorApp/Db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=SIM1,DTYP=asynSimDetector")
 iocInit()
 ```

@@ -23,8 +23,9 @@ use crate::stats::{StatsElem, merge_range};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Configuration for a single ROI region.
-#[derive(Debug, Clone)]
+/// Configuration for a single ROI region. The default is NDPluginROIStat.cpp's
+/// starting ROI: Use 0 (`:557`) and zero geometry.
+#[derive(Debug, Clone, Default)]
 pub struct ROIStatROI {
     pub enabled: bool,
     /// Offset in pixels: [x, y].
@@ -33,17 +34,6 @@ pub struct ROIStatROI {
     pub size: [usize; 2],
     /// Width of the background border (pixels). 0 = no background subtraction.
     pub bgd_width: usize,
-}
-
-impl Default for ROIStatROI {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            offset: [0, 0],
-            size: [0, 0],
-            bgd_width: 0,
-        }
-    }
 }
 
 /// Statistics computed for a single ROI.
@@ -642,15 +632,26 @@ impl NDPluginProcess for ROIStatProcessor {
         self.params.ts_timestamp =
             base.create_param("ROISTAT_TS_TIMESTAMP", ParamType::Float64Array)?;
 
-        // Set initial per-ROI values
+        // NDPluginROIStat.cpp:552-579; BgdWidth is left to the database.
         for (i, roi) in state.rois.iter().enumerate() {
             let addr = i as i32;
+            base.set_string_param(self.params.name, addr, "")?;
             base.set_int32_param(self.params.use_, addr, roi.enabled as i32)?;
-            base.set_int32_param(self.params.bgd_width, addr, roi.bgd_width as i32)?;
             base.set_int32_param(self.params.dim0_min, addr, roi.offset[0] as i32)?;
-            base.set_int32_param(self.params.dim1_min, addr, roi.offset[1] as i32)?;
             base.set_int32_param(self.params.dim0_size, addr, roi.size[0] as i32)?;
+            base.set_int32_param(self.params.dim0_max_size, addr, 0)?;
+            base.set_int32_param(self.params.dim1_min, addr, roi.offset[1] as i32)?;
             base.set_int32_param(self.params.dim1_size, addr, roi.size[1] as i32)?;
+            base.set_int32_param(self.params.dim1_max_size, addr, 0)?;
+            for stat in [
+                self.params.min_value,
+                self.params.max_value,
+                self.params.mean_value,
+                self.params.total,
+                self.params.net,
+            ] {
+                base.set_float64_param(stat, addr, 0.0)?;
+            }
         }
 
         // Export params
@@ -782,6 +783,58 @@ mod tests {
                 .verdict,
             WriteVerdict::Accept(1)
         );
+    }
+
+    #[test]
+    fn test_runtime_seeds_each_roi_as_the_c_constructor() {
+        // Every value NDPluginROIStat.cpp:552-579 sets, at every address;
+        // the controls stay undefined.
+        let (handle, p, _jh) = create_roi_stat_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_INIT").unwrap(),
+            NDArrayPool::new(1_000_000),
+            1,
+            "",
+            Arc::new(WiringRegistry::new()),
+            2,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        for addr in 0..2 {
+            for reason in [
+                p.use_,
+                p.dim0_min,
+                p.dim0_size,
+                p.dim0_max_size,
+                p.dim1_min,
+                p.dim1_size,
+                p.dim1_max_size,
+            ] {
+                assert_eq!(port.read_int32_blocking(reason, addr).unwrap(), 0);
+            }
+            for reason in [p.min_value, p.max_value, p.mean_value, p.total, p.net] {
+                assert_eq!(port.read_float64_blocking(reason, addr).unwrap(), 0.0);
+            }
+            for reason in [p.bgd_width, p.reset] {
+                assert!(port.read_int32_blocking(reason, addr).is_err());
+            }
+        }
+        assert_eq!(port.read_int32_blocking(p.ts_num_points, 0).unwrap(), 2048);
+        for reason in [
+            p.reset_all,
+            p.ts_control,
+            p.ts_current_point,
+            p.ts_acquiring,
+        ] {
+            assert!(port.read_int32_blocking(reason, 0).is_err());
+        }
+        // The port handle has no blocking octet read; Name goes through the base.
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("RS_NAME", 2, PortFlags::default());
+        let mut proc = ROIStatProcessor::new(vec![ROIStatROI::default(); 2], 2048);
+        proc.register_params(&mut base).unwrap();
+        for addr in 0..2 {
+            assert_eq!(base.get_string_param(proc.params.name, addr).unwrap(), b"");
+        }
     }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 

@@ -2015,9 +2015,10 @@ impl NDPluginProcess for StatsProcessor {
         &mut self,
         base: &mut PortDriverBase,
     ) -> Result<(), asyn_rs::error::AsynError> {
+        // NDPluginStats.cpp's constructor sets only PluginType; every control
+        // param below is left to its PINI record.
         self.params.compute_statistics =
             base.create_param("COMPUTE_STATISTICS", ParamType::Int32)?;
-        base.set_int32_param(self.params.compute_statistics, 0, 1)?;
 
         self.params.bgd_width = base.create_param("BGD_WIDTH", ParamType::Int32)?;
         self.params.min_value = base.create_param("MIN_VALUE", ParamType::Float64)?;
@@ -2032,7 +2033,6 @@ impl NDPluginProcess for StatsProcessor {
         self.params.max_y = base.create_param("MAX_Y", ParamType::Float64)?;
 
         self.params.compute_centroid = base.create_param("COMPUTE_CENTROID", ParamType::Int32)?;
-        base.set_int32_param(self.params.compute_centroid, 0, 1)?;
 
         self.params.centroid_threshold =
             base.create_param("CENTROID_THRESHOLD", ParamType::Float64)?;
@@ -2051,10 +2051,8 @@ impl NDPluginProcess for StatsProcessor {
 
         self.params.compute_histogram = base.create_param("COMPUTE_HISTOGRAM", ParamType::Int32)?;
         self.params.hist_size = base.create_param("HIST_SIZE", ParamType::Int32)?;
-        base.set_int32_param(self.params.hist_size, 0, 256)?;
         self.params.hist_min = base.create_param("HIST_MIN", ParamType::Float64)?;
         self.params.hist_max = base.create_param("HIST_MAX", ParamType::Float64)?;
-        base.set_float64_param(self.params.hist_max, 0, 255.0)?;
         // HIST_BELOW/HIST_ABOVE are integer pixel counts: C registers them as
         // asynInt32 and pushes via setIntegerParam (NDPluginStats.cpp:827-828,
         // 627-628; epicsInt32 fields NDPluginStats.h:86-87). A client reading
@@ -2065,9 +2063,7 @@ impl NDPluginProcess for StatsProcessor {
 
         self.params.compute_profiles = base.create_param("COMPUTE_PROFILES", ParamType::Int32)?;
         self.params.cursor_x = base.create_param("CURSOR_X", ParamType::Int32)?;
-        base.set_int32_param(self.params.cursor_x, 0, 0)?;
         self.params.cursor_y = base.create_param("CURSOR_Y", ParamType::Int32)?;
-        base.set_int32_param(self.params.cursor_y, 0, 0)?;
 
         self.params.cursor_val = base.create_param("CURSOR_VAL", ParamType::Float64)?;
         self.params.profile_size_x = base.create_param("PROFILE_SIZE_X", ParamType::Int32)?;
@@ -2183,6 +2179,30 @@ mod tests {
         );
     }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
+
+    #[test]
+    fn test_runtime_leaves_the_controls_to_the_database() {
+        // NDPluginStats.cpp's constructor sets only PluginType.
+        let (handle, _stats, p, _jh) = create_stats_runtime(
+            &asyn_rs::asyn_record::claim_port("STATS_INIT").unwrap(),
+            NDArrayPool::new(1_000_000),
+            1,
+            "",
+            Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        for reason in [
+            p.compute_statistics,
+            p.compute_centroid,
+            p.hist_size,
+            p.cursor_x,
+            p.cursor_y,
+        ] {
+            assert!(port.read_int32_blocking(reason, 0).is_err());
+        }
+        assert!(port.read_float64_blocking(p.hist_max, 0).is_err());
+    }
 
     #[test]
     fn test_ts_point_is_posted_at_address_1() {

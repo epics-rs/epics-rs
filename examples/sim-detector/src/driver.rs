@@ -33,6 +33,7 @@ impl SimDetector {
         port_name: &str,
         max_size_x: i32,
         max_size_y: i32,
+        data_type: i32,
         max_memory: usize,
         acq_tx: rt::CommandSender<AcqCommand>,
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
@@ -50,8 +51,14 @@ impl SimDetector {
         base.set_string_param(ad.params.base.firmware_version, 0, "No firmware")?;
         base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
 
+        // C `:1115` seeds the simDetectorConfig dataType argument.
+        base.set_int32_param(ad.params.base.data_type, 0, data_type)?;
         base.set_int32_param(ad.params.min_x, 0, 0)?;
         base.set_int32_param(ad.params.min_y, 0, 0)?;
+        base.set_int32_param(ad.params.bin_x, 0, 1)?;
+        base.set_int32_param(ad.params.bin_y, 0, 1)?;
+        base.set_int32_param(ad.params.reverse_x, 0, 0)?;
+        base.set_int32_param(ad.params.reverse_y, 0, 0)?;
         // The read/write geometry parameters belong to the concrete driver:
         // `ADDriverBase` seeds only what C's ADDriver constructor seeds
         // (ADDriver.cpp:180-191), because SizeX/SizeY carry PINI="YES" in
@@ -59,19 +66,18 @@ impl SimDetector {
         // autosave.
         base.set_int32_param(ad.params.size_x, 0, max_size_x)?;
         base.set_int32_param(ad.params.size_y, 0, max_size_y)?;
+        base.set_int32_param(ad.params.base.array_size_x, 0, max_size_x)?;
+        base.set_int32_param(ad.params.base.array_size_y, 0, max_size_y)?;
         base.set_float64_param(ad.params.acquire_time, 0, 0.001)?;
         base.set_float64_param(ad.params.acquire_period, 0, 0.005)?;
         base.set_int32_param(ad.params.image_mode, 0, ImageMode::Continuous as i32)?;
         base.set_int32_param(ad.params.num_images, 0, 100)?;
 
-        base.set_float64_param(ad.params.gain, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_x, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_y, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_red, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_green, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_blue, 0, 1.0)?;
-        base.set_float64_param(sim_params.offset, 0, 0.0)?;
-        base.set_float64_param(sim_params.noise, 0, 0.0)?;
         base.set_int32_param(sim_params.sim_mode, 0, 0)?;
         base.set_int32_param(sim_params.peak_start_x, 0, 1)?;
         base.set_int32_param(sim_params.peak_start_y, 0, 1)?;
@@ -81,21 +87,6 @@ impl SimDetector {
         base.set_int32_param(sim_params.peak_num_y, 0, 1)?;
         base.set_int32_param(sim_params.peak_step_x, 0, 1)?;
         base.set_int32_param(sim_params.peak_step_y, 0, 1)?;
-        base.set_float64_param(sim_params.peak_height_variation, 0, 0.0)?;
-        base.set_int32_param(sim_params.x_sine_operation, 0, 0)?;
-        base.set_int32_param(sim_params.y_sine_operation, 0, 0)?;
-        base.set_float64_param(sim_params.x_sine1_amplitude, 0, 0.0)?;
-        base.set_float64_param(sim_params.x_sine1_frequency, 0, 0.0)?;
-        base.set_float64_param(sim_params.x_sine1_phase, 0, 0.0)?;
-        base.set_float64_param(sim_params.x_sine2_amplitude, 0, 0.0)?;
-        base.set_float64_param(sim_params.x_sine2_frequency, 0, 0.0)?;
-        base.set_float64_param(sim_params.x_sine2_phase, 0, 0.0)?;
-        base.set_float64_param(sim_params.y_sine1_amplitude, 0, 0.0)?;
-        base.set_float64_param(sim_params.y_sine1_frequency, 0, 0.0)?;
-        base.set_float64_param(sim_params.y_sine1_phase, 0, 0.0)?;
-        base.set_float64_param(sim_params.y_sine2_amplitude, 0, 0.0)?;
-        base.set_float64_param(sim_params.y_sine2_frequency, 0, 0.0)?;
-        base.set_float64_param(sim_params.y_sine2_phase, 0, 0.0)?;
 
         // Reset image flag - triggers initial buffer allocation
         base.set_int32_param(sim_params.reset_image, 0, 1)?;
@@ -283,6 +274,7 @@ pub fn create_sim_detector(
     claim: &PortClaim,
     max_size_x: i32,
     max_size_y: i32,
+    data_type: i32,
     max_memory: usize,
     array_output: NDArrayOutput,
 ) -> AsynResult<SimDetectorRuntime> {
@@ -295,6 +287,7 @@ pub fn create_sim_detector(
         port_name,
         max_size_x,
         max_size_y,
+        data_type,
         max_memory,
         acq_tx,
         dirty.clone(),
@@ -334,9 +327,30 @@ pub fn create_sim_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::NDDataType;
     use ad_core_rs::plugin::channel::NDArrayOutput;
     use asyn_rs::interfaces::InterfaceType;
     use asyn_rs::port::DrvUserRequest;
+
+    #[test]
+    fn test_new_seeds_the_configured_data_type() {
+        // simDetector.cpp:1115 seeds NDDataType from simDetectorConfig's dataType.
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_DT").unwrap(),
+            8,
+            8,
+            NDDataType::UInt16 as i32,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
+        let port = rt.port_handle();
+        assert_eq!(
+            port.read_int32_blocking(rt.ad_params.base.data_type, 0)
+                .unwrap(),
+            NDDataType::UInt16 as i32
+        );
+    }
 
     #[test]
     fn test_new_default_values() {
@@ -344,6 +358,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM1").unwrap(),
             256,
             256,
+            NDDataType::UInt8 as i32,
             10_000_000,
             NDArrayOutput::new(),
         )
@@ -396,11 +411,52 @@ mod tests {
     }
 
     #[test]
+    fn test_new_leaves_unset_what_simdetector_cpp_leaves_unset() {
+        // simDetector.cpp:1093-1134 seeds these and not the sine, noise,
+        // offset or gain params, whose PINI records then keep their VAL.
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_C").unwrap(),
+            640,
+            480,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        for (reason, want) in [
+            (rt.ad_params.bin_x, 1),
+            (rt.ad_params.bin_y, 1),
+            (rt.ad_params.reverse_x, 0),
+            (rt.ad_params.reverse_y, 0),
+            (rt.ad_params.base.array_size_x, 640),
+            (rt.ad_params.base.array_size_y, 480),
+        ] {
+            assert_eq!(h.read_int32_blocking(reason, 0).unwrap(), want);
+        }
+        let p = &rt.sim_params;
+        for reason in [
+            rt.ad_params.gain,
+            p.offset,
+            p.noise,
+            p.peak_height_variation,
+            p.x_sine1_amplitude,
+            p.y_sine2_phase,
+        ] {
+            assert!(h.read_float64_blocking(reason, 0).is_err());
+        }
+        for reason in [p.x_sine_operation, p.y_sine_operation] {
+            assert!(h.read_int32_blocking(reason, 0).is_err());
+        }
+    }
+
+    #[test]
     fn test_dirty_flags_on_data_type_change() {
         let rt = create_sim_detector(
             &asyn_rs::registry::claim_port("SIM2").unwrap(),
             64,
             64,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )
@@ -420,6 +476,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM3").unwrap(),
             64,
             64,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )
@@ -442,6 +499,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM_GAIN").unwrap(),
             64,
             64,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )
@@ -477,6 +535,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM4").unwrap(),
             64,
             64,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )
@@ -501,6 +560,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM5").unwrap(),
             64,
             64,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )
@@ -525,6 +585,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM6").unwrap(),
             64,
             64,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )

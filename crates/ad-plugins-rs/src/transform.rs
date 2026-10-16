@@ -518,8 +518,9 @@ impl NDPluginProcess for TransformProcessor {
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
-        base.create_param("TRANSFORM_TYPE", ParamType::Int32)?;
-        self.transform_type_idx = base.find_param("TRANSFORM_TYPE");
+        let transform_type = base.create_param("TRANSFORM_TYPE", ParamType::Int32)?;
+        base.set_int32_param(transform_type, 0, *self.transform.lock() as i32)?;
+        self.transform_type_idx = Some(transform_type);
         Ok(())
     }
 
@@ -556,6 +557,20 @@ mod tests {
         );
     }
     use ad_core_rs::ndarray::NDDataType;
+
+    #[test]
+    fn test_register_params_seeds_the_processor_transform() {
+        // The param reads the type the processor applies; the IOC builds
+        // TransformNone as NDPluginTransform.cpp:609 seeds it.
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        for t in [TransformType::None, TransformType::Rot90CW] {
+            let mut base = PortDriverBase::new("TRANS_INIT", 1, PortFlags::default());
+            let mut proc = TransformProcessor::new(t);
+            proc.register_params(&mut base).unwrap();
+            let reason = base.find_param("TRANSFORM_TYPE").unwrap();
+            assert_eq!(base.get_int32_param(reason, 0).unwrap(), t as i32);
+        }
+    }
 
     fn pool() -> std::sync::Arc<NDArrayPool> {
         NDArrayPool::new(0)

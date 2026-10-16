@@ -118,8 +118,8 @@ cargo run -p sim-detector --example demo
 epicsEnvSet("PREFIX", "SIM1:")
 epicsEnvSet("CAM",    "cam1:")
 
-# simDetectorConfig(portName, sizeX, sizeY, maxMemory)
-simDetectorConfig("SIM1", 1024, 1024, 50000000)
+# simDetectorConfig(portName, maxSizeX, maxSizeY, dataType, maxBuffers, maxMemory, priority, stackSize)
+simDetectorConfig("SIM1", 1024, 1024, 1, 0, 50000000)
 
 dbLoadRecords("$(SIM_DETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=SIM1")
 

@@ -194,7 +194,9 @@ impl<W: NDFileWriter> FilePluginController<W> {
             Some(idx) => idx,
             None => return,
         };
-        let (normalized, exists) = check_file_path(&self.file_base.file_path);
+        let Some((normalized, exists)) = check_file_path(&self.file_base.file_path) else {
+            return;
+        };
         self.file_base.file_path = normalized;
         updates.push(ParamUpdate::Int32 {
             reason: idx,
@@ -1008,10 +1010,15 @@ fn write_single<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
 /// Normalize `path` and report whether the directory exists, through the one
 /// implementation of C++ `asynNDArrayDriver::checkPath` that the file plugins
 /// inherit (`NDPluginFile` -> `NDPluginDriver` -> `asynNDArrayDriver`).
-fn check_file_path(path: &str) -> (String, bool) {
+/// `None` for an empty path, which C returns on before touching
+/// NDFilePathExists (asynNDArrayDriver.cpp:105).
+fn check_file_path(path: &str) -> Option<(String, bool)> {
+    if path.is_empty() {
+        return None;
+    }
     let mut normalized = path.to_string();
     let exists = crate::driver::ndarray_driver::check_path_str(&mut normalized);
-    (normalized, exists)
+    Some((normalized, exists))
 }
 
 /// The port's side of a writer's settings: a write lands here at once, never
@@ -1695,6 +1702,7 @@ mod tests {
     #[test]
     fn a_partial_capture_flush_keeps_the_path_check_of_the_same_cycle() {
         let mut c = capture_controller(false);
+        c.file_base.file_path = std::env::temp_dir().display().to_string();
         c.file_base.set_num_capture(4);
         c.writer.lock().fail_write_after = Some(2);
 
@@ -1707,6 +1715,18 @@ mod tests {
             int_update(&last.param_updates, PATH_EXISTS).is_some(),
             "FilePathExists was checked this cycle; the error exit dropped it"
         );
+    }
+
+    /// C `checkPath` returns before NDFilePathExists on an empty FilePath
+    /// (asynNDArrayDriver.cpp:105), so a frame written with no path leaves
+    /// FilePathExists_RBV undefined.
+    #[test]
+    fn an_empty_file_path_does_not_define_file_path_exists() {
+        let mut c = capture_controller(false);
+        c.params.file_path = Some(66);
+        c.store_octet(66, "");
+        let r = c.process_array(&Arc::new(array(1)));
+        assert_eq!(int_update(&r.param_updates, PATH_EXISTS), None);
     }
 
     /// A formerly-bypassing exit: the Stream close ran its own

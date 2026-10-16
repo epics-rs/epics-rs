@@ -390,6 +390,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 mod tests {
     use super::*;
     use crate::driver::create_sim_detector;
+    use ad_core_rs::ndarray::NDDataType;
     use ad_core_rs::plugin::channel::NDArrayOutput;
 
     #[test]
@@ -398,6 +399,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM_TEST").unwrap(),
             32,
             32,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )
@@ -439,9 +441,16 @@ mod tests {
         use ad_core_rs::driver::ColorMode;
         let (acq_tx, _acq_rx) = rt::command_channel(1);
         let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
-        let mut det =
-            crate::driver::SimDetector::new("SIM_RGB_DIMS", 8, 4, 1_000_000, acq_tx, dirty)
-                .unwrap();
+        let mut det = crate::driver::SimDetector::new(
+            "SIM_RGB_DIMS",
+            8,
+            4,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            acq_tx,
+            dirty,
+        )
+        .unwrap();
         for (mode, dims) in [
             (ColorMode::Mono, vec![8, 4]),
             (ColorMode::RGB1, vec![3, 8, 4]),
@@ -471,6 +480,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM_CONT").unwrap(),
             16,
             16,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )
@@ -517,6 +527,7 @@ mod tests {
             &asyn_rs::registry::claim_port("SIM_STOP").unwrap(),
             8,
             8,
+            NDDataType::UInt8 as i32,
             1_000_000,
             NDArrayOutput::new(),
         )

@@ -1112,13 +1112,13 @@ impl NDPluginProcess for ProcessProcessor {
         base.create_param("PROCESS_DATA_TYPE", ParamType::Int32)?;
         base.create_param("SAVE_BACKGROUND", ParamType::Int32)?;
         base.create_param("ENABLE_BACKGROUND", ParamType::Int32)?;
-        base.create_param("VALID_BACKGROUND", ParamType::Int32)?;
+        let valid_background = base.create_param("VALID_BACKGROUND", ParamType::Int32)?;
         base.create_param("SAVE_FLAT_FIELD", ParamType::Int32)?;
         base.create_param("ENABLE_FLAT_FIELD", ParamType::Int32)?;
-        base.create_param("VALID_FLAT_FIELD", ParamType::Int32)?;
+        let valid_flat_field = base.create_param("VALID_FLAT_FIELD", ParamType::Int32)?;
         base.create_param("SCALE_FLAT_FIELD", ParamType::Float64)?;
         base.create_param("ENABLE_OFFSET_SCALE", ParamType::Int32)?;
-        base.create_param("AUTO_OFFSET_SCALE", ParamType::Int32)?;
+        let auto_offset_scale = base.create_param("AUTO_OFFSET_SCALE", ParamType::Int32)?;
         base.create_param("OFFSET", ParamType::Float64)?;
         base.create_param("SCALE", ParamType::Float64)?;
         base.create_param("ENABLE_LOW_CLIP", ParamType::Int32)?;
@@ -1149,17 +1149,22 @@ impl NDPluginProcess for ProcessProcessor {
         base.create_param("FILTER_RC1", ParamType::Float64)?;
         base.create_param("FILTER_RC2", ParamType::Float64)?;
 
+        // NDPluginProcess.cpp's constructor seeds only these three.
+        for reason in [valid_background, valid_flat_field, auto_offset_scale] {
+            base.set_int32_param(reason, 0, 0)?;
+        }
+
         // Look up param indices
         self.params.data_type = base.find_param("PROCESS_DATA_TYPE");
         self.params.save_background = base.find_param("SAVE_BACKGROUND");
         self.params.enable_background = base.find_param("ENABLE_BACKGROUND");
-        self.params.valid_background = base.find_param("VALID_BACKGROUND");
+        self.params.valid_background = Some(valid_background);
         self.params.save_flat_field = base.find_param("SAVE_FLAT_FIELD");
         self.params.enable_flat_field = base.find_param("ENABLE_FLAT_FIELD");
-        self.params.valid_flat_field = base.find_param("VALID_FLAT_FIELD");
+        self.params.valid_flat_field = Some(valid_flat_field);
         self.params.scale_flat_field = base.find_param("SCALE_FLAT_FIELD");
         self.params.enable_offset_scale = base.find_param("ENABLE_OFFSET_SCALE");
-        self.params.auto_offset_scale = base.find_param("AUTO_OFFSET_SCALE");
+        self.params.auto_offset_scale = Some(auto_offset_scale);
         self.params.offset = base.find_param("OFFSET");
         self.params.scale = base.find_param("SCALE");
         self.params.enable_low_clip = base.find_param("ENABLE_LOW_CLIP");
@@ -1303,6 +1308,22 @@ mod tests {
         );
     }
     use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+
+    #[test]
+    fn test_register_params_seeds_the_c_constructor_values() {
+        // NDPluginProcess.cpp:420-422; the controls stay undefined.
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("PROC_INIT", 1, PortFlags::default());
+        let mut proc = ProcessProcessor::new(ProcessConfig::default());
+        proc.register_params(&mut base).unwrap();
+        let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
+        for name in ["VALID_BACKGROUND", "VALID_FLAT_FIELD", "AUTO_OFFSET_SCALE"] {
+            assert_eq!(int(name).unwrap(), 0, "{name}");
+        }
+        for name in ["ENABLE_BACKGROUND", "ENABLE_FILTER", "NUM_FILTER"] {
+            assert!(int(name).is_err(), "{name}");
+        }
+    }
 
     fn pool() -> Arc<NDArrayPool> {
         NDArrayPool::new(0)

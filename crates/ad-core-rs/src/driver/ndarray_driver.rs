@@ -391,13 +391,13 @@ pub(crate) fn write_array_params(
 /// `asynNDArrayDriver` in C and therefore runs this block, so it lives here
 /// once rather than being re-typed in each constructor.
 ///
-/// The four pool statistics (C `:1000-1003`) are deliberately absent: they
-/// belong to `refresh_pool_stats`, which is this port's single owner of
-/// them. A constructor that owns an [`NDArrayPool`] calls that immediately
-/// after this.
+/// The block ends with the pool statistics (C `:1000-1003`): buffer counts
+/// from the pool but both memory figures 0, which only a `PoolPollStats`
+/// write (`refresh_pool_stats`) replaces with the pool's real sizes.
 pub fn init_read_only_params(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
     port_name: &str,
 ) -> AsynResult<()> {
     port_base.set_string_param(params.port_name_self, 0, port_name)?;
@@ -450,7 +450,20 @@ pub fn init_read_only_params(
     port_base.set_int32_param(params.attributes_status, 0, ATTR_STATUS_FILE_NOT_FOUND)?;
     port_base.set_string_param(params.attributes_macros, 0, String::new())?;
 
+    port_base.set_int32_param(
+        params.pool_alloc_buffers,
+        0,
+        pool.num_alloc_buffers() as i32,
+    )?;
+    port_base.set_int32_param(params.pool_free_buffers, 0, pool.num_free_buffers() as i32)?;
+    port_base.set_float64_param(params.pool_max_memory, 0, 0.0)?;
+    port_base.set_float64_param(params.pool_used_memory, 0, 0.0)?;
+
     port_base.set_int32_param(params.num_queued_arrays, 0, 0)?;
+    // C's setIntegerParam override (`:655-660`) clears AcquireBusy when
+    // NumQueuedArrays goes to 0 with Acquire not set, so the line above
+    // defines it on every port.
+    port_base.set_int32_param(params.acquire_busy, 0, 0)?;
     Ok(())
 }
 
@@ -985,7 +998,7 @@ pub(crate) fn check_path(
         .get_string_param(params.file_path, 0)
         .map(octet_text)?;
     if path.is_empty() {
-        return Ok(false);
+        return Ok(true);
     }
 
     let exists = check_path_str(&mut path);
@@ -1047,12 +1060,7 @@ impl NDArrayDriverBase {
         let params = NDArrayDriverParams::create(&mut port_base)?;
         let pool = NDArrayPool::new(max_memory);
 
-        init_read_only_params(&mut port_base, &params, port_name)?;
-        refresh_pool_stats(&mut port_base, &params, &pool)?;
-        // Not part of C's block: `asynNDArrayDriver` leaves NDArrayCallbacks
-        // to the database. This port has no database behind a bare
-        // `NDArrayDriverBase`, so callbacks default on.
-        port_base.set_int32_param(params.array_callbacks, 0, 1)?;
+        init_read_only_params(&mut port_base, &params, &pool, port_name)?;
 
         Ok(Self {
             port_base,
@@ -1142,7 +1150,8 @@ impl NDArrayDriverBase {
 
         let callbacks_enabled = self
             .port_base
-            .get_int32_param(self.params.array_callbacks, 0)?
+            .get_int32_param(self.params.array_callbacks, 0)
+            .unwrap_or(0)
             != 0;
 
         let to_publish = if callbacks_enabled {
@@ -1224,7 +1233,8 @@ impl NDArrayDriverBase {
     /// empty FilePath returns early — neither the path nor `FilePathExists` is
     /// written. Otherwise the path is normalized in place by
     /// [`check_path_str`], written back to the parameter, and `FilePathExists`
-    /// is refreshed.
+    /// is refreshed. Returns C's status: `false` only for a missing directory,
+    /// so an empty FilePath never reaches createFilePath (:530-531).
     pub fn check_path(&mut self) -> AsynResult<bool> {
         check_path(&mut self.port_base, &self.params)
     }
@@ -1403,11 +1413,7 @@ pub(crate) mod tests {
 
     /// The four pool statistics, C `:1000-1003`, for a pool nothing has
     /// allocated from yet.
-    pub(crate) fn assert_fresh_pool_stats(
-        base: &PortDriverBase,
-        params: &NDArrayDriverParams,
-        max_memory_mb: f64,
-    ) {
+    pub(crate) fn assert_fresh_pool_stats(base: &PortDriverBase, params: &NDArrayDriverParams) {
         assert_eq!(
             base.get_int32_param(params.pool_alloc_buffers, 0)
                 .expect("POOL_ALLOC_BUFFERS unset after construction"),
@@ -1426,7 +1432,7 @@ pub(crate) mod tests {
         assert_eq!(
             base.get_float64_param(params.pool_max_memory, 0)
                 .expect("POOL_MAX_MEMORY unset after construction"),
-            max_memory_mb
+            0.0
         );
     }
 
@@ -1441,11 +1447,14 @@ pub(crate) mod tests {
     fn test_constructor_seeds_the_c_read_only_block() {
         let drv = NDArrayDriverBase::new("TEST", 1, 4_194_304, ASYN_CANBLOCK).unwrap();
         assert_c_read_only_block(&drv.port_base, &drv.params, "TEST");
-        // C `:1002-1003` leaves both memory figures at 0 and fills MaxMemory
-        // from the pool later (asynNDArrayDriver.cpp:690). The port has the
-        // pool in hand at construction, so it publishes C's eventual value
-        // from the start rather than a transient 0.
-        assert_fresh_pool_stats(&drv.port_base, &drv.params, 4.0);
+        assert_fresh_pool_stats(&drv.port_base, &drv.params);
+        // C `:655-660` via the NumQueuedArrays seed.
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.acquire_busy, 0)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1466,13 +1475,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_new_sets_callbacks_enabled() {
+    fn test_new_leaves_array_callbacks_to_the_database() {
+        // asynNDArrayDriver never sets NDArrayCallbacks, so the init readback
+        // fails and the record's VAL stands.
         let drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
-        assert_eq!(
+        assert!(
             drv.port_base
                 .get_int32_param(drv.params.array_callbacks, 0)
-                .unwrap(),
-            1,
+                .is_err()
         );
     }
 
@@ -1631,7 +1641,7 @@ pub(crate) mod tests {
         drv.port_base
             .set_int32_param(drv.params.file_path_exists, 0, 1)
             .unwrap();
-        assert!(!drv.check_path().unwrap());
+        assert!(drv.check_path().unwrap(), "C returns asynSuccess");
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.file_path_exists, 0)
@@ -1823,6 +1833,9 @@ pub(crate) mod tests {
     #[test]
     fn test_connect_downstream() {
         let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.array_callbacks, 0, 1)
+            .unwrap();
         let (sender, mut receiver) = ndarray_channel("DOWNSTREAM", 10);
         drv.connect_downstream(sender);
         assert_eq!(drv.num_plugins(), 1);

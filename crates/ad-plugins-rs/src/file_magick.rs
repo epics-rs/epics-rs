@@ -536,10 +536,6 @@ impl NDPluginProcess for MagickFileProcessor {
         self.quality_idx = Some(base.create_param("MAGICK_QUALITY", ParamType::Int32)?);
         self.bit_depth_idx = Some(base.create_param("MAGICK_BIT_DEPTH", ParamType::Int32)?);
         self.compress_type_idx = Some(base.create_param("MAGICK_COMPRESS_TYPE", ParamType::Int32)?);
-        // Set defaults
-        base.set_int32_param(self.quality_idx.unwrap(), 0, 100)?;
-        base.set_int32_param(self.bit_depth_idx.unwrap(), 0, 8)?;
-        base.set_int32_param(self.compress_type_idx.unwrap(), 0, 0)?;
         Ok(())
     }
 }
@@ -550,6 +546,19 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn test_register_params_leaves_the_magick_controls_undefined() {
+        // NDFileMagick.cpp's constructor sets only PluginType.
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("MAGICK_INIT", 1, PortFlags::default());
+        let mut proc = MagickFileProcessor::new();
+        proc.register_params(&mut base).unwrap();
+        for name in ["MAGICK_QUALITY", "MAGICK_BIT_DEPTH", "MAGICK_COMPRESS_TYPE"] {
+            let reason = base.find_param(name).unwrap();
+            assert!(base.get_int32_param(reason, 0).is_err(), "{name}");
+        }
+    }
 
     fn temp_path(ext: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);

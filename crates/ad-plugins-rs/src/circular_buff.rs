@@ -205,7 +205,8 @@ impl CircularBuffer {
             triggered: false,
             post_done: 0,
             pre_flushed: false,
-            preset_trigger_count: 0,
+            // C's constructor seeds PresetTriggerCount 1 (NDPluginCircularBuff.cpp:446).
+            preset_trigger_count: 1,
             trigger_count: 0,
             flush_on_soft_trigger: 0,
             status: BufferStatus::Idle,
@@ -785,10 +786,27 @@ impl NDPluginProcess for CircularBuffProcessor {
         self.params.actual_trigger_count = base.find_param("CIRC_BUFF_ACTUAL_TRIGGER_COUNT");
         self.params.flush_on_soft_trigger = base.find_param("CIRC_BUFF_FLUSH_ON_SOFTTRIGGER");
 
-        // C sets NDCircBuffStatus to "Idle" in the constructor
-        // (NDPluginCircularBuff.cpp:432).
+        // The params C's constructor seeds (NDPluginCircularBuff.cpp:432-449),
+        // read from the buffer that acts on them.
         if let Some(idx) = self.params.status {
             base.set_string_param(idx, 0, "Idle")?;
+        }
+        let p = &self.params;
+        let state = self.state.lock();
+        let b = &state.buffer;
+        for (idx, v) in [
+            (p.current_image, b.buffer.len() as i32),
+            (p.post_count, b.post_done as i32),
+            (p.control, b.control as i32),
+            (p.pre_trigger, b.pre_count as i32),
+            (p.post_trigger, b.post_count as i32),
+            (p.preset_trigger_count, b.preset_trigger_count as i32),
+            (p.actual_trigger_count, b.trigger_count as i32),
+            (p.flush_on_soft_trigger, b.flush_on_soft_trigger),
+        ] {
+            if let Some(idx) = idx {
+                base.set_int32_param(idx, 0, v)?;
+            }
         }
         Ok(())
     }
@@ -900,6 +918,51 @@ mod tests {
             proc.validate_int32(0, 0, 98, clamp, &base).verdict,
             WriteVerdict::Accept(1)
         );
+    }
+
+    #[test]
+    fn test_register_params_seeds_the_c_constructor_values() {
+        // Every value NDPluginCircularBuff.cpp:432-449 sets, for the IOC's
+        // 100/100 buffer; the triggers and calc stay undefined.
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("CB_INIT", 1, PortFlags::default());
+        let mut proc = CircularBuffProcessor::new(100, 100, TriggerCondition::default(), 10);
+        proc.register_params(&mut base).unwrap();
+        let idx = |name: &str| base.find_param(name).unwrap();
+        let int = |name: &str| base.get_int32_param(idx(name), 0);
+        for (name, v) in [
+            ("CIRC_BUFF_CURRENT_IMAGE", 0),
+            ("CIRC_BUFF_POST_COUNT", 0),
+            ("CIRC_BUFF_CONTROL", 0),
+            ("CIRC_BUFF_PRE_TRIGGER", 100),
+            ("CIRC_BUFF_POST_TRIGGER", 100),
+            ("CIRC_BUFF_PRESET_TRIGGER_COUNT", 1),
+            ("CIRC_BUFF_ACTUAL_TRIGGER_COUNT", 0),
+            ("CIRC_BUFF_FLUSH_ON_SOFTTRIGGER", 0),
+        ] {
+            assert_eq!(int(name).unwrap(), v, "{name}");
+        }
+        assert_eq!(
+            base.get_string_param(idx("CIRC_BUFF_STATUS"), 0).unwrap(),
+            b"Idle"
+        );
+        for name in ["CIRC_BUFF_SOFT_TRIGGER", "CIRC_BUFF_TRIGGERED"] {
+            assert!(int(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_register_params_reads_the_buffer_it_seeds_from() {
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("CB_INIT2", 1, PortFlags::default());
+        let mut proc = CircularBuffProcessor::new(5, 7, TriggerCondition::default(), 10);
+        proc.register_params(&mut base).unwrap();
+        let int = |name: &str| {
+            base.get_int32_param(base.find_param(name).unwrap(), 0)
+                .unwrap()
+        };
+        assert_eq!(int("CIRC_BUFF_PRE_TRIGGER"), 5);
+        assert_eq!(int("CIRC_BUFF_POST_TRIGGER"), 7);
     }
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
@@ -1019,6 +1082,7 @@ mod tests {
         // Regression: post_count == 0 must complete the sequence on the first
         // post-trigger frame instead of underflowing the post counter.
         let mut cb = CircularBuffer::new(2, 0, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         cb.push(make_array(1));
         cb.push(make_array(2));
@@ -1055,6 +1119,7 @@ mod tests {
         // sequence — bumping ActualTriggerCount and re-arming — once per running
         // frame, without forwarding it.
         let mut cb = CircularBuffer::new(2, 0, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
 
         for (n, id) in (1..=3).enumerate() {
@@ -1122,6 +1187,7 @@ mod tests {
                 calc: CalcExpression::parse("A>=5"),
             },
         );
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         cb.push(make_array_with_attr(1, 1.0));
         let r = cb.push(make_array_with_attr(2, 9.0));
@@ -1494,13 +1560,14 @@ mod tests {
         assert!(!out.settled);
 
         // :252-253 `preCount ? "Buffer filling" : "Dropping frames"`
+        let pre = base.find_param("CIRC_BUFF_PRE_TRIGGER").unwrap();
+        base.set_int32_param(pre, 0, 0).unwrap();
         let out = cb_write(&proc, &base, "CIRC_BUFF_CONTROL", 1);
         assert_eq!(
             side_int(&out, &base, "CIRC_BUFF_ACTUAL_TRIGGER_COUNT"),
             Some(0)
         );
         assert_eq!(side_status(&out), Some("Dropping frames"));
-        let pre = base.find_param("CIRC_BUFF_PRE_TRIGGER").unwrap();
         base.set_int32_param(pre, 0, 3).unwrap();
         let out = cb_write(&proc, &base, "CIRC_BUFF_CONTROL", 1);
         assert_eq!(side_status(&out), Some("Buffer filling"));
@@ -1582,6 +1649,7 @@ mod tests {
         // the exact C strings, on exactly the frames C calls setStringParam.
         // Filling below capacity: C makes no setStringParam call at all.
         let mut cb = CircularBuffer::new(2, 2, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         assert_eq!(cb.push(make_array(1)).params.status, None);
         // Ring reaches capacity → "Buffer Wrapping" on this and every later
@@ -1603,6 +1671,7 @@ mod tests {
         // preCount == 0: the ring is always "at capacity", so C reports dropped
         // frames both while filling and on completion.
         let mut cb = CircularBuffer::new(0, 1, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         assert_eq!(
             cb.push(make_array(1)).params.status,
@@ -1633,6 +1702,7 @@ mod tests {
         // the param index but never emitted an update, so PostCount_RBV read 0
         // forever.
         let mut cb = CircularBuffer::new(2, 3, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         // Pre-trigger frames touch neither the post count...
         assert_eq!(cb.push(make_array(1)).params.post_count, None);
@@ -1674,6 +1744,7 @@ mod tests {
         // `pre_buffer_len()` on every frame — and the flush drains the ring, so
         // it posted 0 for the whole capture.
         let mut cb = CircularBuffer::new(3, 2, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         assert_eq!(cb.push(make_array(1)).params.current_image, Some(1));
         assert_eq!(cb.push(make_array(2)).params.current_image, Some(2));
@@ -1697,6 +1768,7 @@ mod tests {
         // bumped it inside trigger() and posted it every frame, so
         // ActualTriggerCount_RBV stepped a whole sequence early.
         let mut cb = CircularBuffer::new(1, 2, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
         cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         cb.push(make_array(1));
         assert_eq!(cb.trigger_count(), 0);
@@ -1744,6 +1816,7 @@ mod tests {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
         let mut p = CircularBuffProcessor::new(2, 2, TriggerCondition::default(), 100);
+        p.buffer().set_preset_trigger_count(0); // unlimited triggers
         p.buffer().start(); // C: NDCircBuffControl = 1
         p.params.current_image = Some(11);
         p.params.post_count = Some(13);
@@ -1948,6 +2021,7 @@ mod tests {
     #[test]
     fn test_buffer_status_transitions() {
         let mut cb = CircularBuffer::new(2, 1, TriggerCondition::default());
+        cb.set_preset_trigger_count(0); // unlimited triggers
 
         // Before Control=1 the plugin is idle and records nothing.
         assert_eq!(cb.status(), BufferStatus::Idle);

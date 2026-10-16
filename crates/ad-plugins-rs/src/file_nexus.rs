@@ -1064,12 +1064,10 @@ impl NDPluginProcess for NexusFileProcessor {
     ) -> asyn_rs::error::AsynResult<()> {
         self.ctrl.lock().register_params(base)?;
         use asyn_rs::param::ParamType;
-        let path_idx = base.create_param("NEXUS_TEMPLATE_PATH", ParamType::Octet)?;
-        let file_idx = base.create_param("NEXUS_TEMPLATE_FILE", ParamType::Octet)?;
-        let valid_idx = base.create_param("NEXUS_TEMPLATE_VALID", ParamType::Int32)?;
-        base.create_param("TEMPLATE_FILE_PATH", ParamType::Octet)?;
-        base.create_param("TEMPLATE_FILE_NAME", ParamType::Octet)?;
-        base.create_param("TEMPLATE_FILE_VALID", ParamType::Int32)?;
+        // NDFileNexus.h:20-22.
+        let path_idx = base.create_param("TEMPLATE_FILE_PATH", ParamType::Octet)?;
+        let file_idx = base.create_param("TEMPLATE_FILE_NAME", ParamType::Octet)?;
+        let valid_idx = base.create_param("TEMPLATE_FILE_VALID", ParamType::Int32)?;
         // C++ NDFileNexus.cpp:883 seeds NDFileNexusTemplateValid = 0.
         base.set_int32_param(valid_idx, 0, 0)?;
         self.template_path_idx = Some(path_idx);
@@ -1313,8 +1311,10 @@ mod tests {
         let mut proc = NexusFileProcessor::new();
         proc.register_params(&mut base).unwrap();
 
-        let file_idx = proc.template_file_idx.unwrap();
-        let valid_idx = proc.template_valid_idx.unwrap();
+        // The NDFileNexus.template records address these names.
+        let file_idx = base.find_param("TEMPLATE_FILE_NAME").unwrap();
+        let valid_idx = base.find_param("TEMPLATE_FILE_VALID").unwrap();
+        assert_eq!(base.get_int32_param(valid_idx, 0).unwrap(), 0);
 
         let path = tmpl_path.to_string_lossy().into_owned();
         // A file write in progress does not hold the template write up; the

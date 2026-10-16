@@ -543,6 +543,8 @@ impl NDPluginProcess for ROIProcessor {
         &mut self,
         base: &mut PortDriverBase,
     ) -> Result<(), asyn_rs::error::AsynError> {
+        // NDPluginROI.cpp's constructor sets only PluginType; the geometry
+        // and scaling params are left to their PINI records.
         let dim_names = ["DIM0", "DIM1", "DIM2"];
         for (i, prefix) in dim_names.iter().enumerate() {
             self.params.dims[i].min =
@@ -559,35 +561,12 @@ impl NDPluginProcess for ROIProcessor {
                 base.create_param(&format!("{prefix}_AUTO_SIZE"), ParamType::Int32)?;
             self.params.dims[i].max_size =
                 base.create_param(&format!("{prefix}_MAX_SIZE"), ParamType::Int32)?;
-
-            // Set initial values from config
-            let config = self.config.lock();
-            base.set_int32_param(self.params.dims[i].min, 0, config.dims[i].min as i32)?;
-            base.set_int32_param(self.params.dims[i].size, 0, config.dims[i].size as i32)?;
-            base.set_int32_param(self.params.dims[i].bin, 0, config.dims[i].bin as i32)?;
-            base.set_int32_param(
-                self.params.dims[i].reverse,
-                0,
-                config.dims[i].reverse as i32,
-            )?;
-            base.set_int32_param(self.params.dims[i].enable, 0, config.dims[i].enable as i32)?;
-            base.set_int32_param(
-                self.params.dims[i].auto_size,
-                0,
-                config.dims[i].auto_size as i32,
-            )?;
         }
         self.params.enable_scale = base.create_param("ENABLE_SCALE", ParamType::Int32)?;
         self.params.scale = base.create_param("SCALE_VALUE", ParamType::Float64)?;
         self.params.data_type = base.create_param("ROI_DATA_TYPE", ParamType::Int32)?;
         self.params.collapse_dims = base.create_param("COLLAPSE_DIMS", ParamType::Int32)?;
         self.params.name = base.create_param("NAME", ParamType::Octet)?;
-
-        let config = self.config.lock();
-        base.set_int32_param(self.params.enable_scale, 0, config.enable_scale as i32)?;
-        base.set_float64_param(self.params.scale, 0, config.scale)?;
-        base.set_int32_param(self.params.data_type, 0, -1)?; // -1 = Automatic
-        base.set_int32_param(self.params.collapse_dims, 0, config.collapse_dims as i32)?;
 
         Ok(())
     }
@@ -751,6 +730,29 @@ mod tests {
         );
         let out = proc.validate_int32(threads, 0, 1, WriteVerdict::Accept(1), &base);
         assert!(out.trace.is_empty());
+    }
+
+    #[test]
+    fn test_runtime_leaves_the_roi_controls_to_the_database() {
+        // NDPluginROI.cpp's constructor sets only PluginType.
+        let (handle, p, _jh) = create_roi_runtime(
+            &asyn_rs::asyn_record::claim_port("ROI_INIT").unwrap(),
+            NDArrayPool::new(1_000_000),
+            1,
+            "",
+            Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        for d in &p.dims {
+            for reason in [d.min, d.size, d.bin, d.reverse, d.enable, d.auto_size] {
+                assert!(port.read_int32_blocking(reason, 0).is_err());
+            }
+        }
+        for reason in [p.enable_scale, p.data_type, p.collapse_dims] {
+            assert!(port.read_int32_blocking(reason, 0).is_err());
+        }
+        assert!(port.read_float64_blocking(p.scale, 0).is_err());
     }
 
     fn pool() -> std::sync::Arc<NDArrayPool> {

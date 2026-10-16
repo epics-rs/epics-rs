@@ -30,9 +30,8 @@ impl CodecName {
     }
 
     /// Value of the `COMPRESSOR` parameter that selects this codec, i.e. C
-    /// `NDCodecCompressor_t` (Codec.h:12-18): NONE=0, JPEG=1, BLOSC=2, LZ4=3,
-    /// BSLZ4=4. The Rust-only zlib/lz4hdf5 codecs take ordinals after the C set
-    /// so they never shadow a C ordinal.
+    /// `NDCodecCompressor_t` (NDCodec.h:7-15): NONE=0, JPEG=1, ZLIB=2,
+    /// BLOSC=3, LZ4=4, LZ4HDF5=5, BSLZ4=6.
     ///
     /// This is the single mapping between the `COMPRESSOR` wire value and the
     /// codec, used both when the operator writes the parameter and when the
@@ -42,11 +41,11 @@ impl CodecName {
         match self {
             Self::None => 0,
             Self::JPEG => 1,
-            Self::Blosc => 2,
-            Self::LZ4 => 3,
-            Self::BSLZ4 => 4,
-            Self::Zlib => 5,
-            Self::LZ4HDF5 => 6,
+            Self::Zlib => 2,
+            Self::Blosc => 3,
+            Self::LZ4 => 4,
+            Self::LZ4HDF5 => 5,
+            Self::BSLZ4 => 6,
         }
     }
 
@@ -56,11 +55,11 @@ impl CodecName {
     pub fn from_ordinal(ordinal: i32) -> Self {
         match ordinal {
             1 => Self::JPEG,
-            2 => Self::Blosc,
-            3 => Self::LZ4,
-            4 => Self::BSLZ4,
-            5 => Self::Zlib,
-            6 => Self::LZ4HDF5,
+            2 => Self::Zlib,
+            3 => Self::Blosc,
+            4 => Self::LZ4,
+            5 => Self::LZ4HDF5,
+            6 => Self::BSLZ4,
             _ => Self::None,
         }
     }

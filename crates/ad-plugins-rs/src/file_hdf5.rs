@@ -381,12 +381,12 @@ impl Default for Hdf5Settings {
             compression_type: 0,
             z_compress_level: 6,
             szip_num_pixels: 16,
-            // C default precision=8 bit, offset=0 (NDFileHDF5.cpp:2340-2341):
+            // C default precision=8 bit, offset=0 (NDFileHDF5.cpp:2342-2343):
             // a default-config N-bit request packs to 8 significant bits.
             nbit_precision: 8,
             nbit_offset: 0,
             jpeg_quality: 90,
-            // C default bloscShuffleType=1 (byte shuffle), NDFileHDF5.cpp:2344.
+            // C default bloscShuffleType=1 (byte shuffle), NDFileHDF5.cpp:2346.
             blosc_shuffle_type: 1,
             blosc_compressor: 0,
             blosc_compress_level: 5,
@@ -3638,7 +3638,7 @@ impl Hdf5FileProcessor {
     }
 
     /// C `NDFileHDF5::writeOctet` (NDFileHDF5.cpp:2086-2119) keeps an
-    /// XMLFileName that `verifyLayoutXMLFile` (:2136-2175) rejects and fails
+    /// XMLFileName that `verifyLayoutXMLFile` (:2138-2181) rejects and fails
     /// the write, after the console line naming why; LayoutValid and
     /// LayoutErrorMsg are set inside the write either way.
     fn check_octet(
@@ -3870,6 +3870,8 @@ fn register_hdf5_params(
     base.create_param("HDF5_chunkBoundaryAlign", ParamType::Int32)?;
     base.create_param("HDF5_chunkBoundaryThreshold", ParamType::Int32)?;
     base.create_param("HDF5_nExtraDims", ParamType::Int32)?;
+    base.create_param("HDF5_extraDimOffsetX", ParamType::Int32)?;
+    base.create_param("HDF5_extraDimOffsetY", ParamType::Int32)?;
     base.create_param("HDF5_extraDimSizeN", ParamType::Int32)?;
     base.create_param("HDF5_extraDimNameN", ParamType::Octet)?;
     base.create_param("HDF5_extraDimSizeX", ParamType::Int32)?;
@@ -3934,6 +3936,7 @@ fn register_hdf5_params(
     base.create_param("HDF5_posIndexDim8", ParamType::Octet)?;
     base.create_param("HDF5_posIndexDim9", ParamType::Octet)?;
     base.create_param("HDF5_fillValue", ParamType::Float64)?;
+    base.create_param("HDF5_extraDimChunkN", ParamType::Int32)?;
     base.create_param("HDF5_extraDimChunkX", ParamType::Int32)?;
     base.create_param("HDF5_extraDimChunkY", ParamType::Int32)?;
     base.create_param("HDF5_extraDimChunk3", ParamType::Int32)?;
@@ -3992,7 +3995,7 @@ const CHUNK_SIZE_PARAMS: [&str; 8] = [
     "HDF5_chunkSize9",
 ];
 
-/// C `str_NDFileHDF5_extraDimChunk`; this port creates X..9 only.
+/// C `str_NDFileHDF5_extraDimChunk`, N first.
 const EXTRA_DIM_CHUNK_PARAMS: [&str; MAX_EXTRA_DIMS] = [
     "HDF5_extraDimChunkN",
     "HDF5_extraDimChunkX",
@@ -4146,8 +4149,10 @@ impl NDPluginProcess for Hdf5FileProcessor {
         // outputs read these back at init and write them again, so an unset
         // or zero param here is written as 0 at boot and refused
         // (extraDimSize must be > 0).
-        let int32: [(&str, i32); 25] = [
+        let int32: [(&str, i32); 27] = [
             ("HDF5_chunkSizeAuto", 1),
+            ("HDF5_extraDimOffsetX", 0),
+            ("HDF5_extraDimOffsetY", 0),
             ("HDF5_nFramesChunks", 0),
             ("HDF5_NDAttributeChunk", 0),
             ("HDF5_chunkBoundaryAlign", 0),
@@ -4293,6 +4298,81 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn test_register_params_seeds_the_c_constructor_values() {
+        // Every value NDFileHDF5.cpp:2321-2384 sets, written out from the C.
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("H5INIT", 1, PortFlags::default());
+        let _nd = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let mut proc = Hdf5FileProcessor::new();
+        proc.register_params(&mut base).unwrap();
+        let idx = |name: &str| base.find_param(name).unwrap();
+        let int = |name: &str| base.get_int32_param(idx(name), 0).unwrap();
+        let float = |name: &str| base.get_float64_param(idx(name), 0).unwrap();
+        let string = |name: &str| {
+            String::from_utf8(base.get_string_param(idx(name), 0).unwrap().to_vec()).unwrap()
+        };
+        let ints = [
+            ("HDF5_chunkSizeAuto", 1),
+            ("HDF5_nRowChunks", 0),
+            ("HDF5_nColChunks", 0),
+            ("HDF5_chunkSize2", 0),
+            ("HDF5_chunkSize3", 0),
+            ("HDF5_chunkSize4", 0),
+            ("HDF5_chunkSize5", 0),
+            ("HDF5_chunkSize6", 0),
+            ("HDF5_chunkSize7", 0),
+            ("HDF5_chunkSize8", 0),
+            ("HDF5_chunkSize9", 0),
+            ("HDF5_nFramesChunks", 0),
+            ("HDF5_NDAttributeChunk", 0),
+            ("HDF5_chunkBoundaryAlign", 0),
+            ("HDF5_chunkBoundaryThreshold", 65536),
+            ("HDF5_nExtraDims", 0),
+            ("HDF5_extraDimOffsetX", 0),
+            ("HDF5_extraDimOffsetY", 0),
+            ("HDF5_storeAttributes", 1),
+            ("HDF5_storePerformance", 1),
+            ("HDF5_flushNthFrame", 0),
+            ("HDF5_compressionType", 0),
+            ("HDF5_nbitsPrecision", 8),
+            ("HDF5_nbitsOffset", 0),
+            ("HDF5_szipNumPixels", 16),
+            ("HDF5_zCompressLevel", 6),
+            ("HDF5_bloscShuffleType", 1),
+            ("HDF5_bloscCompressor", 0),
+            ("HDF5_bloscCompressLevel", 5),
+            ("HDF5_dimAttDatasets", 0),
+            ("HDF5_jpegQuality", 90),
+            ("HDF5_layoutValid", 1),
+            ("HDF5_posRunning", 0),
+            ("HDF5_SWMRFlushNow", 0),
+            ("HDF5_SWMRCbCounter", 0),
+            ("HDF5_SWMRMode", 0),
+            ("HDF5_SWMRRunning", 0),
+            ("HDF5_SWMRSupported", 1),
+        ];
+        for (name, v) in ints {
+            assert_eq!(int(name), v, "{name}");
+        }
+        for name in ["HDF5_totalRuntime", "HDF5_totalIoSpeed", "HDF5_fillValue"] {
+            assert_eq!(float(name), 0.0, "{name}");
+        }
+        assert_eq!(string("HDF5_layoutErrorMsg"), "");
+        assert_eq!(string("HDF5_layoutFilename"), "");
+        let dims = ["N", "X", "Y", "3", "4", "5", "6", "7", "8", "9"];
+        for (i, d) in dims.iter().enumerate() {
+            assert_eq!(int(&format!("HDF5_extraDimSize{d}")), 1, "size {d}");
+            assert_eq!(int(&format!("HDF5_extraDimChunk{d}")), 0, "chunk {d}");
+            assert_eq!(
+                string(&format!("HDF5_extraDimName{d}")),
+                format!("scan dimension {i}")
+            );
+            assert_eq!(string(&format!("HDF5_posNameDim{d}")), "");
+            assert_eq!(string(&format!("HDF5_posIndexDim{d}")), "");
+        }
+    }
 
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -6181,7 +6261,7 @@ mod tests {
 
     #[test]
     fn test_blosc_default_shuffle_is_byte_shuffle() {
-        // C default bloscShuffleType=1 (byte shuffle), NDFileHDF5.cpp:2344;
+        // C default bloscShuffleType=1 (byte shuffle), NDFileHDF5.cpp:2346;
         // BLOSC cd_values[5] carries the shuffle type.
         let mut writer = Hdf5Writer::new();
         writer.set_compression_type(COMPRESS_BLOSC);
@@ -7728,7 +7808,7 @@ mod tests {
         // creation rejects it rather than writing an unreadable file.
         let path = temp_path("hdf5_dcw_zlib");
         let mut writer = Hdf5Writer::new();
-        let comp = crate::codec::compress_zlib(&ramp_u16(4, 5)).unwrap();
+        let comp = crate::codec::compress_zlib(&ramp_u16(4, 5), 6).unwrap();
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::Zlib);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
         assert!(

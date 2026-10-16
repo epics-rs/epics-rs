@@ -1942,9 +1942,9 @@ impl PluginPortDriver {
         crate::driver::ndarray_driver::init_read_only_params(
             &mut base,
             &ndarray_params,
+            pool,
             port_name,
         )?;
-        crate::driver::ndarray_driver::refresh_pool_stats(&mut base, &ndarray_params, pool)?;
         if let Some(seed) = processor.array_callbacks_seed() {
             base.set_int32_param(ndarray_params.array_callbacks, 0, seed as i32)?;
         }
@@ -6214,7 +6214,7 @@ mod tests {
         assert_eq!(
             port.read_float64_blocking(p.pool_max_memory, 0)
                 .expect("POOL_MAX_MEMORY unset after construction"),
-            2.0
+            0.0
         );
         assert_eq!(
             port.read_float64_blocking(p.pool_used_memory, 0)

@@ -12,8 +12,7 @@ use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
 use crate::driver::ndarray_driver::{
-    DriverAttributes, handle_write_int32, init_read_only_params, refresh_pool_stats,
-    trace_write_int32,
+    DriverAttributes, handle_write_int32, init_read_only_params, trace_write_int32,
 };
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
@@ -56,10 +55,7 @@ impl ADDriverBase {
         // C `ADDriver::ADDriver` (ADDriver.cpp:150) chains to
         // `asynNDArrayDriver::asynNDArrayDriver`, so its whole read-only block
         // runs for every AD driver before the detector seeds below.
-        init_read_only_params(&mut port_base, &params.base, port_name)?;
-        refresh_pool_stats(&mut port_base, &params.base, &pool)?;
-        // Set initial values
-        port_base.set_string_param(params.base.codec, 0, String::new())?;
+        init_read_only_params(&mut port_base, &params.base, &pool, port_name)?;
 
         // ADDriver.cpp:174-179 states the rule these seeds follow: "values set
         // here will override those in the database for output records because if
@@ -83,12 +79,6 @@ impl ADDriverBase {
         port_base.set_string_param(params.status_message, 0, String::new())?;
         port_base.set_string_param(params.string_to_server, 0, String::new())?;
         port_base.set_string_param(params.string_from_server, 0, String::new())?;
-
-        // Not in C's block, which leaves both to the database: this port has
-        // no NDDataType_RBV default to fall back on, and a detector with no
-        // downstream plugins is still expected to publish arrays.
-        port_base.set_int32_param(params.base.data_type, 0, 1)?; // UInt8
-        port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
 
         // Don't fire callbacks here — no record subscribers exist before
         // dbLoadRecords, so an early `call_param_callbacks(0)` only
@@ -166,7 +156,8 @@ impl ADDriverBase {
 
         let callbacks_enabled = self
             .port_base
-            .get_int32_param(self.params.base.array_callbacks, 0)?
+            .get_int32_param(self.params.base.array_callbacks, 0)
+            .unwrap_or(0)
             != 0;
 
         let to_publish = if callbacks_enabled {
@@ -388,7 +379,17 @@ mod tests {
         // too, not just the six seeds this constructor used to repeat.
         let ad = ADDriverBase::new("TEST", 1, 1024, 768, 50_000_000, ASYN_CANBLOCK).unwrap();
         assert_c_read_only_block(&ad.port_base, &ad.params.base, "TEST");
-        assert_fresh_pool_stats(&ad.port_base, &ad.params.base, 50_000_000.0 / 1_048_576.0);
+        assert_fresh_pool_stats(&ad.port_base, &ad.params.base);
+        // Neither constructor sets NDCodec; only a published array does.
+        assert!(
+            ad.port_base
+                .get_string_param(ad.params.base.codec, 0)
+                .is_err()
+        );
+        // ADDriver.cpp sets neither; the concrete driver or the DB does.
+        for reason in [ad.params.base.array_callbacks, ad.params.base.data_type] {
+            assert!(ad.port_base.get_int32_param(reason, 0).is_err());
+        }
     }
 
     /// A detector that overrides `setShutter`, as marCCD and simDetector do.
@@ -684,6 +685,10 @@ mod tests {
     fn test_attributes_file_write_reaches_the_prepared_array() {
         use crate::attributes::NDAttrValue;
         let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+        ad.port_base
+            .set_int32_param(ad.params.base.array_callbacks, 0, 1)
+            .unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Gain" type="PARAM" source="GAIN" datatype="DOUBLE"/>
         </Attributes>"#;
@@ -774,6 +779,10 @@ mod tests {
     #[test]
     fn test_publish_sets_generic_pointer() {
         let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+        ad.port_base
+            .set_int32_param(ad.params.base.array_callbacks, 0, 1)
+            .unwrap();
         let arr = ad
             .pool
             .alloc(
@@ -1100,6 +1109,10 @@ mod tests {
         use crate::plugin::channel::ndarray_channel;
 
         let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+        ad.port_base
+            .set_int32_param(ad.params.base.array_callbacks, 0, 1)
+            .unwrap();
         let (sender, mut receiver) = ndarray_channel("DOWNSTREAM", 10);
         ad.connect_downstream(sender);
 

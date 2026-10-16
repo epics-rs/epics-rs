@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ad_core_rs::driver::ImageMode;
+use ad_core_rs::ndarray::NDDataType;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use sim_detector::create_sim_detector;
 
@@ -46,6 +47,7 @@ async fn acquire_bo_returns_to_zero_after_single() {
         &asyn_rs::registry::claim_port("RBK_TEST").unwrap(),
         32,
         32,
+        NDDataType::UInt8 as i32,
         10_000_000,
         NDArrayOutput::new(),
     )

@@ -2065,7 +2065,11 @@ impl PvDatabase {
             guard.release();
             // C `dbDbGetValue` returns `dbScanPassive`'s status unread.
             let read = match &*owned {
-                ParsedLink::Db(db) if self.process_passive_db_source(db, visited).is_err() => {
+                ParsedLink::Db(db)
+                    if self
+                        .process_passive_db_source(Some(rec.unframed()), db, visited)
+                        .is_err() =>
+                {
                     (crate::server::recgbl::simm::LinkFetch::Failed, None, None)
                 }
                 _ => self.read_link_with_alarm_at(
@@ -3703,7 +3707,7 @@ impl PvDatabase {
             let read = pn.map(|pn| {
                 let mut visited = ProcStack::new();
                 let (raw, alarm, render) =
-                    db.read_link_value_soft_with_alarm(&pn, true, render, &mut visited);
+                    db.read_link_value_soft_with_alarm(None, &pn, true, render, &mut visited);
                 let time = raw
                     .as_ref()
                     .and_then(|_| db.db_get_time_stamp_tag(&pn))
@@ -4289,20 +4293,19 @@ impl PvDatabase {
         self.read_tsel(rec)
     }
 
-    /// [`Self::cycle_stamp_withheld`] for a caller holding no data guard: the
-    /// plan answers for every type that never withholds, without the lock.
-    #[inline(always)]
-    fn cycle_stamp_withheld_in(rec: InFrame<'_>) -> bool {
-        rec.process_plan().hooks.withholds_cycle_stamp()
-            && Self::cycle_stamp_withheld(&mut rec.write())
+    #[cold]
+    #[inline(never)]
+    fn cycle_tsel_out_of_line(&self, rec: InFrame<'_>) -> super::TselStamp {
+        self.cycle_tsel(rec)
     }
 
     /// Whether this pass's cycle stamp is withheld: always for an own-stamp
     /// type, and for a [`CycleHooks::STAMP_REQUEST`] type unless the pass's
-    /// `process()` asked — which the asking consumes.
+    /// `process()` asked — which the asking consumes. The plan answers for
+    /// every type that never withholds, without the lock.
     #[inline(always)]
-    fn cycle_stamp_withheld(instance: &mut RecordInstance) -> bool {
-        instance.cycle_hooks().withholds_cycle_stamp() && !Self::stamp_requested(instance)
+    fn cycle_stamp_withheld_in(rec: InFrame<'_>) -> bool {
+        rec.process_plan().hooks.withholds_cycle_stamp() && !Self::stamp_requested(&mut rec.write())
     }
 
     #[cold]
@@ -4550,13 +4553,16 @@ impl PvDatabase {
             if matches!(request, crate::server::record::InputLinkRequest::NotRead) {
                 continue;
             }
+
             // C `sCalcoutRecord.c:916` / `:934` read these with `dbGetLink`
             // like every other input, so a failed one raises `setLinkAlarm`
             // (LINK/INVALID, AMSG `field INAA`) even though `fetch_values`
             // itself returns 0 (`:941`) and never gates `sCalcPerform`.
             let (fetch, alarm, _raw) = match parsed {
                 crate::server::record::ParsedLink::Db(db)
-                    if self.process_passive_db_source(db, visited).is_err() =>
+                    if self
+                        .process_passive_db_source(Some(rec.unframed()), db, visited)
+                        .is_err() =>
                 {
                     self.db_get_link_failed(rec, link_field, parsed);
                     (crate::server::recgbl::simm::LinkFetch::Failed, None, false)
@@ -4879,6 +4885,7 @@ impl PvDatabase {
             Some(inp_parsed) => {
                 let request = inp_request.expect("INP request is asked with the link");
                 let (raw, alarm, render) = self.read_link_value_soft_with_alarm(
+                    Some(guard.rec.unframed()),
                     inp_parsed,
                     is_soft,
                     request.renders_at_source(),
@@ -6614,14 +6621,22 @@ impl PvDatabase {
             // `fetch_values` / `readValue`, both already done — that C lets move
             // the TSEL source before this read, so reading it here and storing
             // it at the stamp point is C's order with the lock split out.
-            let tsel = if Self::cycle_stamp_withheld(guard.hold()) {
-                super::TselStamp::Withheld
+            // `plan`, not the instance: the plain arm folds the test away. An
+            // arm that releases the guard takes it back before the merge, so
+            // the no-TSEL arm reaches Segment C with its guard and constant.
+            let tsel = if plan.hooks.withholds_cycle_stamp() {
+                guard.release();
+                let tsel = self.cycle_tsel_out_of_line(rec);
+                guard.hold();
+                tsel
             } else {
                 match Self::tsel_link(guard.hold()) {
                     None => super::TselStamp::None,
                     Some(link) => {
                         guard.release();
-                        self.read_tsel_link(rec, link)
+                        let tsel = self.read_tsel_link(rec, link);
+                        guard.hold();
+                        tsel
                     }
                 }
             };
@@ -7757,11 +7772,15 @@ impl PvDatabase {
             None
         };
         // `recGblFwdLink` drops `dbScanFwdLink`'s status.
+        let src = super::links::TargetSrc {
+            rec: Some(rec),
+            putf,
+            notify: notify.as_ref(),
+        };
         let _ = self.process_target_at(
+            src,
             target,
             super::links::ProcessTargetGate::ScanPassive,
-            putf,
-            notify.as_ref(),
             None,
             visited,
         );
@@ -7935,7 +7954,7 @@ impl PvDatabase {
         // One read for both halves — see
         // `PvDatabase::read_link_value_and_alarm_at_source`.
         let (fetch, source_alarm) =
-            self.read_link_value_as_with_alarm(Some(rec.set()), &parsed, read_as, visited);
+            self.read_link_value_as_with_alarm(Some(rec), &parsed, read_as, visited);
         match fetch {
             LinkFetch::NoData => InputFetch::Nothing,
             // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
@@ -9164,7 +9183,9 @@ impl PvDatabase {
     ) {
         // C `dbDbGetValue` returns `dbScanPassive`'s status unread.
         if let crate::server::record::ParsedLink::Db(db) = link
-            && self.process_passive_db_source(db, visited).is_err()
+            && self
+                .process_passive_db_source(Some(reader.unframed()), db, visited)
+                .is_err()
         {
             self.db_get_link_failed(reader, link_field, link);
             return (crate::server::recgbl::simm::LinkFetch::Failed, None);

@@ -459,6 +459,15 @@ pub(crate) enum ExternalDone<'a> {
     Record(&'a super::DeviceDone),
 }
 
+/// C `processTarget`'s `psrc`: the source's frame, whose PACT reads 1 while
+/// the target processes (`dbDbLink.c:457`, `:514`), and the PUTF and
+/// wait-set the target takes from it.
+#[derive(Clone, Copy)]
+pub(crate) struct TargetSrc<'a> {
+    pub rec: Option<InFrame<'a>>,
+    pub putf: bool,
+    pub notify: Option<&'a Arc<NotifyWaitSet>>,
+}
 impl OutLinkSrc<'_> {
     /// The completion this put's external staging reports to.
     fn external_done(&self) -> ExternalDone<'_> {
@@ -1226,7 +1235,7 @@ impl PvDatabase {
     /// would in a cycle.
     pub(super) fn read_link_at_init(
         &self,
-        reader: SourceId,
+        reader: &Arc<RecordCell>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
     ) -> crate::server::record::InitRead {
@@ -1252,11 +1261,20 @@ impl PvDatabase {
                 failed(InitGetFailure::LinkAlarm)
             }
             _ => {
-                let (fetch, alarm) =
-                    self.read_link_value_as_with_alarm(None, link, read_as, &mut ProcStack::new());
+                // A PP source processes as C `dbDbGetValue`'s `dbScanPassive`
+                // does from `init_record`, holding the reader's PACT.
+                let (fetch, alarm) = self.read_link_value_as_from(
+                    Some(reader),
+                    None,
+                    link,
+                    read_as,
+                    &mut ProcStack::new(),
+                );
                 InitRead {
                     fetch,
-                    inherit: alarm.and_then(|alarm| self.inherit_source_alarm(reader, link, alarm)),
+                    inherit: alarm.and_then(|alarm| {
+                        self.inherit_source_alarm(SourceId::of(reader), link, alarm)
+                    }),
                     failure: InitGetFailure::LinkAlarm,
                 }
             }
@@ -1322,6 +1340,7 @@ impl PvDatabase {
     /// taken under the read's own hold.
     pub(crate) fn read_link_value_and_alarm_at_source(
         &self,
+        src: Option<&Arc<RecordCell>>,
         link: &crate::server::record::ParsedLink,
         render: bool,
         visited: &mut ProcStack,
@@ -1331,7 +1350,7 @@ impl PvDatabase {
         // guard — `read_link_value`'s rule, unchanged.
         // C `dbDbGetValue` returns `dbScanPassive`'s status unread.
         if let crate::server::record::ParsedLink::Db(db) = link
-            && self.process_passive_db_source(db, visited).is_err()
+            && self.process_passive_db_source(src, db, visited).is_err()
         {
             return (None, None, None);
         }
@@ -1376,14 +1395,37 @@ impl PvDatabase {
     /// `LinkFetch::Value` arm.
     pub(crate) fn read_link_value_as_with_alarm(
         &self,
-        held: Option<&crate::server::database::SetGuard>,
+        src: Option<InFrame<'_>>,
+        link: &crate::server::record::ParsedLink,
+        read_as: crate::server::record::LinkReadAs,
+        visited: &mut ProcStack,
+    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
+        self.read_link_value_as_from(
+            src.map(|src| src.unframed()),
+            src.map(|src| src.set()),
+            link,
+            read_as,
+            visited,
+        )
+    }
+
+    /// [`Self::read_link_value_as_with_alarm`] for a reader `src` whose lock
+    /// set `held` may not be taken — C's `psrc` either way.
+    fn read_link_value_as_from(
+        &self,
+        src: Option<&Arc<RecordCell>>,
+        held: Option<&super::SetGuard>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         visited: &mut ProcStack,
     ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         use crate::server::recgbl::simm::LinkFetch;
-        let (value, alarm, render) =
-            self.read_link_value_and_alarm_at_source(link, read_as.renders_at_source(), visited);
+        let (value, alarm, render) = self.read_link_value_and_alarm_at_source(
+            src,
+            link,
+            read_as.renders_at_source(),
+            visited,
+        );
         let Some(value) = value else {
             return (empty_read_fetch(link), None);
         };
@@ -2819,19 +2861,34 @@ impl PvDatabase {
     /// fire instead — an A↔B `PP` cycle bails when the second hop tries
     /// to re-insert a name already on the chain. The FLNK path threads
     /// `visited` the same way (processing.rs FLNK dispatch).
+    ///
+    /// The policy test is the caller's, so a link without PP costs no call.
+    #[inline(always)]
     pub(crate) fn process_passive_db_source(
         &self,
+        src: Option<&Arc<RecordCell>>,
         db: &crate::server::record::DbLink,
         visited: &mut ProcStack,
     ) -> DbResult {
-        if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
-            return Ok(());
+        if db.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
+            return self.process_pp_db_source(src, db, visited);
         }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn process_pp_db_source(
+        &self,
+        src: Option<&Arc<RecordCell>>,
+        db: &crate::server::record::DbLink,
+        visited: &mut ProcStack,
+    ) -> DbResult {
         if let Some(at) = self.db_link_addr(db) {
             let is_passive = at.rec.read().common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
                 // recursive INP-link source processing within
                 // one chain — gate held by the foreign entry record.
+                let _pact = src.map(|src| src.hold_chain_pact());
                 return self
                     .process_record_with_links_recursive_at(&at.name, &at.rec, visited)
                     .map_err(|e| DbStatus::of_error(&e));
@@ -2852,7 +2909,7 @@ impl PvDatabase {
         is_soft: bool,
         visited: &mut ProcStack,
     ) -> Option<EpicsValue> {
-        self.read_link_value_soft_with_alarm(link, is_soft, false, visited)
+        self.read_link_value_soft_with_alarm(None, link, is_soft, false, visited)
             .0
     }
 
@@ -2862,6 +2919,7 @@ impl PvDatabase {
     /// `DBR_STRING` part when `render` asks for it.
     pub(crate) fn read_link_value_soft_with_alarm(
         &self,
+        src: Option<&Arc<RecordCell>>,
         link: &crate::server::record::ParsedLink,
         is_soft: bool,
         render: bool,
@@ -2887,28 +2945,28 @@ impl PvDatabase {
             // configured) was clobbered on the next scan.
             crate::server::record::ParsedLink::Constant(_) => (None, None, None),
             crate::server::record::ParsedLink::Db(_) if is_soft => {
-                self.read_link_value_and_alarm_at_source(link, render, visited)
+                self.read_link_value_and_alarm_at_source(src, link, render, visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
             | crate::server::record::ParsedLink::PvaJson(_)
                 if is_soft =>
             {
-                self.read_link_value_and_alarm_at_source(link, render, visited)
+                self.read_link_value_and_alarm_at_source(src, link, render, visited)
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
             // PVs may themselves be local DB targets (which need the
             // soft path) or remote CA/PVA, but the calc evaluation
             // is uniform either way.
             crate::server::record::ParsedLink::Calc(_) => {
-                self.read_link_value_and_alarm_at_source(link, render, visited)
+                self.read_link_value_and_alarm_at_source(src, link, render, visited)
             }
             // A state link answers whatever the DTYP, for the same reason a
             // calc link does: `lnkState`'s own lset implements `getValue`
             // (`lnkState.c:139-151`), so there is no device support to route
             // around and no target record to process first.
             crate::server::record::ParsedLink::State(_) => {
-                self.read_link_value_and_alarm_at_source(link, render, visited)
+                self.read_link_value_and_alarm_at_source(src, link, render, visited)
             }
             _ => (None, None, None),
         }
@@ -2953,13 +3011,17 @@ impl PvDatabase {
     /// written under without taking it again.
     pub(crate) fn process_target_at(
         &self,
+        src: TargetSrc<'_>,
         target_rec: &Arc<crate::server::record::RecordCell>,
         gate: ProcessTargetGate,
-        src_putf: bool,
-        src_notify: Option<&Arc<NotifyWaitSet>>,
         held: Option<&super::SetGuard>,
         visited: &mut ProcStack,
     ) -> DbResult {
+        let TargetSrc {
+            rec: src_rec,
+            putf: src_putf,
+            notify: src_notify,
+        } = src;
         {
             let mut tg = target_rec.write_under(held);
             // A forward bound before the target was removed still reaches its
@@ -2991,6 +3053,7 @@ impl PvDatabase {
         // `process_record_with_links_body`'s PACT arm, the single owner of
         // that decision, and the refusal is counted there. Its status is
         // `processTarget`'s return (`dbDbLink.c:511-528`).
+        let _pact = src_rec.map(|src| src.unframed().hold_chain_pact());
         self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited)
             .map_err(|e| DbStatus::of_error(&e))
     }
@@ -3251,7 +3314,12 @@ impl PvDatabase {
         }
         // `dbDbPutValue` returns `processTarget`'s status (`dbDbLink.c:387-392`).
         if let (Some(gate), Some(rec)) = (gate, &target) {
-            return self.process_target_at(rec, gate, src.putf, src.notify, held, visited);
+            let src = TargetSrc {
+                rec: source,
+                putf: src.putf,
+                notify: src.notify,
+            };
+            return self.process_target_at(src, rec, gate, held, visited);
         }
         Ok(())
     }
@@ -4422,11 +4490,15 @@ impl PvDatabase {
                             // through the same single owner.
                             // `dbScanFwdLink` returns nothing to the fanout.
                             if let Some(target) = self.record_at(target) {
+                                let src = TargetSrc {
+                                    rec: Some(rec),
+                                    putf: src_putf,
+                                    notify: src_notify.as_ref(),
+                                };
                                 let _ = self.process_target_at(
+                                    src,
                                     target,
                                     ProcessTargetGate::ScanPassive,
-                                    src_putf,
-                                    src_notify.as_ref(),
                                     None,
                                     visited,
                                 );
@@ -6083,7 +6155,7 @@ mod nonlocal_db_link_read_tests {
 
         let mut visited = crate::server::database::ProcStack::new();
         let v = db
-            .read_link_value_and_alarm_at_source(&link, false, &mut visited)
+            .read_link_value_and_alarm_at_source(None, &link, false, &mut visited)
             .0;
         assert_eq!(
             v,
@@ -6134,7 +6206,7 @@ mod nonlocal_db_link_read_tests {
         let link = parse_link_v2("SRC");
         let mut visited = crate::server::database::ProcStack::new();
         let v = db
-            .read_link_value_and_alarm_at_source(&link, false, &mut visited)
+            .read_link_value_and_alarm_at_source(None, &link, false, &mut visited)
             .0;
         assert_eq!(
             v,
@@ -6431,7 +6503,7 @@ mod db_link_addr_tests {
     use std::sync::Arc;
 
     fn read(db: &PvDatabase, link: &ParsedLink) -> Option<EpicsValue> {
-        db.read_link_value_and_alarm_at_source(link, false, &mut ProcStack::new())
+        db.read_link_value_and_alarm_at_source(None, link, false, &mut ProcStack::new())
             .0
     }
 
@@ -6551,7 +6623,7 @@ mod db_link_addr_tests {
         let alarm_of = |text: &str| {
             let link = parse_link_v2(text);
             let (value, alarm, _) =
-                db.read_link_value_and_alarm_at_source(&link, false, &mut ProcStack::new());
+                db.read_link_value_and_alarm_at_source(None, &link, false, &mut ProcStack::new());
             assert_eq!(value, Some(EpicsValue::Double(1.0)));
             (
                 alarm.is_some(),
@@ -7141,7 +7213,7 @@ mod out_link_held_set_tests {
 
 #[cfg(test)]
 mod enum_read_held_set_tests {
-    use crate::server::database::{ProcStack, PvDatabase};
+    use crate::server::database::{FrameGate, ProcStack, PvDatabase};
     use crate::server::recgbl::EventMask;
     use crate::server::recgbl::simm::LinkFetch;
     use crate::server::record::{LinkReadAs, Record, parse_link_v2};
@@ -7186,14 +7258,15 @@ mod enum_read_held_set_tests {
         while posts.try_recv().is_ok() {}
 
         for (reader, field, want) in [("BSRC", "ONAM", 1), ("OTHER", "ZNAM", 0)] {
-            let held = db.lock_record(reader);
+            let cell = db.get_record(reader).unwrap();
+            let gate = FrameGate::Taken(db.lock_instance(&cell));
             let (fetch, _) = db.read_link_value_as_with_alarm(
-                Some(held.set()),
+                Some(gate.frame(&cell)),
                 &parse_link_v2(format!("BSRC.{field} NPP")),
                 LinkReadAs::Enum,
                 &mut ProcStack::new(),
             );
-            drop(held);
+            drop(gate);
             assert!(
                 matches!(&fetch, LinkFetch::Value(EpicsValue::EnumArray(v)) if v.is_empty()),
                 "{reader}: the reader's buffer is unwritten, {fetch:?}"

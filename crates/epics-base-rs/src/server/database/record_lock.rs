@@ -2384,11 +2384,12 @@ mod tests {
         use crate::server::records::calc::CalcRecord;
         let db = PvDatabase::new();
         let cell = |name: &str| {
-            let cell = Arc::new(RecordCell::new(
+            let cell = RecordCell::new(
                 RecordInstance::new(name, CalcRecord::default()),
                 0,
                 false,
-            ));
+                None,
+            );
             db.inner
                 .record_locks
                 .adopt(name.as_bytes(), cell.lock_record());
@@ -2431,11 +2432,12 @@ mod tests {
     fn adopted_cell(db: &PvDatabase, name: &str) -> Arc<crate::server::record::RecordCell> {
         use crate::server::record::{RecordCell, RecordInstance};
         use crate::server::records::calc::CalcRecord;
-        let cell = Arc::new(RecordCell::new(
+        let cell = RecordCell::new(
             RecordInstance::new(name, CalcRecord::default()),
             0,
             false,
-        ));
+            None,
+        );
         db.inner
             .record_locks
             .adopt(name.as_bytes(), cell.lock_record());

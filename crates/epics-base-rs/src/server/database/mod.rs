@@ -3379,7 +3379,7 @@ impl PvDatabase {
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let index = self.inner.record_table.reserve();
-        let rec_arc = Arc::new(RecordCell::new(instance, seq, true).indexed(index));
+        let rec_arc = RecordCell::new(instance, seq, true, Some(index));
         self.inner.record_table.publish(index, rec_arc.clone());
         // C `createLockRecord` allocates the `lockRecord` INTO the record:
         // the registry's answer for this name is this record's own cell,
@@ -3588,15 +3588,14 @@ impl PvDatabase {
                 })
                 .collect()
         };
-        let reader = links::SourceId::of(rec_arc);
         crate::server::record::InitLinkReads::new(
             links
                 .into_iter()
                 .map(|(field, text, read_as, unbound)| {
                     let read = match unbound {
-                        Some(link) => self.read_link_at_init(reader, &link, read_as),
+                        Some(link) => self.read_link_at_init(rec_arc, &link, read_as),
                         None => self.read_link_at_init(
-                            reader,
+                            rec_arc,
                             &crate::server::record::parse_link_v2(
                                 text.as_ref().map_or(&b""[..], |t| t.as_bytes()),
                             ),

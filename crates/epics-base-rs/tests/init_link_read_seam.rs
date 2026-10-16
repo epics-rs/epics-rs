@@ -203,6 +203,41 @@ record(calc, "AO") { field(CALC, "VAL+1") field(VAL, "7.5") field(HOPR, "9") }
     assert_eq!(db.get_pv("CNT").unwrap().to_f64(), Some(1.0));
 }
 
+/// The PP read's `dbScanPassive` is C `processTarget` with the reader as
+/// `psrc` (`dbDbLink.c:175-176`, `:457`), at init as in a cycle: a source
+/// disabled on the reader's PACT does not process.
+#[epics_macros_rs::epics_test]
+async fn an_init_pp_read_holds_the_reader_pact() {
+    let seen: Seen = Arc::default();
+    let factory = seen.clone();
+    let db = IocBuilder::new()
+        .register_record_type("readback", move || {
+            Box::new(Readback {
+                name: String::new(),
+                links: Default::default(),
+                gate: [true, false],
+                r: [-1.0; 2],
+                seen: factory.clone(),
+            })
+        })
+        .db_string(
+            r#"
+record(readback, "RD") { field(TAG, "RD") field(L0, "SRC PP") }
+record(calc, "SRC") { field(CALC, "VAL+1") field(SDIS, "RD.PACT") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(*seen.lock().unwrap(), [("RD".to_string(), 0.0, 0.0)]);
+    // menuAlarmStat DISABLE.
+    assert_eq!(db.get_pv("SRC.STAT").unwrap().to_f64(), Some(18.0));
+    assert_eq!(db.get_pv("RD.PACT").unwrap().to_f64(), Some(0.0));
+}
+
 /// A record created outside the LOAD phase, and a `.db` merge into a live
 /// record, run pass 1 through the same reads as `iocInit`'s drain: C has one
 /// `init_record`, so an init path that answers "unset" is a second meaning.

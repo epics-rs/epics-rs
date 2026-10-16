@@ -2418,6 +2418,13 @@ pub struct RecordCell {
     /// (`iocInit.c:576-577`): claimed once, so each link is opened once at
     /// init however many init walks reach the record.
     link_opens_owed: std::sync::atomic::AtomicBool,
+    /// C `processTarget`'s `psrc->pact = TRUE` (`dbDbLink.c:457`, restored at
+    /// `:514`): this record is the source of a PP or FLNK target being
+    /// processed. Read only as the PACT field (through `RecordCold::cell`),
+    /// so a link the target's chain reads back sees 1; it gates no cycle.
+    /// Set with no borrow of the record, on the line of `name`, which the
+    /// cycle reads.
+    chain_pact: AtomicBool,
     /// This record's slot in the database's record table, given at
     /// registration; `None` for a cell no database registered.
     index: Option<crate::server::database::RecordIdx>,
@@ -3337,7 +3344,31 @@ struct LockSetGuarded<T: Send + Sync>(std::cell::UnsafeCell<T>);
 // same-thread borrow rules are enforced by `RecordCell::borrow`.
 unsafe impl<T: Send + Sync> Sync for LockSetGuarded<T> {}
 
+/// C `processTarget`'s hold of `psrc->pact`: set for the guard's life, then
+/// put back as it was (`dbDbLink.c:443`, `:457`, `:514`).
+pub(crate) struct ChainPactHold<'a> {
+    flag: &'a AtomicBool,
+    was: bool,
+}
+
+impl Drop for ChainPactHold<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.flag.store(self.was, Ordering::Relaxed);
+    }
+}
+
 impl RecordCell {
+    /// Hold this record's PACT as a target's source while the guard lives.
+    /// Under the chain's lock set, so a reader that takes it sees C's value.
+    #[inline(always)]
+    pub(crate) fn hold_chain_pact(&self) -> ChainPactHold<'_> {
+        let flag = &self.chain_pact;
+        let was = flag.load(Ordering::Relaxed);
+        flag.store(true, Ordering::Relaxed);
+        ChainPactHold { flag, was }
+    }
+
     /// Record borrows the calling thread holds, for a test binary's
     /// allocator to tell allocations under a hold from the rest; `0` in
     /// builds without debug assertions.
@@ -3346,7 +3377,24 @@ impl RecordCell {
         live_borrows::count()
     }
 
-    pub(crate) fn new(mut instance: RecordInstance, load_order: u64, init_owed: bool) -> Self {
+    /// The cell for `instance`, registered at record-table `index` if given.
+    pub(crate) fn new(
+        mut instance: RecordInstance,
+        load_order: u64,
+        init_owed: bool,
+        index: Option<crate::server::database::RecordIdx>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|cell| {
+            instance.cold.cell = cell.clone();
+            let cell = Self::build(instance, load_order, init_owed);
+            match index {
+                Some(index) => cell.indexed(index),
+                None => cell,
+            }
+        })
+    }
+
+    fn build(mut instance: RecordInstance, load_order: u64, init_owed: bool) -> Self {
         let slots: Box<[_]> = instance
             .record
             .field_list()
@@ -3372,6 +3420,7 @@ impl RecordCell {
             index: None,
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
             link_opens_owed: std::sync::atomic::AtomicBool::new(true),
+            chain_pact: AtomicBool::new(false),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
@@ -3383,7 +3432,7 @@ impl RecordCell {
     }
 
     /// The cell as registered at record-table index `index`.
-    pub(crate) fn indexed(mut self, index: crate::server::database::RecordIdx) -> Self {
+    fn indexed(mut self, index: crate::server::database::RecordIdx) -> Self {
         self.index = Some(index);
         let body = &*self.data.0.get_mut().record;
         self.lock_record.hints().body.set(
@@ -4856,6 +4905,9 @@ pub struct RecordInstance {
 /// [`RecordInstance`]'s fields no process cycle reads, behind one pointer so
 /// the lines a cycle does read sit closer together.
 struct RecordCold {
+    /// The cell holding this instance — none for one not yet in a cell — for
+    /// the PACT field's read of [`RecordCell::hold_chain_pact`]'s flag.
+    cell: std::sync::Weak<RecordCell>,
     /// The by-name function registry this record's PENDING `init_record` pass
     /// 1 will resolve INAM/SNAM against — C `registryFunctionFind`, reading a
     /// process-global table from inside `init_record`.
@@ -6639,6 +6691,7 @@ impl RecordInstance {
             #[cfg(test)]
             ran_arm: CyclePlan::General,
             cold: Box::new(RecordCold {
+                cell: std::sync::Weak::new(),
                 init_subroutines: None,
                 skipped_posted: SkippedLog::default(),
                 declared_overrides: HashMap::new(),
@@ -9073,7 +9126,12 @@ impl RecordInstance {
             CommonField::Disp => Some(EpicsValue::UChar(self.common.disp)),
             CommonField::Putf => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
             CommonField::Rpro => Some(EpicsValue::UChar(self.common.rpro)),
-            CommonField::Pact => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
+            CommonField::Pact => Some(EpicsValue::Char(
+                (self.is_processing()
+                    || (self.cold.cell.upgrade())
+                        .is_some_and(|cell| cell.chain_pact.load(Ordering::Relaxed)))
+                    as u8,
+            )),
             // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is
             // retained in `prec->proc` and served back SIGNED as `DBR_CHAR`
             // (`caput PROC 255` → `caget` = -1), exactly like DISP/RPRO. The
@@ -13036,6 +13094,7 @@ mod record_cell_layout_tests {
             // Not read by a process cycle from here on.
             init_owed,
             link_opens_owed,
+            chain_pact,
             index,
             rdes,
             slots,
@@ -15343,6 +15402,20 @@ mod pact_exit_tests {
         inst.queue_notify_put(DeferredNotify::Process { completion: tx });
         assert!(inst.leave_pact().restart_pending());
     }
+    /// A hold inside a hold puts back the outer's 1, as C's nested
+    /// `processTarget` restores the `pact` it saved (`dbDbLink.c:443`, `:514`).
+    #[test]
+    fn a_nested_chain_pact_hold_restores_the_outer_hold() {
+        let cell = RecordCell::new(instance(), 0, false, None);
+        let pact = || cell.read().common_field(CommonField::Pact);
+        assert_eq!(pact(), Some(EpicsValue::Char(0)));
+        let outer = cell.hold_chain_pact();
+        let inner = cell.hold_chain_pact();
+        drop(inner);
+        assert_eq!(pact(), Some(EpicsValue::Char(1)), "still the outer hold");
+        drop(outer);
+        assert_eq!(pact(), Some(EpicsValue::Char(0)));
+    }
 }
 
 #[cfg(test)]
@@ -17217,11 +17290,12 @@ mod link_cache_fact_tests {
     #[test]
     fn the_out_target_empties_where_its_entry_can_go() {
         use crate::server::records::ao::AoRecord;
-        let target = Arc::new(RecordCell::new(
+        let target = RecordCell::new(
             RecordInstance::new("TGT", AoRecord::new(0.0)),
             0,
             false,
-        ));
+            None,
+        );
         let put = PutAddr::resolve_in(&target, "VAL");
         let mut inst = RecordInstance::new("SRC", AoRecord::new(0.0));
         let parse = parse_link_field("TGT.VAL PP", LinkFieldType::Out);

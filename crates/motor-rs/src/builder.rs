@@ -8,6 +8,7 @@ use crate::device_state::{self, SharedDeviceState};
 use crate::device_support::MotorDeviceSupport;
 use crate::poll_loop::{MotorPollLoop, PollCommand, PollerInbox};
 use crate::record::MotorRecord;
+use crate::trace::{MotorTrace, TraceUser};
 
 /// Assembled motor components ready for use.
 pub struct MotorSetup {
@@ -20,7 +21,7 @@ pub struct MotorSetup {
 /// Builder for constructing a complete motor record + device support + poll loop.
 pub struct MotorBuilder {
     motor: Arc<Mutex<dyn AsynMotor>>,
-    addr: i32,
+    user: TraceUser,
     timeout: Duration,
     moving_poll_interval: Duration,
     idle_poll_interval: Duration,
@@ -33,7 +34,10 @@ impl MotorBuilder {
     pub fn new(motor: Arc<Mutex<dyn AsynMotor>>) -> Self {
         Self {
             motor,
-            addr: 0,
+            user: TraceUser::Asyn {
+                port: String::new(),
+                addr: 0,
+            },
             timeout: Duration::from_secs(1),
             moving_poll_interval: Duration::from_millis(100),
             idle_poll_interval: Duration::from_secs(1),
@@ -43,8 +47,10 @@ impl MotorBuilder {
         }
     }
 
-    pub fn addr(mut self, addr: i32) -> Self {
-        self.addr = addr;
+    /// The asyn user the axis's trace lines print on: C's `pasynUser`
+    /// `(port, addr)`, or [`TraceUser::Model1`] for a model-1 driver.
+    pub fn trace_user(mut self, user: TraceUser) -> Self {
+        self.user = user;
         self
     }
 
@@ -94,9 +100,9 @@ impl MotorBuilder {
         }
 
         let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
+        let trace = Arc::new(MotorTrace::with_user(self.user));
         let device_support = MotorDeviceSupport::new(
-            self.motor.clone(),
-            self.addr,
+            trace.clone(),
             self.timeout,
             poll_cmd_tx.clone(),
             motor_cmd_tx,
@@ -115,7 +121,8 @@ impl MotorBuilder {
             self.moving_poll_interval,
             self.idle_poll_interval,
             self.forced_fast_polls,
-        );
+        )
+        .with_trace(trace);
 
         MotorSetup {
             record,

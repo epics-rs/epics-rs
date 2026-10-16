@@ -93,6 +93,7 @@ impl MotorRecord {
                 && self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY)
                 && !self.stat.mip.contains(MipFlags::STOP)
             {
+                self.report_ntm_stop();
                 self.stat.mip.insert(MipFlags::STOP);
                 self.mark(m::MIP);
                 self.internal.pp = false;
@@ -212,6 +213,9 @@ impl MotorRecord {
             let pp = std::mem::take(&mut self.internal.pp);
             if pp {
                 self.postprocess_sync();
+                // C postProcess 1030, so the DLY settle runs without it.
+                self.stat.mip.remove(MipFlags::STOP);
+                self.mark(m::MIP);
                 self.finalize_or_delay(&mut effects);
                 return effects;
             }
@@ -646,9 +650,8 @@ impl MotorRecord {
         true
     }
 
-    /// Set motion phase with tracing.
+    /// Set motion phase.
     pub(crate) fn set_phase(&mut self, new_phase: MotionPhase) {
-        tracing::debug!("phase transition: {:?} -> {:?}", self.stat.phase, new_phase);
         self.stat.phase = new_phase;
     }
 

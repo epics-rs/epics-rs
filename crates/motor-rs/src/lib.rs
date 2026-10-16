@@ -59,6 +59,7 @@ pub mod ioc;
 pub mod poll_loop;
 pub mod record;
 pub mod sim_motor;
+pub mod trace;
 
 pub use builder::MotorBuilder;
 pub use record::MotorRecord;

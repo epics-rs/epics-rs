@@ -51,6 +51,7 @@ async fn test_full_move_via_mailbox() {
     let mut setup = make_builder(motor).build();
 
     // Init device support
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
 
     // Spawn poll loop
@@ -94,6 +95,7 @@ async fn test_stop_during_move() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
     let mut setup = make_builder(motor).build();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     let poll_handle = tokio::spawn(setup.poll_loop.run());
 
@@ -165,6 +167,7 @@ async fn test_delay_via_poll_loop() {
         })
         .build();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     let poll_handle = tokio::spawn(setup.poll_loop.run());
 
@@ -223,6 +226,7 @@ async fn test_backlash_via_mailbox() {
         })
         .build();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     let poll_handle = tokio::spawn(setup.poll_loop.run());
 
@@ -463,6 +467,7 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
     let mut setup = make_builder(motor).build();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     // Drive the record only when the poll loop fires io_intr (production wiring).
     let mut io_intr_rx = setup
@@ -587,6 +592,7 @@ async fn init_does_not_clobber_live_controller_position() {
     assert!(setup.record.was_position_restored());
 
     // init() polls the controller (true 5.0) and reseeds nothing.
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     assert!(
         (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
@@ -628,6 +634,7 @@ async fn startup_reseeds_controller_that_lost_position() {
         .put_field("DVAL", EpicsValue::Double(5.0))
         .unwrap();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     assert!(
         read_motor_pos(&motor).abs() < 1e-9,
@@ -660,6 +667,7 @@ async fn init_does_not_reseed_controller_when_nothing_restored() {
     // No put_field("DVAL", ...) — nothing was restored.
     assert!(!setup.record.was_position_restored());
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
@@ -680,7 +688,9 @@ async fn init_forwards_dial_limits_to_driver() {
     let motor: Arc<Mutex<dyn AsynMotor>> = sim.clone();
     let mut setup = make_builder(motor).build();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     let m = sim.lock().unwrap();
     assert_eq!(m.forwarded_high_limit, Some(100.0));
@@ -696,6 +706,7 @@ async fn limit_put_forward_reaches_driver() {
     let motor: Arc<Mutex<dyn AsynMotor>> = sim.clone();
     let mut setup = make_builder(motor).build();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     // The builder harness skips the record init passes; the live IOC
     // sets this in init_record(pass1).
@@ -724,6 +735,7 @@ async fn pid_gain_put_forward_reaches_driver() {
     let motor: Arc<Mutex<dyn AsynMotor>> = sim.clone();
     let mut setup = make_builder(motor).build();
 
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
@@ -975,6 +987,7 @@ async fn pass0_restored_val_is_not_a_move_command() {
         .put_field("VAL", EpicsValue::Double(1.5))
         .unwrap();
     // C init_record era: initial readback seed + parked-put clear.
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     // First status pass = Startup -> initial_readback -> RSTM restore.
     setup.record.process().unwrap();
@@ -1069,6 +1082,7 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
     let dead = Arc::new(AtomicBool::new(false));
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DeadLine { dead: dead.clone() }));
     let mut setup = make_builder(motor).build();
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
@@ -1168,6 +1182,7 @@ async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
     let seen = Arc::new(Seen::default());
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Counting(seen.clone())));
     let mut setup = make_builder(motor).build();
+    setup.poll_loop.prime_cache();
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
@@ -1221,6 +1236,7 @@ async fn sim_motor_msta_at_rest_matches_motor_sim_driver() {
         let mut setup = MotorBuilder::new(motor)
             .poll_interval(Duration::from_millis(5))
             .build();
+        setup.poll_loop.prime_cache();
         setup.device_support.init(&mut setup.record).unwrap();
         let poll_handle = tokio::spawn(setup.poll_loop.run());
 

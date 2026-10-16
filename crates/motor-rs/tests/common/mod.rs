@@ -97,7 +97,7 @@ pub struct MotorFixture {
     pub(crate) _poll_cmd_rx: tokio::sync::mpsc::Receiver<motor_rs::poll_loop::PollCommand>,
     /// The driver commands the record queued for the poller thread, which
     /// this fixture stands in for.
-    motor_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<motor_rs::flags::MotorCommand>>,
+    motor_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<motor_rs::poll_loop::QueuedCommand>>,
 }
 
 impl MotorFixture {
@@ -128,9 +128,17 @@ impl MotorFixture {
 
         let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
         let (motor_cmd_tx, motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The poller's startup poll fills the cache init reads.
+        state.lock().unwrap().latest_status = Some(motor_rs::device_state::StampedStatus {
+            seq: 1,
+            status: asyn_rs::interfaces::motor::AsynMotor::poll(
+                &mut *motor.lock().unwrap(),
+                &asyn_rs::user::AsynUser::new(0),
+            )
+            .unwrap(),
+        });
         let mut dev = MotorDeviceSupport::new(
-            motor.clone() as Arc<Mutex<dyn AsynMotor>>,
-            0,
+            Default::default(),
             Duration::from_secs(1),
             poll_cmd_tx,
             motor_cmd_tx,
@@ -193,7 +201,7 @@ impl MotorFixture {
         let status = {
             let mut motor = self.motor.lock().unwrap();
             while let Ok(commands) = self.motor_cmd_rx.try_recv() {
-                motor_rs::poll_loop::execute_commands(&mut *motor, &commands);
+                motor_rs::poll_loop::execute_commands(&mut *motor, &Default::default(), &commands);
             }
             edit(&mut motor);
             motor.poll(&user).unwrap()

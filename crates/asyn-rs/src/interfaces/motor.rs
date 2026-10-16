@@ -172,6 +172,12 @@ pub trait AsynMotor: Send + Sync {
     /// Set the current position without moving.
     fn set_position(&mut self, user: &AsynUser, position: f64) -> AsynResult<()>;
 
+    /// Set the encoder ratio, motor steps per encoder count (C
+    /// `asynMotorAxis::setEncoderRatio`, a no-op unless the driver needs it).
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     /// Enable or disable closed-loop control.
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
         Ok(())

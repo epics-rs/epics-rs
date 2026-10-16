@@ -39,6 +39,8 @@ pub struct MotorRecord {
     pub alarm: AlarmFields,
     /// Pending event for next process() call
     pending_event: Option<MotorEvent>,
+    /// The axis's asyn user, which also carries `pmr->name`.
+    trace: std::sync::Arc<crate::trace::MotorTrace>,
     /// Track which field was last written (for process)
     last_write: Option<CommandSource>,
     /// One-shot request from a runtime JVEL put: re-emit the jog command
@@ -185,6 +187,7 @@ impl Default for MotorRecord {
             links: LinkFields::default(),
             alarm: AlarmFields::default(),
             pending_event: None,
+            trace: Default::default(),
             last_write: None,
             jog_retune_pending: false,
             device_state: None,
@@ -216,6 +219,39 @@ impl MotorRecord {
     /// Set the shared device state (for late injection by device support init).
     pub fn set_device_state(&mut self, state: SharedDeviceState) {
         self.device_state = Some(state);
+    }
+
+    /// Bind the axis's asyn user; its record name is the one console lines
+    /// carry.
+    pub fn set_trace(&mut self, trace: std::sync::Arc<crate::trace::MotorTrace>) {
+        self.trace = trace;
+    }
+
+    pub(crate) fn trace(&self) -> &crate::trace::MotorTrace {
+        &self.trace
+    }
+
+    /// C 1335: the movn-block NTM stop — "We're going in the wrong
+    /// direction. Readback problem?"
+    pub(crate) fn report_ntm_stop(&self) {
+        println!(
+            "{}:tdir = {}",
+            self.trace.record(),
+            u8::from(self.stat.tdir)
+        );
+    }
+
+    /// C syncTargetPosition (4414-4458). A failed RDBL read leaves the
+    /// readbacks as they were and syncs the targets to them anyway.
+    pub(crate) fn sync_target_position(&mut self) {
+        if !self.conv.ueip && self.conv.urip && self.conv.rdbl_error {
+            println!(
+                "{}: syncTargetPosition: error reading RDBL link.",
+                self.trace.record()
+            );
+        }
+        self.sync_positions();
+        self.mark(m::RRBV | m::DRBV | m::RBV);
     }
 
     /// Set a pending event for the next process() call.
@@ -427,17 +463,13 @@ impl Record for MotorRecord {
         // than overwriting — otherwise the earlier move command is lost.
         if let Some(state) = self.device_state.clone() {
             let actions = self.effects_to_actions(&effects);
-            match state.lock() {
-                Ok(mut ds) => match ds.pending_actions.take() {
+            if let Ok(mut ds) = state.lock() {
+                match ds.pending_actions.take() {
                     Some(mut prev) => {
-                        tracing::warn!("motor: pending_actions not yet consumed — merging batches");
                         prev.merge_newer(actions);
                         ds.pending_actions = Some(prev);
                     }
                     None => ds.pending_actions = Some(actions),
-                },
-                Err(e) => {
-                    tracing::error!("device state lock poisoned in process: {e}");
                 }
             }
         }

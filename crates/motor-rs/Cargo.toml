@@ -13,7 +13,9 @@ epics-ca-rs = { workspace = true }
 asyn-rs = { workspace = true }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 bitflags = "2"
-tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

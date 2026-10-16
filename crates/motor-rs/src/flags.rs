@@ -289,6 +289,21 @@ pub enum MotorCommand {
     SetPosition {
         position: f64,
     },
+    /// C init_controller's position load (devMotorAsyn.c:216-231): a
+    /// SyncIO write that init_controller reports itself rather than through
+    /// asynCallback.
+    InitPosition {
+        position: f64,
+    },
+    /// do_work's SET_ENC_RATIO (motorRecord.cc:1973-1978).
+    SetEncoderRatio {
+        ratio: f64,
+    },
+    /// C init_controller's encoder-ratio write (devMotorAsyn.c:186-198),
+    /// reported by init_controller like [`InitPosition`](Self::InitPosition).
+    InitEncoderRatio {
+        ratio: f64,
+    },
     SetClosedLoop {
         enable: bool,
     },

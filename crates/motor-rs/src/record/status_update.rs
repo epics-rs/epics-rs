@@ -26,13 +26,7 @@ impl MotorRecord {
         // Extract data from shared state, then drop the lock before mutating self
         let (delay_id, new_status) = {
             let state = self.device_state.as_ref()?;
-            let mut ds = match state.lock() {
-                Ok(ds) => ds,
-                Err(e) => {
-                    tracing::error!("device state lock poisoned in determine_event: {e}");
-                    return None;
-                }
-            };
+            let mut ds = state.lock().ok()?;
 
             let delay_id = ds.expired_delay_id.take();
             let new_status = ds
@@ -129,7 +123,14 @@ impl MotorRecord {
         });
 
         DeviceActions {
-            commands: effects.commands.clone(),
+            commands: effects
+                .commands
+                .iter()
+                .map(|command| crate::poll_loop::QueuedCommand {
+                    command: command.clone(),
+                    mres: self.conv.mres,
+                })
+                .collect(),
             poll,
             schedule_delay,
             status_refresh: effects.status_refresh,
@@ -204,12 +205,6 @@ impl MotorRecord {
                 (status.encoder_position / self.conv.eres + 0.5).floor(),
             );
         } else {
-            if self.conv.ueip {
-                tracing::warn!(
-                    "UEIP set but ERES invalid ({:.6}), falling back to MRES for REP",
-                    self.conv.eres
-                );
-            }
             self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
                 (status.encoder_position / self.conv.mres + 0.5).floor(),
             );
@@ -287,7 +282,9 @@ impl MotorRecord {
         // the controller directly, or another record drove the same axis).
         // Mark MIP_EXTERNAL and clear DMOV; do_process() routes the next
         // process() into check_completion via the MIP_EXTERNAL bit.
-        if self.stat.movn
+        // C runs this in process() only, never at init_record.
+        if !initcall
+            && self.stat.movn
             && self.stat.dmov
             && self.stat.phase == MotionPhase::Idle
             && !self.stat.mip.contains(MipFlags::EXTERNAL)
@@ -417,6 +414,15 @@ impl MotorRecord {
         // check_completion's still-moving path — and in the do_work move
         // block / soft-limit puts, ported in plan_absolute_move and
         // detect_inverted_limits.
+
+        if initcall {
+            // C init_record 721-724, right after its process_motor_info(true):
+            // DMOV starts done and MOVN clear whatever the driver reports; a
+            // moving axis is picked up as external on the next pass.
+            self.stat.dmov = true;
+            self.stat.movn = false;
+            self.mark(m::DMOV | m::MOVN);
+        }
     }
 
     /// Sync all positions from readback.
@@ -471,9 +477,6 @@ impl MotorRecord {
         // skips URIP RDBL scaling and seeds the readback from motor position.
         self.process_motor_info_initcall(status, true);
 
-        // DMOV from driver
-        self.stat.dmov = status.done && !status.moving;
-
         if status.moving {
             // At startup, the poll loop may not be active yet — request it.
             effects.request_poll = true;
@@ -495,6 +498,17 @@ impl MotorRecord {
         ) {
             self.internal.dol_udf = Some(false);
         }
+
+        // C init_controller (devMotorAsyn.c:183-198) downloads the encoder
+        // ratio before anything else, parked write or not.
+        let ratio = if self.conv.eres == 0.0 {
+            1.0
+        } else {
+            self.conv.mres / self.conv.eres
+        };
+        effects
+            .commands
+            .push(MotorCommand::InitEncoderRatio { ratio });
 
         // A write parked before this anchor (an autosave pass-1 restore or
         // a CA put in the init→first-poll window — a window C cannot have,
@@ -542,15 +556,8 @@ impl MotorRecord {
         // position, so skip the restore and adopt the driver readback instead.
         if restore && autosaved_rval != 0 {
             let rval_implied_dval = autosaved_rval as f64 * self.conv.mres;
+            // C init_controller has no such check, so nothing to print.
             if (rval_implied_dval - autosaved_dval).abs() > rdbd {
-                tracing::warn!(
-                    "RSTM restore skipped: autosaved DVAL {:.4} inconsistent with \
-                     RVAL {} * MRES {:.6} = {:.4} — MRES likely changed since autosave",
-                    autosaved_dval,
-                    autosaved_rval,
-                    self.conv.mres,
-                    rval_implied_dval,
-                );
                 restore = false;
             }
         }
@@ -566,19 +573,31 @@ impl MotorRecord {
             self.internal.ldvl = autosaved_dval;
             self.internal.lval = self.pos.val;
             self.internal.lrvl = self.pos.rval;
-            effects.commands.push(MotorCommand::SetPosition {
+            effects.commands.push(MotorCommand::InitPosition {
                 position: autosaved_dval,
             });
-        } else if self.links.omsl == 1 {
-            // C init_record (705-714) skips the readback adoption under
-            // closed-loop OMSL — the DOL link owns the drive-value
-            // initialization — but still anchors the change-detection
-            // lasts (730-732).
-            self.internal.lval = self.pos.val;
-            self.internal.ldvl = self.pos.dval;
-            self.internal.lrvl = self.pos.rval;
         } else {
-            self.sync_positions();
+            self.trace().print(
+                asyn_rs::trace::TraceMask::FLOW,
+                crate::poll_loop::MOTOR_STATUS_REASON,
+                format_args!(
+                    "devMotorAsyn::init_controller, {} setting of position not required, position={:.6}, mres={:.6}, dval={autosaved_dval:.6}, rdbd={rdbd:.6}",
+                    self.trace().record(),
+                    self.pos.rmp as f64,
+                    self.conv.mres,
+                ),
+            );
+            if self.links.omsl == 1 {
+                // C init_record (705-714) skips the readback adoption under
+                // closed-loop OMSL — the DOL link owns the drive-value
+                // initialization — but still anchors the change-detection
+                // lasts (730-732).
+                self.internal.lval = self.pos.val;
+                self.internal.ldvl = self.pos.dval;
+                self.internal.lrvl = self.pos.rval;
+            } else {
+                self.sync_positions();
+            }
         }
 
         effects

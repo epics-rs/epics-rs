@@ -541,8 +541,17 @@ fn startup_moving_starts_polling() {
     };
 
     let effects = rec.initial_readback(&status);
-    assert!(!rec.stat.dmov);
+    // C init_record forces DMOV done and MOVN clear (motorRecord.cc:721-724).
+    assert!(rec.stat.dmov);
+    assert!(!rec.stat.movn);
+    assert!(!rec.stat.mip.contains(MipFlags::EXTERNAL));
     assert!(effects.request_poll);
+
+    // The next pass sees the move and takes it as external.
+    rec.process_motor_info(&status);
+    assert!(rec.stat.movn);
+    assert!(!rec.stat.dmov);
+    assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
 }
 
 #[test]
@@ -582,7 +591,7 @@ fn startup_event_runs_initial_readback_through_live_path() {
 #[test]
 fn startup_event_applies_rstm_restore_through_live_path() {
     // The RSTM near-zero restore (devMotorAsyn.c init_controller) must
-    // reach the driver via the live mailbox: the SetPosition command
+    // reach the driver via the live mailbox: the InitPosition command
     // lands in pending_actions for DeviceSupport.write().
     use motor_rs::device_state::{StampedStatus, new_shared_state};
 
@@ -614,7 +623,7 @@ fn startup_event_applies_rstm_restore_through_live_path() {
         actions
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 5.0)),
+            .any(|c| matches!(&c.command, MotorCommand::InitPosition { position, .. } if *position == 5.0)),
         "restore pushes the autosaved position to the driver"
     );
 }
@@ -642,7 +651,10 @@ fn startup_closed_loop_omsl_skips_readback_adoption() {
     assert_eq!(rec.pos.val, 7.0, "closed-loop VAL untouched");
     assert_eq!(rec.pos.dval, 7.0, "closed-loop DVAL untouched");
     assert_eq!(rec.internal.lval, 7.0, "lasts anchored to current VAL");
-    assert!(effects.commands.is_empty());
+    assert!(matches!(
+        effects.commands[..],
+        [MotorCommand::InitEncoderRatio { .. }]
+    ));
 }
 
 #[test]
@@ -727,10 +739,9 @@ fn set_mode_load_pos_collapses_through_live_path() {
     assert!(!rec.stat.dmov);
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
-        actions
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 3.0)),
+        actions.commands.iter().any(
+            |c| matches!(&c.command, MotorCommand::SetPosition { position } if *position == 3.0)
+        ),
         "redefinition reaches the driver"
     );
 
@@ -832,10 +843,9 @@ fn parked_set_redefinition_replays_at_load_pos_collapse() {
     assert!(!rec.stat.dmov);
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
-        actions
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 7.0)),
+        actions.commands.iter().any(
+            |c| matches!(&c.command, MotorCommand::SetPosition { position } if *position == 7.0)
+        ),
         "parked redefinition replays to the driver"
     );
 

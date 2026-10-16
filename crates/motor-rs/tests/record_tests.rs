@@ -371,6 +371,7 @@ fn test_stop_during_move() {
     rec.stat.phase = MotionPhase::MainMove;
     rec.stat.mip = MipFlags::MOVE;
     rec.stat.dmov = false;
+    rec.stat.movn = true;
     rec.pos.rbv = 25.0;
     rec.pos.drbv = 25.0;
     rec.pos.rrbv = 2500;
@@ -385,6 +386,7 @@ fn test_stop_during_move() {
 
     // ...the VAL<-RBV sync happens when the axis has actually stopped.
     rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
     let _ = rec.check_completion();
     assert!(rec.stat.dmov);
     assert_eq!(rec.pos.val, 25.0);
@@ -708,6 +710,46 @@ fn test_runtime_mres_change_use_mode_reanchors_with_load_pos() {
     assert!(
         !rec.internal.res_reanchor,
         "the mark dies with its process pass"
+    );
+}
+
+#[test]
+fn test_runtime_mres_change_with_an_encoder_sends_the_ratio_first() {
+    // C do_work 1946-1978: with EA_PRESENT, SET_ENC_RATIO precedes the
+    // re-anchor's LOAD_POS; build_trans divides the pulse pair.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE | MstaFlags::ENCODER_PRESENT;
+    rec.internal.init_invariants_synced = true;
+    rec.conv.eres = 0.001;
+
+    rec.put_field("MRES", EpicsValue::Double(0.004)).unwrap();
+    let effects = rec.do_process();
+    assert!(
+        matches!(
+            effects.commands[..],
+            [MotorCommand::SetEncoderRatio { ratio }, MotorCommand::SetPosition { .. }]
+                if ratio == (1_000.0 / 0.001) / (1_000.0 / 0.004)
+        ),
+        "{:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn test_runtime_mres_change_without_an_encoder_sends_no_ratio() {
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.internal.init_invariants_synced = true;
+
+    rec.put_field("MRES", EpicsValue::Double(0.004)).unwrap();
+    let effects = rec.do_process();
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetEncoderRatio { .. })),
+        "{:?}",
+        effects.commands
     );
 }
 
@@ -1557,6 +1599,7 @@ fn test_val_write_during_stop_deceleration_reissues_move() {
     rec.pos.drbv = 25.0;
     rec.pos.rrbv = 2500;
     rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
     rec.ctrl.stop = true;
     let effects = rec.plan_motion(CommandSource::Stop);
     assert!(rec.stat.mip.contains(MipFlags::STOP));
@@ -1581,6 +1624,7 @@ fn test_val_write_during_stop_deceleration_reissues_move() {
     rec.pos.drbv = 80.0;
     rec.pos.rrbv = 8000;
     rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
     let _ = rec.check_completion();
     assert!(rec.stat.dmov);
     assert_eq!(rec.pos.val, 80.0);
@@ -2362,6 +2406,7 @@ fn test_spmg_stop_defers_sync_and_dmov_to_completion() {
     rec.stat.phase = MotionPhase::MainMove;
     rec.stat.mip = MipFlags::MOVE;
     rec.stat.dmov = false;
+    rec.stat.movn = true;
     rec.pos.val = 50.0;
     rec.pos.dval = 50.0;
     rec.pos.rbv = 25.0;
@@ -2387,6 +2432,96 @@ fn test_spmg_stop_defers_sync_and_dmov_to_completion() {
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert_eq!(rec.pos.val, 30.0, "synced to the actual rest position");
     assert_eq!(rec.pos.dval, 30.0);
+}
+
+#[test]
+fn test_stop_before_the_axis_moves_syncs_targets_at_once() {
+    // C 1895-1896: a stop whose MIP is neither DONE, STOP nor RETRY on an
+    // axis that is not moving syncs the targets to the readback on the
+    // stop pass (syncTargetPosition), then sets MIP_STOP.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
+    rec.stat.dmov = false;
+    rec.stat.movn = false;
+    rec.pos.val = 50.0;
+    rec.pos.dval = 50.0;
+    rec.pos.rbv = 25.0;
+    rec.pos.drbv = 25.0;
+    rec.pos.rrbv = 2500;
+
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert_eq!(rec.pos.val, 25.0);
+    assert_eq!(rec.pos.dval, 25.0);
+    assert_eq!(rec.pos.rval, 2500);
+}
+
+#[test]
+fn test_stop_during_the_settle_after_a_stop_syncs_targets() {
+    // C postProcess clears MIP_STOP (1030) before DLY arms DELAY_REQ, so a
+    // stop during the settle reaches syncTargetPosition (1896).
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.timing.dly = 1.0;
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.process_motor_info(&asyn_rs::interfaces::motor::MotorStatus {
+        position: 20.0,
+        encoder_position: 20.0,
+        done: false,
+        moving: true,
+        ..Default::default()
+    });
+    rec.plan_motion(CommandSource::Stop);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    rec.process_motor_info(&asyn_rs::interfaces::motor::MotorStatus {
+        position: 25.0,
+        encoder_position: 25.0,
+        done: true,
+        ..Default::default()
+    });
+    let effects = rec.check_completion();
+    assert!(effects.schedule_delay.is_some());
+    assert_eq!(rec.stat.mip, MipFlags::DELAY_REQ);
+
+    // Something moved the readback while the record settles.
+    rec.pos.drbv = 26.0;
+    rec.pos.rbv = 26.0;
+    rec.pos.rrbv = 2600;
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(matches!(effects.commands[..], [MotorCommand::Stop { .. }]));
+    assert_eq!(rec.pos.dval, 26.0);
+    assert_eq!(rec.pos.val, 26.0);
+    assert_eq!(
+        rec.stat.mip,
+        MipFlags::DELAY_REQ,
+        "C keeps MIP under DELAY_REQ"
+    );
+}
+
+#[test]
+fn test_stop_on_a_parked_jog_request_syncs_targets() {
+    // C: MIP_JOG_REQ is not DONE/STOP/RETRY and nothing moves, so the
+    // stop runs syncTargetPosition (1896) before MIP becomes MIP_STOP.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.stat.mip = MipFlags::JOG_REQ;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.rbv = 12.0;
+    rec.pos.drbv = 12.0;
+    rec.pos.rrbv = 1200;
+
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert_eq!(rec.pos.val, 12.0);
+    assert_eq!(rec.pos.dval, 12.0);
 }
 
 #[test]
@@ -5039,6 +5174,7 @@ fn test_stop_sync_skipped_under_closed_loop_omsl() {
     rec.stat.phase = MotionPhase::MainMove;
     rec.stat.mip = MipFlags::MOVE;
     rec.stat.dmov = false;
+    rec.stat.movn = true;
     rec.pos.val = 50.0;
     rec.pos.dval = 50.0;
     rec.pos.rbv = 25.0;
@@ -5097,13 +5233,52 @@ fn test_rstm_never_always_syncs_to_driver() {
         ..Default::default()
     };
     let effects = rec.initial_readback(&status);
-    // Never restore → adopt driver readback (0), no SetPosition emitted
+    // Never restore → adopt driver readback (0), no InitPosition emitted
     assert_eq!(rec.pos.dval, 0.0);
     assert!(
         !effects
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+            .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
+    );
+}
+
+#[test]
+fn test_init_writes_the_encoder_ratio_before_the_position_load() {
+    // C init_controller (devMotorAsyn.c:183-231): eratio = mres/eres,
+    // written ahead of the RSTM position load.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    rec.conv.rstm = RestoreMode::Always;
+    rec.conv.mres = 0.004;
+    rec.conv.eres = 0.001;
+    rec.pos.dval = 7.0;
+    let effects = rec.initial_readback(&MotorStatus::default());
+    assert!(
+        matches!(
+            effects.commands[..],
+            [MotorCommand::InitEncoderRatio { ratio }, MotorCommand::InitPosition { .. }]
+                if ratio == 0.004 / 0.001
+        ),
+        "{:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn test_init_encoder_ratio_is_one_without_eres() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.004;
+    rec.conv.eres = 0.0;
+    let effects = rec.initial_readback(&MotorStatus::default());
+    assert!(
+        matches!(
+            effects.commands[..],
+            [MotorCommand::InitEncoderRatio { ratio: 1.0 }]
+        ),
+        "{:?}",
+        effects.commands
     );
 }
 
@@ -5121,10 +5296,10 @@ fn test_rstm_always_restores_autosaved_dval() {
         ..Default::default()
     };
     let effects = rec.initial_readback(&status);
-    // Always → keep autosaved DVAL, push SetPosition(7.0)
+    // Always → keep autosaved DVAL, push InitPosition(7.0)
     assert_eq!(rec.pos.dval, 7.0);
     assert!(effects.commands.iter().any(
-        |c| matches!(c, MotorCommand::SetPosition { position } if (*position - 7.0).abs() < 1e-9)
+        |c| matches!(c, MotorCommand::InitPosition { position, .. } if (*position - 7.0).abs() < 1e-9)
     ));
 }
 
@@ -5148,7 +5323,7 @@ fn test_rstm_near_zero_restores_when_driver_near_zero() {
         effects
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+            .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
     );
 }
 
@@ -5178,7 +5353,7 @@ fn test_rstm_near_zero_no_restore_when_driver_already_positioned() {
         !effects
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+            .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
     );
 }
 
@@ -5209,7 +5384,7 @@ fn test_rstm_near_zero_uses_motor_position_not_encoder() {
         effects
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+            .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
     );
 }
 
@@ -5277,13 +5452,13 @@ fn test_loadpos_block_skips_rstm_restore() {
         ..Default::default()
     };
     let effects = rec.initial_readback(&status);
-    // LOAD_POS blocked → no SetPosition, driver readback adopted
+    // LOAD_POS blocked → no InitPosition, driver readback adopted
     assert_eq!(rec.pos.dval, 0.0);
     assert!(
         !effects
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+            .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
     );
 }
 
@@ -5322,7 +5497,7 @@ fn test_rstm_restore_skipped_on_mres_mismatch() {
         !effects
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+            .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
     );
 }
 
@@ -5348,7 +5523,7 @@ fn test_rstm_restore_proceeds_when_mres_consistent() {
         effects
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+            .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
     );
 }
 

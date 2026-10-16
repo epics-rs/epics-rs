@@ -152,7 +152,7 @@ async fn pid_gain_put_rides_its_pass_to_the_driver() {
         actions
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPidGain { .. })),
+            .any(|c| matches!(&c.command, MotorCommand::SetPidGain { .. })),
         "SetPidGain forwarded through the put's process pass"
     );
 }
@@ -160,11 +160,15 @@ async fn pid_gain_put_rides_its_pass_to_the_driver() {
 /// Stands in for the poller thread: runs the driver commands the record
 /// passes queued.
 fn run_queued(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<MotorCommand>>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<motor_rs::poll_loop::QueuedCommand>>,
     motor: &std::sync::Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>,
 ) {
     while let Ok(commands) = rx.try_recv() {
-        motor_rs::poll_loop::execute_commands(&mut *motor.lock().unwrap(), &commands);
+        motor_rs::poll_loop::execute_commands(
+            &mut *motor.lock().unwrap(),
+            &Default::default(),
+            &commands,
+        );
     }
 }
 
@@ -256,9 +260,17 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     // drives statuses by hand instead of running the poll loop.
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
     let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The poller's startup poll fills the cache init reads.
+    state.lock().unwrap().latest_status = Some(motor_rs::device_state::StampedStatus {
+        seq: 1,
+        status: asyn_rs::interfaces::motor::AsynMotor::poll(
+            &mut *motor.lock().unwrap(),
+            &asyn_rs::user::AsynUser::new(0),
+        )
+        .unwrap(),
+    });
     let mut dev = MotorDeviceSupport::new(
-        motor.clone(),
-        0,
+        Default::default(),
         Duration::from_secs(1),
         poll_cmd_tx,
         motor_cmd_tx,
@@ -417,9 +429,17 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
 
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
     let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The poller's startup poll fills the cache init reads.
+    state.lock().unwrap().latest_status = Some(motor_rs::device_state::StampedStatus {
+        seq: 1,
+        status: asyn_rs::interfaces::motor::AsynMotor::poll(
+            &mut *motor.lock().unwrap(),
+            &asyn_rs::user::AsynUser::new(0),
+        )
+        .unwrap(),
+    });
     let mut dev = MotorDeviceSupport::new(
-        motor.clone(),
-        0,
+        Default::default(),
         Duration::from_secs(1),
         poll_cmd_tx,
         motor_cmd_tx,

@@ -358,6 +358,7 @@ impl MotorRecord {
                             // disarm any safety-net verify flag armed by a
                             // prior ExtendMove in this motion.
                             self.internal.verify_retarget_on_completion = false;
+                            self.report_ntm_stop();
                             // C 1341: pp = FALSE — "Don't post process the
                             // previous move." The replanned target must not
                             // be synced away at the stop completion.
@@ -688,13 +689,6 @@ impl MotorRecord {
             self.mark(m::LVIO);
         }
         if self.limits.lvio {
-            tracing::warn!(
-                "limit violation: dval={:.4}, bdst={:.4}, limits=[{:.4}, {:.4}]",
-                self.pos.dval,
-                self.retry.bdst,
-                self.limits.dllm,
-                self.limits.dhlm
-            );
             self.refuse_move_restore_lasts();
             return;
         }
@@ -878,54 +872,48 @@ impl MotorRecord {
     /// stop == true`) and the rising-LVIO stop (1475-1484). Single owner
     /// so the entries cannot drift.
     pub(super) fn stop_axis(&mut self, effects: &mut ProcessEffects) {
-        let in_motion =
-            self.stat.phase != MotionPhase::Idle || self.stat.mip.contains(MipFlags::EXTERNAL);
-        if self.stat.mip.contains(MipFlags::RETRY) {
-            // C 1874-1885: a stop during retry abandons the retry and
-            // reports done immediately (mip = MIP_DONE, dmov = TRUE).
-            // No readback sync — the axis is already within RDBD of the
-            // target, so the drive fields keep the user target.
-            self.finalize_motion(effects);
-        } else if in_motion && !self.stat.mip.contains(MipFlags::STOP) {
-            // C 1890-1906: while moving, only mark the stop — pp = TRUE,
-            // clear_buttons(), mip = MIP_STOP (replaced wholesale,
-            // erasing MOVE/JOG/HOME/EXTERNAL bits). The VAL/DVAL/RVAL <-
-            // readback sync and DMOV happen once the axis has actually
-            // stopped (postProcess, 827-849), mirrored by
-            // check_completion's MIP_STOP branch via postprocess_sync().
-            // Syncing or finalizing eagerly here would post a transient
-            // mid-deceleration snapshot before the rest position is known.
-            self.internal.pp = true;
+        let mip = self.stat.mip;
+        if mip.is_empty() || mip.intersects(MipFlags::STOP | MipFlags::RETRY) {
+            // C 1874-1888: MIP DONE, STOP or RETRY sends STOP_AXIS and
+            // returns with MIP untouched, except that a stop during retry
+            // abandons the retry and reports done (mip = MIP_DONE, dmov =
+            // TRUE) with no readback sync.
+            if mip.contains(MipFlags::RETRY) {
+                self.finalize_motion(effects);
+            } else if mip.contains(MipFlags::STOP) {
+                // A stop already in flight drops a parked NTM retarget —
+                // C discards the overtaken target at stop completion via
+                // the `(val != lval) && !(mip & MIP_STOP)` gate (1385)
+                // plus the postProcess sync. A queued jog/home survives:
+                // its buttons/MIP outlive the early return and postProcess
+                // re-fires it.
+                self.internal.pending_retarget = None;
+            }
+        } else {
+            if self.stat.movn {
+                // C 1890-1893: the readback sync and DMOV wait for the axis
+                // to stop (postProcess 827-849, check_completion's
+                // MIP_STOP branch via postprocess_sync()).
+                self.internal.pp = true;
+                self.clear_buttons();
+            } else {
+                // C 1895-1896: nothing is moving, so the targets take the
+                // readback now.
+                self.sync_target_position();
+            }
+            // C 1898-1900.
+            if mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
+                self.clear_buttons();
+            }
+            // C 1902-1907 replaces MIP wholesale, erasing the backlash
+            // legs with the rest: "When we wait for DLY, keep it.
+            // Otherwise the record may lock up."
             self.internal.backlash_pending = false;
-            self.clear_buttons();
-            // C 1902-1907: "When we wait for DLY, keep it. Otherwise the
-            // record may lock up."
-            if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
+            if !mip.contains(MipFlags::DELAY_REQ) {
                 self.stat.mip = MipFlags::STOP;
                 self.mark(m::MIP);
             }
-        } else if in_motion {
-            // A stop already in flight (C 1874-1888 early return). The
-            // explicit stop drops a parked NTM retarget — C discards the
-            // overtaken target at stop completion via the
-            // `(val != lval) && !(mip & MIP_STOP)` gate (1385) plus the
-            // postProcess sync. A queued jog/home survives, matching C
-            // where the buttons/MIP_JOG_REQ outlive the early return and
-            // postProcess re-fires the queued request.
-            self.internal.pending_retarget = None;
-        } else if self.stat.mip.contains(MipFlags::JOG_REQ) {
-            // Idle with a parked jog request. C's stop branch early-
-            // returns only for mip DONE/STOP/RETRY (1874-1888); a parked
-            // MIP_JOG_REQ falls through to the wholesale `mip = MIP_STOP`
-            // (1902-1907) — an explicit stop kills the parked request.
-            // The button itself survives (clear_buttons runs only in the
-            // movn branch, 1893), so Go can still re-arm from it.
-            self.stat.mip = MipFlags::STOP;
-            self.mark(m::MIP);
         }
-        // else: idle — bare STOP_AXIS only (C 1874-1888 early return for
-        // mip DONE/STOP/RETRY keeps MIP untouched).
-        //
         // C motorRecord.cc — STOP_AXIS is sent unconditionally ("just in
         // case"): the driver may still be settling even when the record
         // considers itself idle (e.g. after an InPosition retry, which
@@ -1760,13 +1748,11 @@ impl MotorRecord {
     /// at the new resolution. Runs ungated by stop_or_pause — a steady
     /// SPMG Stop/Pause does not suppress it in C.
     ///
-    /// Deviation from C: SET_ENC_RATIO (1946-1970, 1973-1978) is not
-    /// ported — motor-rs drivers take the encoder scale from ERES at
-    /// readback time, there is no per-axis ratio download. The
-    /// mres/eres normalization C performs around that ratio math is
-    /// kept: it is observable field state.
+    /// With an encoder present the ratio goes down first (SET_ENC_RATIO,
+    /// 1946-1978).
     pub(crate) fn dispatch_res_reanchor(&mut self, effects: &mut ProcessEffects) {
-        if self.stat.msta.contains(MstaFlags::ENCODER_PRESENT) {
+        let encoder = self.stat.msta.contains(MstaFlags::ENCODER_PRESENT);
+        if encoder {
             // C 1950-1959: defend the ratio math against MRES ~ 0 and
             // an unset ERES.
             if self.conv.mres.abs() < 1e-9 {
@@ -1778,6 +1764,18 @@ impl MotorRecord {
         }
         // C 1971: make sure the retry deadband is achievable.
         self.enforce_min_retry_deadband();
+        if encoder {
+            // C 1961-1966: the ratio as encoder pulses over motor pulses
+            // of one scaled count, divided in devMotorAsyn build_trans.
+            let (mres, eres) = (self.conv.mres, self.conv.eres);
+            let mut m = 10_000_000.0_f64;
+            while m > 1.0 && ((m / eres).abs() > 1e6 || (m / mres).abs() > 1e6) {
+                m /= 10.0;
+            }
+            effects.commands.push(MotorCommand::SetEncoderRatio {
+                ratio: (m / eres) / (m / mres),
+            });
+        }
         if self.conv.set && !self.conv.igset {
             self.internal.pp = true;
             effects.request_poll = true;
@@ -2019,9 +2017,7 @@ impl MotorRecord {
             return false;
         }
         self.internal.sync = false;
-        self.sync_positions();
-        // syncTargetPosition (4446-4449).
-        self.mark(m::RRBV | m::DRBV | m::RBV);
+        self.sync_target_position();
         true
     }
 

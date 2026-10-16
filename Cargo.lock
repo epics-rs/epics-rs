@@ -2354,8 +2354,8 @@ dependencies = [
  "criterion",
  "epics-base-rs",
  "epics-ca-rs",
+ "libc",
  "tokio",
- "tracing",
 ]
 
 [[package]]

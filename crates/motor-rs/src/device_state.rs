@@ -1,4 +1,3 @@
-use crate::flags::MotorCommand;
 use asyn_rs::interfaces::motor::MotorStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,7 +39,7 @@ pub struct DelayRequest {
 /// Atomic bundle of actions from Record → DeviceSupport.
 #[derive(Debug, Default)]
 pub struct DeviceActions {
-    pub commands: Vec<MotorCommand>,
+    pub commands: Vec<crate::poll_loop::QueuedCommand>,
     pub poll: PollDirective,
     pub schedule_delay: Option<DelayRequest>,
     pub status_refresh: bool,
@@ -108,22 +107,27 @@ pub fn new_shared_state() -> SharedDeviceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flags::MotorCommand;
+
+    fn queued(command: MotorCommand) -> crate::poll_loop::QueuedCommand {
+        crate::poll_loop::QueuedCommand { command, mres: 1.0 }
+    }
 
     #[test]
     fn merge_newer_appends_commands_fifo() {
         let mut a = DeviceActions {
-            commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
+            commands: vec![queued(MotorCommand::Stop { acceleration: 1.0 })],
             ..Default::default()
         };
         let b = DeviceActions {
-            commands: vec![MotorCommand::Poll],
+            commands: vec![queued(MotorCommand::Poll)],
             ..Default::default()
         };
         a.merge_newer(b);
         assert_eq!(a.commands.len(), 2);
         // earlier batch's command stays first
-        assert!(matches!(a.commands[0], MotorCommand::Stop { .. }));
-        assert!(matches!(a.commands[1], MotorCommand::Poll));
+        assert!(matches!(a.commands[0].command, MotorCommand::Stop { .. }));
+        assert!(matches!(a.commands[1].command, MotorCommand::Poll));
     }
 
     #[test]

@@ -1,8 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use asyn_rs::interfaces::motor::AsynMotor;
-use asyn_rs::user::AsynUser;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::{Record, ScanType};
@@ -10,16 +8,14 @@ use epics_base_rs::types::EpicsValue;
 use tokio::sync::mpsc;
 
 use crate::device_state::*;
+use crate::flags::MotorCommand;
 use crate::poll_loop::{MotorCommandSender, PollCommand};
+use crate::trace::MotorTrace;
 
 /// Motor device support — bridges MotorRecord to AsynMotor driver.
 pub struct MotorDeviceSupport {
-    /// The driver, for the synchronous `init` readback only (C init_record);
-    /// taken there, so later record passes can only queue commands on the
-    /// poller thread.
-    motor: Option<Arc<Mutex<dyn AsynMotor>>>,
     motor_cmd_tx: MotorCommandSender,
-    _addr: i32,
+    trace: Arc<MotorTrace>,
     _timeout: Duration,
     poll_cmd_tx: mpsc::Sender<PollCommand>,
     io_intr_tx: mpsc::Sender<()>,
@@ -32,8 +28,7 @@ pub struct MotorDeviceSupport {
 
 impl MotorDeviceSupport {
     pub fn new(
-        motor: Arc<Mutex<dyn AsynMotor>>,
-        addr: i32,
+        trace: Arc<MotorTrace>,
         timeout: Duration,
         poll_cmd_tx: mpsc::Sender<PollCommand>,
         motor_cmd_tx: MotorCommandSender,
@@ -41,9 +36,8 @@ impl MotorDeviceSupport {
     ) -> Self {
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
         Self {
-            motor: Some(motor),
             motor_cmd_tx,
-            _addr: addr,
+            trace,
             _timeout: timeout,
             poll_cmd_tx,
             io_intr_tx,
@@ -66,15 +60,13 @@ impl MotorDeviceSupport {
         self.io_intr_tx.clone()
     }
 
-    fn make_user(&self) -> AsynUser {
-        AsynUser::new(0)
-    }
-
     /// Queue the commands on the poller thread and manage the poll loop.
     fn execute_actions(&mut self, mut actions: DeviceActions) {
         let commands = std::mem::take(&mut actions.commands);
-        if !commands.is_empty() && self.motor_cmd_tx.send(commands).is_err() {
-            tracing::error!("motor: poller gone, commands dropped");
+        if !commands.is_empty() {
+            // Fails only once the poller has ended, a state C's port queue
+            // cannot be in, so there is no C line to print.
+            let _ = self.motor_cmd_tx.send(commands);
         }
 
         // Manage poll loop — only send StartPolling when transitioning
@@ -86,11 +78,8 @@ impl MotorDeviceSupport {
         match actions.poll {
             PollDirective::Start => {
                 if !self.polling_active {
-                    match self.poll_cmd_tx.try_send(PollCommand::StartPolling) {
-                        Ok(()) => self.polling_active = true,
-                        Err(e) => {
-                            tracing::error!("motor: failed to send StartPolling: {e}")
-                        }
+                    if self.poll_cmd_tx.try_send(PollCommand::StartPolling).is_ok() {
+                        self.polling_active = true;
                     }
                 }
             }
@@ -102,24 +91,26 @@ impl MotorDeviceSupport {
             // StartPolling-triggered poll, so STUP=BUSY clears on a stationary
             // axis. request_poll / status_refresh are discrete events (not set
             // every in-motion pass), so this does not flood the poller.
-            PollDirective::Refresh => match self.poll_cmd_tx.try_send(PollCommand::StartPolling) {
-                Ok(()) => self.polling_active = true,
-                Err(e) => tracing::error!("motor: failed to send forced poll: {e}"),
-            },
-            PollDirective::Stop => match self.poll_cmd_tx.try_send(PollCommand::StopPolling) {
-                Ok(()) => self.polling_active = false,
-                Err(e) => tracing::error!("motor: failed to send StopPolling: {e}"),
-            },
+            PollDirective::Refresh => {
+                if self.poll_cmd_tx.try_send(PollCommand::StartPolling).is_ok() {
+                    self.polling_active = true;
+                }
+            }
+            PollDirective::Stop => {
+                if self.poll_cmd_tx.try_send(PollCommand::StopPolling).is_ok() {
+                    self.polling_active = false;
+                }
+            }
             PollDirective::None => {}
         }
         if let Some(ref delay) = actions.schedule_delay {
-            match self
+            let scheduled = self
                 .poll_cmd_tx
-                .try_send(PollCommand::ScheduleDelay(delay.id, delay.duration))
-            {
-                // Poll loop goes idle during the delay — sync the flag.
-                Ok(()) => self.polling_active = false,
-                Err(e) => tracing::error!("motor: failed to schedule settle delay: {e}"),
+                .try_send(PollCommand::ScheduleDelay(delay.id, delay.duration));
+            // Poll loop goes idle during the delay — sync the flag. C ignores
+            // callbackRequestDelayed's status (motorRecord.cc:1437).
+            if scheduled.is_ok() {
+                self.polling_active = false;
             }
         }
     }
@@ -134,6 +125,7 @@ impl DeviceSupport for MotorDeviceSupport {
 
         if let Some(motor_rec) = motor_rec {
             motor_rec.set_device_state(self.device_state.clone());
+            motor_rec.set_trace(self.trace.clone());
         }
 
         // NO controller reseed here. The RSTM/loadpos(#231)/MRES(#196)
@@ -153,32 +145,25 @@ impl DeviceSupport for MotorDeviceSupport {
         // an IOC restart (default RSTM=NearZero, or RSTM=Never, or an
         // absolute encoder with LOADPOS_BLOCK) was clobbered with the stale
         // autosaved DVAL every boot — the exact failure RSTM/#231 prevent.
-        // The poll below now reads the controller's true position into the
-        // shared status so `initial_readback` can apply the RSTM gate to it.
-        let user = self.make_user();
-        let motor = self.motor.take().ok_or_else(|| {
-            epics_base_rs::error::CaError::InvalidValue(
-                "motor device support re-initialized".into(),
-            )
-        })?;
-
+        //
+        // C init_record reads the status through readGenericPointer, which
+        // only copies the parameter cache the poller's startup poll filled
+        // (asynMotorController.cpp:505-525): no hardware call, and no
+        // failure for a bound axis. An unfilled cache reads as C's
+        // calloc-zeroed status.
         let status = {
-            let mut motor = motor.lock().map_err(|e| {
-                epics_base_rs::error::CaError::InvalidValue(format!("motor lock: {e}"))
+            let mut ds = self.device_state.lock().map_err(|e| {
+                epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
             })?;
-            motor.poll(&user).map_err(|e| {
-                epics_base_rs::error::CaError::InvalidValue(format!("motor poll: {e}"))
-            })?
+            let stamped = ds.latest_status.get_or_insert_with(|| StampedStatus {
+                seq: 1,
+                status: asyn_rs::interfaces::motor::MotorStatus {
+                    done: false,
+                    ..Default::default()
+                },
+            });
+            stamped.status.clone()
         };
-
-        let mut ds = self.device_state.lock().map_err(|e| {
-            epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
-        })?;
-        ds.latest_status = Some(StampedStatus {
-            seq: 1,
-            status: status.clone(),
-        });
-        drop(ds);
 
         // Apply initial status to record (sets RBV, clears LVIO, etc.)
         // Clear last_write so pass0-restored values are not interpreted as
@@ -205,16 +190,17 @@ impl DeviceSupport for MotorDeviceSupport {
                         Some(EpicsValue::Double(d)) => d,
                         _ => 0.0,
                     };
-                (read(rec, "DHLM"), read(rec, "DLLM"))
+                (read(rec, "DHLM"), read(rec, "DLLM"), rec.conv.mres)
             });
-        if let Some((dhlm, dllm)) = dial_limits {
-            let mut motor = motor.lock().map_err(|e| {
-                epics_base_rs::error::CaError::InvalidValue(format!("motor lock: {e}"))
-            })?;
-            // Errors are non-fatal, as in C (init_record ignores the
-            // build_trans return for these two sends).
-            let _ = motor.set_high_limit(&user, dhlm);
-            let _ = motor.set_low_limit(&user, dllm);
+        if let Some((dhlm, dllm, mres)) = dial_limits {
+            // Queued like C's SEND_MSG; non-fatal, as C ignores the
+            // build_trans return, and a refusal prints asynCallback's line
+            // on the poller.
+            let queued = |command| crate::poll_loop::QueuedCommand { command, mres };
+            let _ = self.motor_cmd_tx.send(vec![
+                queued(MotorCommand::SetHighLimit { position: dhlm }),
+                queued(MotorCommand::SetLowLimit { position: dllm }),
+            ]);
         }
 
         self.initialized = true;
@@ -245,7 +231,9 @@ impl DeviceSupport for MotorDeviceSupport {
         &self.dtyp_name
     }
 
-    fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.trace.set_record(name);
+    }
 
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
         self.io_intr_rx.take()

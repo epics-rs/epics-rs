@@ -97,6 +97,10 @@ impl SimMotorHolder {
                 );
 
                 let setup = MotorBuilder::new(motor)
+                    .trace_user(crate::trace::TraceUser::Asyn {
+                        port: port.clone(),
+                        addr: 0,
+                    })
                     .poll_interval(Duration::from_millis(poll_ms))
                     .build();
 

@@ -198,6 +198,10 @@ name = "blocking_write_completes_on_the_callback_band"
 required-features = ["epics"]
 
 [[test]]
+name = "half_built_port_stays_registered"
+required-features = ["epics"]
+
+[[test]]
 name = "port_runtime_lifetime"
 required-features = ["epics"]
 

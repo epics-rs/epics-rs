@@ -16,11 +16,19 @@ interruptAccept gate; `CaChannel::on_connection_change`,
 `create_channel_with_events`, and CA names are bytes; asyn's `*_blocking`
 helpers are gone and `subscribe_async` returns a per-subscriber ring
 instead of a tokio broadcast; `PriorityInheritanceMutex` is the movable
-form, with `PinnedPriorityInheritanceMutex` beside it; and
-`epics-bridge-rs` drops `run_ca_pva_qsrv_ioc` and `BridgeMonitor`;
-`DeviceInitOutcome::Live` splits into `Ok(DeviceUdf)` (C status 0) and
-`DoNotConvert(DeviceUdf)` (C 2), with `DeviceInitOutcome::ok()` as the
-default init's value.
+form, with `PinnedPriorityInheritanceMutex` beside it; an asyn port is
+built under a `PortClaim` (`claim_port_driver`, then
+`create_port_runtime(&claim, ..)` and `claim.publish`), with
+`PortManager::register_port` taking the claim and `registry::register_port`
+behind `test-support`; `ParamList`'s value getters and setters are
+crate-private, the `*_strict` getters are gone and `get_*_param` returns
+`ParamUndefined` for an unset value; the per-parameter stamps
+(`set_param_timestamp`, `current_timestamp`, `ParamList::set_timestamp` and
+`get_timestamp`) give way to the port's `update_time_stamp`,
+`get_time_stamp` and `set_time_stamp`; `DeviceInitOutcome::Live` splits
+into `Ok(DeviceUdf)` (C status 0) and `DoNotConvert(DeviceUdf)` (C 2),
+with `DeviceInitOutcome::ok()` as the default init's value; and
+`epics-bridge-rs` drops `run_ca_pva_qsrv_ioc` and `BridgeMonitor`.
 
 ### A monitored IOC's realtime tail at C's
 
@@ -76,6 +84,22 @@ rumqttc-v5-next 0.34 and keeps paho's connect timeout, reconnect backoff
 and per-request success and failure lines. motorSim reports C's status
 bits, and the motor poller runs on its own thread with no ambient tokio
 runtime.
+
+### asyn ports registered as asynPortDriver registers them
+
+A port's name is claimed before its driver is built, as the
+`registerPort` an `asynPortDriver` constructor makes first, so a duplicate
+Configure prints C's two lines and builds nothing. As C has no
+unregister, a constructor that fails after that point keeps the port:
+`PortClaim::publish_failed` publishes the half-built driver and returns
+the error, and drvModbusAsyn's function, length and octet-port refusals
+now leave a registered, disabled port. A port's own trace lines go
+through device 0 as `pasynUserSelf` does, so on a multi-device port
+`asynSetTraceMask P 0` gates them and their file is device 0's: C's
+`asynSetTraceFile` is not pushed down, so `asynSetTraceFile P -1` no
+longer reaches them and an `st.cmd` names `asynSetTraceFile P 0`. One
+timestamp is kept per port, refreshed only by `updateTimeStamp` and
+read by every callback, and every address resolves through `getAddress`.
 
 ### SCHED_FIFO thread banding is on by default, under C's switch
 

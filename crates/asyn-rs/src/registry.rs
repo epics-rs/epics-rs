@@ -57,7 +57,8 @@ pub struct PortRegistry {
 /// constructor registers the port before it builds anything else
 /// (asynPortDriver.cpp:4036-4040), so a refused name leaves nothing behind;
 /// a claim taken first gives the same order. Dropped unpublished, it frees
-/// the name.
+/// the name; a constructor that fails after C would have registered the port
+/// publishes what it built through [`PortClaim::publish_failed`] instead.
 pub struct PortClaim {
     registry: PortRegistry,
     name: String,
@@ -95,9 +96,11 @@ impl PortClaim {
         if !handle.interrupts().set_owner(owner.clone()) {
             return Err(AsynError::PortAlreadyOwned(self.name.clone()));
         }
-        handle
-            .trace()
-            .register_port(&self.name, handle.is_multi_device());
+        let trace = handle.trace();
+        trace.register_port(&self.name, handle.is_multi_device());
+        // The asynPortDriver ctor's connectDevice(pasynUserSelf, portName, 0)
+        // (asynPortDriver.cpp:4099): the port's own lines print on device 0.
+        trace.connect_device(&self.name, 0);
         let registry = self.registry.clone();
         let mut reg = registry.inner.lock().unwrap();
         // Only this claim's own `Drop` frees a claimed slot, so it is still ours.
@@ -114,6 +117,28 @@ impl PortClaim {
             registry.flush_in_background(&self.name);
         }
         Ok(())
+    }
+
+    /// Publish the port a constructor built before it failed, and hand back
+    /// the constructor's `error`.
+    ///
+    /// C has no unregister: once `registerPort` has run, a driver whose
+    /// constructor gives up keeps the port, answering as the half-built
+    /// driver it is (`drvAsynDG645` returns before setting `init`, every
+    /// transfer then refuses; `drvT4UDirect_EM` returns with its parameters
+    /// created and no IO). A second Configure under the name fails and
+    /// `asynReport` lists it. `handle` is that driver's runtime, in the state
+    /// C's constructor left it.
+    pub fn publish_failed<E: From<AsynError>>(
+        self,
+        handle: PortHandle,
+        owner: &Arc<InterruptGate>,
+        error: E,
+    ) -> E {
+        match self.publish(handle, owner) {
+            Ok(()) => error,
+            Err(e) => e.into(),
+        }
     }
 }
 

@@ -99,8 +99,13 @@ fn fixture_of<D: PortDriver>(
     .unwrap();
     let dir = tempfile::tempdir().expect("fixture root");
     let path = dir.path().join("asyn_trace.log");
-    let file = std::fs::File::create(&path).unwrap();
-    trace.set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+    let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+    // C's setTraceFile is not pushed down: device 0, which a multi-device
+    // port is born with, keeps its own file unless named.
+    if flags.multi_device {
+        trace.set_device_trace_file(port, 0, TraceFile::File(file.clone()));
+    }
+    trace.set_trace_file(Some(port), TraceFile::File(file));
     trace.set_trace_mask(
         Some(port),
         TraceMask::ERROR | TraceMask::IO_DEVICE | TraceMask::IO_DRIVER | TraceMask::FLOW,
@@ -727,6 +732,53 @@ fn a_refused_address_prints_the_getaddress_line() {
         5,
         "{log}"
     );
+}
+
+/// `pasynUserSelf` is connected to device 0 (asynPortDriver.cpp:4099), so the
+/// port's own lines follow `asynSetTraceMask <port> 0`: on a multi-device port
+/// that is device 0's slot, printed as `[port,0,0]`; on any other port
+/// `findDpCommon` and `getAddr` give the port's slot and -1
+/// (asynManager.c:538-545, :2006-2010).
+fn self_line(port: &str, multi_device: bool) -> (String, String) {
+    use asyn_rs::trace::TraceInfoMask;
+    let flags = PortFlags {
+        multi_device,
+        ..PortFlags::default()
+    };
+    let fx = fixture_of(port, flags, |base| DefaultPort { base });
+    let trace = fx.handle.trace().clone();
+    trace.set_trace_info_mask(Some(port), TraceInfoMask::PORT);
+    trace.set_trace_mask(Some(port), TraceMask::empty());
+    trace.set_device_trace_mask(port, 0, TraceMask::ERROR);
+    let say = |text: &'static str| {
+        fx.handle
+            .with_driver_blocking(move |d: &mut DefaultPort| {
+                d.base.trace_print(TraceMask::ERROR, format_args!("{text}"))
+            })
+            .unwrap()
+    };
+    say("device 0 on");
+    let on = fx.log();
+    trace.set_trace_mask(Some(port), TraceMask::ERROR);
+    trace.set_device_trace_mask(port, 0, TraceMask::empty());
+    say("device 0 off");
+    (on, fx.log())
+}
+
+#[test]
+fn a_multi_device_port_prints_its_own_lines_through_device_0() {
+    let (on, off) = self_line("TRSELFMD", true);
+    assert!(on.contains("[TRSELFMD,0,0] device 0 on\n"), "{on}");
+    assert!(!off.contains("device 0 off"), "{off}");
+}
+
+#[test]
+fn a_single_device_port_prints_its_own_lines_on_the_port() {
+    let (on, off) = self_line("TRSELFSD", false);
+    assert!(on.contains("[TRSELFSD,-1,0] device 0 on\n"), "{on}");
+    // Device 0 of a single-device port is the port: switching it off
+    // silenced the port, so nothing printed.
+    assert!(!off.contains("device 0 off"), "{off}");
 }
 
 #[test]

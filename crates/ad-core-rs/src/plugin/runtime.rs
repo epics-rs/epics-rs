@@ -3577,7 +3577,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     }
                                     None => {
                                         // C parity: NDPluginDriver::writeInt32
-                                        // (NDPluginDriver.cpp:743) logs this at
+                                        // (NDPluginDriver.cpp:759-761) logs this
+                                        // through the writing record's user at
                                         // ASYN_TRACE_WARNING, which is OFF in the
                                         // default port trace mask. Gate through the
                                         // port's trace facility so iocInit stays
@@ -3593,12 +3594,15 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         if let Some(entry) =
                                             asyn_rs::asyn_record::get_port(&sender_port_name)
                                         {
-                                            asyn_rs::asyn_trace!(
-                                                entry.handle.trace(),
-                                                sender_port_name.as_str(),
+                                            entry.handle.trace().print(
+                                                Some(sender_port_name.as_str()),
+                                                Some(addr),
+                                                reason as i32,
                                                 asyn_rs::trace::TraceMask::WARNING,
-                                                "plugin {sender_port_name}: ProcessPlugin \
-                                                 requested but no input array cached"
+                                                format_args!(
+                                                    "NDPluginDriver::writeInt32 cannot do \
+                                                     ProcessPlugin, no input array cached"
+                                                ),
                                             );
                                         }
                                     }

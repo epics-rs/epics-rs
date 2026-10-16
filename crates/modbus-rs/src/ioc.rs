@@ -326,6 +326,154 @@ impl OctetTransport for SyncIoTransport {
 // Port driver
 // ---------------------------------------------------------------------------
 
+/// The parameters the `drvModbusAsyn` constructor creates and seeds before
+/// any of its checks (drvModbusAsyn.cpp:215-230), so a half-built port has
+/// them too.
+struct ModbusParams {
+    reason_to_datatype: Vec<Option<ModbusDataType>>,
+    read_reason: usize,
+    read_ok_reason: usize,
+    write_ok_reason: usize,
+    io_errors_reason: usize,
+    last_io_reason: usize,
+    max_io_reason: usize,
+    poll_delay_reason: usize,
+    enable_histogram_reason: usize,
+    read_histogram_reason: usize,
+    histogram_bin_reason: usize,
+    histogram_axis_reason: usize,
+}
+
+impl ModbusParams {
+    fn create(base: &mut PortDriverBase, default_dt: ModbusDataType) -> AsynResult<Self> {
+        // One parameter per data type. The reason index recovers the type;
+        // numeric types use a Float64 cache value (covers the int16/int32
+        // ranges exactly), string types an Octet value.
+        let mut reason_to_datatype: Vec<Option<ModbusDataType>> = Vec::new();
+        for dt in ALL_DATA_TYPES {
+            let ptype = if dt.is_string() {
+                ParamType::Octet
+            } else {
+                ParamType::Float64
+            };
+            let idx = base.create_param(dt.as_str(), ptype)?;
+            if reason_to_datatype.len() <= idx {
+                reason_to_datatype.resize(idx + 1, None);
+            }
+            reason_to_datatype[idx] = Some(dt);
+        }
+
+        // MODBUS_DATA — an alias selecting the port's default data type.
+
+        let data_reason = base.create_param(
+            PARAM_DATA,
+            if default_dt.is_string() {
+                ParamType::Octet
+            } else {
+                ParamType::Float64
+            },
+        )?;
+        if reason_to_datatype.len() <= data_reason {
+            reason_to_datatype.resize(data_reason + 1, None);
+        }
+        reason_to_datatype[data_reason] = Some(default_dt);
+
+        // Control / statistics parameters.
+        let read_reason = base.create_param(PARAM_READ, ParamType::Int32)?;
+        let read_ok_reason = base.create_param(PARAM_READ_OK, ParamType::Int32)?;
+        let write_ok_reason = base.create_param(PARAM_WRITE_OK, ParamType::Int32)?;
+        let io_errors_reason = base.create_param(PARAM_IO_ERRORS, ParamType::Int32)?;
+        let last_io_reason = base.create_param(PARAM_LAST_IO_TIME, ParamType::Int32)?;
+        let max_io_reason = base.create_param(PARAM_MAX_IO_TIME, ParamType::Int32)?;
+        let poll_delay_reason = base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
+        let enable_histogram_reason =
+            base.create_param(PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital)?;
+        let read_histogram_reason =
+            base.create_param(PARAM_READ_HISTOGRAM, ParamType::Int32Array)?;
+        let histogram_bin_reason = base.create_param(PARAM_HISTOGRAM_BIN_TIME, ParamType::Int32)?;
+        let histogram_axis_reason =
+            base.create_param(PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array)?;
+
+        // drvModbusAsyn.cpp:226-230 seeds the statistics params.
+        for r in [
+            read_ok_reason,
+            write_ok_reason,
+            io_errors_reason,
+            last_io_reason,
+            max_io_reason,
+        ] {
+            base.set_int32_param(r, 0, 0)?;
+        }
+
+        Ok(Self {
+            reason_to_datatype,
+            read_reason,
+            read_ok_reason,
+            write_ok_reason,
+            io_errors_reason,
+            last_io_reason,
+            max_io_reason,
+            poll_delay_reason,
+            enable_histogram_reason,
+            read_histogram_reason,
+            histogram_bin_reason,
+            histogram_axis_reason,
+        })
+    }
+}
+
+/// `drvModbusAsyn` as its constructor leaves it when a check after
+/// `registerPort` fails (drvModbusAsyn.cpp:259-305): registered, parameters
+/// created, `initialized_` false. Every `drvUserCreate` disables the caller and
+/// returns `asynDisabled` (:353-356) and `connect` refuses (:459), so no
+/// record reaches its I/O.
+struct ModbusHalfBuilt {
+    base: PortDriverBase,
+}
+
+impl ModbusHalfBuilt {
+    fn new(port_name: &str, data_type: ModbusDataType) -> AsynResult<Self> {
+        let flags = PortFlags {
+            multi_device: true,
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new(port_name, 1, flags);
+        ModbusParams::create(&mut base, data_type)?;
+        Ok(Self { base })
+    }
+
+    fn disabled() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Disabled,
+            message: String::new(),
+        }
+    }
+}
+
+impl PortDriver for ModbusHalfBuilt {
+    fn base(&self) -> &PortDriverBase {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.base
+    }
+
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        self.base.disable_addr(req.addr);
+        Err(Self::disabled())
+    }
+
+    fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        Err(Self::disabled())
+    }
+
+    fn connect_addr(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        Err(Self::disabled())
+    }
+}
+
 /// The Modbus `asyn-rs` port driver — the `drvModbusAsyn` equivalent.
 pub struct ModbusPortDriver {
     base: PortDriverBase,
@@ -414,65 +562,20 @@ impl ModbusPortDriver {
             ..PortFlags::default()
         };
         let mut base = PortDriverBase::new(port_name, engine.config().length.max(1), flags);
-
-        // One parameter per data type. The reason index recovers the type;
-        // numeric types use a Float64 cache value (covers the int16/int32
-        // ranges exactly), string types an Octet value.
-        let mut reason_to_datatype: Vec<Option<ModbusDataType>> = Vec::new();
-        for dt in ALL_DATA_TYPES {
-            let ptype = if dt.is_string() {
-                ParamType::Octet
-            } else {
-                ParamType::Float64
-            };
-            let idx = base.create_param(dt.as_str(), ptype)?;
-            if reason_to_datatype.len() <= idx {
-                reason_to_datatype.resize(idx + 1, None);
-            }
-            reason_to_datatype[idx] = Some(dt);
-        }
-
-        // MODBUS_DATA — an alias selecting the port's default data type.
-        let default_dt = engine.config().data_type;
-        let data_reason = base.create_param(
-            PARAM_DATA,
-            if default_dt.is_string() {
-                ParamType::Octet
-            } else {
-                ParamType::Float64
-            },
-        )?;
-        if reason_to_datatype.len() <= data_reason {
-            reason_to_datatype.resize(data_reason + 1, None);
-        }
-        reason_to_datatype[data_reason] = Some(default_dt);
-
-        // Control / statistics parameters.
-        let read_reason = base.create_param(PARAM_READ, ParamType::Int32)?;
-        let read_ok_reason = base.create_param(PARAM_READ_OK, ParamType::Int32)?;
-        let write_ok_reason = base.create_param(PARAM_WRITE_OK, ParamType::Int32)?;
-        let io_errors_reason = base.create_param(PARAM_IO_ERRORS, ParamType::Int32)?;
-        let last_io_reason = base.create_param(PARAM_LAST_IO_TIME, ParamType::Int32)?;
-        let max_io_reason = base.create_param(PARAM_MAX_IO_TIME, ParamType::Int32)?;
-        let poll_delay_reason = base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
-        let enable_histogram_reason =
-            base.create_param(PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital)?;
-        let read_histogram_reason =
-            base.create_param(PARAM_READ_HISTOGRAM, ParamType::Int32Array)?;
-        let histogram_bin_reason = base.create_param(PARAM_HISTOGRAM_BIN_TIME, ParamType::Int32)?;
-        let histogram_axis_reason =
-            base.create_param(PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array)?;
-
-        // drvModbusAsyn.cpp:226-230 seeds the statistics params.
-        for r in [
+        let ModbusParams {
+            reason_to_datatype,
+            read_reason,
             read_ok_reason,
             write_ok_reason,
             io_errors_reason,
             last_io_reason,
             max_io_reason,
-        ] {
-            base.set_int32_param(r, 0, 0)?;
-        }
+            poll_delay_reason,
+            enable_histogram_reason,
+            read_histogram_reason,
+            histogram_bin_reason,
+            histogram_axis_reason,
+        } = ModbusParams::create(&mut base, engine.config().data_type)?;
 
         let poll_delay_secs = engine.config().poll_delay.as_secs_f64();
 
@@ -1967,10 +2070,25 @@ struct ModbusConfigHandler {
     handle: epics_base_rs::runtime::task::RuntimeHandle,
 }
 
-/// Parse the `drvModbusAsynConfigure` positional arguments into a
-/// [`ModbusConfig`] plus the octet port name. The data type may be given as a
-/// name (`INT32_LE`) or a numeric `modbusDataType_t` index.
-fn parse_configure_args(args: &[ArgValue]) -> Result<(String, String, ModbusConfig), String> {
+/// `drvModbusAsynConfigure`'s arguments as C hands them to the constructor.
+#[derive(Debug)]
+struct ConfigureArgs {
+    port_name: String,
+    octet_port: String,
+    slave: i32,
+    function: i32,
+    start_address: i32,
+    length: i32,
+    data_type: ModbusDataType,
+    poll_msec: i32,
+    plc_type: String,
+}
+
+/// Parse the `drvModbusAsynConfigure` positional arguments. The data type may
+/// be given as a name (`INT32_LE`) or a numeric `modbusDataType_t` index; it is
+/// the one argument C resolves before the constructor registers the port
+/// (drvModbusAsyn.cpp:3117-3133), so the one refusal here frees the name.
+fn parse_configure_args(args: &[ArgValue]) -> Result<ConfigureArgs, String> {
     let s = |i: usize| match &args[i] {
         ArgValue::String(v) => v.to_str().map(str::to_owned),
         _ => Err(format!("argument {i} must be a string")),
@@ -1979,16 +2097,6 @@ fn parse_configure_args(args: &[ArgValue]) -> Result<(String, String, ModbusConf
         ArgValue::Int(v) => Ok(*v as i32),
         _ => Err(format!("argument {i} must be an integer")),
     };
-    let port_name = s(0)?;
-    let octet_port = s(1)?;
-    let slave = n(2)?;
-    let function = ModbusFunctionCode::from_i32(n(3)?)
-        .ok_or_else(|| format!("unsupported Modbus function {}", n(3).unwrap()))?;
-    let start_address = n(4)?;
-    let length = n(5)?;
-    if length < 0 {
-        return Err("modbusLength must be >= 0".into());
-    }
     let dt_str = s(6)?;
     let data_type = if dt_str.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         dt_str
@@ -2000,46 +2108,149 @@ fn parse_configure_args(args: &[ArgValue]) -> Result<(String, String, ModbusConf
         ModbusDataType::from_type_string(&dt_str)
             .ok_or_else(|| format!("unknown data type '{dt_str}'"))?
     };
-    let poll_msec = n(7)?;
-    let plc_type = if args.len() > 8 {
-        s(8).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let config = ModbusConfig {
-        slave: slave as u8,
-        function,
-        start_address,
-        length: length as usize,
+    Ok(ConfigureArgs {
+        port_name: s(0)?,
+        octet_port: s(1)?,
+        slave: n(2)?,
+        function: n(3)?,
+        start_address: n(4)?,
+        length: n(5)?,
         data_type,
-        poll_delay: Duration::from_millis(poll_msec.max(0) as u64),
-        plc_type,
+        poll_msec: n(7)?,
+        plc_type: if args.len() > 8 {
+            s(8).unwrap_or_default()
+        } else {
+            String::new()
+        },
+    })
+}
+
+impl ConfigureArgs {
+    /// The constructor's checks after `registerPort` (drvModbusAsyn.cpp:259-280);
+    /// a refusal is the `ASYN_TRACE_ERROR` line C prints before it returns.
+    fn config(&self) -> Result<ModbusConfig, String> {
+        let port = &self.port_name;
+        let function = ModbusFunctionCode::from_i32(self.function).ok_or_else(|| {
+            format!(
+                "drvModbusAsyn::drvModbusAsyn port {port} unsupported Modbus function {}",
+                self.function
+            )
+        })?;
+        if self.length <= 0 {
+            return Err(format!(
+                "drvModbusAsyn::drvModbusAsyn, port {port} memory length<=0"
+            ));
+        }
+        let max = function.max_length();
+        if self.length as usize > max {
+            return Err(format!(
+                "drvModbusAsyn::drvModbusAsyn, port {port} memory length={} too large, max={max}",
+                self.length
+            ));
+        }
+        Ok(ModbusConfig {
+            slave: self.slave as u8,
+            function,
+            start_address: self.start_address,
+            length: self.length as usize,
+            data_type: self.data_type,
+            poll_delay: Duration::from_millis(self.poll_msec.max(0) as u64),
+            plc_type: self.plc_type.clone(),
+        })
+    }
+}
+
+/// Build `driver`'s runtime under `claim` and publish it to `ctx`'s database.
+fn start_port<D: PortDriver>(
+    claim: asyn_rs::registry::PortClaim,
+    driver: D,
+    ctx: &CommandContext,
+) -> Result<
+    (
+        asyn_rs::runtime::PortRuntimeHandle,
+        asyn_rs::port_handle::PortHandle,
+    ),
+    CommandOutcome,
+> {
+    let port_name = claim.name().to_string();
+    // A port whose actor thread the OS refused is not a port: dropping the
+    // claim frees the name. Same end state as C by a different route — a
+    // failed `registerPort` throws out of the constructor
+    // (asynPortDriver.cpp:4036-4040), iocsh catches it
+    // (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
+    // Both failures below report as that throw.
+    let Ok((runtime, _jh)) = create_port_runtime(&claim, driver, RuntimeConfig::default()) else {
+        return Err(
+            ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                &port_name,
+            )),
+        );
     };
-    config.validate().map_err(|e| e.to_string())?;
-    Ok((port_name, octet_port, config))
+    let port_handle = runtime.port_handle().clone();
+    // Owned by the database this command's IOC runs, so its seed waits
+    // for that database's open.
+    let owner = ctx.db().scan_control().interrupt_gate();
+    if claim.publish(port_handle.clone(), owner).is_err() {
+        // Nothing published this port, so ask the actor to stop.
+        runtime.shutdown();
+        return Err(
+            ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                &port_name,
+            )),
+        );
+    }
+    Ok((runtime, port_handle))
 }
 
 impl CommandHandler for ModbusConfigHandler {
     fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
-        let (port_name, octet_port, config) =
-            parse_configure_args(args).map_err(|e| e.to_string())?;
+        let args = parse_configure_args(args).map_err(|e| e.to_string())?;
+        let ConfigureArgs {
+            port_name,
+            octet_port,
+            ..
+        } = &args;
         // `drvModbusAsyn` is an `asynPortDriver` subclass (drvModbusAsyn.h:123):
         // its base registers the port before the body builds anything.
-        let claim = match asyn_rs::manager::claim_port_driver(&port_name) {
+        let claim = match asyn_rs::manager::claim_port_driver(port_name) {
             Ok(claim) => claim,
             Err(e) => return Ok(ctx.cxx_error(e)),
         };
-        let interpose = take_interpose(&octet_port);
+        let interpose = take_interpose(octet_port);
         let link = interpose.link;
+
+        // The body's refusals come after registration, so C keeps the port
+        // with `initialized_` false and Configure still returns asynSuccess
+        // (drvModbusAsyn.cpp:3134-3140).
+        let built = args.config().and_then(|config| {
+            let entry = asyn_rs::asyn_record::get_port(octet_port).ok_or_else(|| {
+                format!(
+                    "drvModbusAsyn::drvModbusAsyn port {port_name} can't connect to asynOctet on Octet server {octet_port}."
+                )
+            })?;
+            Ok((config, entry))
+        });
+        let (config, entry) = match built {
+            Ok(built) => built,
+            Err(line) => {
+                let half =
+                    ModbusHalfBuilt::new(port_name, args.data_type).map_err(|e| e.to_string())?;
+                let (_runtime, port_handle) = match start_port(claim, half, ctx) {
+                    Ok(started) => started,
+                    Err(outcome) => return Ok(outcome),
+                };
+                let _ = port_handle.with_driver_blocking(move |d: &mut ModbusHalfBuilt| {
+                    d.base.trace_print(TraceMask::ERROR, format_args!("{line}"))
+                });
+                return Ok(CommandOutcome::Continue);
+            }
+        };
         // The read poller is started only for a relative-addressing read port.
         // An absolute-addressing port has no poller (drvModbusAsyn.cpp:267,
         // `if (absoluteAddressing_) needReadThread = 0;`) — each record reads
         // its own wire address on access.
         let needs_poller = config.function.is_read() && !config.absolute_addressing();
 
-        // Find the underlying octet port and build the framed transport.
-        let entry = asyn_rs::asyn_record::get_port(&octet_port)
-            .ok_or_else(|| format!("octet port '{octet_port}' not found"))?;
         // The configured timeout (C `modbusInterposeConfig timeoutMsec`) drives
         // both the underlying read and write; the write delay is applied by the
         // transport before each frame write (R53).
@@ -2055,11 +2266,11 @@ impl CommandHandler for ModbusConfigHandler {
         // this octet port draws from the same sequence and their concurrent
         // requests stay distinguishable.
         let driver = ModbusPortDriver::with_transaction_counter(
-            &port_name,
+            port_name,
             config,
             link,
             transport,
-            octet_transaction_counter(&octet_port),
+            octet_transaction_counter(octet_port),
         )
         .map_err(|e| e.to_string())?;
         let read_reason = driver.read_reason;
@@ -2071,33 +2282,10 @@ impl CommandHandler for ModbusConfigHandler {
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
 
-        // A port whose actor thread the OS refused is not a port: dropping the
-        // claim frees the name. Same end state as C by a different route — a
-        // failed `registerPort` throws out of the constructor
-        // (asynPortDriver.cpp:4036-4040), iocsh catches it
-        // (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
-        // Both failures below report as that throw.
-        let Ok((runtime, _jh)) = create_port_runtime(&claim, driver, RuntimeConfig::default())
-        else {
-            return Ok(
-                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
-                    &port_name,
-                )),
-            );
+        let (runtime, port_handle) = match start_port(claim, driver, ctx) {
+            Ok(started) => started,
+            Err(outcome) => return Ok(outcome),
         };
-        let port_handle = runtime.port_handle().clone();
-        // Owned by the database this command's IOC runs, so its seed waits
-        // for that database's open.
-        let owner = ctx.db().scan_control().interrupt_gate();
-        if claim.publish(port_handle.clone(), owner).is_err() {
-            // Nothing published this port, so ask the actor to stop.
-            runtime.shutdown();
-            return Ok(
-                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
-                    &port_name,
-                )),
-            );
-        }
         // The registry above holds a live `PortHandle` for this port, which is
         // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
         drop(runtime);
@@ -3656,6 +3844,95 @@ mod tests {
             "{stdout}"
         );
         assert!(lines.contains(&"SECOND=true"), "{stdout}");
+    }
+
+    /// C checks the function, the length and the octet port in the
+    /// constructor body, after its base registered the port
+    /// (drvModbusAsyn.cpp:259-305), and Configure returns asynSuccess anyway
+    /// (:3134-3140). The port stays registered with `initialized_` false: a
+    /// second Configure is refused, and a record's drvUserCreate is disabled
+    /// (:353-356). The data-type lookup runs before the constructor
+    /// (:3117-3133), so its refusal leaves the name free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_constructor_refusal_keeps_the_port_registered_and_disabled() {
+        use epics_base_rs::server::iocsh::registry::{ArgValue, CommandOutcome};
+        const CHILD: &str = "MODBUS_RS_HALF_BUILT_CHILD";
+        const TEST: &str =
+            "ioc::tests::a_constructor_refusal_keeps_the_port_registered_and_disabled";
+        let configure = |port: &str, octet: &str, function: i64, data_type: &str| {
+            ModbusConfigHandler {
+                handle: tokio::runtime::Handle::current(),
+            }
+            .call(
+                &[
+                    ArgValue::String(port.into()),
+                    ArgValue::String(octet.into()),
+                    ArgValue::Int(1),
+                    ArgValue::Int(function),
+                    ArgValue::Int(0),
+                    ArgValue::Int(4),
+                    ArgValue::String(data_type.into()),
+                    ArgValue::Int(0),
+                ],
+                &make_ctx(),
+            )
+        };
+        if std::env::var_os(CHILD).is_some() {
+            for (port, octet, function) in [
+                ("MB_HALF_FN", "NO_SUCH_OCTET", 99),
+                ("MB_HALF_OCTET", "NO_SUCH_OCTET", 3),
+            ] {
+                assert!(matches!(
+                    configure(port, octet, function, "UINT16"),
+                    Ok(CommandOutcome::Continue)
+                ));
+                let handle = asyn_rs::asyn_record::get_port(port)
+                    .expect("the half-built port stays registered")
+                    .handle
+                    .clone();
+                let refused = handle
+                    .drv_user_create(&DrvUserRequest::new("UINT16", 0))
+                    .await
+                    .expect_err("drvUserCreate on a half-built port");
+                assert_eq!(refused.status(), AsynStatus::Disabled, "{refused}");
+            }
+            println!("SECOND");
+            let second = configure("MB_HALF_FN", "NO_SUCH_OCTET", 99, "UINT16");
+            assert!(matches!(second, Ok(CommandOutcome::Failed)));
+            println!("BADTYPE");
+            assert!(configure("MB_HALF_TYPE", "NO_SUCH_OCTET", 3, "NONSENSE").is_err());
+            assert!(asyn_rs::asyn_record::get_port("MB_HALF_TYPE").is_none());
+            assert!(asyn_rs::manager::claim_port_driver("MB_HALF_TYPE").is_ok());
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        for line in [
+            "drvModbusAsyn::drvModbusAsyn port MB_HALF_FN unsupported Modbus function 99",
+            "drvModbusAsyn::drvModbusAsyn port MB_HALF_OCTET can't connect to asynOctet on Octet server NO_SUCH_OCTET.",
+        ] {
+            assert!(
+                stderr.lines().any(|l| l.ends_with(line)),
+                "{line}\n{stderr}"
+            );
+        }
+        let second = stdout.split_once("SECOND\n").expect("the child ran").1;
+        let lines: Vec<&str> = second.lines().collect();
+        assert_eq!(
+            lines[..2],
+            [
+                "asynCommon:registerDriver MB_HALF_FN already registered",
+                "asynPortDriver:asynPortDriver ERROR: Can't register port: MB_HALF_FN",
+            ],
+            "{stdout}"
+        );
     }
 
     /// Finding 6: C creates the read-poller thread on `needReadThread` alone
@@ -5934,7 +6211,7 @@ mod tests {
 
     #[test]
     fn parse_configure_args_named_datatype() {
-        let (port, octet, cfg) = parse_configure_args(&args(vec![
+        let parsed = parse_configure_args(&args(vec![
             ArgValue::String("PLC1".into()),
             ArgValue::String("OCTET1".into()),
             ArgValue::Int(1),
@@ -5946,8 +6223,9 @@ mod tests {
             ArgValue::String("Koyo".into()),
         ]))
         .unwrap();
-        assert_eq!(port, "PLC1");
-        assert_eq!(octet, "OCTET1");
+        assert_eq!(parsed.port_name, "PLC1");
+        assert_eq!(parsed.octet_port, "OCTET1");
+        let cfg = parsed.config().unwrap();
         assert_eq!(cfg.function, ModbusFunctionCode::ReadHoldingRegisters);
         assert_eq!(cfg.data_type, ModbusDataType::Int32Le);
         assert_eq!(cfg.length, 10);
@@ -6017,7 +6295,7 @@ mod tests {
     #[test]
     fn parse_configure_args_numeric_datatype() {
         // Data type index 4 = UInt16 (5th entry, 0-based).
-        let (_, _, cfg) = parse_configure_args(&args(vec![
+        let cfg = parse_configure_args(&args(vec![
             ArgValue::String("P".into()),
             ArgValue::String("O".into()),
             ArgValue::Int(1),
@@ -6027,24 +6305,44 @@ mod tests {
             ArgValue::String("4".into()),
             ArgValue::Int(0),
         ]))
+        .unwrap()
+        .config()
         .unwrap();
         assert_eq!(cfg.data_type, ModbusDataType::UInt16);
     }
 
+    /// C checks the function and the length in the constructor, after
+    /// registerPort (drvModbusAsyn.cpp:259-280), so parsing accepts them and
+    /// `config` refuses with C's line.
     #[test]
-    fn parse_configure_args_rejects_bad_function() {
-        let err = parse_configure_args(&args(vec![
-            ArgValue::String("P".into()),
-            ArgValue::String("O".into()),
-            ArgValue::Int(1),
-            ArgValue::Int(99),
-            ArgValue::Int(0),
-            ArgValue::Int(5),
-            ArgValue::String("UINT16".into()),
-            ArgValue::Int(0),
-        ]))
-        .unwrap_err();
-        assert!(err.contains("function"));
+    fn config_refuses_function_and_length_with_the_constructor_lines() {
+        let config = |function: i64, length: i64| {
+            parse_configure_args(&args(vec![
+                ArgValue::String("P".into()),
+                ArgValue::String("O".into()),
+                ArgValue::Int(1),
+                ArgValue::Int(function),
+                ArgValue::Int(0),
+                ArgValue::Int(length),
+                ArgValue::String("UINT16".into()),
+                ArgValue::Int(0),
+            ]))
+            .unwrap()
+            .config()
+            .unwrap_err()
+        };
+        assert_eq!(
+            config(99, 5),
+            "drvModbusAsyn::drvModbusAsyn port P unsupported Modbus function 99"
+        );
+        assert_eq!(
+            config(3, 0),
+            "drvModbusAsyn::drvModbusAsyn, port P memory length<=0"
+        );
+        assert_eq!(
+            config(3, 126),
+            "drvModbusAsyn::drvModbusAsyn, port P memory length=126 too large, max=125"
+        );
     }
 
     #[test]

@@ -410,7 +410,7 @@ impl AsynUser {
         line: u32,
     ) {
         let Some(t) = &self.trace else { return };
-        if t.manager.is_enabled(&t.port, mask) {
+        if t.manager.is_enabled_device(&t.port, self.addr, mask) {
             // C's `pasynUser->reason` is an `int` and `printPort` writes it
             // with `%d` (asynManager.c:3043); the whole reason domain,
             // `ASYN_REASON_SIGNAL` (-1) through `ASYN_REASON_RESERVED_HIGH`

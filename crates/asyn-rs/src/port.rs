@@ -895,8 +895,9 @@ impl PortDriverBase {
     }
 
     /// C `asynPrint(pasynUserSelf, mask, ...)` — the port's own diagnostic
-    /// channel, gated by this port's trace mask and routed to this port's
-    /// trace file.
+    /// channel. `pasynUserSelf` is connected to device 0
+    /// (asynPortDriver.cpp:4099), so on a multi-device port the line follows
+    /// `asynSetTraceMask <port> 0`; on any other port that is the port's own.
     ///
     /// Public because the drivers that need it are not all in this crate. C's
     /// drivers are separate modules too (`drvModbusAsyn.cpp`,
@@ -908,8 +909,11 @@ impl PortDriverBase {
     ///
     /// `args` is formatted only when `mask` is enabled, onto the stack: a
     /// driver write that fails under a record's lock allocates nothing.
+    /// The line goes through device 0, the device C's constructor connects
+    /// `pasynUserSelf` to (asynPortDriver.cpp:4099).
     pub fn trace_print(&self, mask: crate::trace::TraceMask, args: std::fmt::Arguments<'_>) {
-        self.trace.print(Some(&self.port_name), None, 0, mask, args);
+        self.trace
+            .print(Some(&self.port_name), Some(0), 0, mask, args);
     }
 
     /// The `ASYN_TRACEIO_DRIVER` line C's `asynPortDriver::read*` and
@@ -1796,7 +1800,7 @@ impl PortDriverBase {
             _ => return,
         };
         // An undefined read is routine; nothing is formatted unless it prints.
-        if !self.trace.is_enabled(&self.port_name, mask) {
+        if !self.trace.is_enabled_device(&self.port_name, 0, mask) {
             return;
         }
         let port = &self.port_name;

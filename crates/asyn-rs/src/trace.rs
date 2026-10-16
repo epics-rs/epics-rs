@@ -527,6 +527,21 @@ impl TraceManager {
         }
     }
 
+    /// C `connectDevice`'s `locateDevice(pport, addr, TRUE)`
+    /// (asynManager.c:571-590): give `addr` its own slot, born with
+    /// `tracePvtInit`'s defaults, so later port-scoped mask writes push down
+    /// into it while a port-scoped trace file does not reach it. No-op where
+    /// the address names no device.
+    pub fn connect_device(&self, port: &str, addr: i32) {
+        if let Ok(mut ports) = self.ports.lock() {
+            if let Some(pt) = ports.get_mut(port) {
+                if let Some(a) = device_slot(pt.multi_device, Some(addr)) {
+                    pt.devices.entry(a).or_default();
+                }
+            }
+        }
+    }
+
     /// Install the exception sink used by every `set_trace_*` mutator.
     /// Mirrors C asyn where `setTraceMask` / `setTraceIOMask` /
     /// `setTraceInfoMask` / `setTraceFile` / `setTraceIOTruncateSize`
@@ -603,13 +618,23 @@ impl TraceManager {
     where
         F: FnOnce(&TraceConfig) -> R,
     {
+        self.with_dp_common_addr(port, addr, |cfg, _| f(cfg))
+    }
+
+    /// [`Self::with_dp_common`] also handing `f` the address C's `getAddr`
+    /// (asynManager.c:2006-2010) reports for the user, which `printPort`
+    /// prints: -1 on a port without `ASYN_MULTIDEVICE`, whatever `addr` was.
+    fn with_dp_common_addr<R, F>(&self, port: &str, addr: Option<i32>, f: F) -> Option<R>
+    where
+        F: FnOnce(&TraceConfig, Option<i32>) -> R,
+    {
         let ports = self.ports.lock().ok()?;
         let Some(pt) = ports.get(port) else {
-            return Some(f(&TraceConfig::default()));
+            return Some(f(&TraceConfig::default(), addr));
         };
         match device_slot(pt.multi_device, addr) {
-            Some(a) => Some(f(pt.devices.get(&a).unwrap_or(&pt.port))),
-            None => Some(f(&pt.port)),
+            Some(a) => Some(f(pt.devices.get(&a).unwrap_or(&pt.port), Some(a))),
+            None => Some(f(&pt.port, None)),
         }
     }
 
@@ -754,7 +779,7 @@ impl TraceManager {
         mask: TraceMask,
         msg: &str,
     ) {
-        self.with_dp_common(port, addr, |cfg| {
+        self.with_dp_common_addr(port, addr, |cfg, addr| {
             // C `traceVprintSource` re-tests the mask against the *effective*
             // `ptracePvt` it just resolved (asynManager.c:3098), so the gate
             // and the config are the same rung by construction.
@@ -783,7 +808,7 @@ impl TraceManager {
         mask: TraceMask,
         args: std::fmt::Arguments<'_>,
     ) {
-        let emit = |cfg: &TraceConfig| {
+        let emit = |cfg: &TraceConfig, addr: Option<i32>| {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
@@ -794,11 +819,11 @@ impl TraceManager {
         };
         match port {
             Some(port) => {
-                self.with_dp_common(port, addr, emit);
+                self.with_dp_common_addr(port, addr, emit);
             }
             None => {
                 if let Ok(cfg) = self.global_config.lock() {
-                    emit(&cfg);
+                    emit(&cfg, addr);
                 }
             }
         }
@@ -829,7 +854,7 @@ impl TraceManager {
         line: u32,
         msg: &str,
     ) {
-        self.with_dp_common(port, addr, |cfg| {
+        self.with_dp_common_addr(port, addr, |cfg, addr| {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
@@ -878,7 +903,7 @@ impl TraceManager {
         file: &str,
         line: u32,
     ) {
-        self.with_dp_common(port, addr, |cfg| {
+        self.with_dp_common_addr(port, addr, |cfg, addr| {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
@@ -2394,6 +2419,8 @@ mod tests {
     #[test]
     fn the_prefix_is_c_s_four_components_in_c_s_order() {
         let mgr = TraceManager::new();
+        // getAddr reports the address only on a multi-device port.
+        mgr.register_port("p", true);
         mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
         mgr.set_trace_info_mask(
             Some("p"),

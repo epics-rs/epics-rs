@@ -54,7 +54,10 @@ async fn build() -> Arc<PvDatabase> {
 
 async fn read(db: &PvDatabase, rec: &str) -> (String, EpicsValue) {
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links(rec, &mut v).await.unwrap();
+    db.process_record_with_links(rec, &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
     let r = db.get_record(rec).unwrap();
     let inst = r.read();
     let val = match inst.record.get_field("VAL").unwrap() {

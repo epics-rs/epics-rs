@@ -116,6 +116,15 @@ impl Record for BiRecord {
         "bi"
     }
 
+    /// devBiSoft.c and devBiSoftRaw.c return `dbGetLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: false,
+        })
+    }
+
     // biRecord.c:112 returns a nonzero dset status before :114-116.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init != crate::server::device_support::DsetInit::Failed {

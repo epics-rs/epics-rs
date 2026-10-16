@@ -98,6 +98,7 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADOUT", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -121,6 +122,7 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADCA", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -150,6 +152,7 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADSIOL", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -174,6 +177,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_RECOVER", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     assert_eq!(
         alarm_of(&db, "AO_RECOVER").await,

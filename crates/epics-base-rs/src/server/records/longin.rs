@@ -24,6 +24,14 @@ static LONGIN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::recor
     ["VAL"],
 );
 
+/// devLiSoft.c returns `dbGetLink`'s status.
+const LONGIN_STATUS: crate::server::record::ProcessStatusRule =
+    crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+        plain: true,
+        raw: false,
+        async_: false,
+    });
+
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `longinRecord.c:148` is
 // `if (status==0) prec->udf = FALSE;` with no `status == 2` fold anywhere in
@@ -40,6 +48,7 @@ static LONGIN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::recor
     metadata_override = longin_metadata_override,
     process_posted_fields = LONGIN_POSTED,
     dset_owns_udf_on_computed,
+    process_status = LONGIN_STATUS,
     soft_input_read_as = Long
 )]
 pub struct LonginRecord {

@@ -170,6 +170,15 @@ impl Record for EventRecord {
         "event"
     }
 
+    /// devEventSoft.c returns `dbGetLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: false,
+        })
+    }
+
     /// `devEventSoft.c:56` reads INP as `DBR_STRING`; C ships no other soft
     /// event dset.
     fn soft_input_request(

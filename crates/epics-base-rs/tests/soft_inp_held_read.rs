@@ -13,6 +13,7 @@ async fn val_after_process(db: &PvDatabase, name: &str) -> f64 {
     let mut visited = ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     match db.get_pv(name).unwrap() {
         EpicsValue::Double(v) => v,

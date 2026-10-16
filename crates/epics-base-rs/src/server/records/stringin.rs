@@ -87,6 +87,15 @@ impl Record for StringinRecord {
         "stringin"
     }
 
+    /// devSiSoft.c returns `dbGetLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: false,
+        })
+    }
+
     /// C reads INP (`devSiSoft.c:53`) and SIOL (`stringinRecord.c:208`) with
     /// a plain `dbGetLink(..., DBR_STRING, ...)`: an ENUM/MENU source
     /// delivers its state label, never the index digits (epics-base#183).

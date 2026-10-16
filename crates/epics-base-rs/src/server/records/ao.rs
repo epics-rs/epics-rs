@@ -405,6 +405,16 @@ impl Record for AoRecord {
         "ao"
     }
 
+    /// devAoSoft.c, devAoSoftRaw.c and devAoSoftCallback.c return `dbPutLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: true,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
+    }
+
     /// C `aoRecord.c:181-184`: the `!dbLinkIsConstant(&prec->dol) && omsl ==
     /// menuOmslclosed_loop` gate calls `fetch_value` (`:433-455`), which unlike
     /// its siblings reads into a LOCAL — `dbGetLink(&prec->dol, DBR_DOUBLE,

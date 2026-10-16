@@ -121,7 +121,10 @@ async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
     db.add_record("HGF", Box::new(hg)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("HGF", &mut v).await.unwrap();
+    db.process_record_with_links("HGF", &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 
     assert_eq!(
         db.get_pv("HGF.SGNL").unwrap(),

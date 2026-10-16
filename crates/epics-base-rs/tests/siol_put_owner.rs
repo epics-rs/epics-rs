@@ -22,7 +22,10 @@ use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links(name, &mut v).await.unwrap();
+    db.process_record_with_links(name, &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {

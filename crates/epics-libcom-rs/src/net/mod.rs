@@ -42,6 +42,22 @@
 
 use std::net::Ipv4Addr;
 
+/// C `epicsSocketConvertErrorToString` / `epicsSocketConvertErrnoToString`
+/// (`epicsSocketConvertErrnoToString.cpp:25-38`), which are `strerror` into
+/// a 64-byte buffer. `io::Error`'s Display is the same sentence with
+/// ` (os error N)` appended, so the suffix comes off rather than the text
+/// being rebuilt from a table this port would have to keep in step.
+pub fn sock_err_string(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(errno) => text
+            .strip_suffix(&format!(" (os error {errno})"))
+            .unwrap_or(&text)
+            .to_string(),
+        None => text,
+    }
+}
+
 #[cfg(tokio_backend)]
 pub mod async_udp_v4;
 pub mod fanout;

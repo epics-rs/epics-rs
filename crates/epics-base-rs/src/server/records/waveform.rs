@@ -973,6 +973,22 @@ impl Record for WaveformRecord {
         self.kind.as_record_type()
     }
 
+    /// devWfSoft.c and devAaiSoft.c return `dbGetLink`'s status; devAaoSoft.c
+    /// returns 0, and a failed DOL's status is aao's own (`process` below);
+    /// `subArrayRecord.c:71` returns 0.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        use crate::server::record::{ProcessStatusRule, SoftStatus};
+        match self.kind {
+            ArrayKind::Waveform | ArrayKind::Aai => ProcessStatusRule::io(SoftStatus {
+                plain: true,
+                raw: false,
+                async_: false,
+            }),
+            ArrayKind::Aao => ProcessStatusRule::io(SoftStatus::NONE),
+            ArrayKind::SubArray => ProcessStatusRule::ZERO,
+        }
+    }
+
     /// The index fields four kinds answer from their own array bounds rather
     /// than from the field's type range — so they cannot take the routed
     /// `default:` arm, and cannot keep the VAL cache either.
@@ -1686,7 +1702,10 @@ impl Record for WaveformRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if self.dol_read_failed {
             self.dol_read_failed = false;
-            return Ok(ProcessOutcome::complete_no_emit());
+            return Ok(ProcessOutcome {
+                status: Err(crate::error::DbStatus::FAILED),
+                ..ProcessOutcome::complete_no_emit()
+            });
         }
         Ok(ProcessOutcome::complete())
     }

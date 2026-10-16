@@ -368,6 +368,15 @@ impl Record for MbbiRecord {
         "mbbi"
     }
 
+    /// devMbbiSoft.c and devMbbiSoftRaw.c return `dbGetLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: false,
+        })
+    }
+
     /// C `mbbiRecord.c:221-226` — the `db_post_events` inside `special()`
     /// after a `SPC_MOD` write:
     ///

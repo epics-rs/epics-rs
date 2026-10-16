@@ -31,6 +31,7 @@ record(mbbiDirect, "MS") { field(DTYP, "Soft Channel") field(INP, "NOPE CA") fie
         let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
+            .or_else(epics_base_rs::error::CaError::unless_process_status)
             .unwrap();
         let inst = rec.read();
         let got = (

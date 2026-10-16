@@ -1828,6 +1828,7 @@ fn partition_special_actions(
         matches!(
             a,
             A::WriteDbLink { .. }
+                | A::WriteDbLinkOrReturn { .. }
                 | A::ReadDbLink { .. }
                 | A::GetLink { .. }
                 | A::WriteDbLinkNotify { .. }
@@ -2377,6 +2378,17 @@ impl PvDatabase {
         let canonical = self
             .resolve_alias(record)
             .unwrap_or_else(|| RecordName::from(record));
+        if let Some(desc) =
+            crate::server::record::record_instance::field_desc_in(rec.rdes().fields, &field)
+            && let Some(class) = crate::types::link_class_of(desc)
+        {
+            crate::server::record::warn_discarded_cp(
+                &canonical,
+                desc.name,
+                crate::server::record::LinkFieldType::for_class(class),
+                text.as_bytes(),
+            );
+        }
         let value = EpicsValue::String(text.clone());
         // C `dbPutFieldLink` → `dbAddLink`: a link naming no record here is
         // CA from this put on, as at iocInit.
@@ -2384,7 +2396,7 @@ impl PvDatabase {
         if let Some(l) = link.as_mut() {
             l.relink(|parsed, ftype| self.add_link(parsed, ftype));
         }
-        let mut common = PreparedCommonLink::for_put(&canonical, &field, &value);
+        let mut common = PreparedCommonLink::for_put(&field, &value);
         if let Some(l) = common.as_mut() {
             l.relink(|parsed, ftype| self.add_link(parsed, ftype));
             l.ask_add_record(self, &rec);
@@ -3816,7 +3828,8 @@ impl PvDatabase {
             }
         };
         let mut visited = crate::server::database::ProcStack::new();
-        self.process_record_with_links_already_locked(record_name, &mut visited)?;
+        self.process_record_with_links_already_locked(record_name, &mut visited)
+            .or_else(CaError::unless_process_status)?;
         Ok(Some(notify))
     }
 
@@ -4186,24 +4199,8 @@ impl PvDatabase {
             // when `acquire_gate`, and the caller (an atomic group PUT) holds it
             // when not. The gate is not reentrant, so acquiring it again
             // here deadlocks every PROC put.
-            let _ = self.put_driven_process_already_locked(record_name);
-            // The wait-set fires the oneshot only after the whole
-            // FLNK/OUT chain (sync + async) settles. If it has
-            // already completed the chain was fully synchronous —
-            // report immediate success; otherwise hand the receiver
-            // to the CA layer to await the deferred completion.
-            return match parked {
-                Some((notify, completion_rx)) => {
-                    if notify.completed() {
-                        Ok(crate::server::record::ProcessCompletion::Sync)
-                    } else {
-                        Ok(crate::server::record::ProcessCompletion::from_signal(
-                            completion_rx,
-                        ))
-                    }
-                }
-                None => Ok(crate::server::record::ProcessCompletion::Sync),
-            };
+            let processed = self.put_driven_process_already_locked(record_name);
+            return put_answer(parked, processed);
         }
 
         // C `dbPutField` -> `dbPut` (`dbAccess.c:1263`). A special's link
@@ -4332,7 +4329,7 @@ impl PvDatabase {
         // Process the record after field put — through the single owner of C's
         // `dbPutField:1268-1277` decision, so an async-active record takes the
         // RPRO deferral instead of a doomed re-entrant `dbProcess`.
-        let _ = self.put_driven_process_already_locked(record_name);
+        let processed = self.put_driven_process_already_locked(record_name);
 
         // Is the ORIGINATING record itself still async-pending? Its
         // wait-set membership is taken + `leave`d at its own completion
@@ -4376,26 +4373,7 @@ impl PvDatabase {
             }
         }
 
-        // CA completion gates on the WHOLE chain, not just the
-        // originating record: the put-notify must not report
-        // done until every FLNK/OUT target it drove — including an async
-        // FLNK target that the originating record's sync cycle merely
-        // kicked off — has settled. `completed()` is true iff the
-        // wait-set drained to zero during this call (fully synchronous
-        // chain); otherwise the receiver fires later from the last
-        // chain member's `leave`.
-        match parked {
-            Some((notify, completion_rx)) => {
-                if notify.completed() {
-                    Ok(crate::server::record::ProcessCompletion::Sync)
-                } else {
-                    Ok(crate::server::record::ProcessCompletion::from_signal(
-                        completion_rx,
-                    ))
-                }
-            }
-            None => Ok(crate::server::record::ProcessCompletion::Sync),
-        }
+        put_answer(parked, processed)
     }
 
     /// Put a PV value without triggering process (for restore).
@@ -4584,6 +4562,31 @@ impl<'v> PutChain<'v> {
             tail: PutTail::default(),
             visited,
         }
+    }
+}
+
+/// A put's answer once the process it drove has run.
+///
+/// A put-callback answers when its wait-set drains — the whole FLNK/OUT
+/// chain, an async target it merely started included: `completed()` says
+/// the chain settled in this call, otherwise the receiver fires from the
+/// last member's `leave`. It never reads the process status (`dbNotify`). A
+/// plain put returns that status, `dbPutField`'s `dbProcess` (`dbAccess.c:
+/// 1279`).
+fn put_answer(
+    parked: Option<(
+        std::sync::Arc<crate::server::record::NotifyWaitSet>,
+        Option<crate::runtime::sync::oneshot::Receiver<()>>,
+    )>,
+    processed: CaResult<()>,
+) -> CaResult<crate::server::record::ProcessCompletion> {
+    use crate::server::record::ProcessCompletion;
+    match parked {
+        Some((notify, _)) if notify.completed() => Ok(ProcessCompletion::Sync),
+        Some((_, completion_rx)) => Ok(ProcessCompletion::from_signal(completion_rx)),
+        None => processed
+            .map(|()| ProcessCompletion::Sync)
+            .map_err(|e| CaError::ProcessStatus(crate::error::DbStatus::of_error(&e))),
     }
 }
 

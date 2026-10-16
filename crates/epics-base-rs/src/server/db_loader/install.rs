@@ -405,7 +405,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                     // mechanism, so the per-field release is a bounded,
                     // `.await`-free window.
                     let mut link =
-                        crate::server::record::PreparedCommonLink::for_put(def.name.as_bytes(), &name, &value);
+                        crate::server::record::PreparedCommonLink::for_put(&name, &value);
                     let put = rec_arc
                         .write()
                         .put_common_field_db_load_prepared(&name, value, &mut link);

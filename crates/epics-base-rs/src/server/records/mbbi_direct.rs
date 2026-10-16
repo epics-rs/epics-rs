@@ -137,6 +137,15 @@ impl Record for MbbiDirectRecord {
         "mbbiDirect"
     }
 
+    /// devMbbiDirectSoft.c returns `dbGetLink`'s status; devMbbiDirectSoftRaw.c returns 0.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: false,
+        })
+    }
+
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiDirectRecord.dbd.pod`): the
     /// three-choice NO/YES/RAW simulation menu. Served as `DBR_ENUM` with
     /// these labels. `SIMS`/`OLDSIMM` are shared menus resolved centrally.

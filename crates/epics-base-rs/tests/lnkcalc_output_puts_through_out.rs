@@ -28,6 +28,7 @@ async fn dbpf(db: &PvDatabase, rec: &str, value: EpicsValue) {
     db.put_pv(rec, value).await.unwrap();
     db.process_record_with_links(rec, &mut ProcStack::new())
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 }
 

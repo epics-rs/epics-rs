@@ -98,6 +98,7 @@ impl Record for FlagSource {
                 actions: vec![write],
                 device_did_compute: false,
                 post_write_fields: clear,
+                status: Ok(()),
             },
             Arm::NoLinkWrites => ProcessOutcome {
                 post_write_fields: clear,

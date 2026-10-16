@@ -31,6 +31,7 @@ async fn a_time_tsel_skips_the_siol_stamp_read() {
         let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(rec, &mut visited)
             .await
+            .or_else(epics_base_rs::error::CaError::unless_process_status)
             .unwrap();
     }
     epics_base_rs::runtime::log::errlog_flush();

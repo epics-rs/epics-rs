@@ -1497,11 +1497,7 @@ mod link_cache {
     impl PreparedCommonLink {
         /// `Some` when `field` is one of the `dbCommon` link fields (and
         /// swait's `OUTN`) and `value` a string.
-        pub(crate) fn for_put(
-            record: &[u8],
-            field: &str,
-            value: &crate::types::EpicsValue,
-        ) -> Option<Self> {
+        pub(crate) fn for_put(field: &str, value: &crate::types::EpicsValue) -> Option<Self> {
             let crate::types::EpicsValue::String(text) = value else {
                 return None;
             };
@@ -1518,18 +1514,6 @@ mod link_cache {
             .into_iter()
             .find(|(f, _)| f.eq_ignore_ascii_case(field))?;
             let text = text.clone();
-            // C `dbParseLink` (dbStaticLib.c:2382-2386) discards a CP/CPP
-            // modifier on a DBF_OUTLINK and warns once, as it parses; the
-            // discard itself is `parse_link_field`'s.
-            if field == "OUT" && crate::server::record::out_link_discards_cp(&text) {
-                tracing::warn!(
-                    target: "epics_base_rs::record",
-                    record = %String::from_utf8_lossy(record),
-                    field = "OUT",
-                    link = %text,
-                    "Discarding CP/CPP modifier in CA output link"
-                );
-            }
             Some(PreparedCommonLink {
                 field,
                 ftype,
@@ -2511,6 +2495,8 @@ pub(crate) struct RecordDesc {
     refused_async_read_keeps_udf: bool,
     /// [`Record::raw_soft_read_failure_skips_convert`], here for the same reason.
     raw_soft_read_failure_skips_convert: bool,
+    /// [`Record::process_status_rule`], here for the same reason.
+    process_status: crate::server::record::ProcessStatusRule,
     /// [`Record::string_input_links`].
     string_input_links: &'static [(&'static str, &'static str)],
 }
@@ -2555,6 +2541,16 @@ impl RecordDesc {
         self.raw_soft_read_failure_skips_convert
     }
 
+    /// [`Record::process_status_rule`]; `record` as in [`Self::is_primary`].
+    #[inline]
+    pub(crate) fn process_status(
+        &self,
+        record: &dyn Record,
+    ) -> crate::server::record::ProcessStatusRule {
+        debug_assert_eq!(self.process_status, record.process_status_rule());
+        self.process_status
+    }
+
     /// [`Record::string_input_links`]; `record` as in [`Self::is_primary`].
     #[inline]
     pub(crate) fn string_input_links(
@@ -2575,6 +2571,7 @@ impl RecordDesc {
             rederives_udf_on_computed_read: record.rederives_udf_on_computed_read(),
             refused_async_read_keeps_udf: record.refused_async_read_keeps_udf(),
             raw_soft_read_failure_skips_convert: record.raw_soft_read_failure_skips_convert(),
+            process_status: record.process_status_rule(),
             string_input_links: record.string_input_links(),
         }
     }
@@ -9367,7 +9364,7 @@ impl RecordInstance {
         value: EpicsValue,
         bound: MenuBound,
     ) -> CaResult<CommonFieldPutResult> {
-        let mut link = PreparedCommonLink::for_put(&self.name, name, &value);
+        let mut link = PreparedCommonLink::for_put(name, &value);
         if let Some(link) = &mut link {
             self.check_link_assignment(link.field, link.text.as_bytes(), bound)?;
             // The database's put bodies run the gate under their own hold.
@@ -10325,14 +10322,22 @@ impl RecordInstance {
         self.suppress_subroutine_run |= self.monitor_plan.subroutine_kind.is_some();
     }
 
-    pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
+    pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<crate::error::DbResult> {
         let outcome = self.run_subroutine_body();
         // A subroutine that errored out has no C counterpart (a C subroutine
         // returns a `long`); it is a failed cycle, so it takes the non-zero
         // arm — no outputs.
         let status = *outcome.as_ref().unwrap_or(&SUBROUTINE_STATUS_ERROR);
         self.record.set_subroutine_status(status);
-        outcome.map(|_| ())
+        outcome?;
+        // `subRecord.c` returns this status, but 0 for the asynchronous 1;
+        // `aSubRecord.c` returns 0.
+        Ok(match self.monitor_plan.subroutine_kind {
+            Some(SubroutineKind::Sub) if status != 1 => {
+                crate::error::DbStatus::new(status as i32).map_or(Ok(()), Err)
+            }
+            _ => Ok(()),
+        })
     }
 
     /// Returns C `process`'s `status` for this cycle: 0 only when `do_sub` ran
@@ -11116,7 +11121,8 @@ impl RecordInstance {
 
         // Call subroutine if registered (for sub/aSub records). Single owner
         // shared with the main engine path — see `run_registered_subroutine`.
-        self.run_registered_subroutine()?;
+        // `process_local`'s callers never read a status.
+        let _ = self.run_registered_subroutine()?;
         // Soft-Channel input records must skip the RVAL->VAL convert
         // (C `devAiSoft.c` `read_ai` returns 2 = "don't convert" for
         // every Soft-Channel input record, incl. one with a constant /

@@ -899,6 +899,7 @@ impl Record for SwaitRecord {
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
+                status: Ok(()),
             });
         }
 

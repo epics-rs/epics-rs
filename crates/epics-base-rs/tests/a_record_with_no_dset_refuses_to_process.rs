@@ -59,7 +59,11 @@ async fn the_first_cycle_refuses_and_the_record_stays_active() {
     )
     .await;
 
-    db.process_record("T:A").await.unwrap();
+    let status = db.process_record("T:A").await;
+    assert!(
+        matches!(status, Err(epics_base_rs::error::CaError::ProcessStatus(s)) if s.get() == (514 << 16) | 5),
+        "`aoRecord.c:175` returns S_dev_missingSup, got {status:?}"
+    );
     let after_one = heard(&sink);
     assert!(
         after_one.contains("recGblRecordError: write_ao Error (514,5) PV: T:A"),

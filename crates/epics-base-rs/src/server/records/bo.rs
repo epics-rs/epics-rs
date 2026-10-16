@@ -163,6 +163,16 @@ impl Record for BoRecord {
         "bo"
     }
 
+    /// devBoSoft.c, devBoSoftRaw.c and devBoSoftCallback.c return `dbPutLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: true,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
+    }
+
     /// C `boRecord.c:191-205`: the scalar `dbGetLink(&prec->dol, ..., &val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {
@@ -396,6 +406,7 @@ impl Record for BoRecord {
             actions,
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         })
     }
 

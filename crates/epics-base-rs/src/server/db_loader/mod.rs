@@ -3769,6 +3769,19 @@ pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
                 continue;
             }
         }
+        // `dbPutString` parses a link field's text as it stores it.
+        if let Some(desc) = crate::server::record::record_instance::field_desc_of(
+            target.record(),
+            &f.name.to_uppercase(),
+        ) && let Some(class) = crate::types::link_class_of(desc)
+        {
+            crate::server::record::warn_discarded_cp(
+                record_name.as_bytes(),
+                desc.name,
+                crate::server::record::LinkFieldType::for_class(class),
+                f.value.as_bytes(),
+            );
+        }
         let field = std::slice::from_ref(f);
         let Err(e) = check_link_types(links, target.record().record_type(), field)
             .and_then(|()| apply_fields(target, field, common_fields))

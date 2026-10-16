@@ -382,3 +382,125 @@ async fn a_device_link_of_a_type_without_device_support_is_held_to_constant() {
         .unwrap();
     assert_eq!(db.get_record("T:C1").unwrap().read().common.text.inp, "");
 }
+
+/// The ten-record transcript above, heard where C prints it: `iocInit`'s
+/// refusal lines go through errlog, so an errlog listener receives each one.
+#[epics_macros_rs::epics_test]
+async fn the_refusals_print_through_errlog_at_ioc_init() {
+    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
+    use std::sync::Mutex;
+
+    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&heard);
+    errlog_add_listener(move |m| {
+        let m = errlog_strip_ansi(m);
+        if m.contains(": T:") {
+            sink.lock().unwrap().push(m);
+        }
+    });
+    // `build` ends in `ioc_init`.
+    IocBuilder::new()
+        .db_string(
+            r##"
+record(ai,"T:R1"){ field(DTYP,"Soft Timestamp") field(INP,"5")           }
+record(ai,"T:R2"){ field(DTYP,"Soft Timestamp") field(INP,"OTHER.VAL")   }
+record(ai,"T:R3"){ field(DTYP,"Soft Timestamp") field(INP,"")            }
+record(ai,"T:R4"){ field(DTYP,"Soft Channel")   field(INP,"@instio parm")}
+record(ai,"T:R5"){ field(DTYP,"Soft Timestamp") field(INP,"#C0 S0 @x")   }
+record(ai,"T:N1"){                              field(INP,"@instio parm")}
+record(ai,"T:N2"){ field(DTYP,"Soft Channel")   field(SDIS,"@instio parm")}
+record(ai,"T:N3"){ field(DTYP,"Soft Channel")   field(FLNK,"@instio parm")}
+record(ai,"T:A1"){ field(DTYP,"Soft Timestamp") field(INP,"@instio parm")}
+record(ai,"T:A2"){ field(DTYP,"Soft Channel")   field(INP,"5")           }
+"##,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    errlog_flush();
+    let want = [
+        r#"T:R1.INP: can't initialize link type INST_IO with "5" (type CONSTANT)"#,
+        r#"T:R2.INP: can't initialize link type INST_IO with "OTHER.VAL" (type PV_LINK)"#,
+        r#"T:R3.INP: can't initialize link type INST_IO with "" (type CONSTANT)"#,
+        r#"T:R4.INP: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+        r##"T:R5.INP: can't initialize link type INST_IO with "#C0 S0 @x" (type VME_IO)"##,
+        r#"T:N1.INP: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+        r#"T:N2.SDIS: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+        r#"T:N3.FLNK: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+    ]
+    .map(|line| format!("ERROR: {line}\n"));
+    assert_eq!(*heard.lock().unwrap(), want);
+}
+
+/// `iocInit` walks the records type-major (`iterateRecords`, `iocInit.c:484`)
+/// over the name-sorted `recordTypeList`, load order within a type, so its
+/// lines come out in that order and not the `.db`'s. softIoc R7.0.10 on the DB
+/// below prints, after the load's own six CP lines, exactly `want`.
+#[epics_macros_rs::epics_test]
+async fn the_ioc_init_lines_follow_cs_record_type_order() {
+    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
+    use std::sync::Mutex;
+
+    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&heard);
+    errlog_add_listener(move |m| {
+        let m = errlog_strip_ansi(m);
+        if m.contains("Discarding") || m.contains("can't initialize") {
+            sink.lock().unwrap().push(m);
+        }
+    });
+    // `build` is the load and then `ioc_init`.
+    IocBuilder::new()
+        .db_string(
+            r#"
+record(seq, "S1") { field(LNK1, "R:S CP") }
+record(ao, "A1") { field(OUT, "X:Y CP") }
+record(ai, "I1") { field(DTYP, "Soft Timestamp") field(INP, "5") }
+record(calcout, "C1") { field(OUT, "E:F CP") }
+record(ao, "A2") { field(OUT, "X:Z CP") }
+record(waveform, "W1") { field(DTYP, "Soft Channel") field(INP, "@w") }
+record(bo, "B1") { field(OUT, "B:B CP") }
+record(aSub, "U1") { field(OUTA, "U:U CP") }
+record(ai, "I2") { field(INP, "@x") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    errlog_flush();
+    let cp = |from: &str, to: &str| {
+        format!("WARNING: Discarding CP/CPP modifier in CA output link from {from} to {to}.\n")
+    };
+    let load = [
+        cp("S1.LNK1", "R:S"),
+        cp("A1.OUT", "X:Y"),
+        cp("C1.OUT", "E:F"),
+        cp("A2.OUT", "X:Z"),
+        cp("B1.OUT", "B:B"),
+        cp("U1.OUTA", "U:U"),
+    ];
+    let ioc_init = [
+        cp("U1.OUTA", "U:U"),
+        r#"ERROR: I1.INP: can't initialize link type INST_IO with "5" (type CONSTANT)"#.to_string()
+            + "\n",
+        r#"ERROR: I2.INP: can't initialize link type CONSTANT with "@x" (type INST_IO)"#
+            .to_string()
+            + "\n",
+        cp("A1.OUT", "X:Y"),
+        cp("A2.OUT", "X:Z"),
+        cp("B1.OUT", "B:B"),
+        cp("C1.OUT", "E:F"),
+        cp("S1.LNK1", "R:S"),
+        r#"ERROR: W1.INP: can't initialize link type CONSTANT with "@w" (type INST_IO)"#
+            .to_string()
+            + "\n",
+    ];
+    assert_eq!(
+        *heard.lock().unwrap(),
+        [load.to_vec(), ioc_init.to_vec()].concat()
+    );
+}

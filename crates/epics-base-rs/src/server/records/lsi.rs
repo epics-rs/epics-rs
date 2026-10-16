@@ -279,6 +279,16 @@ impl Record for LsiRecord {
         "lsi"
     }
 
+    /// devLsiSoft.c returns `dbGetLinkLS`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: false,
+        })
+        .ls()
+    }
+
     /// C reads INP (`devLsiSoft.c:32`) and SIOL (`lsiRecord.c:244`) through
     /// `dbGetLinkLS` (`dbLink.c:497-505`), whose switch is on the SOURCE
     /// class: a `DBF_CHAR`/`DBF_UCHAR` source is read as the bytes it

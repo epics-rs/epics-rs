@@ -378,6 +378,7 @@ impl Record for NotifySourceRecord {
                 }],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -416,6 +417,7 @@ impl Record for AbortSourceRecord {
             actions: vec![ProcessAction::CancelReprocess],
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         })
     }
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -568,6 +570,7 @@ impl Record for PendingNotifyWriteSource {
             }],
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         })
     }
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

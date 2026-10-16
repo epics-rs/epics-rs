@@ -30,7 +30,10 @@ async fn put(db: &PvDatabase, pv: &str, v: EpicsValue) {
 
 async fn proc(db: &PvDatabase, rec: &str) {
     let mut v = ProcStack::new();
-    db.process_record_with_links(rec, &mut v).await.unwrap();
+    db.process_record_with_links(rec, &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 }
 
 /// `(VAL, SIMM, STAT, SEVR, PACT)` as text.

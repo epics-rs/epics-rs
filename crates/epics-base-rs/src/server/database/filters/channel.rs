@@ -43,13 +43,20 @@ impl std::fmt::Display for ChannelCreateError {
 impl std::error::Error for ChannelCreateError {}
 
 impl ChannelCreateError {
-    /// The errlog line C's parse printed on the way to this NULL, if any:
-    /// `chf_map_key`'s on an unknown filter (`dbChannel.c:179`).
+    /// The line C's parse printed on the way to this NULL, if any:
+    /// `chf_map_key`'s on an unknown filter (`dbChannel.c:179`), or yajl's
+    /// block (`:295`), whose own trailing newline leaves C's blank line.
     pub fn report(&self) {
-        if let Self::Filter(FilterParseError::UnknownFilter { name }) = self {
-            crate::runtime::log::errlog_vprintf(format_args!(
-                "dbChannelCreate: Channel filter '{name}' not found\n"
-            ));
+        match self {
+            Self::Filter(FilterParseError::UnknownFilter { name }) => {
+                crate::runtime::log::errlog_vprintf(format_args!(
+                    "dbChannelCreate: Channel filter '{name}' not found\n"
+                ));
+            }
+            Self::Filter(FilterParseError::Syntax { block, .. }) => {
+                crate::runtime::log::errlog_vprintf(format_args!("dbChannelCreate: {block}\n"));
+            }
+            _ => {}
         }
     }
 }

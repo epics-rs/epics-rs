@@ -318,7 +318,8 @@ impl PutStatus {
             CaError::Disconnected | CaError::Shutdown | CaError::Io(_) => ECA_DISCONN,
             // Every way the database can refuse a put — a value the field's
             // converter rejects, a menu string that names no choice, a
-            // record-side veto — is C's `dbStatus < 0`. A second put-callback
+            // record-side veto, the status a plain put's process cycle
+            // returned — is C's `dbStatus < 0`. A second put-callback
             // for the record is not among them: the database queues it on the
             // record's restart list, so [`PutNotifySlot`] is this server's only
             // source of ECA_PUTCBINPROG and it answers a timed-out predecessor.
@@ -345,7 +346,7 @@ mod put_status_tests {
     //! "Write access denied" (`ECA_NOWTACCESS`).
 
     use super::*;
-    use epics_base_rs::error::CaError;
+    use epics_base_rs::error::{CaError, DbStatus};
 
     /// Every way the database can refuse a value is C's `dbStatus < 0`, and
     /// C answers all of them with one status. In particular none of them may
@@ -362,6 +363,11 @@ mod put_status_tests {
             CaError::BadChoice("S_db_badChoice".into()),
             CaError::PutDisabled("DISP".into()),
             CaError::FieldNotFound("NOSUCH".into()),
+            // A positive status too: `dbChannel_put` folds every non-zero
+            // `dbPutField` status to -1 before rsrv tests `< 0`
+            // (`db_access.c:980`).
+            CaError::ProcessStatus(DbStatus::new(-1).unwrap()),
+            CaError::ProcessStatus(DbStatus::new((514 << 16) | 5).unwrap()),
         ];
         for err in &refusals {
             let status = PutStatus::of_failure(err).eca();
@@ -7007,7 +7013,10 @@ record(stringin, "SI") { field(SIMM, "YES") field(SIOL, "abc") field(SIMS, "MAJO
             .await
             .unwrap();
         for (name, want) in [("X", (1, 2)), ("SI", (1, 3))] {
-            db.process_record(name).await.unwrap();
+            db.process_record(name)
+                .await
+                .or_else(epics_base_rs::error::CaError::unless_process_status)
+                .unwrap();
             let target = ChannelTarget::RecordField {
                 record: db.get_record(name).unwrap(),
                 field: "VAL".into(),

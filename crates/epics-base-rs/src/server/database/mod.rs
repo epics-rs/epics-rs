@@ -2903,14 +2903,13 @@ impl PvDatabase {
     /// means running this pass ahead of that drain, a reordering the eager
     /// (`IocBuilder`, non-LOAD `dbLoadRecords`) callers would have to follow too.
     async fn db_init_record_links(&self) {
-        use crate::runtime::log::ERL_ERROR;
         use crate::server::record::{
             DbLinkType, ParsedLink, declared_link_type, link_type_refusal,
         };
         let empty_assigned =
             std::mem::take(&mut *self.inner.empty_link_assignments.lock().unwrap());
         let states = crate::server::database::filters::sync::db_state_registry();
-        for name in self.all_record_names().await {
+        for name in self.iterate_record_names().await {
             let Some(rec) = self.get_record(&name) else {
                 continue;
             };
@@ -2931,6 +2930,7 @@ impl PvDatabase {
                     || assigned_empty.is_some_and(|fields| fields.iter().any(|f| f == &field));
                 let mut refused = false;
                 if assigned {
+                    crate::server::record::warn_discarded_cp(&name, &field, ftype, text.as_bytes());
                     if let Some(line) = link_type_refusal(
                         &name.to_str_lossy(),
                         &record_type,
@@ -2938,7 +2938,10 @@ impl PvDatabase {
                         &field,
                         &text,
                     ) {
-                        eprintln!("{ERL_ERROR}: {line}");
+                        crate::runtime::log::errlog_vprintf(format_args!(
+                            "{}: {line}\n",
+                            crate::runtime::log::erl_error()
+                        ));
                         refused = true;
                     }
                 }
@@ -2946,7 +2949,7 @@ impl PvDatabase {
                     let empty = declared_link_type(&record_type, Some(&dtyp), &field)
                         .map_or("", DbLinkType::empty_link_text);
                     if empty != text {
-                        let after = Self::set_link_text(&name, &rec, &field, empty);
+                        let after = Self::set_link_text(&rec, &field, empty);
                         if let Some(work) = after {
                             work.run(self);
                         }
@@ -2977,7 +2980,6 @@ impl PvDatabase {
     ///
     /// Returns the work the field's `special()` left for after the hold.
     fn set_link_text(
-        name: &[u8],
         rec: &RecordCell,
         field: &str,
         text: &str,
@@ -2985,7 +2987,7 @@ impl PvDatabase {
         let value = EpicsValue::String(text.into());
         // Both parses are made before the write guard and both old ones
         // dropped after it.
-        let mut common = crate::server::record::PreparedCommonLink::for_put(name, field, &value);
+        let mut common = crate::server::record::PreparedCommonLink::for_put(field, &value);
         let declared =
             crate::server::record::PreparedLink::for_put(rec.rdes().fields, field, &value);
         let after = Self::set_link_text_held(&mut rec.write(), field, value, &mut common, declared);
@@ -4259,6 +4261,25 @@ impl PvDatabase {
         };
         names.sort_unstable();
         names.into_iter().map(|(_order, name)| name).collect()
+    }
+
+    /// C's `iterateRecords` (`iocInit.c:484-505`): type-major over
+    /// `recordTypeList`, which is name-sorted (see `ScanKey::record_type`),
+    /// each type's records in load order (`dbStaticLib.c:1446`). An `iocInit`
+    /// pass that prints walks this, so its lines come out in C's order.
+    pub(crate) async fn iterate_record_names(&self) -> Vec<RecordName> {
+        let mut names: Vec<(&'static str, RecordName)> = self
+            .all_record_names()
+            .await
+            .into_iter()
+            .filter_map(|name| {
+                let record_type = self.get_record(&name)?.read().record.record_type();
+                Some((record_type, name))
+            })
+            .collect();
+        // Stable, so load order holds within a type.
+        names.sort_by_key(|(record_type, _)| *record_type);
+        names.into_iter().map(|(_, name)| name).collect()
     }
 
     /// Every node C's `dbFirstRecord` / `dbNextRecord` walk visits — the

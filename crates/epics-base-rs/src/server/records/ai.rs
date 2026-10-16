@@ -173,6 +173,15 @@ impl Record for AiRecord {
         "ai"
     }
 
+    /// devAiSoft.c and devAiSoftRaw.c return `dbGetLink`'s status, `aiRecord.c:166` returns it.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: false,
+        })
+    }
+
     /// `aiRecord.c:267-288` `get_control_double` lists one field the shared
     /// VAL-class set does not: `SVAL`, which takes the record's own
     /// `HOPR`/`LOPR` like `VAL` does. Without this it falls to the `default:`

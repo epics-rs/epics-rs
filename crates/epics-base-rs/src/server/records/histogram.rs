@@ -257,6 +257,11 @@ impl Record for HistogramRecord {
         "histogram"
     }
 
+    /// devHistogramSoft.c returns 0 after its SVL read.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus::NONE)
+    }
+
     /// `histogramRecord.c:458-475` `get_control_double` lists `VAL` (which the
     /// shared VAL-class route already serves) and `WDTH`, the bucket width,
     /// whose limits are the span the buckets cover: `ULIM - LLIM` up, `0.0`

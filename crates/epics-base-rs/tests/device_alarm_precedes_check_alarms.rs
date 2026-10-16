@@ -84,6 +84,7 @@ async fn a_soft_input_link_failure_wins_the_tie_too() {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AM", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     assert_eq!(db.get_pv("AM.SEVR").unwrap(), EpicsValue::Short(3));
     assert_eq!(

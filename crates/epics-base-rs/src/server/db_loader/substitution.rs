@@ -564,9 +564,9 @@ impl Parser {
         // C dbLoadTemplate silently drops a `file` entry whose body
         // yields no rows (empty `{}`, row-less pattern, globals-only) —
         // epics-base#666. Upstream is undecided between expand-once and
-        // a doc fix, so the semantics stay; only the silence goes.
+        // a doc fix, so the semantics and the silence stay.
         if self.load_count == loads_before {
-            tracing::warn!(
+            tracing::debug!(
                 file = %filename,
                 line = entry_line,
                 "substitutions entry produced no template loads"
@@ -1042,27 +1042,18 @@ file "rec.db" {
         String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
     }
 
-    /// epics-base#666: the zero-load entry stays legal (pinned above),
-    /// but must no longer be silent. All three row-less shapes warn;
-    /// an entry with rows does not.
+    /// epics-base#666: the zero-load entry stays legal (pinned above) and,
+    /// as in C, silent at the default level.
     #[test]
-    fn zero_load_file_entry_warns() {
+    fn zero_load_file_entry_is_silent() {
         for src in [
             r#"file "rec.db" { }"#,
             r#"file "rec.db" { pattern {N} }"#,
             r#"file "rec.db" { global {A=1} }"#,
+            r#"file "rec.db" { { A=1 } }"#,
         ] {
-            let out = captured(src);
-            assert!(
-                out.contains("no template loads") && out.contains("rec.db"),
-                "row-less entry {src:?} must warn, got: {out:?}"
-            );
+            assert_eq!(captured(src), "", "{src:?}");
         }
-        assert_eq!(
-            captured(r#"file "rec.db" { { A=1 } }"#),
-            "",
-            "an entry with rows must not warn"
-        );
     }
 
     fn notices_of(subs: &Substitutions) -> Vec<&str> {

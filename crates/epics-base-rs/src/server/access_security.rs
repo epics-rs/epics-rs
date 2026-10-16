@@ -448,7 +448,7 @@ where
     let refreshed = match AS_OFFLOAD.run(move || resolve(&config)) {
         Ok(job) => job.await,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 target: "epics_base_rs::access_security",
                 error = %e,
                 "HAG DNS refresh: no offload thread; skipping this tick"
@@ -463,7 +463,7 @@ where
         return false;
     };
     if AcfCell(inner).replace_derived(&from, refreshed) {
-        tracing::info!(
+        tracing::debug!(
             target: "epics_base_rs::access_security",
             "HAG DNS refresh: re-resolved members changed; republishing policy"
         );
@@ -1508,7 +1508,7 @@ impl AccessSecurityConfig {
         let refreshed: HashMap<Vec<u8>, Vec<Vec<u8>>> = self
             .hag_raw
             .iter()
-            .map(|(name, raw)| (name.clone(), hag_members(raw)))
+            .map(|(name, raw)| (name.clone(), hag_members(raw, false)))
             .collect();
         if refreshed == self.hag {
             return None;
@@ -2076,7 +2076,8 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
             } else {
                 "(non-string panic payload)".to_string()
             };
-            tracing::error!(
+            // asTrapWrite.c prints nothing, and the panic hook has already.
+            tracing::debug!(
                 target: "epics_base_rs::server::access_security",
                 pv = %String::from_utf8_lossy(msg.pv_name),
                 event_id = msg.event_id,
@@ -2455,6 +2456,10 @@ struct AcfScanner<'a> {
     pos: usize,
     /// 1-based, counting every `\n` consumed.
     line: u32,
+    /// asLib.y `yyWarned`: only a parse's first warning prints.
+    warned: bool,
+    /// The line that warning printed.
+    warning: Option<String>,
 }
 
 impl<'a> AcfScanner<'a> {
@@ -2463,7 +2468,25 @@ impl<'a> AcfScanner<'a> {
             src: content,
             pos: 0,
             line: 1,
+            warned: false,
+            warning: None,
         }
+    }
+
+    /// asLib.y `yywarn`, on stderr as C's `fprintf` is. `line` is where C's
+    /// grammar action runs: a construct C must see past to recognise is
+    /// reported at the line of the token after it.
+    fn warn(&mut self, what: &str, line: u32, token: &[u8]) {
+        if !self.warned && !token.is_empty() {
+            let warning = format!(
+                "{} {what} at line {line}: {}",
+                crate::runtime::log::ERL_WARNING,
+                String::from_utf8_lossy(token)
+            );
+            eprintln!("{warning}");
+            self.warning = Some(warning);
+        }
+        self.warned = true;
     }
 
     fn peek(&mut self) -> Option<u8> {
@@ -2627,6 +2650,14 @@ pub async fn read_acf(path: impl AsRef<std::path::Path>) -> CaResult<AccessSecur
 }
 
 pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
+    let content = content.as_ref();
+    AcfScanner::check_tokens(content)?;
+    parse_acf_in(&mut AcfScanner::new(content))
+}
+
+/// [`parse_acf`] past the lexer's pass, on a scanner a test can ask what it
+/// warned.
+fn parse_acf_in(sc: &mut AcfScanner) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
         hag: HashMap::new(),
@@ -2647,20 +2678,18 @@ pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
         .asg
         .insert(b"DEFAULT".to_vec(), AccessSecurityGroup::default());
 
-    AcfScanner::check_tokens(content.as_ref())?;
-    let mut sc = AcfScanner::new(content.as_ref());
     let mut current: CurrentRule = None;
 
     loop {
         sc.skip_ws_comments();
         let at = sc.line;
-        let keyword = match read_token(&mut sc)? {
+        let keyword = match read_token(sc)? {
             Some(Token::Keyword(k)) => k,
             Some(Token::Name(k) | Token::Quoted(k)) => {
-                skip_generic_item(&mut sc, at, &k)?;
+                skip_generic_item(sc, at, &k)?;
                 continue;
             }
-            Some(Token::Number(n)) => return Err(number_error(&sc, &n)),
+            Some(Token::Number(n)) => return Err(number_error(sc, &n)),
             // An empty or comment-only file is the deliberate divergence
             // from C kept by `empty_acf_denies_all_access`.
             None => match sc.peek() {
@@ -2670,38 +2699,38 @@ pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
         };
         match keyword.as_slice() {
             b"UAG" => {
-                let name = read_paren_name(&mut sc)?;
+                let name = read_paren_name(sc)?;
                 if config.uag.contains_key(&name) {
-                    return Err(duplicate(&sc, at, "User Access Group", &name));
+                    return Err(duplicate(sc, at, "User Access Group", &name));
                 }
-                let members = read_optional_brace_list(&mut sc)?;
+                let members = read_optional_brace_list(sc)?;
                 config.uag.insert(name, members);
             }
             b"HAG" => {
-                let name = read_paren_name(&mut sc)?;
+                let name = read_paren_name(sc)?;
                 if config.hag.contains_key(&name) {
-                    return Err(duplicate(&sc, at, "Host Access Group", &name));
+                    return Err(duplicate(sc, at, "Host Access Group", &name));
                 }
-                let members = read_optional_brace_list(&mut sc)?;
+                let members = read_optional_brace_list(sc)?;
                 // C `asHagAddHost` reads `asCheckClientIP` at ACF-parse
                 // time and stores names or resolved IPs accordingly.
-                config.hag.insert(name.clone(), hag_members(&members));
+                config.hag.insert(name.clone(), hag_members(&members, true));
                 config.hag_raw.insert(name, members);
             }
             b"ASG" => {
-                let name = read_paren_name(&mut sc)?;
+                let name = read_paren_name(sc)?;
                 let taken = |g: &AccessSecurityGroup| {
                     name != b"DEFAULT" || !g.rules.is_empty() || !g.inp.is_empty()
                 };
                 if config.asg.get(&name).is_some_and(taken) {
-                    return Err(duplicate(&sc, at, "Access Security Group", &name));
+                    return Err(duplicate(sc, at, "Access Security Group", &name));
                 }
                 // `asAsgAdd` makes the group, or hands back the empty DEFAULT,
                 // before the body is read; a bare head leaves it empty.
                 config.asg.entry(name.clone()).or_default();
                 sc.skip_ws_comments();
                 if sc.peek() == Some(b'{') {
-                    parse_asg_body(&mut sc, &mut config, &name, &mut current)?;
+                    parse_asg_body(sc, &mut config, &name, &mut current)?;
                 }
             }
             // The other lexer keywords cannot start a `generic_item`.
@@ -2728,19 +2757,22 @@ fn skip_generic_item(sc: &mut AcfScanner, at: u32, keyword: &[u8]) -> CaResult<(
     }
     read_token_list(sc, b'(', b')', ListKind::Generic)?;
     sc.skip_ws_comments();
-    if sc.peek() == Some(b'{') && skip_generic_block(sc)? {
-        sc.skip_ws_comments();
-        if sc.peek() == Some(b'{') && read_token_list(sc, b'{', b'}', ListKind::Generic)?.len() < 2
-        {
-            return Err(sc.reject("syntax error at '}'"));
+    let mut what = "Ignoring unsupported TOP LEVEL bare block";
+    if sc.peek() == Some(b'{') {
+        what = "Ignoring unsupported TOP LEVEL block";
+        if skip_generic_block(sc)? {
+            sc.skip_ws_comments();
+            if sc.peek() == Some(b'{') {
+                if read_token_list(sc, b'{', b'}', ListKind::Generic)?.len() < 2 {
+                    return Err(sc.reject("syntax error at '}'"));
+                }
+                what = "Ignoring unsupported TOP LEVEL nested block";
+            }
         }
     }
-    tracing::warn!(
-        target: "epics_base_rs::access_security",
-        line = at,
-        keyword = %String::from_utf8_lossy(keyword),
-        "ACF: ignoring unsupported top-level block"
-    );
+    // The cursor is where C's action runs: past a bare head or a `{ e }`, at
+    // the next token, which only it tells from the longer form.
+    sc.warn(what, sc.line, keyword);
     Ok(())
 }
 
@@ -2795,13 +2827,24 @@ pub fn set_as_check_client_ip(on: bool) {
 /// The two halves are read from the same flag on purpose: a mixed
 /// configuration (names on one side, IPs on the other) matches nothing,
 /// which is precisely the R7-16 defect.
-fn hag_members(members: &[Vec<u8>]) -> Vec<Vec<u8>> {
+///
+/// `at_load` prints C's line for each unresolvable host, as `asHagAddHost`
+/// does; the port's own refresh re-resolves silently.
+fn hag_members(members: &[Vec<u8>], at_load: bool) -> Vec<Vec<u8>> {
     if !as_check_client_ip() {
         // C `tolower` in the C locale moves only ASCII letters.
         return members.iter().map(|m| m.to_ascii_lowercase()).collect();
     }
 
-    let unresolved = |m: &[u8]| [b"unresolved:".as_slice(), m].concat();
+    let unresolved = |m: &[u8]| {
+        if at_load {
+            crate::runtime::log::errlog_vprintf(format_args!(
+                "ACF: Unable to resolve host '{}'\n",
+                String::from_utf8_lossy(m)
+            ));
+        }
+        [b"unresolved:".as_slice(), m].concat()
+    };
     members
         .iter()
         .map(|m| {
@@ -2829,15 +2872,7 @@ fn resolve_hag_host(m: &str) -> Option<Vec<u8>> {
             .filter(|sa| sa.is_ipv4())
             .map(|sa| sa.ip().to_string().into_bytes())
             .next(),
-        Err(e) => {
-            tracing::warn!(
-                target: "epics_base_rs::access_security",
-                host = %m,
-                error = %e,
-                "ACF: Unable to resolve host (asCheckClientIP=1)"
-            );
-            None
-        }
+        Err(_) => None,
     }
 }
 
@@ -3234,11 +3269,10 @@ fn parse_rule(
             });
             *current = Some((asg.to_vec(), rules.len() - 1));
         }
-        None => tracing::warn!(
-            target: "epics_base_rs::access_security",
-            line = sc.line,
-            keyword = %shown(&access_str),
-            "ACF: ignoring RULE with unsupported access keyword"
+        None => sc.warn(
+            "Ignoring RULE that contains an unsupported keyword",
+            sc.line,
+            &access_str,
         ),
     }
 
@@ -3350,13 +3384,12 @@ fn parse_rule(
         };
         // C `asLib.y:300-306`: any other element disables the rule
         // (`asAsgRuleDisable`), which fails on a NULL `yyAsgRule`.
-        tracing::warn!(
-            target: "epics_base_rs::access_security",
-            line = at,
-            keyword = %String::from_utf8_lossy(&name),
-            "ACF: ignoring RULE with unsupported keyword — rule disabled"
-        );
         skip_generic_elem(sc)?;
+        sc.warn(
+            "Ignoring RULE that contains an unsupported keyword",
+            sc.line,
+            &name,
+        );
         current_rule(&mut config.asg, current)
             .ok_or_else(|| no_rule_to_disable(sc, at, &name))?
             .ignore = true;
@@ -3410,6 +3443,61 @@ fn compile_rule_calc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `yywarn` printed for `acf`, against softIoc R7.0.10 on the same
+    /// file (`asLib.y:88-103`, `:265`, `:300-306`).
+    fn warned(acf: &str) -> Option<String> {
+        let mut sc = AcfScanner::new(acf.as_bytes());
+        let _ = parse_acf_in(&mut sc);
+        sc.warning
+            .map(|w| w.replacen(crate::runtime::log::ERL_WARNING, "WARNING", 1))
+    }
+
+    #[test]
+    fn an_unsupported_element_warns_with_cs_line() {
+        let asg = "ASG(DEFAULT) { RULE(1, READ) }\n";
+        for (acf, want) in [
+            (
+                "ASG(DEFAULT) {\n  RULE(1, READ)\n}\nFOO(a) {\n  BAR(b)\n}\n\nASG(Z) { RULE(1,WRITE) }\n".to_string(),
+                "Ignoring unsupported TOP LEVEL block at line 6: FOO",
+            ),
+            (format!("{asg}FOO(a)\n{{\nx\n}}\n\n"), "Ignoring unsupported TOP LEVEL block at line 7: FOO"),
+            (format!("{asg}FOO(a)\n{{\nx,\ny\n}}\n\n"), "Ignoring unsupported TOP LEVEL block at line 6: FOO"),
+            (format!("{asg}FOO(a) {{x}}\n{{\na,\nb\n}}\n\n\n"), "Ignoring unsupported TOP LEVEL nested block at line 6: FOO"),
+            (format!("{asg}FOO(a)\n\n\n"), "Ignoring unsupported TOP LEVEL bare block at line 5: FOO"),
+            (format!("FOO(a)\n\n\n{asg}"), "Ignoring unsupported TOP LEVEL bare block at line 4: FOO"),
+            (format!("\"FOO\"(a)\n\n{asg}"), "Ignoring unsupported TOP LEVEL bare block at line 3: FOO"),
+            // Only the first of a parse prints.
+            (format!("FOO(a)\nBAR(b)\n{asg}"), "Ignoring unsupported TOP LEVEL bare block at line 2: FOO"),
+            (
+                "ASG(DEFAULT) {\n  RULE(1, READ)\n  RULE(2, EXECUTE)\n}\n".to_string(),
+                "Ignoring RULE that contains an unsupported keyword at line 3: EXECUTE",
+            ),
+            (
+                "ASG(DEFAULT) { RULE(1, \nFROB\n\n)\n}\n".to_string(),
+                "Ignoring RULE that contains an unsupported keyword at line 2: FROB",
+            ),
+            (
+                "ASG(DEFAULT) { RULE(1, READ)\n{\nFOO(a)\n{\nBAR\n}\n\n}\n}\n".to_string(),
+                "Ignoring RULE that contains an unsupported keyword at line 6: FOO",
+            ),
+            (
+                "ASG(DEFAULT) { RULE(1, READ) {\nFOO(a)\n{\nx,\ny\n}\n\n}\n}\n".to_string(),
+                "Ignoring RULE that contains an unsupported keyword at line 6: FOO",
+            ),
+            (
+                "ASG(DEFAULT) { RULE(1, READ)\n{\nFOO(a)\n\n\n}\n}\n".to_string(),
+                "Ignoring RULE that contains an unsupported keyword at line 6: FOO",
+            ),
+            (
+                "ASG(DEFAULT) { RULE(1, READ) {\nFOO(a) # c\n# c\n\n}\n}\nBAR(b)\n".to_string(),
+                "Ignoring RULE that contains an unsupported keyword at line 5: FOO",
+            ),
+        ] {
+            assert_eq!(warned(&acf), Some(format!("WARNING {want}")), "{acf}");
+        }
+        assert_eq!(warned(asg), None);
+    }
 
     /// A delivered reading with no alarm.
     /// What the `INP*` watcher delivers for `links`: each declared input whose
@@ -3575,13 +3663,30 @@ ASG(DEFAULT) {
     /// sentinel that simply never matches.
     #[test]
     fn hag_unresolvable_under_as_check_client_ip_becomes_sentinel() {
+        use crate::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
         let _guard = lock_as_check_client_ip();
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let id = errlog_add_listener(move |m| {
+            if m.contains("lab-pc1.invalid") {
+                sink.lock().unwrap().push(m.to_string());
+            }
+        });
         set_as_check_client_ip(true);
         let config = parse_acf("HAG(lab) { lab-pc1.invalid }\n").unwrap();
+        // The port's own refresh re-resolves without C's line.
+        assert!(config.with_refreshed_hags().is_none());
         set_as_check_client_ip(false);
+        errlog_flush();
+        errlog_remove_listener(id);
         assert_eq!(
             config.hag[b"lab".as_slice()],
             bs(&["unresolved:lab-pc1.invalid"])
+        );
+        // softIoc R7.0.10, `var asCheckClientIP 1`.
+        assert_eq!(
+            *heard.lock().unwrap(),
+            ["ACF: Unable to resolve host 'lab-pc1.invalid'\n"]
         );
     }
 

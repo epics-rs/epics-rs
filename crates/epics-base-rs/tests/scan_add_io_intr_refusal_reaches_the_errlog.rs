@@ -80,3 +80,30 @@ async fn a_record_with_no_dset_is_refused_through_recgbl_record_error() {
         "the refused record is demoted to Passive"
     );
 }
+
+/// `buildScanLists` feeds `scanAdd` type-major over the name-sorted
+/// `recordTypeList` (`dbScan.c:1054-1076`), so the refusals come out in that
+/// order. softIoc R7.0.10 on the DB below prints A1, A2, B1, L1.
+#[epics_macros_rs::epics_test]
+async fn the_refusals_come_out_in_cs_record_type_order() {
+    let sink = listen();
+    ioc(r#"
+record(longin, "L1") { field(SCAN, "I/O Intr") }
+record(ai, "A1") { field(SCAN, "I/O Intr") }
+record(bi, "B1") { field(SCAN, "I/O Intr") }
+record(ai, "A2") { field(SCAN, "I/O Intr") }
+"#)
+    .await;
+    epics_base_rs::runtime::log::errlog_flush();
+    let log: Vec<String> = sink
+        .lock()
+        .expect("sink")
+        .iter()
+        .filter(|m| m.contains("scanAdd"))
+        .cloned()
+        .collect();
+    let want = ["A1", "A2", "B1", "L1"].map(|pv| {
+        format!("recGblRecordError: scanAdd: I/O Intr not valid (no get_ioint_info)  PV: {pv}\n")
+    });
+    assert_eq!(log, want);
+}

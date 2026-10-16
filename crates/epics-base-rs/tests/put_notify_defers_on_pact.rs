@@ -77,6 +77,7 @@ impl Record for AsyncOnceRecord {
                 actions: Vec::new(),
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -642,6 +643,7 @@ impl Record for OdlyRecord {
                 )],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -898,6 +900,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAI", &mut v2)
         .await
+        .or_else(CaError::unless_process_status)
         .unwrap();
 
     // The put parked on that window is replayed even though the cycle ended in

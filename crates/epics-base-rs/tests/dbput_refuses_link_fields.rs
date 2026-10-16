@@ -59,7 +59,10 @@ async fn db_out_link_write_to_a_link_field_is_refused() {
     )
     .await;
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("SRC", &mut v).await.unwrap();
+    db.process_record_with_links("SRC", &mut v)
+        .await
+        .or_else(CaError::unless_process_status)
+        .unwrap();
 
     assert_eq!(
         link_text(&db, "TGT.INP"),

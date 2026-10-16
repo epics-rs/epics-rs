@@ -104,6 +104,16 @@ impl Record for LsoRecord {
         "lso"
     }
 
+    /// devLsoSoft.c and devLsoSoftCallback.c return `dbPutLinkLS`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: true,
+        })
+        .ls()
+    }
+
     /// C `lsoRecord.c:108-122`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {

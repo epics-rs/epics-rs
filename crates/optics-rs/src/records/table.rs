@@ -545,17 +545,18 @@ pub struct TableRecord {
     resume: Resume,
 }
 
-/// The read a cycle has in flight: C's `process()` reads its links inline,
-/// the port in the link stage, one at a time, and picks the cycle up again
-/// from [`Record::link_read_result`] at axis `at` of `stage`'s loop.
+/// The read or put a cycle has in flight: C's `process()` reads and puts its
+/// links inline, the port in the link stage, one at a time, and picks the
+/// cycle up again from [`Record::link_read_result`] or
+/// [`Record::set_out_link_write_status`] at step `at` of `stage`'s loop.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Resume {
     stage: Stage,
     at: usize,
 }
 
-/// A loop of `dbGetLink`s C's `process()` makes. Each returns at its first
-/// failed read, leaving the later axes as they were.
+/// A loop of `dbGetLink`s or `dbPutLink`s C's `process()` makes. Each returns
+/// at its first failure, leaving the later axes as they were.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Stage {
     /// No read in flight.
@@ -567,6 +568,10 @@ enum Stage {
     /// `SaveMotorSpeeds` (`:536`), then the move from the motor positions
     /// `sm` the cycle started at.
     Speeds { sm: [f64; 6] },
+    /// The move's `dbPutLink`s, one per step `at`: `ProcessOutputLinks`'s
+    /// speeds (0-5) and drives (6-11), then `RestoreMotorSpeeds`'s saved
+    /// speeds `sv0x` (12-17) (`tableRecord.c:573-574`).
+    Move { sv0x: [f64; 6], mask: u8 },
     /// The closing `GetReadback` (`:587`).
     Readbacks,
     /// The closing `ReadEncoders` (`:591`).
@@ -2251,7 +2256,46 @@ impl TableRecord {
             self.set_speed_val(&sv0x);
         }
 
-        self.build_output_actions(motor_move_mask, &sv0x)
+        self.next_write(sv0x, motor_move_mask, 0)
+    }
+
+    /// The move's put from step `from` on (see [`Stage::Move`]); past the
+    /// last, the tail every branch reaches.
+    fn next_write(&mut self, sv0x: [f64; 6], mask: u8, from: usize) -> Vec<ProcessAction> {
+        for at in from..18 {
+            let i = at % 6;
+            let action = match at / 6 {
+                0 => (mask & (1 << i) != 0 && self.lnk_stat[i].can_rw_speed).then(|| {
+                    ProcessAction::WriteDbLink {
+                        link_field: SPEED_OUT_LINK[i],
+                        value: EpicsValue::Double(self.speed_val()[i]),
+                    }
+                }),
+                1 => self.lnk_stat[i]
+                    .can_rw_drive
+                    .then(|| ProcessAction::WriteDbLink {
+                        link_field: MOTOR_DRIVE_LINK[i],
+                        value: EpicsValue::Double(self.motor_drive()[i]),
+                    }),
+                // Every speed-capable motor, moved or not (`:998-1006`); a
+                // failed put returns from `process()` with PACT set.
+                _ => self.lnk_stat[i]
+                    .can_rw_speed
+                    .then(|| ProcessAction::WriteDbLinkOrReturn {
+                        link_field: SPEED_OUT_LINK[i],
+                        value: EpicsValue::Double(sv0x[i]),
+                    }),
+            };
+            if let Some(action) = action {
+                self.resume = Resume {
+                    stage: Stage::Move { sv0x, mask },
+                    at,
+                };
+                return vec![action];
+            }
+        }
+        self.resume = Resume::default();
+        self.close_cycle()
     }
 
     /// `stage`'s next read from axis `from`, zeroing the readback or encoder
@@ -2260,7 +2304,7 @@ impl TableRecord {
     fn next_read(&mut self, stage: Stage, from: usize) -> Vec<ProcessAction> {
         for i in from..6 {
             let read = match stage {
-                Stage::Idle => None,
+                Stage::Idle | Stage::Move { .. } => None,
                 Stage::Branch { .. } | Stage::Readbacks => {
                     let mut r = self.motor_readback();
                     r[i] = 0.0;
@@ -2291,7 +2335,7 @@ impl TableRecord {
         }
         self.resume = Resume::default();
         match stage {
-            Stage::Idle => Vec::new(),
+            Stage::Idle | Stage::Move { .. } => Vec::new(),
             Stage::Branch { init } => {
                 if init {
                     self.init_from_readbacks();
@@ -2300,11 +2344,7 @@ impl TableRecord {
                 }
                 self.close_cycle()
             }
-            Stage::Speeds { sm } => {
-                let mut actions = self.move_motors(&sm);
-                actions.extend(self.close_cycle());
-                actions
-            }
+            Stage::Speeds { sm } => self.move_motors(&sm),
             Stage::Readbacks => self.next_read(Stage::Encoders, 0),
             Stage::Encoders => {
                 let r = self.motor_readback();
@@ -2347,52 +2387,6 @@ impl TableRecord {
                 });
             }
         }
-        actions
-    }
-
-    /// Build WriteDbLink actions to write speed then drive values.
-    fn build_output_actions(
-        &self,
-        motor_move_mask: u8,
-        saved_speeds: &[f64; 6],
-    ) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-        let speeds = self.speed_val();
-        let motors = self.motor_drive();
-
-        // Write speeds for motors that need to move
-        for i in 0..6 {
-            if (motor_move_mask & (1 << i)) != 0 && self.lnk_stat[i].can_rw_speed {
-                actions.push(ProcessAction::WriteDbLink {
-                    link_field: SPEED_OUT_LINK[i],
-                    value: EpicsValue::Double(speeds[i]),
-                });
-            }
-        }
-
-        // Write drive values for all connected motors
-        for i in 0..6 {
-            if self.lnk_stat[i].can_rw_drive {
-                actions.push(ProcessAction::WriteDbLink {
-                    link_field: MOTOR_DRIVE_LINK[i],
-                    value: EpicsValue::Double(motors[i]),
-                });
-            }
-        }
-
-        // Restore original speeds. C RestoreMotorSpeeds writes the saved speed
-        // to every can_RW_speed motor, NOT just the ones that moved
-        // (tableRecord.c:998-1006, called unconditionally at :574) — a
-        // stationary speed-capable motor still has its speed link restored.
-        for i in 0..6 {
-            if self.lnk_stat[i].can_rw_speed {
-                actions.push(ProcessAction::WriteDbLink {
-                    link_field: SPEED_OUT_LINK[i],
-                    value: EpicsValue::Double(saved_speeds[i]),
-                });
-            }
-        }
-
         actions
     }
 
@@ -2723,6 +2717,34 @@ impl Record for TableRecord {
             at + 1
         };
         self.next_read(stage, from).into()
+    }
+
+    /// Resumes the move after the put `Resume` holds. A failed put ends
+    /// `ProcessOutputLinks` (`tableRecord.c:937-950`), whose status `process()`
+    /// discards, and ends `process()` in `RestoreMotorSpeeds`, where the
+    /// framework returns the status.
+    fn set_out_link_write_status(
+        &mut self,
+        _link_field: &'static str,
+        _value: &EpicsValue,
+        failed: bool,
+    ) -> ProcessActions {
+        let Resume {
+            stage: Stage::Move { sv0x, mask },
+            at,
+        } = self.resume
+        else {
+            return ProcessActions::new();
+        };
+        let from = match (failed, at) {
+            (false, _) => at + 1,
+            (true, ..12) => 12,
+            (true, _) => {
+                self.resume = Resume::default();
+                return ProcessActions::new();
+            }
+        };
+        self.next_write(sv0x, mask, from).into()
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -4144,6 +4166,34 @@ mod tests {
         assert_eq!(t.curr_yang, 90.0);
     }
 
+    /// Runs the move's put chain from `next`, failing the puts `fails` names
+    /// by their place in the chain: (returns, link, value) per put.
+    fn run_puts(
+        t: &mut TableRecord,
+        mut next: Vec<ProcessAction>,
+        fails: &[usize],
+    ) -> Vec<(bool, &'static str, f64)> {
+        let mut puts = Vec::new();
+        while let [action] = next.as_slice() {
+            let (returns, link_field, value) = match action {
+                ProcessAction::WriteDbLink { link_field, value } => (false, *link_field, value),
+                ProcessAction::WriteDbLinkOrReturn { link_field, value } => {
+                    (true, *link_field, value)
+                }
+                _ => break,
+            };
+            puts.push((returns, link_field, value.to_f64().unwrap()));
+            next = t
+                .set_out_link_write_status(
+                    link_field,
+                    &value.clone(),
+                    fails.contains(&(puts.len() - 1)),
+                )
+                .into_vec();
+        }
+        puts
+    }
+
     #[test]
     fn test_speed_restore_covers_all_speed_capable_motors() {
         // C RestoreMotorSpeeds restores the saved speed on EVERY can_RW_speed
@@ -4153,23 +4203,45 @@ mod tests {
             t.lnk_stat[i].can_rw_speed = i < 2; // motors 0 and 1 speed-capable
             t.lnk_stat[i].can_rw_drive = false;
         }
+        t.v0x = 5.0;
         let saved = [11.0, 22.0, 0.0, 0.0, 0.0, 0.0];
 
         // Only motor 0 is in the move mask; motor 1 stays put.
-        let actions = t.build_output_actions(0b01, &saved);
-
-        let restored = |link: &str, want: f64| {
-            actions.iter().any(|a| {
-                matches!(a,
-                    ProcessAction::WriteDbLink { link_field, value: EpicsValue::Double(v) }
-                    if *link_field == link && (*v - want).abs() < 1e-12)
-            })
-        };
-        assert!(restored("V0XL", 11.0), "moving motor 0 speed restored");
-        assert!(
-            restored("V0YL", 22.0),
-            "stationary speed-capable motor 1 speed restored"
+        let next = t.next_write(saved, 0b01, 0);
+        assert_eq!(
+            run_puts(&mut t, next, &[]),
+            [
+                (false, "V0XL", 5.0),
+                (true, "V0XL", 11.0),
+                (true, "V0YL", 22.0)
+            ]
         );
+    }
+
+    #[test]
+    fn test_a_failed_put_ends_its_loop() {
+        // ProcessOutputLinks returns at a failed put and process() goes on to
+        // RestoreMotorSpeeds (tableRecord.c:937-950, :573-574), which returns
+        // at its own first failure.
+        let mut t = TableRecord::new();
+        for i in 0..6 {
+            t.lnk_stat[i].can_rw_speed = i < 2;
+            t.lnk_stat[i].can_rw_drive = i < 2;
+        }
+        t.v0x = 5.0;
+        t.v0y = 6.0;
+        t.m0x = 1.0;
+        t.m0y = 2.0;
+        let saved = [11.0, 22.0, 0.0, 0.0, 0.0, 0.0];
+
+        let next = t.next_write(saved, 0b11, 0);
+        // V0XL's speed fails: V0YL's speed and both drives are skipped. The
+        // first restore fails: V0YL's is never put.
+        assert_eq!(
+            run_puts(&mut t, next, &[0, 1]),
+            [(false, "V0XL", 5.0), (true, "V0XL", 11.0)]
+        );
+        assert_eq!(t.resume, Resume::default());
     }
 
     #[test]

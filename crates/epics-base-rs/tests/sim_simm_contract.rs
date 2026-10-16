@@ -328,6 +328,7 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BUSYFAIL", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let rec = db.get_record("BUSYFAIL").unwrap();
@@ -379,6 +380,7 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIOLFAIL", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let rec = db.get_record("SIOLFAIL").unwrap();
@@ -415,6 +417,7 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIOLTIE", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let rec = db.get_record("SIOLTIE").unwrap();
@@ -471,7 +474,10 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
     db.put_pv("RAWIN.SIMM", EpicsValue::Short(2)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("RAWIN", &mut v).await.unwrap();
+    db.process_record_with_links("RAWIN", &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 
     assert_eq!(
         db.get_pv("RAWIN").unwrap(),
@@ -508,6 +514,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("RAWOUT", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -536,7 +543,10 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
     db.put_pv("BRAW", EpicsValue::Short(1)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("BRAW", &mut v).await.unwrap();
+    db.process_record_with_links("BRAW", &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 
     assert_eq!(db.get_pv("BSINK").unwrap(), EpicsValue::Long(0));
     let rec = db.get_record("BRAW").unwrap();
@@ -614,6 +624,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("E5BUSY", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let inst = db.get_record("E5BUSY").unwrap();
@@ -654,6 +665,7 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("E5SBUSY", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(

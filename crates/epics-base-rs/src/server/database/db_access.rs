@@ -992,7 +992,7 @@ impl<D: EventDelivery> DbEventSource<D> {
                 if let Err(e) = crate::runtime::task::block_on_sync(task.run()) {
                     // Unreachable: a fresh dedicated thread is neither a
                     // facility worker nor a current-thread runtime.
-                    tracing::error!(error = ?e, "{name} drain could not block on its event task");
+                    tracing::debug!(error = ?e, "{name} drain could not block on its event task");
                 }
                 live.fetch_sub(1, Ordering::AcqRel);
             },

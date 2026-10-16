@@ -234,6 +234,12 @@ impl Record for DfanoutRecord {
         "dfanout"
     }
 
+    /// `dfanoutRecord.c:119` keeps the DOL status; `push_values` drops the outputs'.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::ZERO
+            .with_dol(crate::server::record::DolStatus::Kept)
+    }
+
     /// C `dfanoutRecord.c:116-122`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {

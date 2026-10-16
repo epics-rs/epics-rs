@@ -139,6 +139,16 @@ impl Record for Int64outRecord {
         "int64out"
     }
 
+    /// devI64outSoft.c drops `dbPutLink`'s status; devI64outSoftCallback.c returns it.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: false,
+            raw: false,
+            async_: true,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
+    }
+
     /// C `int64outRecord.c:139-150`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {

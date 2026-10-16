@@ -193,6 +193,16 @@ impl Record for BusyRecord {
         "busy"
     }
 
+    /// devBusySoft.c and devBusySoftRaw.c return `dbPutLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: false,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
+    }
+
     /// C `busyRecord.c:151-159`:
     /// `if (prec->dol.type == CONSTANT) { unsigned short ival = 0;
     ///      if (recGblInitConstantLink(&prec->dol, DBF_USHORT, &ival)) {

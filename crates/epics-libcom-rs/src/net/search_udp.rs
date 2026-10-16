@@ -863,7 +863,8 @@ mod sys {
         out
     }
 
-    /// Read datagrams until asked to stop or the receiver is gone.
+    /// Read datagrams until asked to stop or the receiver is gone; a recv
+    /// error is reported and the loop goes on, as libca's does.
     fn pump(
         socket: &UdpSocket,
         stop: &AtomicBool,
@@ -893,14 +894,12 @@ mod sys {
                 {
                     continue;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "epics_base_rs::net",
-                        error = %e,
-                        "SEARCH receive pump stopping"
-                    );
-                    return;
-                }
+                // `udpiiu.cpp:434`, and the loop goes on.
+                Err(e) => crate::runtime::log::errlog_vprintf(format_args!(
+                    "CAC: UDP recv {} was \"{}\"\n",
+                    crate::runtime::log::erl_error(),
+                    crate::net::sock_err_string(&e)
+                )),
             }
         }
     }

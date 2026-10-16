@@ -197,6 +197,9 @@ pub struct EpidRecord {
     /// raised. The framework `check_alarms` hook reads this flag and
     /// applies the severity via `recGblSetSevr`.
     pub inp_constant: bool,
+    /// This cycle's `do_pid` status, which `epidRecord.c:214` returns:
+    /// the `1` of a sub-MDT pass (`devEpidSoft.c:125`). Taken by `process`.
+    pub(crate) pid_status: epics_base_rs::error::DbResult,
     /// The `MONITOR_POSTS` entries whose field moved off its own old copy this
     /// cycle, taken by `take_cycle_posted_fields`.
     monitor_marks: u128,
@@ -325,6 +328,7 @@ impl Default for EpidRecord {
             ctp: now,
             device_did_compute: false,
             inp_constant: false,
+            pid_status: Ok(()),
             monitor_marks: 0,
             async_callback: false,
             udf: 1,
@@ -651,6 +655,7 @@ impl Record for EpidRecord {
             crate::device_support::epid_soft::EpidSoftDeviceSupport::do_pid(self);
         }
         self.device_did_compute = false; // Reset for next cycle
+        let status = std::mem::replace(&mut self.pid_status, Ok(()));
 
         // Alarm evaluation is NOT done here. The framework invokes the
         // `Record::check_alarms` trait hook (below) after `process()`,
@@ -662,7 +667,10 @@ impl Record for EpidRecord {
 
         // Device support actions are now merged by the framework
         let actions = Vec::new();
-        Ok(ProcessOutcome::complete_with(actions))
+        Ok(ProcessOutcome {
+            status,
+            ..ProcessOutcome::complete_with(actions)
+        })
     }
 
     /// Per-record alarm hook — C `epidRecord.c::checkAlarms`.

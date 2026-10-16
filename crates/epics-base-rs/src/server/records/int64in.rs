@@ -36,6 +36,14 @@ static INT64IN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::reco
     ["VAL"],
 );
 
+/// devI64inSoft.c returns `dbGetLink`'s status.
+const INT64IN_STATUS: crate::server::record::ProcessStatusRule =
+    crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+        plain: true,
+        raw: false,
+        async_: false,
+    });
+
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `int64inRecord.c:144` is
 // `if (status==0) prec->udf = FALSE;` with no `status == 2` fold, the longin
@@ -50,6 +58,7 @@ static INT64IN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::reco
     metadata_override = int64in_metadata_override,
     process_posted_fields = INT64IN_POSTED,
     dset_owns_udf_on_computed,
+    process_status = INT64IN_STATUS,
     soft_input_read_as = Int64
 )]
 pub struct Int64inRecord {

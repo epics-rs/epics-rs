@@ -364,6 +364,7 @@ impl Record for HeldRecord {
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         })
     }
 

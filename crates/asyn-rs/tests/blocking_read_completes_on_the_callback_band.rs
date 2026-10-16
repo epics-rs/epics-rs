@@ -272,7 +272,10 @@ async fn a_disabled_port_refuses_the_read_in_the_same_pass() {
     let db = ai("OFFREAD", false, &passes).await;
     rt.port_handle().set_enable(-1, false).unwrap();
 
-    db.process_record("REC").await.unwrap();
+    db.process_record("REC")
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
     assert!(!db.get_record("REC").unwrap().read().is_processing());
     assert!(
         calls.reads.lock().unwrap().is_empty(),

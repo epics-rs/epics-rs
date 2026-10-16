@@ -25,7 +25,7 @@
 //! * [`parse_filter_chain`] is the permissive forward-compatibility
 //!   path retained for the CA server: it downgrades an unparseable
 //!   suffix to an unfiltered subscription, skipping bad entries with a
-//!   `tracing::warn!`.
+//!   `tracing::debug!`.
 
 use std::sync::Arc;
 
@@ -378,8 +378,9 @@ fn merge_arr_into_json(arr_inner: &str, existing: &str) -> String {
 /// rather than silently downgrade to an unfiltered stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterParseError {
-    /// The suffix was not valid JSON (after JSON5 key normalization).
-    InvalidJson { suffix: String, message: String },
+    /// yajl refused the suffix (`chf_parse`'s `yajl_status_error`,
+    /// `dbChannel.c:291-296`); `block` is the text C prints.
+    Syntax { suffix: String, block: String },
     /// The suffix parsed but its top-level value is not an object.
     NotObject { suffix: String },
     /// A requested filter name is not implemented (EPICS `parse_stop`
@@ -397,8 +398,8 @@ pub enum FilterParseError {
 impl std::fmt::Display for FilterParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidJson { suffix, message } => {
-                write!(f, "invalid channel-filter JSON `{suffix}`: {message}")
+            Self::Syntax { suffix, block } => {
+                write!(f, "invalid channel-filter JSON `{suffix}`: {block}")
             }
             Self::NotObject { suffix } => {
                 write!(f, "channel-filter body `{suffix}` is not a JSON object")
@@ -422,34 +423,205 @@ impl std::error::Error for FilterParseError {}
 /// Parse the JSON suffix into a [`FilterChain`], rejecting any
 /// syntactically-present-but-unparseable filter request.
 ///
-/// This is the channel-creation contract: it mirrors EPICS base
-/// `dbChannelCreate()` / `chf_parse()`, which abort channel creation on
-/// malformed JSON, a non-object body, an unknown filter name, or a
-/// filter whose own parser rejects its configuration. An empty object
-/// (`{}`) is a valid no-filter request and yields an empty chain. The
-/// documented JSON5 unquoted-key forms are accepted via
-/// [`crate::json5::relaxed_to_strict`].
+/// This is the channel-creation contract: C `chf_parse` (`dbChannel.c:262-307`)
+/// — one yajl pass whose callbacks are `dbChannel.c`'s `chf_*` over
+/// `chfPlugin.c`'s per-option ones, so the first refusal left to right is the
+/// one that stops the parse, whether it is yajl's syntax error, an unknown
+/// filter, an unknown option, a value its option cannot store, or a filter's
+/// `parse_end`. An empty object (`{}`) is a valid no-filter request and
+/// yields an empty chain.
 pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseError> {
-    let normalized =
-        crate::json5::relaxed_to_strict(json).map_err(|e| FilterParseError::InvalidJson {
-            suffix: json.to_string(),
-            message: e.to_string(),
-        })?;
-    let value: serde_json::Value =
-        serde_json::from_str(&normalized).map_err(|e| FilterParseError::InvalidJson {
-            suffix: json.to_string(),
-            message: e.to_string(),
-        })?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| FilterParseError::NotObject {
-            suffix: json.to_string(),
-        })?;
-    let mut chain = FilterChain::new();
-    for (key, cfg) in obj {
-        chain.push(build_filter(key, cfg)?);
+    use crate::server::db_convert_json::{Parser, Status};
+    let txt = json.as_bytes();
+    let mut parser = Parser::new(ChfScan::new(json));
+    let mut status = parser.parse(txt);
+    if status == Status::Ok {
+        status = parser.finish();
     }
-    Ok(chain)
+    match status {
+        Status::Ok => Ok(parser.ctx.chain),
+        Status::ClientCanceled => Err(parser
+            .ctx
+            .refusal
+            .take()
+            .expect("a cancelled scan says why")),
+        Status::Error => Err(FilterParseError::Syntax {
+            suffix: json.to_string(),
+            block: parser.render_error(txt),
+        }),
+    }
+}
+
+/// `chf_parse`'s `parseContext` (`dbChannel.c:44-48`) and the open filter's
+/// `chfFilter` (`chfPlugin.c`), as the yajl callbacks share them.
+struct ChfScan<'a> {
+    suffix: &'a str,
+    /// The opening `{` has been seen.
+    opened: bool,
+    filter: Option<OpenFilter>,
+    chain: FilterChain,
+    refusal: Option<FilterParseError>,
+}
+
+/// One filter between its key and its value's end.
+struct OpenFilter {
+    name: &'static str,
+    defs: &'static [ArgDef],
+    build: FilterBuilder,
+    depth: u32,
+    /// `f->nextParam`: the option the last key selected; never reset.
+    next: Option<&'static ArgDef>,
+    stored: Vec<(&'static str, ArgValue)>,
+}
+
+impl ChfScan<'_> {
+    fn new(suffix: &str) -> ChfScan<'_> {
+        ChfScan {
+            suffix,
+            opened: false,
+            filter: None,
+            chain: FilterChain::new(),
+            refusal: None,
+        }
+    }
+
+    fn refuse(&mut self, refusal: FilterParseError) -> bool {
+        self.refusal = Some(refusal);
+        false
+    }
+
+    fn bad_config(&mut self) -> bool {
+        let name = self.filter.as_ref().map_or("", |f| f.name).to_string();
+        self.refuse(FilterParseError::BadConfig {
+            name,
+            config: self.suffix.to_string(),
+        })
+    }
+
+    /// A value outside any filter: only the opening `{` is legal there.
+    fn not_object(&mut self) -> bool {
+        self.refuse(FilterParseError::NotObject {
+            suffix: self.suffix.to_string(),
+        })
+    }
+
+    /// `parse_boolean` / `_integer` / `_double` / `_string`
+    /// (`chfPlugin.c:391-445`), then `chf_value`.
+    fn scalar(&mut self, store: impl FnOnce(&ArgDef) -> Option<ArgValue>) -> bool {
+        let Some(filter) = self.filter.as_mut() else {
+            return self.not_object();
+        };
+        let Some(value) = filter.next.and_then(store) else {
+            return self.bad_config();
+        };
+        let name = filter.next.expect("stored under an option").name;
+        // A repeated key overwrites the same member, at the later position.
+        filter.stored.retain(|(n, _)| *n != name);
+        filter.stored.push((name, value));
+        self.value()
+    }
+
+    /// `chf_value` (`dbChannel.c:72-85`): a value that closes at depth 0 runs
+    /// the filter's `parse_end` (`chfPlugin.c:361-389`).
+    fn value(&mut self) -> bool {
+        if self.filter.as_ref().is_some_and(|f| f.depth > 0) {
+            return true;
+        }
+        let Some(filter) = self.filter.take() else {
+            return true;
+        };
+        match (filter.build)(&Opts(filter.stored)) {
+            Some(built) => {
+                self.chain.push(built);
+                true
+            }
+            None => self.refuse(FilterParseError::BadConfig {
+                name: filter.name.to_string(),
+                config: self.suffix.to_string(),
+            }),
+        }
+    }
+}
+
+impl crate::server::db_convert_json::Callbacks for ChfScan<'_> {
+    /// `chfPlugin` leaves `parse_null` NULL, which `CALLIF` turns into
+    /// `parse_stop` (`chfPlugin.c:571`, `dbChannel.c:50`).
+    fn null(&mut self) -> bool {
+        if self.filter.is_none() {
+            return self.not_object();
+        }
+        self.bad_config()
+    }
+    fn boolean(&mut self, value: bool) -> bool {
+        self.scalar(|def| store_boolean(def, value))
+    }
+    /// `parse_integer` range-checks yajl's `long` into `epicsInt32` first
+    /// (`chfPlugin.c:409-413`).
+    fn integer(&mut self, value: i64) -> bool {
+        self.scalar(|def| store_integer(def, i32::try_from(value).ok()?))
+    }
+    fn double(&mut self, value: f64) -> bool {
+        self.scalar(|def| store_double(def, value))
+    }
+    fn string(&mut self, bytes: &[u8]) -> bool {
+        self.scalar(|def| store_string(def, std::str::from_utf8(bytes).ok()?))
+    }
+    /// `chf_start_map` (`dbChannel.c:197-208`); the plugin's own
+    /// `parse_start_map` continues at any depth.
+    fn start_map(&mut self) -> bool {
+        match self.filter.as_mut() {
+            Some(filter) => filter.depth += 1,
+            None if !self.opened => self.opened = true,
+            None => return self.not_object(),
+        }
+        true
+    }
+    fn end_map(&mut self) -> bool {
+        let Some(filter) = self.filter.as_mut() else {
+            return true;
+        };
+        filter.depth -= 1;
+        self.value()
+    }
+    /// `chfPlugin` leaves `parse_start_array` NULL.
+    fn start_array(&mut self) -> bool {
+        if self.filter.is_none() {
+            return self.not_object();
+        }
+        self.bad_config()
+    }
+    /// `chf_map_key` (`dbChannel.c:163-200`), and inside a filter
+    /// `parse_map_key` (`chfPlugin.c:455-490`).
+    fn map_key(&mut self, key: &[u8]) -> bool {
+        let key = String::from_utf8_lossy(key);
+        if let Some(filter) = self.filter.as_mut() {
+            filter.next = filter.defs.iter().find(|d| chf_prefix_match(&key, d.name));
+            if filter.next.is_none() {
+                let filter = filter.name.to_string();
+                return self.refuse(FilterParseError::UnknownOption {
+                    filter,
+                    key: key.into_owned(),
+                });
+            }
+            return true;
+        }
+        match PLUGINS.iter().find(|(name, _, _)| **name == *key) {
+            Some((name, defs, build)) => {
+                self.filter = Some(OpenFilter {
+                    name,
+                    defs,
+                    build: *build,
+                    depth: 0,
+                    next: None,
+                    stored: Vec::new(),
+                });
+                true
+            }
+            None => self.refuse(FilterParseError::UnknownFilter {
+                name: key.into_owned(),
+            }),
+        }
+    }
 }
 
 /// Permissive parse retained for the CA-server forward-compatibility
@@ -457,16 +629,17 @@ pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseErro
 /// an unparseable suffix to an unfiltered subscription rather than
 /// failing the request. Returns an empty chain on JSON / non-object
 /// failure and skips individual unparseable entries with a
-/// `tracing::warn!`. New channel-creation boundaries must use
+/// `tracing::debug!`. New channel-creation boundaries must use
 /// [`try_parse_filter_chain`] so a bad suffix rejects the channel
 /// (EPICS `dbChannelCreate` parity) instead of silently changing the
 /// requested semantics. JSON5 unquoted keys are accepted here too.
 pub fn parse_filter_chain(json: &str) -> FilterChain {
+    // Debug, not warn: C prints at `dbChannelCreate`, never per read.
     let mut chain = FilterChain::new();
     let normalized = match crate::json5::relaxed_to_strict(json) {
         Ok(normalized) => normalized,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 json = %json,
                 error = %e,
                 "channel filter JSON parse failed; subscription proceeds without filters",
@@ -477,7 +650,7 @@ pub fn parse_filter_chain(json: &str) -> FilterChain {
     let value: serde_json::Value = match serde_json::from_str(&normalized) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 json = %json,
                 error = %e,
                 "channel filter JSON parse failed; subscription proceeds without filters",
@@ -486,14 +659,14 @@ pub fn parse_filter_chain(json: &str) -> FilterChain {
         }
     };
     let Some(obj) = value.as_object() else {
-        tracing::warn!(json = %json, "channel filter JSON must be an object");
+        tracing::debug!(json = %json, "channel filter JSON must be an object");
         return chain;
     };
     for (key, cfg) in obj {
         match build_filter(key, cfg) {
             Ok(filt) => chain.push(filt),
             Err(e) => {
-                tracing::warn!(error = %e, "channel filter skipped");
+                tracing::debug!(error = %e, "channel filter skipped");
             }
         }
     }
@@ -1497,8 +1670,11 @@ mod tests {
 
     #[test]
     fn try_parse_rejects_malformed_json() {
+        let err = try_parse_filter_chain("{]").unwrap_err();
+        assert!(matches!(err, FilterParseError::Syntax { .. }));
+        // yajl reads `not` as a JSON5 key, so the lookup refuses it first.
         let err = try_parse_filter_chain("{not json").unwrap_err();
-        assert!(matches!(err, FilterParseError::InvalidJson { .. }));
+        assert_eq!(err, FilterParseError::UnknownFilter { name: "not".into() });
     }
 
     #[test]
@@ -1554,10 +1730,9 @@ mod tests {
     /// `yajl_parse_integer`, `yajl_parser.c:57-62`), a leading `+`
     /// (`yajl_lex.c:438`), and a leading or trailing `.` (`:478`, `:491`).
     ///
-    /// What this pins is the ROUTING: that `try_parse_filter_chain` still
-    /// reads its suffix through [`crate::json5::relaxed_to_strict`]. The
-    /// conversions themselves are pinned in `json5.rs`'s own tests, and a
-    /// path that stopped going through it fails here with `InvalidJson`.
+    /// What this pins is the ROUTING: that `try_parse_filter_chain` reads
+    /// its suffix through the JSON5 yajl lexer, whose conversions are pinned
+    /// in `db_convert_json.rs`'s own tests.
     #[test]
     fn try_parse_accepts_the_json5_numeric_literals_yajl_lexes() {
         for json in [
@@ -1594,42 +1769,20 @@ mod tests {
         );
     }
 
-    /// DELIBERATE deviation, recorded rather than fixed. C accepts a
-    /// non-finite filter argument: `Infinity`/`NaN` lex as
-    /// `yajl_tok_double` under JSON5 (`yajl_lex.c:673-682`, `:684-693`),
-    /// `epicsStrtod` converts them without setting `ERANGE` so the
-    /// overflow guard does not fire (`yajl_parser.c:329-353`),
-    /// `chfPlugin`'s `parse_double` forwards them (`chfPlugin.c:423-434`)
-    /// and `store_double_value` writes the raw double with no finite check
-    /// (`chfPlugin.c:206-209`) — `{"dbnd":{"d":Infinity}}` builds a channel
-    /// whose deadband suppresses every update.
-    ///
-    /// The port refuses it. `relaxed_to_strict` is the dialect's single
-    /// reader and its output alphabet is strict JSON, which has no
-    /// spelling for a non-finite, so the value arrives as `null` and
-    /// `store` stops the parse. Accepting it needs either a second reader
-    /// for this path — the two-reader split `json5.rs` exists to prevent —
-    /// or a per-consumer re-spelling that trades this deviation for a
-    /// narrower one elsewhere (`Infinity` as the string `"Infinity"` is
-    /// what C's `store_string_value` wants for a double option, but C's
-    /// `store_double_value` writes `"inf"` into a STRING option, so the
-    /// re-spelling would diverge on `sync`'s `s`). The refusal is narrower
-    /// than C, never a wrong answer: C's own outcome is a degenerate
-    /// filter.
+    /// C accepts a non-finite filter argument: `Infinity`/`NaN` lex as
+    /// `yajl_tok_double` under JSON5 (`yajl_lex.c:673-693`), and
+    /// `store_double_value` writes the raw double with no finite check
+    /// (`chfPlugin.c:206-209`). softIoc R7.0.10 connects each name below.
     #[test]
-    fn a_non_finite_filter_argument_is_refused_where_c_accepts_it() {
+    fn a_non_finite_filter_argument_is_accepted_as_in_c() {
         for json in [
             r#"{"dbnd":{"d":Infinity}}"#,
             r#"{"dbnd":{"d":-Infinity}}"#,
             r#"{"dbnd":{"d":NaN}}"#,
             r#"{"dbnd":{"abs":Infinity}}"#,
         ] {
-            let err = try_parse_filter_chain(json)
-                .expect_err("the port refuses a non-finite filter argument");
-            assert!(
-                matches!(err, FilterParseError::BadConfig { .. }),
-                "{json}: {err}"
-            );
+            let chain = try_parse_filter_chain(json).unwrap_or_else(|e| panic!("{json}: {e}"));
+            assert_eq!(chain.len(), 1, "{json}");
         }
     }
 

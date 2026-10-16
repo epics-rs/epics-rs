@@ -100,6 +100,7 @@ async fn read_once(record_type: &str, sourced: EpicsValue, step: Step) -> (u8, A
     database
         .process_record_with_links(REC, &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     let rec = database.get_record(REC).unwrap();
     let inst = rec.read();

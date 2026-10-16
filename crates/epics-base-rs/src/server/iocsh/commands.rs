@@ -3937,9 +3937,9 @@ fn cmd_dbtr() -> CommandDef {
             if let Err(e) = processed {
                 // C `recGblRecordError(status, precord, "dbtr(dbProcess)")`
                 // (`dbTest.c:491-492`) renders the numeric status through
-                // `errSymLookup`; the port's process path reports a
-                // `CaError` and has no status number to look up, so the
-                // error's own text takes that slot.
+                // `errSymLookup`, which is a `ProcessStatus`'s text; any
+                // other `CaError` has no status, so its own text takes
+                // that slot.
                 crate::server::recgbl::rec_gbl_record_error(
                     &e.to_string(),
                     &String::from_utf8_lossy(base),
@@ -12516,7 +12516,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
         ctx.block_on(db.ioc_init());
         let rec = db.get_record("DS").unwrap();
         let text = || crate::types::EpicsValue::String("@st2".into());
-        let mut link = crate::server::record::PreparedCommonLink::for_put(b"DS", "INP", &text());
+        let mut link = crate::server::record::PreparedCommonLink::for_put("INP", &text());
         link.as_mut().unwrap().ask_add_record(&db, &rec);
         rec.write().common.dtyp.set_name("Soft Channel");
         let put = rec.write().gate_device_link_put(link.as_ref().unwrap());

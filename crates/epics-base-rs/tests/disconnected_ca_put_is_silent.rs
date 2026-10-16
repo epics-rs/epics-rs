@@ -80,6 +80,7 @@ async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
     }
     db.process_record_with_links("R1", &mut ProcStack::new())
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     db.sync_external_link_puts().await;
     errlog_flush();

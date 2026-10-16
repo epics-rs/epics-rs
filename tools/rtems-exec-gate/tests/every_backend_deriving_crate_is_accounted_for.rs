@@ -145,6 +145,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/qsrv_app_declares_pva_link_type.rs",
     ),
     ("epics-bridge-rs", "tests/qsrv_app_group_file.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/qsrv_put_fails_on_the_process_status.rs",
+    ),
     ("epics-bridge-rs", "tests/qsrv_remote_log.rs"),
     ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_ca_link.rs"),
     ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_pva_link.rs"),
@@ -206,6 +210,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/dollar_long_string_record.rs"),
     ("epics-ca-rs", "tests/long_string_dollar_monitor_counts.rs"),
     ("epics-ca-rs", "tests/long_string_plain_monitor_counts.rs"),
+    (
+        "epics-ca-rs",
+        "tests/plain_write_fails_on_the_process_status.rs",
+    ),
     (
         "epics-ca-rs",
         "tests/put_failure_status_is_the_layer_not_the_error.rs",

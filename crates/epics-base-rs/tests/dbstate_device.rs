@@ -147,6 +147,7 @@ record(bi, "DBST_NONAME") {
         let mut v = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("DBST_NONAME", &mut v)
             .await
+            .or_else(epics_base_rs::error::CaError::unless_process_status)
             .unwrap();
     }
 

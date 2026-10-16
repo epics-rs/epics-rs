@@ -120,7 +120,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::ReadBuf;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::runtime::offload::{MAX_OFFLOAD_WORKERS, OffloadPool};
 use crate::runtime::task::{StackSizeClass, ThreadPriority, block_on_sync};
@@ -238,7 +238,7 @@ fn pump_thread_lost(role: &str, label: &str, what: &str) {
              down. Other connections are unaffected.\n"
         ),
     );
-    warn!(label, role, what, "blocking socket pump: a thread was lost");
+    debug!(label, role, what, "blocking socket pump: a thread was lost");
 }
 
 // ---------------------------------------------------------------------------

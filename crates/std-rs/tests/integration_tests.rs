@@ -1776,3 +1776,34 @@ record(epid, "E") { field(KP, "1") }
     assert_eq!(cycle(0), (17, 3));
     assert_eq!(cycle(0), (0, 0));
 }
+
+/// `do_pid` returns 1 inside MDT (`devEpidSoft.c:125`) and `epidRecord.c:214`
+/// returns it, so a plain process fails; a put-callback does not read it.
+#[tokio::test]
+async fn an_epid_inside_mdt_returns_do_pids_status() {
+    let db_str = r#"
+record(ao, "MDT:SRC") { field(VAL, "1") }
+record(epid, "MDT:PID") {
+    field(SMSL, "1")
+    field(STPL, "MDT:SRC.VAL")
+    field(MDT, "1000")
+}
+"#;
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+    let status = db.process_record("MDT:PID").await;
+    assert!(
+        matches!(status, Err(epics_base_rs::error::CaError::ProcessStatus(s)) if s.get() == 1),
+        "got {status:?}"
+    );
+    db.put_record_field_from_ca("MDT:PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+}

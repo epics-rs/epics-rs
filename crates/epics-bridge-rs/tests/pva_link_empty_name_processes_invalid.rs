@@ -77,6 +77,7 @@ async fn empty_pva_name_processes_link_invalid_and_opens_nothing() {
         for rec in &records {
             db.process_record_with_links(rec, &mut ProcStack::new())
                 .await
+                .or_else(epics_base_rs::error::CaError::unless_process_status)
                 .unwrap_or_else(|e| panic!("{rec}: {e:?}"));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

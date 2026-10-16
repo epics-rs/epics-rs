@@ -121,6 +121,7 @@ record(seq, "SQ") {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W3", &mut visited)
         .await
+        .or_else(CaError::unless_process_status)
         .unwrap();
     assert_eq!(heard(), [NOMOD]);
 

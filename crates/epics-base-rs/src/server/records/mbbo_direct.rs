@@ -152,6 +152,15 @@ impl Record for MbboDirectRecord {
         "mbboDirect"
     }
 
+    /// devMbboDirectSoft.c and devMbboDirectSoftRaw.c drop `dbPutLink`'s status; devMbboDirectSoftCallback.c returns it.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: false,
+            raw: false,
+            async_: true,
+        })
+    }
+
     /// C `mbboDirectRecord.c:176-190`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {

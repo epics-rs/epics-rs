@@ -26,7 +26,7 @@
 //!   (plus motor-rs extension fields documented at the entry)
 //!
 //! The table is **total and fail-safe**: an unlisted record type returns the
-//! empty slice (`&[]`) and emits a one-time `tracing::warn!`, so a put to its
+//! empty slice (`&[]`) and emits a one-time `tracing::debug!`, so a put to its
 //! fields never auto-processes (only `PROC` does). This makes spurious
 //! processing **opt-in** — a record type must declare its `pp(TRUE)` set to
 //! get any field-triggered processing — instead of the former fail-dangerous
@@ -36,8 +36,7 @@
 //! plus the module-crate records scaler, std epid/throttle/timestamp, optics
 //! table, asyn), and `create_record` rejects unknown types, so the warning
 //! path is reachable only by a *future* record type registered without an
-//! entry — where the loud warning surfaces the omission in testing rather than
-//! as silent under-processing. `asynRecord` has two impls across crates
+//! entry. It is debug, not warn, because C has no such print. `asynRecord` has two impls across crates
 //! (`epics-base-rs` stub + `asyn-rs` functional) but both report the type
 //! string `"asyn"`, so the single `"asyn"` entry covers both.
 
@@ -222,7 +221,7 @@ pub fn pp_fields_for(record_type: &str) -> &'static [&'static str] {
         // Unreachable for any instantiable record (create_record rejects
         // unknown types and every built/registered type is listed above), so
         // this fires only for a future record type registered without an
-        // entry — the one-time warning surfaces that omission loudly.
+        // entry.
         other => {
             warn_unknown_record_type_once(other);
             &[]
@@ -230,7 +229,7 @@ pub fn pp_fields_for(record_type: &str) -> &'static [&'static str] {
     }
 }
 
-/// Emit a one-time `tracing::warn!` the first time an unmodeled `record_type`
+/// Emit a one-time `tracing::debug!` the first time an unmodeled `record_type`
 /// reaches [`pp_fields_for`]'s fallthrough. Deduplicated per type string so a
 /// hot put path does not spam the log.
 fn warn_unknown_record_type_once(record_type: &str) {
@@ -243,7 +242,7 @@ fn warn_unknown_record_type_once(record_type: &str) {
         .map(|mut set| set.insert(record_type.to_string()))
         .unwrap_or(true);
     if is_new {
-        tracing::warn!(
+        tracing::debug!(
             record_type,
             "record type has no pp_fields_for entry; its field puts will never \
              auto-process (PROC-only). Add its pp(TRUE) set to pp_fields_for."

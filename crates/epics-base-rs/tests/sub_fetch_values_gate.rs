@@ -90,7 +90,10 @@ async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
     let db = sub_db("NOSUCHPV").await;
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("SUB", &mut v).await.unwrap();
+    db.process_record_with_links("SUB", &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 
     let arc = db.get_record("SUB").unwrap();
     let inst = arc.read();

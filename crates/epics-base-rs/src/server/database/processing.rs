@@ -88,6 +88,7 @@ impl ProcStack {
 }
 
 use std::mem::ManuallyDrop;
+use std::ops::ControlFlow;
 
 /// One of C `dbProcess`'s TPRO lines, `"%s: ..."` on stdout. C's context is
 /// the server client's name or else the thread's (`dbAccess.c:527-534`); the
@@ -100,7 +101,7 @@ fn trace_dbprocess(line: std::fmt::Arguments<'_>) {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::error::{CaError, CaResult};
+use crate::error::{CaError, CaResult, DbResult, DbStatus};
 use crate::server::record::record_instance::StampPass;
 use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
@@ -1196,6 +1197,136 @@ struct TailCtx<'a> {
     plan: &'a crate::server::record::record_instance::ProcessPlan,
 }
 
+use cycle_status::CycleStatus;
+
+mod cycle_status {
+    use super::*;
+
+    /// C `process()`'s `long status`, gathered raw through the cycle and
+    /// judged once against the type's [`ProcessStatusRule`]. A cycle that
+    /// returned zero everywhere carries `None`, so its exit tests one word.
+    ///
+    /// [`ProcessStatusRule`]: crate::server::record::ProcessStatusRule
+    #[derive(Clone, Copy)]
+    pub(super) struct CycleStatus(Option<Failed>);
+
+    /// The parts of a non-zero status; each keeps its first failure.
+    #[derive(Clone, Copy)]
+    struct Failed {
+        /// A failed closed-loop DOL read.
+        dol: DbResult,
+        /// The soft dset's INP or OUT link.
+        soft: DbResult,
+        /// That link is an external one that is not connected.
+        soft_unconnected: bool,
+        /// `readValue`/`writeValue`'s own: the device read or write, SIOL, SIMM.
+        io: DbResult,
+        /// IVOA "Don't drive outputs" skipped `writeValue`. Only read with a
+        /// DOL failure, which the cycle records before deciding the skip.
+        write_skipped: bool,
+        /// The record's own: `do_sub`'s, [`ProcessOutcome::status`], a status
+        /// link's.
+        ///
+        /// [`ProcessOutcome::status`]: crate::server::record::ProcessOutcome::status
+        record: DbResult,
+    }
+
+    fn keep(part: &mut DbResult, e: DbStatus) {
+        if part.is_ok() {
+            *part = Err(e);
+        }
+    }
+
+    impl CycleStatus {
+        pub(super) const OK: Self = Self(None);
+
+        #[cold]
+        fn failed(&mut self) -> &mut Failed {
+            self.0.get_or_insert(Failed {
+                dol: Ok(()),
+                soft: Ok(()),
+                soft_unconnected: false,
+                io: Ok(()),
+                write_skipped: false,
+                record: Ok(()),
+            })
+        }
+
+        #[inline(always)]
+        pub(super) fn dol(&mut self, status: DbResult) {
+            if let Err(e) = status {
+                keep(&mut self.failed().dol, e);
+            }
+        }
+
+        #[inline(always)]
+        pub(super) fn io(&mut self, status: DbResult) {
+            if let Err(e) = status {
+                keep(&mut self.failed().io, e);
+            }
+        }
+
+        #[inline(always)]
+        pub(super) fn record(&mut self, status: DbResult) {
+            if let Err(e) = status {
+                keep(&mut self.failed().record, e);
+            }
+        }
+
+        pub(super) fn soft_failed(&mut self, e: DbStatus, unconnected: bool) {
+            let failed = self.failed();
+            keep(&mut failed.soft, e);
+            failed.soft_unconnected = unconnected;
+        }
+
+        /// IVOA "Don't drive outputs" vetoed `writeValue`.
+        pub(super) fn write_skipped(&mut self) {
+            if let Some(failed) = &mut self.0 {
+                failed.write_skipped = true;
+            }
+        }
+
+        /// The cycle's frame result: `Err(ProcessStatus)` for a non-zero status.
+        #[inline(always)]
+        pub(super) fn frame_result(&self, guard: &mut DataGuard<'_>) -> CaResult<()> {
+            match &self.0 {
+                None => Ok(()),
+                Some(failed) => failed.judged(guard).map_err(CaError::ProcessStatus),
+            }
+        }
+    }
+
+    impl Failed {
+        #[cold]
+        fn judged(&self, guard: &DataGuard<'_>) -> DbResult {
+            let rdes = guard.rec.rdes();
+            let ask = |instance: &RecordInstance| {
+                (
+                    rdes.process_status(&*instance.record),
+                    instance.common.dtyp.soft(),
+                )
+            };
+            // Asked under whatever hold the exit left, never taking one.
+            let (rule, dtyp) = match &guard.held {
+                Some(held) => ask(held),
+                None => ask(&guard.rec.read()),
+            };
+            let soft = match dtyp {
+                Some(d) if rule.soft.returns(d) && !(rule.ls && self.soft_unconnected) => self.soft,
+                _ => Ok(()),
+            };
+            let io = if rule.io { self.io.and(soft) } else { Ok(()) };
+            let framework = match rule.dol {
+                crate::server::record::DolStatus::Dropped => io,
+                crate::server::record::DolStatus::UntilWrite if !self.write_skipped => io,
+                crate::server::record::DolStatus::UntilWrite
+                | crate::server::record::DolStatus::Kept => self.dol.and(io),
+            };
+            framework.and(self.record)
+        }
+    }
+}
+
 /// Result of the simulation-mode check.
 ///
 /// C handles simulation entirely inside `readValue()` / `writeValue()` —
@@ -1216,8 +1347,9 @@ enum SimOutcome {
     /// Simulated INPUT record: the SIOL read + convert already ran here
     /// (`readValue` precedes the body). The caller must still run the
     /// forward-link / RPRO tail exactly as `recGblFwdLink` does for a
-    /// real process cycle, but skips the (already-substituted) body.
-    Simulated,
+    /// real process cycle, but skips the (already-substituted) body. Carries
+    /// the SIOL read's status, `readValue`'s.
+    Simulated(DbResult),
     /// Simulated record whose simulation replaces only the INPUT STAGE of its
     /// body ([`Record::simulation_substitutes_input_stage`](crate::server::record::Record::simulation_substitutes_input_stage)) — swait. The SIOL
     /// read, the `VAL = SVAL` / `UDF = FALSE` write and the SIMM_ALARM raise
@@ -1904,14 +2036,17 @@ impl PvDatabase {
             owned_target = target.cloned();
             owned = entry.parsed().clone();
             guard.release();
-            if let ParsedLink::Db(db) = &*owned {
-                self.process_passive_db_source(db, visited);
-            }
-            let read = self.read_link_with_alarm_at(
-                &owned,
-                owned_target.as_ref(),
-                request.renders_at_source(),
-            );
+            // C `dbDbGetValue` returns `dbScanPassive`'s status unread.
+            let read = match &*owned {
+                ParsedLink::Db(db) if self.process_passive_db_source(db, visited).is_err() => {
+                    (crate::server::recgbl::simm::LinkFetch::Failed, None, None)
+                }
+                _ => self.read_link_with_alarm_at(
+                    &owned,
+                    owned_target.as_ref(),
+                    request.renders_at_source(),
+                ),
+            };
             let inst = guard.hold();
             (&mut *inst.record, &mut inst.common, &*owned, read)
         };
@@ -3615,7 +3750,8 @@ impl PvDatabase {
             // LINK_ALARM/INVALID on a failed put exactly as the synchronous
             // `dbPutLink` does (dbLink.c:469-471). The put runs under the
             // source's set, as C's `processCallback` holds `dbScanLock`.
-            self.with_frame(&rec, |frame| {
+            // `processCallback` reads no status: sseq's `asyncFinish` returns 0.
+            let _ = self.with_frame(&rec, |frame| {
                 self.write_out_link_value(
                     frame,
                     Arc::new(parsed),
@@ -4342,15 +4478,19 @@ impl PvDatabase {
             if matches!(request, crate::server::record::InputLinkRequest::NotRead) {
                 continue;
             }
-            if let crate::server::record::ParsedLink::Db(db) = parsed {
-                self.process_passive_db_source(db, visited);
-            }
             // C `sCalcoutRecord.c:916` / `:934` read these with `dbGetLink`
             // like every other input, so a failed one raises `setLinkAlarm`
             // (LINK/INVALID, AMSG `field INAA`) even though `fetch_values`
             // itself returns 0 (`:941`) and never gates `sCalcPerform`.
-            let (fetch, alarm, _raw) =
-                self.db_get_link_deferred(rec, link_field, parsed, None, request);
+            let (fetch, alarm, _raw) = match parsed {
+                crate::server::record::ParsedLink::Db(db)
+                    if self.process_passive_db_source(db, visited).is_err() =>
+                {
+                    self.db_get_link_failed(rec, link_field, parsed);
+                    (crate::server::recgbl::simm::LinkFetch::Failed, None, false)
+                }
+                _ => self.db_get_link_deferred(rec, link_field, parsed, None, request),
+            };
             if let Some(pair) = self.input_link_inheritance(rec, parsed, alarm) {
                 link_alarms.push(pair);
             }
@@ -5194,6 +5334,7 @@ impl PvDatabase {
         } else {
             plan
         };
+        let mut cycle_status = CycleStatus::OK;
         // 0. SDIS disable check — C parity dbAccess.c:562-592.
         //
         // When the SDIS link evaluates to a value equal to DISV, the
@@ -5240,10 +5381,17 @@ impl PvDatabase {
                 )
             };
 
+            // `dbProcess` returns this read's status when the record is disabled
+            // (`dbAccess.c:566-572`).
+            let mut sdis_status = Ok(());
             let disa = match sdis_link {
                 Some(sdis_link) => {
                     guard.release();
-                    if let Some(val) = self.db_get_link_in(rec, "SDIS", &sdis_link).value() {
+                    let fetch = self.db_get_link_in(rec, "SDIS", &sdis_link);
+                    if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
+                        sdis_status = Err(DbStatus::FAILED);
+                    }
+                    if let Some(val) = fetch.value() {
                         // C `dbGetLink(&prec->sdis, DBR_SHORT, &prec->disa)` — the
                         // routine is picked by the SOURCE type, so this goes through
                         // the coercion owner, not `c_cast` direct (an integer SDIS
@@ -5319,7 +5467,7 @@ impl PvDatabase {
                 if let Some(ws) = notify {
                     ws.leave();
                 }
-                return Ok(());
+                return sdis_status.map_err(CaError::ProcessStatus);
             }
         }
 
@@ -5385,7 +5533,7 @@ impl PvDatabase {
                 if let Some(ws) = notify {
                     ws.leave();
                 }
-                return Ok(());
+                return Err(CaError::ProcessStatus(DbStatus::MISSING_SUP));
             }
         }
 
@@ -5436,10 +5584,11 @@ impl PvDatabase {
         cycle_end.merge_in(sim_pact_exit);
         let sim_output = match sim_outcome {
             SimOutcome::NotSimulated => None,
-            SimOutcome::Simulated => {
+            SimOutcome::Simulated(read) => {
                 self.run_forward_link_tail(name, rec, visited);
                 self.end_process_cycle(name, rec, cycle_end.take());
-                return Ok(());
+                cycle_status.io(read);
+                return cycle_status.frame_result(guard);
             }
             SimOutcome::AbortedBeforeWrite => {
                 // C busy `writeValue`: `status = dbGetLink(&prec->siml, ...);
@@ -5447,9 +5596,12 @@ impl PvDatabase {
                 // routine returns before `write_busy` AND before the SIOL
                 // redirect. `dbGetLink` has already raised LINK_ALARM/INVALID.
                 sim_write_aborted = true;
+                cycle_status.io(Err(DbStatus::FAILED));
                 None
             }
             SimOutcome::IllegalMode { is_output, siol } => {
+                // The `default:` arm's `return -1`.
+                cycle_status.io(Err(DbStatus::FAILED));
                 if is_output {
                     // `writeValue` follows the body, so only the write is lost.
                     sim_write_aborted = true;
@@ -5476,7 +5628,7 @@ impl PvDatabase {
                     }
                     self.run_forward_link_tail(name, rec, visited);
                     self.end_process_cycle(name, rec, cycle_end.take());
-                    return Ok(());
+                    return cycle_status.frame_result(guard);
                 }
             }
             SimOutcome::SimulatedInputStage => {
@@ -5600,6 +5752,7 @@ impl PvDatabase {
                 let dol_fetch = links.as_ref().and_then(|l| l.dol_fetch.as_ref());
                 if let Some(crate::server::recgbl::simm::LinkFetch::Failed) = dol_fetch {
                     instance.record.closed_loop_dol_read_failed();
+                    cycle_status.dol(Err(DbStatus::FAILED));
                 }
                 let mut links = links;
                 if let Some(crate::server::recgbl::simm::LinkFetch::Value(dol_val)) =
@@ -5778,6 +5931,8 @@ impl PvDatabase {
                     // see its own stale buffer and called itself defined.
                     instance.record.soft_input_read_failed();
                     read_produced_no_value = true;
+                    cycle_status
+                        .soft_failed(DbStatus::FAILED, !self.link_connected(&instance.parsed_inp));
                 }
 
                 // Apply multi-input values (INPA..INPL -> A..L).
@@ -5901,6 +6056,7 @@ impl PvDatabase {
                                 device_did_compute = status.skips_conversion();
                                 if status.read_failed() {
                                     read_produced_no_value = true;
+                                    cycle_status.io(Err(DbStatus::FAILED));
                                 }
                                 device_read_computed = matches!(
                                     status,
@@ -5932,6 +6088,7 @@ impl PvDatabase {
                             // support says what it has to.
                             Err(_) => {
                                 use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr};
+                                cycle_status.io(Err(DbStatus::FAILED));
                                 rec_gbl_set_sevr(
                                     &mut instance.common,
                                     alarm_status::READ_ALARM,
@@ -6115,7 +6272,7 @@ impl PvDatabase {
                 // engine path — SCAN, event, CA-put-to-PP, FLNK — never ran the
                 // subroutine and VAL/VALA..VALU/OUTA..OUTU never updated.
                 if plan.runs_subroutine {
-                    instance.run_registered_subroutine()?;
+                    cycle_status.record(instance.run_registered_subroutine()?);
                 }
 
                 // Process, after pushing framework-owned common state
@@ -6124,6 +6281,7 @@ impl PvDatabase {
                 // (`epidRecord.c:195` checks `pepid->udf`, `timestampRecord.c:90`
                 // checks `tse`, `transformRecord.c:554` checks `ptran->nsev`).
                 let mut outcome = instance.process_and_drain()?;
+                cycle_status.record(outcome.status);
                 // Merge deferred device actions into process outcome actions
                 if let Some(deferred) = deferred_device_actions {
                     outcome.actions.extend(deferred);
@@ -6187,7 +6345,13 @@ impl PvDatabase {
 
                 // `ReprocessAfter` for a delayed re-entry, and the record's own
                 // `dbPutLink`s made inside `process()`.
-                self.execute_process_actions_in(name, rec, process_actions, visited);
+                if let ControlFlow::Break(e) =
+                    self.run_process_actions(name, rec, process_actions, visited)
+                {
+                    cycle_status.record(Err(e));
+                    self.return_with_pact_held(name, rec, cycle_end.take());
+                    return cycle_status.frame_result(guard);
+                }
                 // After every action this arm runs, so the ordering rule holds
                 // whatever the outcome carried. The `ReprocessAfter` a pending
                 // cycle usually arms cannot overtake this: the continuation
@@ -6199,7 +6363,11 @@ impl PvDatabase {
                 // PACT and the body re-entered it) leaves the queue head where it
                 // is, the deferral closed under its own restart.
                 self.apply_pact_exit(name, cycle_end.take());
-                return Ok(());
+                // `if (!pact && prec->pact) return 0` (aiRecord.c:153).
+                if async_pending {
+                    return Ok(());
+                }
+                return cycle_status.frame_result(guard);
             }
             if let crate::server::record::RecordProcessResult::AsyncPendingNotify(fields) =
                 process_result
@@ -6272,7 +6440,14 @@ impl PvDatabase {
                 // which is deferred to async completion on this pending pass).
                 let (link_writes, deferred_actions): (Vec<_>, Vec<_>) =
                     process_actions.into_iter().partition(runs_in_link_stage);
-                self.execute_process_actions_in(name, rec, link_writes, visited);
+                match self.execute_link_writes_in(name, rec, link_writes, visited) {
+                    ControlFlow::Continue(status) => cycle_status.record(status),
+                    ControlFlow::Break(e) => {
+                        cycle_status.record(Err(e));
+                        self.return_with_pact_held(name, rec, cycle_end.take());
+                        return cycle_status.frame_result(guard);
+                    }
+                }
                 self.publish_post_write_fields(rec, post_write_fields);
                 {
                     let inst = rec.read();
@@ -6282,7 +6457,8 @@ impl PvDatabase {
                 // Same as the `AsyncPending` arm: run the restart check through the
                 // single drain owner, which is a no-op if this pass re-took PACT.
                 self.apply_pact_exit(name, cycle_end.take());
-                return Ok(());
+                // motor's pending pass returns RLNK's status (motorRecord.cc:1495).
+                return cycle_status.frame_result(guard);
             }
 
             // Async-completion PACT clear for the `ReprocessAfter`
@@ -6683,6 +6859,9 @@ impl PvDatabase {
                 // (`ProcessPlan::output_stage`: C `calcRecord.c::process` has no
                 // OUT lines) or IVOA vetoes them on an INVALID cycle.
                 let skip_out = !plan.output_stage || ivoa_skips_output(instance, real_sev, true);
+                if skip_out && plan.output_stage {
+                    cycle_status.write_skipped();
+                }
 
                 // Output-time input links (swait DOL). C
                 // `swaitRecord.c::execOutput` (763-772) fetches DOL through
@@ -6925,6 +7104,9 @@ impl PvDatabase {
                                         }
                                         Err(_) => true,
                                     };
+                                if write_failed {
+                                    cycle_status.io(Err(DbStatus::FAILED));
+                                }
                                 instance.device = Some(dev);
                                 raise_write_value_alarm(instance, write_failed, false);
                             }
@@ -6991,8 +7173,10 @@ impl PvDatabase {
                     notify: src_notify.as_ref(),
                     field: "OUT",
                 };
-                if let Some((out, out_val)) = out_info {
-                    self.write_out(rec, out, out_val, src, visited);
+                if let Some((out, out_val)) = out_info
+                    && let Err(e) = self.write_out(rec, out, out_val, src, visited)
+                {
+                    cycle_status.soft_failed(e, !self.link_connected(&rec.read().parsed_out));
                 }
                 // C `longoutRecord.c:492-493`, OUTSIDE `if (doDevSupWrite)`:
                 // the OOPT reference advances on a suppressed cycle too, which
@@ -7019,10 +7203,23 @@ impl PvDatabase {
                     super::links::MultiOutDispatch::default()
                 };
                 if sim_output.is_some() {
-                    self.write_simulated_output_siol(rec, &sim_output, skip_out, src, visited);
+                    cycle_status.io(self.write_simulated_output_siol(
+                        rec,
+                        &sim_output,
+                        skip_out,
+                        src,
+                        visited,
+                    ));
                 }
                 if let Some(link_writes) = link_writes {
-                    self.execute_process_actions_in(name, rec, link_writes, visited);
+                    match self.execute_link_writes_in(name, rec, link_writes, visited) {
+                        ControlFlow::Continue(status) => cycle_status.record(status),
+                        ControlFlow::Break(e) => {
+                            cycle_status.record(Err(e));
+                            self.return_with_pact_held(name, rec, cycle_end.take());
+                            return cycle_status.frame_result(guard);
+                        }
+                    }
                 }
                 // Every link-carried output of the cycle has now run, so the
                 // withheld stores become visible here — still ahead of Segment
@@ -7198,7 +7395,7 @@ impl PvDatabase {
         guard.release();
         self.apply_pact_exit(name, cycle_end.take());
 
-        Ok(())
+        cycle_status.frame_result(guard)
     }
 
     /// The end of a synchronous process cycle — C `recGblFwdLink`'s tail
@@ -7415,7 +7612,8 @@ impl PvDatabase {
         } else {
             None
         };
-        self.process_target_at(
+        // `recGblFwdLink` drops `dbScanFwdLink`'s status.
+        let _ = self.process_target_at(
             target,
             super::links::ProcessTargetGate::ScanPassive,
             putf,
@@ -7727,6 +7925,132 @@ impl PvDatabase {
             .set_resolved_out_target(link_field, target);
     }
 
+    /// A record's `WriteDbLink`, C `dbPutLink` on `link_field`: its status,
+    /// once the actions the record answered it with have run.
+    fn write_db_link_action(
+        &self,
+        record_name: &[u8],
+        rec: InFrame<'_>,
+        link_field: &'static str,
+        value: EpicsValue,
+        visited: &mut ProcStack,
+    ) -> ControlFlow<DbStatus, DbResult> {
+        // 1. Get the record's stored link for the field
+        // and the source PUTF for processTarget propagation.
+        let (parsed, src_putf, src_notify) = {
+            let instance = rec.read();
+            let link = instance
+                .stored_link_shared(link_field)
+                .filter(|l| !matches!(***l, crate::server::record::ParsedLink::None))
+                .cloned();
+            debug_assert!(
+                instance.stored_link(link_field).is_some(),
+                "WriteDbLink on {link_field}, which is not a link of the record"
+            );
+            (link, instance.common.putf, instance.notify.clone())
+        };
+        let Some(parsed) = parsed else {
+            // No link to put through: C `dbPutLink` on an
+            // unresolved link is a failure, and the emitter is
+            // told so — every emitted action reports exactly once,
+            // so a record deriving a field from the result cannot
+            // be left holding a stale one.
+            let more = rec
+                .write()
+                .record
+                .set_out_link_write_status(link_field, &value, true);
+            self.run_process_actions(record_name, rec, more, visited)?;
+            // The status, though, is an empty CONSTANT link's: 0
+            // (`dbConstPutValue`).
+            return ControlFlow::Continue(Ok(()));
+        };
+        // 2. Write to the linked PV — DB *or*
+        // external `ca://`/`pva://`. A record's `process()`
+        // emits `WriteDbLink` to drive an OUT-link field
+        // (transform `OUTn`, throttle/scaler `COUTP`, epid
+        // `TRIG`/`OUTL`); that field may resolve to a CA/PVA
+        // link, which C `dbPutLink` routes through the link
+        // set's `putValue` identically to a DB link
+        // (dbLink.c:434-448). The field is a `DBF_OUTLINK`, so its
+        // slot carries the OUT modifier mask
+        // (`dbStaticLib.c:2382-2387`); a removed one is
+        // `S_db_noLSET` with no alarm.
+        let status = self.write_out_link_value(
+            rec,
+            parsed,
+            super::PutSrc::Value(&value),
+            super::links::OutLinkSrc {
+                putf: src_putf,
+                notify: src_notify.as_ref(),
+                field: link_field,
+            },
+            visited,
+        );
+        // The record-owned half of the put's outcome. The alarm
+        // half was already raised by `write_out_link_value`; this
+        // is what lets a record keep a C-truthful status field
+        // (throttle STS) instead of committing its own intent.
+        let more =
+            rec.write()
+                .record
+                .set_out_link_write_status(link_field, &value, status.is_err());
+        self.run_process_actions(record_name, rec, more, visited)?;
+        ControlFlow::Continue(status)
+    }
+
+    /// [`Self::execute_process_actions_in`] for the actions a record's
+    /// `process()` makes before it returns: the status of the record's
+    /// [`ProcessStatusRule::status_link`] put, the one C's `process()` returns.
+    ///
+    /// [`ProcessStatusRule::status_link`]: crate::server::record::ProcessStatusRule::status_link
+    fn execute_link_writes_in(
+        &self,
+        record_name: &[u8],
+        rec: InFrame<'_>,
+        actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
+        visited: &mut ProcStack,
+    ) -> ControlFlow<DbStatus, DbResult> {
+        let mut status = Ok(());
+        for action in actions {
+            match action {
+                crate::server::record::ProcessAction::WriteDbLink { link_field, value } => {
+                    if let Err(e) =
+                        self.write_db_link_action(record_name, rec, link_field, value, visited)?
+                        && Self::is_status_link(rec, link_field)
+                    {
+                        status = Err(e);
+                    }
+                }
+                other => {
+                    self.run_process_actions(record_name, rec, [other], visited)?;
+                }
+            }
+        }
+        ControlFlow::Continue(status)
+    }
+
+    /// A failed [`ProcessAction::WriteDbLinkOrReturn`]: C's `process()` has
+    /// returned with `pact` still set, so the cycle ends here and nothing
+    /// releases PACT.
+    ///
+    /// [`ProcessAction::WriteDbLinkOrReturn`]: crate::server::record::ProcessAction::WriteDbLinkOrReturn
+    #[cold]
+    fn return_with_pact_held(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+        exit: crate::server::record::PactExit,
+    ) {
+        rec.read().enter_pact();
+        self.apply_pact_exit(name, exit);
+    }
+
+    #[cold]
+    fn is_status_link(rec: InFrame<'_>, link_field: &'static str) -> bool {
+        let instance = rec.read();
+        rec.rdes().process_status(&*instance.record).status_link == Some(link_field)
+    }
+
     /// Execute ProcessActions returned by a record's process() call.
     ///
     /// Actions are executed in order:
@@ -7735,6 +8059,12 @@ impl PvDatabase {
     /// - GetLink: reads a linked PV value and hands it to the record
     /// - WriteDbLink: writes a value to a linked PV
     /// - ReprocessAfter: schedules a delayed re-process via tokio::spawn
+    ///
+    /// Where nothing reads `process()`'s return: a failed
+    /// [`ProcessAction::WriteDbLinkOrReturn`] still ends the list, as its C
+    /// `return` ends the function that put.
+    ///
+    /// [`ProcessAction::WriteDbLinkOrReturn`]: crate::server::record::ProcessAction::WriteDbLinkOrReturn
     pub(super) fn execute_process_actions_in(
         &self,
         record_name: &[u8],
@@ -7742,6 +8072,21 @@ impl PvDatabase {
         actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
         visited: &mut ProcStack,
     ) {
+        let _ = self.run_process_actions(record_name, rec, actions, visited);
+    }
+
+    /// [`Self::execute_process_actions_in`] inside a `process()` cycle:
+    /// `Break` is a failed [`ProcessAction::WriteDbLinkOrReturn`], whose
+    /// status `process()` returned; the actions after it do not run.
+    ///
+    /// [`ProcessAction::WriteDbLinkOrReturn`]: crate::server::record::ProcessAction::WriteDbLinkOrReturn
+    fn run_process_actions(
+        &self,
+        record_name: &[u8],
+        rec: InFrame<'_>,
+        actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
+        visited: &mut ProcStack,
+    ) -> ControlFlow<DbStatus> {
         use crate::server::record::ProcessAction;
 
         for action in actions {
@@ -7756,75 +8101,26 @@ impl PvDatabase {
                     // loudly on another.
                     let more =
                         self.read_link_for_record(rec, link_field, Some(target_field), visited);
-                    self.execute_process_actions_in(record_name, rec, more, visited);
+                    self.run_process_actions(record_name, rec, more, visited)?;
                 }
                 ProcessAction::GetLink { link_field } => {
                     let more = self.read_link_for_record(rec, link_field, None, visited);
-                    self.execute_process_actions_in(record_name, rec, more, visited);
+                    self.run_process_actions(record_name, rec, more, visited)?;
                 }
                 // A pre-process action (the record asks for the target BEFORE it
                 // decides), so it is a no-op if it reaches the post-process
                 // stage — the resolve here would be too late to change anything.
                 ProcessAction::ResolveOutTarget { .. } => {}
                 ProcessAction::WriteDbLink { link_field, value } => {
-                    // 1. Get the record's stored link for the field
-                    // and the source PUTF for processTarget propagation.
-                    let (parsed, src_putf, src_notify) = {
-                        let instance = rec.read();
-                        let link = instance
-                            .stored_link_shared(link_field)
-                            .filter(|l| !matches!(***l, crate::server::record::ParsedLink::None))
-                            .cloned();
-                        debug_assert!(
-                            instance.stored_link(link_field).is_some(),
-                            "WriteDbLink on {link_field}, which is not a link of the record"
-                        );
-                        (link, instance.common.putf, instance.notify.clone())
-                    };
-                    let Some(parsed) = parsed else {
-                        // No link to put through: C `dbPutLink` on an
-                        // unresolved link is a failure, and the emitter is
-                        // told so — every emitted action reports exactly once,
-                        // so a record deriving a field from the result cannot
-                        // be left holding a stale one.
-                        let more = rec
-                            .write()
-                            .record
-                            .set_out_link_write_status(link_field, &value, true);
-                        self.execute_process_actions_in(record_name, rec, more, visited);
-                        continue;
-                    };
-                    // 2. Write to the linked PV — DB *or*
-                    // external `ca://`/`pva://`. A record's `process()`
-                    // emits `WriteDbLink` to drive an OUT-link field
-                    // (transform `OUTn`, throttle/scaler `COUTP`, epid
-                    // `TRIG`/`OUTL`); that field may resolve to a CA/PVA
-                    // link, which C `dbPutLink` routes through the link
-                    // set's `putValue` identically to a DB link
-                    // (dbLink.c:434-448). The field is a `DBF_OUTLINK`, so its
-                    // slot carries the OUT modifier mask
-                    // (`dbStaticLib.c:2382-2387`); a removed one is
-                    // `S_db_noLSET` with no alarm.
-                    let failed = self.write_out_link_value(
-                        rec,
-                        parsed,
-                        super::PutSrc::Value(&value),
-                        super::links::OutLinkSrc {
-                            putf: src_putf,
-                            notify: src_notify.as_ref(),
-                            field: link_field,
-                        },
-                        visited,
-                    );
-                    // The record-owned half of the put's outcome. The alarm
-                    // half was already raised by `write_out_link_value`; this
-                    // is what lets a record keep a C-truthful status field
-                    // (throttle STS) instead of committing its own intent.
-                    let more = rec
-                        .write()
-                        .record
-                        .set_out_link_write_status(link_field, &value, failed);
-                    self.execute_process_actions_in(record_name, rec, more, visited);
+                    let _ =
+                        self.write_db_link_action(record_name, rec, link_field, value, visited)?;
+                }
+                ProcessAction::WriteDbLinkOrReturn { link_field, value } => {
+                    if let Err(e) =
+                        self.write_db_link_action(record_name, rec, link_field, value, visited)?
+                    {
+                        return ControlFlow::Break(e);
+                    }
                 }
                 ProcessAction::DeviceCommand { command, ref args } => {
                     let mut instance = rec.write();
@@ -7925,7 +8221,8 @@ impl PvDatabase {
                     let token = Self::mint_async_token_in(record_name, rec);
                     let (waitset, completion) = Self::new_put_notify();
                     if let Some(parsed) = parsed {
-                        self.write_out_link_value(
+                        // sseq's `process()` returns 0 whatever the put did.
+                        let _ = self.write_out_link_value(
                             rec,
                             parsed,
                             super::PutSrc::Owned(value),
@@ -7967,6 +8264,7 @@ impl PvDatabase {
                 }
             }
         }
+        ControlFlow::Continue(())
     }
 
     /// Complete an asynchronous record's post-process steps.
@@ -8256,8 +8554,10 @@ impl PvDatabase {
                 notify: src_notify.as_ref(),
                 field: "OUT",
             };
+            // The completing pass's status reaches nobody: the put that started
+            // the cycle was answered when the record went PACT.
             if let Some((out, out_val)) = out_info {
-                self.write_out(rec, out, out_val, src, visited);
+                let _ = self.write_out(rec, out, out_val, src, visited);
             }
             // Same `conditional_write` epilogue as the synchronous stage. C
             // runs it on the async device's first pass as well (the record
@@ -8506,17 +8806,17 @@ impl PvDatabase {
         skip_out: bool,
         src: super::links::OutLinkSrc<'_>,
         visited: &mut ProcStack,
-    ) {
+    ) -> crate::error::DbResult {
         let Some((siol, _sims, raw_mode)) = sim_output else {
-            return;
+            return Ok(());
         };
         // IVOA Don't_drive veto (C skips `writeValue` entirely) and a
         // non-writable SIOL (empty / constant — C `dbPutLink` no-op) both
         // suppress the write.
         if skip_out || !siol.is_writable_out_link() {
-            return;
+            return Ok(());
         }
-        self.write_siol(rec, siol, *raw_mode, src, visited);
+        self.write_siol(rec, siol, *raw_mode, src, visited)
     }
 
     /// [`Self::write_simulated_output_siol`] past its gates, out of line so a
@@ -8528,7 +8828,7 @@ impl PvDatabase {
         raw_mode: bool,
         src: super::links::OutLinkSrc<'_>,
         visited: &mut ProcStack,
-    ) {
+    ) -> crate::error::DbResult {
         // The record's own OUT value (RAW: RVAL) — matching C `writeValue`
         // (`dbPutLink(&prec->siol, ..., &prec->oval)`), so the SIOL redirect
         // sends exactly what the real OUT link would have.
@@ -8544,8 +8844,8 @@ impl PvDatabase {
                 super::PutSrc::of_output(rec, &instance, false)
             }
         };
-        if let Some(value) = value {
-            self.write_out_link_value(
+        match value {
+            Some(value) => self.write_out_link_value(
                 rec,
                 Arc::clone(siol),
                 value,
@@ -8554,7 +8854,8 @@ impl PvDatabase {
                     ..src
                 },
                 visited,
-            );
+            ),
+            None => Ok(()),
         }
     }
 
@@ -8701,6 +9002,7 @@ impl PvDatabase {
     /// `setLinkAlarm`, but the PP rule applies first: C `dbGetLink` on a
     /// `ProcessPassive` DB link processes the passive source before reading it.
     /// Used by sel's NVL→SELN read and the closed-loop DOL read.
+    #[inline]
     pub(crate) fn db_get_input_link_in(
         &self,
         reader: InFrame<'_>,
@@ -8712,8 +9014,12 @@ impl PvDatabase {
         crate::server::recgbl::simm::LinkFetch,
         Option<crate::server::record::record_instance::SourceRender>,
     ) {
-        if let crate::server::record::ParsedLink::Db(db) = link {
-            self.process_passive_db_source(db, visited);
+        // C `dbDbGetValue` returns `dbScanPassive`'s status unread.
+        if let crate::server::record::ParsedLink::Db(db) = link
+            && self.process_passive_db_source(db, visited).is_err()
+        {
+            self.db_get_link_failed(reader, link_field, link);
+            return (crate::server::recgbl::simm::LinkFetch::Failed, None);
         }
         self.db_get_link_rendered_in(reader, link_field, link, render)
     }
@@ -9892,7 +10198,7 @@ impl PvDatabase {
         // write follows the body), so only an INPUT record reaches here — its
         // `readValue` precedes the body, so the SIOL read + convert are done
         // in place and the caller short-circuits.
-        {
+        let read_status = {
             // C `readValue` raises the SIMM severity at the TOP of the
             // `case menuYesNoYES:` arm — BEFORE the SIOL read
             // (`longinRecord.c:414` `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`,
@@ -10095,7 +10401,12 @@ impl PvDatabase {
                 fetch_ok,
                 rec.process_plan(),
             );
-        }
+            if fetch_ok {
+                Ok(())
+            } else {
+                Err(DbStatus::FAILED)
+            }
+        };
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
         // (`prec->pact = FALSE`, aiRecord.c:496 / aoRecord.c:578). On the
@@ -10112,7 +10423,7 @@ impl PvDatabase {
             rec.read().pact_exit_without_release()
         };
 
-        (SimOutcome::Simulated, exit)
+        (SimOutcome::Simulated(read_status), exit)
     }
 }
 
@@ -10867,6 +11178,7 @@ fn runs_in_link_stage(a: &crate::server::record::ProcessAction) -> bool {
     matches!(
         a,
         crate::server::record::ProcessAction::WriteDbLink { .. }
+            | crate::server::record::ProcessAction::WriteDbLinkOrReturn { .. }
             | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
             | crate::server::record::ProcessAction::GetLink { .. }
             | crate::server::record::ProcessAction::ReadDbLink { .. }

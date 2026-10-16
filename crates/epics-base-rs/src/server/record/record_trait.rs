@@ -2067,6 +2067,16 @@ pub enum ProcessAction {
         value: EpicsValue,
     },
 
+    /// A [`Self::WriteDbLink`] whose failure is C's `if (status) return
+    /// status;` with `pact` still set (`tableRecord.c:574-576`, `:1001-1004`):
+    /// `process()` returns the put's status there, and the cycle runs no
+    /// further action, alarm commit, monitor or forward link. The record
+    /// stays PACT, as C leaves it.
+    WriteDbLinkOrReturn {
+        link_field: &'static str,
+        value: EpicsValue,
+    },
+
     /// Resolve an OUT link's TARGET ([`OutTarget`]) and hand it to the record
     /// through [`Record::set_resolved_out_target`], BEFORE `process()` runs.
     ///
@@ -2553,6 +2563,97 @@ pub enum RecordProcessResult {
     CompleteAlarmOnly,
 }
 
+/// Which statuses of the framework's cycle a type's C `process()` returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessStatusRule {
+    /// `readValue`/`writeValue`'s status: a failed device read or write, the
+    /// SIOL link's under simulation, and an illegal SIMM's -1.
+    pub io: bool,
+    /// The Soft Channel dsets whose `read_xxx`/`write_xxx` return the INP or
+    /// OUT link's status.
+    pub soft: SoftStatus,
+    /// The soft dset is `dbGetLinkLS`/`dbPutLinkLS`'s, which return 0 for an
+    /// unconnected link (`dbLink.c:504-505`).
+    pub ls: bool,
+    pub dol: DolStatus,
+    /// The link of a [`ProcessAction::WriteDbLink`] whose `dbPutLink`
+    /// status `process()` returns (`motorRecord.cc:1495`, RLNK).
+    pub status_link: Option<&'static str>,
+}
+
+impl ProcessStatusRule {
+    /// A `process()` that returns 0 whatever its links did.
+    pub const ZERO: Self = Self {
+        io: false,
+        soft: SoftStatus::NONE,
+        ls: false,
+        dol: DolStatus::Dropped,
+        status_link: None,
+    };
+
+    /// `readValue`/`writeValue`'s status, with `soft`'s dsets passing the
+    /// link's up.
+    pub const fn io(soft: SoftStatus) -> Self {
+        Self {
+            io: true,
+            soft,
+            ..Self::ZERO
+        }
+    }
+
+    pub const fn with_dol(self, dol: DolStatus) -> Self {
+        Self { dol, ..self }
+    }
+
+    pub const fn ls(self) -> Self {
+        Self { ls: true, ..self }
+    }
+
+    pub const fn with_status_link(self, link: &'static str) -> Self {
+        Self {
+            status_link: Some(link),
+            ..self
+        }
+    }
+}
+
+/// [`ProcessStatusRule::soft`], one flag per [`SoftDtyp`](crate::server::device_support::SoftDtyp).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoftStatus {
+    pub plain: bool,
+    pub raw: bool,
+    pub async_: bool,
+}
+
+impl SoftStatus {
+    pub const NONE: Self = Self {
+        plain: false,
+        raw: false,
+        async_: false,
+    };
+
+    pub const fn returns(self, dtyp: crate::server::device_support::SoftDtyp) -> bool {
+        use crate::server::device_support::SoftDtyp;
+        match dtyp {
+            SoftDtyp::Plain => self.plain,
+            SoftDtyp::Raw => self.raw,
+            SoftDtyp::Async => self.async_,
+        }
+    }
+}
+
+/// What a failed closed-loop DOL read does to `process()`'s status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DolStatus {
+    /// Overwritten or never kept (`mbboRecord.c`, `lsoRecord.c`).
+    Dropped,
+    /// Kept unless `writeValue` runs and replaces it — only IVOA "Don't
+    /// drive outputs" keeps it (`aoRecord.c:196-223`).
+    UntilWrite,
+    /// Returned whatever the outputs did (`dfanoutRecord.c:119`).
+    Kept,
+}
+
 /// Complete outcome of a record's process() call.
 ///
 /// Contains the processing result (Complete, AsyncPending, etc.) and a list
@@ -2595,6 +2696,10 @@ pub struct ProcessOutcome {
     /// gates `recGblFwdLink` at `motorRecord.cc:1509-1510`, so it is read after
     /// it is set and does not belong here.
     pub post_write_fields: Vec<(PostStage, String, EpicsValue)>,
+    /// The status the record's own `process()` returns: epid's `do_pid`
+    /// status (`epidRecord.c:214`), aao's failed DOL (`aaoRecord.c:167-168`).
+    /// The framework's statuses are [`Record::process_status_rule`]'s.
+    pub status: crate::error::DbResult,
 }
 
 /// Who posts a [`ProcessOutcome::post_write_fields`] entry, stored after the
@@ -2618,6 +2723,7 @@ impl ProcessOutcome {
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         }
     }
 
@@ -2628,6 +2734,7 @@ impl ProcessOutcome {
             actions,
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         }
     }
 
@@ -2640,6 +2747,7 @@ impl ProcessOutcome {
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         }
     }
 
@@ -2669,6 +2777,7 @@ impl ProcessOutcome {
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         }
     }
 
@@ -2679,6 +2788,7 @@ impl ProcessOutcome {
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         }
     }
 }
@@ -4042,6 +4152,12 @@ pub trait Record: Send + Sync + 'static {
     /// returns 0, so its convert runs on the unchanged RVAL.
     fn raw_soft_read_failure_skips_convert(&self) -> bool {
         false
+    }
+
+    /// Which of the cycle's statuses C's `process()` returns; the record's
+    /// own is [`ProcessOutcome::status`].
+    fn process_status_rule(&self) -> ProcessStatusRule {
+        ProcessStatusRule::ZERO
     }
 
     /// The `DTYP="Raw Soft Channel"` OUTPUT dset — C's four `devXxxSoftRaw.c`

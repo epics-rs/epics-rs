@@ -43,7 +43,10 @@ async fn an_invalid_pva_link_names_disconn_on_read_and_the_field_on_put() {
         ("PL:CALC", "INPA Disconn"),
         ("PL:AO", "field OUT"),
     ] {
-        db.process_record(rec).await.unwrap();
+        db.process_record(rec)
+            .await
+            .or_else(epics_base_rs::error::CaError::unless_process_status)
+            .unwrap();
         let cell = db.get_record(rec).unwrap();
         let inst = cell.read();
         assert_eq!(inst.common.sevr, AlarmSeverity::Invalid, "{rec}");

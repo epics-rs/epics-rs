@@ -419,6 +419,12 @@ impl Record for MotorRecord {
         "motor"
     }
 
+    /// `motorRecord.cc:1495`: `status = dbPutLink(&pmr->rlnk, ...)` is what
+    /// `process()` returns.
+    fn process_status_rule(&self) -> epics_base_rs::server::record::ProcessStatusRule {
+        epics_base_rs::server::record::ProcessStatusRule::ZERO.with_status_link("RLNK")
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
@@ -495,6 +501,7 @@ impl Record for MotorRecord {
                 // an input to a later decision in the same cycle, not a
                 // completion flag published after the writes.
                 post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             // Ongoing motion or idle: the cycle's monitor() posts the marks.

@@ -1581,7 +1581,8 @@ impl IocBuild {
                     tracing::debug!("iocInit: {connected}/{total} external links connected");
                 } else {
                     let unconnected = db.unconnected_external_links().await;
-                    tracing::info!(
+                    // C's iocInit has no link wait and prints nothing here.
+                    tracing::debug!(
                         target: "epics_base_rs::ioc_app",
                         connected,
                         total,
@@ -2912,7 +2913,8 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: &str) 
 /// `scanAdd` failure paths cannot be present on one startup route and absent on
 /// the other.
 pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
-    let all_names = db.all_record_names().await;
+    // `buildScanLists` order (`dbScan.c:1054-1076`), so the refusals print in C's.
+    let all_names = db.iterate_record_names().await;
     let io_intr_recs: Vec<(crate::types::RecordName, Arc<record::RecordCell>)> = {
         let mut recs = Vec::new();
         for name in &all_names {

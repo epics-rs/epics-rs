@@ -108,9 +108,11 @@ async fn a_link_put_opens_the_link_before_the_put_returns() {
     .await
     .unwrap();
     assert_eq!(lset.opened.lock()[init..], ["OL:Q"]);
-    // Not a link's text: nothing opens.
+    // Not a link's text: nothing opens. The put processes OL:AI, whose dead
+    // INP is the put's status.
     db.put_record_field_from_ca_no_notify("OL:AI", "VAL", EpicsValue::Double(1.0))
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     assert_eq!(lset.opened.lock().len(), init + 1);
 }

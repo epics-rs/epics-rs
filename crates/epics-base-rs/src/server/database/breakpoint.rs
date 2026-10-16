@@ -1787,6 +1787,7 @@ mod tests {
             .expect("VAL");
         db.process_record_with_links("BPO:src", &mut crate::server::database::ProcStack::new())
             .await
+            .or_else(crate::error::CaError::unless_process_status)
             .expect("process");
         assert_eq!(
             db.get_pv("BPO:new").expect("BPO:new").to_f64(),

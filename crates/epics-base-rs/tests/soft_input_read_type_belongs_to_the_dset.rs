@@ -54,7 +54,10 @@ async fn settle(db: &PvDatabase, name: &str) {
 
 /// Process `name` and return `fields` and its STAT.
 async fn read_after_process(db: &PvDatabase, name: &str, fields: &[&str]) -> Vec<EpicsValue> {
-    db.process_record(name).await.unwrap();
+    db.process_record(name)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
     settle(db, name).await;
     let rec = db.get_record(name).unwrap();
     let inst = rec.read();
@@ -177,7 +180,10 @@ record(ai, "ASYNC") {
 }"#)
     .await;
     for (name, stat, amsg) in [("PLAIN", 14, "field INP"), ("ASYNC", 1, "")] {
-        db.process_record(name).await.unwrap();
+        db.process_record(name)
+            .await
+            .or_else(epics_base_rs::error::CaError::unless_process_status)
+            .unwrap();
         settle(&db, name).await;
         let rec = db.get_record(name).unwrap();
         let inst = rec.read();

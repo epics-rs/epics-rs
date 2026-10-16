@@ -61,6 +61,7 @@ fn allocs(db: Arc<PvDatabase>, rec: &'static str) -> usize {
     MandatoryThread::new("scan-1", ThreadPriority::ScanLow, StackSizeClass::Big).spawn(move || {
         for _ in 0..3 {
             db.process_record_with_links_already_locked(rec, &mut ProcStack::new())
+                .or_else(epics_base_rs::error::CaError::unless_process_status)
                 .unwrap();
         }
         let mut visited = ProcStack::new();
@@ -68,6 +69,7 @@ fn allocs(db: Arc<PvDatabase>, rec: &'static str) -> usize {
         COUNTING.with(|c| c.set(true));
         for _ in 0..100 {
             db.process_record_with_links_already_locked(rec, &mut visited)
+                .or_else(epics_base_rs::error::CaError::unless_process_status)
                 .unwrap();
         }
         COUNTING.with(|c| c.set(false));

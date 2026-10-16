@@ -4079,27 +4079,47 @@ impl LinkFieldType {
     }
 }
 
-/// Does `s`, read as a `DBF_OUTLINK`, carry a `CP`/`CPP` modifier that
-/// [`parse_output_link_v2`] will discard?
+/// The target of `s`, read as a `DBF_OUTLINK`, when it carries a `CP`/`CPP`
+/// modifier that [`parse_output_link_v2`] will discard: C's `pinfo->target`,
+/// the text before the first space.
 ///
-/// The query behind C's load-time warning (`dbStaticLib.c:2382-2386`
-/// `"Discarding CP/CPP modifier in CA output link from %s.%s to %s."`). It uses
-/// the same modifier resolution as the parser, so it cannot drift from what is
-/// actually discarded — unlike a trailing-`" CP"` text test, which misses
-/// `"TARGET CP MS"` and mis-fires on a target whose *name* ends in `CP`.
-pub fn out_link_discards_cp(s: impl AsRef<[u8]>) -> bool {
-    let s = trim_link_text(s.as_ref());
-    // Only a plain PV link reaches the modifier scan in C; a JSON/hardware/
-    // scheme link never does.
-    if matches!(s.first(), None | Some(b'{' | b'@' | b'#' | b'"')) {
-        return false;
+/// Only a PV link reaches C's modifier scan, so the text first goes through
+/// `dbParseLink`'s tests in its order (`dbStaticLib.c:2266-2357`): `@` INST_IO,
+/// `{…}` JSON, `#` hardware, an empty or wholly numeric CONSTANT, a `[…]`
+/// array CONSTANT. The modifiers resolve as the parser's do, so a target
+/// whose *name* ends in `CP` is not mistaken for one.
+pub fn out_link_discards_cp(s: &[u8]) -> Option<&[u8]> {
+    let s = trim_link_text(s);
+    let wrapped = |open: u8, close: u8| s.first() == Some(&open) && s.last() == Some(&close);
+    if matches!(s.first(), None | Some(b'@' | b'#'))
+        || wrapped(b'{', b'}')
+        || wrapped(b'[', b']')
+        || std::str::from_utf8(s).is_ok_and(|t| parse_c_double(t).is_some())
+    {
+        return None;
     }
-    let Some(space) = s.iter().position(|&b| b == b' ') else {
-        return false;
-    };
-    // Resolve through the same chain the parser uses, so the warning cannot
-    // drift from the mask: exactly the classes the OUT mask downgrades.
-    ProcessClass::from_modifier_text(&s[space + 1..]).is_cp_or_cpp()
+    let space = s.iter().position(|&b| b == b' ')?;
+    ProcessClass::from_modifier_text(&s[space + 1..])
+        .is_cp_or_cpp()
+        .then(|| &s[..space])
+}
+
+/// C `dbParseLink`'s warning for the `CP`/`CPP` a `DBF_OUTLINK` discards
+/// (`dbStaticLib.c:2382-2387`). C prints it on every parse, so its three
+/// callers each print it: the `.db` load, `iocInit`'s `dbInitRecordLinks` and a
+/// runtime `dbPutFieldLink`; the port calls this at each of their counterparts.
+pub(crate) fn warn_discarded_cp(record: &[u8], field: &str, ftype: LinkFieldType, text: &[u8]) {
+    if ftype != LinkFieldType::Out {
+        return;
+    }
+    if let Some(target) = out_link_discards_cp(text) {
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "{}: Discarding CP/CPP modifier in CA output link from {}.{field} to {}.\n",
+            crate::runtime::log::erl_warning(),
+            String::from_utf8_lossy(record),
+            String::from_utf8_lossy(target),
+        ));
+    }
 }
 
 /// Split a link string into its target and its modifiers, mirroring C
@@ -5524,7 +5544,10 @@ mod json_link_tests {
     #[test]
     fn out_link_discards_cp_predicate_tracks_the_mask() {
         for text in ["TARGET CP", "TARGET CPP", "TARGET CP MS", "TARGET MSI CPP"] {
-            assert!(out_link_discards_cp(text), "{text} loses its CP/CPP");
+            assert!(
+                out_link_discards_cp(text.as_bytes()).is_some(),
+                "{text} loses its CP/CPP"
+            );
         }
         for text in [
             "TARGET",            // no modifiers at all
@@ -5536,7 +5559,10 @@ mod json_link_tests {
             "\"CP\"",            // quoted constant, never modifier-scanned
             "{ca: {pv: \"X\"}}", // JSON link, never modifier-scanned
         ] {
-            assert!(!out_link_discards_cp(text), "{text} discards nothing");
+            assert!(
+                out_link_discards_cp(text.as_bytes()).is_none(),
+                "{text} discards nothing"
+            );
         }
     }
 

@@ -1028,6 +1028,7 @@ async fn the_d_arm_inherits_link_severity_as_c_does() {
             }
             db.process_record_with_links("S", &mut visited)
                 .await
+                .or_else(crate::error::CaError::unless_process_status)
                 .unwrap();
             db.process_record_with_links("T", &mut visited)
                 .await
@@ -1074,6 +1075,7 @@ async fn ao_with_lent_out_target(
     db.put_pv("T", EpicsValue::Double(6.0)).await.unwrap();
     db.process_record_with_links("T", &mut super::ProcStack::new())
         .await
+        .or_else(crate::error::CaError::unless_process_status)
         .unwrap();
     db
 }

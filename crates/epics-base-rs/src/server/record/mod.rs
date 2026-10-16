@@ -53,7 +53,7 @@ pub use link::{
 };
 pub(crate) use link::{
     DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif,
-    json_const_value, trim_link_text,
+    json_const_value, trim_link_text, warn_discarded_cp,
 };
 pub(crate) use menu_choices::{EnumChoice, enum_state_choice};
 pub use menu_choices::{
@@ -78,18 +78,18 @@ pub(crate) use record_instance::{
 pub use record_trait::{
     AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,
     ConstantInitLink, CycleCell, CycleHooks, CycleList, CycleMarks, CyclePostMask, CycleRead,
-    CycleValue, DeadbandCells, DeclaredFields, DelayedCallbackOutcome,
+    CycleValue, DeadbandCells, DeclaredFields, DelayedCallbackOutcome, DolStatus,
     EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots, FORCE_GENERAL, FieldDeclaration, FieldDesc,
     FieldMetadataOverride, FieldSlot, InitLinkReads, InputFetchPolicy, InputLinkRequest, LinkRead,
     LinkReadAs, MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate, OutTarget, OutView,
     Pact, PostName, PostStage, PostTable, PostedValue, ProcessAction, ProcessActions,
-    ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult,
-    ResolvedInputLinks, SecondaryTake, SharedAfterWork, SimmCells, SlotMut, SlotRef, Special,
-    SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
-    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value, declared_field_ix,
-    declared_post_table, declared_set, field_at, input_link_slots_of, link_value_in_field_shape,
-    monitor_deadband_classes, put_field_internal_default, put_value_in_field_shape,
-    seed_input_links, uniform_post_table,
+    ProcessContext, ProcessOutcome, ProcessSnapshot, ProcessStatusRule, RawSoftEntry, Record,
+    RecordProcessResult, ResolvedInputLinks, SecondaryTake, SharedAfterWork, SimmCells, SlotMut,
+    SlotRef, SoftStatus, Special, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset,
+    arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
+    declared_field_ix, declared_post_table, declared_set, field_at, input_link_slots_of,
+    link_value_in_field_shape, monitor_deadband_classes, put_field_internal_default,
+    put_value_in_field_shape, seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{InitGetFailure, InitRead};
 pub(crate) use record_trait::{

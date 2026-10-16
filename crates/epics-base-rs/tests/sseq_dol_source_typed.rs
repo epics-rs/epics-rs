@@ -297,6 +297,7 @@ impl Record for PickyReader {
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         })
     }
     fn pre_process_actions(&mut self) -> ProcessActions {

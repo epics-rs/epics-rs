@@ -366,6 +366,7 @@ impl ScalcoutRecord {
             }],
             device_did_compute: false,
             post_write_fields: Vec::new(),
+            status: Ok(()),
         })
     }
 
@@ -1109,6 +1110,7 @@ impl Record for ScalcoutRecord {
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
+                status: Ok(()),
             });
         }
 

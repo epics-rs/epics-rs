@@ -132,21 +132,7 @@ impl Diag {
     }
 }
 
-/// C `epicsSocketConvertErrorToString` / `epicsSocketConvertErrnoToString`
-/// (`epicsSocketConvertErrnoToString.cpp:25-38`), which are `strerror` into
-/// a 64-byte buffer. `io::Error`'s Display is the same sentence with
-/// ` (os error N)` appended, so the suffix comes off rather than the text
-/// being rebuilt from a table this port would have to keep in step.
-pub(crate) fn sock_err_string(e: &io::Error) -> String {
-    let text = e.to_string();
-    match e.raw_os_error() {
-        Some(errno) => text
-            .strip_suffix(&format!(" (os error {errno})"))
-            .unwrap_or(&text)
-            .to_string(),
-        None => text,
-    }
-}
+pub(crate) use epics_base_rs::net::sock_err_string;
 
 /// Per-client connected UDP socket, matching C EPICS repeaterClient.
 /// Using a connected socket lets the OS detect dead clients via

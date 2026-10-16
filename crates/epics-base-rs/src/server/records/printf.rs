@@ -900,6 +900,16 @@ impl Record for PrintfRecord {
         "printf"
     }
 
+    /// devPrintfSoft.c and devPrintfSoftCallback.c return `dbPutLinkLS`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: true,
+        })
+        .ls()
+    }
+
     /// printf is THE exception to "a constant link delivers nothing at
     /// process". Its `GET_PRINT` macro (`printfRecord.c:49-52`) is
     ///

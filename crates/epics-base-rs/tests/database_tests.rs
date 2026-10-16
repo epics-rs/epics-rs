@@ -113,6 +113,7 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BROKEN", &mut visited)
         .await
+        .or_else(CaError::unless_process_status)
         .unwrap();
 
     let rec = db.get_record("BROKEN").expect("record exists");
@@ -621,6 +622,7 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
     // Must not panic; process completes cleanly.
     db.process_record_with_links("AO_NOLSET", &mut visited)
         .await
+        .or_else(CaError::unless_process_status)
         .expect("process must complete despite the unresolvable OUT link");
 
     let rec = db.get_record("AO_NOLSET").expect("record exists");
@@ -3655,6 +3657,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
                     )],
                     device_did_compute: false,
                     post_write_fields: Vec::new(),
+                    status: Ok(()),
                 })
             } else {
                 // Continuation reached: complete cleanly, clear PACT.
@@ -9772,6 +9775,7 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
             let mut visited = epics_base_rs::server::database::ProcStack::new();
             db.process_record_with_links(name, &mut visited)
                 .await
+                .or_else(CaError::unless_process_status)
                 .unwrap();
         }
     }

@@ -324,6 +324,8 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   the closed set the record's C `process()` + `monitor()` post:
 ///   `Record::process_posted_fields` answers `Some` of the named
 ///   `[FieldIx; N]`, e.g. a `declared_set`
+/// - `#[record(type = "longin", process_status = LONGIN_STATUS)]` —
+///   `Record::process_status_rule` answers the named `ProcessStatusRule`
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -440,6 +442,8 @@ struct RecordAttrs {
     /// `Record::soft_input_request`; the variant path is resolved by rustc, so
     /// a misspelt one is a compile error.
     soft_input_read_as: Option<syn::Ident>,
+    /// `#[record(process_status = SOME_RULE)]`.
+    process_status: Option<syn::Path>,
 }
 
 struct FieldInfo {
@@ -812,6 +816,15 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         quote! {}
     };
 
+    let process_status_method = match &attrs.process_status {
+        Some(path) => quote! {
+            fn process_status_rule(&self) -> #krate::server::record::ProcessStatusRule {
+                #path
+            }
+        },
+        None => quote! {},
+    };
+
     // `#[record(soft_input_read_as = Variant)]` — emit
     // `Record::soft_input_request` answering that variant under every soft DTYP.
     let soft_input_request_method = match &attrs.soft_input_read_as {
@@ -965,6 +978,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #value_monitor_method
             #computed_udf_method
             #soft_input_request_method
+            #process_status_method
             #cycle_cell_methods
             #metadata_override_method
             #link_metadata_field_method
@@ -1033,6 +1047,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut process_posted_fields: Option<syn::Path> = None;
     let mut dset_owns_udf_on_computed = false;
     let mut soft_input_read_as: Option<syn::Ident> = None;
+    let mut process_status: Option<syn::Path> = None;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -1093,13 +1108,17 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                 } else if meta.path.is_ident("soft_input_read_as") {
                     soft_input_read_as = Some(meta.value()?.parse()?);
                     Ok(())
+                } else if meta.path.is_ident("process_status") {
+                    process_status = Some(meta.value()?.parse()?);
+                    Ok(())
                 } else {
                     Err(meta.error(
                         "expected `type`, `crate_path`, `constant_init`, `init`, \
                          `metadata_override`, `link_metadata_field`, \
                          `no_value_monitor`, `take_cycle_posted_fields`, \
                          `fields_posted_only_when_marked`, `process_posted_fields`, \
-                         `dset_owns_udf_on_computed` or `soft_input_read_as`",
+                         `dset_owns_udf_on_computed`, `soft_input_read_as` or \
+                         `process_status`",
                     ))
                 }
             })?;
@@ -1122,6 +1141,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         process_posted_fields,
         dset_owns_udf_on_computed,
         soft_input_read_as,
+        process_status,
     })
 }
 

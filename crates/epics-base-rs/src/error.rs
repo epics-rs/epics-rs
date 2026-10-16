@@ -163,6 +163,148 @@ pub enum CaError {
     /// rsrv answers `ECA_PUTFAIL`.
     #[error("get conversion failed: {0}")]
     GetConvertFailed(String),
+
+    /// A put that landed and then processed the record, whose `dbProcess`
+    /// returned non-zero (`dbPutField`, `dbAccess.c:1279`). The value stays
+    /// written and the cycle ran; only the status is the failure. Every plain
+    /// put reports it — `dbChannel_put` folds any non-zero status to -1 for
+    /// rsrv (`db_access.c:980`), pvxs throws on it (`iocsource.cpp:420`) —
+    /// and no put-callback does: `dbNotify` never reads the process status.
+    #[error("{0}")]
+    ProcessStatus(DbStatus),
+}
+
+impl CaError {
+    /// A process frame's error as a put-callback sees it: `dbNotify` never
+    /// reads `dbProcess`'s status (`dbNotify.c:261`), so it is no error.
+    pub fn unless_process_status(self) -> CaResult<()> {
+        match self {
+            Self::ProcessStatus(_) => Ok(()),
+            e => Err(e),
+        }
+    }
+}
+
+/// A non-zero C `long` status a record's `process()` returned. A `Copy` word,
+/// so the cycle can carry it without allocating; its text is rendered only
+/// where a server reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbStatus(std::num::NonZeroI32);
+
+/// C's `long status` on the cycle path: `Ok` is 0.
+pub type DbResult = Result<(), DbStatus>;
+
+impl DbStatus {
+    /// The bare `-1` `dbCa`, pvalink and most device support return.
+    pub const FAILED: Self = Self::of(-1);
+    /// `S_db_noLSET`: a put through a link with no lset entry.
+    pub const NO_LSET: Self = Self::of((511 << 16) | 21);
+    /// `S_db_badDbrtype`.
+    pub const BAD_DBRTYPE: Self = Self::of((511 << 16) | 3);
+    /// `S_dev_missingSup`: a `process()` whose dset routine is absent.
+    pub const MISSING_SUP: Self = Self::of((514 << 16) | 5);
+
+    const fn of(status: i32) -> Self {
+        match Self::new(status) {
+            Some(s) => s,
+            None => panic!("a status constant is non-zero"),
+        }
+    }
+
+    /// The status a process frame's `Err` stands for: its own, or `-1` for a
+    /// failure that never had one.
+    pub fn of_error(e: &CaError) -> Self {
+        match e {
+            CaError::ProcessStatus(s) => *s,
+            _ => Self::FAILED,
+        }
+    }
+
+    /// `None` for 0, which is success and no status.
+    #[must_use]
+    pub const fn new(status: i32) -> Option<Self> {
+        match std::num::NonZeroI32::new(status) {
+            Some(s) => Some(Self(s)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0.get()
+    }
+
+    /// C `errSymLookup` (`errSymLib.c:158-212`): a module below
+    /// `MIN_MODULE_NUM` is an errno, a status in a linked symbol table is its
+    /// message, anything else `errRawCopy`'s numbers — so the `-1` a soft
+    /// device support returns reads "Error (65535,65535)".
+    #[must_use]
+    pub fn text(self) -> std::borrow::Cow<'static, str> {
+        const MIN_MODULE_NUM: u32 = 501;
+        let status = self.get();
+        let modnum = (status as u32 >> 16) & 0xffff;
+        let errnum = status as u32 & 0xffff;
+        if modnum < MIN_MODULE_NUM {
+            let os = std::io::Error::from_raw_os_error(status).to_string();
+            // Rust appends " (os error N)" to `strerror`'s text.
+            return match os.rfind(" (os error ") {
+                Some(at) => os[..at].to_string().into(),
+                None => os.into(),
+            };
+        }
+        if let Some(message) = symbol_message(modnum, errnum) {
+            return message.into();
+        }
+        format!("Error ({modnum},{errnum})").into()
+    }
+}
+
+impl std::fmt::Display for DbStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
+/// The symbol-table messages of the modules whose statuses reach a process
+/// status: `dbAccessDefs.h:177-205` (`M_dbAccess`, 511) and
+/// `epicsStdlib.h:43-51` (`M_stdlib`, 504). `M_devSup` has no table in an
+/// IOC, which is why `S_dev_*` read as numbers.
+const fn symbol_message(modnum: u32, errnum: u32) -> Option<&'static str> {
+    Some(match (modnum, errnum) {
+        (511, 1) => "Process Variable Not Found",
+        (511, 3) => "Illegal Database Request Type",
+        (511, 5) => "Attempt to modify noMod field",
+        (511, 7) => "Illegal Lock Set",
+        (511, 9) => "get precision failed",
+        (511, 11) => "Only one element allowed",
+        (511, 13) => "Illegal choice",
+        (511, 15) => "Illegal field value",
+        (511, 17) => "Logic error generating lock sets",
+        (511, 21) => "No link support table or entry",
+        (511, 31) => "missing record support entry table",
+        (511, 33) => "RSET or DSXT routine not defined",
+        (511, 35) => "Subroutine not found",
+        (511, 37) => "Request is pending",
+        (511, 39) => "Request is Blocked",
+        (511, 41) => "putFields are disabled",
+        (511, 43) => "Hardware link type not on INP/OUT",
+        (511, 53) => "Breakpoint already set",
+        (511, 55) => "No breakpoint set in record",
+        (511, 57) => "Record not stopped",
+        (511, 59) => "Error in argument",
+        (511, 61) => "Logic error in breakpoint routine",
+        (511, 63) => "Cannot spawn dbContTask",
+        (511, 65) => "Cannot resume dbContTask",
+        (511, 66) => "unable to allocate data structure from pool",
+        (511, 67) => "Not initialized",
+        (511, 68) => "Buffer full",
+        (504, 1) => "No digits to convert",
+        (504, 2) => "Extraneous characters",
+        (504, 3) => "Too small to represent",
+        (504, 4) => "Too large to represent",
+        (504, 5) => "Number base not supported",
+        _ => return None,
+    })
 }
 
 /// The payload of [`CaError::BadChoice`], as data: the refusal is made under
@@ -606,3 +748,30 @@ impl CaError {
 }
 
 pub type CaResult<T> = Result<T, CaError>;
+
+#[cfg(test)]
+mod db_status_tests {
+    use super::DbStatus;
+
+    fn text(status: i32) -> String {
+        DbStatus::new(status).expect("non-zero").text().into_owned()
+    }
+
+    /// One case per `errSymLookup` arm. The `-1` text is what a pvxs client
+    /// prints for a soft ao whose CA OUT link is down (measured on
+    /// softIocPVX: "Error (65535,65535)").
+    #[test]
+    fn text_is_err_sym_lookup() {
+        assert!(DbStatus::new(0).is_none());
+        assert_eq!(text(-1), "Error (65535,65535)");
+        // S_dev_missingSup: M_devSup has no table.
+        assert_eq!(text((514 << 16) | 5), "Error (514,5)");
+        // S_db_badField and S_stdlib_overflow: in the table.
+        assert_eq!(text((511 << 16) | 15), "Illegal field value");
+        assert_eq!(text((504 << 16) | 4), "Too large to represent");
+        // An unlisted dbAccess number falls back to the numbers.
+        assert_eq!(text((511 << 16) | 2), "Error (511,2)");
+        #[cfg(unix)]
+        assert_eq!(text(libc::ENOENT), "No such file or directory");
+    }
+}

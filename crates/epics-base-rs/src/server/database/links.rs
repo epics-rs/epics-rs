@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::error::{DbResult, DbStatus};
 use crate::server::record::{
     AlarmSeverity, NotifyWaitSet, OutTarget, RecordCell, RecordInstance, ScanType,
 };
@@ -580,6 +581,27 @@ pub(crate) struct LinkStage {
         super::field_io::LinkTail<'static>,
     ),
     report: Option<(super::field_io::PutTail, std::borrow::Cow<'static, str>)>,
+}
+
+/// The [`LinkStage`] slot a link write's caller owns. Empty on every write
+/// but a special's, so its drop is an inlined test: `Option<LinkStage>`'s own
+/// drop glue went out of line and cost a call per write.
+#[derive(Default)]
+struct StageSlot(std::mem::ManuallyDrop<Option<LinkStage>>);
+
+impl Drop for StageSlot {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            empty_stage_slot(&mut self.0);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn empty_stage_slot(slot: &mut Option<LinkStage>) {
+    *slot = None;
 }
 
 /// What a DB link's `dbPut` leaves its caller to finish: the special's
@@ -1278,8 +1300,11 @@ impl PvDatabase {
         // PP: process a Passive DB source before reading, threading the
         // caller's chain state so an A<->B cycle terminates at the existing
         // guard — `read_link_value`'s rule, unchanged.
-        if let crate::server::record::ParsedLink::Db(db) = link {
-            self.process_passive_db_source(db, visited);
+        // C `dbDbGetValue` returns `dbScanPassive`'s status unread.
+        if let crate::server::record::ParsedLink::Db(db) = link
+            && self.process_passive_db_source(db, visited).is_err()
+        {
+            return (None, None, None);
         }
         let (value, alarm, render) = self.read_link_value_and_alarm(link, render);
         // A failed read inherits NOTHING: the gate
@@ -2086,6 +2111,19 @@ impl PvDatabase {
             .is_some()
     }
 
+    /// C `dbIsLinkConnected`: only an external link can be down, and its
+    /// lset says whether it is.
+    pub(crate) fn link_connected(&self, link: &crate::server::record::ParsedLink) -> bool {
+        let Some(external) = link.external() else {
+            return true;
+        };
+        let (target, body) = Self::split_external_link_name(external.name);
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+            lset.is_connected(body).then_some(())
+        })
+        .is_some()
+    }
+
     /// C `doResolveLinks`' `openLink` (`iocInit.c:535-559`) for each
     /// external link of `rec_arc`, once per record
     /// ([`RecordCell::claim_link_opens`]); a link its lset opens without one
@@ -2760,18 +2798,21 @@ impl PvDatabase {
         &self,
         db: &crate::server::record::DbLink,
         visited: &mut ProcStack,
-    ) {
+    ) -> DbResult {
         if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
-            return;
+            return Ok(());
         }
         if let Some(at) = self.db_link_addr(db) {
             let is_passive = at.rec.read().common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
                 // recursive INP-link source processing within
                 // one chain — gate held by the foreign entry record.
-                let _ = self.process_record_with_links_recursive_at(&at.name, &at.rec, visited);
+                return self
+                    .process_record_with_links_recursive_at(&at.name, &at.rec, visited)
+                    .map_err(|e| DbStatus::of_error(&e));
             }
         }
+        Ok(())
     }
 
     /// Read a value from a parsed link for INP (only reads DB links when soft channel).
@@ -2893,20 +2934,20 @@ impl PvDatabase {
         src_notify: Option<&Arc<NotifyWaitSet>>,
         held: Option<&super::SetGuard>,
         visited: &mut ProcStack,
-    ) {
+    ) -> DbResult {
         {
             let mut tg = target_rec.write_under(held);
             // A forward bound before the target was removed still reaches its
             // cell (the record table keeps it); a removed record runs nothing.
             if tg.is_destroyed() {
-                return;
+                return Ok(());
             }
             // The gate. A target that does not pass it never reaches
             // `processTarget`, so it gets no PUTF, no RPRO, and no put-notify
             // join — the join in particular would `enter` the wait-set without
             // ever `leave`ing it.
             if !gate.admits(tg.common.scan) {
-                return;
+                return Ok(());
             }
             // C's `pdst->pact` is both halves: a cycle on this chain (C's
             // `processTarget` marker, `claim_dst` false) or an async wait.
@@ -2923,8 +2964,10 @@ impl PvDatabase {
         // held by the foreign entry record. Unconditional, as C's
         // `dbProcess(pdst)` is: an active target is refused inside
         // `process_record_with_links_body`'s PACT arm, the single owner of
-        // that decision, and the refusal is counted there.
-        let _ = self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited);
+        // that decision, and the refusal is counted there. Its status is
+        // `processTarget`'s return (`dbDbLink.c:511-528`).
+        self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited)
+            .map_err(|e| DbStatus::of_error(&e))
     }
 
     /// C `dbDbPutValue` (`dbDbLink.c:372-392`) for a caller with no frame —
@@ -2940,9 +2983,9 @@ impl PvDatabase {
         let link = Arc::new(crate::server::record::ParsedLink::Db(Arc::new(
             link.clone(),
         )));
-        let mut staged = None;
+        let mut staged = StageSlot::default();
         let mut out = LinkWriteOut {
-            staged: &mut staged,
+            staged: &mut staged.0,
             visited,
         };
         let write = self.write_db_link_value_in(
@@ -2953,6 +2996,7 @@ impl PvDatabase {
             &mut out,
         );
         self.finish_db_link_write(write, out.staged, None, src, out.visited)
+            .is_err()
     }
 
     /// [`Self::write_db_link_value_in`] for a DB link whose target is not
@@ -3147,7 +3191,7 @@ impl PvDatabase {
         source: Option<InFrame<'_>>,
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
-    ) -> bool {
+    ) -> DbResult {
         let held = source.map(|source| source.set());
         let DbLinkWrite {
             target,
@@ -3176,13 +3220,15 @@ impl PvDatabase {
         // Only a successful write reaches target processing. An empty array
         // into a scalar field is not a failure: C `dbPut` raises LINK/INVALID
         // on the destination and returns 0 (`dbAccess.c:1370-1372`).
+        // `dbPut`'s own failure codes are not kept; the put reports `-1`.
         if failed {
-            return true;
+            return Err(DbStatus::FAILED);
         }
+        // `dbDbPutValue` returns `processTarget`'s status (`dbDbLink.c:387-392`).
         if let (Some(gate), Some(rec)) = (gate, &target) {
-            self.process_target_at(rec, gate, src.putf, src.notify, held, visited);
+            return self.process_target_at(rec, gate, src.putf, src.notify, held, visited);
         }
-        false
+        Ok(())
     }
 
     /// [`LinkStage`]'s owed work: the special's link writes, the rest of its
@@ -3745,7 +3791,8 @@ impl PvDatabase {
             // would actually put (`devsCalcoutSoft.c:66-144`,
             // `devaCalcoutSoft.c:75-87`).
             let val = self.multi_out_buffer_choice(rec, link_field, &parsed, val);
-            self.write_out_link_value(
+            // scalcout, acalcout, aSub and epid return 0 past these puts.
+            let _ = self.write_out_link_value(
                 rec,
                 parsed,
                 super::PutSrc::Owned(val),
@@ -3793,10 +3840,10 @@ impl PvDatabase {
     /// (`dbConstPutValue`). A `Hw`/`Removed` one has no lset, so the put
     /// fails `S_db_noLSET` without a `setLinkAlarm` (`dbLink.c:440-441`).
     ///
-    /// Returns C's `dbPutLink` status as a bool — `true` when the put failed.
-    /// A caller needs it only to reproduce a record-specific alarm C raises ON
-    /// TOP of the put's own (dfanout's `LINK_ALARM`/`MAJOR`); the INVALID that
-    /// every failing put owes the record is already raised here.
+    /// Returns C's `dbPutLink` status: a soft dset returns it from its
+    /// `write_xxx`, and dfanout raises its own `LINK_ALARM`/`MAJOR` on top
+    /// of it. The INVALID that every failing put owes the record is already
+    /// raised here.
     #[inline]
     pub(crate) fn write_out_link_value(
         &self,
@@ -3805,12 +3852,13 @@ impl PvDatabase {
         value: super::field_io::PutSrc<'_>,
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
-    ) -> bool {
-        let failed = match &*link {
+    ) -> DbResult {
+        let mut alarms = true;
+        let status = match &*link {
             crate::server::record::ParsedLink::Db(_) => {
-                let mut staged = None;
+                let mut staged = StageSlot::default();
                 let mut out = LinkWriteOut {
-                    staged: &mut staged,
+                    staged: &mut staged.0,
                     visited,
                 };
                 let write = self.write_db_link_value_in(Some(src_rec), link, value, &src, &mut out);
@@ -3823,7 +3871,7 @@ impl PvDatabase {
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
                 match self.external_put_value(name, value) {
-                    None => false,
+                    None => Ok(()),
                     Some(value) => {
                         match self.write_external_pv(
                             src.link_id(Some(src_rec)),
@@ -3831,10 +3879,11 @@ impl PvDatabase {
                             value,
                             src.notify,
                         ) {
-                            Ok(()) => false,
+                            Ok(()) => Ok(()),
+                            // `dbCaPutLinkCallback`'s and pvalink's `-1`.
                             Err(refusal) => {
                                 refusal.report(name);
-                                true
+                                Err(DbStatus::FAILED)
                             }
                         }
                     }
@@ -3857,24 +3906,33 @@ impl PvDatabase {
                 match StateLink::put_of(value) {
                     StatePut::Truth(truth) => {
                         self.db_state(&st.name).set(st.write(truth));
-                        false
+                        Ok(())
                     }
-                    StatePut::Nothing => false,
-                    StatePut::BadDbrType => true,
+                    StatePut::Nothing => Ok(()),
+                    StatePut::BadDbrType => Err(DbStatus::BAD_DBRTYPE),
                 }
             }
             crate::server::record::ParsedLink::Calc(calc) => {
-                self.put_calc_link(src_rec, calc, value, src, visited)
+                match self.put_calc_link(src_rec, calc, value, src, visited) {
+                    true => Err(DbStatus::FAILED),
+                    false => Ok(()),
+                }
             }
             // A constant link's `dbConstPutValue` answers 0
             // (`dbConstLink.c:228-232`). A hardware or removed link has no
             // lset: `S_db_noLSET`, and no `setLinkAlarm` (`dbLink.c:440-441`).
-            other => return crate::server::recgbl::simm::has_no_lset(other),
+            other => {
+                alarms = false;
+                match crate::server::recgbl::simm::has_no_lset(other) {
+                    true => Err(DbStatus::NO_LSET),
+                    false => Ok(()),
+                }
+            }
         };
-        if failed {
+        if alarms && status.is_err() {
             set_out_link_alarm(src_rec, src.field);
         }
-        failed
+        status
     }
 
     /// [`Self::write_out_link_value`] for the write a frame captured.
@@ -3886,7 +3944,7 @@ impl PvDatabase {
         value: super::field_io::PutSrc<'_>,
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
-    ) -> bool {
+    ) -> DbResult {
         match out.0 {
             OutWrite::Lent(ref lent) => self.write_lent_out(src_rec, lent, value, src, visited),
             OutWrite::Link(link) => self.write_out_link_value(src_rec, link, value, src, visited),
@@ -3901,7 +3959,7 @@ impl PvDatabase {
         value: super::field_io::PutSrc<'_>,
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
-    ) -> bool {
+    ) -> DbResult {
         let held = src_rec.set();
         // SAFETY: `OutLinkWrite::capture` read the target from this frame's
         // record's OUT cache at the revision it checked.
@@ -3913,17 +3971,17 @@ impl PvDatabase {
             field: lent.field.name,
             at: &put,
         };
-        let mut staged = None;
+        let mut staged = StageSlot::default();
         let mut out = LinkWriteOut {
-            staged: &mut staged,
+            staged: &mut staged.0,
             visited,
         };
         let write = self.write_local_target(Some(held), to, lent.acts, value, &mut out);
-        let failed = self.finish_db_link_write(write, out.staged, Some(src_rec), src, out.visited);
-        if failed {
+        let status = self.finish_db_link_write(write, out.staged, Some(src_rec), src, out.visited);
+        if status.is_err() {
             set_out_link_alarm(src_rec, src.field);
         }
-        failed
+        status
     }
 
     /// C `lnkCalc_putValue` (`lnkCalc.c:631-703`): the value, or `expr`
@@ -3995,13 +4053,15 @@ impl PvDatabase {
         // parent's `setLinkAlarm` after it is a no-op, the record being
         // INVALID already.
         let unalarmed = src_rec.read().common.nsev < AlarmSeverity::Invalid;
-        let failed = self.write_out_link_value(
-            src_rec,
-            Arc::clone(out),
-            super::field_io::PutSrc::Owned(EpicsValue::Double(val)),
-            src,
-            visited,
-        );
+        let failed = self
+            .write_out_link_value(
+                src_rec,
+                Arc::clone(out),
+                super::field_io::PutSrc::Owned(EpicsValue::Double(val)),
+                src,
+                visited,
+            )
+            .is_err();
         if failed && unalarmed {
             let mut inst = src_rec.write();
             if inst.common.nsev == AlarmSeverity::Invalid {
@@ -4318,8 +4378,9 @@ impl PvDatabase {
                             // PUTF (and sets RPRO on a busy target) exactly
                             // like the explicit FLNK path — so this goes
                             // through the same single owner.
+                            // `dbScanFwdLink` returns nothing to the fanout.
                             if let Some(target) = self.record_at(target) {
-                                self.process_target_at(
+                                let _ = self.process_target_at(
                                     target,
                                     ProcessTargetGate::ScanPassive,
                                     src_putf,
@@ -4369,16 +4430,19 @@ impl PvDatabase {
                         // carries dfanout's OWN LINK_ALARM/MAJOR
                         // (`dfanoutRecord.c:311-312`), which C raises on top of
                         // (and is subsumed by) the put's INVALID.
-                        if self.write_out_link_value(
-                            rec,
-                            parsed,
-                            super::PutSrc::Value(&val),
-                            OutLinkSrc {
-                                field: DFANOUT_LINK_FIELDS[idx],
-                                ..out_src
-                            },
-                            visited,
-                        ) {
+                        if self
+                            .write_out_link_value(
+                                rec,
+                                parsed,
+                                super::PutSrc::Value(&val),
+                                OutLinkSrc {
+                                    field: DFANOUT_LINK_FIELDS[idx],
+                                    ..out_src
+                                },
+                                visited,
+                            )
+                            .is_err()
+                        {
                             link_failed = true;
                         }
                     }
@@ -4557,8 +4621,8 @@ impl PvDatabase {
             };
             // Through the put owner: a failed LNKn `dbPutLink` raises the seq
             // record's LINK_ALARM/INVALID from inside the put (C
-            // `dbLink.c:444-446`).
-            self.write_out_link_value(
+            // `dbLink.c:444-446`). seq's `process()` returns 0.
+            let _ = self.write_out_link_value(
                 rec,
                 Arc::clone(&grp.lnk),
                 super::PutSrc::Owned(EpicsValue::Double(new_dov)),

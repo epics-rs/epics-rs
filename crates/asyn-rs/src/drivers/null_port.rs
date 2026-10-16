@@ -51,7 +51,7 @@ impl NullOctetPort {
         // that — drvAsynIPPort.c:1082-1083). This driver has no C original, so
         // that mirror is the whole of its flag model: it grants no shutdown
         // rights either, because drvAsynIPPort grants none.
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {

@@ -708,10 +708,22 @@ impl ExceptionAnnouncer {
 }
 
 impl PortDriverBase {
-    pub fn new(port_name: &str, max_addr: usize, flags: PortFlags) -> Self {
+    /// An `asynPortDriver` base: more than one address makes the port
+    /// multi-device even when the caller left the flag off
+    /// (asynPortDriver.cpp:4013-4014).
+    pub fn new(port_name: &str, max_addr: usize, mut flags: PortFlags) -> Self {
+        flags.multi_device |= max_addr > 1;
+        Self::new_exact_flags(port_name, max_addr, flags)
+    }
+
+    /// A base whose flags are registered as given, for the drivers that, like
+    /// C's `drvAsyn*` ports, call `registerPort` themselves rather than derive
+    /// from `asynPortDriver`.
+    pub fn new_exact_flags(port_name: &str, max_addr: usize, flags: PortFlags) -> Self {
+        let max_addr = max_addr.max(1);
         Self {
             port_name: port_name.into(),
-            max_addr: max_addr.max(1),
+            max_addr,
             flags,
             params: ParamList::new(max_addr),
             interrupts: InterruptManager::new(),
@@ -2966,6 +2978,14 @@ pub(crate) fn octet_flush_chain(
 mod tests {
     use super::*;
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
+    #[test]
+    fn more_than_one_address_forces_multi_device() {
+        for (max_addr, multi) in [(0, false), (1, false), (2, true)] {
+            let base = PortDriverBase::new("md", max_addr, PortFlags::default());
+            assert_eq!(base.flags.multi_device, multi, "maxAddr {max_addr}");
+        }
+    }
 
     /// A driver whose `io_read_octet_eom` hands back one scripted chunk per
     /// call, with the driver-level eomReason C would report (CNT when the

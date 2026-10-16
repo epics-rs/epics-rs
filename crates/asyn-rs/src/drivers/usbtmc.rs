@@ -252,7 +252,7 @@ impl DrvAsynUsbtmcPort {
     ) -> AsynResult<Self> {
         let config =
             UsbtmcConfig::from_positional(vendor_id, product_id, serial_number, priority, flags);
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {

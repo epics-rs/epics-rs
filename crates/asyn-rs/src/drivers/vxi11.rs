@@ -273,7 +273,7 @@ impl DrvVxi11Port {
         // at :1016 and :1738, but does not define it).
         let max_addr = if multi_device { 32 } else { 1 };
 
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             max_addr,
             PortFlags {

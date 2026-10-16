@@ -468,7 +468,7 @@ impl DrvAsynSerialPort {
     /// `auto_connect = true` and `can_block = true`.
     pub fn new(port_name: &str, config_str: &str) -> AsynResult<Self> {
         let config = SerialConfig::parse(config_str)?;
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {

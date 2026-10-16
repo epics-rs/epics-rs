@@ -910,7 +910,7 @@ impl DrvAsynIPServerPort {
             });
         }
         let max = config.max_clients;
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             max,
             PortFlags {
@@ -1674,7 +1674,7 @@ impl DrvAsynIPSubport {
         slot: Arc<ClientSlot>,
         no_process_eos: bool,
     ) -> Self {
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             &port_name,
             1,
             PortFlags {

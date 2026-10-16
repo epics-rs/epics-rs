@@ -168,7 +168,7 @@ impl DrvAsynPrologixPort {
             format!("{host}:{DEFAULT_TCP_PORT} TCP")
         };
         let inner = super::ip_port::DrvAsynIPPort::new(&format!("{port_name}_TCP"), &ip_spec)?;
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             // GPIB primary addresses 0..30 → 31 slots; secondary
             // addresses are encoded into addr (addr/100 + addr%100)

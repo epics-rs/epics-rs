@@ -137,7 +137,7 @@ impl DrvAsynFtdiPort {
         mode: i32,
     ) -> AsynResult<Self> {
         let config = FtdiConfig::from_positional(vendor, product, baudrate, latency, mode);
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {

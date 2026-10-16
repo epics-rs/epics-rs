@@ -1043,7 +1043,7 @@ impl AsyncDbHandle {
 /// more work (motor mid-move) or declining its forward link (busy at
 /// VAL=1) keeps its membership and leaves on the later cycle that reaches
 /// C's `recGblFwdLink`.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
 fn finish_cycle(inst: &mut RecordInstance) {
     if !inst.is_processing() {
         inst.common.putf = false;
@@ -1265,7 +1265,7 @@ impl AlarmPosts {
     }
 
     /// The union of every post's mask; empty exactly when nothing posts.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     pub fn mask(&self) -> crate::server::recgbl::EventMask {
         use crate::server::recgbl::EventMask;
         let mut m = self.stat_mask;
@@ -1360,21 +1360,21 @@ mod cycle_status {
             })
         }
 
-        #[inline(always)]
+        #[cfg_attr(not(debug_assertions), inline(always))]
         pub(super) fn dol(&mut self, status: DbResult) {
             if let Err(e) = status {
                 keep(&mut self.failed().dol, e);
             }
         }
 
-        #[inline(always)]
+        #[cfg_attr(not(debug_assertions), inline(always))]
         pub(super) fn io(&mut self, status: DbResult) {
             if let Err(e) = status {
                 keep(&mut self.failed().io, e);
             }
         }
 
-        #[inline(always)]
+        #[cfg_attr(not(debug_assertions), inline(always))]
         pub(super) fn record(&mut self, status: DbResult) {
             if let Err(e) = status {
                 keep(&mut self.failed().record, e);
@@ -1395,7 +1395,7 @@ mod cycle_status {
         }
 
         /// The cycle's frame result: `Err(ProcessStatus)` for a non-zero status.
-        #[inline(always)]
+        #[cfg_attr(not(debug_assertions), inline(always))]
         pub(super) fn frame_result(&self, guard: &mut DataGuard<'_>) -> CaResult<()> {
             match &self.0 {
                 None => Ok(()),
@@ -1827,7 +1827,7 @@ impl PvDatabase {
     /// Self-reads are excluded by the caller as C excludes them from
     /// `recGblInheritSevrMsg` (`precord != dbChannelRecord(chan)`), so the
     /// inheritance needs no record test here.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn fetch_native_db_input(
         &self,
         record: &mut dyn crate::server::record::Record,
@@ -1999,7 +1999,7 @@ impl PvDatabase {
     /// `always`: the two loops are its callers, and the frame it would
     /// otherwise be — the held path's arguments moved in and the outcome
     /// moved out — is what the held path exists to avoid.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn fetch_multi_input(
         &self,
         guard: &mut DataGuard<'_>,
@@ -2023,7 +2023,7 @@ impl PvDatabase {
     /// the reader's guard held throughout. Decides from the cached parse and
     /// target alone, so a link it declines has cost the general path one
     /// cache hit.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn fetch_native_input_held(
         &self,
         guard: &mut DataGuard<'_>,
@@ -2322,7 +2322,7 @@ impl<'a> DataGuard<'a> {
     /// cycle and the answer is a loaded pointer whenever the guard is held.
     /// Left to the inliner, one more caller of [`RecordCell::write`] flipped
     /// it out of line, at 150 instructions of frame per cycle.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn hold(&mut self) -> &mut RecordInstance {
         let rec = self.rec;
         self.held.get_or_insert_with(|| rec.write())
@@ -2330,7 +2330,7 @@ impl<'a> DataGuard<'a> {
 
     /// [`Self::hold`] with the set guard alongside, for the link reads of
     /// the same set ([`RecordCell::read_in`]).
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn hold_in(&mut self) -> (&mut RecordInstance, &crate::server::database::SetGuard) {
         let rec = self.rec;
         self.held.get_or_insert_with(|| rec.write()).split()
@@ -2373,7 +2373,7 @@ enum Reads {
 /// most records run, drops as one inline tag compare; the glue for what a
 /// read produced is called only when there is something to free.
 impl Drop for InputStage {
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn drop(&mut self) {
         if !matches!(*self.reads, Reads::None | Reads::Typed(_)) {
             self.drop_reads();
@@ -2484,20 +2484,20 @@ trait SoftDbSlot {
 }
 
 impl SoftDbSlot for () {
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn set(&mut self, _: Option<f64>) {}
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn take(&mut self) -> Option<f64> {
         None
     }
 }
 
 impl SoftDbSlot for Option<f64> {
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn set(&mut self, value: Option<f64>) {
         *self = value;
     }
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn take(&mut self) -> Option<f64> {
         Option::take(self)
     }
@@ -2522,7 +2522,7 @@ trait SoftDbValue: Sized {
 impl SoftDbValue for f64 {
     type Request = ();
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn read(
         db: &PvDatabase,
         held: &crate::server::database::SetGuard,
@@ -2542,7 +2542,7 @@ impl SoftDbValue for SoftReading {
 
     /// A `DBF_DOUBLE` VAL slot converts from its `f64`; every other source
     /// takes the link layer's conversion at the same request.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn read(
         db: &PvDatabase,
         held: &crate::server::database::SetGuard,
@@ -2570,7 +2570,7 @@ impl SoftDbValue for SoftReading {
 impl SoftDbValue for EpicsValue {
     type Request = crate::server::record::LinkReadAs;
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn read(
         db: &PvDatabase,
         held: &crate::server::database::SetGuard,
@@ -3566,7 +3566,7 @@ impl PvDatabase {
     /// at its [`crate::server::record::PostStage`]. A clear C posts after
     /// `recGblFwdLink` is not one of them: it is a
     /// [`crate::server::record::ProcessAction::PutAfterEpilogue`].
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     pub(crate) fn publish_post_write_fields(
         &self,
         rec: InFrame<'_>,
@@ -4366,7 +4366,7 @@ impl PvDatabase {
     /// hands a pass with no `recGblGetTimeStamp` its
     /// [`TselStamp::Withheld`](super::TselStamp::Withheld), so no stamp site
     /// of the cycle stores TIME for it.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn cycle_tsel(&self, rec: InFrame<'_>) -> super::TselStamp {
         if Self::cycle_stamp_withheld_in(rec) {
             return super::TselStamp::Withheld;
@@ -4384,7 +4384,7 @@ impl PvDatabase {
     /// type, and for a [`CycleHooks::STAMP_REQUEST`] type unless the pass's
     /// `process()` asked — which the asking consumes. The plan answers for
     /// every type that never withholds, without the lock.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn cycle_stamp_withheld_in(rec: InFrame<'_>) -> bool {
         rec.process_plan().hooks.withholds_cycle_stamp() && !Self::stamp_requested(&mut rec.write())
     }
@@ -4517,7 +4517,7 @@ impl PvDatabase {
     /// link that needs the guard released (a PP source, a self-link, a target
     /// found by name, a remote timestamp to adopt), which takes the general
     /// path.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn soft_db_inp_stage(
         &self,
         rec: InFrame<'_>,
@@ -4555,7 +4555,7 @@ impl PvDatabase {
     /// already holds. The source's severity is inherited as the read
     /// returns, as `dbGetLink` raises it, so what is handed back is the one
     /// thing left to apply: the value, `None` for a read that failed.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn soft_db_inp_read<V: SoftDbValue>(
         &self,
         rec: InFrame<'_>,
@@ -4584,7 +4584,7 @@ impl PvDatabase {
     /// `fetch_input_stage` for [`CyclePlan::ConstSoftIn`](crate::server::record::record_instance::CyclePlan::ConstSoftIn): INP constant, no
     /// other read, soft DTYP — the stage's own early return, taken without
     /// asking.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn plain_input_stage(guard: &mut DataGuard<'_>) -> InputStage {
         let instance = guard.hold();
         instance.push_process_context();
@@ -4692,7 +4692,7 @@ impl PvDatabase {
     /// that cycle used to walk the whole stage to learn it: the empty INP read
     /// through three classifiers, twelve slots asked for a text that was
     /// never set. It now gets [`InputStage::none`] from inside that guard.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn fetch_input_stage(
         &self,
         name: &[u8],
@@ -5381,7 +5381,7 @@ impl PvDatabase {
     /// (`dbAccess.c:611-628`, `dbNotify.c:252-264`); every deferred step here
     /// does the same — it stages work on a queue or spawns a task and returns.
     #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn process_record_with_links_body(
         &self,
         name: &[u8],
@@ -5477,7 +5477,7 @@ impl PvDatabase {
     /// The cycle past the prologue, once per [`CyclePlan`](crate::server::record::record_instance::CyclePlan) arm. `PLAIN` is a
     /// compile-time fact: the arm's gates are folded away, so it is the one
     /// source of the cycle and not a second copy that could drift from it.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn process_cycle<const PLAIN: bool, const DB_INP: bool>(
         &self,
         ctx: CycleCtx<'_, '_>,
@@ -7687,7 +7687,7 @@ impl PvDatabase {
     /// record's advisory write gate, so a client put racing this spawn cannot
     /// take the record between the pop and the replay and thereby overtake a
     /// notify that has been waiting longer.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     pub(super) fn apply_pact_exit(&self, name: &[u8], exit: PactExit) {
         // NO record lock here, deliberately. This runs from cycle tails and
         // from a `Drop` that can fire while a `rec.write()` guard is still
@@ -7743,7 +7743,7 @@ impl PvDatabase {
     /// link, and RPRO reprocess. Shared by the
     /// main process path and the simulation-mode path so both run the
     /// identical `recGblFwdLink` equivalent.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn run_forward_link_tail_with_putf(
         &self,
         name: &[u8],
@@ -7828,7 +7828,7 @@ impl PvDatabase {
     }
 
     /// C `dbScanFwdLink` on what [`RecordInstance::forward_target`] resolved.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn scan_forward_target(
         &self,
         rec: InFrame<'_>,
@@ -9062,7 +9062,7 @@ impl PvDatabase {
     /// record never enters `process_record_with_links_inner`'s async state —
     /// that future is polled one frame deeper per FLNK hop, unbounded as in C,
     /// and bloating it overflows the stack sooner (the deep-chain tests).
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn write_simulated_output_siol(
         &self,
         rec: InFrame<'_>,
@@ -10070,7 +10070,7 @@ impl PvDatabase {
     /// the SDLY window. The caller carries it to the cycle's `recGblFwdLink`
     /// tail; the release cannot silently drop it (`#[must_use]`), which is what
     /// stranded it here before.
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn check_simulation_mode(
         &self,
         guard: &mut DataGuard<'_>,
@@ -10723,7 +10723,7 @@ impl SiolStamp {
 /// (`aoRecord.c:196-217`): whether an INVALID `sev` vetoes the output.
 /// `Set output to IVOV` stores IVOV only on a first pass (`if (prec->pact ==
 /// FALSE)`), not on the pass that completes an asynchronous write.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
 fn ivoa_skips_output(
     instance: &mut RecordInstance,
     sev: crate::server::record::AlarmSeverity,
@@ -10792,7 +10792,7 @@ fn invalid_output_action(instance: &mut RecordInstance, first_pass: bool) -> boo
 /// the write's failure (a PENDING raise that this cycle's `monitor()`
 /// commits), then the device's own. Only a cycle whose IVOA test let the
 /// output through reaches it.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
 fn raise_write_value_alarm(instance: &mut RecordInstance, write_failed: bool, is_soft: bool) {
     if write_failed {
         crate::server::recgbl::rec_gbl_set_sevr(
@@ -10805,7 +10805,7 @@ fn raise_write_value_alarm(instance: &mut RecordInstance, write_failed: bool, is
 }
 
 /// The alarm a device support's last transfer left, raised into the record.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
 fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) {
     if !is_soft {
         apply_hard_device_alarm(instance);
@@ -10986,7 +10986,7 @@ impl CycleEndGuard<'_> {
 }
 
 impl Drop for CycleEndGuard<'_> {
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn drop(&mut self) {
         if self.exit.is_some() {
             if let Some(exit) = self.exit.take() {

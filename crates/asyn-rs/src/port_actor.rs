@@ -3634,6 +3634,14 @@ mod tests {
         let (drv, calls) = mk(false);
         let tx = spawn_actor(drv);
         let mut reply = send(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(1));
+        // A direct call outranks every band (`Rank::Direct`), so a probe that
+        // lands in the same drain as the read is answered before it: wait for
+        // the port attempt, then probe to let the pass it ran in finish.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while calls.lock().is_empty() {
+            assert!(Instant::now() < deadline, "no port connect was attempted");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         send_and_wait(&tx, RequestOp::GetAutoConnect, AsynUser::new(0)).unwrap();
         assert!(reply.try_recv().is_err(), "the port is down: still queued");
         assert_eq!(

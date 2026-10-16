@@ -263,7 +263,6 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(sub)) if !sub.is_empty() => path.join(sub.to_path()?),
                         _ => path,
                     };
-                    eprintln!("set_requestfile_path: {}", full_path.display());
                     h.lock().unwrap().request_file_paths.push(full_path);
                     Ok(CommandOutcome::Continue)
                 },
@@ -295,10 +294,8 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(sub)) if !sub.is_empty() => path.join(sub.to_path()?),
                         _ => path,
                     };
-                    eprintln!("set_savefile_path: {}", full_path.display());
-                    if let Err(e) = std::fs::create_dir_all(&full_path) {
-                        eprintln!("  warning: could not create directory: {e}");
-                    }
+                    // Creating the directory is an rs extension; C prints nothing here.
+                    let _ = std::fs::create_dir_all(&full_path);
                     h.lock().unwrap().save_file_path = Some(full_path);
                     Ok(CommandOutcome::Continue)
                 },
@@ -338,10 +335,6 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    eprintln!(
-                        "create_monitor_set: {filename}, period={}s",
-                        period.as_secs()
-                    );
                     let def = MonitorSetDef {
                         filename,
                         period,
@@ -405,7 +398,6 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    eprintln!("create_triggered_set: {filename}, trigger={trigger_channel}");
                     let def = TriggeredSetDef {
                         filename,
                         trigger_pv: trigger_channel,
@@ -516,7 +508,6 @@ impl AutosaveStartupConfig {
                         } else {
                             CompatMode::Native
                         };
-                    eprintln!("save_restoreSet_CompatMode: {compat:?}");
                     h.lock().unwrap().compat = compat;
                     Ok(CommandOutcome::Continue)
                 },
@@ -538,7 +529,6 @@ impl AutosaveStartupConfig {
                         ArgValue::String(s) => s.to_str()?.to_owned(),
                         _ => return Err("prefix argument required".into()),
                     };
-                    eprintln!("save_restoreSet_status_prefix: {prefix}");
                     h.lock().unwrap().status_prefix = Some(prefix);
                     Ok(CommandOutcome::Continue)
                 },

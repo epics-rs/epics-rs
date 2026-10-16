@@ -34,7 +34,9 @@ struct Ioc {
 }
 
 impl Ioc {
-    fn start(db: &std::path::Path, port: u16, addr_list: &str) -> Ioc {
+    /// `None` when the console says `port` was taken before `iocRun`: RSRV
+    /// binds in iocInit.
+    fn start(db: &std::path::Path, port: u16, addr_list: &str) -> Option<Ioc> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
             .arg("-d")
             .arg(db)
@@ -68,17 +70,20 @@ impl Ioc {
             let up = line.contains("iocRun: All initialization complete");
             boot.push(line);
             if up {
-                return Ioc {
+                return Some(Ioc {
                     child,
                     stdin,
                     lines,
                     boot,
                     heard: Vec::new(),
-                };
+                });
             }
         }
         let _ = child.kill();
         let _ = child.wait();
+        if named_port::verdict::rs_ioc_port_was_taken(&boot.join("\n"), port) {
+            return None;
+        }
         panic!("softioc-rs on {db:?} never came up: {boot:#?}")
     }
 
@@ -97,8 +102,9 @@ impl Ioc {
         None
     }
 
-    /// Whether the console says `port` belonged to somebody else. The report
-    /// follows `iocRun`, so this reads what has arrived by now.
+    /// Whether the console says `port` belonged to somebody else after
+    /// `iocRun`, where a lost TCP port is reported; this reads what has
+    /// arrived by now.
     fn lost_its_port(&mut self, port: u16) -> bool {
         while let Ok(line) = self.lines.try_recv() {
             self.heard.push(line);
@@ -171,14 +177,15 @@ fn ca_forward_links_process_the_remote_record_once_per_source_process() {
 /// dropped probe too; it is judged where the forwards are awaited, so a B
 /// that lost it earlier fails the run instead of retrying.
 fn forward_links_on(tgt: &std::path::Path, src: &std::path::Path, a_port: u16) -> Option<()> {
-    let mut a = Ioc::start(tgt, a_port, "127.0.0.1");
+    let mut a = Ioc::start(tgt, a_port, "127.0.0.1")?;
     let b_port = loop {
         let p = named_port::free_for_tcp_and_udp();
         if p != a_port {
             break p;
         }
     };
-    let mut b = Ioc::start(src, b_port, &format!("127.0.0.1:{a_port}"));
+    let mut b = Ioc::start(src, b_port, &format!("127.0.0.1:{a_port}"))
+        .unwrap_or_else(|| panic!("B lost its port {b_port} before iocRun"));
     // softIoc's iocInit, for LNK2 and LNK4; ERL_WARNING is uncoloured on a
     // pipe.
     let warning = "WARNING: Forward-link uses Channel Access without pointing to PROC field";

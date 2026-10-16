@@ -104,11 +104,12 @@ pub fn held_texts() -> &'static [String] {
 /// trigger for a test that names the port of `softioc-rs` or
 /// `realtime-ca-ioc`.
 ///
-/// Both bind after `iocRun`, so the report follows it and a test judges the
-/// console only once its attempt is over. softioc-rs prints C's
-/// [`PORT_WAS_TAKEN`] for the TCP listener and serves on a dynamic one as C
-/// does, or names the address its search responder could not bind and exits
-/// 1; realtime-ca-ioc names the port on either bind arm and exits 1. On the
+/// A test judges the console once its attempt is over, including one that
+/// ended before `iocRun`: softioc-rs binds in iocInit as C `rsrv_init` does.
+/// It prints C's [`PORT_WAS_TAKEN`] for the TCP listener and serves on a
+/// dynamic one as C does, or names the address its search responder could
+/// not bind and exits; realtime-ca-ioc names the port on either bind arm and
+/// exits 1. On the
 /// lines that carry an error the cause must be one of [`held_texts`] and
 /// nothing else: realtime-ca-ioc's TCP arm also covers a `local_addr`
 /// failure, which is no steal.

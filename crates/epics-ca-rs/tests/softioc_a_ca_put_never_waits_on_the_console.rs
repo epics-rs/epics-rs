@@ -46,7 +46,15 @@ fn puts_past_a_stalled_console(
     let mut chunk = [0u8; 65536];
     while !String::from_utf8_lossy(&seen).contains("iocRun") {
         let n = out.read(&mut chunk).expect("read console");
-        assert!(n > 0, "softioc-rs exited before iocRun");
+        if n == 0 {
+            // RSRV binds in iocInit, so a taken port ends the IOC before iocRun.
+            let _ = child.wait();
+            let console = String::from_utf8_lossy(&seen);
+            if softioc_verdict::rs_ioc_port_was_taken(&console, port) {
+                return None;
+            }
+            panic!("softioc-rs exited before iocRun:\n{console}");
+        }
         seen.extend_from_slice(&chunk[..n]);
     }
     // From here nothing reads the console.

@@ -2,16 +2,16 @@
 //!
 //! The integration plan:
 //!
-//! 1. `PvaLinkResolver` owns a [`PvaLinkRegistry`] (PvaLink cache); the
-//!    synchronous resolver closure submits background work through the
-//!    `epics_base_rs::runtime::task` spawn seam — `tokio::spawn` on the host,
-//!    the callback pool on the RTEMS target where no tokio runtime exists.
-//! 2. [`install_pvalink_resolver`] hooks the resolver into the database via
-//!    `PvDatabase::set_external_resolver`. Records with `INP=pva://...`
-//!    will then resolve through the registry instead of returning `None`.
+//! 1. `PvaLinkResolver` owns a [`PvaLinkRegistry`] (PvaLink cache) and
+//!    submits background work through the `epics_base_rs::runtime::task`
+//!    spawn seam — `tokio::spawn` on the host, the callback pool on the
+//!    RTEMS target where no tokio runtime exists.
+//! 2. [`install_pvalink_resolver`] registers the resolver as the database's
+//!    `pva` link set. Records with `INP=pva://...` then resolve through the
+//!    registry instead of returning `None`.
 //! 3. INP links are pre-warmed via [`PvaLinkResolver::open`] (also exposed
-//!    as the `pvxr` iocsh command) so the synchronous resolver path can
-//!    return the cached monitor value without blocking on a fresh GET.
+//!    as the `pvxr` iocsh command) so the synchronous cached read can
+//!    return the monitor value without blocking on a fresh GET.
 //!    Out-of-band reads still work — `block_on` will issue a GET — but
 //!    pre-warmed monitors are always cheaper.
 //!
@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    ExternalPvResolver, LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkSet,
-    PutAdmission, PvDatabase,
+    LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkSet, PutAdmission,
+    PvDatabase,
 };
 use epics_base_rs::server::record::{
     JlinkValue, PVAJSON_IDENTITY_SEP, pvajson_identity_key, pvajson_identity_parts,
@@ -302,7 +302,7 @@ impl PvaLinkResolver {
         self
     }
 
-    /// Master enable / disable. When disabled, the resolver closure
+    /// Master enable / disable. When disabled, the link set
     /// returns `None` for every lookup so dependent records see
     /// LINK/INVALID alarms but no stale cached values bleed through.
     /// An epics-rs addition; pvxs has no such switch (see `enabled`).
@@ -803,67 +803,6 @@ impl PvaLinkResolver {
             task::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
-
-    /// Build the [`ExternalPvResolver`] closure that the database
-    /// expects.
-    ///
-    /// Cache-only, like [`LinkSet::get_cached_value`] and for the same
-    /// reason: this closure runs on the record-processing thread with the
-    /// record's advisory gate held. C `dbCaGetLink` reads `pca->pgetNative`
-    /// under `pca->lock` and returns -1 while the link is down
-    /// (`dbCa.c:419-506`, `:430-435`); it never waits for the wire. A miss
-    /// therefore stages the open on the pvalink runtime — C `dbCaAddLink`'s
-    /// `addAction(pca, CA_CONNECT)` (`dbCa.c:393`) — and reports `None`
-    /// for this cycle, so the reading record takes LINK/INVALID until the
-    /// monitor cache is warm.
-    pub fn build_resolver(self) -> ExternalPvResolver {
-        let resolver = self;
-        Arc::new(move |name: &[u8]| {
-            if !resolver.is_enabled() {
-                return None;
-            }
-            // Strip optional pva:// prefix — the resolver receives the
-            // bare PV name in some link forms but the prefixed form in
-            // others. `ca://` is handled by libca, not pvalink — reject.
-            let full = strip_scheme(name)?;
-            // the per-link config before the fast path, so the field
-            // selector is available for `try_read_cached_with_field`.
-            let cfg = resolver.inp_cfg_for(full);
-
-            // Cache hit: a previously-opened link with a cached monitor
-            // value. `try_get_inp` resolves THIS caller's monitor variant
-            // (`pipeline` / `Q`), so a `Q=1` record reads from its own
-            // monitor, not a `Q=64` sibling sharing the PV name.
-            // `try_read_cached_with_field` then applies the per-link field
-            // selector.
-            if let Some(link) =
-                resolver
-                    .registry
-                    .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
-            {
-                if let Some(value) = link.with_cached_value(&cfg.field, pvfield_to_epics_value) {
-                    resolver
-                        .reads
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return value;
-                }
-                // Open but the first monitor event has not landed. C's
-                // `!pca->gotInNative` arm returns without a value
-                // (`dbCa.c:459-464`).
-                return None;
-            }
-
-            // Never opened. Stage the open off the record thread and refuse
-            // this cycle. B4: `inp_cfg_for` so a link registered via
-            // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
-            // `monorder`); `default_inp_cfg` would discard them.
-            let opener = resolver.opener.clone();
-            resolver.reactor.spawn(async move {
-                let _ = opener.open(&cfg).await;
-            });
-            None
-        })
-    }
 }
 
 /// Report a link that the install scan could not open, on the one channel
@@ -909,9 +848,8 @@ fn report_open_failure(
 /// caller can pre-open links and query stats (`db_pvxr` /
 /// `pvalinkrefdiff` iocsh commands lean on this).
 ///
-/// Registers the resolver under the `"pva"` lset scheme *and*
-/// installs the legacy [`ExternalPvResolver`] closure so callers
-/// using either dispatch path work transparently.
+/// Registers the resolver as the `"pva"` lset, the only route a pva link
+/// is read through.
 ///
 /// also pre-registers pvalink options and CP/CPP scan targets
 /// for every loaded DB record that carries a JSON-object pvalink with
@@ -925,8 +863,6 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
     // B3: give the resolver the DB handle so the scan-on-update
     // forwarder can process owning records.
     resolver.attach_database((**db).clone());
-    db.set_external_resolver(resolver.clone().build_resolver())
-        .await;
     db.register_link_set("pva", Arc::new(resolver.clone()))
         .await;
 

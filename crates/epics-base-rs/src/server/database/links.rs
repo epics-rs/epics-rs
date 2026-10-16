@@ -1174,7 +1174,7 @@ impl PvDatabase {
     /// database; a non-local target is a CA link — `dbDbInitLink` fails to
     /// resolve it locally and falls through to `dbCaAddLink`, so its value
     /// comes
-    /// from the external resolver. Pre-fix every `Db` arm read only the
+    /// from the ca link set. Pre-fix every `Db` arm read only the
     /// local DB (`get_pv`) and returned `None` for a non-local target, so
     /// a plain `INP="other:pv"` (no modifier) and a re-parsed multi-input
     /// (`INPA`..`INPL`) / `DOL` link never read the remote value.
@@ -1263,13 +1263,10 @@ impl PvDatabase {
     /// `dbCaAddLink`'s verbatim `pv_link.pvname`, which this port qualifies
     /// with the link's own scheme ([`ParsedLink::external_pv_name`](crate::server::record::ParsedLink::external_pv_name)).
     ///
-    /// [`PvDatabase::resolve_external_pv`](super::PvDatabase::resolve_external_pv) accepts the bare body too, and
-    /// resolves it as `LinkTarget::Any`: every registered lset in turn, the
-    /// first holding a cached value wins. A reader that spelled the name
-    /// itself therefore read a `pva` link off the `ca` link set whenever both
-    /// were installed — measured, and the reason `external_pv_name` qualifies
-    /// the two variants that know their scheme. Deriving the name here and
-    /// nowhere else is what keeps the bare spelling from coming back.
+    /// [`PvDatabase::resolve_external_pv`](super::PvDatabase::resolve_external_pv) reads a bare body as a CA
+    /// link, so a reader that spelled a `pva` link's name itself would read
+    /// it off the `ca` link set. Deriving the name here and nowhere else is
+    /// what keeps the bare spelling from coming back.
     fn read_external_link_value(
         &self,
         link: &crate::server::record::ParsedLink,
@@ -2103,12 +2100,11 @@ impl PvDatabase {
         let Some(external) = link.external() else {
             return false;
         };
-        let (target, body) = Self::split_external_link_name(external.name);
-        matches!(target, super::link_put_queue::LinkTarget::Scheme(_))
-            && super::link_put_queue::find_lset(&self.inner, &target, |lset| {
-                lset.get_failure_disconn(body).then_some(())
-            })
-            .is_some()
+        let (scheme, body) = Self::split_external_link_name(external.name);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
+            lset.get_failure_disconn(body).then_some(())
+        })
+        .is_some()
     }
 
     /// C `dbIsLinkConnected`: only an external link can be down, and its
@@ -2215,7 +2211,7 @@ impl PvDatabase {
         if !replaced && !instance.link_unadded(field) {
             return;
         }
-        let Some((target, body)) = Self::scheme_link_name(&before) else {
+        let Some((scheme, body)) = Self::scheme_link_name(&before) else {
             return;
         };
         let holder = super::LinkHolder::new(
@@ -2223,7 +2219,7 @@ impl PvDatabase {
             instance.name.as_bytes(),
             field,
         );
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
             lset.remove_link(holder, body);
             Some(())
         });
@@ -2258,20 +2254,19 @@ impl PvDatabase {
         holder: super::LinkHolder<'_>,
         link: &crate::server::record::ParsedLink,
     ) -> Option<super::LinkOpen> {
-        let (target, body) = Self::scheme_link_name(link)?;
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+        let (scheme, body) = Self::scheme_link_name(link)?;
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
             Some(lset.open_link(holder, body))
         })
     }
 
-    /// The lset target and name of a link naming its scheme — the links an
-    /// lset opens and removes.
-    fn scheme_link_name(
-        link: &crate::server::record::ParsedLink,
-    ) -> Option<(super::link_put_queue::LinkTarget, &[u8])> {
+    /// The lset scheme and name of an external link an lset opens and
+    /// removes: every one but a CA link, which C's `dbCaAddLink` takes with
+    /// no `openLink` (`dbLink.c:128`).
+    fn scheme_link_name(link: &crate::server::record::ParsedLink) -> Option<(&'static str, &[u8])> {
         let external = link.external()?;
-        let (target, body) = Self::split_external_link_name(external.name);
-        matches!(target, super::link_put_queue::LinkTarget::Scheme(_)).then_some((target, body))
+        let (scheme, body) = Self::split_external_link_name(external.name);
+        (scheme != "ca").then_some((scheme, body))
     }
 
     /// What an open of `field`'s stored link answered, bound into the record:
@@ -2315,7 +2310,7 @@ impl PvDatabase {
     }
 
     /// A DB link whose target is not served here reads as the CA link C
-    /// makes it: value and raw remote alarm from the external resolver,
+    /// makes it: value and raw remote alarm from the ca link set,
     /// identical to the `Ca`/`Pva` arm of
     /// [`Self::read_unresolved_link_value_and_alarm`].
     fn read_db_external(
@@ -2434,8 +2429,8 @@ impl PvDatabase {
     /// remote `timeStamp.userTag` widened without sign extension, or `0`
     /// when the source carries none.
     pub(crate) fn external_link_time(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
-        let (target, body) = Self::split_external_link_name(name);
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| lset.time_stamp(body))
+        let (scheme, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| lset.time_stamp(body))
     }
 
     /// Build a [`LinkAlarm`] from the registered lset's alarm
@@ -2447,10 +2442,8 @@ impl PvDatabase {
     /// is `Some`, the `stat` is `LINK_ALARM` and the message comes
     /// from `alarm_message`.
     fn external_link_alarm(&self, name: &[u8]) -> Option<LinkAlarm> {
-        // A bare name tries every registered lset until one reports a
-        // severity (mirrors `resolve_external_pv`'s bare path).
-        let (target, body) = Self::split_external_link_name(name);
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+        let (scheme, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
             let sev = lset.alarm_severity(body)?;
             Some(LinkAlarm {
                 // remote STAT for MSS, else LINK_ALARM.
@@ -2489,8 +2482,8 @@ impl PvDatabase {
         &self,
         name: &[u8],
     ) -> Option<crate::server::database::RemoteAlarm> {
-        let (target, body) = Self::split_external_link_name(name);
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| lset.remote_alarm(body))
+        let (scheme, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| lset.remote_alarm(body))
     }
 
     /// Remote display / control / valueAlarm metadata for an external
@@ -2513,8 +2506,8 @@ impl PvDatabase {
         &self,
         name: &[u8],
     ) -> Option<crate::server::database::LinkMetadata> {
-        let (target, body) = Self::split_external_link_name(name);
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| lset.link_metadata(body))
+        let (scheme, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| lset.link_metadata(body))
     }
 
     /// C `dbGetControlLimits` / `dbGetGraphicLimits` / `dbGetAlarmLimits` /
@@ -3268,22 +3261,16 @@ impl PvDatabase {
     fn external_put_gate<'a>(
         &self,
         name: &'a [u8],
-    ) -> Result<(super::link_put_queue::LinkTarget, &'a [u8]), ExternalPutRefusal> {
-        use super::link_put_queue::{LinkTarget, find_lset};
+    ) -> Result<(&'static str, &'a [u8]), ExternalPutRefusal> {
+        use super::link_put_queue::find_lset;
         use super::link_set::PutAdmission;
         let shown = String::from_utf8_lossy(name);
 
-        // A bare name has every registered lset as a candidate, first
-        // accepting write wins (mirrors `resolve_external_pv`'s bare-name
-        // path).
-        let (target, body) = Self::split_external_link_name(name);
-        if !self.link_addressable(&target, body) {
-            return Err(ExternalPutRefusal::Unserviceable(match target {
-                LinkTarget::Scheme(scheme) => {
-                    format!("no '{scheme}' link set registered for '{shown}'")
-                }
-                LinkTarget::Any => format!("no link set registered for external link '{shown}'"),
-            }));
+        let (scheme, body) = Self::split_external_link_name(name);
+        if !self.link_addressable(scheme, body) {
+            return Err(ExternalPutRefusal::Unserviceable(format!(
+                "no '{scheme}' link set registered for '{shown}'"
+            )));
         }
 
         // A database built with no tokio runtime anywhere has no reactor for
@@ -3308,26 +3295,12 @@ impl PvDatabase {
         // record alarms in this cycle. `put_admission` is answered from cached
         // state — this is the only lset call left inside the record's advisory
         // write gate, and it does no I/O.
-        let mut admission = PutAdmission::Refused;
-        find_lset(&self.inner, &target, |lset| {
-            match lset.put_admission(body) {
-                PutAdmission::Connected => {
-                    admission = PutAdmission::Connected;
-                    Some(())
-                }
-                // Unopened outranks Refused: the write must still be
-                // staged so the lset's lazy open runs (see `PutAdmission`).
-                PutAdmission::Unopened => {
-                    admission = PutAdmission::Unopened;
-                    None
-                }
-                PutAdmission::Refused => None,
-            }
-        });
+        let admission = find_lset(&self.inner, scheme, |lset| Some(lset.put_admission(body)))
+            .unwrap_or(PutAdmission::Refused);
         if admission == PutAdmission::Refused {
             return Err(ExternalPutRefusal::NotConnected);
         }
-        Ok((target, body))
+        Ok((scheme, body))
     }
 
     /// Ask [`Self::external_put_gate`] on its own, staging nothing: `Ok` iff a
@@ -3376,8 +3349,7 @@ impl PvDatabase {
     /// `name` may be a fully scheme-prefixed string (`pva://X`,
     /// `ca://X`) or the bare body (the form stored in
     /// `ParsedLink::Ca`/`Pva` after `record/link.rs` strips the
-    /// scheme). For a bare name every registered lset is tried in
-    /// turn — the first whose `put_value` succeeds wins.
+    /// scheme), which is a CA link.
     ///
     /// # What the returned status means
     ///
@@ -3424,7 +3396,7 @@ impl PvDatabase {
         let op = Self::external_put_op(src_notify);
         use super::link_put_queue::{Channel, LinkKey};
 
-        let (target, body) = self.external_put_gate(name)?;
+        let (scheme, body) = self.external_put_gate(name)?;
 
         self.inner
             .link_puts
@@ -3432,7 +3404,7 @@ impl PvDatabase {
         let key = LinkKey {
             link,
             channel: Channel {
-                target,
+                scheme,
                 name: body.into(),
             },
         };
@@ -5239,12 +5211,12 @@ impl PvDatabase {
             .update(|cp| cp.set_link(&holder, &field, keyed));
         if let Some(edge) = edge {
             let pv = external_cp_key(&edge.pv);
-            let (target, body) = Self::split_external_link_name(pv);
+            let (scheme, body) = Self::split_external_link_name(pv);
             let holder = super::CpTarget {
                 record: holder,
                 passive_only: edge.passive_only,
             };
-            super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+            super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
                 lset.cp_link_added(body, holder.clone());
                 None::<()>
             });
@@ -5991,10 +5963,30 @@ mod external_link_pv_name_tests {
 
 #[cfg(test)]
 mod nonlocal_db_link_read_tests {
-    use crate::server::database::PvDatabase;
+    use crate::server::database::{LinkSet, PvDatabase};
     use crate::server::record::{ParsedLink, parse_link_v2};
     use crate::types::EpicsValue;
     use std::sync::Arc;
+
+    /// A `ca` network half whose monitor cache holds what `serve` answers.
+    struct NetworkStub(fn(&[u8]) -> Option<EpicsValue>);
+    #[async_trait::async_trait]
+    impl LinkSet for NetworkStub {
+        fn is_connected(&self, name: &[u8]) -> bool {
+            (self.0)(name).is_some()
+        }
+        fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+            (self.0)(name)
+        }
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
+            (self.0)(name)
+        }
+    }
+
+    pub(super) async fn serve_network(db: &PvDatabase, serve: fn(&[u8]) -> Option<EpicsValue>) {
+        db.register_link_set("ca", Arc::new(NetworkStub(serve)))
+            .await;
+    }
 
     /// C `dbInitLink` (`dbLink.c:118-128`, the call being `dbCaAddLink` at
     /// `:128`) makes a PV link whose target is
@@ -6005,12 +5997,12 @@ mod nonlocal_db_link_read_tests {
     /// `None`. Pre-fix the `Db` read arm read only the local DB (`get_pv`)
     /// and dropped the non-local target.
     #[epics_macros_rs::epics_test]
-    async fn plain_nonlocal_db_link_reads_via_external_resolver() {
+    async fn plain_nonlocal_db_link_reads_via_the_ca_link_set() {
         let db = PvDatabase::new();
-        // Stand-in for the calink/pvalink lset: resolve OTHER:PV remotely.
-        db.set_external_resolver(Arc::new(|name: &[u8]| {
+        // Stand-in for the CA network: resolve OTHER:PV remotely.
+        serve_network(&db, |name| {
             (name == b"OTHER:PV").then_some(EpicsValue::Double(42.0))
-        }))
+        })
         .await;
 
         let link = parse_link_v2("OTHER:PV");
@@ -6026,7 +6018,7 @@ mod nonlocal_db_link_read_tests {
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
-            "a plain non-local Db link must resolve through the external resolver (C dbCaAddLink fallback)"
+            "a plain non-local Db link must resolve through the ca link set (C dbCaAddLink fallback)"
         );
     }
 
@@ -6038,9 +6030,9 @@ mod nonlocal_db_link_read_tests {
     #[epics_macros_rs::epics_test]
     async fn nonlocal_db_link_value_and_alarm_via_external() {
         let db = PvDatabase::new();
-        db.set_external_resolver(Arc::new(|name: &[u8]| {
+        serve_network(&db, |name| {
             (name == b"OTHER:PV").then_some(EpicsValue::Double(5.0))
-        }))
+        })
         .await;
 
         let link = parse_link_v2("OTHER:PV");
@@ -6048,9 +6040,9 @@ mod nonlocal_db_link_read_tests {
         assert_eq!(
             fetch.value(),
             Some(EpicsValue::Double(5.0)),
-            "non-local Db link value must come from the external resolver"
+            "non-local Db link value must come from the ca link set"
         );
-        // No lset is registered (only the legacy resolver), so the bare
+        // The CA network half reports no severity, so the bare
         // external alarm path reports None — never a fabricated local
         // record alarm for a record that does not exist in this IOC.
         assert!(
@@ -6060,15 +6052,14 @@ mod nonlocal_db_link_read_tests {
     }
 
     /// Owner path: a Db link whose target IS a local record still reads
-    /// the local database and never consults the external resolver.
+    /// the local database and never consults the ca link set.
     #[epics_macros_rs::epics_test]
     async fn local_db_link_reads_local_not_external() {
         let db = PvDatabase::new();
         db.add_pv("SRC", EpicsValue::Double(7.0)).await.unwrap();
         // A resolver returning a DIFFERENT value proves the local read
         // wins and the external path is not taken for a local target.
-        db.set_external_resolver(Arc::new(|_name: &[u8]| Some(EpicsValue::Double(-1.0))))
-            .await;
+        serve_network(&db, |_| Some(EpicsValue::Double(-1.0))).await;
 
         let link = parse_link_v2("SRC");
         let mut visited = crate::server::database::ProcStack::new();
@@ -6078,7 +6069,7 @@ mod nonlocal_db_link_read_tests {
         assert_eq!(
             v,
             Some(EpicsValue::Double(7.0)),
-            "a local Db link must read the local DB, not the external resolver"
+            "a local Db link must read the local DB, not the ca link set"
         );
     }
 }
@@ -6504,13 +6495,13 @@ mod db_link_addr_tests {
     }
 
     /// A target that leaves the database turns the link non-local: the
-    /// cached address is not read, the external resolver is.
+    /// cached address is not read, the ca link set is.
     #[epics_macros_rs::epics_test]
     async fn a_removed_target_falls_through_to_the_external_path() {
         let db = PvDatabase::new();
-        db.set_external_resolver(Arc::new(|name: &[u8]| {
+        super::nonlocal_db_link_read_tests::serve_network(&db, |name| {
             (name == b"SRC").then_some(EpicsValue::Double(9.0))
-        }))
+        })
         .await;
         db.add_record("SRC", Box::new(AiRecord::new(1.0)))
             .await

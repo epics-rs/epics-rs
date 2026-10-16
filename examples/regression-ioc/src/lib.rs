@@ -118,7 +118,13 @@ impl RegressionIoc {
         };
         let (motor_type, motor_record_factory) = motor_rs::motor_record_factory();
 
+        // dbCa, which every C IOC links.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("boot runs on the IOC's reactor");
         let (db, _autosave) = IocBuilder::new()
+            .register_link_type("ca", move |db| {
+                epics_ca_rs::calink::calink_link_set_install(db, reactor)
+            })
             .register_record_type(motor_type, motor_record_factory)
             .register_dynamic_device_support(motor_factory)
             .db_string(db_text, &macros)?

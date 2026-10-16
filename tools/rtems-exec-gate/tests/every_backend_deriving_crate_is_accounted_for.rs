@@ -121,6 +121,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-base-rs", "tests/client_server.rs"),
     (
         "epics-bridge-rs",
+        "tests/a_bare_ca_link_opens_no_pva_channel.rs",
+    ),
+    (
+        "epics-bridge-rs",
         "tests/connected_pva_link_lset_calls_allocate_nothing.rs",
     ),
     (

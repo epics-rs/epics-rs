@@ -292,17 +292,6 @@ pub enum PvEntry {
     Record(Arc<RecordCell>),
 }
 
-/// Callback for resolving external PV names (CA/PVA links).
-/// Returns the *cached* value of the external PV, or `None` if unavailable.
-///
-/// **Sync**, for the same reason [`LinkSet::get_cached_value`] is: this runs
-/// on the record-processing thread with the record's L1 gate held, and C's
-/// `dbCaGetLink` likewise only reads `pca->pgetNative` under `pca->lock` —
-/// it never waits for the wire (`dbCa.c:419-506`). A resolver that cannot
-/// answer from cache must stage the open on its own executor and return
-/// `None` (C's `!pca->isConnected` arm, `dbCa.c:430-435`).
-pub type ExternalPvResolver = Arc<dyn Fn(&[u8]) -> Option<EpicsValue> + Send + Sync>;
-
 /// Async hook invoked by [`PvDatabase::has_name`] when a name is not yet
 /// in the database. Used by the CA gateway and similar proxy components
 /// to lazily populate PVs on first search.
@@ -810,29 +799,24 @@ struct PvDatabaseInner {
     /// completes, then re-executed through a fresh IocShell so the
     /// commands run with the database in its post-init state.
     after_ioc_running: std::sync::Mutex<Vec<Vec<u8>>>,
-    /// Optional resolver for external PVs (ca://, pva:// links).
-    ///
-    /// Whole-value replace: the only writer stores a complete new value
-    /// ([`PvDatabase::set_external_resolver`]), so an
-    /// [`ArcSwapOption`] store IS the mutation and no writer gate is
-    /// needed. Readers take the `Arc` with no lock at all.
-    external_resolver: ArcSwapOption<ExternalPvResolver>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
     ///
-    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8g).
+    /// Whole-value replace: the only writer stores a complete new value, so
+    /// an [`ArcSwapOption`] store IS the mutation and no writer gate is
+    /// needed. Readers take the `Arc` with no lock at all (§3 row L8g).
     search_resolver: ArcSwapOption<SearchResolver>,
     /// Optional per-request gate consulted before a *cached* simple PV is
     /// advertised as existing (e.g. CA gateway host/state admission). See
     /// [`ExistenceGate`]. `None` for a plain IOC (short-circuit unchanged).
     ///
-    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8h).
+    /// Whole-value replace, as [`Self::search_resolver`] (§3 row L8h).
     existence_gate: ArcSwapOption<ExistenceGate>,
     /// The database debugger, installed by the first `dbb` and removed when
     /// its last breakpoint goes — C's `lset_stack_count`, which `dbProcess`
     /// tests before it calls either breakpoint hook (`dbAccess.c:504`,
     /// `:614`).
     ///
-    /// Whole-value replace, as [`Self::external_resolver`]: a database nobody
+    /// Whole-value replace, as [`Self::search_resolver`]: a database nobody
     /// is debugging pays one relaxed atomic load per processed record where C
     /// pays one comparison, and the mechanism stays testable and removable
     /// instead of welded into `process_record_with_links_body` as a pair of
@@ -855,8 +839,7 @@ struct PvDatabaseInner {
     /// `false` with a live table.
     debugging: std::sync::atomic::AtomicBool,
     /// Per-scheme link sets — pluggable backends for `pva://` /
-    /// `ca://` link resolution. Consulted before the legacy
-    /// [`ExternalPvResolver`] in `resolve_external_pv`.
+    /// `ca://` link resolution, the only route `resolve_external_pv` takes.
     /// Mirrors the C-EPICS lset abstraction.
     ///
     /// Read-modify-write cell (`register_link_set` inserts one scheme into
@@ -1490,7 +1473,6 @@ impl PvDatabase {
                     ),
                     simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
                     pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
-                    external_resolver: ArcSwapOption::empty(),
                     breakpoints: ArcSwapOption::empty(),
                     debugging: std::sync::atomic::AtomicBool::new(false),
                     search_resolver: ArcSwapOption::empty(),
@@ -1863,12 +1845,6 @@ impl PvDatabase {
         !gate(record_path, peer).await
     }
 
-    /// Set an external PV resolver for CA/PVA link resolution.
-    /// The resolver is called synchronously from link reads.
-    pub async fn set_external_resolver(&self, resolver: ExternalPvResolver) {
-        self.inner.external_resolver.store(Some(Arc::new(resolver)));
-    }
-
     /// The database debugger, or `None` when nothing is being debugged.
     ///
     /// The hot-path read behind both breakpoint hooks: C's
@@ -1941,8 +1917,7 @@ impl PvDatabase {
 
     /// Register a [`LinkSet`] under `scheme` (e.g. `"pva"` /
     /// `"ca"`). The lset is consulted for `ParsedLink::Pva` /
-    /// `ParsedLink::Ca` link reads/writes before falling back to
-    /// the legacy [`ExternalPvResolver`]. A later call for the same
+    /// `ParsedLink::Ca` link reads/writes. A later call for the same
     /// scheme replaces it for reads and writes, but a forward link already
     /// opened keeps the first lset's handle: its slot is set once.
     ///
@@ -2256,12 +2231,10 @@ impl PvDatabase {
         out
     }
 
-    /// Resolve an external PV name. Dispatches through the
-    /// `(scheme, name)` lset if one is registered; otherwise falls
-    /// back to the legacy [`ExternalPvResolver`] closure. `name`
-    /// may be the bare PV name (in which case `pva://` is assumed
-    /// when an lset is registered for that scheme) or a fully
-    /// scheme-prefixed string.
+    /// Resolve an external PV name through the one lset its scheme names:
+    /// `pva` for `pva://`, `ca` for `ca://` and a bare name. No other lset
+    /// is asked — C picks one lset per link and never searches across them
+    /// (`dbLink.c:107-130`).
     ///
     /// # Cached read, then a staged open — C `dbCaGetLink`
     ///
@@ -2283,64 +2256,41 @@ impl PvDatabase {
         &self,
         link: crate::server::record::ExternalRef<'_>,
     ) -> Option<EpicsValue> {
-        // Try lsets first. We accept both "scheme://body" and the
-        // bare body (stored in ParsedLink::Pva/Ca after the
-        // dispatch in record/link.rs). `Any` tries every registered
-        // lset in turn; the first one with a cached value wins.
+        // Try lsets first: the scheme's one lset, `ca` for a bare name.
         let name = link.name;
-        let (target, body) = Self::split_external_link_name(name);
+        let (scheme, body) = Self::split_external_link_name(name);
         if let Some(v) =
-            link_put_queue::find_lset(&self.inner, &target, |lset| lset.get_cached_value(body))
+            link_put_queue::find_lset(&self.inner, scheme, |lset| lset.get_cached_value(body))
         {
             return Some(v);
         }
         self.stage_external_link_open(link);
-        // Fall through to legacy resolver, which is addressed with the
-        // caller's string verbatim (scheme prefix and all).
-        let resolver = self
-            .inner
-            .external_resolver
-            .load_full()
-            .map(|r| (*r).clone());
-        match resolver {
-            Some(r) => r(name),
-            None => None,
-        }
+        None
     }
 
     /// Split an external link's boundary name
     /// ([`crate::server::record::ParsedLink::external_pv_name`]) into the
-    /// work-queue target plus the name the lset is addressed with.
+    /// scheme of its one lset plus the name that lset is addressed with.
     ///
     /// Single owner of the `ca://` / `pva://` prefix convention: the
     /// cache-miss stage in `resolve_external_pv` and the iocInit
     /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
     /// the same [`link_put_queue::Channel`] from the same link, or the
     /// queue's once-per-link open would fire twice under two spellings.
-    fn split_external_link_name(name: &[u8]) -> (link_put_queue::LinkTarget, &[u8]) {
+    fn split_external_link_name(name: &[u8]) -> (&'static str, &[u8]) {
         if let Some(rest) = name.strip_prefix(b"pva://") {
-            (link_put_queue::LinkTarget::Scheme("pva"), rest)
-        } else if let Some(rest) = name.strip_prefix(b"ca://") {
-            (link_put_queue::LinkTarget::Scheme("ca"), rest)
+            ("pva", rest)
         } else {
-            (link_put_queue::LinkTarget::Any, name)
+            ("ca", name.strip_prefix(b"ca://").unwrap_or(name))
         }
     }
 
-    /// Whether any lset can take a link to `body` under `target`: the `ca`
-    /// set only for a name it can connect ([`ca_link::CaLinks::addresses`]).
-    pub(crate) fn link_addressable(
-        &self,
-        target: &link_put_queue::LinkTarget,
-        body: &[u8],
-    ) -> bool {
-        let registry = self.inner.link_sets.load();
-        match target {
-            link_put_queue::LinkTarget::Scheme("ca") => self.inner.ca_links.addresses(body),
-            link_put_queue::LinkTarget::Scheme(s) => registry.get_ref(s).is_some(),
-            link_put_queue::LinkTarget::Any => {
-                registry.len() > 1 || self.inner.ca_links.addresses(body)
-            }
+    /// Whether `scheme`'s lset can take a link to `body`: the `ca` set only
+    /// for a name it can connect ([`ca_link::CaLinks::addresses`]).
+    pub(crate) fn link_addressable(&self, scheme: &str, body: &[u8]) -> bool {
+        match scheme {
+            "ca" => self.inner.ca_links.addresses(body),
+            s => self.inner.link_sets.load().get_ref(s).is_some(),
         }
     }
 
@@ -2365,12 +2315,12 @@ impl PvDatabase {
         let Some(rec) = self.get_record(record) else {
             return 0;
         };
-        let (target, body) = Self::split_external_link_name(link_name.as_ref());
+        let (scheme, body) = Self::split_external_link_name(link_name.as_ref());
         self.inner.link_puts.coalesced_for(
             rec.index(),
             field,
             &link_put_queue::Channel {
-                target,
+                scheme,
                 name: body.into(),
             },
         )
@@ -2423,8 +2373,8 @@ impl PvDatabase {
         if link.open.is_some_and(|open| open.is_set()) {
             return false;
         }
-        let (target, body) = Self::split_external_link_name(link.name);
-        if !self.link_addressable(&target, body) {
+        let (scheme, body) = Self::split_external_link_name(link.name);
+        if !self.link_addressable(scheme, body) {
             return false;
         }
         // Nothing is staged that no owner can perform. A database built with
@@ -2443,12 +2393,10 @@ impl PvDatabase {
         // C `dbInitLink` adds a local CA link with `DBCA_CALLBACK_INIT_START`
         // (`dbLink.c:127-129`), which `dbCaRun` waits for. Registered as the
         // open is queued, so nothing the open does can report it first.
-        let local_ca = (matches!(target, link_put_queue::LinkTarget::Any)
-            || matches!(target, link_put_queue::LinkTarget::Scheme("ca")))
-            && self.has_name_no_resolve(body);
+        let local_ca = scheme == "ca" && self.has_name_no_resolve(body);
         let staged = self.inner.link_puts.stage_open(
             link_put_queue::Channel {
-                target,
+                scheme,
                 name: body.into(),
             },
             || local_ca.then(|| self.inner.ca_run.register()).flatten(),

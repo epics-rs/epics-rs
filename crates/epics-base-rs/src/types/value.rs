@@ -34,7 +34,7 @@ pub enum EpicsValue {
     /// a `DBR_STRING` target copies `choices[index]`, a numeric target
     /// takes the index). This is a TRANSIENT carrier produced only on
     /// the pvalink NTEnum link-resolver path (`pvfield_to_epics_value`);
-    /// the dbrType-blind [`ExternalPvResolver`](crate::server::database)
+    /// the dbrType-blind [`LinkSet::get_cached_value`](crate::server::database::LinkSet::get_cached_value)
     /// boundary cannot resolve the label itself, so the choices must
     /// survive to the record's `put_field`. Everywhere else it behaves
     /// exactly like [`Self::Enum`]: read the public `index` field for the

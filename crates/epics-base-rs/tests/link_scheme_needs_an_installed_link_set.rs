@@ -219,9 +219,9 @@ async fn locally_serviced_and_ca_shaped_links_are_not_refused() {
 /// (`initialize_link_locality` says so, and `record_link_fields` does not
 /// enumerate it), so the scheme has to survive to the link-set boundary as
 /// well: `external_pv_name` returns `pva://…` and
-/// `split_external_link_name` reads it back as `LinkTarget::Scheme("pva")`.
-/// Addressed by its bare name the link resolved to `LinkTarget::Any` and was
-/// measured being read from the CA link set (`read:SRC`, `A` delivered 9.0).
+/// `split_external_link_name` reads it back as the `pva` scheme. Addressed
+/// by its bare name the link is a CA link, and was measured being read from
+/// the CA link set (`read:SRC`, `A` delivered 9.0).
 #[epics_macros_rs::epics_test]
 async fn a_reparsed_pva_link_is_not_serviced_by_another_schemes_link_set() {
     let ca = SpyLset::new("ca");

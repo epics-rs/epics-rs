@@ -35,5 +35,5 @@ export RUSTFLAGS="-Cprofile-use=$PROFILE -Clink-arg=-Wl,--defsym=epics_rs_pgo=0"
 EPICS_RS_BUILD_EXEC_BACKEND=thread cargo build --release --locked --target "$TRIPLE" \
     -p epics-ca-rs --bin realtime-ca-ioc
 EPICS_RS_BUILD_EXEC_BACKEND=thread cargo build --release --locked --target "$TRIPLE" \
-    -p epics-bridge-rs --features qsrv-core,pvalink --bin realtime-pva-ioc
+    -p epics-bridge-rs --features qsrv-core,pvalink,calink-core --bin realtime-pva-ioc
 cargo build --release --locked --target "$TRIPLE" -p epics-ca-rs --bin softioc-rs

@@ -266,7 +266,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # `epics-bridge-rs` with no features compiles `error`, `convert` and `lib.rs`
 # and nothing else — the `qsrv` module is behind `qsrv-core` — so a featureless
 # build would type-check none of the production lines this gate covers.
-# `qsrv-core,pvalink` and not `qsrv`: the latter implies `qsrv-bin` machinery no
+# `qsrv-core,pvalink,calink-core` and not `qsrv`: the latter implies `qsrv-bin` machinery no
 # target runs. `epics-ca-rs` selects `client-core` because `realtime-ca-ioc` mounts
 # the `ca://` resolver, and `client-core` rather than `client` is the circuit,
 # search engine, subscriptions and resolver WITHOUT the beacon/repeater/
@@ -280,7 +280,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # stopped importing `epics_base_rs` — so the entry is deleted rather than
 # re-tuned, exactly as the workaround comment said it should be.
 declare -A CRATE_FEATURES=(
-    [epics-bridge-rs]="qsrv-core,pvalink"
+    [epics-bridge-rs]="qsrv-core,pvalink,calink-core"
     [epics-ca-rs]="client-core"
 )
 

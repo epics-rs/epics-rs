@@ -187,7 +187,13 @@ async fn boot_ioc_on(ca_port: u16) -> Result<Ioc, Box<dyn std::error::Error>> {
         std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1");
     }
     let macros = std::collections::HashMap::new();
+    // dbCa, which every C IOC links.
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("boot runs on the IOC's reactor");
     let (db, _autosave) = IocBuilder::new()
+        .register_link_type("ca", move |db| {
+            epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
         .db_string(FAST_DB, &macros)?
         .build_served()
         .await?;

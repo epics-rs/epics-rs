@@ -648,7 +648,7 @@ jobs:
                      epics-rtems-boot epics-bridge-rs asyn-rs; do
           feats=()
           case "$crate" in
-            epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
+            epics-bridge-rs) feats=(--features qsrv-core,pvalink,calink-core) ;;
             epics-ca-rs)     feats=(--features client-core) ;;
             asyn-rs)         feats=(--features epics) ;;
           esac
@@ -674,7 +674,7 @@ jobs:
                      epics-rtems-boot epics-bridge-rs asyn-rs; do
           feats=()
           case "$crate" in
-            epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
+            epics-bridge-rs) feats=(--features qsrv-core,pvalink,calink-core) ;;
             epics-ca-rs)     feats=(--features client-core) ;;
             asyn-rs)         feats=(--features epics) ;;
           esac

@@ -2229,15 +2229,9 @@ impl ParsedLink {
                 name: &ca.pv,
                 open: Some(&ca.open),
             }),
-            // Scheme-qualified, because these two variants KNOW their scheme
-            // and the boundary must not lose it: `split_external_link_name`
-            // reads the prefix back into `LinkTarget::Scheme("pva")`, and
-            // without it a pva link addressed by its bare name resolves to
-            // `LinkTarget::Any` — every registered lset in turn, first to
-            // answer wins. Measured on a database holding only a `ca` link
-            // set: `INPA="{pva:{pv:\"SRC\"}}"` was read from the CA link set.
-            // The lset itself still sees the unprefixed body, which is what
-            // `split_external_link_name` hands it.
+            // Scheme-qualified: `split_external_link_name` reads the prefix
+            // back into the `pva` scheme, and a bare name is a CA
+            // link. The lset itself still sees the unprefixed body.
             ParsedLink::Pva(name) => Some(ExternalRef {
                 name: name.qualified.as_bytes(),
                 open: Some(&name.open),
@@ -2266,8 +2260,8 @@ impl ParsedLink {
     /// `Ca` deliberately answers `None`. The parse erases the difference
     /// between `ca://X`, `{ca:{pv:"X"}}`, the `X CA` modifier and the
     /// `dbInitLink` non-local fallthrough — all four are `Ca(CaLink{pv:"X"})`
-    /// — and the last two must keep working with no lset, through the legacy
-    /// [`ExternalPvResolver`](crate::server::database::ExternalPvResolver).
+    /// — and the last two must keep working with no lset registered, through
+    /// the database's own `ca` link set.
     /// There is no C rule to match either: `ca` has no `link()` line in base
     /// or in pvxs, so it is this port's own extension.
     pub fn required_link_set_scheme(&self) -> Option<&'static str> {
@@ -5277,7 +5271,7 @@ mod json_link_tests {
     /// (pv + canonical options), not the bare PV — so two same-PV links
     /// that differ by options resolve to distinct configs — under the
     /// `pva://` scheme prefix, which is what keeps the boundary dispatch on
-    /// `LinkTarget::Scheme("pva")` instead of "try every registered lset".
+    /// the `pva` scheme instead of the bare name's `ca`.
     /// The lset itself is still handed the unprefixed key:
     /// `split_external_link_name` takes the prefix back off.
     #[test]

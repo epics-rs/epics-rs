@@ -9,8 +9,7 @@
 //!
 //! At runtime [`super::PvDatabase`] holds a registry keyed by URL
 //! scheme (`"pva"`, `"ca"`); each entry is an `Arc<dyn LinkSet>`.
-//! Record-link reads dispatch through the matching lset before
-//! falling back to the legacy `ExternalPvResolver` closure.
+//! Record-link reads dispatch through the matching lset and no other.
 //!
 //! The trait is **split by thread**, mirroring the C `dbCa` split
 //! between the record-processing thread and the `dbCaTask`
@@ -805,11 +804,6 @@ impl LinkSetRegistry {
 
     pub(crate) fn get_ref(&self, scheme: &str) -> Option<&DynLinkSet> {
         self.inner.get(scheme)
-    }
-
-    /// Every registered lset, in [`Self::schemes`] order.
-    pub(crate) fn link_sets(&self) -> impl Iterator<Item = &DynLinkSet> {
-        self.inner.values()
     }
 
     /// Names of every registered scheme (`["pva", "ca", ...]`).

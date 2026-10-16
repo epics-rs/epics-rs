@@ -64,7 +64,7 @@ gen() { # gen <target-dir> <cargo build args...>
 EPICS_RS_BUILD_EXEC_BACKEND=thread gen "$OUT/gen-thread" \
     -p epics-ca-rs --bin realtime-ca-ioc
 EPICS_RS_BUILD_EXEC_BACKEND=thread gen "$OUT/gen-thread" \
-    -p epics-bridge-rs --features qsrv-core,pvalink --bin realtime-pva-ioc
+    -p epics-bridge-rs --features qsrv-core,pvalink,calink-core --bin realtime-pva-ioc
 gen "$OUT/gen" -p epics-ca-rs --bin softioc-rs
 CARGO_TARGET_DIR="$OUT/tools" cargo build --release --locked \
     -p epics-ca-rs --bin caget-rs --bin caput-rs --bin camonitor-rs

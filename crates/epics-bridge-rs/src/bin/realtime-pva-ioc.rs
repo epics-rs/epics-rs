@@ -357,10 +357,20 @@ mod ioc {
         // is off. Kept for the banner and the probe report.
         let resolver = Arc::new(std::sync::OnceLock::new());
         let installed = Arc::clone(&resolver);
-        let mut builder = IocBuilder::new().register_link_type("pva", move |db| async move {
-            let _ = installed.set(epics_bridge_rs::qsrv::install_pvalink(&db).await);
-            Vec::new()
-        });
+        // And dbCa, which every C IOC links, softIocPVX included: without it a
+        // bare remote link has no lset and stays LINK/INVALID. Its client is
+        // built at the first CA link, reading the `EPICS_CA_*` boot variables.
+        let mut builder = IocBuilder::new()
+            .register_link_type("pva", move |db| async move {
+                let _ = installed.set(epics_bridge_rs::qsrv::install_pvalink(&db).await);
+                Vec::new()
+            })
+            .register_link_type("ca", |db| async move {
+                let reactor = epics_base_rs::runtime::task::Reactor::current()
+                    .expect("the exec backend's reactor is process-global");
+                epics_ca_rs::calink::install_calink_resolver(&db, reactor).await;
+                Vec::new()
+            });
         #[cfg(feature = "bench-subroutines")]
         {
             builder = builder.register_subroutine("benchNoop", |_r| Ok(0));

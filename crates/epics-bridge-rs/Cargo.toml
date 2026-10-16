@@ -58,19 +58,15 @@ bringup-probes = ["epics-pva-rs?/bringup-probes"]
 bench-subroutines = []
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
-# symmetric with `calink`, which is always-on whenever `epics-ca-rs` is
-# present (`epics_ca_rs::calink`, no feature). pvxs likewise ties pvalink
-# to QSRV2 (`iochooks.cpp:461-496`).
-#
-# `epics-ca-rs` is needed by the host runners only — `run_ca_pva_qsrv_ioc_app`
-# and the `ca` link set `run_qsrv_ioc_app` installs — which is why it is here
-# and not in `qsrv-core`.
-# The `epics-pva-rs/*` entries restore what `default-features = false` on the
-# dependency drops; see the note over the dependency itself.
+# symmetric with `calink-core`, the `ca` link set `run_qsrv_ioc_app`
+# installs. pvxs likewise ties pvalink to QSRV2 (`iochooks.cpp:461-496`).
+# The `epics-pva-rs/*` and `epics-ca-rs/client` entries restore what
+# `default-features = false` on those dependencies drops.
 qsrv = [
     "qsrv-core",
     "pvalink",
-    "dep:epics-ca-rs",
+    "calink-core",
+    "epics-ca-rs/client",
     "epics-pva-rs/client",
     "epics-pva-rs/tls",
     "epics-pva-rs/pkcs12",
@@ -78,7 +74,7 @@ qsrv = [
 # QSRV daemon binary (qsrv-rs)
 qsrv-bin = ["qsrv", "dep:clap"]
 # CA fan-out gateway (C++ ca-gateway equivalent)
-ca-gateway = ["dep:epics-ca-rs", "dep:regex"]
+ca-gateway = ["dep:epics-ca-rs", "epics-ca-rs/client", "dep:regex"]
 # CA gateway daemon binary (ca-gateway-rs)
 ca-gateway-bin = ["ca-gateway", "dep:clap", "dep:tracing-subscriber"]
 # CA gateway with TLS termination on the downstream side. Clients
@@ -91,6 +87,10 @@ ca-gateway-tls = [
     "ca-gateway-bin",
     "epics-ca-rs/experimental-rust-tls",
 ]
+# The network half of the `ca` link set, with only the client a record link
+# needs, so it compiles for the target: C's dbCa is in every IOC, softIocPVX
+# included, and an IOC without it leaves a bare remote link LINK/INVALID.
+calink-core = ["dep:epics-ca-rs", "epics-ca-rs/client-core"]
 # PVA links for record INP/OUT (pvalink lset). Enabled by default via
 # `qsrv` above; can still be selected on its own for a pvalink-only
 # build with no QSRV server.
@@ -124,6 +124,7 @@ all-bridges = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin", "pvalink", "p
 dual-ioc = [
     "dep:epics-pva-rs",
     "dep:epics-ca-rs",
+    "epics-ca-rs/client",
     "epics-pva-rs/client",
     "epics-pva-rs/tls",
     "epics-pva-rs/pkcs12",
@@ -176,23 +177,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # `pva-gateway`, `dual-ioc` — so host builds resolve exactly as before. Only
 # `qsrv-core`, the RTEMS selection, gets the reduced set.
 epics-pva-rs = { path = "../epics-pva-rs", version = "0.32.0", optional = true, default-features = false }
-# `epics-ca-rs` stays inherited, but NOT because its defaults are empty — they
-# stopped being empty at `274a734b`, which introduced the `client-core`/`client`
-# split and made `default = ["client"]`. The reason is narrower and is a fact
-# about the graph rather than about the feature list: no feature this crate can
-# select on the target pulls `epics-ca-rs` at all. `dep:epics-ca-rs` is reached
-# only through `qsrv`, `ca-gateway`, `dual-ioc` and `experimental-rust-tls`, and
-# the RTEMS selection (`scripts/rtems-check.sh`: `qsrv-core,pvalink`) carries
-# none of them — measured with `cargo tree -p epics-bridge-rs
-# --no-default-features --features qsrv-core,pvalink`, which does not name it.
-# So `default-features = false` here would change nothing the target compiles,
-# while costing the second hand-written `version` pin that the
-# `epics-pva-rs` entry above had to accept for a real reason.
-#
-# If a target feature ever does pull it, this entry needs the same treatment
-# `epics-pva-rs` got — `client` is a real default to drop now, and the target's
-# selection is `client-core`.
-epics-ca-rs = { workspace = true, optional = true }
+# `epics-ca-rs` is spelled out for the reason `epics-pva-rs` is above: the
+# target pulls it through `calink-core`, whose selection is `client-core`, and
+# an inherited entry would turn the host-only `client` default on there too.
+# Every host feature that pulls it restores `client`.
+epics-ca-rs = { path = "../epics-ca-rs", version = "0.32.0", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 parking_lot = "0.12"
@@ -297,7 +286,7 @@ required-features = ["dual-gateway-bin"]
 [[bin]]
 name = "realtime-pva-ioc"
 path = "src/bin/realtime-pva-ioc.rs"
-required-features = ["qsrv-core", "pvalink"]
+required-features = ["qsrv-core", "pvalink", "calink-core"]
 
 # `build.rs` calls `epics_rtems_boot::contract::emit_link_args()` for
 # `realtime-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`

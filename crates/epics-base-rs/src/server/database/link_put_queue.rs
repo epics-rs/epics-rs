@@ -68,25 +68,12 @@ use std::sync::Weak;
 use super::link_set::{DynLinkSet, LinkPutOp};
 use crate::types::EpicsValue;
 
-/// Which lset a staged write is bound to.
-///
-/// `Scheme(s)` is a `pva://`/`ca://` prefixed link — the write goes to that
-/// one lset. `Any` is the bare-name form (the body stored in
-/// `ParsedLink::Ca`/`Pva` once `record/link.rs` has stripped the scheme):
-/// every registered lset is tried in turn, first to accept wins, which is
-/// what the pre-queue `write_external_pv` did.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum LinkTarget {
-    Scheme(&'static str),
-    Any,
-}
-
-/// The channel an external link addresses: the lset it belongs to plus the
-/// name that lset is addressed with. The unit of an OPEN, because the lset
+/// The channel an external link addresses: the scheme of the one lset it
+/// belongs to plus the name that lset is addressed with. The unit of an OPEN, because the lset
 /// keeps one connection per name.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Channel {
-    pub(crate) target: LinkTarget,
+    pub(crate) scheme: &'static str,
     pub(crate) name: crate::types::RecordName,
 }
 
@@ -695,24 +682,24 @@ async fn owner_loop(
                     // (`dbCa.c:1133-1160`).
                     while let Some((key, init)) = q.take_ready_open() {
                         let Some(inner) = db.upgrade() else { return };
-                        let lsets = resolve_lsets(&inner, &key.target);
+                        let lset = resolve_lset(&inner, key.scheme);
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
-                            for lset in &lsets {
-                                lset.connect_link(&key.name, init.clone()).await;
+                            match lset {
+                                Some(lset) => lset.connect_link(&key.name, init).await,
+                                None => drop(init),
                             }
-                            drop(init);
                             q2.finish_open(key);
                         });
                     }
                     while let Some((key, staged)) = q.take_ready() {
                         let Some(inner) = db.upgrade() else { return };
-                        let lsets = resolve_lsets(&inner, &key.channel.target);
+                        let lset = resolve_lset(&inner, key.channel.scheme);
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
-                            run_put(&lsets, &key, staged).await;
+                            run_put(lset.as_ref(), &key, staged).await;
                             q2.finish(key);
                         });
                     }
@@ -741,33 +728,21 @@ async fn owner_loop(
     }
 }
 
-/// Offer `f` the lsets a read, write or open may go to, in order, until it
-/// answers. Single owner of the target → lset mapping, shared with
-/// `PvDatabase::resolve_external_pv` so a link's cached read and its staged
-/// open address the same lsets. Allocates nothing: a cycle asks it.
+/// Offer `f` the one lset `scheme` names, if registered. Single owner of the
+/// scheme → lset mapping, shared with `PvDatabase::resolve_external_pv` so a
+/// link's cached read and its staged open address the same lset. Allocates
+/// nothing: a cycle asks it.
 pub(super) fn find_lset<T>(
     inner: &super::PvDatabaseInner,
-    target: &LinkTarget,
-    f: impl FnMut(&DynLinkSet) -> Option<T>,
+    scheme: &str,
+    f: impl FnOnce(&DynLinkSet) -> Option<T>,
 ) -> Option<T> {
-    let registry = inner.link_sets.load();
-    match target {
-        LinkTarget::Scheme(s) => registry.get_ref(s).and_then(f),
-        LinkTarget::Any => registry.link_sets().find_map(f),
-    }
+    inner.link_sets.load().get_ref(scheme).and_then(f)
 }
 
-/// [`find_lset`]'s lsets, held past the registry snapshot for an await.
-pub(super) fn resolve_lsets(
-    inner: &super::PvDatabaseInner,
-    target: &LinkTarget,
-) -> Vec<DynLinkSet> {
-    let mut lsets = Vec::new();
-    find_lset(inner, target, |lset| {
-        lsets.push(lset.clone());
-        None::<()>
-    });
-    lsets
+/// [`find_lset`]'s lset, held past the registry snapshot for an await.
+pub(super) fn resolve_lset(inner: &super::PvDatabaseInner, scheme: &str) -> Option<DynLinkSet> {
+    find_lset(inner, scheme, |lset| Some(lset.clone()))
 }
 
 /// Resolve a staged write that no owner can perform, because the database
@@ -792,31 +767,30 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
 
 /// Perform one dequeued write. The network suspension lives here — on the
 /// owner's spawned task, never on a record-processing thread.
-async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
+async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) {
     let StagedPut {
         value,
         op,
         completion,
     } = staged;
-    let mut result = Err(format!(
-        "no link set accepted the write to external link '{}'",
-        key.channel.name
-    ));
-    for lset in lsets {
-        match lset.put_value(&key.channel.name, value.clone(), op).await {
-            Ok(()) => {
+    let result = match lset {
+        Some(lset) => {
+            let result = lset.put_value(&key.channel.name, value, op).await;
+            if result.is_ok() {
                 // Production drain of any retry-queued OUT writes
                 // on this lset now that a write has reached it (the
                 // channel may have just reconnected). pvxs replays
                 // the queued put from record processing, not
                 // test code (`ioc/pvalink_channel.cpp:220-280`).
                 lset.flush_puts().await;
-                result = Ok(());
-                break;
             }
-            Err(e) => result = Err(e),
+            result
         }
-    }
+        None => Err(format!(
+            "no link set accepted the write to external link '{}'",
+            key.channel.name
+        )),
+    };
     // C reports a failed wire write on the task, via `errlogPrintf`
     // (`dbCa.c:1175-1179`) — for BOTH flavours: the `status != ECA_NORMAL`
     // arm sits below the `CA_PUT` / `CA_PUT_CALLBACK` fork and covers each
@@ -825,9 +799,7 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
     // that went down after staging says nothing: the task skips it with
     // `if (ca_state(pca->chid) != cs_conn) continue;` (`dbCa.c:1224`).
     if let Err(e) = &result
-        && lsets
-            .iter()
-            .any(|lset| lset.is_connected(&key.channel.name))
+        && lset.is_some_and(|lset| lset.is_connected(&key.channel.name))
     {
         crate::runtime::log::errlog_vprintf(format_args!(
             "dbCa: external link put to '{}' failed: {e}\n",
@@ -868,7 +840,7 @@ mod tests {
                 install: LinkInstall::Installed(Arc::downgrade(link)),
             },
             channel: Channel {
-                target: LinkTarget::Scheme("ca"),
+                scheme: "ca",
                 name: name.into(),
             },
         }

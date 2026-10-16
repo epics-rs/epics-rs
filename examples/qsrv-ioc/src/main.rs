@@ -144,7 +144,16 @@ async fn parse_and_build(script: &str) -> CaResult<(BareIoc, Option<String>)> {
     // Seed QSRV_IOC so $(QSRV_IOC) expands in st.cmd
     macros.insert("QSRV_IOC".into(), env!("CARGO_MANIFEST_DIR").into());
     // A st.cmd goes on past a failed `dbLoadRecords`, unlike `softIoc -d`.
-    let mut ioc = IocBuilder::new().boot_past_failed_loads();
+    // softIocPVX's two link sets: dbCa, which every C IOC links, and pvxs's
+    // `lsetPVX`. Without them a bare remote link or a `pva://` one is dead.
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("main runs on the IOC's reactor");
+    let mut ioc = IocBuilder::new()
+        .boot_past_failed_loads()
+        .register_link_type("ca", move |db| {
+            epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
+        .register_link_type("pva", epics_bridge_rs::qsrv::pvalink_link_set_install);
     let mut group_file: Option<String> = None;
 
     for raw_line in script.lines() {

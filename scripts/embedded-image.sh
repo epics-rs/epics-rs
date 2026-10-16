@@ -77,7 +77,7 @@ PROFILE="${EMBEDDED_PROFILE:-release-embedded}"
 
 case "$KIND" in
     ca)  CRATE=epics-ca-rs;     BIN=realtime-ca-ioc;  FEATURES=client-core ;;
-    pva) CRATE=epics-bridge-rs; BIN=realtime-pva-ioc; FEATURES=qsrv-core,pvalink ;;
+    pva) CRATE=epics-bridge-rs; BIN=realtime-pva-ioc; FEATURES=qsrv-core,pvalink,calink-core ;;
     *) usage ;;
 esac
 

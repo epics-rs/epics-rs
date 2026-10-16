@@ -463,19 +463,6 @@ impl ModbusPortDriver {
         let histogram_axis_reason =
             base.create_param(PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array)?;
 
-        // C `drvModbusAsyn` constructor (drvModbusAsyn.cpp:226-230) seeds the
-        // statistics counters to 0 so a record reading them before the first
-        // poll gets a defined value.
-        for r in [
-            read_ok_reason,
-            write_ok_reason,
-            io_errors_reason,
-            last_io_reason,
-            max_io_reason,
-        ] {
-            base.set_int32_param(r, 0, 0)?;
-        }
-
         let poll_delay_secs = engine.config().poll_delay.as_secs_f64();
 
         let mut driver = Self {
@@ -627,14 +614,6 @@ impl ModbusPortDriver {
         let result = self
             .engine
             .read_absolute(self.transport.as_mut(), function, addr, count);
-        // C `doModbusIO` setIntegerParams the statistics counters inline on
-        // every I/O — success OR failure — before it returns
-        // (drvModbusAsyn.cpp:2206/2214/2255/2279/2301). The relative-mode
-        // poller publishes them via `poll_cycle`, but an absolute-addressing
-        // port has no poller (`poll_cycle` early-returns), so the per-record
-        // read is the only place an I/O happens. Publish here too, or the
-        // statistics records read 0 forever (R50).
-        self.publish_stats()?;
         result.map_err(to_asyn)
     }
 
@@ -645,17 +624,12 @@ impl ModbusPortDriver {
         let result = self
             .engine
             .write_absolute(self.transport.as_mut(), function, addr, regs);
-        // Publish the statistics counters after the I/O, same as the read
-        // path — C `doModbusIO` setIntegerParams them inline on every write
-        // too (drvModbusAsyn.cpp:2326/2334/2341), and the absolute-mode write
-        // has no poller to publish them otherwise (R50).
-        self.publish_stats()?;
         result.map_err(to_asyn)
     }
 
     /// One acquisition cycle: read all registers, refresh every touched
-    /// record's parameter and fire its I/O Intr callbacks, then publish the
-    /// statistics counters. Port of the data half of `readPoller`.
+    /// record's parameter and fire its I/O Intr callbacks. Port of the data
+    /// half of `readPoller`.
     fn poll_cycle(&mut self) -> AsynResult<()> {
         // Absolute addressing has no periodic poller (drvModbusAsyn.cpp:267):
         // each record reads its own wire address on access. Nothing to do.
@@ -683,18 +657,6 @@ impl ModbusPortDriver {
             // `asynError` and told every record the wrong reason.
             Err(e) => to_asyn(e).status(),
         };
-
-        // C `doModbusIO` moves the statistics counters on every I/O — success or
-        // failure (`IOErrors_` at :2206, the timings at :2214-2217, `readOK_` at
-        // :2255) — so they must be published on a failed cycle too; the old
-        // early-`?` return left IO_ERRORS reading 0 through an outage.
-        self.publish_stats()?;
-        // The statistics/control params are set at asyn addr 0 (their
-        // `statistics.template` records bind `@asyn($(PORT) 0)`) and still flow
-        // through the param-cache callback path — they are single-interface
-        // control values, not per-interface data points. Flush addr 0 every
-        // cycle so the statistics monitors post.
-        self.base.call_param_callbacks(0)?;
 
         // A *persistent* error — this poll failed and so did the previous one —
         // is the one case C skips the callbacks for: it sleeps 1.0 s and starts
@@ -1040,24 +1002,24 @@ impl ModbusPortDriver {
         Ok(())
     }
 
-    /// Copy the engine's I/O statistics into their parameters.
-    fn publish_stats(&mut self) -> AsynResult<()> {
+    /// The I/O statistics counter `reason` names, if it names one.
+    ///
+    /// The counters live only in `engine.stats` and never enter the parameter
+    /// library, so no param callback can post them: C `doModbusIO` moves
+    /// `readOK_`/`IOErrors_`/… and their params (drvModbusAsyn.cpp:2205-2341)
+    /// but never calls `callParamCallbacks`, so a statistics record has to be
+    /// scanned (`statistics.template`).
+    fn stat_counter(&self, reason: usize) -> Option<i32> {
         let s = &self.engine.stats;
-        let (read_ok, write_ok, io_errors, last, max) = (
-            s.read_ok as i32,
-            s.write_ok as i32,
-            s.io_errors as i32,
-            s.last_io_msec as i32,
-            s.max_io_msec as i32,
-        );
-        self.base.set_int32_param(self.read_ok_reason, 0, read_ok)?;
-        self.base
-            .set_int32_param(self.write_ok_reason, 0, write_ok)?;
-        self.base
-            .set_int32_param(self.io_errors_reason, 0, io_errors)?;
-        self.base.set_int32_param(self.last_io_reason, 0, last)?;
-        self.base.set_int32_param(self.max_io_reason, 0, max)?;
-        Ok(())
+        let v = match reason {
+            r if r == self.read_ok_reason => s.read_ok,
+            r if r == self.write_ok_reason => s.write_ok,
+            r if r == self.io_errors_reason => s.io_errors,
+            r if r == self.last_io_reason => s.last_io_msec,
+            r if r == self.max_io_reason => s.max_io_msec,
+            _ => return None,
+        };
+        Some(v as i32)
     }
 
     /// Flush a freshly-converted set of registers to the slave with the
@@ -1278,6 +1240,13 @@ impl PortDriver for ModbusPortDriver {
         // (statistics/control params) delegates to `asynPortDriver::readInt32`,
         // returning the cached parameter-library value.
         let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+            // C sets the statistics params on list 0 only, which
+            // `getAddress` also hands a user carrying addr -1.
+            if matches!(user.addr, 0 | -1)
+                && let Some(v) = self.stat_counter(user.reason)
+            {
+                return Ok(v);
+            }
             return self.base.get_int32_param(user.reason, user.addr);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -3229,12 +3198,10 @@ mod tests {
         assert_eq!(v, 0xBEEF);
     }
 
-    /// R50: an absolute-addressing port has no poller, so the statistics
-    /// counters were only ever published from `poll_cycle` and read 0 forever.
-    /// C `doModbusIO` setIntegerParams them inline on every I/O
-    /// (drvModbusAsyn.cpp:2255/2279/2301), so the per-record absolute read must
-    /// publish them too. After one successful absolute read, READ_OK must be 1
-    /// and IO_ERRORS 0.
+    /// R50: an absolute-addressing port has no poller, and the statistics once
+    /// read 0 forever there. C `doModbusIO` moves them on every I/O
+    /// (drvModbusAsyn.cpp:2255/2279/2301), so after one successful absolute
+    /// read READ_OK must be 1 and IO_ERRORS 0.
     #[test]
     fn absolute_read_publishes_statistics() {
         let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
@@ -5108,10 +5075,10 @@ mod tests {
         );
     }
 
-    /// BUG 1 regression — a statistics/control reason has no
-    /// `reason_to_datatype` entry. `read_int32` must return the cached
-    /// parameter value (C `readInt32` delegates `reason != P_Data` to
-    /// `asynPortDriver::readInt32`), not error.
+    /// BUG 1 regression — a statistics reason has no `reason_to_datatype`
+    /// entry. `read_int32` must return the driver's counter (C `readInt32`
+    /// delegates `reason != P_Data` to `asynPortDriver::readInt32`, which reads
+    /// the param `doModbusIO` keeps equal to it), not error.
     #[test]
     fn read_int32_returns_cached_value_for_statistics_reason() {
         let mut driver = ModbusPortDriver::new(
@@ -5124,7 +5091,7 @@ mod tests {
 
         // READ_OK is a statistics param — not a Modbus data parameter.
         let read_ok = driver.read_ok_reason;
-        // Constructor seeds it to 0; reading it must succeed, not error.
+        // Before any I/O it reads 0, not an error.
         let user = AsynUser::new(read_ok);
         assert_eq!(
             driver
@@ -5133,9 +5100,15 @@ mod tests {
             0
         );
 
-        // After the driver stages a new statistics value, the read reflects it.
-        driver.base.set_int32_param(read_ok, 0, 42).unwrap();
+        // The read follows the counter, at addr 0 and at the -1 sentinel.
+        driver.engine.stats.read_ok = 42;
         assert_eq!(driver.read_int32(&user).unwrap(), 42);
+        assert_eq!(
+            driver
+                .read_int32(&AsynUser::new(read_ok).with_addr(0))
+                .unwrap(),
+            42
+        );
 
         // The other statistics counters are equally readable.
         for reason in [
@@ -5152,12 +5125,11 @@ mod tests {
         }
     }
 
-    /// BUG 2 regression — when no data record sits at asyn addr 0, a poll
-    /// cycle must still flush addr 0's changed-param list so the statistics
-    /// monitors post. Bind a data record at addr 2, then verify a poll cycle
-    /// emits interrupt notifications for the statistics params at addr 0.
+    /// C `drvModbusAsyn` never calls `callParamCallbacks`, so a poll cycle that
+    /// moves the statistics counters posts no monitor for them: an I/O Intr
+    /// statistics record hears nothing, a scanned one reads the counter.
     #[test]
-    fn poll_cycle_flushes_statistics_monitors_without_addr0_data_record() {
+    fn poll_cycle_posts_no_statistics_monitor() {
         // ReadHoldingRegisters response for the 4-word buffer.
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
         let mut driver = ModbusPortDriver::new(
@@ -5169,31 +5141,21 @@ mod tests {
         .expect("non-absolute config must build");
         let read_ok_reason = driver.read_ok_reason;
 
-        // No data record is bound anywhere — the statistics params at addr 0
-        // must still post their monitors after a poll, because `publish_stats`
-        // is independent of the per-record interrupt fan-out.
-        // `publish_stats` posts through `call_param_callbacks`, which is gated on
-        // `interruptAccept` — a real IOC opens it at the `iocInit`/`scan_run`
-        // barrier. This unit test drives `poll_cycle` with no scan facility, so
-        // it must establish that post-`iocInit` precondition itself: an owned
-        // manager, in place before anything subscribes.
+        // Param callbacks are gated on `interruptAccept`; open it as `iocInit`
+        // would, so a post would be seen if one were made.
         driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
             epics_base_rs::runtime::interrupt_accept::InterruptGate::opened(),
         );
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         driver.poll_cycle().expect("poll_cycle must succeed");
 
-        // The statistics params live at addr 0; their monitors must have
-        // posted even though no data record is bound there.
-        let mut saw_read_ok = false;
+        assert_eq!(driver.engine.stats.read_ok, 1);
         while let Ok(iv) = rx.try_recv() {
-            if iv.reason == read_ok_reason && iv.addr == 0 {
-                saw_read_ok = true;
-            }
+            assert_ne!(iv.reason, read_ok_reason, "READ_OK was posted: {iv:?}");
         }
-        assert!(
-            saw_read_ok,
-            "READ_OK statistics monitor must post at addr 0 after a poll cycle"
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(read_ok_reason)).unwrap(),
+            1
         );
     }
 

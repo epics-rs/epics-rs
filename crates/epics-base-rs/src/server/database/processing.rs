@@ -769,6 +769,53 @@ impl AsyncDbHandle {
         rendered.map(crate::types::codec::cap_dbr_string)
     }
 
+    /// C `dbNameToAddr(name, &addr)` succeeding, answered with
+    /// `addr.no_elements`: 1, or the capacity `cvt_dbaddr` gives an array
+    /// field (`NELM`, not `NORD`). `None` is a name that does not resolve.
+    ///
+    /// Takes no record's lock set, as C's takes no lock: sscan resolves a PV
+    /// name from `special` while it holds its own record
+    /// (`sscanRecord.c:2335`), and two scans naming each other's fields at
+    /// once must not each wait on the other's set. A record that is free is
+    /// read once, so [`Self::db_get`] has an answer for the name while the
+    /// record is busy later.
+    pub fn name_to_addr(&self, name: impl AsRef<[u8]>) -> Option<u32> {
+        let name = name.as_ref();
+        let db = self.db()?;
+        if let Some(pv) = db.simple_pv_bytes(name) {
+            return Some(pv.snapshot().value.count() as u32);
+        }
+        let (base, field) = super::parse_pv_name(name);
+        let count = db.get_record(base)?.no_elements(field)?;
+        db.db_get_snapshot(name, None);
+        Some(count)
+    }
+
+    /// C `dbGet(&addr, dbr_type, buf, &options, &count, NULL)` with
+    /// `options = DBR_UNITS | DBR_PRECISION | DBR_GR_DOUBLE | DBR_CTRL_DOUBLE`
+    /// (`sscanRecord.c:2636`): the value in `dbr_type`, at most `count`
+    /// elements — its element count is C's `nRequest` on return — and the
+    /// field's metadata. `None` is a failed `dbGet`: no such field, or a value
+    /// `dbr_type` cannot hold.
+    ///
+    /// `own` is the calling record, `(name, itself)`, when it calls from
+    /// inside its own processing. C's `dbGet` takes no lock, so this never
+    /// waits for one: the caller's own fields are read from `own`, and
+    /// another record whose lock set is held elsewhere serves its last fresh
+    /// read here or at [`Self::name_to_addr`].
+    pub fn db_get(
+        &self,
+        name: impl AsRef<[u8]>,
+        dbr_type: crate::types::DbFieldType,
+        count: usize,
+        own: Option<(&[u8], &dyn crate::server::record::Record)>,
+    ) -> Option<crate::server::snapshot::Snapshot> {
+        let mut snap = self.db()?.db_get_snapshot(name.as_ref(), own)?;
+        snap.value = snap.value.get_convert(dbr_type).ok()?;
+        snap.value.truncate(count);
+        Some(snap)
+    }
+
     /// Out-of-band field post — see [`PvDatabase::post_fields`]. Returns an
     /// empty `Vec` (no-op) if the database has been dropped.
     pub fn post_fields(
@@ -2346,6 +2393,18 @@ impl<'a> DataGuard<'a> {
     }
 }
 
+/// C posts by hand inside `process()` whatever it then returns
+/// (`sscanRecord.c:1040-1050`). The frame's guard drops on every exit of the
+/// cycle, so what an early or failed exit left marked posts in this cycle; the
+/// complete path drained its own ahead of `monitor()`.
+impl Drop for DataGuard<'_> {
+    fn drop(&mut self) {
+        if self.rec.process_plan().hooks.has(CycleHooks::HAND_POSTED) {
+            post_hand_marks(self);
+        }
+    }
+}
+
 /// What the input stage hands the rest of the cycle. See
 /// [`PvDatabase::fetch_input_stage`].
 struct InputStage {
@@ -3439,7 +3498,7 @@ impl PvDatabase {
     /// and a monitor event is posted with `DBE_VALUE | DBE_LOG` — the mask C
     /// device support uses for an out-of-process value post
     /// (`db_post_events(precord, &prec->field, DBE_VALUE | DBE_LOG)`).
-    /// Metadata-class writes invalidate the metadata cache via
+    /// Metadata-class writes rebuild the metadata cache via
     /// `notify_field_written`, honouring the snapshot-cache contract.
     ///
     /// Unlike [`Self::complete_async_record`], this runs *no* alarm /
@@ -3498,7 +3557,7 @@ impl PvDatabase {
         let mut written = Vec::with_capacity(post.writes.len());
         for (field, value) in post.writes {
             self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
-            // Snapshot-cache contract: a metadata-class write must invalidate
+            // Snapshot-cache contract: a metadata-class write must rebuild
             // the cache before the monitor snapshot below is built, or the
             // property event would carry the pre-change enum choices.
             inst.notify_field_written(&field);
@@ -3562,7 +3621,7 @@ impl PvDatabase {
             }
             self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
             // Snapshot-cache contract: a metadata-class write must
-            // invalidate the cache before the monitor snapshot is built.
+            // rebuild the cache before the monitor snapshot is built.
             inst.notify_field_written(&field);
             if rule != PostRule::Silent {
                 inst.notify_field(&field, mask);
@@ -10938,6 +10997,16 @@ fn sim_process_tail(
     publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
 }
 
+/// [`DataGuard`]'s drain, out of line so the cycle of every other type carries
+/// none of it. A panic is not a cycle that posts.
+#[cold]
+#[inline(never)]
+fn post_hand_marks(guard: &mut DataGuard<'_>) {
+    if !std::thread::panicking() {
+        super::field_io::emit_cycle_posts(guard.hold());
+    }
+}
+
 /// The single finalizer for a process cycle, for every path that can end one.
 ///
 /// **Invariant:** a cycle that ENDS runs [`PvDatabase::end_process_cycle`]
@@ -11618,5 +11687,80 @@ mod owed_tests {
                 "protocol error: 6"
             ]
         );
+    }
+}
+
+impl PvDatabase {
+    /// [`AsyncDbHandle::db_get`]'s read of `name`, before the conversion:
+    /// fresh when it can be read without waiting, else the last fresh read.
+    pub(crate) fn db_get_snapshot(
+        &self,
+        name: &[u8],
+        own: Option<(&[u8], &dyn crate::server::record::Record)>,
+    ) -> Option<crate::server::snapshot::Snapshot> {
+        // [`PvDatabase::get_pv`]'s order: a simple PV, then a record.
+        if let Some(pv) = self.simple_pv_bytes(name) {
+            return Some(pv.snapshot());
+        }
+        let (base, field) = super::parse_pv_name(name);
+        let cell = self.get_record(base)?;
+        let field = cell.canonical_field(field);
+        let own = own.and_then(|(own, record)| Some((self.get_record(own)?, record)));
+        let policy = ReadPolicy::NoWait {
+            own: own.as_ref().map(|(cell, record)| (&**cell, *record)),
+        };
+        let fresh = self.channel_snapshot_for_field_guarded(
+            &cell,
+            &field,
+            false,
+            &mut std::collections::HashSet::new(),
+            policy,
+        );
+        let mut last = self.inner.db_get_last.lock();
+        match fresh {
+            Some(snap) => {
+                last.insert(name.into(), snap.clone());
+                Some(snap)
+            }
+            None => last.get(name).cloned(),
+        }
+    }
+}
+
+/// How a metadata resolve takes the records it reads.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadPolicy<'a> {
+    /// Under each record's lock set, waiting for it.
+    Wait,
+    /// [`AsyncDbHandle::db_get`]'s: a record whose set is held elsewhere is
+    /// not read, and `own`, the record the caller is inside, is read from
+    /// itself.
+    NoWait {
+        own: Option<(&'a RecordCell, &'a dyn crate::server::record::Record)>,
+    },
+}
+
+impl<'a> ReadPolicy<'a> {
+    /// `f` on `cell`'s instance; `None` when the policy does not wait and
+    /// the record is busy.
+    pub(crate) fn read<R>(
+        self,
+        cell: &RecordCell,
+        f: impl FnOnce(&crate::server::record::RecordInstance) -> R,
+    ) -> Option<R> {
+        match self {
+            Self::Wait => Some(f(&cell.read())),
+            Self::NoWait { .. } => cell.try_read().map(|inst| f(&inst)),
+        }
+    }
+
+    /// The caller's own record, when `cell` is it.
+    pub(crate) fn own(self, cell: &RecordCell) -> Option<&'a dyn crate::server::record::Record> {
+        match self {
+            Self::NoWait {
+                own: Some((own, record)),
+            } if std::ptr::eq(own, cell) => Some(record),
+            _ => None,
+        }
     }
 }

@@ -2677,9 +2677,19 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         visited: &mut HashSet<RecordName>,
     ) -> Option<crate::server::database::LinkMetadata> {
+        self.link_metadata_through(link, visited, super::ReadPolicy::Wait)
+    }
+
+    /// [`Self::link_metadata`] taking each target as `policy` says.
+    pub(crate) fn link_metadata_through(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        visited: &mut HashSet<RecordName>,
+        policy: super::ReadPolicy<'_>,
+    ) -> Option<crate::server::database::LinkMetadata> {
         use crate::server::record::ParsedLink;
         match link {
-            ParsedLink::Db(db) => self.db_link_metadata(db, visited),
+            ParsedLink::Db(db) => self.db_link_metadata(db, visited, policy),
             ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => {
                 let name = link
                     .external_pv_name()
@@ -2756,6 +2766,7 @@ impl PvDatabase {
         &self,
         db: &crate::server::record::DbLink,
         visited: &mut HashSet<RecordName>,
+        policy: super::ReadPolicy<'_>,
     ) -> Option<crate::server::database::LinkMetadata> {
         let key = db.pvname().clone();
         // C `if (!(mutable_plink->flags & DBLINK_FLAG_VISITED))`
@@ -2764,7 +2775,7 @@ impl PvDatabase {
         if !visited.insert(key.clone()) {
             return None;
         }
-        let meta = self.db_target_metadata(db, visited);
+        let meta = self.db_target_metadata(db, visited, policy);
         // C `mutable_plink->flags &= ~DBLINK_FLAG_VISITED` (`dbDbLink.c:257`)
         // — the guard spans only the inner fetch, so a diamond (two distinct
         // links onto one target) still reports metadata on both.
@@ -2781,6 +2792,7 @@ impl PvDatabase {
         &self,
         db: &crate::server::record::DbLink,
         visited: &mut HashSet<RecordName>,
+        policy: super::ReadPolicy<'_>,
     ) -> Option<crate::server::database::LinkMetadata> {
         let target = db.target();
         let record = match self.db_link_target(db) {
@@ -2804,8 +2816,13 @@ impl PvDatabase {
         // No `$` view: a link target is `REC.FLD` out of a link string, which
         // C resolves with `dbNameToAddr` (`dbDbLink.c:60-70`). Only
         // `dbChannelCreate` parses a `$`, and no link ever goes through it.
-        let snapshot =
-            self.channel_snapshot_for_field_guarded(&record, &target.field, false, visited)?;
+        let snapshot = self.channel_snapshot_for_field_guarded(
+            &record,
+            &target.field,
+            false,
+            visited,
+            policy,
+        )?;
         Some(crate::server::database::LinkMetadata {
             // `dbDbGetDBFtype` = `dbChannelFinalFieldType` (`dbDbLink.c:151-155`)
             // and `dbDbGetElements` = `dbChannelFinalElements`

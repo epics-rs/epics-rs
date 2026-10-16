@@ -36,11 +36,11 @@ pub(crate) use links::{
     LinkAlarm, ProcessTargetGate, inherit_sevr_msg, multi_out_rows, multi_output_dispatch_owned,
     posts_software_event, reads_sell, resolves_subroutine_from_link,
 };
-pub(crate) use processing::NotifiedRead;
 pub use processing::{
     AsyncDbHandle, AsyncToken, CaLinkInit, DeviceDone, DeviceDoneSource, ExternalCpProcess,
     InputLinkTexts, PostItem, PostRule, ProcStack, ProcessCallback, TokenWatch,
 };
+pub(crate) use processing::{NotifiedRead, ReadPolicy};
 pub(crate) use record_lock::{CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard};
 pub use record_lock::{
     LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, in_sync_driver_wait,
@@ -671,6 +671,9 @@ struct PvDatabaseInner {
     /// simple PV spelled `REC.FLD` shadows that field, so a cached link
     /// address must not outlive one appearing.
     simple_pvs_revision: std::sync::atomic::AtomicU64,
+    /// [`AsyncDbHandle::db_get`]'s last fresh read of each name it was asked
+    /// for: what it serves while that record's lock set is held elsewhere.
+    db_get_last: parking_lot::Mutex<HashMap<Box<[u8]>, crate::server::snapshot::Snapshot>>,
     /// Wake-up for servers holding channels on this database: something was
     /// removed, re-check what you serve. Carries no name — the receiver
     /// tests the target it already holds
@@ -1503,6 +1506,7 @@ impl PvDatabase {
                         crate::runtime::sync::CMutex::PvdBucket,
                     ),
                     simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
+                    db_get_last: parking_lot::Mutex::new(HashMap::new()),
                     pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
                     breakpoints: ArcSwapOption::empty(),
                     debugging: std::sync::atomic::AtomicBool::new(false),
@@ -3069,6 +3073,7 @@ impl PvDatabase {
             field,
             string_view,
             &mut std::collections::HashSet::new(),
+            ReadPolicy::Wait,
         )
     }
 
@@ -3082,28 +3087,41 @@ impl PvDatabase {
     /// arms while a cycle stops. `db_target_metadata` passes its caller's set
     /// through to here, so one guard spans the whole resolve exactly as C's
     /// does.
+    ///
+    /// `policy` says how each record on the way is taken. Under
+    /// [`ReadPolicy::NoWait`] none is waited for, so a resolve from inside a
+    /// record's own processing cannot close a cycle with another holder.
     pub(crate) fn channel_snapshot_for_field_guarded(
         &self,
         record: &Arc<RecordCell>,
         field: &str,
         string_view: bool,
         visited: &mut std::collections::HashSet<RecordName>,
+        policy: ReadPolicy<'_>,
     ) -> Option<crate::server::snapshot::Snapshot> {
+        if let Some(own) = policy.own(record)
+            && !string_view
+        {
+            return crate::server::record::record_instance::own_field_snapshot(record, own, field);
+        }
         // 1. Under a short read lock: is this field link-backed at all, and if
         //    so what does its link field currently say. Nothing is resolved
         //    here — resolving needs the target's lock.
-        let link = {
-            let inst = record.read();
+        // A field no link backs is served under that same lock.
+        let link = match policy.read(record, |inst| {
             match inst.link_backed_metadata_field_of(field) {
-                None => {
-                    return inst.channel_snapshot_for_field(
-                        field,
-                        string_view,
-                        LinkBacking::none(),
-                    );
-                }
-                Some(link_field) => inst.link_text(&link_field).map(|text| (link_field, text)),
+                None => std::ops::ControlFlow::Break(inst.channel_snapshot_for_field(
+                    field,
+                    string_view,
+                    LinkBacking::none(),
+                )),
+                Some(link_field) => std::ops::ControlFlow::Continue(
+                    inst.link_text(&link_field).map(|text| (link_field, text)),
+                ),
             }
+        })? {
+            std::ops::ControlFlow::Continue(link) => link,
+            std::ops::ControlFlow::Break(served) => return served,
         };
 
         // 2. No record lock held. A link that resolves to nothing — CONSTANT,
@@ -3112,18 +3130,22 @@ impl PvDatabase {
         let mut resolved = HashMap::new();
         if let Some((link_field, text)) = link {
             let parsed = crate::server::record::parse_link_v2(&text);
-            if let Some(meta) = self.link_metadata(&parsed, visited) {
+            if let Some(meta) = self.link_metadata_through(&parsed, visited, policy) {
                 resolved.insert(link_field, meta);
             }
         }
 
         // 3. Re-lock and build with what was just resolved. The borrow ends
         //    with this call, so there is nowhere to keep it.
-        record.read().channel_snapshot_for_field(
-            field,
-            string_view,
-            LinkBacking::resolved(&resolved),
-        )
+        policy
+            .read(record, |inst| {
+                inst.channel_snapshot_for_field(
+                    field,
+                    string_view,
+                    LinkBacking::resolved(&resolved),
+                )
+            })
+            .flatten()
     }
 
     /// Every link-backed field's metadata for one record, resolved once with
@@ -3507,7 +3529,7 @@ impl PvDatabase {
                 let reached = instance.run_init_pass0(&name.to_str_lossy());
                 // The load has moved the type selectors since the cell was
                 // built, and an `add_record` below may ask this record's `$`.
-                rec_arc.settle_string_typed(instance);
+                rec_arc.settle_addr_facts(instance);
                 drop(guard);
                 (name, rec_arc, reached)
             })
@@ -3573,7 +3595,7 @@ impl PvDatabase {
                 instance.run_init_pass1(&name.to_str_lossy(), reads);
             }
             super::database::processing::seed_constant_links(instance);
-            rec_arc.settle_string_typed(instance);
+            rec_arc.settle_addr_facts(instance);
             (
                 instance.common.scan,
                 instance.common.phas,

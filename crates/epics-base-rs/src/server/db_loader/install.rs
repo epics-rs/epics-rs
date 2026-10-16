@@ -467,7 +467,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                     if let Some(reads) = &mut reads {
                         inst.run_init_pass1(&def.name.to_str_lossy(), reads);
                     }
-                    rec_arc.settle_string_typed(&inst);
+                    rec_arc.settle_addr_facts(&inst);
                 }
             }
             // C's `init_record` checkLinks (`init_links`) and the constant-INP

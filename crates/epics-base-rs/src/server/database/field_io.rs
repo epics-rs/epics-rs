@@ -836,6 +836,11 @@ fn special_after_put(
     if instance.record.take_udf_clear() {
         instance.common.udf = 0;
     }
+    // sscan's `psscan->scan = 0` (`sscanRecord.c:1571`): the field alone,
+    // with the scan list left as it was — see `Record::take_scan_store`.
+    if let Some(scan) = instance.record.take_scan_store() {
+        instance.common.scan = scan;
+    }
     // The posts `special()` made are drained here, on every `dbPut` route and
     // whatever the status, for the same reason its actions are: C's `special()`
     // calls `db_post_events` itself, before `dbPut`'s own field post

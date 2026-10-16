@@ -5930,6 +5930,24 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// A `special(_, true)` pass that stored the common `SCAN` field itself,
+    /// as `sscanRecord.c:1571` does with `psscan->scan = 0`: a store, not a
+    /// `dbPut`, so no `scanDelete`/`scanAdd` runs. The record stays on the scan
+    /// list it was on and goes on being processed there, because C's `scanList`
+    /// never reads `SCAN` (`dbScan.c:1014-1019`). A later `SCAN` put deletes
+    /// from the list the stored value names (none for Passive, `dbScan.c:318`)
+    /// and adds to the new one, so the record is then on both; C's `addToList`
+    /// re-links its one `scan_element` there and corrupts the old list
+    /// (`:1083-1095`), which the port's per-list index does not reproduce.
+    ///
+    /// Drained beside [`Self::take_udf_clear`], ahead of the pass's posts, so a
+    /// mark on `SCAN` posts the stored value.
+    ///
+    /// Default: none.
+    fn take_scan_store(&mut self) -> Option<super::ScanType> {
+        None
+    }
+
     /// True iff the C `special()` for a put to `put_field` runs the record's
     /// own `monitor()` — whose first act is `recGblResetAlarms(prec)`, which
     /// commits `nsta`/`nsev` into `stat`/`sevr` and clears the born-UDF alarm.

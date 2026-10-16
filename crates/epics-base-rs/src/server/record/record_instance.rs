@@ -650,7 +650,7 @@ impl PactExit {
 /// Stores the result of `populate_display_info` / `populate_control_info` /
 /// `populate_enum_info` so subsequent `snapshot_for_field` calls can skip
 /// rebuilding the metadata. The
-/// cache is invalidated whenever a metadata-class field is written
+/// cache is rebuilt whenever a metadata-class field is written
 /// (EGU, PREC, HOPR, LOPR, alarm limits, DRVH/DRVL, state strings).
 ///
 /// In a CA-only IOC this is a CPU win; in a hybrid CA + PVA IOC where
@@ -667,10 +667,13 @@ pub(crate) struct MetadataSnapshot {
     /// function ignores the field and answers from `rtype` alone, so which
     /// FIELDS receive these is still [`RecordInstance::route_field_metadata`]'s
     /// decision — only the eight `resolve_field` name lookups behind the
-    /// numbers move here, where an invalidation rather than a snapshot pays
+    /// numbers move here, where a rebuild rather than a snapshot pays
     /// for them.
     pub alarm: (f64, f64, f64, f64),
 }
+
+/// [`RecordCold::metadata_cache`]: `None` until first built.
+type MetadataCell = Arc<arc_swap::ArcSwapOption<MetadataSnapshot>>;
 
 /// Does a write to this field make the record's metadata cache stale?
 ///
@@ -690,10 +693,10 @@ pub(crate) struct MetadataSnapshot {
 /// written. Field name is expected uppercase.
 ///
 /// `DESC` feeds `display.description` but is deliberately absent: its
-/// invalidation is owned by the DESC arm of `put_common_field`, the single
+/// rebuild is owned by the DESC arm of `put_common_field`, the single
 /// writer of `common.text.desc`. The `Q:form` info tag (`populate_display_info` ->
 /// `display.form`) is an immutable load-time tag, not a runtime field, so it
-/// needs no invalidation either.
+/// needs no rebuild either.
 fn is_metadata_cache_source(name: &str) -> bool {
     matches!(
         name,
@@ -2479,11 +2482,37 @@ pub struct RecordCell {
     /// Bit `i`: the `i`th [`FieldDesc::runtime_typed`] field of `rdes.fields`
     /// is served as `DBF_STRING` (`cvt_dbaddr` from `FTVL`, `FTA`...). Those
     /// selectors are `SPC_NOMOD`, so the fact is settled where they can still
-    /// move ([`Self::settle_string_typed`]) and read with no lock.
+    /// move ([`Self::settle_addr_facts`]) and read with no lock.
     string_typed: std::sync::atomic::AtomicU64,
+    /// C `paddr->no_elements` of each `SPC_DBADDR` field, by its index in
+    /// `rdes.fields`: what `cvt_dbaddr` answers, settled with
+    /// [`Self::string_typed`] so `dbNameToAddr` reads it with no lock, as C
+    /// reads `prec->nelm`. The capacity fields are `SPC_NOMOD`.
+    dbaddr_counts: arc_swap::ArcSwap<Vec<(u16, u32)>>,
+    /// The instance's [`RecordCold::metadata_cache`], shared: what the record
+    /// reads of its own metadata from inside its processing
+    /// ([`own_field_snapshot`]), with no lock.
+    metadata: MetadataCell,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
+
+/// [`RecordCell::dbaddr_counts`] of `inst`.
+fn dbaddr_counts_of(inst: &RecordInstance) -> Vec<(u16, u32)> {
+    let rec = &*inst.record;
+    rec.field_list()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.long_string && rec.field_is_dbaddr(f.name))
+        .map(|(i, f)| {
+            let count = rec
+                .field_native_count(f.name)
+                .or_else(|| inst.resolve_field(f.name).map(|v| v.count() as u32))
+                .unwrap_or(1);
+            (i as u16, count)
+        })
+        .collect()
+}
 
 /// [`RecordCell::string_typed`] of `inst`.
 fn string_typed_mask(inst: &RecordInstance) -> u64 {
@@ -3444,6 +3473,8 @@ impl RecordCell {
             link_opens_owed: std::sync::atomic::AtomicBool::new(true),
             chain_pact: AtomicBool::new(false),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
+            dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts_of(&instance)),
+            metadata: Arc::clone(&instance.cold.metadata_cache),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
     }
@@ -3491,13 +3522,36 @@ impl RecordCell {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Re-read [`Self::string_typed`] from `inst`, this cell's record, after a
-    /// load or an `init_record` that may have moved a type selector.
-    pub(crate) fn settle_string_typed(&self, inst: &RecordInstance) {
+    /// Re-read [`Self::string_typed`] and [`Self::dbaddr_counts`] from
+    /// `inst`, this cell's record, after a load or an `init_record` that may
+    /// have moved a type selector or a capacity.
+    pub(crate) fn settle_addr_facts(&self, inst: &RecordInstance) {
         self.string_typed.store(
             string_typed_mask(inst),
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.dbaddr_counts.store(Arc::new(dbaddr_counts_of(inst)));
+    }
+
+    /// C `dbNameToAddr(name, &addr)` on this record succeeding, answered with
+    /// `addr.no_elements` (1, or an array field's capacity), with no lock:
+    /// the field is resolved against the type's declaration and the capacity
+    /// was settled at init. `None` is a field the type does not declare.
+    pub fn no_elements(&self, field: &str) -> Option<u32> {
+        let named = |f: &&FieldDesc| f.name.eq_ignore_ascii_case(field);
+        let Some(i) = self.rdes.fields.iter().position(|f| named(&f)) else {
+            return super::dbd_generated::DB_COMMON_FIELDS
+                .iter()
+                .any(|f| named(&f))
+                .then_some(1);
+        };
+        let counts = self.dbaddr_counts.load();
+        Some(
+            counts
+                .iter()
+                .find(|(at, _)| usize::from(*at) == i)
+                .map_or(1, |(_, n)| *n),
+        )
     }
 
     /// C `dbChannelCreate`'s `$` test (`dbChannel.c:486-503`) on the type
@@ -3625,6 +3679,23 @@ impl RecordCell {
             cell: self,
             _set: Some(set),
         }
+    }
+
+    /// [`Self::read`] without waiting: `None` while another thread holds the
+    /// record's lock set, or while this thread holds the record for writing.
+    pub(crate) fn try_read(&self) -> Option<RecordRef<'_>> {
+        use std::sync::atomic::Ordering;
+        let set = self.lock_record.try_acquire()?;
+        let borrow = self.borrow.load(Ordering::Relaxed);
+        if borrow < 0 {
+            return None;
+        }
+        self.borrow.store(borrow + 1, Ordering::Relaxed);
+        live_borrows::taken();
+        Some(RecordRef {
+            cell: self,
+            _set: Some(set),
+        })
     }
 
     /// [`Self::read`] for a thread that holds `held`: when this record is in
@@ -4528,6 +4599,8 @@ thread_local! {
     static NAME_BYTE_COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many snapshots reached the delivery loop.
     static DELIVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times [`RecordInstance::build_metadata`] ran.
+    static METADATA_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many log heads were built.
     static HEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many times the subscriber set was tested ([`RecordInstance::unwatched`]).
@@ -4545,6 +4618,12 @@ thread_local! {
     /// The fields whose post reached [`RecordInstance::record_value_post_as`]
     /// only to store nothing.
     static STORELESS_POSTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`METADATA_BUILDS`] on this thread.
+#[cfg(test)]
+fn builds() -> usize {
+    METADATA_BUILDS.with(std::cell::Cell::get)
 }
 
 /// The `dbCommon` declarations the acknowledge put path posts, so it reads
@@ -5007,16 +5086,13 @@ struct RecordCold {
     /// (`Q:group`, `Q:form`), and IOC-specific extensions. Empty for
     /// records loaded without info(...) clauses.
     info: HashMap<String, String>,
-    /// Cached metadata (display/control/enums) — `None` means stale or
-    /// not yet built. Populated lazily by `snapshot_for_field` and
-    /// invalidated by `invalidate_metadata_cache`
-    /// whenever a metadata-class field (EGU/PREC/HOPR/LOPR/limit/state)
-    /// is written.
+    /// Cached metadata (display/control/enums) — `None` until built. Seeded
+    /// at the end of `init_record` and rebuilt by
+    /// `RecordInstance::refresh_metadata_cache`, its only writer, whenever a
+    /// metadata-class field (EGU/PREC/HOPR/LOPR/limit/state) is written.
     ///
-    /// Wrapped in `std::sync::Mutex` for interior mutability — the
-    /// containing `RecordInstance` is shared via `Arc<RwLock<...>>` from
-    /// `PvDatabase`, and snapshot construction holds a read lock; the
-    /// inner Mutex lets us still mutate the cache from a `&self` method.
+    /// An `ArcSwapOption` so the cache can be rebuilt from a `&self` method
+    /// and read without the record's lock.
     ///
     /// # Cache invariant (CONTRACT)
     ///
@@ -5024,7 +5100,7 @@ struct RecordCold {
     /// code path that mutates a cache-source field (the set defined in
     /// the file-private [`is_metadata_cache_source`] predicate) MUST call
     /// [`RecordInstance::notify_field_written`] (or
-    /// [`RecordInstance::invalidate_metadata_cache`] directly) afterward.
+    /// [`RecordInstance::refresh_metadata_cache`] directly) afterward.
     ///
     /// All current write paths in `field_io.rs` already do this. If you
     /// add a new code path that:
@@ -5039,21 +5115,21 @@ struct RecordCold {
     /// then call `instance.notify_field_written(field_name)` to keep the
     /// cache consistent. Forgetting will produce a stale snapshot —
     /// monitors will continue to see the old EGU/PREC/limits until the
-    /// next legitimate cache-source write triggers invalidation.
+    /// next legitimate cache-source write triggers a rebuild.
     ///
     /// # Symmetric note for `populate_*` extensions
     ///
     /// If a future change adds a new field to `populate_display_info`,
     /// `populate_control_info`, or `populate_enum_info`, the new source
     /// field name MUST also be added to [`is_metadata_cache_source`] so
-    /// writes to it invalidate the cache — unless, like DESC
-    /// (`display.description`), its write owner invalidates directly (see
+    /// writes to it rebuild the cache — unless, like DESC
+    /// (`display.description`), its write owner rebuilds directly (see
     /// the DESC arm of `put_common_field`). This set says nothing about
     /// `DBE_PROPERTY`, which the field's own `prop(YES)` declaration
     /// decides ([`RecordInstance::field_posts_property`]). (The `Q:form`
     /// -> `display.form` mapping is exempt: it reads an immutable
     /// load-time info tag, not a runtime field.)
-    metadata_cache: StdMutex<Option<MetadataSnapshot>>,
+    metadata_cache: MetadataCell,
     /// `DBE_ALARM` when the last epilogue's `recGblResetAlarms` posted the
     /// alarm fields (its return value, `recGbl.c:209-212`), else empty. Set
     /// only by the alarm-moving monitor publication and taken by the same
@@ -5600,6 +5676,572 @@ pub(crate) fn field_desc_of<R: Record + ?Sized>(
     field: &str,
 ) -> Option<&'static FieldDesc> {
     field_desc_in(record.field_list(), field)
+}
+
+/// C's `getEnumString` dispatch for `field` of `record`; `device` answers
+/// `DTYP`'s choices. See [`RecordInstance::enum_string_form_for`].
+fn enum_string_form_with(
+    record: &dyn Record,
+    field: &str,
+    device: impl FnOnce() -> Option<Vec<PvString>>,
+) -> Option<EnumStringForm> {
+    let desc = field_desc_of(record, field);
+    if is_device(desc) {
+        // `None` propagates C's `goto nostrs` (`dbAccess.c:178`): a record
+        // type with no `device()` declaration supplies no choice list, so
+        // the leaf is omitted rather than marked empty.
+        return device().map(EnumStringForm::device);
+    }
+    if let Some(choices) = menu_choices_with(record, field, desc) {
+        return Some(EnumStringForm::menu(
+            choices.iter().map(|c| PvString::from(*c)),
+        ));
+    }
+    if field.eq_ignore_ascii_case("VAL") {
+        return record.enum_slots().map(EnumSlots::form);
+    }
+    None
+}
+
+/// The per-field half of C's `dbGet` options — the rset slots, keyed by
+/// field — over the record-level metadata cache. Everything it reads is the
+/// record type's own code and declarations, so a record inside its own
+/// processing serves it from `&dyn Record` ([`own_field_snapshot`]) as C's
+/// lock-free `dbGet` does.
+pub(crate) trait FieldMetaSource {
+    fn rec(&self) -> &dyn Record;
+    /// A field of the record by name; the `FTVL` test reads it.
+    fn read_field(&self, field: &str) -> Option<EpicsValue>;
+    /// [`RecordInstance::enum_string_form_for`].
+    fn enum_string_form(&self, field: &str) -> Option<EnumStringForm>;
+
+    /// `meta`, the record's cached VAL metadata, finished for `field`.
+    fn finish_metadata(
+        &self,
+        field: &str,
+        meta: MetadataSnapshot,
+        backing: LinkBacking<'_>,
+        snap: &mut super::super::snapshot::Snapshot,
+    ) {
+        let explicit_alarm = meta.alarm;
+        snap.display = meta.display;
+        snap.control = meta.control;
+        snap.enums = meta.enums;
+
+        // The cache above is the record's VAL metadata. C routes PER FIELD, so
+        // a non-VAL-class field does NOT get VAL's limits — see
+        // [`Self::route_field_metadata`], which owns that decision.
+        self.route_field_metadata(field, backing, explicit_alarm, snap);
+
+        // Per-field RSET metadata (C get_units/get_precision/
+        // get_graphic_double/get_control_double/get_alarm_double key on
+        // dbGetFieldIndex) patches the record-level cache for this field.
+        self.apply_field_metadata_override(field, snap);
+
+        // DBF_MENU field (a shared menu such as `SCAN`/`OMSL`/`HHSV`/... or
+        // a record-specific menu such as `sel.SELM`): carry the menu index
+        // as DBR_ENUM and attach its `menu()` choice labels. See
+        // `attach_menu_enum`. This overrides any record VAL enum table
+        // copied from the metadata cache above, because a menu field
+        // carries its own menu's choices, not the record's VAL state
+        // strings.
+        self.attach_menu_enum(field, snap);
+
+        // The metadata VALUES and the mask that says which of them this
+        // channel actually supplies are assigned by the same owner, from the
+        // settled value, so they cannot disagree.
+        self.assign_property_support(field, snap);
+    }
+
+    /// C's rset metadata slots route **per field**, on `dbGetFieldIndex`. The
+    /// port's metadata cache is the record's VAL metadata, and serving it to
+    /// every field is what made a non-VAL field report VAL's limits.
+    ///
+    /// Every base record's `get_control_double` / `get_alarm_double` has the
+    /// same two-arm shape: a listed set of field indices that take the
+    /// record's own limits, and a `default:` arm that hands the field to
+    /// `recGblGetControlDouble` / `recGblGetAlarmDouble` — the field TYPE's
+    /// numeric range, and four NaN. This routes the `default:` arm; a listed
+    /// field keeps the cache, which already holds exactly the record's own
+    /// limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
+    /// HOPR/LOPR).
+    ///
+    /// The three slots' listed sets are **different**, and each has its own
+    /// owner here: [`RecordInstance::control_explicit_field`],
+    /// [`RecordInstance::graphic_explicit_field`] and [`RecordInstance::alarm_explicit_field`].
+    /// They are separate switches over separate field lists in C, so the
+    /// membership question is asked once per slot, never once for both — and
+    /// each list varies by record TYPE, so it is asked once per type too.
+    ///
+    /// Measured on a real `softIocPVX` against `record(calc,"X"){}`:
+    /// `.PHAS` (DBF_SHORT, unlisted) serves control ±32767 — the SHRT range —
+    /// while `.VAL` and `.HIHI` (both listed) serve 0/0 from HOPR/LOPR.
+    ///
+    /// Display (graphic) limits differ from control in one way: the `default:`
+    /// arm of `get_graphic_double` tries a LINK first (`calcRecord.c`
+    /// `get_linkNumber` → `dbGetGraphicLimits`) and only falls to `recGbl` for
+    /// a field that backs no link. A constant (unset) link has no metadata
+    /// getters, so the `dbAccess.c:216` 0/0 seed stands — measured: `CALC.A`
+    /// serves display 0/0 but control ±1e300. [`Record::link_backed_metadata_field`]
+    /// carries that per-record C knowledge.
+    ///
+    /// Units and precision are routed here too, and they are NOT the
+    /// `get_*_double` shape: neither has a `recGbl` range arm, so a field the
+    /// type's switch does not name keeps `dbAccess.c`'s memset — empty units,
+    /// and the precision seed. They were built into the record-level cache
+    /// until `subArray`/`sel`/`sub`/`dfanout` were measured serving `""`/`0`
+    /// against C's EGU/PREC, which is the same dual meaning the alarm leaves
+    /// had: whether a field carried the record's own value depended on a
+    /// `match rtype` in a different function.
+    ///
+    /// The last arm is not the same for every record type — a slot can also
+    /// fall through WITHOUT delegating, keeping the seed. That fact is one bit
+    /// per record type, read from its C source: `control_default_arm`.
+    fn route_field_metadata(
+        &self,
+        field: &str,
+        backing: LinkBacking<'_>,
+        explicit_alarm: (f64, f64, f64, f64),
+        snap: &mut super::super::snapshot::Snapshot,
+    ) {
+        // The rset slots this record type actually supplies. A NULL slot makes
+        // `dbAccess.c` clear the option bit, so the leaf is never served and
+        // there is nothing to route — minting a value here would put a
+        // fabricated number into the struct while `Snapshot::properties` says
+        // the slot is absent, and the two wires read different halves of that
+        // disagreement: CA goes through the mask-gated accessors
+        // (`codec.rs::get_limits` calls `graphic_limits()`/`alarm_limits()`/
+        // `control_limits()`, each `then_some`-gated), PVA reads the struct
+        // straight (`native_source.rs:226`) under its own leaf mask.
+        let slots = self.rec().property_support();
+        let rtype = self.rec().record_type();
+        let f: &str = &upper_field(field);
+
+        // C's `get_linkNumber` question, asked ONCE per snapshot: which of this
+        // record's own link fields, if any, supplies this field's metadata.
+        // Four of the six slots consult it — `aSubRecord.c:306-404` is the
+        // complete specimen — and control does not, because
+        // `dbGetControlLimits` has no caller anywhere in base.
+        let link_backed = self.rec().link_backed_metadata_field(f);
+        // Resolved for THIS build and handed in — see [`LinkBacking`]. Reading
+        // a value the record had stored is what made a `caput SRC.EGU` invisible
+        // to a passive source's clients until the source next processed.
+        let link_meta = link_backed.as_ref().and_then(|lf| backing.metadata(lf));
+
+        // C `get_units`'s "no case" arm — the field the rset tests for and
+        // declines to write, leaving `dbAccess.c:378`'s zeroed buffer. The
+        // record-level cache holds `EGU` for every type that supplies the
+        // slot, so this is the step that takes it back off the fields C never
+        // gives it to. See [`RecordInstance::units_from_egu`].
+        if slots.units {
+            if link_backed.is_some() {
+                // C's link arm — `dbGetUnits(&prec->inpa + n, ...)`, which
+                // writes only what the TARGET record supplies. A constant or
+                // unresolved link supplies nothing and `dbAccess.c:378`'s
+                // zeroed buffer stands.
+                snap.display.get_or_insert_with(Default::default).units = link_meta
+                    .and_then(|m| m.units.as_deref())
+                    .map(crate::types::PvString::from)
+                    .unwrap_or_default();
+            } else if !self.units_from_egu(rtype, f) {
+                snap.display.get_or_insert_with(Default::default).units = Default::default();
+            }
+        }
+
+        // C `get_precision`'s link arm, which the port had no arm for at all.
+        // All five link-routing types seed `*pprecision = prec->prec` — the
+        // record's own PREC, already in the metadata cache — and overwrite it
+        // only when `dbGetPrecision` on the backing link SUCCEEDS
+        // (`calcRecord.c:184-203`, `aSubRecord.c:323-348`). So an unresolved or
+        // constant link means "leave the cache alone", which is the `None`
+        // arm here.
+        if slots.precision {
+            let link_precision = link_meta.and_then(|m| m.precision);
+            if link_backed.is_some()
+                && let Some(precision) = link_precision
+            {
+                snap.display.get_or_insert_with(Default::default).precision = precision;
+            }
+            // C `get_precision`'s SHARED TAIL — `recGblGetPrec`
+            // (`recGbl.c:119-144`), which every one of these bodies hands the
+            // fields it did not name. For a field that can carry a precision
+            // (`dbAccess.c:388-389` gates `DBR_PRECISION` on
+            // `DBF_FLOAT`/`DBF_DOUBLE`) the tail does one thing: clamp a PREC
+            // outside `0..=15` to 15. Applied here rather than per record so
+            // "does this field take the tail" has one owner —
+            // [`RecordInstance::precision_explicit_field`] — instead of thirty
+            // `field_metadata_override`s that each have to remember it.
+            //
+            // Gated on the field being float or double so the tail runs
+            // exactly where C's does: `dbAccess.c:388-389` refuses to call
+            // `get_precision` at all for any other type, which is what keeps
+            // `recGblGetPrec`'s integer arm (`*precision = 0`) unobservable —
+            // it must stay unobservable here too.
+            let field_type = self.static_field_type(field);
+            if matches!(
+                field_type,
+                Some(crate::types::DbFieldType::Float | crate::types::DbFieldType::Double)
+            ) && !RecordInstance::precision_explicit_field(
+                rtype,
+                f,
+                link_backed.is_some(),
+                link_precision.is_some(),
+            ) {
+                let d = snap.display.get_or_insert_with(Default::default);
+                d.precision = crate::server::recgbl::rec_gbl_get_prec(field_type, d.precision);
+            }
+        }
+
+        // C `get_control_double`'s last arm. No base record routes control
+        // through a link: `dbGetControlLimits` has zero callers in all of
+        // base, so unlike display this arm needs no link branch.
+        if slots.control_double && !RecordInstance::control_explicit_field(rtype, field) {
+            let (upper, lower) =
+                match super::record_trait::control_default_arm(self.rec().record_type()) {
+                    // `recGblGetControlDouble` → `getMaxRangeValues(field_type)`.
+                    // A type with no case in C's switch (STRING/MENU/DEVICE/links)
+                    // is written by nothing, leaving the `dbAccess.c:256` seed —
+                    // which is 0/0, exactly what `unwrap_or` supplies.
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
+                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
+                    }
+                    // The slot exists but writes nothing here, so the same
+                    // `dbAccess.c:256` seed stands. Modelled as a value rather
+                    // than as `None`: C's option bit is ON (the slot is supplied
+                    // and returned 0), so the leaf IS served — carrying the seed.
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
+                };
+            snap.control = Some(super::super::snapshot::ControlInfo {
+                upper_ctrl_limit: upper,
+                lower_ctrl_limit: lower,
+            });
+        }
+
+        // C `get_graphic_double`'s last arm. Unlike control this one has a LINK
+        // branch ahead of the recGbl call, so the three answers are: keep the
+        // cache (listed on HOPR/LOPR), the link's limits, or the default arm.
+        if slots.graphic_double && !RecordInstance::graphic_explicit_field(rtype, field) {
+            let (upper, lower) = if link_backed.is_some() {
+                // `dbGetGraphicLimits` on the backing link. A CONSTANT link has
+                // no metadata getters and an unresolved one has nothing cached,
+                // so in both cases the `dbAccess.c:216` 0/0 seed stands.
+                link_meta
+                    .and_then(|m| m.graphic_limits)
+                    .map(|(lower, upper)| (upper, lower))
+                    .unwrap_or((0.0, 0.0))
+            } else {
+                match super::record_trait::graphic_default_arm(rtype) {
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
+                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
+                    }
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
+                }
+            };
+            let d = snap.display.get_or_insert_with(Default::default);
+            d.upper_disp_limit = upper;
+            d.lower_disp_limit = lower;
+        }
+
+        // C `get_alarm_double`, BOTH arms. This branch owns the four limits
+        // outright: `slots.alarm_double` is exactly the condition under which
+        // `getProperties` assigns the four `valueAlarm.*Limit` leaves, so
+        // whenever the leaves are served this assigns them.
+        //
+        // The explicit arm used to be left to the record-level metadata cache
+        // (`populate_display_info`), whose `match rtype` covered only some of
+        // the types that supply the slot. A type it missed reached the wire
+        // with `snap.display == None` and the four leaves kept the NT's
+        // structural 0 — measured: DFANOUT.VAL, SEL.VAL and SUB.VAL served 0
+        // where C serves NaN. That made "which limits does VAL carry" depend on
+        // a match arm existing somewhere else, which is the dual meaning this
+        // single owner removes.
+        if slots.alarm_double {
+            let (hihi, high, low, lolo) = if RecordInstance::alarm_explicit_field(rtype, field) {
+                explicit_alarm
+            } else if link_backed.is_some() {
+                // `dbGetAlarmLimits` on the backing link; `dbAccess.c:294`'s
+                // four NaN stand when it supplies nothing.
+                link_meta
+                    .and_then(|m| m.alarm_limits)
+                    .map(|(lolo, low, high, hihi)| (hihi, high, low, lolo))
+                    .unwrap_or_else(crate::server::recgbl::rec_gbl_get_alarm_double)
+            } else {
+                crate::server::recgbl::rec_gbl_get_alarm_double()
+            };
+            // The four alarm limits live on DisplayInfo because that mirrors
+            // C's `dbr_gr_double` packing, which the CA encoder depends on.
+            // Minting it here is safe: every other DisplayInfo field defaults
+            // to the same value the `None` path already served.
+            let d = snap.display.get_or_insert_with(Default::default);
+            d.upper_alarm_limit = hihi;
+            d.upper_warning_limit = high;
+            d.lower_warning_limit = low;
+            d.lower_alarm_limit = lolo;
+        }
+    }
+
+    /// Apply a record's per-field metadata override (C RSET
+    /// `get_units`/`get_precision`/`get_graphic_double`/
+    /// `get_control_double`/`get_alarm_double`, all keyed by field)
+    /// over the cached record-level metadata. Shared by the GET and
+    /// monitor snapshot builders. Computed live on every call — never
+    /// cached — so overrides derived from fields outside the
+    /// [`is_metadata_cache_source`] set cannot go stale.
+    ///
+    /// This is also where the record-level `Q:form` info tag is narrowed to
+    /// the served field: QSRV assigns `display.form.index` only when the
+    /// channel addresses the VAL field (`IOCSource::initialize` gates it on
+    /// `dbIsValueField(dbChannelFldDes(chan))`, `iocsource.cpp:53`; the form
+    /// *menu*, `form.choices`, is published for every field). The metadata
+    /// cache is per-record, so a channel on `REC.RVAL` of a record carrying
+    /// `info(Q:form, "Hex")` used to report Hex where pvxs reports Default.
+    /// Every served `Snapshot`, a monitor update's delivery read included,
+    /// runs this one owner, so
+    /// `DisplayInfo::form` means exactly one thing on every path: the form
+    /// index that applies to THIS field.
+    fn apply_field_metadata_override(
+        &self,
+        field: &str,
+        snap: &mut super::super::snapshot::Snapshot,
+    ) {
+        if let Some(display) = snap.display.as_mut()
+            && !crate::server::database::is_value_field(field)
+        {
+            display.form = 0;
+        }
+        let Some(ov) = self.rec().field_metadata_override(field) else {
+            return;
+        };
+        if ov.units.is_some()
+            || ov.precision.is_some()
+            || ov.disp_limits.is_some()
+            || ov.alarm_limits.is_some()
+        {
+            let d = snap.display.get_or_insert_with(Default::default);
+            if let Some(units) = ov.units {
+                d.units = units;
+            }
+            if let Some(precision) = ov.precision {
+                d.precision = precision;
+            }
+            if let Some((upper, lower)) = ov.disp_limits {
+                d.upper_disp_limit = upper;
+                d.lower_disp_limit = lower;
+            }
+            if let Some((hihi, high, low, lolo)) = ov.alarm_limits {
+                d.upper_alarm_limit = hihi;
+                d.upper_warning_limit = high;
+                d.lower_warning_limit = low;
+                d.lower_alarm_limit = lolo;
+            }
+        }
+        if let Some((upper, lower)) = ov.ctrl_limits {
+            let c = snap.control.get_or_insert_with(Default::default);
+            c.upper_ctrl_limit = upper;
+            c.lower_ctrl_limit = lower;
+        }
+    }
+
+    /// Attach a `DBF_MENU` field's `menu()` choice labels to a built snapshot,
+    /// so the CA/PVA enum encoders present `"NO CONVERSION"` rather than `0`.
+    ///
+    /// The VALUE half of the `DBF_MENU` -> `DBR_ENUM` mapping is not here: the
+    /// `.dbd` declares a menu field `DBF_MENU`, the generator types that
+    /// `DbFieldType::Enum` (`mapDBFToDBR`), and
+    /// [`RecordInstance::project_to_declared_type`] — which every delivery path runs —
+    /// makes the served value an [`EpicsValue::Enum`] on that declaration
+    /// alone. So the label table is all that is left to attach, and it is
+    /// attached exactly when the served value came out an enum. A same-named
+    /// field that is NOT a menu index (`scalcout.OSV`, declared `DBF_STRING`,
+    /// shares a name with the alarm-severity menu) is served as its own
+    /// declared string and gets no choice table.
+    fn attach_menu_enum(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
+        if !matches!(snap.value, EpicsValue::Enum(_)) {
+            return;
+        }
+        // `VAL` is the one field whose two rset slots differ: C's
+        // `get_enum_strs` (the `DBR_GR_ENUM` labels) is TRIMMED to `no_str`
+        // while `get_enum_str` (the DBR_STRING form) indexes the untrimmed
+        // state array. `populate_enum_info` owns that pair; every OTHER
+        // enum-valued field is a menu or a device, whose one choice list
+        // answers both (C `getMenuString`/`getDeviceString` index the same
+        // `papChoiceValue` the GR_ENUM reply carries).
+        if field.eq_ignore_ascii_case("VAL") {
+            return;
+        }
+        let Some(form) = self.enum_string_form(field) else {
+            return;
+        };
+        snap.enums = Some(super::super::snapshot::EnumInfo::with_string_form(
+            form.slots.clone(),
+            form,
+        ));
+    }
+
+    /// Stamp a built snapshot with the property mask THIS channel supplies —
+    /// [`Record::property_support`] narrowed to the addressed field by C's
+    /// second gate ([`PropertySupport::narrowed_to_field`]). Called by both
+    /// snapshot builders once the value has settled (after
+    /// [`RecordInstance::attach_menu_enum`] promoted a `DBF_MENU` field to its
+    /// `DBR_ENUM` form), so the mask is read off the same value the client
+    /// receives and no consumer has to re-derive either gate.
+    fn assign_property_support(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
+        snap.properties = self.rec().property_support().narrowed_to_field(
+            snap.value.db_field_type(),
+            menu_choices_of(self.rec(), field).is_some(),
+        );
+    }
+
+    /// Whether C's `get_units` copies the record's own `EGU` into `field`.
+    ///
+    /// The fourth membership question, and the one the port never asked. Units
+    /// had no per-field step at all: the record-level cache was the entire
+    /// answer, so every field of a type that supplies the slot was served
+    /// `EGU` — including the fields whose C rset tests first and writes
+    /// nothing, leaving the `dbAccess.c:378` empty seed. Measured shape:
+    /// `caget -d DBR_GR_DOUBLE AI.SMOO` served `EGU` where `aiRecord.c:223-226`
+    /// deliberately skips the three raw-conversion fields.
+    ///
+    /// * `ai`/`ao` (`aiRecord.c:217-232`, `aoRecord.c:284-298`) — a DBF_DOUBLE
+    ///   field other than the raw-conversion ones, which carry no engineering
+    ///   units.
+    /// * `calc`/`calcout`/`sub`/`sel`/`dfanout` (`calcRecord.c:169-182`,
+    ///   `calcoutRecord.c:425-444`, `subRecord.c:206-219`,
+    ///   `selRecord.c:136-143`, `dfanoutRecord.c:155-163`) — any DBF_DOUBLE
+    ///   field.
+    /// * `longin`/`longout` (`longinRecord.c:183-191`) test DBF_LONG and the
+    ///   int64 pair (`int64inRecord.c:179-187`) DBF_INT64: the record's own VAL
+    ///   type, not DOUBLE.
+    /// * `compress` (`compressRecord.c:449-458`) widens the DBF_DOUBLE test
+    ///   with `VAL`, whose served type comes from the record rather than the
+    ///   dbd.
+    /// * the array types (`waveformRecord.c:220-233`, `aaiRecord.c`,
+    ///   `aaoRecord.c`, `subArrayRecord.c:202-215`) name `VAL`, `HOPR` and
+    ///   `LOPR`, and drop `VAL` when `FTVL` makes it strings or enums.
+    /// * `histogram`, `seq`, `bo`, `table` and `aSub` never write `EGU` at all;
+    ///   each answers a literal or a link for a named set and nothing
+    ///   elsewhere, and the literals come from
+    ///   [`Record::field_metadata_override`].
+    ///
+    /// Every other ported type copies `EGU` with no test whatever
+    /// (`sCalcoutRecord.c:603-609`, `aCalcoutRecord.c:743-749`,
+    /// `epidRecord.c:217-223`, `mcaRecord.c:884-890`, `motorRecord.cc`'s
+    /// `default:` arm).
+    fn units_from_egu(&self, rtype: &str, field: &str) -> bool {
+        use crate::types::DbFieldType as T;
+        let f: &str = &upper_field(field);
+        // The link arm is NOT here: `route_field_metadata` asks
+        // [`Record::link_backed_metadata_field`] first and only falls through
+        // to this EGU question for a field no link backs. This function
+        // answers C's `else strncpy(units, prec->egu, ...)` branch alone.
+        let own = |t: T| self.static_field_type(f) == Some(t);
+        match rtype {
+            "ai" => own(T::Double) && !matches!(f, "ASLO" | "AOFF" | "SMOO"),
+            "ao" => own(T::Double) && !matches!(f, "ASLO" | "AOFF"),
+            "calc" | "calcout" | "sub" | "sel" | "dfanout" => own(T::Double),
+            "longin" | "longout" => own(T::Long),
+            "int64in" | "int64out" => own(T::Int64),
+            "compress" => own(T::Double) || f == "VAL",
+            "waveform" | "aai" | "aao" | "subArray" => {
+                matches!(f, "HOPR" | "LOPR") || (f == "VAL" && !self.ftvl_is_string_or_enum())
+            }
+            "histogram" | "seq" | "bo" | "table" | "aSub" => false,
+            _ => true,
+        }
+    }
+
+    /// The field's type as the **dbd declares it**, which is the only type
+    /// `recGblGetPrec` / `getMaxRangeValues` ever see.
+    ///
+    /// C reads `pdbFldDes->field_type` (`recGbl.c:127`, `:151`, `:169`) — the
+    /// STATIC descriptor — so a `cvt_dbaddr` retype (the port's
+    /// `runtime_typed`, DBF_NOACCESS in the dbd) never reaches the switch and
+    /// the switch has no case for it. `None` reproduces that: no case, no
+    /// write.
+    fn static_field_type(&self, field: &str) -> Option<crate::types::DbFieldType> {
+        let desc = field_desc_of(self.rec(), field)?;
+        (!desc.runtime_typed).then_some(desc.dbf_type)
+    }
+
+    /// `recGblGetGraphicDouble` / `recGblGetControlDouble` for `field` — the
+    /// same `getMaxRangeValues` table both C entry points share
+    /// (`recGbl.c:146-171`). `None` where C's switch has no case (STRING,
+    /// MENU, DEVICE, NOACCESS, links), which writes nothing.
+    ///
+    /// `declared_dbf` is C's `pdbFldDes->field_type` verbatim. Deciding
+    /// menu-ness from `desc.menu` instead asked whether the field carries its
+    /// own inline choice list, which `SCAN` and `DTYP` do not — their choices
+    /// come from the scan table and the device registry — so both reported a
+    /// `DBF_USHORT` range of 65535/0 to `gft` where C reports 0/0.
+    fn rec_gbl_range_for(&self, field: &str) -> Option<(f64, f64)> {
+        let desc = field_desc_of(self.rec(), field)?;
+        crate::server::recgbl::rec_gbl_get_graphic_double(desc.declared_dbf)
+    }
+
+    /// `FTVL` names `DBF_STRING` or `DBF_ENUM` — the two element types for
+    /// which the array rsets break out of the `VAL` case before copying `EGU`.
+    /// `menuFtype` is declared in `DBF_` code order, so `0` is STRING and `11`
+    /// is ENUM.
+    fn ftvl_is_string_or_enum(&self) -> bool {
+        matches!(
+            self.read_field("FTVL").and_then(|v| v.to_f64()),
+            Some(x) if x == 0.0 || x == 11.0
+        )
+    }
+}
+
+impl FieldMetaSource for RecordInstance {
+    fn rec(&self) -> &dyn Record {
+        self.record.as_ref()
+    }
+    fn read_field(&self, field: &str) -> Option<EpicsValue> {
+        self.resolve_field(field)
+    }
+    fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
+        self.enum_string_form_for(field)
+    }
+}
+
+/// A record read from inside its own processing: its type's code and
+/// nothing behind its lock set.
+struct OwnRecord<'a>(&'a dyn Record);
+
+impl FieldMetaSource for OwnRecord<'_> {
+    fn rec(&self) -> &dyn Record {
+        self.0
+    }
+    fn read_field(&self, field: &str) -> Option<EpicsValue> {
+        self.0.get_field(field)
+    }
+    fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
+        // `DTYP` lives in dbCommon, behind the lock set.
+        enum_string_form_with(self.0, field, || None)
+    }
+}
+
+/// C `dbGet` of `field` (canonical) of `cell`, from inside that record's own
+/// processing: the value and the field's metadata from `record`, the record
+/// itself, and the metadata cache, which needs no lock. `None` for a field
+/// the record type does not serve itself (dbCommon's) or whose metadata cache
+/// init has not built. A link-backed field gets its C seeds: resolving its
+/// link would read through the lock set this record holds.
+pub(crate) fn own_field_snapshot(
+    cell: &RecordCell,
+    record: &dyn Record,
+    field: &str,
+) -> Option<super::super::snapshot::Snapshot> {
+    let meta = cell.metadata.load_full()?;
+    let value = record.get_field(field)?;
+    let value = match declared_projection_of(declared_field_type_of(record, field), &value, || {
+        record.field_is_long_string(field)
+    }) {
+        Some(declared) => value.into_type(declared),
+        None => value,
+    };
+    let mut snap =
+        super::super::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::UNIX_EPOCH);
+    OwnRecord(record).finish_metadata(field, (*meta).clone(), LinkBacking::none(), &mut snap);
+    Some(snap)
 }
 
 /// [`field_desc_of`] against a type's table — C `dbFindFieldPart`: the
@@ -6753,7 +7395,7 @@ impl RecordInstance {
                 link_backed_metadata_links,
                 link_backed_metadata_input_slot,
                 info: HashMap::new(),
-                metadata_cache: StdMutex::new(None),
+                metadata_cache: MetadataCell::default(),
                 alarm_reset: crate::server::recgbl::EventMask::NONE,
             }),
         }
@@ -6792,7 +7434,7 @@ impl RecordInstance {
             if self.put_internal_field(&field, value).is_err() {
                 continue;
             }
-            // Snapshot-cache contract, as `post_fields_with_mask`: invalidate
+            // Snapshot-cache contract, as `post_fields_with_mask`: rebuild
             // before the monitor snapshot is built.
             self.notify_field_written(&field);
             if stage == PostStage::Output {
@@ -7002,6 +7644,7 @@ impl RecordInstance {
         // `init_record(1)`, so a driver `init` that defines VAL is still not
         // reflected in the trackers seeded a line earlier.
         crate::server::device_support::init_device_support(self);
+        self.seed_metadata_cache();
         // C `subRecord.c:107-129` / `aSubRecord.c:139-160` — the INAM call and
         // the SNAM lookup, also inside pass 1. `false` is C's early return
         // (`S_db_BadSub`, or the empty-SNAM `pact = TRUE; return 0`), so the
@@ -7315,14 +7958,26 @@ impl RecordInstance {
         }
     }
 
-    /// Invalidate the metadata cache. Called after writing any
-    /// metadata-class field (EGU, PREC, HOPR/LOPR, alarm limits,
-    /// DRVH/DRVL, enum strings). The next snapshot will rebuild the
-    /// cache from the new values.
-    pub fn invalidate_metadata_cache(&self) {
-        if let Ok(mut guard) = self.cold.metadata_cache.lock() {
-            *guard = None;
+    /// **The** writer of the metadata cache, called after a write of any
+    /// metadata-class field (EGU, PREC, HOPR/LOPR, alarm limits, DRVH/DRVL,
+    /// enum strings, DESC): a cache already built is rebuilt now rather than
+    /// cleared, so a reader that cannot rebuild it — one inside this record's
+    /// own processing — never finds it stale. One not yet built stays
+    /// unbuilt; [`Self::seed_metadata_cache`] builds it once init has written
+    /// the record.
+    pub fn refresh_metadata_cache(&self) {
+        if self.cold.metadata_cache.load().is_some() {
+            self.seed_metadata_cache();
         }
+    }
+
+    /// Build the metadata cache from the record as it stands: the end of
+    /// `init_record`, after device support's `init` has written its fields
+    /// (asyn's `setEnums`) with no notification.
+    pub(crate) fn seed_metadata_cache(&self) -> Arc<MetadataSnapshot> {
+        let meta = Arc::new(self.build_metadata());
+        self.cold.metadata_cache.store(Some(Arc::clone(&meta)));
+        meta
     }
 
     /// **The** `DBE_PROPERTY` gate: C `dbAccess.c:1330`
@@ -7341,15 +7996,14 @@ impl RecordInstance {
     }
 
     /// Hook called by the database after a field is written. If the field is a
-    /// metadata-cache source, the cache is invalidated so the next snapshot
-    /// picks up the new value. Posts nothing — a caller that also owes the
+    /// metadata-cache source, the cache is rebuilt from the new value. Posts nothing — a caller that also owes the
     /// `DBE_PROPERTY` event uses [`Self::notify_field_written_if_changed`].
     ///
     /// Field name is automatically uppercased.
     pub fn notify_field_written(&self, field: &str) {
         let upper = upper_field(field);
         if is_metadata_cache_source(&upper) {
-            self.invalidate_metadata_cache();
+            self.refresh_metadata_cache();
         }
     }
 
@@ -7430,7 +8084,7 @@ impl RecordInstance {
             return;
         }
         if cache_source {
-            self.invalidate_metadata_cache();
+            self.refresh_metadata_cache();
         }
         if posts_property {
             // mirror C dbAccess.c:1395-1396 — the gate `if (propertyUpdate &&
@@ -7449,17 +8103,18 @@ impl RecordInstance {
     }
 
     /// Returns the cached MetadataSnapshot, building and storing it on
-    /// the first call (or after invalidation), so the populate cost is paid
-    /// at most once per metadata-stable interval.
+    /// the first call, so the populate cost is paid at most once per
+    /// metadata-stable interval.
     fn cached_metadata(&self) -> MetadataSnapshot {
-        // Fast path: cache hit
-        if let Ok(guard) = self.cold.metadata_cache.lock()
-            && let Some(cached) = guard.as_ref()
-        {
-            return cached.clone();
+        match self.cold.metadata_cache.load_full() {
+            Some(cached) => (*cached).clone(),
+            None => (*self.seed_metadata_cache()).clone(),
         }
+    }
 
-        // Cache miss: build a fresh metadata snapshot
+    fn build_metadata(&self) -> MetadataSnapshot {
+        #[cfg(test)]
+        METADATA_BUILDS.with(|n| n.set(n.get() + 1));
         let mut tmp = super::super::snapshot::Snapshot::new(
             EpicsValue::Double(0.0),
             0,
@@ -7469,19 +8124,12 @@ impl RecordInstance {
         self.populate_display_info(&mut tmp);
         self.populate_control_info(&mut tmp);
         self.populate_enum_info(&mut tmp);
-
-        let meta = MetadataSnapshot {
+        MetadataSnapshot {
             display: tmp.display,
             control: tmp.control,
             enums: tmp.enums,
             alarm: self.explicit_alarm_limits(self.record.record_type()),
-        };
-
-        // Store back; ignore poisoning (cache is best-effort).
-        if let Ok(mut guard) = self.cold.metadata_cache.lock() {
-            *guard = Some(meta.clone());
         }
-        meta
     }
 
     /// C `dbChannelSpecial(chan) == SPC_NOMOD` — **the single owner of the
@@ -8312,22 +8960,7 @@ impl RecordInstance {
     /// [`EnumOverflow`](crate::server::snapshot::EnumOverflow)); the index is
     /// rendered as a number for a `DBF_MENU` and ONLY for a `DBF_MENU`.
     pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
-        let desc = field_desc_of(self.record.as_ref(), field);
-        if is_device(desc) {
-            // `None` propagates C's `goto nostrs` (`dbAccess.c:178`): a record
-            // type with no `device()` declaration supplies no choice list, so
-            // the leaf is omitted rather than marked empty.
-            return self.device_choices().map(EnumStringForm::device);
-        }
-        if let Some(choices) = menu_choices_with(self.record.as_ref(), field, desc) {
-            return Some(EnumStringForm::menu(
-                choices.iter().map(|c| PvString::from(*c)),
-            ));
-        }
-        if field.eq_ignore_ascii_case("VAL") {
-            return self.record.enum_slots().map(EnumSlots::form);
-        }
-        None
+        enum_string_form_with(self.record.as_ref(), field, || self.device_choices())
     }
 
     /// Is `field` one of the DBF classes C's soft device support writes as
@@ -8593,42 +9226,6 @@ impl RecordInstance {
         Some(self.project_to_declared_type(field, value))
     }
 
-    /// Attach a `DBF_MENU` field's `menu()` choice labels to a built snapshot,
-    /// so the CA/PVA enum encoders present `"NO CONVERSION"` rather than `0`.
-    ///
-    /// The VALUE half of the `DBF_MENU` -> `DBR_ENUM` mapping is not here: the
-    /// `.dbd` declares a menu field `DBF_MENU`, the generator types that
-    /// `DbFieldType::Enum` (`mapDBFToDBR`), and
-    /// [`Self::project_to_declared_type`] — which every delivery path runs —
-    /// makes the served value an [`EpicsValue::Enum`] on that declaration
-    /// alone. So the label table is all that is left to attach, and it is
-    /// attached exactly when the served value came out an enum. A same-named
-    /// field that is NOT a menu index (`scalcout.OSV`, declared `DBF_STRING`,
-    /// shares a name with the alarm-severity menu) is served as its own
-    /// declared string and gets no choice table.
-    fn attach_menu_enum(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        if !matches!(snap.value, EpicsValue::Enum(_)) {
-            return;
-        }
-        // `VAL` is the one field whose two rset slots differ: C's
-        // `get_enum_strs` (the `DBR_GR_ENUM` labels) is TRIMMED to `no_str`
-        // while `get_enum_str` (the DBR_STRING form) indexes the untrimmed
-        // state array. `populate_enum_info` owns that pair; every OTHER
-        // enum-valued field is a menu or a device, whose one choice list
-        // answers both (C `getMenuString`/`getDeviceString` index the same
-        // `papChoiceValue` the GR_ENUM reply carries).
-        if field.eq_ignore_ascii_case("VAL") {
-            return;
-        }
-        let Some(form) = self.enum_string_form_for(field) else {
-            return;
-        };
-        snap.enums = Some(super::super::snapshot::EnumInfo::with_string_form(
-            form.slots.clone(),
-            form,
-        ));
-    }
-
     /// Build a Snapshot with full metadata for the given field — for a field
     /// **no link backs**.
     ///
@@ -8742,39 +9339,9 @@ impl RecordInstance {
         // that raise no message (C's plain `recGblSetSevr` clears namsg).
         snap.alarm.amsg = String::from(&self.common.amsg);
 
-        // Pull display/control/enums from the metadata cache (build on
-        // first call, hit thereafter until invalidated by a metadata-class
-        // field write).
-        let meta = self.cached_metadata();
-        let explicit_alarm = meta.alarm;
-        snap.display = meta.display;
-        snap.control = meta.control;
-        snap.enums = meta.enums;
-
-        // The cache above is the record's VAL metadata. C routes PER FIELD, so
-        // a non-VAL-class field does NOT get VAL's limits — see
-        // [`Self::route_field_metadata`], which owns that decision.
-        self.route_field_metadata(field, backing, explicit_alarm, &mut snap);
-
-        // Per-field RSET metadata (C get_units/get_precision/
-        // get_graphic_double/get_control_double/get_alarm_double key on
-        // dbGetFieldIndex) patches the record-level cache for this field.
-        self.apply_field_metadata_override(field, &mut snap);
-
-        // DBF_MENU field (a shared menu such as `SCAN`/`OMSL`/`HHSV`/... or
-        // a record-specific menu such as `sel.SELM`): carry the menu index
-        // as DBR_ENUM and attach its `menu()` choice labels. See
-        // `attach_menu_enum`. This overrides any record VAL enum table
-        // copied from the metadata cache above, because a menu field
-        // carries its own menu's choices, not the record's VAL state
-        // strings.
-        self.attach_menu_enum(field, &mut snap);
-
-        // The metadata VALUES and the mask that says which of them this
-        // channel actually supplies are assigned by the same owner, from the
-        // settled value, so they cannot disagree.
-        self.assign_property_support(field, &mut snap);
-
+        // Pull display/control/enums from the metadata cache (seeded at init,
+        // rebuilt by every metadata-class field write).
+        self.finish_metadata(field, self.cached_metadata(), backing, &mut snap);
         snap
     }
 
@@ -8842,20 +9409,6 @@ impl RecordInstance {
             .iter()
             .position(|name| name == tag)
             .map(|i| i as i16)
-    }
-
-    /// Stamp a built snapshot with the property mask THIS channel supplies —
-    /// [`Record::property_support`] narrowed to the addressed field by C's
-    /// second gate ([`PropertySupport::narrowed_to_field`]). Called by both
-    /// snapshot builders once the value has settled (after
-    /// [`Self::attach_menu_enum`] promoted a `DBF_MENU` field to its
-    /// `DBR_ENUM` form), so the mask is read off the same value the client
-    /// receives and no consumer has to re-derive either gate.
-    fn assign_property_support(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        snap.properties = self.record.property_support().narrowed_to_field(
-            snap.value.db_field_type(),
-            self.menu_choices_for(field).is_some(),
-        );
     }
 
     /// The property mask a channel on `field` supplies, without building a
@@ -8945,7 +9498,7 @@ impl RecordInstance {
         // qsrv builders always emit the leaf (defaulting a `None`
         // display), so creating the DisplayInfo here changes leaf
         // values, never the wire shape. Cache freshness is owned by the
-        // DESC arm of `put_common_field`, which invalidates without
+        // DESC arm of `put_common_field`, which rebuilds without
         // posting DBE_PROPERTY (epics-base#785 / UI-106).
         snap.display
             .get_or_insert_with(Default::default)
@@ -9009,88 +9562,28 @@ impl RecordInstance {
     /// live in `declared_overrides`, and their unset defaults in the `.dbd`
     /// `initial()`, both of which only `resolve_field` reaches.
     fn metadata_limit(&self, field: &str) -> f64 {
-        self.resolve_field(field)
+        self.metadata_field(field)
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0)
+    }
+
+    /// A metadata source field, read only where the record declares it: C
+    /// reads these out of record memory, so an undeclared one (`EGU` on `bo`)
+    /// is absent, and asking the virtual-name fallback for it is a by-name
+    /// compare on every metadata rebuild.
+    fn metadata_field(&self, field: &str) -> Option<EpicsValue> {
+        let desc = self.field_desc(field)?;
+        self.resolve_field_upper_at(field, Some(desc))
     }
 
     /// `EGU`, the source every ported C `get_units` copies from. Empty for a
     /// record type whose `.dbd` declares no `EGU` — `seq` and `histogram` have
     /// none, and C writes nothing into the `dbAccess.c:378` seed for either.
     fn metadata_units(&self) -> crate::types::PvString {
-        match self.resolve_field("EGU") {
+        match self.metadata_field("EGU") {
             Some(EpicsValue::String(s)) => s,
             _ => Default::default(),
         }
-    }
-
-    /// Whether C's `get_units` copies the record's own `EGU` into `field`.
-    ///
-    /// The fourth membership question, and the one the port never asked. Units
-    /// had no per-field step at all: the record-level cache was the entire
-    /// answer, so every field of a type that supplies the slot was served
-    /// `EGU` — including the fields whose C rset tests first and writes
-    /// nothing, leaving the `dbAccess.c:378` empty seed. Measured shape:
-    /// `caget -d DBR_GR_DOUBLE AI.SMOO` served `EGU` where `aiRecord.c:223-226`
-    /// deliberately skips the three raw-conversion fields.
-    ///
-    /// * `ai`/`ao` (`aiRecord.c:217-232`, `aoRecord.c:284-298`) — a DBF_DOUBLE
-    ///   field other than the raw-conversion ones, which carry no engineering
-    ///   units.
-    /// * `calc`/`calcout`/`sub`/`sel`/`dfanout` (`calcRecord.c:169-182`,
-    ///   `calcoutRecord.c:425-444`, `subRecord.c:206-219`,
-    ///   `selRecord.c:136-143`, `dfanoutRecord.c:155-163`) — any DBF_DOUBLE
-    ///   field.
-    /// * `longin`/`longout` (`longinRecord.c:183-191`) test DBF_LONG and the
-    ///   int64 pair (`int64inRecord.c:179-187`) DBF_INT64: the record's own VAL
-    ///   type, not DOUBLE.
-    /// * `compress` (`compressRecord.c:449-458`) widens the DBF_DOUBLE test
-    ///   with `VAL`, whose served type comes from the record rather than the
-    ///   dbd.
-    /// * the array types (`waveformRecord.c:220-233`, `aaiRecord.c`,
-    ///   `aaoRecord.c`, `subArrayRecord.c:202-215`) name `VAL`, `HOPR` and
-    ///   `LOPR`, and drop `VAL` when `FTVL` makes it strings or enums.
-    /// * `histogram`, `seq`, `bo`, `table` and `aSub` never write `EGU` at all;
-    ///   each answers a literal or a link for a named set and nothing
-    ///   elsewhere, and the literals come from
-    ///   [`Record::field_metadata_override`].
-    ///
-    /// Every other ported type copies `EGU` with no test whatever
-    /// (`sCalcoutRecord.c:603-609`, `aCalcoutRecord.c:743-749`,
-    /// `epidRecord.c:217-223`, `mcaRecord.c:884-890`, `motorRecord.cc`'s
-    /// `default:` arm).
-    fn units_from_egu(&self, rtype: &str, field: &str) -> bool {
-        use crate::types::DbFieldType as T;
-        let f: &str = &upper_field(field);
-        // The link arm is NOT here: `route_field_metadata` asks
-        // [`Record::link_backed_metadata_field`] first and only falls through
-        // to this EGU question for a field no link backs. This function
-        // answers C's `else strncpy(units, prec->egu, ...)` branch alone.
-        let own = |t: T| self.static_field_type(f) == Some(t);
-        match rtype {
-            "ai" => own(T::Double) && !matches!(f, "ASLO" | "AOFF" | "SMOO"),
-            "ao" => own(T::Double) && !matches!(f, "ASLO" | "AOFF"),
-            "calc" | "calcout" | "sub" | "sel" | "dfanout" => own(T::Double),
-            "longin" | "longout" => own(T::Long),
-            "int64in" | "int64out" => own(T::Int64),
-            "compress" => own(T::Double) || f == "VAL",
-            "waveform" | "aai" | "aao" | "subArray" => {
-                matches!(f, "HOPR" | "LOPR") || (f == "VAL" && !self.ftvl_is_string_or_enum())
-            }
-            "histogram" | "seq" | "bo" | "table" | "aSub" => false,
-            _ => true,
-        }
-    }
-
-    /// `FTVL` names `DBF_STRING` or `DBF_ENUM` — the two element types for
-    /// which the array rsets break out of the `VAL` case before copying `EGU`.
-    /// `menuFtype` is declared in `DBF_` code order, so `0` is STRING and `11`
-    /// is ENUM.
-    fn ftvl_is_string_or_enum(&self) -> bool {
-        matches!(
-            self.resolve_field("FTVL").and_then(|v| v.to_f64()),
-            Some(x) if x == 0.0 || x == 11.0
-        )
     }
 
     /// Populate EnumInfo — C rset `get_enum_strs`.
@@ -10067,7 +10560,7 @@ impl RecordInstance {
                         // cache here at the write owner without posting
                         // DBE_PROPERTY: the pvxs behavior (fresh on the next
                         // metadata build, no event).
-                        self.invalidate_metadata_cache();
+                        self.refresh_metadata_cache();
                     }
                 }
             }
@@ -11322,11 +11815,11 @@ impl RecordInstance {
         }
 
         // If the record reports it modified a metadata-class field during
-        // process(), invalidate the metadata cache so the next snapshot
-        // rebuilds from the new values. Default impl returns false, so
+        // process(), rebuild the metadata cache from the new values.
+        // Default impl returns false, so
         // most records pay zero cost here.
         if self.record.took_metadata_change() {
-            self.invalidate_metadata_cache();
+            self.refresh_metadata_cache();
             // mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
             self.post_record_wide(
                 &mut PostBurst::new(),
@@ -11588,295 +12081,6 @@ impl RecordInstance {
         }
     }
 
-    /// Apply a record's per-field metadata override (C RSET
-    /// `get_units`/`get_precision`/`get_graphic_double`/
-    /// `get_control_double`/`get_alarm_double`, all keyed by field)
-    /// over the cached record-level metadata. Shared by the GET and
-    /// monitor snapshot builders. Computed live on every call — never
-    /// cached — so overrides derived from fields outside the
-    /// [`is_metadata_cache_source`] set cannot go stale.
-    ///
-    /// This is also where the record-level `Q:form` info tag is narrowed to
-    /// the served field: QSRV assigns `display.form.index` only when the
-    /// channel addresses the VAL field (`IOCSource::initialize` gates it on
-    /// `dbIsValueField(dbChannelFldDes(chan))`, `iocsource.cpp:53`; the form
-    /// *menu*, `form.choices`, is published for every field). The metadata
-    /// cache is per-record, so a channel on `REC.RVAL` of a record carrying
-    /// `info(Q:form, "Hex")` used to report Hex where pvxs reports Default.
-    /// Every served `Snapshot`, a monitor update's delivery read included,
-    /// runs this one owner, so
-    /// `DisplayInfo::form` means exactly one thing on every path: the form
-    /// index that applies to THIS field.
-    fn apply_field_metadata_override(
-        &self,
-        field: &str,
-        snap: &mut super::super::snapshot::Snapshot,
-    ) {
-        if let Some(display) = snap.display.as_mut()
-            && !crate::server::database::is_value_field(field)
-        {
-            display.form = 0;
-        }
-        let Some(ov) = self.record.field_metadata_override(field) else {
-            return;
-        };
-        if ov.units.is_some()
-            || ov.precision.is_some()
-            || ov.disp_limits.is_some()
-            || ov.alarm_limits.is_some()
-        {
-            let d = snap.display.get_or_insert_with(Default::default);
-            if let Some(units) = ov.units {
-                d.units = units;
-            }
-            if let Some(precision) = ov.precision {
-                d.precision = precision;
-            }
-            if let Some((upper, lower)) = ov.disp_limits {
-                d.upper_disp_limit = upper;
-                d.lower_disp_limit = lower;
-            }
-            if let Some((hihi, high, low, lolo)) = ov.alarm_limits {
-                d.upper_alarm_limit = hihi;
-                d.upper_warning_limit = high;
-                d.lower_warning_limit = low;
-                d.lower_alarm_limit = lolo;
-            }
-        }
-        if let Some((upper, lower)) = ov.ctrl_limits {
-            let c = snap.control.get_or_insert_with(Default::default);
-            c.upper_ctrl_limit = upper;
-            c.lower_ctrl_limit = lower;
-        }
-    }
-
-    /// C's rset metadata slots route **per field**, on `dbGetFieldIndex`. The
-    /// port's metadata cache is the record's VAL metadata, and serving it to
-    /// every field is what made a non-VAL field report VAL's limits.
-    ///
-    /// Every base record's `get_control_double` / `get_alarm_double` has the
-    /// same two-arm shape: a listed set of field indices that take the
-    /// record's own limits, and a `default:` arm that hands the field to
-    /// `recGblGetControlDouble` / `recGblGetAlarmDouble` — the field TYPE's
-    /// numeric range, and four NaN. This routes the `default:` arm; a listed
-    /// field keeps the cache, which already holds exactly the record's own
-    /// limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
-    /// HOPR/LOPR).
-    ///
-    /// The three slots' listed sets are **different**, and each has its own
-    /// owner here: [`Self::control_explicit_field`],
-    /// [`Self::graphic_explicit_field`] and [`Self::alarm_explicit_field`].
-    /// They are separate switches over separate field lists in C, so the
-    /// membership question is asked once per slot, never once for both — and
-    /// each list varies by record TYPE, so it is asked once per type too.
-    ///
-    /// Measured on a real `softIocPVX` against `record(calc,"X"){}`:
-    /// `.PHAS` (DBF_SHORT, unlisted) serves control ±32767 — the SHRT range —
-    /// while `.VAL` and `.HIHI` (both listed) serve 0/0 from HOPR/LOPR.
-    ///
-    /// Display (graphic) limits differ from control in one way: the `default:`
-    /// arm of `get_graphic_double` tries a LINK first (`calcRecord.c`
-    /// `get_linkNumber` → `dbGetGraphicLimits`) and only falls to `recGbl` for
-    /// a field that backs no link. A constant (unset) link has no metadata
-    /// getters, so the `dbAccess.c:216` 0/0 seed stands — measured: `CALC.A`
-    /// serves display 0/0 but control ±1e300. [`Record::link_backed_metadata_field`]
-    /// carries that per-record C knowledge.
-    ///
-    /// Units and precision are routed here too, and they are NOT the
-    /// `get_*_double` shape: neither has a `recGbl` range arm, so a field the
-    /// type's switch does not name keeps `dbAccess.c`'s memset — empty units,
-    /// and the precision seed. They were built into the record-level cache
-    /// until `subArray`/`sel`/`sub`/`dfanout` were measured serving `""`/`0`
-    /// against C's EGU/PREC, which is the same dual meaning the alarm leaves
-    /// had: whether a field carried the record's own value depended on a
-    /// `match rtype` in a different function.
-    ///
-    /// The last arm is not the same for every record type — a slot can also
-    /// fall through WITHOUT delegating, keeping the seed. That fact is one bit
-    /// per record type, read from its C source: `control_default_arm`.
-    fn route_field_metadata(
-        &self,
-        field: &str,
-        backing: LinkBacking<'_>,
-        explicit_alarm: (f64, f64, f64, f64),
-        snap: &mut super::super::snapshot::Snapshot,
-    ) {
-        // The rset slots this record type actually supplies. A NULL slot makes
-        // `dbAccess.c` clear the option bit, so the leaf is never served and
-        // there is nothing to route — minting a value here would put a
-        // fabricated number into the struct while `Snapshot::properties` says
-        // the slot is absent, and the two wires read different halves of that
-        // disagreement: CA goes through the mask-gated accessors
-        // (`codec.rs::get_limits` calls `graphic_limits()`/`alarm_limits()`/
-        // `control_limits()`, each `then_some`-gated), PVA reads the struct
-        // straight (`native_source.rs:226`) under its own leaf mask.
-        let slots = self.record.property_support();
-        let rtype = self.record.record_type();
-        let f: &str = &upper_field(field);
-
-        // C's `get_linkNumber` question, asked ONCE per snapshot: which of this
-        // record's own link fields, if any, supplies this field's metadata.
-        // Four of the six slots consult it — `aSubRecord.c:306-404` is the
-        // complete specimen — and control does not, because
-        // `dbGetControlLimits` has no caller anywhere in base.
-        let link_backed = self.record.link_backed_metadata_field(f);
-        // Resolved for THIS build and handed in — see [`LinkBacking`]. Reading
-        // a value the record had stored is what made a `caput SRC.EGU` invisible
-        // to a passive source's clients until the source next processed.
-        let link_meta = link_backed.as_ref().and_then(|lf| backing.metadata(lf));
-
-        // C `get_units`'s "no case" arm — the field the rset tests for and
-        // declines to write, leaving `dbAccess.c:378`'s zeroed buffer. The
-        // record-level cache holds `EGU` for every type that supplies the
-        // slot, so this is the step that takes it back off the fields C never
-        // gives it to. See [`Self::units_from_egu`].
-        if slots.units {
-            if link_backed.is_some() {
-                // C's link arm — `dbGetUnits(&prec->inpa + n, ...)`, which
-                // writes only what the TARGET record supplies. A constant or
-                // unresolved link supplies nothing and `dbAccess.c:378`'s
-                // zeroed buffer stands.
-                snap.display.get_or_insert_with(Default::default).units = link_meta
-                    .and_then(|m| m.units.as_deref())
-                    .map(crate::types::PvString::from)
-                    .unwrap_or_default();
-            } else if !self.units_from_egu(rtype, f) {
-                snap.display.get_or_insert_with(Default::default).units = Default::default();
-            }
-        }
-
-        // C `get_precision`'s link arm, which the port had no arm for at all.
-        // All five link-routing types seed `*pprecision = prec->prec` — the
-        // record's own PREC, already in the metadata cache — and overwrite it
-        // only when `dbGetPrecision` on the backing link SUCCEEDS
-        // (`calcRecord.c:184-203`, `aSubRecord.c:323-348`). So an unresolved or
-        // constant link means "leave the cache alone", which is the `None`
-        // arm here.
-        if slots.precision {
-            let link_precision = link_meta.and_then(|m| m.precision);
-            if link_backed.is_some()
-                && let Some(precision) = link_precision
-            {
-                snap.display.get_or_insert_with(Default::default).precision = precision;
-            }
-            // C `get_precision`'s SHARED TAIL — `recGblGetPrec`
-            // (`recGbl.c:119-144`), which every one of these bodies hands the
-            // fields it did not name. For a field that can carry a precision
-            // (`dbAccess.c:388-389` gates `DBR_PRECISION` on
-            // `DBF_FLOAT`/`DBF_DOUBLE`) the tail does one thing: clamp a PREC
-            // outside `0..=15` to 15. Applied here rather than per record so
-            // "does this field take the tail" has one owner —
-            // [`Self::precision_explicit_field`] — instead of thirty
-            // `field_metadata_override`s that each have to remember it.
-            //
-            // Gated on the field being float or double so the tail runs
-            // exactly where C's does: `dbAccess.c:388-389` refuses to call
-            // `get_precision` at all for any other type, which is what keeps
-            // `recGblGetPrec`'s integer arm (`*precision = 0`) unobservable —
-            // it must stay unobservable here too.
-            let field_type = self.static_field_type(field);
-            if matches!(
-                field_type,
-                Some(crate::types::DbFieldType::Float | crate::types::DbFieldType::Double)
-            ) && !Self::precision_explicit_field(
-                rtype,
-                f,
-                link_backed.is_some(),
-                link_precision.is_some(),
-            ) {
-                let d = snap.display.get_or_insert_with(Default::default);
-                d.precision = crate::server::recgbl::rec_gbl_get_prec(field_type, d.precision);
-            }
-        }
-
-        // C `get_control_double`'s last arm. No base record routes control
-        // through a link: `dbGetControlLimits` has zero callers in all of
-        // base, so unlike display this arm needs no link branch.
-        if slots.control_double && !Self::control_explicit_field(rtype, field) {
-            let (upper, lower) =
-                match super::record_trait::control_default_arm(self.record.record_type()) {
-                    // `recGblGetControlDouble` → `getMaxRangeValues(field_type)`.
-                    // A type with no case in C's switch (STRING/MENU/DEVICE/links)
-                    // is written by nothing, leaving the `dbAccess.c:256` seed —
-                    // which is 0/0, exactly what `unwrap_or` supplies.
-                    super::record_trait::RsetDefaultArm::RecGblRange => {
-                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
-                    }
-                    // The slot exists but writes nothing here, so the same
-                    // `dbAccess.c:256` seed stands. Modelled as a value rather
-                    // than as `None`: C's option bit is ON (the slot is supplied
-                    // and returned 0), so the leaf IS served — carrying the seed.
-                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
-                };
-            snap.control = Some(super::super::snapshot::ControlInfo {
-                upper_ctrl_limit: upper,
-                lower_ctrl_limit: lower,
-            });
-        }
-
-        // C `get_graphic_double`'s last arm. Unlike control this one has a LINK
-        // branch ahead of the recGbl call, so the three answers are: keep the
-        // cache (listed on HOPR/LOPR), the link's limits, or the default arm.
-        if slots.graphic_double && !Self::graphic_explicit_field(rtype, field) {
-            let (upper, lower) = if link_backed.is_some() {
-                // `dbGetGraphicLimits` on the backing link. A CONSTANT link has
-                // no metadata getters and an unresolved one has nothing cached,
-                // so in both cases the `dbAccess.c:216` 0/0 seed stands.
-                link_meta
-                    .and_then(|m| m.graphic_limits)
-                    .map(|(lower, upper)| (upper, lower))
-                    .unwrap_or((0.0, 0.0))
-            } else {
-                match super::record_trait::graphic_default_arm(rtype) {
-                    super::record_trait::RsetDefaultArm::RecGblRange => {
-                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
-                    }
-                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
-                }
-            };
-            let d = snap.display.get_or_insert_with(Default::default);
-            d.upper_disp_limit = upper;
-            d.lower_disp_limit = lower;
-        }
-
-        // C `get_alarm_double`, BOTH arms. This branch owns the four limits
-        // outright: `slots.alarm_double` is exactly the condition under which
-        // `getProperties` assigns the four `valueAlarm.*Limit` leaves, so
-        // whenever the leaves are served this assigns them.
-        //
-        // The explicit arm used to be left to the record-level metadata cache
-        // (`populate_display_info`), whose `match rtype` covered only some of
-        // the types that supply the slot. A type it missed reached the wire
-        // with `snap.display == None` and the four leaves kept the NT's
-        // structural 0 — measured: DFANOUT.VAL, SEL.VAL and SUB.VAL served 0
-        // where C serves NaN. That made "which limits does VAL carry" depend on
-        // a match arm existing somewhere else, which is the dual meaning this
-        // single owner removes.
-        if slots.alarm_double {
-            let (hihi, high, low, lolo) = if Self::alarm_explicit_field(rtype, field) {
-                explicit_alarm
-            } else if link_backed.is_some() {
-                // `dbGetAlarmLimits` on the backing link; `dbAccess.c:294`'s
-                // four NaN stand when it supplies nothing.
-                link_meta
-                    .and_then(|m| m.alarm_limits)
-                    .map(|(lolo, low, high, hihi)| (hihi, high, low, lolo))
-                    .unwrap_or_else(crate::server::recgbl::rec_gbl_get_alarm_double)
-            } else {
-                crate::server::recgbl::rec_gbl_get_alarm_double()
-            };
-            // The four alarm limits live on DisplayInfo because that mirrors
-            // C's `dbr_gr_double` packing, which the CA encoder depends on.
-            // Minting it here is safe: every other DisplayInfo field defaults
-            // to the same value the `None` path already served.
-            let d = snap.display.get_or_insert_with(Default::default);
-            d.upper_alarm_limit = hihi;
-            d.upper_warning_limit = high;
-            d.lower_warning_limit = low;
-            d.lower_alarm_limit = lolo;
-        }
-    }
-
     /// The four limits C's `get_alarm_double` serves for the fields its rset
     /// lists — [`alarm_explicit_fields`](super::record_trait::alarm_explicit_fields).
     ///
@@ -11889,15 +12093,11 @@ impl RecordInstance {
     /// and `sel` no matter how its HIHI/HHSV were set, because those two types
     /// have no slot at all.
     fn explicit_alarm_limits(&self, rtype: &str) -> (f64, f64, f64, f64) {
-        let limit = |name: &str| {
-            self.resolve_field(name)
-                .and_then(|v| v.to_f64())
-                .unwrap_or(0.0)
-        };
+        let limit = |name: &str| self.metadata_limit(name);
         // The raw stored ordinal, NOT clamped to 0..=3: C tests `prec->hhsv`
         // for NONZERO, so an out-of-range severity still enables its limit.
         let severity = |name: &str| {
-            self.resolve_field(name)
+            self.metadata_field(name)
                 .and_then(|v| v.to_f64())
                 .unwrap_or(0.0) as i16
         };
@@ -12246,34 +12446,6 @@ impl RecordInstance {
             // behaves, not as it reads.
             _ => false,
         }
-    }
-
-    /// The field's type as the **dbd declares it**, which is the only type
-    /// `recGblGetPrec` / `getMaxRangeValues` ever see.
-    ///
-    /// C reads `pdbFldDes->field_type` (`recGbl.c:127`, `:151`, `:169`) — the
-    /// STATIC descriptor — so a `cvt_dbaddr` retype (the port's
-    /// `runtime_typed`, DBF_NOACCESS in the dbd) never reaches the switch and
-    /// the switch has no case for it. `None` reproduces that: no case, no
-    /// write.
-    fn static_field_type(&self, field: &str) -> Option<crate::types::DbFieldType> {
-        let desc = self.field_desc(field)?;
-        (!desc.runtime_typed).then_some(desc.dbf_type)
-    }
-
-    /// `recGblGetGraphicDouble` / `recGblGetControlDouble` for `field` — the
-    /// same `getMaxRangeValues` table both C entry points share
-    /// (`recGbl.c:146-171`). `None` where C's switch has no case (STRING,
-    /// MENU, DEVICE, NOACCESS, links), which writes nothing.
-    ///
-    /// `declared_dbf` is C's `pdbFldDes->field_type` verbatim. Deciding
-    /// menu-ness from `desc.menu` instead asked whether the field carries its
-    /// own inline choice list, which `SCAN` and `DTYP` do not — their choices
-    /// come from the scan table and the device registry — so both reported a
-    /// `DBF_USHORT` range of 65535/0 to `gft` where C reports 0/0.
-    fn rec_gbl_range_for(&self, field: &str) -> Option<(f64, f64)> {
-        let desc = self.field_desc(field)?;
-        crate::server::recgbl::rec_gbl_get_graphic_double(desc.declared_dbf)
     }
 
     /// Notify subscribers from a snapshot (call outside lock).
@@ -13199,6 +13371,8 @@ mod record_cell_layout_tests {
             load_order,
             bkpt,
             string_typed,
+            dbaddr_counts,
+            metadata,
         });
         packed_in_order(cell);
 
@@ -13587,7 +13761,7 @@ mod metadata_cache_tests {
         let inst = ai_instance();
 
         // Cache starts empty
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
+        assert!(inst.cold.metadata_cache.load().is_none());
 
         // First snapshot triggers populate + cache store
         let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -13598,7 +13772,7 @@ mod metadata_cache_tests {
         assert_eq!(display.lower_disp_limit, 0.0);
 
         // Cache is now populated
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
     }
 
     #[test]
@@ -13797,52 +13971,65 @@ mod metadata_cache_tests {
     }
 
     #[test]
-    fn invalidate_clears_cache() {
+    fn refresh_rebuilds_a_built_cache() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        let built = builds();
 
-        inst.invalidate_metadata_cache();
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
+        inst.refresh_metadata_cache();
+        assert_eq!(builds(), built + 1);
+        assert!(inst.cold.metadata_cache.load().is_some());
+    }
+
+    #[test]
+    fn refresh_leaves_an_unbuilt_cache_unbuilt() {
+        let inst = ai_instance();
+        let built = builds();
+        inst.refresh_metadata_cache();
+        assert_eq!(builds(), built);
+        assert!(inst.cold.metadata_cache.load().is_none());
     }
 
     #[test]
     fn notify_field_written_invalidates_for_metadata_field() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
 
-        // Writing a metadata field should invalidate
+        let built = builds();
+        // Writing a metadata field rebuilds it
         inst.notify_field_written("EGU");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
+        assert_eq!(builds(), built + 1);
     }
 
     #[test]
     fn notify_field_written_skips_non_metadata_field() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
 
-        // Writing a value field should NOT invalidate the cache
+        let built = builds();
+        // Writing a value field does NOT rebuild the cache
         inst.notify_field_written("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert_eq!(builds(), built);
 
         // DESC is not property-class either — its cache invalidation
         // is owned by the DESC arm of `put_common_field`, not by this
         // notify path (UI-106).
         inst.notify_field_written("DESC");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert_eq!(builds(), built);
     }
 
     #[test]
     fn notify_field_written_is_case_insensitive() {
         let inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
 
-        // Lowercase metadata field name should still trigger invalidation
+        let built = builds();
+        // Lowercase metadata field name still triggers the rebuild
         inst.notify_field_written("egu");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_none());
+        assert_eq!(builds(), built + 1);
     }
 
     /// epics-base faac1df1 — `notify_field_written_if_changed` must
@@ -13854,15 +14041,17 @@ mod metadata_cache_tests {
     fn notify_field_written_if_changed_skips_when_unchanged() {
         let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
 
         // Capture prev, do a no-op put, then notify — cache must remain.
+        let built = builds();
         let prev = inst.record.get_field("EGU");
         let _ = inst.record.put_field("EGU", prev.clone().unwrap());
         inst.notify_field_written_if_changed("EGU", prev.as_ref());
-        assert!(
-            inst.cold.metadata_cache.lock().unwrap().is_some(),
-            "no-op put must not invalidate the metadata cache"
+        assert_eq!(
+            builds(),
+            built,
+            "no-op put must not rebuild the metadata cache"
         );
     }
 
@@ -13871,16 +14060,18 @@ mod metadata_cache_tests {
     fn notify_field_written_if_changed_invalidates_on_real_change() {
         let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
 
         let prev = inst.record.get_field("EGU");
         let _ = inst
             .record
             .put_field("EGU", EpicsValue::String("kPa".into()));
         inst.notify_field_written_if_changed("EGU", prev.as_ref());
-        assert!(
-            inst.cold.metadata_cache.lock().unwrap().is_none(),
-            "real metadata change must invalidate cache"
+        let cached = inst.cold.metadata_cache.load_full().expect("still built");
+        assert_eq!(
+            cached.display.as_ref().unwrap().units,
+            "kPa",
+            "real metadata change must rebuild the cache"
         );
     }
 
@@ -13898,11 +14089,13 @@ mod metadata_cache_tests {
             snap.display.as_ref().unwrap().description.as_str_lossy(),
             "before"
         );
+        let built = builds();
         inst.put_common_field("DESC", EpicsValue::String("after".into()))
             .unwrap();
-        assert!(
-            inst.cold.metadata_cache.lock().unwrap().is_none(),
-            "a changed DESC must invalidate the metadata cache"
+        assert_eq!(
+            builds(),
+            built + 1,
+            "a changed DESC must rebuild the metadata cache"
         );
         let snap = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(
@@ -13919,12 +14112,13 @@ mod metadata_cache_tests {
         inst.put_common_field("DESC", EpicsValue::String("same".into()))
             .unwrap();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        let built = builds();
         inst.put_common_field("DESC", EpicsValue::String("same".into()))
             .unwrap();
-        assert!(
-            inst.cold.metadata_cache.lock().unwrap().is_some(),
-            "an unchanged DESC must not invalidate the metadata cache"
+        assert_eq!(
+            builds(),
+            built,
+            "an unchanged DESC must not rebuild the metadata cache"
         );
     }
 
@@ -13935,11 +14129,12 @@ mod metadata_cache_tests {
     fn notify_field_written_if_changed_skips_non_metadata_field() {
         let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
         // VAL is neither a cache source nor `prop(YES)` — must be skipped
         // even with a changed value.
+        let built = builds();
         inst.notify_field_written_if_changed("VAL", None);
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert_eq!(builds(), built);
     }
 
     #[test]
@@ -14778,15 +14973,17 @@ mod metadata_cache_tests {
         // Build the cache once with the original EGU
         let snap1 = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap1.display.unwrap().units, "V");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert!(inst.cold.metadata_cache.load().is_some());
 
         // Run process_local — the stub record sets took_change inside process()
         let _ = inst.process_local();
 
-        // Cache should now be invalidated (took_metadata_change returned true)
-        assert!(
-            inst.cold.metadata_cache.lock().unwrap().is_none(),
-            "process_local should invalidate cache when took_metadata_change is true"
+        // Rebuilt from the new EGU (took_metadata_change returned true)
+        let cached = inst.cold.metadata_cache.load_full().expect("still built");
+        assert_eq!(
+            cached.display.as_ref().unwrap().units,
+            "kV",
+            "process_local should rebuild the cache when took_metadata_change is true"
         );
 
         // Next snapshot picks up the new EGU
@@ -14831,15 +15028,13 @@ mod metadata_cache_tests {
         let mut inst = RecordInstance::new("STABLE", StableMetaRecord { val: 0.0 });
 
         let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        let built = builds();
 
         // Run process_local several times — cache should remain intact
         let _ = inst.process_local();
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
         let _ = inst.process_local();
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
         let _ = inst.process_local();
-        assert!(inst.cold.metadata_cache.lock().unwrap().is_some());
+        assert_eq!(builds(), built);
     }
 
     // ── Regression: DBE_PROPERTY event delivery boundaries ──────────────

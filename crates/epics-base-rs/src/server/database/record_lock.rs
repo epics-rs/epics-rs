@@ -527,6 +527,18 @@ impl LockRecord {
         self.acquire_fresh(me)
     }
 
+    /// [`Self::acquire`] without waiting: `None` while another thread holds
+    /// the set, or when a merge moved the record off the set just taken.
+    pub(crate) fn try_acquire(&self) -> Option<SetGuard> {
+        let set = self.set();
+        let me = thread_key();
+        if set.owner.load(Ordering::Acquire) == me {
+            return Some(set.reenter());
+        }
+        let guard = set.try_lock_fresh(me)?;
+        std::ptr::eq(self.set(), set).then_some(guard)
+    }
+
     /// The set was not held. The common case is a free mutex and a record
     /// that has not moved: one `try_lock`, the publication, one re-check of
     /// the cell, and none of the loop's saved registers.

@@ -1222,8 +1222,7 @@ impl ProcessPlan {
             restamps_time_after_completion: record.restamps_time_after_completion(),
             alarms_before_stamp: record.alarms_before_stamp(),
             stamps_before_alarms: !record.alarms_before_stamp()
-                && !record.restamps_time_after_completion()
-                && !record.cycle_hooks().stamps_at_own_reset(),
+                && !record.restamps_time_after_completion(),
             stamps_before_siml_read: output_stage && !record.stamps_after_write(),
             clears_udf: record.clears_udf(),
             soft_read_clears_udf: record.soft_read_clears_udf(),
@@ -2247,8 +2246,8 @@ pub(crate) struct ProcessPlan {
     pub(crate) restamps_time_after_completion: bool,
     pub(crate) alarms_before_stamp: bool,
     /// The cycle stamps before `checkAlarms`: neither `alarms_before_stamp`
-    /// nor `restamps_time_after_completion` nor `CycleHooks::stamps_at_own_reset`. One test where the cycle once
-    /// tested the latter alone.
+    /// nor `restamps_time_after_completion`. A pass whose stamp is withheld
+    /// holds `TselStamp::Withheld`, which stores nothing at either point.
     pub(crate) stamps_before_alarms: bool,
     /// An output whose `recGblGetTimeStampSimm(prec, prec->simm, NULL)` runs
     /// before `writeValue` reads SIML, so it sees the previous cycle's SIMM

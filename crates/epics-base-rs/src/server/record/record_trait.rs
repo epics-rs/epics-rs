@@ -2356,6 +2356,11 @@ impl CycleHooks {
     pub const OUTPUT_HOOKS: Self = Self(2048);
     /// [`Record::set_process_continuation`].
     pub const CONTINUATION: Self = Self(4096);
+    /// [`Record::take_time_stamp_request`]: outside [`Self::ALL`], declared by
+    /// a type whose C `process()` calls `recGblGetTimeStamp` only on some
+    /// passes (`mcaRecord.c:762`, `:811`). The cycle stamps such a pass only
+    /// when its `process()` asked, and reads no `TSEL` otherwise.
+    pub const STAMP_REQUEST: Self = Self(8192);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
@@ -2378,6 +2383,13 @@ impl CycleHooks {
     pub const fn stamps_at_own_reset(self) -> bool {
         self.0 & Self::OWN_STAMP != 0
     }
+
+    /// Whether the cycle's own stamp may be withheld: [`Self::STAMP_REQUEST`]
+    /// or the own-stamp bit of [`Self::HAND_POSTED_OWN_STAMP`].
+    #[inline(always)]
+    pub const fn withholds_cycle_stamp(self) -> bool {
+        self.0 & (Self::OWN_STAMP | Self::STAMP_REQUEST.0) != 0
+    }
 }
 
 // The stamp bit never stands without the drain that stamps.
@@ -2398,6 +2410,7 @@ const _: () = {
         CycleHooks::MONITOR_SETS.0,
         CycleHooks::OUTPUT_HOOKS.0,
         CycleHooks::CONTINUATION.0,
+        CycleHooks::STAMP_REQUEST.0,
     ];
     let mut seen = 0;
     let mut i = 0;
@@ -5717,6 +5730,16 @@ pub trait Record: Send + Sync + 'static {
     /// `valuePut` drains. Empty unless a `valuePut` ran since the last take.
     fn take_value_put_tail(&mut self) -> CycleMarks {
         CycleMarks::NONE
+    }
+
+    /// Whether the `process()` that just ran called C `recGblGetTimeStamp`,
+    /// asked once per pass at the pass's stamp point, so an answer of `true`
+    /// is cleared by the asking. Only a [`CycleHooks::STAMP_REQUEST`] type is
+    /// asked; its pass that answers `false` leaves TIME as it was. The stamp
+    /// lands after `process()` returns; the next pass sees it as
+    /// [`ProcessContext::time`].
+    fn take_time_stamp_request(&mut self) -> bool {
+        false
     }
 
     /// Whether this record type's support reads SIML through the `recGbl`

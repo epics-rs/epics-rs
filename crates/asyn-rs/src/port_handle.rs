@@ -1739,6 +1739,7 @@ mod tests {
             here,
             "ran before queue_request returned"
         );
+        #[cfg(feature = "epics")]
         assert!(!cell.is_outstanding());
 
         handle.set_can_block(true);

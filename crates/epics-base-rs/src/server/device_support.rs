@@ -1132,7 +1132,6 @@ pub fn init_device_support(instance: &mut RecordInstance) {
         };
         return;
     };
-    let name = instance.name.clone();
     dev.bind_database(instance.device_done.database());
     let status = match dev.init(&mut *instance.record) {
         Ok(DeviceInitOutcome::Ok(udf)) => {
@@ -1161,17 +1160,10 @@ pub fn init_device_support(instance: &mut RecordInstance) {
             instance.enter_pact();
             DsetInit::Failed
         }
-        Err(e) => {
-            eprintln!(
-                "device support init failed for record '{name}' (DTYP '{}'): {e}",
-                instance.common.dtyp
-            );
-            // Flag the record so the failure is observable rather
-            // than presenting a healthy-looking record.
-            instance.common.sevr = AlarmSeverity::Invalid;
-            instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
-            DsetInit::Failed
-        }
+        // iocInit.c:570 discards init_record's status: the dset printed its
+        // own line, and what the failure means to the record is
+        // `DsetInit::Failed`, not an alarm.
+        Err(_) => DsetInit::Failed,
     };
     instance.dset_init = if !dev.has_init_record() {
         DsetInit::Absent
@@ -1194,7 +1186,7 @@ fn apply_init_udf(instance: &mut RecordInstance, udf: DeviceUdf) {
 mod tests {
     use super::*;
     use crate::error::CaError;
-    use crate::server::record::{AlarmSeverity, Record, RecordInstance, ScanType};
+    use crate::server::record::{Record, RecordInstance, ScanType};
     use crate::server::records::ai::AiRecord;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1322,35 +1314,19 @@ mod tests {
         );
     }
 
-    /// M2 regression: a device support whose `init()` returns `Err`
-    /// must NOT be attached as a healthy record — the record is
-    /// flagged INVALID severity with a SOFT status. (Pre-fix the
-    /// IocBuilder path discarded the error with `let _ =`.)
+    /// iocInit.c:570 discards init_record's status: a failed dset init raises
+    /// no alarm (the dset printed its own line), and the record learns of it
+    /// only through `DsetInit::Failed`.
     #[test]
-    fn wire_device_init_failure_flags_record_invalid() {
-        let mut instance = RecordInstance::new("TEST:AI", AiRecord::new(0.0));
-        instance.common.dtyp = "ProbeDev".into();
-        let obs = Arc::new(Mutex::new(WireObservation::default()));
-        let dev = Box::new(ProbeDev {
-            obs: obs.clone(),
-            info: HashMap::new(),
-            record_info_set: false,
-            verdict: InitVerdict::Fail,
-        });
+    fn wire_device_init_failure_raises_no_alarm_and_marks_the_dset_failed() {
+        let failed = wire(InitVerdict::Fail);
+        let live = wire(InitVerdict::Live);
 
-        wire_device_to_record(&mut instance, dev);
-
-        assert_eq!(
-            instance.common.sevr,
-            AlarmSeverity::Invalid,
-            "failed device init must flag the record INVALID"
-        );
-        assert_eq!(
-            instance.common.stat,
-            crate::server::recgbl::alarm_status::SOFT_ALARM,
-        );
+        assert_eq!(failed.common.sevr, live.common.sevr);
+        assert_eq!(failed.common.stat, live.common.stat);
+        assert_eq!(failed.dset_init, DsetInit::Failed);
         assert!(
-            instance.device.is_some(),
+            failed.device.is_some(),
             "device is still attached so the record is addressable"
         );
     }

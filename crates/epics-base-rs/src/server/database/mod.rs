@@ -175,6 +175,11 @@ mod tsel_stamp {
         /// value and the stamp raises `setLinkAlarm`, at the stamp point
         /// because that is where C's read is.
         Failed,
+        /// This pass calls no `recGblGetTimeStamp`: a
+        /// [`CycleHooks::withholds_cycle_stamp`](crate::server::record::CycleHooks::withholds_cycle_stamp)
+        /// type whose pass did not ask. `TSEL` was not read and nothing is
+        /// stored.
+        Withheld,
     }
 
     impl TselStamp {
@@ -216,6 +221,7 @@ mod tsel_stamp {
                     // never declared, and overwrote one that did.
                     return;
                 }
+                TselStamp::Withheld => return,
                 TselStamp::None => {}
                 TselStamp::Tse(tse) => common.set_tse(tse),
                 TselStamp::Failed => {

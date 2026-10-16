@@ -4191,6 +4191,9 @@ impl PvDatabase {
         rec: InFrame<'_>,
         siol: &crate::server::record::ParsedLink,
     ) -> (super::TselStamp, SiolStamp) {
+        if Self::cycle_stamp_withheld_in(rec) {
+            return (super::TselStamp::Withheld, SiolStamp::Keep);
+        }
         let (link, own_tse) = {
             let instance = rec.read();
             (Self::tsel_link(&instance), instance.common.tse())
@@ -4203,6 +4206,7 @@ impl PvDatabase {
             super::TselStamp::Time(..) => return (tsel, SiolStamp::Keep),
             super::TselStamp::Tse(tse) => tse,
             super::TselStamp::None | super::TselStamp::Failed => own_tse,
+            super::TselStamp::Withheld => unreachable!("returned above"),
         };
         if tse != crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
             return (tsel, SiolStamp::Keep);
@@ -4271,6 +4275,41 @@ impl PvDatabase {
             None => super::TselStamp::None,
             Some(link) => self.read_tsel_link(rec, link),
         }
+    }
+
+    /// [`Self::read_tsel`] for the cycle's own stamp point: the one read that
+    /// hands a pass with no `recGblGetTimeStamp` its
+    /// [`TselStamp::Withheld`](super::TselStamp::Withheld), so no stamp site
+    /// of the cycle stores TIME for it.
+    #[inline(always)]
+    fn cycle_tsel(&self, rec: InFrame<'_>) -> super::TselStamp {
+        if Self::cycle_stamp_withheld_in(rec) {
+            return super::TselStamp::Withheld;
+        }
+        self.read_tsel(rec)
+    }
+
+    /// [`Self::cycle_stamp_withheld`] for a caller holding no data guard: the
+    /// plan answers for every type that never withholds, without the lock.
+    #[inline(always)]
+    fn cycle_stamp_withheld_in(rec: InFrame<'_>) -> bool {
+        rec.process_plan().hooks.withholds_cycle_stamp()
+            && Self::cycle_stamp_withheld(&mut rec.write())
+    }
+
+    /// Whether this pass's cycle stamp is withheld: always for an own-stamp
+    /// type, and for a [`CycleHooks::STAMP_REQUEST`] type unless the pass's
+    /// `process()` asked — which the asking consumes.
+    #[inline(always)]
+    fn cycle_stamp_withheld(instance: &mut RecordInstance) -> bool {
+        instance.cycle_hooks().withholds_cycle_stamp() && !Self::stamp_requested(instance)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn stamp_requested(instance: &mut RecordInstance) -> bool {
+        instance.cycle_hooks().has(CycleHooks::STAMP_REQUEST)
+            && instance.record.take_time_stamp_request()
     }
 
     /// The TSEL link this cycle has to read — `None` for a constant TSEL,
@@ -5658,7 +5697,7 @@ impl PvDatabase {
                     // `monitor()` and `recGblFwdLink()` regardless of the -1.
                     let (tsel, siol_stamp) = match &siol {
                         Some(siol) => self.read_sim_stamp(rec, siol),
-                        None => (self.read_tsel(rec), SiolStamp::Keep),
+                        None => (self.cycle_tsel(rec), SiolStamp::Keep),
                     };
                     {
                         let mut instance = rec.write();
@@ -6399,7 +6438,15 @@ impl PvDatabase {
                 {
                     crate::server::recgbl::rec_gbl_set_sevr(&mut guard.hold().common, stat, sevr);
                 }
+                // A pass that returns early still stamps when its `process()`
+                // asked: `mcaRecord.c:762` stamps ahead of the `return(0)` that
+                // waits for the data callback.
+                let stamps = rec.process_plan().hooks.has(CycleHooks::STAMP_REQUEST)
+                    && Self::stamp_requested(guard.hold());
                 guard.release();
+                if stamps {
+                    self.rec_gbl_get_time_stamp_in(rec);
+                }
 
                 // `ReprocessAfter` for a delayed re-entry, and the record's own
                 // `dbPutLink`s made inside `process()`.
@@ -6450,7 +6497,7 @@ impl PvDatabase {
                 // snapshot. The data guard is released before the link-write /
                 // notify awaits below (parking_lot guards are `!Send`).
                 guard.release();
-                let tsel = self.read_tsel(rec);
+                let tsel = self.cycle_tsel(rec);
                 let snapshot = {
                     let mut instance = rec.write();
                     if !is_soft {
@@ -6567,11 +6614,15 @@ impl PvDatabase {
             // `fetch_values` / `readValue`, both already done — that C lets move
             // the TSEL source before this read, so reading it here and storing
             // it at the stamp point is C's order with the lock split out.
-            let tsel = match Self::tsel_link(guard.hold()) {
-                None => super::TselStamp::None,
-                Some(link) => {
-                    guard.release();
-                    self.read_tsel_link(rec, link)
+            let tsel = if Self::cycle_stamp_withheld(guard.hold()) {
+                super::TselStamp::Withheld
+            } else {
+                match Self::tsel_link(guard.hold()) {
+                    None => super::TselStamp::None,
+                    Some(link) => {
+                        guard.release();
+                        self.read_tsel_link(rec, link)
+                    }
                 }
             };
 
@@ -8471,7 +8522,7 @@ impl PvDatabase {
 
         // This pass IS C's `process()` re-entry, so it runs the whole
         // `recGblGetTimeStampSimm` again — TSEL read included, before the guard.
-        let tsel = self.read_tsel(rec);
+        let tsel = self.cycle_tsel(rec);
 
         let (flnk_name, pact_exit) = {
             // Phase 1 — first write guard, confined to this scope so the

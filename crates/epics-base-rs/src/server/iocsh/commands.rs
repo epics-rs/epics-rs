@@ -7964,19 +7964,34 @@ mod tests {
             field: "INP",
             install: crate::server::database::LinkInstall::Detached,
         };
-        db.write_external_pv(inp.clone(), b"UP:PV", EpicsValue::Double(1.0), None)
-            .unwrap();
+        db.write_external_pv(
+            inp.clone(),
+            b"UP:PV",
+            EpicsValue::Double(1.0),
+            crate::server::database::ExternalDone::None,
+        )
+        .unwrap();
         entered.recv().expect("the first write reached the lset");
         // Staged behind an in-flight write: restaged, nothing displaced.
-        db.write_external_pv(inp.clone(), b"UP:PV", EpicsValue::Double(2.0), None)
-            .unwrap();
+        db.write_external_pv(
+            inp.clone(),
+            b"UP:PV",
+            EpicsValue::Double(2.0),
+            crate::server::database::ExternalDone::None,
+        )
+        .unwrap();
         assert_eq!(
             db.external_link_puts_coalesced_for("L:UP", "INP", "UP:PV"),
             0
         );
         // Now one IS displaced.
-        db.write_external_pv(inp.clone(), b"UP:PV", EpicsValue::Double(3.0), None)
-            .unwrap();
+        db.write_external_pv(
+            inp.clone(),
+            b"UP:PV",
+            EpicsValue::Double(3.0),
+            crate::server::database::ExternalDone::None,
+        )
+        .unwrap();
         assert_eq!(
             db.external_link_puts_coalesced_for("L:UP", "INP", "UP:PV"),
             1

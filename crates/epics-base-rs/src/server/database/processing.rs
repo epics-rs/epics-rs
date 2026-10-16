@@ -409,6 +409,16 @@ impl DeviceDone {
         *self.0.body().outcome.lock().unwrap() = Some(Completion::Read);
         crate::runtime::task::request_cell(priority, &self.0)
     }
+
+    /// [`Self::reprocess`] at the record's band for the re-entry `epoch`
+    /// names, for a completion that minted its own [`AsyncToken`].
+    pub(crate) fn reprocess_at(
+        &self,
+        epoch: u64,
+    ) -> Result<(), crate::runtime::background::CallbackError> {
+        self.0.body().epoch.store(epoch, Ordering::Release);
+        self.reprocess(self.priority())
+    }
 }
 
 /// Which pass a [`DeviceDone`] request runs.
@@ -3688,13 +3698,19 @@ impl PvDatabase {
                     time,
                 })
             });
+            // `doneCallback`: `callbackRequestProcessCallback(&cb, prec->prio,
+            // prec)` (`devAiSoftCallback.c:70-75`), at the band PRIO names now.
             if let Some(rec) = db.get_record(token.record_name()) {
-                let mut instance = rec.write();
-                if token.is_current() {
+                let done = {
+                    let mut instance = rec.write();
+                    if !token.is_current() {
+                        return;
+                    }
                     instance.dpvt.set_notified_read(read);
-                }
+                    instance.device_done.clone()
+                };
+                let _ = done.reprocess_at(token.epoch);
             }
-            let _ = token.fire(&db).await;
         });
     }
 
@@ -7042,8 +7058,39 @@ impl PvDatabase {
                                 // write without disturbing alarms / monitors.
                                 None
                             } else if instance.parsed_out.is_writable_out_link() {
-                                // Built only for an OUT link that will take it.
-                                super::PutSrc::of_output(rec, instance, true)
+                                if instance.common.dtyp.soft()
+                                    == Some(crate::server::device_support::SoftDtyp::Async)
+                                {
+                                    // C `devAoSoftCallback.c:44-54`: nothing on a
+                                    // PACT pass; else `dbPutLinkAsync`, and
+                                    // `dbPutLink` on `S_db_noLSET`.
+                                    use super::links::AsyncPutStatus;
+                                    match if is_continuation {
+                                        AsyncPutStatus::Done
+                                    } else {
+                                        self.put_out_async(rec, instance)
+                                    } {
+                                        AsyncPutStatus::Taken => {
+                                            // `pact = TRUE`, and `process()`
+                                            // returns before `monitor()`; the
+                                            // put's callback completes the
+                                            // record (`dbCaCallbackProcess`).
+                                            if plan.redecides_after_output {
+                                                instance.record.after_output_decision();
+                                            }
+                                            instance.enter_pact();
+                                            cycle_end.hand_off_to_async_completion();
+                                            return Ok(());
+                                        }
+                                        AsyncPutStatus::Done => None,
+                                        AsyncPutStatus::NoLset => {
+                                            super::PutSrc::of_output(rec, instance, true)
+                                        }
+                                    }
+                                } else {
+                                    // Built only for an OUT link that will take it.
+                                    super::PutSrc::of_output(rec, instance, true)
+                                }
                             } else {
                                 None
                             }
@@ -8510,7 +8557,11 @@ impl PvDatabase {
                 // synchronous OUT stage (`RecordInstance::soft_output_value`).
                 let soft_out = instance.has_soft_output();
                 let record_should_output = instance.should_output();
-                let out_value = if skip_out {
+                // A `devXxxSoftCallback` write on a PACT pass returns 0 and
+                // puts nothing (`devAoSoftCallback.c:44-45`).
+                let soft_callback = instance.common.dtyp.soft()
+                    == Some(crate::server::device_support::SoftDtyp::Async);
+                let out_value = if skip_out || soft_callback {
                     None
                 } else if !can_dev_write {
                     // Non-output records (calcout, etc.) with soft OUT link

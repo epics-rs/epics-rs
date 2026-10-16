@@ -1685,6 +1685,17 @@ impl<'a> PutSrc<'a> {
 
     /// The characters of a [`PutSrc::LongStr`].
     #[inline(always)]
+    /// [`Self::of_output`] for a caller under the source record's guard,
+    /// which a [`PutSrc::Field`] would take again: always an owned value.
+    pub(crate) fn of_output_held(inst: &RecordInstance, soft: bool) -> Option<PutSrc<'static>> {
+        use crate::server::record::OutView;
+        let chars = matches!(output_view_of(inst, soft), Some(OutView::Chars(_)));
+        Some(match output_value_of(inst, soft)? {
+            EpicsValue::CharArray(c) if chars => PutSrc::LongStr(c),
+            v => PutSrc::Owned(v),
+        })
+    }
+
     pub(crate) fn long_string(&self) -> Option<&crate::types::SharedArray<u8>> {
         match self {
             PutSrc::LongStr(c) => Some(c),

@@ -159,25 +159,56 @@ pub(crate) struct LinkKey {
 /// `PutCompletion` cannot be lost: `Drop` resolves it. That is strictly
 /// stronger than C and is what makes "no pending put loses its
 /// classification silently" hold by construction rather than by review.
-struct PutCompletion(Option<tokio::sync::oneshot::Sender<Result<(), String>>>);
+enum PutCompletion {
+    /// A put-notify chain's callback: the oneshot the chain awaits.
+    Notify(Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
+    /// C `dbCaCallbackProcess` → `dbLinkAsyncComplete` (`dbCa.c:317-322`,
+    /// `dbLink.c`): the `devXxxSoftCallback` record's completing pass, which
+    /// takes no status.
+    Record(Option<super::DeviceDone>),
+}
 
 impl PutCompletion {
     /// Resolve with the outcome the owner (or a superseding put) determined.
     fn resolve(mut self, result: Result<(), String>) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(result);
+        self.finish(result);
+    }
+
+    fn finish(&mut self, result: Result<(), String>) {
+        match self {
+            Self::Notify(tx) => {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(result);
+                }
+            }
+            Self::Record(done) => {
+                if let Some(done) = done.take() {
+                    let _ = done.complete(done.priority(), Ok(()));
+                }
+            }
         }
     }
 }
 
 impl Drop for PutCompletion {
     fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(Err(
-                "external link put dropped before completion (link queue torn down)".to_string(),
-            ));
-        }
+        self.finish(Err(
+            "external link put dropped before completion (link queue torn down)".to_string(),
+        ));
     }
+}
+
+/// Who a staged put reports its completion to.
+#[derive(Clone, Copy)]
+pub(crate) enum PutWaiter<'a> {
+    /// C `dbCaPutLink`: nobody.
+    None,
+    /// A put-notify chain's `dbCaPutLinkCallback`: the receiver
+    /// [`LinkPutQueue::stage_put`] returns.
+    Notify,
+    /// C `dbPutLinkAsync` from a `devXxxSoftCallback` (`dbCaPutAsync`,
+    /// `dbCa.c:537-542`): the record's own completion.
+    Record(&'a super::DeviceDone),
 }
 
 /// One link's pending value — `pca->pputNative` plus the `putType` /
@@ -335,22 +366,32 @@ impl LinkPutQueue {
     }
 
     /// Stage `value` on `key`, coalescing latest-wins onto any pending value
-    /// (C `dbCa.c:582-583`). Returns the completion receiver for an
-    /// [`LinkPutOp::Async`] put — the caller awaits it, which is the
-    /// `dbCaPutLinkCallback` route; [`LinkPutOp::Plain`] gets `None` and the
-    /// caller returns immediately, which is `dbCaPutLink`.
+    /// (C `dbCa.c:582-583`). Returns the completion receiver for a
+    /// [`PutWaiter::Notify`] put — the caller awaits it, which is the
+    /// `dbCaPutLinkCallback` route; [`PutWaiter::None`] gets `None` and the
+    /// caller returns immediately, which is `dbCaPutLink`. A
+    /// [`PutWaiter::Record`] put completes its record and returns `None`.
     pub(crate) fn stage_put(
         &self,
         key: LinkKey,
         value: EpicsValue,
-        op: LinkPutOp,
+        waiter: PutWaiter<'_>,
     ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
-        let (completion, rx) = match op {
-            LinkPutOp::Plain => (None, None),
-            LinkPutOp::Async => {
+        let (op, completion, rx) = match waiter {
+            PutWaiter::None => (LinkPutOp::Plain, None, None),
+            PutWaiter::Notify => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                (Some(PutCompletion(Some(tx))), Some(rx))
+                (
+                    LinkPutOp::Async,
+                    Some(PutCompletion::Notify(Some(tx))),
+                    Some(rx),
+                )
             }
+            PutWaiter::Record(done) => (
+                LinkPutOp::Async,
+                Some(PutCompletion::Record(Some(done.clone()))),
+                None,
+            ),
         };
         let staged = StagedPut {
             value,
@@ -878,11 +919,11 @@ mod tests {
     fn second_put_on_same_link_coalesces_latest_wins() {
         let q = LinkPutQueue::default();
         assert!(
-            q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain)
+            q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None)
                 .is_none()
         );
         assert!(
-            q.stage_put(key("A"), EpicsValue::Long(2), LinkPutOp::Plain)
+            q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None)
                 .is_none()
         );
 
@@ -904,9 +945,9 @@ mod tests {
     fn the_coalesce_count_is_attributed_per_link() {
         let q = LinkPutQueue::default();
         for v in [1, 2, 3] {
-            q.stage_put(key("A"), EpicsValue::Long(v), LinkPutOp::Plain);
+            q.stage_put(key("A"), EpicsValue::Long(v), PutWaiter::None);
         }
-        q.stage_put(key("B"), EpicsValue::Long(9), LinkPutOp::Plain);
+        q.stage_put(key("B"), EpicsValue::Long(9), PutWaiter::None);
 
         assert_eq!(coalesced(&q, &key("A")), 2);
         assert_eq!(coalesced(&q, &key("B")), 0);
@@ -928,8 +969,8 @@ mod tests {
             },
             ..key("A")
         };
-        q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
-        q.stage_put(other.clone(), EpicsValue::Long(2), LinkPutOp::Plain);
+        q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
+        q.stage_put(other.clone(), EpicsValue::Long(2), PutWaiter::None);
 
         assert_eq!(q.coalesced_count(), 0);
         let (k1, s1) = q.take_ready().expect("first link ready");
@@ -944,8 +985,8 @@ mod tests {
     #[test]
     fn the_coalesce_count_outlives_the_links_pending_state() {
         let q = LinkPutQueue::default();
-        q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
-        q.stage_put(key("A"), EpicsValue::Long(2), LinkPutOp::Plain);
+        q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
+        q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(coalesced(&q, &key("A")), 1);
         let (k, _staged) = q.take_ready().expect("ready");
         q.finish(k);
@@ -958,8 +999,8 @@ mod tests {
     #[test]
     fn distinct_links_keep_their_own_pending_value() {
         let q = LinkPutQueue::default();
-        q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
-        q.stage_put(key("B"), EpicsValue::Long(2), LinkPutOp::Plain);
+        q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
+        q.stage_put(key("B"), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(q.coalesced_count(), 0);
         assert_eq!(q.take_ready().expect("A first").0, key("A"));
         assert_eq!(q.take_ready().expect("B second").0, key("B"));
@@ -973,12 +1014,12 @@ mod tests {
     #[test]
     fn put_staged_during_flight_is_requeued_on_finish() {
         let q = LinkPutQueue::default();
-        q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
+        q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
         let (k, first) = q.take_ready().expect("ready");
         assert_eq!(first.value, EpicsValue::Long(1));
         assert!(q.take_ready().is_none(), "in flight, nothing ready");
 
-        q.stage_put(key("A"), EpicsValue::Long(9), LinkPutOp::Plain);
+        q.stage_put(key("A"), EpicsValue::Long(9), PutWaiter::None);
         assert!(
             q.take_ready().is_none(),
             "still in flight — at most one write per link keeps write order"
@@ -997,9 +1038,9 @@ mod tests {
     fn superseded_completion_is_resolved_not_dropped() {
         let q = LinkPutQueue::default();
         let rx = q
-            .stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Async)
+            .stage_put(key("A"), EpicsValue::Long(1), PutWaiter::Notify)
             .expect("Async put yields a completion");
-        q.stage_put(key("A"), EpicsValue::Long(2), LinkPutOp::Async);
+        q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::Notify);
 
         assert!(
             resolved(rx).unwrap_err().contains("superseded"),
@@ -1014,7 +1055,7 @@ mod tests {
     fn teardown_resolves_pending_completions() {
         let q = LinkPutQueue::default();
         let rx = q
-            .stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Async)
+            .stage_put(key("A"), EpicsValue::Long(1), PutWaiter::Notify)
             .expect("Async put yields a completion");
         drop(q);
         assert!(
@@ -1031,7 +1072,7 @@ mod tests {
     fn plain_put_has_no_completion() {
         let q = LinkPutQueue::default();
         assert!(
-            q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain)
+            q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None)
                 .is_none()
         );
     }
@@ -1042,7 +1083,7 @@ mod tests {
     fn idle_tracks_staged_and_in_flight() {
         let q = LinkPutQueue::default();
         assert!(q.is_idle());
-        q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
+        q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
         assert!(!q.is_idle(), "staged but not run");
         let (k, _) = q.take_ready().expect("ready");
         assert!(!q.is_idle(), "in flight");
@@ -1062,9 +1103,9 @@ mod tests {
         let q = LinkPutQueue::default();
         let old = Arc::new(crate::server::record::ParsedLink::None);
         let rx = q
-            .stage_put(key_on("A", &old), EpicsValue::Long(1), LinkPutOp::Async)
+            .stage_put(key_on("A", &old), EpicsValue::Long(1), PutWaiter::Notify)
             .expect("Async put yields a completion");
-        q.stage_put(key_on("A", &old), EpicsValue::Long(2), LinkPutOp::Plain);
+        q.stage_put(key_on("A", &old), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(coalesced(&q, &key_on("A", &old)), 1);
         let new = Arc::new(crate::server::record::ParsedLink::None);
         drop(old);
@@ -1075,7 +1116,7 @@ mod tests {
         assert_eq!(coalesced(&q, &key_on("A", &new)), 0, "a new caLink");
         assert_eq!(q.coalesced_count(), 0);
 
-        q.stage_put(key_on("A", &new), EpicsValue::Long(3), LinkPutOp::Plain);
+        q.stage_put(key_on("A", &new), EpicsValue::Long(3), PutWaiter::None);
         let (_, staged) = q.take_ready().expect("the new link's value is sent");
         assert_eq!(staged.value, EpicsValue::Long(3));
     }
@@ -1087,11 +1128,11 @@ mod tests {
     fn a_relink_drops_the_value_restaged_behind_a_write_in_flight() {
         let q = LinkPutQueue::default();
         let old = Arc::new(crate::server::record::ParsedLink::None);
-        q.stage_put(key_on("A", &old), EpicsValue::Long(1), LinkPutOp::Plain);
+        q.stage_put(key_on("A", &old), EpicsValue::Long(1), PutWaiter::None);
         let (k, first) = q.take_ready().expect("ready");
         assert_eq!(first.value, EpicsValue::Long(1));
         let rx = q
-            .stage_put(key_on("A", &old), EpicsValue::Long(2), LinkPutOp::Async)
+            .stage_put(key_on("A", &old), EpicsValue::Long(2), PutWaiter::Notify)
             .expect("Async put yields a completion");
         drop(old);
 

@@ -29,6 +29,8 @@ pub use link_set::{
     LinkHolder, LinkMetadata, LinkOpen, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
     RemoteAlarm,
 };
+#[cfg(test)]
+pub(crate) use links::ExternalDone;
 pub(crate) use links::{
     LinkAlarm, ProcessTargetGate, inherit_sevr_msg, multi_out_rows, multi_output_dispatch_owned,
     posts_software_event, reads_sell, resolves_subroutine_from_link,

@@ -11,7 +11,7 @@ use super::filters::ChannelName;
 use super::link_set::LinkDbfType;
 use super::processing::ProcStack;
 use super::record_lock::InFrame;
-use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
+use super::{PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
 
 /// The `record[.FIELD]` name a link target is addressed by in the local
 /// database — the name with the channel filter already removed.
@@ -435,7 +435,36 @@ pub(crate) struct OutLinkSrc<'a> {
     pub field: &'static str,
 }
 
+/// What [`PvDatabase::put_out_async`] did with the write.
+pub(crate) enum AsyncPutStatus {
+    /// `putAsync` took it: the record is PACT until the put completes.
+    Taken,
+    /// Nothing more to do this cycle: no value, or a refused put, alarmed.
+    Done,
+    /// `S_db_noLSET`: the write goes through `dbPutLink` as a plain one.
+    NoLset,
+}
+
+/// Who an external put reports its completion to.
+#[derive(Clone, Copy)]
+pub(crate) enum ExternalDone<'a> {
+    /// C `dbCaPutLink`.
+    None,
+    /// The put-notify chain the source record is in: `dbCaPutLinkCallback`.
+    Notify(&'a Arc<NotifyWaitSet>),
+    /// `dbCaPutAsync`, whose callback completes the record.
+    Record(&'a super::DeviceDone),
+}
+
 impl OutLinkSrc<'_> {
+    /// The completion this put's external staging reports to.
+    fn external_done(&self) -> ExternalDone<'_> {
+        match self.notify {
+            Some(notify) => ExternalDone::Notify(notify),
+            None => ExternalDone::None,
+        }
+    }
+
     /// The link this put leaves through, which keys its external staging.
     /// Built only on the external arm, so a DB write pays nothing for it.
     fn link_id(&self, src_rec: Option<InFrame<'_>>) -> super::LinkId {
@@ -3011,7 +3040,7 @@ impl PvDatabase {
                     src_out.link_id(frame),
                     external,
                     value,
-                    src_out.notify,
+                    src_out.external_done(),
                 ) {
                     Ok(()) => false,
                     Err(refusal) => {
@@ -3381,20 +3410,18 @@ impl PvDatabase {
     ///   Nothing is awaited here — the record's advisory write gate is
     ///   released at the end of this cycle exactly as it is for a plain put.
     ///
-    /// `src_notify` is the source record's put-completion wait-set. Its
-    /// presence is what selects [`LinkPutOp::Async`] over
-    /// [`LinkPutOp::Plain`] — see [`Self::external_put_op`], the single
-    /// owner of that mapping — and it is also the thing the completion is
-    /// reported through, so the two cannot disagree.
+    /// `done` names who the completion is reported to, and so selects the
+    /// flavour: [`ExternalDone::None`] is the plain put; a put-notify chain
+    /// and a `devXxxSoftCallback` record ([`ExternalDone::Record`], whose
+    /// completing pass `dbCaCallbackProcess` runs) take the completion one.
     pub(crate) fn write_external_pv(
         &self,
         link: super::LinkId,
         name: &[u8],
         value: EpicsValue,
-        src_notify: Option<&Arc<NotifyWaitSet>>,
+        done: ExternalDone<'_>,
     ) -> Result<(), ExternalPutRefusal> {
-        let op = Self::external_put_op(src_notify);
-        use super::link_put_queue::{Channel, LinkKey};
+        use super::link_put_queue::{Channel, LinkKey, PutWaiter};
 
         let (scheme, body) = self.external_put_gate(name)?;
 
@@ -3408,8 +3435,14 @@ impl PvDatabase {
                 name: body.into(),
             },
         };
-        match self.inner.link_puts.stage_put(key, value, op) {
-            // `dbCaPutLink`: staged, signalled, returned (`dbCa.c:593-595`).
+        let waiter = match done {
+            ExternalDone::None => PutWaiter::None,
+            ExternalDone::Notify(_) => PutWaiter::Notify,
+            ExternalDone::Record(done) => PutWaiter::Record(done),
+        };
+        match self.inner.link_puts.stage_put(key, value, waiter) {
+            // `dbCaPutLink`: staged, signalled, returned (`dbCa.c:593-595`);
+            // `dbCaPutAsync` the same, with the record's callback stored.
             None => Ok(()),
             // `dbCaPutLinkCallback`: the completion route. C stores the
             // callback and returns (`dbCa.c:585-595`); `putComplete`
@@ -3427,7 +3460,7 @@ impl PvDatabase {
             // (`dbCa.c:1175-1179`), and `dbPutLink`'s `setLinkAlarm` gate
             // therefore alarms on refusal to stage (`dbLink.c:434-448`).
             Some(rx) => {
-                if let Some(waitset) = src_notify {
+                if let ExternalDone::Notify(waitset) = done {
                     let waitset = waitset.clone();
                     waitset.enter();
                     // C pins every put-notify callback to the low band —
@@ -3487,26 +3520,12 @@ impl PvDatabase {
         match target {
             ExternalForward::Ca { pv, fwd } => {
                 if fwd {
-                    let _ = self.write_external_pv(link, pv, EpicsValue::Short(1), None);
+                    let _ =
+                        self.write_external_pv(link, pv, EpicsValue::Short(1), ExternalDone::None);
                 }
                 Ok(())
             }
             ExternalForward::Pva(slot) => slot.scan_forward(),
-        }
-    }
-
-    /// Map a record's put-completion wait-set to the external-link put
-    /// op. A write that originates inside a put-notify / blocking-put
-    /// chain (the source record carries a completion wait-set) is
-    /// delivered as [`LinkPutOp::Async`] (the pvxs `pvaPutValueAsync` /
-    /// C `dbPutLinkAsync` path); a plain record-processing OUT write is
-    /// [`LinkPutOp::Plain`]. Single owner of the notify→op mapping so
-    /// the external-OUT dispatch sites cannot diverge.
-    fn external_put_op(src_notify: Option<&Arc<NotifyWaitSet>>) -> LinkPutOp {
-        if src_notify.is_some() {
-            LinkPutOp::Async
-        } else {
-            LinkPutOp::Plain
         }
     }
 
@@ -3849,7 +3868,7 @@ impl PvDatabase {
                             src.link_id(Some(src_rec)),
                             name,
                             value,
-                            src.notify,
+                            src.external_done(),
                         ) {
                             Ok(()) => Ok(()),
                             // `dbCaPutLinkCallback`'s and pvalink's `-1`.
@@ -3905,6 +3924,54 @@ impl PvDatabase {
             set_out_link_alarm(src_rec, src.field);
         }
         status
+    }
+
+    /// C `dbPutLinkAsync` (`dbLink.c:462-474`) of a `devXxxSoftCallback`
+    /// write, under the record's guard. Only a CA link has a `putAsync` — a
+    /// `ca://`/`pva://` link, or a DB link whose target is not here — and it
+    /// only stages the put, so no other record is locked. Any other link
+    /// answers `S_db_noLSET` for the caller's `dbPutLink`. A refused
+    /// `putAsync` alarms as `dbPutLinkAsync` does (`:469-471`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn put_out_async(
+        &self,
+        rec: InFrame<'_>,
+        instance: &mut crate::server::record::RecordInstance,
+    ) -> AsyncPutStatus {
+        use crate::server::record::{DbLinkAnswer, ParsedLink};
+        let link = Arc::clone(instance.parsed_out.shared());
+        let name = match &*link {
+            ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => {
+                link.external_pv_name()
+            }
+            ParsedLink::Db(db) if matches!(self.db_link_answer(db), DbLinkAnswer::External) => {
+                Some(db.pvname().as_bytes())
+            }
+            _ => None,
+        };
+        let Some(name) = name else {
+            return AsyncPutStatus::NoLset;
+        };
+        let value = super::field_io::PutSrc::of_output_held(instance, true)
+            .and_then(|src| self.external_put_value(name, src));
+        let Some(value) = value else {
+            return AsyncPutStatus::Done;
+        };
+        let done = instance.device_done.clone();
+        let link_id = super::LinkId {
+            rec: rec.unframed().index(),
+            field: "OUT",
+            install: super::LinkInstall::of_field(instance, "OUT"),
+        };
+        match self.write_external_pv(link_id, name, value, ExternalDone::Record(&done)) {
+            Ok(()) => AsyncPutStatus::Taken,
+            Err(refusal) => {
+                refusal.report(name);
+                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "OUT");
+                AsyncPutStatus::Done
+            }
+        }
     }
 
     /// [`Self::write_out_link_value`] for the write a frame captured.

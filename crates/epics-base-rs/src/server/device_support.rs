@@ -28,8 +28,9 @@ pub enum SoftDtyp {
     /// DBR_DOUBLE, &oval, 1)` with a synchronous `dbPutLink` fallback when the
     /// link has no LSET (`devAoSoftCallback.c:41-54`), and `read_ai` returns 2
     /// on every terminal path (`devAiSoftCallback.c:167-216`) after
-    /// `dbProcessNotify` on INP has completed. The output side still applies
-    /// its link synchronously.
+    /// `dbProcessNotify` on INP has completed. An output whose link takes the
+    /// put asynchronously (CA, pva) stays PACT until the put's callback
+    /// completes it; any other link puts synchronously.
     Async,
 }
 

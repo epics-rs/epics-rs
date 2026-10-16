@@ -1533,8 +1533,10 @@ impl EpicsValue {
     /// integer width is `dbPutStringNum`'s 64-bit parse then C's cast; the
     /// floats take [`Self::parse`].
     pub fn parse_bytes(dbr_type: DbFieldType, bytes: &[u8]) -> CaResult<Self> {
+        // Verbatim, as `dbPutString`'s `strncpy`: a leading or trailing space
+        // is part of a DBF_STRING value.
         if dbr_type == DbFieldType::String {
-            return Ok(Self::String(PvString::from_bytes(bytes.trim_ascii())));
+            return Ok(Self::String(PvString::from_bytes(bytes)));
         }
         let text = String::from_utf8_lossy(bytes);
         // An integer width in a `.db` body or a `.dbd` `initial(...)` is C's
@@ -1551,8 +1553,13 @@ impl EpicsValue {
     /// cast into the width. A `.db` body or `.dbd` `initial(...)` takes
     /// [`Self::parse_bytes`], which casts as `dbPutStringNum` does.
     pub fn parse(dbr_type: DbFieldType, s: &str) -> CaResult<Self> {
+        // A string is verbatim, spaces included, as `dbPutString` stores it;
         // C EPICS treats empty/whitespace strings as zero for numeric fields
-        let s = s.trim();
+        let s = if dbr_type == DbFieldType::String {
+            s
+        } else {
+            s.trim()
+        };
         if s.is_empty() {
             return match dbr_type {
                 DbFieldType::String => Ok(Self::String(PvString::new())),
@@ -1871,6 +1878,23 @@ mod parse_radix_tests {
         assert_eq!(
             EpicsValue::parse(DbFieldType::Double, "1e6").unwrap(),
             EpicsValue::Double(1_000_000.0)
+        );
+    }
+
+    #[test]
+    fn a_string_parse_keeps_its_spaces() {
+        for text in [" MF", "MF ", "  a b  ", "   "] {
+            let want = EpicsValue::String(text.into());
+            assert_eq!(
+                EpicsValue::parse_bytes(DbFieldType::String, text.as_bytes()).unwrap(),
+                want
+            );
+            assert_eq!(EpicsValue::parse(DbFieldType::String, text).unwrap(), want);
+        }
+        // A number still ignores the spaces around it.
+        assert_eq!(
+            EpicsValue::parse_bytes(DbFieldType::Long, b" 7 ").unwrap(),
+            EpicsValue::Long(7)
         );
     }
 

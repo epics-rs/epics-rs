@@ -592,16 +592,18 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
 }
 
 /// Parse a save file value string back to EpicsValue, using template for type.
-pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
-    let s = s.trim();
+pub fn parse_save_value(raw: &str, template: &EpicsValue) -> Option<EpicsValue> {
+    let s = raw.trim();
     match template {
+        // Untrimmed: C `dbrestore` hands everything after the separator to
+        // `dbPutString`, so a scalar string's spaces are part of its value.
         EpicsValue::String(_) => {
-            if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-                let inner = &s[1..s.len() - 1];
+            if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+                let inner = &raw[1..raw.len() - 1];
                 let unescaped = inner.replace("\\\"", "\"").replace("\\\\", "\\");
                 Some(EpicsValue::String(unescaped.into()))
             } else {
-                Some(EpicsValue::String(s.to_string().into()))
+                Some(EpicsValue::String(raw.to_string().into()))
             }
         }
         EpicsValue::Double(_) => s.parse::<f64>().ok().map(EpicsValue::Double),
@@ -677,6 +679,30 @@ mod tests {
         assert_eq!(value_to_save_str_c(&v), "hello world");
         // Native quotes it.
         assert_eq!(value_to_save_str(&v), "\"hello world\"");
+    }
+
+    /// C `dbrestore` reads a scalar line as `%80s%c%[^\n\r]`: the value is
+    /// everything after the one separator, spaces at either end included.
+    #[test]
+    fn a_string_value_keeps_its_spaces_on_restore() {
+        let template = EpicsValue::String(Default::default());
+        for text in [" MF", "MF ", "   "] {
+            let v = EpicsValue::String(text.to_string().into());
+            for written in [value_to_save_str_c(&v), value_to_save_str(&v)] {
+                let contents = parse_save_content(&format!("X:post {written}\n"));
+                let entry = &contents.entries[0];
+                assert_eq!(
+                    parse_save_value(&entry.value, &template),
+                    Some(v.clone()),
+                    "{written:?}"
+                );
+            }
+        }
+        // A number still ignores the spaces around it.
+        assert_eq!(
+            parse_save_value(" 7 ", &EpicsValue::Long(0)),
+            Some(EpicsValue::Long(7))
+        );
     }
 
     /// M6: a C-format array uses the `@array@ { "v" "v" }` form a C

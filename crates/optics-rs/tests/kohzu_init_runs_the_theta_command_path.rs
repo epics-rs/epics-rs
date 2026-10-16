@@ -1,4 +1,3 @@
-#![cfg(tokio_backend)]
 //! kohzuCtl's boot ends where C's does. initSequence's two theta passes
 //! (`kohzuCtl.st:581`, `:595-603`) clamp against C's unset thetaHi/thetaLo
 //! and are rolled back. The first waitForCmnd then takes the connect-time
@@ -9,14 +8,17 @@
 //! Expected values are a C kohzuIoc's (sequencer 2.2.9, optics, motorSim
 //! axes with these limits) after the same boot.
 
+use epics_base_rs::runtime::task::{self, BlockingBridge};
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
-use epics_ca_rs::server::{CaServer, CaServerBuilder};
 use optics_rs::snl::kohzu_ctl::{self, KohzuConfig};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 const KOHZU_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db/kohzuSeq.db");
@@ -27,12 +29,12 @@ record(motor, "K:z") { field(HLM, "250") field(LLM, "-250") }
 "#;
 
 /// Boot with these theta, Y and Z readbacks.
-async fn boot(rbv: [f64; 3]) -> CaServer {
+async fn boot(rbv: [f64; 3]) -> Arc<PvDatabase> {
     boot_with(rbv, &[]).await
 }
 
 /// [`boot`], with these PVs put before the sequencer connects.
-async fn boot_with(rbv: [f64; 3], presets: &[(&str, f64)]) -> CaServer {
+async fn boot_with(rbv: [f64; 3], presets: &[(&str, f64)]) -> Arc<PvDatabase> {
     let macros: HashMap<String, String> = [
         ("P", "K:"),
         ("M_THETA", "th"),
@@ -44,18 +46,18 @@ async fn boot_with(rbv: [f64; 3], presets: &[(&str, f64)]) -> CaServer {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    let server = CaServerBuilder::new()
-        .port(0)
+    let ioc = IocBuilder::new()
         .register_record_type("busy", || Box::new(BusyRecord::default()))
         .register_record_type("motor", || Box::new(motor_rs::MotorRecord::new()))
         .db_string(MOTORS, &macros)
         .unwrap()
         .db_file(KOHZU_DB, &macros)
         .unwrap()
-        .build()
+        .build_served()
         .await
-        .unwrap();
-    let db = (**server.database()).clone();
+        .unwrap()
+        .0;
+    let db = PvDatabase::clone(&ioc);
     // RBV is a readback the loader refuses; no driver moves these motors,
     // so the one set here is the one kohzuCtl reads.
     for (name, rbv) in ["K:th", "K:y", "K:z"].into_iter().zip(rbv) {
@@ -75,36 +77,36 @@ async fn boot_with(rbv: [f64; 3], presets: &[(&str, f64)]) -> CaServer {
             .await
             .unwrap();
     }
-    tokio::spawn(kohzu_ctl::run(
+    BlockingBridge::capture().spawn(kohzu_ctl::run(
         KohzuConfig::new("K:", "th", "y", "z", 0),
         db,
     ));
-    server
+    ioc
 }
 
-async fn f64_of(server: &CaServer, pv: &str) -> f64 {
-    server.get(pv).await.unwrap().to_f64().unwrap()
+async fn f64_of(ioc: &PvDatabase, pv: &str) -> f64 {
+    ioc.get_pv(pv).unwrap().to_f64().unwrap()
 }
 
-async fn string_of(server: &CaServer, pv: &str) -> String {
-    match server.get(pv).await.unwrap() {
+async fn string_of(ioc: &PvDatabase, pv: &str) -> String {
+    match ioc.get_pv(pv).unwrap() {
         EpicsValue::String(s) => s.to_string(),
         other => panic!("{pv} is not a string: {other:?}"),
     }
 }
 
 /// Wait until SeqMsg1 reads `msg1`, then let the rest of the pass land.
-async fn settled(server: &CaServer, msg1: &str) {
+async fn settled(ioc: &PvDatabase, msg1: &str) {
     for _ in 0..200 {
-        if string_of(server, "K:KohzuSeqMsg1SI").await == msg1 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        if string_of(ioc, "K:KohzuSeqMsg1SI").await == msg1 {
+            task::sleep(Duration::from_millis(500)).await;
             return;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        task::sleep(Duration::from_millis(50)).await;
     }
     panic!(
         "SeqMsg1 never read {msg1:?}; last {:?}",
-        string_of(server, "K:KohzuSeqMsg1SI").await
+        string_of(ioc, "K:KohzuSeqMsg1SI").await
     );
 }
 
@@ -112,8 +114,8 @@ fn near(got: f64, want: f64) -> bool {
     (got - want).abs() <= 1e-4 * want.abs().max(1.0)
 }
 
-async fn assert_near(server: &CaServer, pv: &str, want: f64) {
-    let got = f64_of(server, pv).await;
+async fn assert_near(ioc: &PvDatabase, pv: &str, want: f64) {
+    let got = f64_of(ioc, pv).await;
     assert!(near(got, want), "{pv}: {got}, C {want}");
 }
 
@@ -125,22 +127,22 @@ async fn eventually<F: Future<Output = Result<(), String>>>(mut check: impl FnMu
             Ok(()) => return,
             Err(e) => last = e,
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        task::sleep(Duration::from_millis(50)).await;
     }
     panic!("{last}");
 }
 
-async fn assert_state(server: &CaServer, msg2: &str, moving: f64, values: &[(&str, f64)]) {
-    eventually(|| state_mismatch(server, msg2, moving, values)).await;
+async fn assert_state(ioc: &PvDatabase, msg2: &str, moving: f64, values: &[(&str, f64)]) {
+    eventually(|| state_mismatch(ioc, msg2, moving, values)).await;
 }
 
 async fn state_mismatch(
-    server: &CaServer,
+    ioc: &PvDatabase,
     msg2: &str,
     moving: f64,
     values: &[(&str, f64)],
 ) -> Result<(), String> {
-    let got = string_of(server, "K:KohzuSeqMsg2SI").await;
+    let got = string_of(ioc, "K:KohzuSeqMsg2SI").await;
     if got != msg2 {
         return Err(format!("SeqMsg2 {got:?}, C {msg2:?}"));
     }
@@ -152,7 +154,7 @@ async fn state_mismatch(
     .into_iter()
     .chain(values.iter().copied())
     {
-        let got = f64_of(server, pv).await;
+        let got = f64_of(ioc, pv).await;
         if !near(got, want) {
             return Err(format!("{pv}: {got}, C {want}"));
         }
@@ -162,12 +164,12 @@ async fn state_mismatch(
 
 /// thetaLimits sets 1..89, the readback pass moves theta to it, and the
 /// yOffset pass recomputes Y/Z for it: nothing is rolled back.
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_readback_inside_the_limits_stands_after_the_connect_time_passes() {
-    let server = boot([10.0, -17.77, 100.78]).await;
-    settled(&server, "y offset changed to 17.500000").await;
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
     assert_state(
-        &server,
+        &ioc,
         "Set to Manual Mode",
         0.0,
         &[
@@ -188,14 +190,14 @@ async fn a_readback_inside_the_limits_stands_after_the_connect_time_passes() {
 
 /// Below thetaLo the readback pass is clamped to 1 deg and Z exceeds its
 /// limit; the yOffset pass is rolled back the same way.
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_readback_below_theta_lo_is_rolled_back_to_the_drive_limits() {
-    let server = boot([0.5, -17.501, 200.0]).await;
-    settled(&server, "Z will exceed soft limits").await;
+    let ioc = boot([0.5, -17.501, 200.0]).await;
+    settled(&ioc, "Z will exceed soft limits").await;
     // The readback pass rolls back first; wait out the yOffset pass.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    task::sleep(Duration::from_millis(500)).await;
     assert_state(
-        &server,
+        &ioc,
         "Command ignored",
         0.0,
         &[
@@ -216,23 +218,23 @@ async fn a_readback_below_theta_lo_is_rolled_back_to_the_drive_limits() {
 
 /// A zero readback holds init in chkMotorLimits: the limits are never set
 /// and the first pass's KohzuMoving stays raised.
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_zero_readback_holds_init_in_chk_motor_limits() {
-    let server = boot([0.0, 0.0, 0.0]).await;
-    settled(&server, "Theta Readback of 0 not reasonable").await;
+    let ioc = boot([0.0, 0.0, 0.0]).await;
+    settled(&ioc, "Theta Readback of 0 not reasonable").await;
     // Past two of chkMotorLimits' 2 s rounds and initSeq=3's 1 s delay.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    task::sleep(Duration::from_secs(5)).await;
     assert_eq!(
-        string_of(&server, "K:KohzuSeqMsg1SI").await,
+        string_of(&ioc, "K:KohzuSeqMsg1SI").await,
         "Theta Readback of 0 not reasonable"
     );
-    let msg2 = string_of(&server, "K:KohzuSeqMsg2SI").await;
+    let msg2 = string_of(&ioc, "K:KohzuSeqMsg2SI").await;
     assert!(
         msg2 == "Set to Manual Mode" || msg2 == "Modify Motor Positions/Limits",
         "SeqMsg2 {msg2:?}"
     );
     assert_state(
-        &server,
+        &ioc,
         &msg2,
         1.0,
         &[
@@ -247,29 +249,29 @@ async fn a_zero_readback_holds_init_in_chk_motor_limits() {
         ],
     )
     .await;
-    assert_eq!(f64_of(&server, "K:BraggEAO.DRVL").await, f64::INFINITY);
+    assert_eq!(f64_of(&ioc, "K:BraggEAO.DRVL").await, f64::INFINITY);
 }
 
 /// A lattice change runs dInputChanged into thChanged: theta stands, E and
 /// lambda follow the new 2d, and the manual-mode pass leaves KohzuMoving
 /// raised by the setpoint puts.
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_lattice_change_recomputes_e_and_lambda_for_the_standing_theta() {
-    let server = boot([10.0, -17.77, 100.78]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    let db = (**server.database()).clone();
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:BraggHAO")
         .put_f64_process(3.0)
         .await
         .unwrap();
-    settled(&server, "New d spacing").await;
+    settled(&ioc, "New d spacing").await;
     assert_eq!(
-        string_of(&server, "K:KohzuSeqMsg2SI").await,
+        string_of(&ioc, "K:KohzuSeqMsg2SI").await,
         "Set to Manual Mode"
     );
-    assert_eq!(f64_of(&server, "K:KohzuMoving").await, 1.0, "KohzuMoving");
-    assert_eq!(f64_of(&server, "K:KohzuAlertBO").await, 0.0, "KohzuAlertBO");
-    assert_eq!(f64_of(&server, "K:KohzuModeBO").await, 0.0, "KohzuModeBO");
+    assert_eq!(f64_of(&ioc, "K:KohzuMoving").await, 1.0, "KohzuMoving");
+    assert_eq!(f64_of(&ioc, "K:KohzuAlertBO").await, 0.0, "KohzuAlertBO");
+    assert_eq!(f64_of(&ioc, "K:KohzuModeBO").await, 0.0, "KohzuModeBO");
     for (pv, want) in [
         ("K:Bragg2dSpacingAO", 3.27503),
         ("K:BraggThetaAO", 10.0),
@@ -285,33 +287,33 @@ async fn a_lattice_change_recomputes_e_and_lambda_for_the_standing_theta() {
         ("K:BraggThetaRdbkAO", 10.0),
         ("K:BraggERdbkAO", 21.8012),
     ] {
-        assert_near(&server, pv, want).await;
+        assert_near(&ioc, pv, want).await;
     }
 }
 
 /// updatePsuedo echoes each motor field monitor on its own, so the echo
 /// PVs follow the motors while init holds in chkMotorLimits.
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn the_echo_pvs_follow_the_motors_while_init_holds() {
-    let server = boot([0.0, 0.0, 0.0]).await;
-    settled(&server, "Theta Readback of 0 not reasonable").await;
-    let db = (**server.database()).clone();
+    let ioc = boot([0.0, 0.0, 0.0]).await;
+    settled(&ioc, "Theta Readback of 0 not reasonable").await;
+    let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:z.VELO")
         .put_f64_process(7.0)
         .await
         .unwrap();
-    eventually_near(&server, "K:KohzuZVelAI", 7.0).await;
-    assert_eq!(f64_of(&server, "K:KohzuThetaDmovBI").await, 1.0);
+    eventually_near(&ioc, "K:KohzuZVelAI", 7.0).await;
+    assert_eq!(f64_of(&ioc, "K:KohzuThetaDmovBI").await, 1.0);
 }
 
 /// A theta move made outside kohzuCtl posts many readbacks; updateRdbk's
 /// efClear(thetaMotRdbk_mon) drops the ones queued while it waited, so C
 /// runs one "Only Theta Motor Moved" pass per move (C kohzuIoc oracle).
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
-    let server = boot([10.0, -17.77, 100.78]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    let db = (**server.database()).clone();
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    let db = PvDatabase::clone(&ioc);
     // Each pass sets theta to the readback, which DRVH clamps to 89. SeqMsg1
     // cannot count passes: a string monitor is by-reference, so a slow reader
     // loses a message the next one overwrites; a double monitor queues each.
@@ -337,13 +339,13 @@ async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
     post("DMOV", 0.0);
     post("RBV", 50.0);
     // updateRdbk's readback pass shows the first RBV was taken.
-    eventually_near(&server, "K:BraggThetaRdbkAO", 50.0).await;
+    eventually_near(&ioc, "K:BraggThetaRdbkAO", 50.0).await;
     post("RBV", 70.0);
     post("RBV", 89.5);
     post("DMOV", 1.0);
     let mut passes = 0;
     while passes == 0 {
-        let v = tokio::time::timeout(Duration::from_secs(10), theta.recv_f64())
+        let v = task::timeout(Duration::from_secs(10), theta.recv_f64())
             .await
             .expect("no Only Theta Motor Moved pass")
             .unwrap();
@@ -355,7 +357,7 @@ async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
         .put_f64_process(85.0)
         .await
         .unwrap();
-    eventually_near(&server, "K:BraggThetaAO.DRVH", 85.0).await;
+    eventually_near(&ioc, "K:BraggThetaAO.DRVH", 85.0).await;
     while let Ok(event) = theta.try_recv_event() {
         let v = event.value().as_value().and_then(EpicsValue::to_f64);
         passes += usize::from(v == Some(89.0));
@@ -363,41 +365,41 @@ async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
     assert_eq!(passes, 1, "Only Theta Motor Moved passes");
 }
 
-async fn use_set_and_motor_sets(server: &CaServer) -> [f64; 4] {
+async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     [
-        f64_of(server, "K:KohzuUseSetBO").await,
-        f64_of(server, "K:th.SET").await,
-        f64_of(server, "K:y.SET").await,
-        f64_of(server, "K:z.SET").await,
+        f64_of(ioc, "K:KohzuUseSetBO").await,
+        f64_of(ioc, "K:th.SET").await,
+        f64_of(ioc, "K:y.SET").await,
+        f64_of(ioc, "K:z.SET").await,
     ]
 }
 
 /// updateSet (kohzuCtl.st:1387-1430) runs on the connect-time monitors with UseSet first,
 /// so UseSet's value wins: a preset motor .SET is put back (C kohzuIoc
 /// oracle: th.SET=Set before seq gives all Use; UseSet=Set gives all Set).
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn use_set_drives_the_motor_set_fields_at_connect() {
-    let server = boot_with([10.0, -17.77, 100.78], &[("K:th.SET", 1.0)]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    assert_eq!(use_set_and_motor_sets(&server).await, [0.0; 4]);
-    let server = boot_with([10.0, -17.77, 100.78], &[("K:KohzuUseSetBO", 1.0)]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    assert_eq!(use_set_and_motor_sets(&server).await, [1.0; 4]);
+    let ioc = boot_with([10.0, -17.77, 100.78], &[("K:th.SET", 1.0)]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    assert_eq!(use_set_and_motor_sets(&ioc).await, [0.0; 4]);
+    let ioc = boot_with([10.0, -17.77, 100.78], &[("K:KohzuUseSetBO", 1.0)]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    assert_eq!(use_set_and_motor_sets(&ioc).await, [1.0; 4]);
 }
 
 /// A motor .SET put reaches UseSet, and UseSet the other two motors
 /// (C kohzuIoc oracle: y.SET=Set leaves all four Set).
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_motor_set_put_drives_use_set_and_the_other_motors() {
-    let server = boot([10.0, -17.77, 100.78]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    let db = (**server.database()).clone();
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:y.SET")
         .put_f64_process(1.0)
         .await
         .unwrap();
     eventually(|| async {
-        match use_set_and_motor_sets(&server).await {
+        match use_set_and_motor_sets(&ioc).await {
             [1.0, 1.0, 1.0, 1.0] => Ok(()),
             sets => Err(format!("UseSet and motor SETs {sets:?}")),
         }
@@ -409,16 +411,16 @@ async fn a_motor_set_put_drives_use_set_and_the_other_motors() {
 /// eChanged/lChanged/thChanged chain (kohzuCtl.st:747-808), so in auto
 /// mode it moves Y back from where it was driven (C kohzuIoc oracle: y=5,
 /// E tweak 1000 → y.VAL -17.77; the same for lambda and theta).
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_tweak_past_the_limit_moves_to_the_standing_setpoint() {
     for (step, inc) in [
         ("K:BraggETweakAI", "K:BraggEIncBO"),
         ("K:BraggLambdaTweakAI", "K:BraggLambdaIncBO"),
         ("K:BraggThetaTweakAI", "K:BraggThetaIncBO"),
     ] {
-        let server = boot([10.0, -17.77, 100.78]).await;
-        settled(&server, "y offset changed to 17.500000").await;
-        let db = (**server.database()).clone();
+        let ioc = boot([10.0, -17.77, 100.78]).await;
+        settled(&ioc, "y offset changed to 17.500000").await;
+        let db = PvDatabase::clone(&ioc);
         let put = |pv: &'static str, v: f64| {
             let db = db.clone();
             async move {
@@ -441,36 +443,36 @@ async fn a_tweak_past_the_limit_moves_to_the_standing_setpoint() {
         put(step, 1000.0).await;
         put(inc, 1.0).await;
         eventually(|| async {
-            let msg1 = string_of(&server, "K:KohzuSeqMsg1SI").await;
+            let msg1 = string_of(&ioc, "K:KohzuSeqMsg1SI").await;
             match msg1.ends_with("tweak exceeds limit") {
                 true => Ok(()),
                 false => Err(format!("{inc}: SeqMsg1 {msg1:?}")),
             }
         })
         .await;
-        eventually_near(&server, "K:y.VAL", -17.77).await;
+        eventually_near(&ioc, "K:y.VAL", -17.77).await;
     }
 }
 
 /// Poll `pv` until it is within [`assert_near`]'s tolerance of `want`, then
 /// assert it.
-async fn eventually_near(server: &CaServer, pv: &str, want: f64) {
+async fn eventually_near(ioc: &PvDatabase, pv: &str, want: f64) {
     for _ in 0..100 {
-        if (f64_of(server, pv).await - want).abs() <= 1e-4 * want.abs().max(1.0) {
+        if (f64_of(ioc, pv).await - want).abs() <= 1e-4 * want.abs().max(1.0) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        task::sleep(Duration::from_millis(50)).await;
     }
-    assert_near(server, pv, want).await;
+    assert_near(ioc, pv, want).await;
 }
 
 /// Two E puts queued before the sequencer looks raise E_mon once, and C's
 /// sync'd variable holds the later value, so theta follows the second put.
-#[tokio::test(flavor = "current_thread")]
+#[epics_base_rs::epics_test]
 async fn two_queued_e_puts_take_the_later_value() {
-    let server = boot([10.0, -17.77, 100.78]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    let db = (**server.database()).clone();
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    let db = PvDatabase::clone(&ioc);
     // Both posts land in one step with no await, so the sequencer, on this
     // one-thread runtime, cannot take the first before the second is queued.
     {
@@ -481,24 +483,24 @@ async fn two_queued_e_puts_take_the_later_value() {
             inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
         }
     }
-    let two_d = f64_of(&server, "K:Bragg2dSpacingAO").await;
+    let two_d = f64_of(&ioc, "K:Bragg2dSpacingAO").await;
     let theta = optics_rs::snl::kohzu_ctl::lambda_to_theta(
         optics_rs::snl::kohzu_ctl::energy_to_lambda(14.0),
         two_d,
     )
     .unwrap();
-    eventually_near(&server, "K:BraggThetaAO", theta).await;
-    assert_near(&server, "K:BraggEAO", 14.0).await;
+    eventually_near(&ioc, "K:BraggThetaAO", theta).await;
+    assert_near(&ioc, "K:BraggEAO", 14.0).await;
 }
 
 /// C writes autoMode as its monitor arrives (kohzuCtl.st:78-80, no efflag),
 /// so an E put queued with Mode=Auto already sees auto mode and moves Y
 /// back from where it was driven, though E is taken before Mode.
-#[tokio::test(flavor = "current_thread")]
+#[epics_base_rs::epics_test]
 async fn an_e_put_queued_after_auto_mode_moves() {
-    let server = boot([10.0, -17.77, 100.78]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    let db = (**server.database()).clone();
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    let db = PvDatabase::clone(&ioc);
     db.get_record("K:y")
         .unwrap()
         .write()
@@ -508,7 +510,7 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         .unwrap()
         .pos
         .val = 5.0;
-    let e = f64_of(&server, "K:BraggEAO").await;
+    let e = f64_of(&ioc, "K:BraggEAO").await;
     // No await between the posts: on this one-thread runtime the sequencer
     // finds both queued.
     for (pv, v) in [
@@ -520,7 +522,7 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         inst.record.put_field("VAL", v).unwrap();
         inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
     }
-    eventually_near(&server, "K:y.VAL", -17.77).await;
+    eventually_near(&ioc, "K:y.VAL", -17.77).await;
 }
 
 /// updateRdbk takes no command while the motors move: the next
@@ -528,11 +530,11 @@ async fn an_e_put_queued_after_auto_mode_moves() {
 /// HLM put waits for the move (C kohzuIoc oracle: theta 20 and th.HLM 85
 /// put during the move to 30 leave DRVH 89 until it stops, then th.VAL 30,
 /// BraggThetaAO 20, DRVH 85, "Theta Motor Soft Limits Changed", Done).
-#[tokio::test(flavor = "multi_thread")]
+#[epics_base_rs::epics_test]
 async fn a_setpoint_put_during_a_move_is_dropped() {
-    let server = boot([10.0, -17.77, 100.78]).await;
-    settled(&server, "y offset changed to 17.500000").await;
-    let db = (**server.database()).clone();
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
+    let db = PvDatabase::clone(&ioc);
     let put = |pv: &'static str, v: f64| {
         let db = db.clone();
         async move {
@@ -556,20 +558,20 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
                 .dmov = done;
         }
     };
-    let drvh = f64_of(&server, "K:BraggThetaAO.DRVH").await;
+    let drvh = f64_of(&ioc, "K:BraggThetaAO.DRVH").await;
     put("K:KohzuModeBO", 1.0).await;
     set_dmov(false);
     put("K:BraggThetaAO", 30.0).await;
-    eventually_near(&server, "K:th.VAL", 30.0).await;
+    eventually_near(&ioc, "K:th.VAL", 30.0).await;
     put("K:BraggThetaAO", 20.0).await;
     put("K:th.HLM", 85.0).await;
     // Nothing to wait on for an absence: give a taken command time to show.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_near(&server, "K:th.VAL", 30.0).await;
-    assert_near(&server, "K:BraggThetaAO.DRVH", drvh).await;
+    task::sleep(Duration::from_millis(300)).await;
+    assert_near(&ioc, "K:th.VAL", 30.0).await;
+    assert_near(&ioc, "K:BraggThetaAO.DRVH", drvh).await;
     set_dmov(true);
     eventually(|| async {
-        let msg1 = string_of(&server, "K:KohzuSeqMsg1SI").await;
+        let msg1 = string_of(&ioc, "K:KohzuSeqMsg1SI").await;
         if msg1 == "Theta Motor Soft Limits Changed" {
             Ok(())
         } else {
@@ -577,8 +579,8 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
         }
     })
     .await;
-    eventually_near(&server, "K:BraggThetaAO.DRVH", 85.0).await;
-    eventually_near(&server, "K:KohzuMoving", 0.0).await;
-    assert_near(&server, "K:th.VAL", 30.0).await;
-    assert_near(&server, "K:BraggThetaAO", 20.0).await;
+    eventually_near(&ioc, "K:BraggThetaAO.DRVH", 85.0).await;
+    eventually_near(&ioc, "K:KohzuMoving", 0.0).await;
+    assert_near(&ioc, "K:th.VAL", 30.0).await;
+    assert_near(&ioc, "K:BraggThetaAO", 20.0).await;
 }

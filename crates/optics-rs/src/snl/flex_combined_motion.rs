@@ -516,10 +516,11 @@ impl FlexController {
 
 /// Async entry point — runs the flex combined motion state machine against live PVs.
 pub async fn run(config: FlexConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use epics_base_rs::runtime::task::sleep;
     use epics_base_rs::types::EpicsValue;
     use epics_ca_rs::client::{CaChannel, CaClient};
+    use std::time::Duration;
     use tokio::select;
-    use tokio::time::{Duration, sleep};
 
     async fn get_f64(ch: &CaChannel) -> f64 {
         match ch.get().await {

@@ -503,10 +503,11 @@ pub fn ar_pcntr_efficiency(energy: f64) -> f64 {
 
 /// Async entry point — runs the Io state machine against live PVs.
 pub async fn run(config: IoConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use epics_base_rs::runtime::task::sleep;
     use epics_base_rs::types::EpicsValue;
     use epics_ca_rs::client::{CaChannel, CaClient};
+    use std::time::Duration;
     use tokio::select;
-    use tokio::time::{Duration, sleep};
 
     /// Helper: read f64 from channel.
     async fn get_f64(ch: &CaChannel) -> f64 {

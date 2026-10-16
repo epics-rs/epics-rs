@@ -805,7 +805,7 @@ pub async fn run(
     let mut wait_for_cmnd_enter = false;
     loop {
         if wait_for_cmnd_enter {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
             for pv in enter_clears {
                 monitor.clear(pv);
             }
@@ -1137,7 +1137,7 @@ pub async fn run(
 
             // Wait for motors
             loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
 
                 // Check limit switches
                 if ch_phi1_hls.get_i16().await != 0 || ch_phi1_lls.get_i16().await != 0 {
@@ -1150,7 +1150,7 @@ pub async fn run(
                     if op_mode != HrOpMode::Single {
                         let _ = ch_phi2_mot_stop.put_i16_process(1).await;
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
                     break;
                 }
                 if op_mode != HrOpMode::Single
@@ -1163,7 +1163,7 @@ pub async fn run(
                     let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_phi1_mot_stop.put_i16_process(1).await;
                     let _ = ch_phi2_mot_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
                     break;
                 }
 

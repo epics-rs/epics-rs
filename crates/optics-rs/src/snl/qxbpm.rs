@@ -680,7 +680,7 @@ pub async fn run<R, W>(
     ) -> Result<String, std::io::Error> {
         send_cmd(writer, cmd).await?;
         buf.clear();
-        match tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(buf)).await {
+        match epics_base_rs::runtime::task::timeout(RESPONSE_TIMEOUT, reader.read_line(buf)).await {
             Ok(Ok(0)) => Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "EOF",
@@ -733,7 +733,7 @@ pub async fn run<R, W>(
                     continue;
                 }
                 // Wait for device reset
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
 
                 // Apply current gain
                 if let Err(e) = send_cmd(
@@ -789,7 +789,7 @@ pub async fn run<R, W>(
                 publish_status(&ctrl, &status_tx);
 
                 tokio::select! {
-                    _ = tokio::time::sleep(ERROR_RECONNECT_INTERVAL) => {
+                    _ = epics_base_rs::runtime::task::sleep(ERROR_RECONNECT_INTERVAL) => {
                         ctrl.state = QxbpmState::Init;
                     }
                     cmd = cmd_rx.recv() => {
@@ -881,9 +881,9 @@ pub async fn run<R, W>(
                         )
                         .await;
                         // Wait for settling
-                        tokio::time::sleep(epics_base_rs::runtime::time::duration_from_secs(
-                            ctrl.settling,
-                        ))
+                        epics_base_rs::runtime::task::sleep(
+                            epics_base_rs::runtime::time::duration_from_secs(ctrl.settling),
+                        )
                         .await;
                         // Read current values
                         match send_and_read(
@@ -920,7 +920,7 @@ pub async fn run<R, W>(
                 update_delay = 0.0; // Only delay extra once after gain change
 
                 tokio::select! {
-                    _ = tokio::time::sleep(epics_base_rs::runtime::time::duration_from_secs(read_delay)) => {
+                    _ = epics_base_rs::runtime::task::sleep(epics_base_rs::runtime::time::duration_from_secs(read_delay)) => {
                         // Read all currents
                         match send_and_read(
                             &mut writer,

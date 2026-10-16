@@ -343,7 +343,7 @@ impl QxbpmPollLoop {
                         Some(QxbpmPollCommand::Shutdown) | None => return,
                     }
                 }
-                _ = tokio::time::sleep(self.poll_interval) => {
+                _ = epics_base_rs::runtime::task::sleep(self.poll_interval) => {
                     if self.port.is_closed() {
                         return;
                     }

@@ -14,7 +14,8 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use tracing::info;
 
-use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
+use crate::db_access::{DbMultiMonitor, alloc_origin};
+use epics_base_rs::server::snl::{PutQueue, StateSet};
 
 // Re-use physics from kohzu_ctl.
 use crate::snl::kohzu_ctl::{
@@ -124,20 +125,23 @@ pub async fn run(
         ));
     }
     // updatePsuedo_soft (kohzuCtl_soft.st:1168-1235).
-    let echoes = echo_motor_fields(db.clone(), echoes);
+    let queue = PutQueue::new(&db, "kohzuCtl_soft");
+    let echoes = echo_motor_fields(db.clone(), queue.state_set("updatePsuedo_soft"), echoes);
     let use_set_pv = config.mono_pv("UseSet");
+    let update_set_ss = queue.state_set("updateSet");
     let use_set_mode = Arc::new(AtomicBool::new(
-        DbChannel::new(&db, &use_set_pv).get_i16().await != 0,
+        update_set_ss.pv(&use_set_pv).get_i16().await != 0,
     ));
     // updateSet (kohzuCtl_soft.st:1243-1286).
     let update_set = update_set(
         db.clone(),
+        update_set_ss,
         use_set_pv,
         [&config.m_theta, &config.m_y, &config.m_z].map(|m| config.motor_pv(m, ".SET")),
         use_set_mode.clone(),
     );
     tokio::select! {
-        r = kohzu_ctl_soft(config, db, use_set_mode) => r,
+        r = kohzu_ctl_soft(config, db, queue.state_set("kohzuCtl_soft"), use_set_mode) => r,
         () = echoes => Ok(()),
         () = update_set => Ok(()),
     }
@@ -147,6 +151,7 @@ pub async fn run(
 async fn kohzu_ctl_soft(
     config: KohzuSoftConfig,
     db: PvDatabase,
+    ss: StateSet,
     use_set_mode: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(
@@ -157,112 +162,100 @@ async fn kohzu_ctl_soft(
     let my_origin = alloc_origin();
 
     // -- Create channels --
-    let _ch_debug = DbChannel::with_origin(&db, &config.mono_pv("CtlDebug"), my_origin);
-    let ch_seq_msg1 = DbChannel::with_origin(&db, &config.mono_pv("SeqMsg1"), my_origin);
-    let ch_seq_msg2 = DbChannel::with_origin(&db, &config.mono_pv("SeqMsg2"), my_origin);
-    let ch_alert = DbChannel::with_origin(&db, &config.mono_pv("Alert"), my_origin);
-    let ch_oper_ack = DbChannel::with_origin(&db, &config.mono_pv("OperAck"), my_origin);
-    let ch_put_vals = DbChannel::with_origin(&db, &config.mono_pv("Put"), my_origin);
-    let ch_auto_mode = DbChannel::with_origin(&db, &config.mono_pv("Mode"), my_origin);
-    let ch_moving = DbChannel::with_origin(&db, &config.mono_pv("Moving"), my_origin);
+    let _ch_debug = ss.pv_with_origin(&config.mono_pv("CtlDebug"), my_origin);
+    let ch_seq_msg1 = ss.pv_with_origin(&config.mono_pv("SeqMsg1"), my_origin);
+    let ch_seq_msg2 = ss.pv_with_origin(&config.mono_pv("SeqMsg2"), my_origin);
+    let ch_alert = ss.pv_with_origin(&config.mono_pv("Alert"), my_origin);
+    let ch_oper_ack = ss.pv_with_origin(&config.mono_pv("OperAck"), my_origin);
+    let ch_put_vals = ss.pv_with_origin(&config.mono_pv("Put"), my_origin);
+    let ch_auto_mode = ss.pv_with_origin(&config.mono_pv("Mode"), my_origin);
+    let ch_moving = ss.pv_with_origin(&config.mono_pv("Moving"), my_origin);
 
     // Crystal parameters
-    let ch_h = DbChannel::with_origin(&db, &config.mono_pv("H"), my_origin);
-    let ch_k = DbChannel::with_origin(&db, &config.mono_pv("K"), my_origin);
-    let ch_l = DbChannel::with_origin(&db, &config.mono_pv("L"), my_origin);
-    let ch_a = DbChannel::with_origin(&db, &config.mono_pv("A"), my_origin);
-    let ch_d = DbChannel::with_origin(&db, &config.mono_pv("2dSpacing"), my_origin);
+    let ch_h = ss.pv_with_origin(&config.mono_pv("H"), my_origin);
+    let ch_k = ss.pv_with_origin(&config.mono_pv("K"), my_origin);
+    let ch_l = ss.pv_with_origin(&config.mono_pv("L"), my_origin);
+    let ch_a = ss.pv_with_origin(&config.mono_pv("A"), my_origin);
+    let ch_d = ss.pv_with_origin(&config.mono_pv("2dSpacing"), my_origin);
 
     // Energy / lambda / theta
-    let ch_e = DbChannel::with_origin(&db, &config.mono_pv("E"), my_origin);
-    let ch_e_hi = DbChannel::with_origin(&db, &config.mono_pv("E.HLM"), my_origin);
-    let ch_e_lo = DbChannel::with_origin(&db, &config.mono_pv("E.LLM"), my_origin);
-    let ch_e_rdbk = DbChannel::with_origin(&db, &config.mono_pv("ERdbk"), my_origin);
+    let ch_e = ss.pv_with_origin(&config.mono_pv("E"), my_origin);
+    let ch_e_hi = ss.pv_with_origin(&config.mono_pv("E.HLM"), my_origin);
+    let ch_e_lo = ss.pv_with_origin(&config.mono_pv("E.LLM"), my_origin);
+    let ch_e_rdbk = ss.pv_with_origin(&config.mono_pv("ERdbk"), my_origin);
 
-    let ch_lambda = DbChannel::with_origin(&db, &config.mono_pv("Lambda"), my_origin);
-    let ch_lambda_hi = DbChannel::with_origin(&db, &config.mono_pv("Lambda.HLM"), my_origin);
-    let ch_lambda_lo = DbChannel::with_origin(&db, &config.mono_pv("Lambda.LLM"), my_origin);
-    let ch_lambda_rdbk = DbChannel::with_origin(&db, &config.mono_pv("LambdaRdbk"), my_origin);
+    let ch_lambda = ss.pv_with_origin(&config.mono_pv("Lambda"), my_origin);
+    let ch_lambda_hi = ss.pv_with_origin(&config.mono_pv("Lambda.HLM"), my_origin);
+    let ch_lambda_lo = ss.pv_with_origin(&config.mono_pv("Lambda.LLM"), my_origin);
+    let ch_lambda_rdbk = ss.pv_with_origin(&config.mono_pv("LambdaRdbk"), my_origin);
 
-    let ch_theta = DbChannel::with_origin(&db, &config.mono_pv("Theta"), my_origin);
-    let ch_theta_hi = DbChannel::with_origin(&db, &config.mono_pv("Theta.HLM"), my_origin);
-    let ch_theta_lo = DbChannel::with_origin(&db, &config.mono_pv("Theta.LLM"), my_origin);
-    let ch_theta_rdbk = DbChannel::with_origin(&db, &config.mono_pv("ThetaRdbk"), my_origin);
+    let ch_theta = ss.pv_with_origin(&config.mono_pv("Theta"), my_origin);
+    let ch_theta_hi = ss.pv_with_origin(&config.mono_pv("Theta.HLM"), my_origin);
+    let ch_theta_lo = ss.pv_with_origin(&config.mono_pv("Theta.LLM"), my_origin);
+    let ch_theta_rdbk = ss.pv_with_origin(&config.mono_pv("ThetaRdbk"), my_origin);
 
     // Soft echo PVs
-    let ch_theta_mot_name = DbChannel::with_origin(&db, &config.mono_pv("ThetaPv"), my_origin);
-    let ch_y_mot_name = DbChannel::with_origin(&db, &config.mono_pv("YPv"), my_origin);
-    let ch_z_mot_name = DbChannel::with_origin(&db, &config.mono_pv("ZPv"), my_origin);
+    let ch_theta_mot_name = ss.pv_with_origin(&config.mono_pv("ThetaPv"), my_origin);
+    let ch_y_mot_name = ss.pv_with_origin(&config.mono_pv("YPv"), my_origin);
+    let ch_z_mot_name = ss.pv_with_origin(&config.mono_pv("ZPv"), my_origin);
 
-    let ch_theta_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("ThetaCmd"), my_origin);
-    let ch_y_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("YCmd"), my_origin);
-    let ch_z_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("ZCmd"), my_origin);
-    let ch_theta_rdbk_echo =
-        DbChannel::with_origin(&db, &config.mono_pv("ThetaMotRdbk"), my_origin);
-    let ch_y_rdbk_echo = DbChannel::with_origin(&db, &config.mono_pv("YRdbk"), my_origin);
-    let ch_z_rdbk_echo = DbChannel::with_origin(&db, &config.mono_pv("ZRdbk"), my_origin);
-    let ch_theta_vel_echo = DbChannel::with_origin(&db, &config.mono_pv("ThetaVel"), my_origin);
-    let ch_y_vel_echo = DbChannel::with_origin(&db, &config.mono_pv("YVel"), my_origin);
-    let ch_z_vel_echo = DbChannel::with_origin(&db, &config.mono_pv("ZVel"), my_origin);
-    let ch_theta_dmov_echo = DbChannel::with_origin(&db, &config.mono_pv("ThetaDmov"), my_origin);
-    let ch_y_dmov_echo = DbChannel::with_origin(&db, &config.mono_pv("YDmov"), my_origin);
-    let ch_z_dmov_echo = DbChannel::with_origin(&db, &config.mono_pv("ZDmov"), my_origin);
+    let ch_theta_cmd_echo = ss.pv_with_origin(&config.mono_pv("ThetaCmd"), my_origin);
+    let ch_y_cmd_echo = ss.pv_with_origin(&config.mono_pv("YCmd"), my_origin);
+    let ch_z_cmd_echo = ss.pv_with_origin(&config.mono_pv("ZCmd"), my_origin);
+    let ch_theta_rdbk_echo = ss.pv_with_origin(&config.mono_pv("ThetaMotRdbk"), my_origin);
+    let ch_y_rdbk_echo = ss.pv_with_origin(&config.mono_pv("YRdbk"), my_origin);
+    let ch_z_rdbk_echo = ss.pv_with_origin(&config.mono_pv("ZRdbk"), my_origin);
+    let ch_theta_vel_echo = ss.pv_with_origin(&config.mono_pv("ThetaVel"), my_origin);
+    let ch_y_vel_echo = ss.pv_with_origin(&config.mono_pv("YVel"), my_origin);
+    let ch_z_vel_echo = ss.pv_with_origin(&config.mono_pv("ZVel"), my_origin);
+    let ch_theta_dmov_echo = ss.pv_with_origin(&config.mono_pv("ThetaDmov"), my_origin);
+    let ch_y_dmov_echo = ss.pv_with_origin(&config.mono_pv("YDmov"), my_origin);
+    let ch_z_dmov_echo = ss.pv_with_origin(&config.mono_pv("ZDmov"), my_origin);
 
     // Motor records
     let ch_theta_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".STOP"), my_origin);
-    let ch_y_stop = DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".STOP"), my_origin);
-    let ch_z_stop = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".STOP"), my_origin);
+        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".STOP"), my_origin);
+    let ch_y_stop = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".STOP"), my_origin);
+    let ch_z_stop = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".STOP"), my_origin);
 
-    let ch_theta_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".DMOV"), my_origin);
-    let ch_y_dmov = DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".DMOV"), my_origin);
-    let ch_z_dmov = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".DMOV"), my_origin);
+    let ch_theta_dmov = ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".DMOV"), my_origin);
+    let ch_y_dmov = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".DMOV"), my_origin);
+    let ch_z_dmov = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".DMOV"), my_origin);
 
-    let ch_theta_set_ao = DbChannel::with_origin(&db, &config.mono_pv("ThetaSet"), my_origin);
-    let ch_y_set_ao = DbChannel::with_origin(&db, &config.mono_pv("YSet"), my_origin);
-    let ch_z_set_ao = DbChannel::with_origin(&db, &config.mono_pv("ZSet"), my_origin);
-    let ch_y_set_hi = DbChannel::with_origin(&db, &config.mono_pv("YSet.DRVH"), my_origin);
-    let ch_y_set_lo = DbChannel::with_origin(&db, &config.mono_pv("YSet.DRVL"), my_origin);
+    let ch_theta_set_ao = ss.pv_with_origin(&config.mono_pv("ThetaSet"), my_origin);
+    let ch_y_set_ao = ss.pv_with_origin(&config.mono_pv("YSet"), my_origin);
+    let ch_z_set_ao = ss.pv_with_origin(&config.mono_pv("ZSet"), my_origin);
+    let ch_y_set_hi = ss.pv_with_origin(&config.mono_pv("YSet.DRVH"), my_origin);
+    let ch_y_set_lo = ss.pv_with_origin(&config.mono_pv("YSet.DRVL"), my_origin);
 
     let ch_theta_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLM"), my_origin);
+        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".HLM"), my_origin);
     let ch_theta_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLM"), my_origin);
-    let ch_y_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".HLM"), my_origin);
-    let ch_y_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".LLM"), my_origin);
-    let ch_z_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLM"), my_origin);
-    let ch_z_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLM"), my_origin);
+        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".LLM"), my_origin);
+    let ch_y_mot_hilim = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".HLM"), my_origin);
+    let ch_y_mot_lolim = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".LLM"), my_origin);
+    let ch_z_mot_hilim = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".HLM"), my_origin);
+    let ch_z_mot_lolim = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".LLM"), my_origin);
 
-    let ch_theta_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ""), my_origin);
-    let ch_y_mot_cmd = DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ""), my_origin);
-    let ch_z_mot_cmd = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ""), my_origin);
+    let ch_theta_mot_cmd = ss.pv_with_origin(&config.motor_pv(&config.m_theta, ""), my_origin);
+    let ch_y_mot_cmd = ss.pv_with_origin(&config.motor_pv(&config.m_y, ""), my_origin);
+    let ch_z_mot_cmd = ss.pv_with_origin(&config.motor_pv(&config.m_z, ""), my_origin);
 
     let ch_theta_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".VELO"), my_origin);
-    let ch_y_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".VELO"), my_origin);
-    let ch_z_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".VELO"), my_origin);
+        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".VELO"), my_origin);
+    let ch_y_mot_velo = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".VELO"), my_origin);
+    let ch_z_mot_velo = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".VELO"), my_origin);
 
-    let ch_theta_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".RBV"), my_origin);
-    let ch_y_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".RBV"), my_origin);
-    let ch_z_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".RBV"), my_origin);
+    let ch_theta_mot_rbv = ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".RBV"), my_origin);
+    let ch_y_mot_rbv = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".RBV"), my_origin);
+    let ch_z_mot_rbv = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".RBV"), my_origin);
 
-    let ch_speed_ctrl = DbChannel::with_origin(&db, &config.mono_pv("SpeedCtrl"), my_origin);
-    let ch_y_offset = DbChannel::with_origin(&db, &config.mono_pv("yOffset"), my_origin);
-    let ch_y_offset_hi = DbChannel::with_origin(&db, &config.mono_pv("yOffset.DRVH"), my_origin);
-    let ch_y_offset_lo = DbChannel::with_origin(&db, &config.mono_pv("yOffset.DRVL"), my_origin);
+    let ch_speed_ctrl = ss.pv_with_origin(&config.mono_pv("SpeedCtrl"), my_origin);
+    let ch_y_offset = ss.pv_with_origin(&config.mono_pv("yOffset"), my_origin);
+    let ch_y_offset_hi = ss.pv_with_origin(&config.mono_pv("yOffset.DRVH"), my_origin);
+    let ch_y_offset_lo = ss.pv_with_origin(&config.mono_pv("yOffset.DRVL"), my_origin);
 
-    let limit_switches = LimitSwitches::new(&db, my_origin, |m, f| {
+    let limit_switches = LimitSwitches::new(&ss, my_origin, |m, f| {
         config.motor_pv([&config.m_theta, &config.m_y, &config.m_z][m], f)
     });
 
@@ -415,7 +408,7 @@ async fn kohzu_ctl_soft(
                     KohzuSoftState::UpdateReadback
                 }
                 _ => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
                     let _ = ch_seq_msg1.put_string_process("Kohzu Control Ready").await;
                     let _ = ch_seq_msg2.put_string_process(" ").await;
                     init_seq_done = true;
@@ -432,7 +425,7 @@ async fn kohzu_ctl_soft(
             KohzuSoftState::WaitForCommandEnter if !init_seq_done => KohzuSoftState::InitSequence,
             KohzuSoftState::WaitForCommandEnter => {
                 // kohzuCtl_soft.st:563-622
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                 for pv in [&pv_h, &pv_k, &pv_l, &pv_a, &pv_e, &pv_lambda, &pv_theta] {
                     monitor.clear(pv);
                 }
@@ -756,7 +749,7 @@ async fn kohzu_ctl_soft(
                     let _ = ch_alert.put_i16_process(1).await;
                     KohzuSoftState::WaitForCommandEnter
                 } else if all_done().await {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
                     let rbv = ch_theta_mot_rbv.get_f64().await;
                     put_readbacks(rbv, two_d).await;
                     kohzu_done = true;
@@ -772,7 +765,7 @@ async fn kohzu_ctl_soft(
                         .await;
                     KohzuSoftState::StopKohzu
                 } else {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                     put_readbacks(ch_theta_mot_rbv.get_f64().await, two_d).await;
                     KohzuSoftState::UpdateReadback
                 }
@@ -859,7 +852,7 @@ async fn kohzu_ctl_soft(
                     let _ = ch_alert.put_i16_process(1).await;
                     let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(2)).await;
                     let _ = ch_alert.put_i16_process(1).await;
                     let _ = ch_seq_msg2
                         .put_string_process("Modify Motor Positions/Limits")
@@ -878,7 +871,7 @@ async fn kohzu_ctl_soft(
                 let _ = ch_theta_mot_stop.put_i16_process(1).await;
                 let _ = ch_y_stop.put_i16_process(1).await;
                 let _ = ch_z_stop.put_i16_process(1).await;
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
                 KohzuSoftState::UpdateReadback
             }
         };

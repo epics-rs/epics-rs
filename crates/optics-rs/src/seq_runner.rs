@@ -259,10 +259,7 @@ mod tests {
 
     /// filterDrive's blade count is the `NUM_FILTERS` macro
     /// (`filterDrive.st:338`), published to `NumFilters` by `start`.
-    // filterDrive's states sleep on tokio::time, which the exec backend's
-    // callback threads have no reactor for.
-    #[cfg(tokio_backend)]
-    #[tokio::test]
+    #[epics_base_rs::epics_test]
     async fn filter_drive_takes_its_blade_count_from_num_filters() {
         let db = PvDatabase::new();
         db.add_record(
@@ -284,7 +281,7 @@ mod tests {
             if db.get_pv("F:f:NumFilters").unwrap().to_f64() == Some(2.0) {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("NumFilters is {:?}", db.get_pv("F:f:NumFilters").unwrap());
     }
@@ -292,8 +289,7 @@ mod tests {
     /// ml_monoCtl's y offset is the `Y_OFF` macro (`ml_monoCtl.st:587`),
     /// put by initSequence; with every motor readback at 0, chkMotorLimits
     /// then holds and nothing overwrites it.
-    #[cfg(tokio_backend)]
-    #[tokio::test]
+    #[epics_base_rs::epics_test]
     async fn ml_mono_takes_its_y_offset_from_y_off() {
         let db = PvDatabase::new();
         db.add_record(
@@ -309,7 +305,7 @@ mod tests {
             if db.get_pv("Y:ml_mono_yOffset").unwrap().to_f64() == Some(40.0) {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("yOffset is {:?}", db.get_pv("Y:ml_mono_yOffset").unwrap());
     }

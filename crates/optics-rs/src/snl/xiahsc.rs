@@ -1085,7 +1085,8 @@ pub async fn run<R, W>(
         buf: &mut String,
     ) -> Result<HscResponse, std::io::Error> {
         buf.clear();
-        let n = tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(buf)).await;
+        let n =
+            epics_base_rs::runtime::task::timeout(RESPONSE_TIMEOUT, reader.read_line(buf)).await;
         match n {
             Ok(Ok(0)) => Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -1138,21 +1139,21 @@ pub async fn run<R, W>(
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "H & V IDs must be different".to_string();
                     publish_status(&ctrl, &status_tx);
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
                 if !validate_hsc_id(&ctrl.h_id, false) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "H ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
                 if !validate_hsc_id(&ctrl.v_id, false) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "V ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
 
@@ -1168,7 +1169,7 @@ pub async fn run<R, W>(
                     publish_status(&ctrl, &status_tx);
                     continue;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
 
                 ctrl.state = HscState::InitLimits;
                 publish_status(&ctrl, &status_tx);
@@ -1314,7 +1315,7 @@ pub async fn run<R, W>(
 
                 // Wait before retrying
                 tokio::select! {
-                    _ = tokio::time::sleep(ERROR_RECONNECT_INTERVAL) => {
+                    _ = epics_base_rs::runtime::task::sleep(ERROR_RECONNECT_INTERVAL) => {
                         ctrl.state = HscState::Init;
                     }
                     cmd = cmd_rx.recv() => {
@@ -1359,7 +1360,7 @@ pub async fn run<R, W>(
                         publish_status(&ctrl, &status_tx);
                         continue;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                     ctrl.locate_requested = true;
                 }
 
@@ -1371,7 +1372,7 @@ pub async fn run<R, W>(
                         publish_status(&ctrl, &status_tx);
                         continue;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                     ctrl.locate_requested = true;
                 }
 
@@ -1381,7 +1382,7 @@ pub async fn run<R, W>(
                     if ctrl.h_busy {
                         // Interrupt active move
                         let _ = send_cmd(&mut writer, &HscCommand::Kill(ctrl.h_id.clone())).await;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                     }
                     ctrl.h_busy = true;
                     let (pos_a, pos_b) = ctrl.h_raw_positions();
@@ -1392,7 +1393,7 @@ pub async fn run<R, W>(
                         publish_status(&ctrl, &status_tx);
                         continue;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                     ctrl.locate_requested = true;
                     publish_status(&ctrl, &status_tx);
                 }
@@ -1402,7 +1403,7 @@ pub async fn run<R, W>(
                     ctrl.v_move_pending = false;
                     if ctrl.v_busy {
                         let _ = send_cmd(&mut writer, &HscCommand::Kill(ctrl.v_id.clone())).await;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                     }
                     ctrl.v_busy = true;
                     let (pos_a, pos_b) = ctrl.v_raw_positions();
@@ -1413,7 +1414,7 @@ pub async fn run<R, W>(
                         publish_status(&ctrl, &status_tx);
                         continue;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
                     ctrl.locate_requested = true;
                     publish_status(&ctrl, &status_tx);
                 }
@@ -1433,7 +1434,7 @@ pub async fn run<R, W>(
                 };
 
                 tokio::select! {
-                    _ = tokio::time::sleep(poll) => {
+                    _ = epics_base_rs::runtime::task::sleep(poll) => {
                         ctrl.locate_requested = true;
                     }
                     cmd = cmd_rx.recv() => {

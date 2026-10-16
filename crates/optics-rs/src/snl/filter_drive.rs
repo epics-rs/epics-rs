@@ -11,7 +11,8 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 
 use crate::data::chantler::{find_material, transmission};
-use crate::db_access::{DbChannel, DbMultiMonitor};
+use crate::db_access::DbMultiMonitor;
+use epics_base_rs::server::snl::{PutQueue, SeqPv};
 
 /// Maximum number of filters supported.
 pub const MAX_FILTERS: usize = 32;
@@ -347,20 +348,20 @@ pub(super) const MBBO_STATE_FIELDS: [&str; 16] = [
 
 /// One channel per blade field the program assigns.
 struct BladeChannels {
-    thick: DbChannel,
+    thick: SeqPv,
     mater: String,
-    transm: DbChannel,
-    lock: DbChannel,
-    set: DbChannel,
-    enbl: DbChannel,
-    outget: DbChannel,
+    transm: SeqPv,
+    lock: SeqPv,
+    set: SeqPv,
+    enbl: SeqPv,
+    outget: SeqPv,
 }
 
 impl BladeChannels {
-    async fn read(&self, db: &PvDatabase) -> Blade {
+    async fn read(&self, queue: &PutQueue) -> Blade {
         Blade {
             thick: self.thick.get_f64().await,
-            mater: mbbo_string(db, &self.mater).await,
+            mater: mbbo_string(queue, &self.mater).await,
             lock: self.lock.get_i32().await,
             set: self.set.get_i32().await,
             enbl: self.enbl.get_i32().await,
@@ -369,17 +370,13 @@ impl BladeChannels {
     }
 }
 
-async fn mbbo_string(db: &PvDatabase, record: &str) -> String {
-    let idx = DbChannel::new(db, record).get_i32().await;
+async fn mbbo_string(queue: &PutQueue, record: &str) -> String {
+    let idx = queue.pv(record).get_i32().await;
     match usize::try_from(idx)
         .ok()
         .and_then(|i| MBBO_STATE_FIELDS.get(i))
     {
-        Some(field) => {
-            DbChannel::new(db, &format!("{record}.{field}"))
-                .get_string()
-                .await
-        }
+        Some(field) => queue.pv(&format!("{record}.{field}")).get_string().await,
         None => "Illegal Value".into(),
     }
 }
@@ -421,13 +418,15 @@ impl Names {
 
 /// Take every monitor already queued, raising the flags it is synced to.
 async fn poll(monitor: &mut DbMultiMonitor, names: &Names, flags: &mut Flags) {
-    while let Ok((pv, _)) = tokio::time::timeout(Duration::ZERO, monitor.wait_change()).await {
+    while let Ok((pv, _)) =
+        epics_base_rs::runtime::task::timeout(Duration::ZERO, monitor.wait_change()).await
+    {
         names.raise(flags, &pv);
     }
 }
 
-fn sleep_secs(secs: f64) -> tokio::time::Sleep {
-    tokio::time::sleep(epics_base_rs::runtime::time::duration_from_secs(secs))
+fn sleep_secs(secs: f64) -> impl std::future::Future<Output = ()> {
+    epics_base_rs::runtime::task::sleep(epics_base_rs::runtime::time::duration_from_secs(secs))
 }
 
 /// Async entry point — runs the filter_drive state machine against live PVs.
@@ -438,7 +437,8 @@ pub async fn run(
     let name = config.name.as_str();
     let pr = format!("{}{}", config.prefix, config.record);
     let n = config.num_filters;
-    let ch = |leaf: &str| DbChannel::new(&db, &format!("{pr}{leaf}"));
+    let queue = PutQueue::new(&db, "filterDrive");
+    let ch = |leaf: &str| queue.pv(&format!("{pr}{leaf}"));
 
     let ch_status = ch("Status");
     let ch_nfilters = ch("NumFilters");
@@ -463,13 +463,13 @@ pub async fn run(
     sleep_secs(1.0).await;
     let blades_ch: Vec<BladeChannels> = (1..=n)
         .map(|i| BladeChannels {
-            thick: DbChannel::new(&db, &config.blade_pv(i, "Thickness")),
+            thick: queue.pv(&config.blade_pv(i, "Thickness")),
             mater: config.blade_pv(i, "Material"),
-            transm: DbChannel::new(&db, &config.blade_pv(i, "Transmission")),
-            lock: DbChannel::new(&db, &config.blade_pv(i, "Lock")),
-            set: DbChannel::new(&db, &config.blade_pv(i, "Set")),
-            enbl: DbChannel::new(&db, &config.blade_pv(i, "Enable")),
-            outget: DbChannel::new(&db, &config.blade_pv(i, "OutGet")),
+            transm: queue.pv(&config.blade_pv(i, "Transmission")),
+            lock: queue.pv(&config.blade_pv(i, "Lock")),
+            set: queue.pv(&config.blade_pv(i, "Set")),
+            enbl: queue.pv(&config.blade_pv(i, "Enable")),
+            outget: queue.pv(&config.blade_pv(i, "OutGet")),
         })
         .collect();
     let names = Names {
@@ -562,7 +562,7 @@ pub async fn run(
                 let outget = b.outget.get_f64().await as i32;
                 poll(&mut monitor, &names, &mut flags).await;
                 flags.external_io = false;
-                let mut blade = b.read(&db).await;
+                let mut blade = b.read(&queue).await;
                 if blade.set != outget {
                     // Only on a difference: the put processes Set, whose busy
                     // link would bring the program straight back here.
@@ -603,7 +603,7 @@ pub async fn run(
         }
         let mut blades = Vec::with_capacity(n);
         for b in &blades_ch {
-            blades.push(b.read(&db).await);
+            blades.push(b.read(&queue).await);
         }
         let setpt = ch_setpt.get_f64().await;
         let mask_setpt = ch_mask_setpt.get_f64().await as i32;

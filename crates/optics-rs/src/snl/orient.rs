@@ -861,7 +861,8 @@ pub async fn run(
     config: OrientConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::time::{Duration, sleep};
+    use epics_base_rs::runtime::task::sleep;
+    use std::time::Duration;
 
     println!("orient: starting for prefix={}", config.prefix);
 

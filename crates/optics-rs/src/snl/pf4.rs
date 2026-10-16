@@ -11,7 +11,8 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
 
 use crate::data::chantler::{find_material, other_absorption_length_um};
-use crate::db_access::{DbChannel, DbMultiMonitor};
+use crate::db_access::DbMultiMonitor;
+use epics_base_rs::server::snl::{PutQueue, SeqPv};
 
 /// Number of filter combinations per bank (4 bits = 16).
 pub const NUM_COMBINATIONS: usize = 16;
@@ -453,13 +454,15 @@ fn take_first(flags: &mut [bool], order: impl IntoIterator<Item = usize>) -> boo
 
 /// Take every monitor already queued, raising the flags it is synced to.
 async fn poll(monitor: &mut DbMultiMonitor, names: &Names, flags: &mut Flags) {
-    while let Ok((pv, _)) = tokio::time::timeout(Duration::ZERO, monitor.wait_change()).await {
+    while let Ok((pv, _)) =
+        epics_base_rs::runtime::task::timeout(Duration::ZERO, monitor.wait_change()).await
+    {
         names.raise(flags, &pv);
     }
 }
 
-fn sleep_secs(secs: f64) -> tokio::time::Sleep {
-    tokio::time::sleep(epics_base_rs::runtime::time::duration_from_secs(secs))
+fn sleep_secs(secs: f64) -> impl std::future::Future<Output = ()> {
+    epics_base_rs::runtime::task::sleep(epics_base_rs::runtime::time::duration_from_secs(secs))
 }
 
 /// Wait for a monitor or for `deadline`, whichever is first.
@@ -467,11 +470,11 @@ async fn wait(
     monitor: &mut DbMultiMonitor,
     names: &Names,
     flags: &mut Flags,
-    deadline: tokio::time::Instant,
+    deadline: epics_base_rs::runtime::task::Instant,
 ) {
     tokio::select! {
         (pv, _) = monitor.wait_change() => names.raise(flags, &pv),
-        _ = tokio::time::sleep_until(deadline) => {}
+        _ = epics_base_rs::runtime::task::sleep_until(deadline) => {}
     }
 }
 
@@ -488,7 +491,7 @@ enum State {
 /// `DEBUG_PRINT` (`seqPVmacros.h`): the line, then a 10 ms sleep.
 struct Debug<'a> {
     name: &'a str,
-    flag: DbChannel,
+    flag: SeqPv,
 }
 
 impl Debug<'_> {
@@ -507,7 +510,8 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ph = format!("{}{}", config.prefix, config.hardware);
     let bk = config.bank.as_str();
-    let ch = |pv: &str| DbChannel::new(&db, pv);
+    let queue = PutQueue::new(&db, "pf4");
+    let ch = |pv: &str| queue.pv(pv);
     let blade = |what: &str, k: usize| format!("{ph}{what}{}{bk}", k + 1);
     let names = Names {
         b: std::array::from_fn(|k| config.bit_pv(k)),
@@ -522,13 +526,13 @@ pub async fn run(
         other: std::array::from_fn(|k| blade("Other", k)),
         other_show: format!("{ph}OtherShow"),
     };
-    let ch_b: [DbChannel; 4] = std::array::from_fn(|k| ch(&names.b[k]));
-    let ch_display_bit: [DbChannel; 4] = std::array::from_fn(|k| ch(&blade("displayBit", k)));
-    let ch_f: [DbChannel; 4] = std::array::from_fn(|k| ch(&names.f[k]));
-    let ch_z: [DbChannel; 4] = std::array::from_fn(|k| ch(&names.z[k]));
-    let ch_other: [DbChannel; 4] = std::array::from_fn(|k| ch(&names.other[k]));
-    let ch_other_legal: [DbChannel; 4] = std::array::from_fn(|k| ch(&blade("OtherLegal", k)));
-    let ch_label: [DbChannel; NUM_COMBINATIONS] = std::array::from_fn(|i| {
+    let ch_b: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.b[k]));
+    let ch_display_bit: [SeqPv; 4] = std::array::from_fn(|k| ch(&blade("displayBit", k)));
+    let ch_f: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.f[k]));
+    let ch_z: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.z[k]));
+    let ch_other: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.other[k]));
+    let ch_other_legal: [SeqPv; 4] = std::array::from_fn(|k| ch(&blade("OtherLegal", k)));
+    let ch_label: [SeqPv; NUM_COMBINATIONS] = std::array::from_fn(|i| {
         ch(&format!(
             "{}.{}",
             names.filpos,
@@ -539,7 +543,7 @@ pub async fn run(
     let ch_display_energy = ch(&format!("{ph}displayEnergy"));
     let ch_select = ch(&names.select);
     let ch_local = ch(&names.local);
-    let ch_filter: [DbChannel; 3] =
+    let ch_filter: [SeqPv; 3] =
         ["filterAl", "filterTi", "filterGlass"].map(|n| ch(&format!("{ph}{n}")));
     let ch_trans = ch(&format!("{ph}trans{bk}"));
     let ch_invtrans = ch(&format!("{ph}invTrans{bk}"));
@@ -549,7 +553,7 @@ pub async fn run(
     let ch_filpos = ch(&names.filpos);
     let ch_other_show = ch(&names.other_show);
     let ch_num_show = ch(&format!("{ph}E.NELM"));
-    let show_records = [format!("{ph}E"), format!("{ph}T")];
+    let show_records = [ch(&format!("{ph}E")), ch(&format!("{ph}T"))];
     let debug = Debug {
         name: &config.name,
         flag: ch(&names.debug),
@@ -574,7 +578,7 @@ pub async fn run(
         } else {
             off
         };
-        let _ = ch_bankctl.put_i16_process(v).await;
+        let _ = ch_bankctl.put_i16_sync(v).await;
         v
     };
 
@@ -582,11 +586,11 @@ pub async fn run(
     energytimeout = 0.0;
     let b = read_b().await;
     for k in 0..4 {
-        let _ = ch_display_bit[k].put_i32_process(b[k]).await;
+        let _ = ch_display_bit[k].put_i32_sync(b[k]).await;
     }
     let mono = ch_mono.get_f64().await;
-    let _ = ch_display_energy.put_f64_process(mono).await;
-    let _ = ch_local.put_f64_process(mono).await;
+    let _ = ch_display_energy.put_f64_sync(mono).await;
+    let _ = ch_local.put_f64_sync(mono).await;
     let mut flags = Flags::default();
     poll(&mut monitor, &names, &mut flags).await;
     // init clears every flag but these, which their connect-time monitors raised.
@@ -601,7 +605,7 @@ pub async fn run(
     loop {
         state = match state {
             State::Idle => {
-                let entered = tokio::time::Instant::now();
+                let entered = epics_base_rs::runtime::task::Instant::now();
                 let delay = epics_base_rs::runtime::time::duration_from_secs(IDLE_WAIT);
                 loop {
                     poll(&mut monitor, &names, &mut flags).await;
@@ -611,7 +615,7 @@ pub async fn run(
                         break State::Idle;
                     }
                     if std::mem::take(&mut flags.local) {
-                        let _ = ch_select.put_i32_process(0).await;
+                        let _ = ch_select.put_i32_sync(0).await;
                         sleep_secs(PVPUT_WAIT).await;
                         poll(&mut monitor, &names, &mut flags).await;
                         flags.select = false;
@@ -625,7 +629,7 @@ pub async fn run(
                     if std::mem::take(&mut flags.select) {
                         let select = ch_select.get_i32().await;
                         if select != 0 {
-                            let _ = ch_local.put_f64_process(ch_mono.get_f64().await).await;
+                            let _ = ch_local.put_f64_sync(ch_mono.get_f64().await).await;
                             sleep_secs(PVPUT_WAIT).await;
                             poll(&mut monitor, &names, &mut flags).await;
                             flags.local = false;
@@ -637,9 +641,9 @@ pub async fn run(
                     }
                     if std::mem::take(&mut flags.mono) {
                         let mono = ch_mono.get_f64().await;
-                        let _ = ch_display_energy.put_f64_process(mono).await;
+                        let _ = ch_display_energy.put_f64_sync(mono).await;
                         if ch_select.get_i32().await != 0 {
-                            let _ = ch_local.put_f64_process(mono).await;
+                            let _ = ch_local.put_f64_sync(mono).await;
                             sleep_secs(PVPUT_WAIT).await;
                             poll(&mut monitor, &names, &mut flags).await;
                             flags.local = false;
@@ -696,7 +700,7 @@ pub async fn run(
                         debug.print(2, 428, &msg).await;
                         for k in 0..4 {
                             let legal = i16::from(is_legal_other(&other[k]));
-                            let _ = ch_other_legal[k].put_i16_process(legal).await;
+                            let _ = ch_other_legal[k].put_i16_sync(legal).await;
                         }
                         put_bankctl(3, 0).await;
                         break State::Idle;
@@ -735,14 +739,9 @@ pub async fn run(
                         let n = usize::try_from(ch_num_show.get_i32().await).unwrap_or(0);
                         let [e, t] = &mut show;
                         if fill_show_arrays(&species, n, e, t) {
-                            for (rec, arr) in show_records.iter().zip(&show) {
-                                let _ = db
-                                    .put_record_field_from_ca(
-                                        rec,
-                                        "VAL",
-                                        EpicsValue::FloatArray(arr.to_vec().into()),
-                                    )
-                                    .await;
+                            // `pvPut(showEnergy)`, `pvPut(showTransmission)`: DEFAULT.
+                            for (pv, arr) in show_records.iter().zip(&show) {
+                                let _ = pv.put(EpicsValue::FloatArray(arr.to_vec().into()));
                             }
                         }
                         break State::Idle;
@@ -755,13 +754,13 @@ pub async fn run(
             State::FilterBits => {
                 let b = read_b().await;
                 for k in 0..4 {
-                    let _ = ch_display_bit[k].put_i32_process(b[k]).await;
+                    let _ = ch_display_bit[k].put_i32_sync(b[k]).await;
                 }
                 let pattern = (b[3] << 3) | (b[2] << 2) | (b[1] << 1) | b[0];
                 let filpos = find_position(&bits, pattern);
-                let _ = ch_filpos.put_i16_process(filpos as i16).await;
-                let _ = ch_bitflg.put_i32_process(1 << filpos).await;
-                let _ = ch_bitsts.put_i16_process(i16::from(bits[filpos])).await;
+                let _ = ch_filpos.put_i16_sync(filpos as i16).await;
+                let _ = ch_bitflg.put_i32_sync(1 << filpos).await;
+                let _ = ch_bitsts.put_i16_sync(i16::from(bits[filpos])).await;
                 put_bankctl(2, 0).await;
                 poll(&mut monitor, &names, &mut flags).await;
                 flags.filpos = false;
@@ -774,19 +773,19 @@ pub async fn run(
                 let pattern = bits[filpos];
                 for k in 0..4 {
                     if pattern & (1 << k) != 0 {
-                        let _ = ch_b[k].put_i32_process(1).await;
-                        let _ = ch_display_bit[k].put_i32_process(1).await;
+                        let _ = ch_b[k].put_i32_sync(1).await;
+                        let _ = ch_display_bit[k].put_i32_sync(1).await;
                     }
                 }
                 sleep_secs(FILTER_WAIT).await;
                 for k in 0..4 {
                     if pattern & (1 << k) == 0 {
-                        let _ = ch_b[k].put_i32_process(0).await;
-                        let _ = ch_display_bit[k].put_i32_process(0).await;
+                        let _ = ch_b[k].put_i32_sync(0).await;
+                        let _ = ch_display_bit[k].put_i32_sync(0).await;
                     }
                 }
-                let _ = ch_bitflg.put_i32_process(1 << filpos).await;
-                let _ = ch_bitsts.put_i16_process(i16::from(pattern)).await;
+                let _ = ch_bitflg.put_i32_sync(1 << filpos).await;
+                let _ = ch_bitsts.put_i16_sync(i16::from(pattern)).await;
                 poll(&mut monitor, &names, &mut flags).await;
                 flags.b = [false; 4];
                 State::RecalcBank
@@ -816,17 +815,17 @@ pub async fn run(
                             {
                                 if z.contains(&mat) {
                                     let thick = thickness_by_material(mat, true, b, z, f);
-                                    let _ = ch.put_f64_process(thick).await;
+                                    let _ = ch.put_f64_sync(thick).await;
                                 }
                             }
                             let filpos = filpos_index(ch_filpos.get_i16().await);
                             let trans = xmit[filpos];
-                            let _ = ch_trans.put_f64_process(trans).await;
+                            let _ = ch_trans.put_f64_sync(trans).await;
                             if trans > 0.0 {
-                                let _ = ch_invtrans.put_f64_process(1.0 / trans).await;
+                                let _ = ch_invtrans.put_f64_sync(1.0 / trans).await;
                             }
-                            let _ = ch_bitsts.put_i16_process(i16::from(bits[filpos])).await;
-                            let _ = ch_bitflg.put_i32_process(1 << filpos).await;
+                            let _ = ch_bitsts.put_i16_sync(i16::from(bits[filpos])).await;
+                            let _ = ch_bitflg.put_i32_sync(1 << filpos).await;
                             let v = put_bankctl(1, 0).await;
                             format!("filter bank changed value to {v}")
                         }
@@ -847,9 +846,9 @@ pub async fn run(
                             (xmit, bits) =
                                 recalc_filters(local, &cfg, true, debug.flag.get_i32().await);
                             for (label, x) in ch_label.iter().zip(xmit) {
-                                let _ = label.put_string_process(&fmt_e(x, 3, false)).await;
+                                let _ = label.put_string_sync(&fmt_e(x, 3, false)).await;
                             }
-                            let _ = ch_bankctl.put_i16_process(2).await;
+                            let _ = ch_bankctl.put_i16_sync(2).await;
                             "filter bank changed value to 2".to_string()
                         }
                         _ => format!("invalid filter bank value of {bankctl}"),
@@ -861,14 +860,14 @@ pub async fn run(
 
             // `bankOff` (`pf4.st:326-341`).
             State::BankOff => {
-                let mut entered = tokio::time::Instant::now();
+                let mut entered = epics_base_rs::runtime::task::Instant::now();
                 let delay = epics_base_rs::runtime::time::duration_from_secs(IDLE_WAIT);
                 loop {
                     poll(&mut monitor, &names, &mut flags).await;
                     let bankctl = ch_bankctl.get_i16().await;
                     if bankctl != 0 {
                         let mono = ch_mono.get_f64().await;
-                        let _ = ch_display_energy.put_f64_process(mono).await;
+                        let _ = ch_display_energy.put_f64_sync(mono).await;
                         poll(&mut monitor, &names, &mut flags).await;
                         flags.local = false;
                         let msg = format!("filter bank switched on ({bankctl})");
@@ -876,7 +875,7 @@ pub async fn run(
                         break State::RecalcBank;
                     }
                     if entered.elapsed() >= delay {
-                        entered = tokio::time::Instant::now();
+                        entered = epics_base_rs::runtime::task::Instant::now();
                         continue;
                     }
                     wait(&mut monitor, &names, &mut flags, entered + delay).await;
@@ -894,7 +893,7 @@ fn filpos_index(filpos: i16) -> usize {
         .min(NUM_COMBINATIONS - 1)
 }
 
-async fn blades(ch_z: &[DbChannel; 4], ch_f: &[DbChannel; 4]) -> ([u8; 4], [f64; 4]) {
+async fn blades(ch_z: &[SeqPv; 4], ch_f: &[SeqPv; 4]) -> ([u8; 4], [f64; 4]) {
     let mut z = [0u8; 4];
     let mut f = [0.0; 4];
     for k in 0..4 {

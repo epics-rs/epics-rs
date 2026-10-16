@@ -15,12 +15,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_base_rs::calc::engine::cvt::fmt_f;
+use epics_base_rs::runtime::task::Instant;
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::Notify;
-use tokio::time::Instant;
 
-use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
+use crate::db_access::{DbMultiMonitor, alloc_origin};
 use crate::snl::kohzu_ctl::{HC, update_set};
+use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 
 /// `radConv`, as C sets it in state `init` (ml_monoCtl.st:537).
 const RAD_CONV: f64 = 57.2958;
@@ -286,7 +287,7 @@ fn table(cfg: &MlMonoConfig) -> Vec<(String, Decl)> {
 /// written as its monitor arrives and raises the flag `sync`ed to it; the
 /// others hold what the program last assigned (0 until then).
 struct Vars {
-    chans: Vec<DbChannel>,
+    chans: Vec<SeqPv>,
     decls: Vec<Decl>,
     val: [f64; N_VARS],
     flag: [bool; N_VARS],
@@ -297,7 +298,13 @@ struct Vars {
 impl Vars {
     /// Subscribe the monitored variables among `watch`. Their connect-time
     /// monitors raise their flags, so each found starts raised.
-    async fn new(db: &PvDatabase, cfg: &MlMonoConfig, origin: u64, watch: &[usize]) -> Self {
+    async fn new(
+        db: &PvDatabase,
+        ss: &StateSet,
+        cfg: &MlMonoConfig,
+        origin: u64,
+        watch: &[usize],
+    ) -> Self {
         let table = table(cfg);
         let mut val = [0.0; N_VARS];
         let mut flag = [false; N_VARS];
@@ -318,7 +325,7 @@ impl Vars {
         Self {
             chans: table
                 .iter()
-                .map(|(pv, _)| DbChannel::with_origin(db, pv, origin))
+                .map(|(pv, _)| ss.pv_with_origin(pv, origin))
                 .collect(),
             decls: table.iter().map(|(_, d)| *d).collect(),
             val,
@@ -337,8 +344,11 @@ impl Vars {
 
     /// Take every monitor already queued.
     async fn poll(&mut self) {
-        while let Ok((pv, v)) =
-            tokio::time::timeout(std::time::Duration::ZERO, self.monitor.wait_change()).await
+        while let Ok((pv, v)) = epics_base_rs::runtime::task::timeout(
+            std::time::Duration::ZERO,
+            self.monitor.wait_change(),
+        )
+        .await
         {
             self.take(&pv, v);
         }
@@ -349,7 +359,7 @@ impl Vars {
         let (pv, v) = match deadline {
             Some(at) => tokio::select! {
                 r = self.monitor.wait_change() => r,
-                _ = tokio::time::sleep_until(at) => return,
+                _ = epics_base_rs::runtime::task::sleep_until(at) => return,
             },
             None => self.monitor.wait_change().await,
         };
@@ -415,22 +425,33 @@ pub async fn run(
     config: MlMonoConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let queue = PutQueue::new(&db, "ml_monoCtl");
     let use_set_pv = config.pv("UseSet");
+    let update_set_ss = queue.state_set("updateSet");
     let use_set_mode = Arc::new(AtomicBool::new(
-        DbChannel::new(&db, &use_set_pv).get_i16().await != 0,
+        update_set_ss.pv(&use_set_pv).get_i16().await != 0,
     ));
     // updateSet (ml_monoCtl.st:1262-1305).
     let update_set = update_set(
         db.clone(),
+        update_set_ss,
         use_set_pv,
         [&config.m_theta, &config.m_theta2, &config.m_z].map(|m| config.motor_pv(m, ".SET")),
         use_set_mode.clone(),
     );
     let pseudo = Arc::new(Pseudo::default());
-    let main = MlMono::new(&config, &db, use_set_mode, pseudo.clone()).await;
+    let main = MlMono::new(
+        &config,
+        &db,
+        &queue.state_set("ml_monoCtl"),
+        use_set_mode,
+        pseudo.clone(),
+    )
+    .await;
+    let update_pseudo_ss = queue.state_set("updatePsuedo");
     tokio::select! {
         () = main.run() => Ok(()),
-        () = update_pseudo(&config, &db, &pseudo) => Ok(()),
+        () = update_pseudo(&config, &db, &update_pseudo_ss, &pseudo) => Ok(()),
         () = update_set => Ok(()),
     }
 }
@@ -445,7 +466,7 @@ struct Pseudo {
 }
 
 /// ss updatePsuedo (ml_monoCtl.st:1191-1255).
-async fn update_pseudo(cfg: &MlMonoConfig, db: &PvDatabase, pseudo: &Pseudo) {
+async fn update_pseudo(cfg: &MlMonoConfig, db: &PvDatabase, ss: &StateSet, pseudo: &Pseudo) {
     let watch = [
         TH_RBV,
         TH2_RBV,
@@ -461,7 +482,7 @@ async fn update_pseudo(cfg: &MlMonoConfig, db: &PvDatabase, pseudo: &Pseudo) {
         TH2_DMOV,
         Z_DMOV,
     ];
-    let mut v = Vars::new(db, cfg, alloc_origin(), &watch).await;
+    let mut v = Vars::new(db, ss, cfg, alloc_origin(), &watch).await;
     let echoes = [
         (Z_RBV, Z_RDBK_ECHO),
         (Y_RBV, Y_OFFSET),
@@ -519,9 +540,9 @@ enum State {
 /// ss ml_monoCtl and its program variables.
 struct MlMono {
     v: Vars,
-    seq_msg1: DbChannel,
-    seq_msg2: DbChannel,
-    mot_names: [(DbChannel, String); 4],
+    seq_msg1: SeqPv,
+    seq_msg2: SeqPv,
+    mot_names: [(SeqPv, String); 4],
     y_off: f64,
     use_set_mode: Arc<AtomicBool>,
     pseudo: Arc<Pseudo>,
@@ -541,15 +562,16 @@ impl MlMono {
     async fn new(
         cfg: &MlMonoConfig,
         db: &PvDatabase,
+        ss: &StateSet,
         use_set_mode: Arc<AtomicBool>,
         pseudo: Arc<Pseudo>,
     ) -> Self {
         let origin = alloc_origin();
         let all: Vec<usize> = (0..N_VARS).collect();
-        let ch = |suffix: &str| DbChannel::with_origin(db, &cfg.pv(suffix), origin);
+        let ch = |suffix: &str| ss.pv_with_origin(&cfg.pv(suffix), origin);
         let name = |suffix: &str, motor: &str| (ch(suffix), format!("{}{}", cfg.prefix, motor));
         Self {
-            v: Vars::new(db, cfg, origin, &all).await,
+            v: Vars::new(db, ss, cfg, origin, &all).await,
             seq_msg1: ch("SeqMsg1"),
             seq_msg2: ch("SeqMsg2"),
             mot_names: [

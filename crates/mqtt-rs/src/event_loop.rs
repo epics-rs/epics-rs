@@ -83,7 +83,10 @@ pub async fn mqtt_event_loop(
     // paho's `connectTimeout` in C's v5 connect options (MQTTAsync.h:1394).
     mqttoptions.set_connect_timeout(Duration::from_secs(30));
 
-    let (client, mut eventloop) = AsyncClient::builder(mqttoptions).capacity(256).build();
+    // Unbounded, as paho's command queue is: the ConnAck arm queues one
+    // SUBSCRIBE per bound topic from the task that drains the channel, so a
+    // bound refused every topic past it.
+    let (client, mut eventloop) = AsyncClient::builder(mqttoptions).unbounded().build();
 
     // `EventLoop::poll()` is not cancel-safe (rumqttc internal iterators can be
     // left half-advanced if the future is dropped mid-poll), so we must never
@@ -1699,6 +1702,138 @@ mod tests {
         assert!(!log().contains("Connection lost"), "{}", log());
         // paho calls only `onFailure5` for the refused filter.
         assert!(!log().contains("Subscribed to topic"), "{}", log());
+
+        runtime.shutdown();
+        assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
+        tokio::time::timeout(Duration::from_secs(10), ev)
+            .await
+            .expect("event loop did not exit")
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// paho queues every `onConnectCb` subscribe however many there are: 300
+    /// `I/O Intr` topics give 300 SUBSCRIBEs and 300 `onSubscribeCb` lines.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_bound_topic_is_subscribed_past_the_request_channel() {
+        use asyn_rs::interrupt::InterruptFilter;
+        use asyn_rs::port::PortDriver;
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+        use tokio::io::AsyncWriteExt;
+
+        const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
+        const TOPICS: usize = 300;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = MqttConfig {
+            broker_host: "127.0.0.1".into(),
+            broker_port: listener.local_addr().unwrap().port(),
+            client_id: "many-topics".into(),
+            keep_alive_secs: 3600,
+            ..MqttConfig::default()
+        };
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let mut driver = crate::driver::MqttDriver::new(
+            "MQMANY",
+            &config,
+            Vec::new(),
+            publish_tx,
+            connected.clone(),
+        );
+        let reasons: Vec<usize> = (0..TOPICS)
+            .map(|i| {
+                driver
+                    .drv_user_create(&asyn_rs::port::DrvUserRequest::new(
+                        format!("FLAT:INT dev/t{i}"),
+                        0,
+                    ))
+                    .unwrap()
+                    .reason
+            })
+            .collect();
+        let topic_map = driver.topic_map();
+        let connected_param = driver.connected_param;
+        let shutdown = driver.shutdown_signal();
+        let teardown_done = driver.teardown_ack();
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+            driver,
+            asyn_rs::runtime::config::RuntimeConfig {
+                services,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("mqmany-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("MQMANY"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some("MQMANY"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let _bindings: Vec<_> = reasons
+            .iter()
+            .map(|&reason| {
+                runtime.port_handle().interrupts().register_sync_callback(
+                    InterruptFilter {
+                        reason: Some(reason),
+                        addr: Some(0),
+                        ..Default::default()
+                    },
+                    |_| {},
+                )
+            })
+            .collect();
+
+        let port_handle = runtime.port_handle().clone();
+        let start = Arc::new(Notify::new());
+        let loop_start = start.clone();
+        let ev = tokio::spawn(async move {
+            mqtt_event_loop(
+                config,
+                topic_map,
+                port_handle,
+                publish_rx,
+                connected_param,
+                connected,
+                Lifecycle {
+                    start: loop_start,
+                    shutdown,
+                    done: teardown_done,
+                },
+            )
+            .await;
+        });
+        start.notify_one();
+
+        let (mut sock, _) = listener.accept().await.unwrap();
+        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        sock.write_all(&CONNACK).await.unwrap();
+        let log = || std::fs::read_to_string(&path).unwrap();
+        let mut topics = HashSet::new();
+        while topics.len() < TOPICS {
+            let (kind, body) = tokio::time::timeout(Duration::from_secs(5), read_packet(&mut sock))
+                .await
+                .unwrap_or_else(|_| panic!("{} of {TOPICS} subscribed:\n{}", topics.len(), log()))
+                .unwrap();
+            assert_eq!(kind, 8, "SUBSCRIBE");
+            // Packet id, an empty property list, then the one filter.
+            let len = usize::from(u16::from_be_bytes([body[3], body[4]]));
+            topics.insert(String::from_utf8(body[5..5 + len].to_vec()).unwrap());
+            sock.write_all(&[0x90, 0x04, body[0], body[1], 0x00, 0x00])
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while log().matches("onSubscribeCb: Subscribed to topic").count() < TOPICS {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fewer than {TOPICS} onSubscribeCb lines in:\n{}", log()));
+        assert!(!log().contains("onFailCb"), "{}", log());
 
         runtime.shutdown();
         assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");

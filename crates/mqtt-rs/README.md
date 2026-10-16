@@ -217,7 +217,7 @@ and masks, so `asynSetTraceMask` / `asynSetTraceFile` govern them:
 | Broker refused a subscribe or publish (SUBACK/PUBACK/PUBREC/PUBCOMP reason ≥ 0x80); the session stays up | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: '` |
 | ConnAck after a loss | `ERROR\|DRIVER` | `MqttDriver::onConnectCb: Reconnected.` |
 | Every ConnAck | `DRIVER` | `MqttDriver::onConnectCb: Connected to broker` |
-| Subscribe / publish handed to the client | `DRIVER` | `MqttDriver::onSubscribeCb: Subscribed to topic '<t>'` / `MqttDriver::onPublishCb: Published to topic '<t>'` |
+| SUBACK granted / PUBLISH acked (QoS 0: written, QoS 1: PUBACK, QoS 2: PUBCOMP) | `DRIVER` | `MqttDriver::onSubscribeCb: Subscribed to topic '<t>'` / `MqttDriver::onPublishCb: Published to topic '<t>'` |
 | Inbound payload a record cannot take | `ERROR` | `MqttDriver::onMessageCb: ...` |
 | Write failed | `ERROR` | `MqttDriver::<x>Write: Failed to set value for topic '<t>': ...` |
 

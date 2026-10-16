@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::param::ParamValue;
@@ -8,8 +8,11 @@ use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
 use rumqttc::Outgoing;
-use rumqttc::v5::mqttbytes::v5::{PubAckReason, PubCompReason, PubRecReason, SubscribeReasonCode};
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
+use rumqttc::v5::mqttbytes::v5::{
+    Filter, PubAckReason, PubCompReason, PubRecReason, Subscribe, SubscribeReasonCode,
+};
+use rumqttc::v5::mqttbytes::valid_filter;
+use rumqttc::v5::{AsyncClient, Event, EventLoop, Incoming, MqttOptions, Request};
 use tokio::sync::{Notify, mpsc};
 
 use crate::address::{PayloadFormat, TopicAddress, ValueType};
@@ -79,10 +82,12 @@ pub async fn mqtt_event_loop(
     // left half-advanced if the future is dropped mid-poll), so we must never
     // drive it inside a `tokio::select!`. Instead, outbound publishes are
     // forwarded on a dedicated task, and the main loop only awaits `poll()`.
+    let mut acks = AckTopics::default();
     tokio::spawn(publish_task(
         client.clone(),
         publish_rx,
         port_handle.clone(),
+        acks.published.clone(),
     ));
 
     // MQ4 shutdown. C's `~MqttClient` calls `disconnect()`
@@ -181,7 +186,8 @@ pub async fn mqtt_event_loop(
                     ),
                 }
             }
-            Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+            Ok(Event::Incoming(Incoming::ConnAck(connack))) => {
+                acks.connected(&mut eventloop, connack.session_present);
                 mark_connected(&port_handle, connected_param, &connected).await;
                 backoff.connected();
                 if session == Session::Lost {
@@ -206,15 +212,18 @@ pub async fn mqtt_event_loop(
                     &reason_to_topic,
                     &port_handle.interrupts().subscribed_bindings(),
                 );
-                // Spawn subscribe so we return to `poll()` immediately — the
-                // event loop is the only thing that drains rumqttc's command
-                // channel, so awaiting subscribe inline risks stalling.
-                let sub_client = client.clone();
-                let sub_qos = config.qos;
-                let sub_port = port_handle.clone();
-                tokio::spawn(async move {
-                    subscribe_all(&sub_client, &sub_topics, sub_qos, &sub_port).await;
-                });
+                for topic in sub_topics {
+                    if let Err(topic) = acks.subscribe(&mut eventloop, topic, config.qos.into()) {
+                        // The filter `AsyncClient::subscribe` refuses.
+                        asyn_print(
+                            &port_handle,
+                            TraceMask::ERROR,
+                            format_args!(
+                                "MqttDriver::onFailCb: MQTT Operation error: 'Error: invalid topic filter {topic}'"
+                            ),
+                        );
+                    }
+                }
             }
             Ok(Event::Incoming(Incoming::PingResp(_))) => {
                 if session != Session::Up {
@@ -225,12 +234,33 @@ pub async fn mqtt_event_loop(
                     session = Session::Up;
                 }
             }
-            Ok(Event::Incoming(ack)) if ack_refused(&ack) => asyn_print(
-                &port_handle,
-                TraceMask::ERROR,
-                // paho hands `onFailure5` no message, so C's text is empty.
-                format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: '"),
-            ),
+            Ok(Event::Incoming(
+                ack @ (Incoming::SubAck(_)
+                | Incoming::PubAck(_)
+                | Incoming::PubRec(_)
+                | Incoming::PubComp(_)),
+            )) => match acks.acked(&ack) {
+                AckLine::None => {}
+                AckLine::Subscribed(topic) => asyn_print(
+                    &port_handle,
+                    TraceMask::IO_DRIVER,
+                    format_args!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'"),
+                ),
+                AckLine::Published(topic) => print_published(&port_handle, &topic),
+                AckLine::Refused => asyn_print(
+                    &port_handle,
+                    TraceMask::ERROR,
+                    // paho hands `onFailure5` no message, so C's text is empty.
+                    format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: '"),
+                ),
+            },
+            Ok(Event::Outgoing(sent)) if !matches!(sent, Outgoing::Disconnect) => {
+                // paho's QoS 0 `onSuccess` fires once the PUBLISH is written
+                // (MQTTAsyncUtils.c:1474-1500).
+                if let Some(topic) = acks.sent(&sent) {
+                    print_published(&port_handle, &topic);
+                }
+            }
             Ok(Event::Outgoing(Outgoing::Disconnect)) => {
                 tracing::info!("MQTT DISCONNECT sent; event loop exiting");
                 break;
@@ -243,6 +273,7 @@ pub async fn mqtt_event_loop(
                     tracing::info!("MQTT event loop exiting while disconnected: {e}");
                     break;
                 }
+                acks.lost(&eventloop);
                 // `onDisconnectCb`'s `reconnect()` retries a lost session at
                 // once; every failed attempt waits out paho's backoff.
                 let wait = if session == Session::Up {
@@ -329,6 +360,158 @@ fn ack_refused(incoming: &Incoming) -> bool {
         Incoming::PubComp(ack) => ack.reason != PubCompReason::Success,
         _ => false,
     }
+}
+
+/// The topic of every SUBSCRIBE and PUBLISH still owed its ack, so the success
+/// line is printed from the ack as paho's `onSuccess` is (mqttClient.cpp
+/// `on_success`), and a refused ack prints only `onFailCb`.
+///
+/// rumqttc's events name a packet by pkid alone, so topics are matched to
+/// pkids in request order: this loop is the only producer of SUBSCRIBE (it
+/// queues them on `EventLoop::pending` itself) and `publish_task` the only one
+/// of PUBLISH.
+#[derive(Default)]
+struct AckTopics {
+    /// SUBSCRIBEs on `EventLoop::pending`, in order.
+    subscribing: VecDeque<String>,
+    /// PUBLISHes `publish_task` sent that rumqttc has not yet taken, in order.
+    published: Arc<Mutex<VecDeque<String>>>,
+    /// Of `published`, how many lead it on `EventLoop::pending`: rumqttc
+    /// drained them from its channel at the last loss, and drops them if the
+    /// broker starts a new session.
+    published_pending: usize,
+    /// A PUBLISH rumqttc holds back on a pkid collision, sent after that
+    /// pkid's ack.
+    collided: Option<(u16, String)>,
+    sub_pkids: HashMap<u16, String>,
+    pub_pkids: HashMap<u16, String>,
+}
+
+enum AckLine {
+    None,
+    Subscribed(String),
+    Published(String),
+    Refused,
+}
+
+impl AckTopics {
+    /// Queue one SUBSCRIBE; `Err` gives back a filter rumqttc's
+    /// `AsyncClient::subscribe` would refuse.
+    fn subscribe(
+        &mut self,
+        eventloop: &mut EventLoop,
+        topic: String,
+        qos: rumqttc::v5::mqttbytes::QoS,
+    ) -> Result<(), String> {
+        if !valid_filter(&topic) {
+            return Err(topic);
+        }
+        let request = Subscribe::new(Filter::new(topic.clone(), qos), None);
+        eventloop.pending.push_back(Request::Subscribe(request));
+        self.subscribing.push_back(topic);
+        Ok(())
+    }
+
+    /// rumqttc wrote a packet. Returns the topic of a QoS 0 PUBLISH, which no
+    /// ack follows.
+    fn sent(&mut self, sent: &Outgoing) -> Option<String> {
+        match *sent {
+            Outgoing::Subscribe(pkid) => {
+                if let Some(topic) = self.subscribing.pop_front() {
+                    self.sub_pkids.insert(pkid, topic);
+                }
+                None
+            }
+            Outgoing::Publish(0) => self.take_published(),
+            Outgoing::Publish(pkid) => {
+                match self.collided.take() {
+                    Some((held, topic)) if held == pkid => {
+                        self.pub_pkids.insert(pkid, topic);
+                    }
+                    other => {
+                        self.collided = other;
+                        // A pkid already owed an ack is a resumed session's
+                        // retransmission, not a new request.
+                        if !self.pub_pkids.contains_key(&pkid)
+                            && let Some(topic) = self.take_published()
+                        {
+                            self.pub_pkids.insert(pkid, topic);
+                        }
+                    }
+                }
+                None
+            }
+            Outgoing::AwaitAck(pkid) => {
+                self.collided = self.take_published().map(|topic| (pkid, topic));
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn take_published(&mut self) -> Option<String> {
+        self.published.lock().unwrap().pop_front()
+    }
+
+    /// An ack arrived. QoS 1 succeeds on PUBACK, QoS 2 on PUBCOMP
+    /// (MQTTAsyncUtils.c:3157-3209).
+    fn acked(&mut self, ack: &Incoming) -> AckLine {
+        let refused = ack_refused(ack);
+        let topic = match ack {
+            Incoming::SubAck(a) => self.sub_pkids.remove(&a.pkid),
+            Incoming::PubRec(a) if refused => self.pub_pkids.remove(&a.pkid),
+            Incoming::PubRec(_) => return AckLine::None,
+            Incoming::PubAck(a) => self.pub_pkids.remove(&a.pkid),
+            Incoming::PubComp(a) => self.pub_pkids.remove(&a.pkid),
+            _ => return AckLine::None,
+        };
+        match (refused, topic, ack) {
+            (true, _, _) => AckLine::Refused,
+            (false, Some(topic), Incoming::SubAck(_)) => AckLine::Subscribed(topic),
+            (false, Some(topic), _) => AckLine::Published(topic),
+            (false, None, _) => AckLine::None,
+        }
+    }
+
+    /// The network failed. rumqttc has just drained its channel onto
+    /// `pending`, behind the retransmissions; the drained PUBLISHes are the
+    /// ones not yet given a pkid.
+    fn lost(&mut self, eventloop: &EventLoop) {
+        self.published_pending = eventloop
+            .pending
+            .iter()
+            .filter(|r| matches!(r, Request::Publish(p) if p.pkid == 0))
+            .count();
+    }
+
+    /// A ConnAck. Without `session_present` rumqttc has cleared `pending`
+    /// (eventloop.rs:152-155) and no ack owed by the old session will come;
+    /// with it the retransmissions keep their pkids. SUBSCRIBEs are never
+    /// resumed, and this ConnAck queues them afresh.
+    fn connected(&mut self, eventloop: &mut EventLoop, session_present: bool) {
+        if session_present {
+            eventloop
+                .pending
+                .retain(|r| !matches!(r, Request::Subscribe(_)));
+        } else {
+            let mut published = self.published.lock().unwrap();
+            let n = self.published_pending.min(published.len());
+            published.drain(..n);
+            self.pub_pkids.clear();
+            self.collided = None;
+        }
+        self.published_pending = 0;
+        self.subscribing.clear();
+        self.sub_pkids.clear();
+    }
+}
+
+fn print_published(port_handle: &PortHandle, topic: &str) {
+    asyn_print(
+        port_handle,
+        TraceMask::IO_DRIVER,
+        format_args!("MqttDriver::onPublishCb: Published to topic '{topic}'"),
+    );
 }
 
 /// The session as paho's connect token sees it.
@@ -420,6 +603,7 @@ async fn publish_task(
     client: AsyncClient,
     mut publish_rx: mpsc::UnboundedReceiver<PublishRequest>,
     port_handle: PortHandle,
+    published: Arc<Mutex<VecDeque<String>>>,
 ) {
     while let Some(req) = publish_rx.recv().await {
         let PublishRequest {
@@ -432,19 +616,16 @@ async fn publish_task(
         // v5 publish wants `P: Into<Bytes>`; the owned `Vec<u8>` payload
         // satisfies it directly (no borrow held across the await), carrying raw
         // non-UTF-8 octet bytes through unchanged.
-        // C prints these from `onPublishCb` / `onFailCb` (drvMqtt.cpp:234,
-        // :241); here the success line marks the request handed to the client.
-        match client.publish(&topic, qos, retained, payload).await {
-            Ok(()) => asyn_print(
-                &port_handle,
-                TraceMask::IO_DRIVER,
-                format_args!("MqttDriver::onPublishCb: Published to topic '{topic}'"),
-            ),
-            Err(e) => asyn_print(
+        // Queued before the send so the event loop finds it when rumqttc takes
+        // the request; this task is the only sender of PUBLISH.
+        published.lock().unwrap().push_back(topic.clone());
+        if let Err(e) = client.publish(&topic, qos, retained, payload).await {
+            published.lock().unwrap().pop_back();
+            asyn_print(
                 &port_handle,
                 TraceMask::ERROR,
                 format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
-            ),
+            );
         }
     }
 }
@@ -665,30 +846,6 @@ fn subscribe_topics(
         }
     }
     topics
-}
-
-async fn subscribe_all(
-    client: &AsyncClient,
-    topics: &[String],
-    qos: crate::config::QoS,
-    port_handle: &PortHandle,
-) {
-    let rqos: rumqttc::v5::mqttbytes::QoS = qos.into();
-    for topic in topics {
-        // C: `onSubscribeCb` / `onFailCb` (drvMqtt.cpp:227, :234).
-        match client.subscribe(topic, rqos).await {
-            Ok(()) => asyn_print(
-                port_handle,
-                TraceMask::IO_DRIVER,
-                format_args!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'"),
-            ),
-            Err(e) => asyn_print(
-                port_handle,
-                TraceMask::ERROR,
-                format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
-            ),
-        }
-    }
 }
 
 /// C `asynPrint(pasynUserSelf, mask, ...)`: gated by this port's
@@ -1435,6 +1592,7 @@ mod tests {
             Some("MQSUBACK"),
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
+        trace.set_trace_mask(Some("MQSUBACK"), TraceMask::ERROR | TraceMask::IO_DRIVER);
         // An `I/O Intr` binding on the topic, so the ConnAck subscribes it.
         let _binding = runtime.port_handle().interrupts().register_sync_callback(
             InterruptFilter {
@@ -1500,6 +1658,8 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("the PUBLISH after the refusal never landed:\n{}", log()));
         assert!(!log().contains("Connection lost"), "{}", log());
+        // paho calls only `onFailure5` for the refused filter.
+        assert!(!log().contains("Subscribed to topic"), "{}", log());
 
         runtime.shutdown();
         assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
@@ -1624,5 +1784,186 @@ mod tests {
         assert_eq!(bases(&mut b, 2), [4, 8]);
         let wait = b.failed();
         assert!((13..=19).contains(&wait.as_secs()), "{wait:?}");
+    }
+
+    mod ack_topics {
+        use super::super::*;
+        use rumqttc::v5::mqttbytes::QoS as V5;
+        use rumqttc::v5::mqttbytes::v5::{PubAck, PubComp, PubRec, Publish, SubAck};
+
+        fn eventloop() -> EventLoop {
+            EventLoop::new(MqttOptions::new("acks", "127.0.0.1", 1), 10)
+        }
+
+        fn sent_publish(acks: &AckTopics, topic: &str) {
+            acks.published.lock().unwrap().push_back(topic.into());
+        }
+
+        fn suback(pkid: u16, code: SubscribeReasonCode) -> Incoming {
+            Incoming::SubAck(SubAck {
+                pkid,
+                return_codes: vec![code],
+                properties: None,
+            })
+        }
+
+        fn puback(pkid: u16, reason: PubAckReason) -> Incoming {
+            Incoming::PubAck(PubAck {
+                pkid,
+                reason,
+                properties: None,
+            })
+        }
+
+        fn line(l: AckLine) -> String {
+            match l {
+                AckLine::None => "none".into(),
+                AckLine::Subscribed(t) => format!("sub {t}"),
+                AckLine::Published(t) => format!("pub {t}"),
+                AckLine::Refused => "refused".into(),
+            }
+        }
+
+        #[test]
+        fn subscribed_only_on_a_granted_suback() {
+            let mut ev = eventloop();
+            let mut acks = AckTopics::default();
+            acks.subscribe(&mut ev, "a".into(), V5::AtLeastOnce)
+                .unwrap();
+            acks.subscribe(&mut ev, "b".into(), V5::AtLeastOnce)
+                .unwrap();
+            assert_eq!(ev.pending.len(), 2);
+            assert!(
+                acks.subscribe(&mut ev, "a/#/b".into(), V5::AtLeastOnce)
+                    .is_err()
+            );
+            assert_eq!(acks.sent(&Outgoing::Subscribe(4)), None);
+            assert_eq!(acks.sent(&Outgoing::Subscribe(5)), None);
+            let ok = SubscribeReasonCode::Success(V5::AtLeastOnce);
+            assert_eq!(
+                line(acks.acked(&suback(5, SubscribeReasonCode::NotAuthorized))),
+                "refused"
+            );
+            assert_eq!(line(acks.acked(&suback(4, ok))), "sub a");
+            // Each ack is spent once.
+            assert_eq!(line(acks.acked(&suback(4, ok))), "none");
+        }
+
+        #[test]
+        fn published_on_write_for_qos0_and_on_the_last_ack_otherwise() {
+            let mut acks = AckTopics::default();
+            for t in ["q0", "q1", "q2", "q1-refused"] {
+                sent_publish(&acks, t);
+            }
+            assert_eq!(acks.sent(&Outgoing::Publish(0)).as_deref(), Some("q0"));
+            assert_eq!(acks.sent(&Outgoing::Publish(1)), None);
+            assert_eq!(acks.sent(&Outgoing::Publish(2)), None);
+            assert_eq!(acks.sent(&Outgoing::Publish(3)), None);
+            assert_eq!(
+                line(acks.acked(&puback(1, PubAckReason::Success))),
+                "pub q1"
+            );
+            let pubrec = Incoming::PubRec(PubRec {
+                pkid: 2,
+                reason: PubRecReason::Success,
+                properties: None,
+            });
+            assert_eq!(line(acks.acked(&pubrec)), "none");
+            let pubcomp = Incoming::PubComp(PubComp {
+                pkid: 2,
+                reason: PubCompReason::Success,
+                properties: None,
+            });
+            assert_eq!(line(acks.acked(&pubcomp)), "pub q2");
+            assert_eq!(
+                line(acks.acked(&puback(3, PubAckReason::NotAuthorized))),
+                "refused"
+            );
+            assert!(acks.pub_pkids.is_empty());
+        }
+
+        #[test]
+        fn a_collided_publish_takes_its_topic_when_it_is_sent() {
+            let mut acks = AckTopics::default();
+            sent_publish(&acks, "first");
+            sent_publish(&acks, "held");
+            acks.sent(&Outgoing::Publish(1));
+            acks.sent(&Outgoing::AwaitAck(1));
+            assert_eq!(
+                line(acks.acked(&puback(1, PubAckReason::Success))),
+                "pub first"
+            );
+            acks.sent(&Outgoing::Publish(1));
+            assert_eq!(
+                line(acks.acked(&puback(1, PubAckReason::Success))),
+                "pub held"
+            );
+        }
+
+        /// A new session: rumqttc drops what it drained at the loss and no old
+        /// ack comes, so the next PUBLISH written is the one sent after.
+        #[test]
+        fn a_new_session_drops_the_drained_publishes() {
+            let mut ev = eventloop();
+            let mut acks = AckTopics::default();
+            for t in ["inflight", "drained", "later"] {
+                sent_publish(&acks, t);
+            }
+            acks.sent(&Outgoing::Publish(2));
+            ev.pending.push_back(Request::Publish(Publish::new(
+                "drained",
+                V5::AtLeastOnce,
+                "x",
+                None,
+            )));
+            acks.subscribe(&mut ev, "s".into(), V5::AtLeastOnce)
+                .unwrap();
+            acks.lost(&ev);
+            ev.pending.clear();
+            acks.connected(&mut ev, false);
+            assert_eq!(line(acks.acked(&puback(2, PubAckReason::Success))), "none");
+            acks.sent(&Outgoing::Publish(3));
+            assert_eq!(
+                line(acks.acked(&puback(3, PubAckReason::Success))),
+                "pub later"
+            );
+            assert!(acks.subscribing.is_empty());
+        }
+
+        /// A resumed session: the retransmission keeps its pkid and topic, the
+        /// drained PUBLISH is still sent, and the old SUBSCRIBE is not.
+        #[test]
+        fn a_resumed_session_keeps_retransmissions_and_requeues_subscribes() {
+            let mut ev = eventloop();
+            let mut acks = AckTopics::default();
+            for t in ["inflight", "drained"] {
+                sent_publish(&acks, t);
+            }
+            acks.sent(&Outgoing::Publish(2));
+            acks.subscribe(&mut ev, "s".into(), V5::AtLeastOnce)
+                .unwrap();
+            let mut retx = Publish::new("inflight", V5::AtLeastOnce, "x", None);
+            retx.pkid = 2;
+            ev.pending.push_back(Request::Publish(retx));
+            ev.pending.push_back(Request::Publish(Publish::new(
+                "drained",
+                V5::AtLeastOnce,
+                "x",
+                None,
+            )));
+            acks.lost(&ev);
+            acks.connected(&mut ev, true);
+            assert_eq!(ev.pending.len(), 2, "the old SUBSCRIBE is dropped");
+            acks.sent(&Outgoing::Publish(2));
+            acks.sent(&Outgoing::Publish(3));
+            assert_eq!(
+                line(acks.acked(&puback(2, PubAckReason::Success))),
+                "pub inflight"
+            );
+            assert_eq!(
+                line(acks.acked(&puback(3, PubAckReason::Success))),
+                "pub drained"
+            );
+        }
     }
 }

@@ -498,10 +498,7 @@ impl IocBuilder {
 
         // 4. Autosave restore
         if let Some(ref autosave_cfg) = self.autosave_config {
-            let count = autosave::restore_from_file(&db, &autosave_cfg.save_path).await?;
-            if count > 0 {
-                eprintln!("autosave: restored {count} PVs");
-            }
+            autosave::restore_from_file(&db, &autosave_cfg.save_path).await?;
         }
 
         // 4.5. C's `initDatabase` per-record pass: bind each record's dset and

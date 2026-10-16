@@ -1394,20 +1394,8 @@ impl IocBuild {
                 Box::new(move || {
                     Box::pin(async move {
                         for sav_path in &files {
-                            match autosave::restore_from_file(&db_p0, sav_path).await {
-                                Ok(count) if count > 0 => {
-                                    eprintln!(
-                                        "pass0 restore: {count} PVs from {}",
-                                        sav_path.display()
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "pass0 restore warning: {} - {e}",
-                                        sav_path.display()
-                                    );
-                                }
-                                _ => {}
+                            if let Err(e) = autosave::restore_from_file(&db_p0, sav_path).await {
+                                eprintln!("pass0 restore warning: {} - {e}", sav_path.display());
                             }
                         }
                     })
@@ -1425,31 +1413,13 @@ impl IocBuild {
                 Box::new(move || {
                     Box::pin(async move {
                         for sav_path in &files {
-                            match autosave::restore_from_file(&db_p1, sav_path).await {
-                                Ok(count) if count > 0 => {
-                                    eprintln!(
-                                        "pass1 restore: {count} PVs from {}",
-                                        sav_path.display()
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "pass1 restore warning: {} - {e}",
-                                        sav_path.display()
-                                    );
-                                }
-                                _ => {}
+                            if let Err(e) = autosave::restore_from_file(&db_p1, sav_path).await {
+                                eprintln!("pass1 restore warning: {} - {e}", sav_path.display());
                             }
                         }
                         if let Some(path) = cfg_path {
-                            match autosave::restore_from_file(&db_p1, &path).await {
-                                Ok(count) if count > 0 => {
-                                    eprintln!("autosave: restored {count} PVs");
-                                }
-                                Err(e) => {
-                                    eprintln!("autosave restore warning: {} - {e}", path.display());
-                                }
-                                _ => {}
+                            if let Err(e) = autosave::restore_from_file(&db_p1, &path).await {
+                                eprintln!("autosave restore warning: {} - {e}", path.display());
                             }
                         }
                     })

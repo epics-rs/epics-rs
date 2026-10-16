@@ -436,7 +436,6 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    eprintln!("set_pass0_restoreFile: {filename}");
                     h.lock()
                         .unwrap()
                         .pass0_restores
@@ -471,7 +470,6 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    eprintln!("set_pass1_restoreFile: {filename}");
                     h.lock()
                         .unwrap()
                         .pass1_restores

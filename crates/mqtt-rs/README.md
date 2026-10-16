@@ -213,9 +213,9 @@ and masks, so `asynSetTraceMask` / `asynSetTraceFile` govern them:
 | Event | Mask | Message |
 |-------|------|---------|
 | Live session lost | `ERROR` | `MqttDriver::onDisconnectCb: Connection lost. Reconnecting... (<error>)` |
-| Boot connect attempt (before the first ConnAck), subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` |
+| Boot connect failed: every attempt while the address lookup, `socket()` or `connect()` fails at once, else only the first; subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` |
 | Broker refused a subscribe or publish (SUBACK/PUBACK/PUBREC/PUBCOMP reason ≥ 0x80); the session stays up | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: '` |
-| ConnAck after a loss | `ERROR\|DRIVER` | `MqttDriver::onConnectCb: Reconnected.` |
+| ConnAck after a loss, or after a boot failure met once the connect was in flight | `ERROR\|DRIVER` | `MqttDriver::onConnectCb: Reconnected.` |
 | Every ConnAck | `DRIVER` | `MqttDriver::onConnectCb: Connected to broker` |
 | SUBACK granted / PUBLISH acked (QoS 0: written, QoS 1: PUBACK, QoS 2: PUBCOMP) | `DRIVER` | `MqttDriver::onSubscribeCb: Subscribed to topic '<t>'` / `MqttDriver::onPublishCb: Published to topic '<t>'` |
 | Inbound payload a record cannot take | `ERROR` | `MqttDriver::onMessageCb: ...` |

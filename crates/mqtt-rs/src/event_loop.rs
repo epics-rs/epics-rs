@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -8,10 +10,11 @@ use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
 use rumqttc::{
-    AsyncClient, ClientError, Event, Incoming, MqttOptions, Outgoing, PubAckReason, PubCompReason,
-    PublishNoticeError, PublishOptions, PublishResult, SubAck, SubscribeNoticeError,
-    SubscribeReasonCode,
+    AsyncClient, ClientError, ConnectionError, Event, Incoming, MqttOptions, Outgoing,
+    PubAckReason, PubCompReason, PublishNoticeError, PublishOptions, PublishResult, SubAck,
+    SubscribeNoticeError, SubscribeReasonCode,
 };
+use socket2::{Domain, Socket, Type};
 use tokio::sync::{Notify, mpsc};
 
 use crate::address::{PayloadFormat, TopicAddress, ValueType};
@@ -75,6 +78,7 @@ pub async fn mqtt_event_loop(
     // keepAlive, no will. rumqttc's v5 client uses `clean_start` (the v5
     // spelling) in place of v3.1.1's `clean_session`.
     mqttoptions.set_clean_start(config.clean_session);
+    mqttoptions.set_socket_connector(|host, _| paho_connect(host));
 
     let (client, mut eventloop) = AsyncClient::builder(mqttoptions).capacity(256).build();
 
@@ -190,7 +194,7 @@ pub async fn mqtt_event_loop(
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 mark_connected(&port_handle, connected_param, &connected).await;
                 backoff.connected();
-                if session == Session::Lost {
+                if session == Session::Spent {
                     asyn_print(
                         &port_handle,
                         TraceMask::IO_DRIVER | TraceMask::ERROR,
@@ -259,14 +263,15 @@ pub async fn mqtt_event_loop(
                                 "MqttDriver::onDisconnectCb: Connection lost. Reconnecting... ({e})"
                             ),
                         );
-                        session = Session::Lost;
+                        session = Session::Spent;
                     }
-                    Session::Booting => asyn_print(
-                        &port_handle,
-                        TraceMask::ERROR,
-                        format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
-                    ),
-                    Session::Lost => {}
+                    Session::Booting => {
+                        print_fail(&port_handle, &e.to_string());
+                        if !dispatch_failure(&e) {
+                            session = Session::Spent;
+                        }
+                    }
+                    Session::Spent => {}
                 }
                 // Close the publish gate first so a concurrent write fails fast
                 // (C: publish throws while disconnected) instead of buffering.
@@ -401,18 +406,73 @@ fn subscribe(client: &AsyncClient, port_handle: &PortHandle, topic: String, qos:
 /// The session as paho's connect token sees it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Session {
-    /// The initHook `connect()` has not yet succeeded. Its token's
-    /// `onFailure` reports every attempt that fails to connect
-    /// (paho.mqtt.c MQTTAsyncUtils.c:1574-1626), and its `onSuccess` makes the first
-    /// ConnAck a connect rather than `Reconnected.` (:2195). A failure paho
-    /// meets only after the TCP connect is in flight spends the token instead
-    /// (:1685-1712); rumqttc does not tell the two apart.
+    /// The initHook `connect()` token is live. Its `onFailure` reports an
+    /// attempt that fails while paho dispatches it and stays set for the
+    /// retry (paho.mqtt.c MQTTAsyncUtils.c:1574-1626); its `onSuccess` makes
+    /// the first ConnAck a connect rather than `Reconnected.` (:2195).
     Booting,
     Up,
-    /// Down after a session was up. The first ConnAck spent the token
-    /// (:2173-2174), so a failed retry prints nothing and the next ConnAck is
-    /// `Reconnected.`.
-    Lost,
+    /// Down with the token spent: by a ConnAck (:2173-2174), or by a failure
+    /// met once the TCP connect was in flight, which `nextOrClose` reports
+    /// and then nulls (:1685-1712). A failed retry prints nothing and the
+    /// next ConnAck is `Reconnected.`.
+    Spent,
+}
+
+/// A connect failure paho meets while it dispatches the CONNECT, before the
+/// TCP connect is in flight: the address lookup, `socket()`, or a
+/// non-blocking `connect()` that fails at once (Socket.c:1194-1279).
+#[derive(Debug)]
+struct DispatchFailure(io::Error);
+
+impl std::fmt::Display for DispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for DispatchFailure {}
+
+fn dispatch_failure(e: &ConnectionError) -> bool {
+    matches!(e, ConnectionError::Io(e) if e.get_ref().is_some_and(|e| e.is::<DispatchFailure>()))
+}
+
+/// paho's `Socket_new`: the first IPv4 address, else the last one, and one
+/// non-blocking `connect()` (Socket.c:1194-1279).
+async fn paho_connect(host: String) -> io::Result<tokio::net::TcpStream> {
+    let dispatch = |e: io::Error| io::Error::new(e.kind(), DispatchFailure(e));
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(host)
+        .await
+        .map_err(dispatch)?
+        .collect();
+    let Some(&addr) = addrs.iter().find(|a| a.is_ipv4()).or(addrs.last()) else {
+        return Err(dispatch(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "could not resolve to any address",
+        )));
+    };
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None).map_err(dispatch)?;
+    socket.set_nonblocking(true).map_err(dispatch)?;
+    if let Err(e) = socket.connect(&addr.into())
+        && !connect_pending(&e)
+    {
+        return Err(dispatch(e));
+    }
+    let stream = tokio::net::TcpStream::from_std(socket.into())?;
+    stream.writable().await?;
+    match stream.take_error()? {
+        Some(e) => Err(e),
+        None => Ok(stream),
+    }
+}
+
+/// paho's `rc == EINPROGRESS || rc == EWOULDBLOCK` (Socket.c:1280).
+fn connect_pending(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::EINPROGRESS) {
+        return true;
+    }
+    e.kind() == io::ErrorKind::WouldBlock
 }
 
 /// paho's `automaticReconnect` retry interval with the v5 connect-option
@@ -1126,10 +1186,12 @@ mod tests {
     }
 
     /// C prints the session's edges through `asynPrint` (drvMqtt.cpp:202-205,
-    /// :219, :234): one boundary each — a failed boot connect attempt is an
-    /// `onFailCb`, the first ConnAck is not a reconnect, an error on a live
-    /// session is a loss, a failed retry after it prints nothing (paho spent
-    /// the connect token), and a ConnAck after a loss is `Reconnected.`.
+    /// :219, :234): one boundary each. A refused boot connect fails once the
+    /// TCP connect is in flight (Linux answers a non-blocking `connect()` with
+    /// EINPROGRESS even on loopback), so paho reports it once and spends the
+    /// token: later failures print nothing and the first ConnAck is
+    /// `Reconnected.`. An error on a live session is a loss, a failed retry
+    /// after it prints nothing, and the ConnAck after it is `Reconnected.`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_edges_print_c_s_trace_lines() {
         use asyn_rs::runtime::config::RuntimeConfig;
@@ -1224,8 +1286,9 @@ mod tests {
         });
         start.notify_one();
 
-        // Each failed attempt of the boot connect is reported.
-        wait_for_n(&path, "onFailCb: MQTT Operation error: 'Error: ", 2).await;
+        // The first failed attempt is reported, the retries are not.
+        wait_for(&path, "onFailCb: MQTT Operation error: 'Error: ").await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
 
         // First session, then the broker goes away entirely.
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -1234,8 +1297,8 @@ mod tests {
         sock.write_all(&CONNACK).await.unwrap();
         wait_for(&path, "onConnectCb: Connected to broker").await;
         let booted = std::fs::read_to_string(&path).unwrap();
-        assert!(!booted.contains("Reconnected."), "{booted}");
-        let boot_failures = booted.matches("Operation error").count();
+        assert_eq!(booted.matches("Operation error").count(), 1, "{booted}");
+        assert_eq!(booted.matches("Reconnected.").count(), 1, "{booted}");
         drop(listener);
         drop(sock);
         wait_for(&path, "onDisconnectCb: Connection lost. Reconnecting...").await;
@@ -1247,17 +1310,102 @@ mod tests {
         let (mut sock, _) = listener.accept().await.unwrap();
         assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
         sock.write_all(&CONNACK).await.unwrap();
-        wait_for(&path, "onConnectCb: Reconnected.").await;
+        wait_for_n(&path, "onConnectCb: Reconnected.", 2).await;
 
         let text = std::fs::read_to_string(&path).unwrap();
         let n = |needle: &str| text.matches(needle).count();
         assert_eq!(n("Connected to broker"), 2, "{text}");
-        assert_eq!(n("Reconnected."), 1, "{text}");
+        assert_eq!(n("Reconnected."), 2, "{text}");
         assert_eq!(n("Connection lost"), 1, "{text}");
-        assert_eq!(n("Operation error"), boot_failures, "{text}");
+        assert_eq!(n("Operation error"), 1, "{text}");
 
         runtime.shutdown();
         assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
+        tokio::time::timeout(Duration::from_secs(10), ev)
+            .await
+            .expect("event loop did not exit")
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A connect that fails while paho dispatches it keeps the token's
+    /// `onFailure` for the retry (MQTTAsyncUtils.c:1574-1626), so every attempt
+    /// is reported: Linux refuses a `connect()` to the broadcast address with
+    /// ENETUNREACH before anything is in flight.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_dispatch_failure_of_the_boot_connect_is_reported() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        let config = MqttConfig {
+            broker_host: "255.255.255.255".into(),
+            broker_port: 1883,
+            client_id: "dispatch-test".into(),
+            keep_alive_secs: 3600,
+            ..MqttConfig::default()
+        };
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let mut driver = crate::driver::MqttDriver::new(
+            "MQDISPATCH",
+            &config,
+            Vec::new(),
+            publish_tx,
+            connected.clone(),
+        );
+        let topic_map = driver.topic_map();
+        let connected_param = driver.connected_param;
+        let shutdown = driver.shutdown_signal();
+        let teardown_done = driver.teardown_ack();
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+            driver,
+            asyn_rs::runtime::config::RuntimeConfig {
+                services,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("mqdispatch-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("MQDISPATCH"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some("MQDISPATCH"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let port_handle = runtime.port_handle().clone();
+        let start = Arc::new(Notify::new());
+        let loop_start = start.clone();
+        let ev = tokio::spawn(async move {
+            mqtt_event_loop(
+                config,
+                topic_map,
+                port_handle,
+                publish_rx,
+                connected_param,
+                connected,
+                Lifecycle {
+                    start: loop_start,
+                    shutdown,
+                    done: teardown_done,
+                },
+            )
+            .await;
+        });
+        start.notify_one();
+
+        let log = || std::fs::read_to_string(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while log().matches("onFailCb: MQTT Operation error").count() < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fewer than two onFailCb lines in:\n{}", log()));
+
+        runtime.shutdown();
         tokio::time::timeout(Duration::from_secs(10), ev)
             .await
             .expect("event loop did not exit")
@@ -1346,13 +1494,11 @@ mod tests {
     /// the third, 3-4 s) releases the driver at once, not after the wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_shutdown_during_a_retry_wait_releases_the_driver() {
-        use asyn_rs::services::PortServices;
-        use asyn_rs::trace::TraceFile;
-
+        // Every attempt is accepted and dropped before a CONNACK.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = MqttConfig {
             broker_host: "127.0.0.1".into(),
-            // Nothing listens here: every attempt is refused.
-            broker_port: 1,
+            broker_port: listener.local_addr().unwrap().port(),
             client_id: "mq-backoff-exit".into(),
             ..MqttConfig::default()
         };
@@ -1369,22 +1515,11 @@ mod tests {
         let connected_param = driver.connected_param;
         let shutdown = driver.shutdown_signal();
         let teardown_done = driver.teardown_ack();
-        let services = PortServices::new();
-        let trace = services.trace().clone();
         let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
             driver,
-            asyn_rs::runtime::config::RuntimeConfig {
-                services,
-                ..Default::default()
-            },
+            asyn_rs::runtime::config::RuntimeConfig::default(),
         )
         .unwrap();
-        let path = std::env::temp_dir().join(format!("mqbackoff-{}.log", std::process::id()));
-        let file = std::fs::File::create(&path).unwrap();
-        trace.set_trace_file(
-            Some("MQBACKOFF"),
-            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
-        );
         let port_handle = runtime.port_handle().clone();
         let start = Arc::new(Notify::new());
         let loop_start = start.clone();
@@ -1406,26 +1541,21 @@ mod tests {
         });
         start.notify_one();
 
-        let failures = || {
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .matches("Operation error")
-                .count()
-        };
         tokio::time::timeout(Duration::from_secs(10), async {
-            while failures() < 3 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            for _ in 0..3 {
+                drop(listener.accept().await.unwrap());
             }
         })
         .await
-        .expect("three refused attempts");
+        .expect("three failed attempts");
+        // Let the third failure reach the loop, which then waits.
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         runtime.shutdown();
         tokio::time::timeout(Duration::from_secs(2), ev)
             .await
             .expect("the event loop must not wait out the retry interval")
             .unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A broker that refuses a subscription gets C's `onFailCb` line and the

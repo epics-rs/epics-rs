@@ -1250,6 +1250,7 @@ mod tests {
         let mut fb = NDPluginFileBase::new();
         fb.file_path = format!("{}/", root.path().display());
         fb.file_name = "nc_stream_".into();
+        fb.file_template = "%s%s%4.4d".into();
         fb.set_mode(NDFileMode::Stream);
         fb.set_num_capture(0);
 

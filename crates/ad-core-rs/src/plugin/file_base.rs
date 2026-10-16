@@ -133,8 +133,73 @@ impl FileAttributes {
     }
 }
 
-/// Open `path`, run `body` against the open writer, and close — exactly once,
-/// on every exit path out of `body`.
+/// asynError, the status C's base messages quote for a failed writer call.
+const WRITER_ERROR: i32 = 3;
+
+/// A writer call that failed under NDPluginFile's `base` step: the lines the
+/// writer printed, then C's own, with C's `message` for `NDFileWriteMessage`.
+fn base_failure(writer_lines: &[String], base: &str, message: String) -> ADError {
+    let mut lines = writer_lines.to_vec();
+    lines.push(format!("NDPluginFile::{base} {message}"));
+    ADError::Reported { lines, message }
+}
+
+/// The writer's `openFile` as C `openFileBase` (NDPluginFile.cpp:62-73) or
+/// `readFileBase` (:158-168) reports it.
+fn open_file_base<W: NDFileWriter + ?Sized>(
+    w: &mut W,
+    base: &str,
+    path: &Path,
+    mode: NDFileMode,
+    layout: &NDArray,
+) -> ADResult<()> {
+    w.open_file(path, mode, layout).map_err(|e| {
+        let message = format!(
+            "Error opening file {}, status={WRITER_ERROR}",
+            path.display()
+        );
+        base_failure(e.lines(), base, message)
+    })
+}
+
+/// The writer's `writeFile` as C `writeFileBase` reports it
+/// (NDPluginFile.cpp:253-260, :302-309, :350-357).
+fn write_file_base<W: NDFileWriter + ?Sized>(w: &mut W, array: &Arc<NDArray>) -> ADResult<()> {
+    w.write_file(array).map_err(|e| {
+        let message = format!("Error writing file, status={WRITER_ERROR}");
+        base_failure(e.lines(), "writeFileBase", message)
+    })
+}
+
+/// C `closeFileBase` (NDPluginFile.cpp:83-130): the writer's `closeFile`,
+/// then the temp file renamed to its final name when `rename` names both —
+/// whether or not the close succeeded. A failed rename's message replaces the
+/// close's, and C prints only the one left.
+fn close_file_base<W: NDFileWriter + ?Sized>(
+    w: &mut W,
+    rename: Option<(&Path, &Path)>,
+) -> ADResult<()> {
+    let closed = w.close_file();
+    let renamed = rename.map_or(Ok(()), |(temp, final_path)| {
+        std::fs::rename(temp, final_path).map_err(|_| {
+            format!(
+                "Error renaming temporary file {} to {}",
+                temp.display(),
+                final_path.display()
+            )
+        })
+    });
+    let message = match (&closed, renamed) {
+        (_, Err(message)) => message,
+        (Err(_), Ok(())) => format!("Error closing file, status={WRITER_ERROR}"),
+        (Ok(()), Ok(())) => return Ok(()),
+    };
+    let writer_lines = closed.as_ref().err().map_or(&[][..], ADError::lines);
+    Err(base_failure(writer_lines, "closeFileBase", message))
+}
+
+/// Open `path` as the `base` step names it, run `body` against the open
+/// writer, and close — exactly once, on every exit path out of `body`.
 ///
 /// The close is the finalizer, so a failing `write_file` or `read_file` cannot
 /// leave the writer holding an open file (for HDF5 an H5 file id, plus a stale
@@ -142,25 +207,48 @@ impl FileAttributes {
 /// is open, so an `open_file` that itself fails is safe to close as well, and
 /// the guard can cover the open too rather than starting just after it.
 ///
-/// The close error is reported only when `body` succeeded: when the body
-/// failed, its error is the one worth returning.
-pub(crate) fn with_open_file<W: NDFileWriter + ?Sized, R>(
+/// `close` runs only when `body` succeeded; when it failed, its error is the
+/// one worth returning and the guard's close reports nothing.
+fn with_open_file<W: NDFileWriter + ?Sized, R>(
     writer: &mut W,
+    base: &str,
     path: &Path,
     mode: NDFileMode,
     layout: &NDArray,
     body: impl FnOnce(&mut W) -> ADResult<R>,
+    close: impl FnOnce(&mut W) -> ADResult<()>,
 ) -> ADResult<R> {
     let mut open = Finalize::new(writer, |w: &mut W| {
         let _ = w.close_file();
     });
     let value = open.run(|w| {
-        w.open_file(path, mode, layout)?;
+        open_file_base(w, base, path, mode, layout)?;
         body(w)
     })?;
-    let closed = open.run(|w| w.close_file());
+    let closed = open.run(close);
     open.disarm();
     closed.map(|()| value)
+}
+
+/// C `readFileBase`'s file I/O (NDPluginFile.cpp:156-182): open, read, and a
+/// close whose status C ignores.
+pub(crate) fn read_file_base<W: NDFileWriter + ?Sized>(
+    writer: &mut W,
+    path: &Path,
+    layout: &NDArray,
+) -> ADResult<NDArray> {
+    const BASE: &str = "readFileBase";
+    let read = |w: &mut W| {
+        w.read_file().map_err(|e| {
+            let message = format!("Error  file {}, status={WRITER_ERROR}", path.display());
+            base_failure(e.lines(), BASE, message)
+        })
+    };
+    let close = |w: &mut W| {
+        let _ = w.close_file();
+        Ok(())
+    };
+    with_open_file(writer, BASE, path, NDFileMode::Single, layout, read, close)
 }
 
 /// The file I/O half of NDPluginFile's locking. C runs `openFile`,
@@ -199,16 +287,15 @@ fn write_one_file(
     frames: &[Arc<NDArray>],
 ) -> ADResult<()> {
     writer.set_num_capture(num_capture);
-    with_open_file(writer, path, mode, &frames[0], |w| {
-        for arr in frames {
-            w.write_file(arr)?;
-        }
-        Ok(())
-    })?;
-    if let Some(final_path) = final_path {
-        NDPluginFileBase::rename_temp(path, final_path)?;
-    }
-    Ok(())
+    with_open_file(
+        writer,
+        "openFileBase",
+        path,
+        mode,
+        &frames[0],
+        |w| frames.iter().try_for_each(|arr| write_file_base(w, arr)),
+        |w| close_file_base(w, final_path.map(|f| (path, f))),
+    )
 }
 
 /// File path/name management and capture buffering for file plugins.
@@ -257,110 +344,103 @@ impl NDPluginFileBase {
     /// Template uses printf-style: first `%s` → filePath, second `%s` → fileName,
     /// `%d` (with optional width/precision like `%3.3d`) → fileNumber.
     pub fn create_file_name(&self) -> String {
-        if self.file_template.is_empty() {
-            format!(
-                "{}{}{:04}",
-                self.file_path, self.file_name, self.file_number
-            )
-        } else {
-            let mut result = String::new();
-            let mut chars = self.file_template.chars().peekable();
-            let mut s_count = 0;
-            while let Some(c) = chars.next() {
-                if c == '%' {
-                    // Collect printf flags and the width/precision spec:
-                    // optional `-` (left-justify) / `0` (zero-pad) flags,
-                    // digits (width), `.digits` (precision). C++ uses real
-                    // epicsSnprintf.
-                    let mut left_justify = false;
-                    let mut zero_pad = false;
-                    loop {
-                        match chars.peek() {
-                            Some('-') => {
-                                left_justify = true;
-                                chars.next();
-                            }
-                            Some('0') => {
-                                zero_pad = true;
-                                chars.next();
-                            }
-                            _ => break,
-                        }
-                    }
-                    let mut spec = String::new();
-                    while let Some(&nc) = chars.peek() {
-                        if nc.is_ascii_digit() || nc == '.' {
-                            spec.push(nc);
+        let mut result = String::new();
+        let mut chars = self.file_template.chars().peekable();
+        let mut s_count = 0;
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                // Collect printf flags and the width/precision spec:
+                // optional `-` (left-justify) / `0` (zero-pad) flags,
+                // digits (width), `.digits` (precision). C++ uses real
+                // epicsSnprintf.
+                let mut left_justify = false;
+                let mut zero_pad = false;
+                loop {
+                    match chars.peek() {
+                        Some('-') => {
+                            left_justify = true;
                             chars.next();
-                        } else {
-                            break;
                         }
+                        Some('0') => {
+                            zero_pad = true;
+                            chars.next();
+                        }
+                        _ => break,
                     }
-                    match chars.next() {
-                        // `%%` → literal percent.
-                        Some('%') if spec.is_empty() && !left_justify => result.push('%'),
-                        Some('s') => {
-                            s_count += 1;
-                            match s_count {
-                                1 => result.push_str(&self.file_path),
-                                2 => result.push_str(&self.file_name),
-                                _ => {}
-                            }
-                        }
-                        Some('d') => {
-                            // `width.precision`: precision = minimum digits
-                            // (zero-pad), width = minimum field width
-                            // (space-pad unless precision provided).
-                            let (width, precision) = match spec.split_once('.') {
-                                Some((w, p)) => (
-                                    w.parse::<usize>().unwrap_or(0),
-                                    p.parse::<usize>().unwrap_or(0),
-                                ),
-                                None => (spec.parse::<usize>().unwrap_or(0), 0),
-                            };
-                            // Apply precision first (zero-pad the number).
-                            let digits = format!("{:0>prec$}", self.file_number, prec = precision);
-                            // Then pad to the field width. The `0` flag
-                            // zero-pads (ignored when left-justified or when an
-                            // explicit precision is given, per C printf).
-                            if digits.len() >= width {
-                                result.push_str(&digits);
-                            } else if zero_pad && !left_justify && precision == 0 {
-                                result.push_str(&format!(
-                                    "{:0>width$}",
-                                    self.file_number,
-                                    width = width
-                                ));
-                            } else {
-                                let pad = " ".repeat(width - digits.len());
-                                if left_justify {
-                                    result.push_str(&digits);
-                                    result.push_str(&pad);
-                                } else {
-                                    result.push_str(&pad);
-                                    result.push_str(&digits);
-                                }
-                            }
-                        }
-                        Some(other) => {
-                            result.push('%');
-                            if left_justify {
-                                result.push('-');
-                            }
-                            if zero_pad {
-                                result.push('0');
-                            }
-                            result.push_str(&spec);
-                            result.push(other);
-                        }
-                        None => result.push('%'),
-                    }
-                } else {
-                    result.push(c);
                 }
+                let mut spec = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_digit() || nc == '.' {
+                        spec.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match chars.next() {
+                    // `%%` → literal percent.
+                    Some('%') if spec.is_empty() && !left_justify => result.push('%'),
+                    Some('s') => {
+                        s_count += 1;
+                        match s_count {
+                            1 => result.push_str(&self.file_path),
+                            2 => result.push_str(&self.file_name),
+                            _ => {}
+                        }
+                    }
+                    Some('d') => {
+                        // `width.precision`: precision = minimum digits
+                        // (zero-pad), width = minimum field width
+                        // (space-pad unless precision provided).
+                        let (width, precision) = match spec.split_once('.') {
+                            Some((w, p)) => (
+                                w.parse::<usize>().unwrap_or(0),
+                                p.parse::<usize>().unwrap_or(0),
+                            ),
+                            None => (spec.parse::<usize>().unwrap_or(0), 0),
+                        };
+                        // Apply precision first (zero-pad the number).
+                        let digits = format!("{:0>prec$}", self.file_number, prec = precision);
+                        // Then pad to the field width. The `0` flag
+                        // zero-pads (ignored when left-justified or when an
+                        // explicit precision is given, per C printf).
+                        if digits.len() >= width {
+                            result.push_str(&digits);
+                        } else if zero_pad && !left_justify && precision == 0 {
+                            result.push_str(&format!(
+                                "{:0>width$}",
+                                self.file_number,
+                                width = width
+                            ));
+                        } else {
+                            let pad = " ".repeat(width - digits.len());
+                            if left_justify {
+                                result.push_str(&digits);
+                                result.push_str(&pad);
+                            } else {
+                                result.push_str(&pad);
+                                result.push_str(&digits);
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        result.push('%');
+                        if left_justify {
+                            result.push('-');
+                        }
+                        if zero_pad {
+                            result.push('0');
+                        }
+                        result.push_str(&spec);
+                        result.push(other);
+                    }
+                    None => result.push('%'),
+                }
+            } else {
+                result.push(c);
             }
-            result
         }
+        result
     }
 
     /// Get the temp file path (if temp_suffix is set).
@@ -414,12 +494,6 @@ impl NDPluginFileBase {
             let temp = PathBuf::from(format!("{}{}", final_path.display(), self.temp_suffix));
             (temp, Some(final_path))
         }
-    }
-
-    /// Rename temp file to final path if applicable.
-    fn rename_temp(temp_path: &Path, final_path: &Path) -> ADResult<()> {
-        std::fs::rename(temp_path, final_path)?;
-        Ok(())
     }
 
     /// Delete the driver's original file for `array` when `delete_driver_file`
@@ -505,7 +579,7 @@ impl NDPluginFileBase {
                 Self::open_stream_io(lock, &array)?;
                 lock.io(|w| {
                     w.set_num_capture(num_capture);
-                    w.write_file(&array)
+                    write_file_base(w, &array)
                 })?;
                 let base = lock.base();
                 base.maybe_delete_driver_file(&array);
@@ -630,7 +704,7 @@ impl NDPluginFileBase {
         base.is_open = true;
         let opened = lock.io(|w| {
             w.set_num_capture(num_capture);
-            w.open_file(&write_path, NDFileMode::Stream, array)
+            open_file_base(w, "openFileBase", &write_path, NDFileMode::Stream, array)
         });
         if opened.is_err() {
             lock.base().is_open = false;
@@ -660,13 +734,10 @@ impl NDPluginFileBase {
         let final_name = base.full_file_name.clone();
         let temp_name =
             (!base.temp_suffix.is_empty()).then(|| format!("{}{}", final_name, base.temp_suffix));
-        lock.io(|w| {
-            w.close_file()?;
-            if let Some(temp_name) = temp_name {
-                Self::rename_temp(Path::new(&temp_name), Path::new(&final_name))?;
-            }
-            Ok(())
-        })
+        let rename = temp_name
+            .as_deref()
+            .map(|t| (Path::new(t), Path::new(&final_name)));
+        lock.io(|w| close_file_base(w, rename))
     }
 
     pub fn is_open(&self) -> bool {
@@ -864,12 +935,14 @@ mod tests {
     }
 
     #[test]
-    fn test_create_file_name_default() {
+    /// `epicsSnprintf` with an empty FileTemplate makes an empty name
+    /// (asynNDArrayDriver.cpp:210-211); nothing stands in for the template.
+    fn an_empty_template_makes_an_empty_name() {
         let mut fb = NDPluginFileBase::new();
         fb.file_path = "/data/".into();
         fb.file_name = "img_".into();
         fb.file_number = 42;
-        assert_eq!(fb.create_file_name(), "/data/img_0042");
+        assert_eq!(fb.create_file_name(), "");
     }
 
     #[test]
@@ -931,6 +1004,7 @@ mod tests {
         let mut fb = NDPluginFileBase::new();
         fb.file_path = "/data/".into();
         fb.file_name = "img_".into();
+        fb.file_template = "%s%s%4.4d".into();
         fb.file_number = 1;
         fb.temp_suffix = ".tmp".into();
 
@@ -952,31 +1026,69 @@ mod tests {
         fb.auto_increment = true;
         fb.temp_suffix = ".tmp".into();
         fb.set_mode(NDFileMode::Stream);
-        struct Touch(MockWriter);
-        impl NDFileWriter for Touch {
-            fn open_file(&mut self, p: &Path, m: NDFileMode, a: &NDArray) -> ADResult<()> {
-                std::fs::write(p, b"")?;
-                self.0.open_file(p, m, a)
-            }
-            fn write_file(&mut self, a: &Arc<NDArray>) -> ADResult<()> {
-                self.0.write_file(a)
-            }
-            fn read_file(&mut self) -> ADResult<NDArray> {
-                self.0.read_file()
-            }
-            fn close_file(&mut self) -> ADResult<()> {
-                self.0.close_file()
-            }
-            fn writes_incrementally(&self) -> bool {
-                true
-            }
-        }
         let mut writer = Touch(MockWriter::new(true));
         fb.open_stream(&mut writer, &make_array(1)).unwrap();
         assert_eq!(fb.file_number, 4);
         fb.close_stream(&mut writer).unwrap();
         assert!(dir.join("s_3.h5").is_file());
         assert_eq!(fb.file_number, 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A writer whose open creates the file, so a rename has one to move.
+    struct Touch(MockWriter);
+    impl NDFileWriter for Touch {
+        fn open_file(&mut self, p: &Path, m: NDFileMode, a: &NDArray) -> ADResult<()> {
+            std::fs::write(p, b"")?;
+            self.0.open_file(p, m, a)
+        }
+        fn write_file(&mut self, a: &Arc<NDArray>) -> ADResult<()> {
+            self.0.write_file(a)
+        }
+        fn read_file(&mut self) -> ADResult<NDArray> {
+            self.0.read_file()
+        }
+        fn close_file(&mut self) -> ADResult<()> {
+            self.0.close_file()
+        }
+        fn supports_multiple_arrays(&self) -> bool {
+            self.0.supports_multiple_arrays()
+        }
+        fn writes_incrementally(&self) -> bool {
+            true
+        }
+    }
+
+    /// C closeFileBase renames the temp file after a failed closeFile as
+    /// after a clean one (NDPluginFile.cpp:103-117), in Stream mode and for
+    /// a Single file alike; the error is still the close's.
+    #[test]
+    fn a_failed_close_still_renames_the_temp_file() {
+        let dir = std::env::temp_dir().join(format!("fb-closefail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (mode, name) in [
+            (NDFileMode::Stream, "s_0.h5"),
+            (NDFileMode::Single, "s_1.h5"),
+        ] {
+            let mut fb = NDPluginFileBase::new();
+            fb.file_path = format!("{}/", dir.display());
+            fb.file_name = "s".into();
+            fb.file_template = "%s%s_%d.h5".into();
+            fb.file_number = if mode == NDFileMode::Stream { 0 } else { 1 };
+            fb.temp_suffix = ".tmp".into();
+            fb.set_mode(mode);
+            let mut writer = Touch(MockWriter::new(true));
+            writer.0.fail_close = true;
+            let err = if mode == NDFileMode::Stream {
+                fb.open_stream(&mut writer, &make_array(1)).unwrap();
+                fb.close_stream(&mut writer).unwrap_err()
+            } else {
+                fb.process_array(make_array(1), &mut writer).unwrap_err()
+            };
+            assert_eq!(err.to_string(), "Error closing file, status=3");
+            assert!(dir.join(name).is_file(), "{mode:?}: temp file not renamed");
+            assert!(!dir.join(format!("{name}.tmp")).exists());
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

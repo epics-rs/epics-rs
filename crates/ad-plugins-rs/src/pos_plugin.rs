@@ -713,6 +713,7 @@ impl NDPluginProcess for PosPluginProcessor {
             param_updates: updates,
             scatter: false,
             addressed: vec![],
+            trace: vec![],
         }
     }
 

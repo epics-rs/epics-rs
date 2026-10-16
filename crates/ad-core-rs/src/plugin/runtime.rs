@@ -216,6 +216,8 @@ pub struct ProcessResult {
     /// `endProcessCallbacks`, ignores NDArrayCallbacks, the throttle and the
     /// sort buffer. Published before `output_arrays`.
     pub addressed: Vec<(usize, Arc<NDArray>)>,
+    /// Lines C's `processCallbacks` prints, in order.
+    pub trace: Vec<(TraceMask, String)>,
 }
 
 impl ProcessResult {
@@ -226,6 +228,7 @@ impl ProcessResult {
             param_updates,
             scatter: false,
             addressed: vec![],
+            trace: vec![],
         }
     }
 
@@ -236,6 +239,7 @@ impl ProcessResult {
             param_updates: vec![],
             scatter: false,
             addressed: vec![],
+            trace: vec![],
         }
     }
 
@@ -248,6 +252,7 @@ impl ProcessResult {
             param_updates,
             scatter: false,
             addressed: vec![],
+            trace: vec![],
         }
     }
 
@@ -258,6 +263,7 @@ impl ProcessResult {
             param_updates: vec![],
             scatter: false,
             addressed: vec![],
+            trace: vec![],
         }
     }
 
@@ -270,6 +276,7 @@ impl ProcessResult {
             param_updates: vec![],
             scatter: true,
             addressed: vec![],
+            trace: vec![],
         }
     }
 }
@@ -1072,6 +1079,10 @@ impl SharedProcessorInner {
         result: ProcessResult,
         elapsed_ms: f64,
     ) -> ProcessOutput {
+        let port = &self.port_handle;
+        for (mask, line) in &result.trace {
+            port.trace().output(port.port_name(), *mask, line);
+        }
         // C++ endProcessCallbacks (NDPluginDriver.cpp:257-265): when
         // NDArrayCallbacks==0 the method caches the array and returns BEFORE the
         // throttle / sort-admission / `doCallbacksGenericPointer` path. So a

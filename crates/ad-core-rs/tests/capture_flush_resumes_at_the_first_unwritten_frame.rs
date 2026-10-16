@@ -96,6 +96,7 @@ fn captured_three() -> NDPluginFileBase {
     let mut fb = NDPluginFileBase::new();
     fb.file_path = "/tmp/".into();
     fb.file_name = "img_".into();
+    fb.file_template = "%s%s%4.4d".into();
     fb.file_number = 1;
     fb.auto_increment = true;
     fb.set_mode(NDFileMode::Capture);

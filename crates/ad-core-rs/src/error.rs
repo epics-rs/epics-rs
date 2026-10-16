@@ -26,6 +26,21 @@ pub enum ADError {
 
     #[error("asyn error: {0}")]
     Asyn(#[from] AsynError),
+
+    /// A failure C reports itself: `lines` are what it prints, in order, and
+    /// `message` is what it leaves in `NDFileWriteMessage`.
+    #[error("{message}")]
+    Reported { lines: Vec<String>, message: String },
+}
+
+impl ADError {
+    /// The console lines C prints for this failure; none unless `Reported`.
+    pub fn lines(&self) -> &[String] {
+        match self {
+            Self::Reported { lines, .. } => lines,
+            _ => &[],
+        }
+    }
 }
 
 pub type ADResult<T> = Result<T, ADError>;

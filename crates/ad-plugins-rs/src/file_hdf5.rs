@@ -762,12 +762,17 @@ impl Hdf5Writer {
     fn load_layout(&mut self) -> ADResult<()> {
         self.read_settings();
         let spec = self.cfg.layout_spec.as_str();
+        // A parse error prints only under HDF5_LOGGING (NDFileHDF5LayoutXML.h:34-41).
+        let mut lines = Vec::new();
         let loaded = if spec.is_empty() {
             Ok(Self::default_layout())
         } else if Hdf5Layout::is_inline(spec) || Path::new(spec).exists() {
             Hdf5Layout::load(spec).map_err(|e| e.0)
         } else {
-            Err("NDFileHDF5createFileLayout Warning: specified XML file does not exist".into())
+            lines.push(
+                "NDFileHDF5createFileLayout Warning: specified XML file does not exist".to_owned(),
+            );
+            Err("specified XML file does not exist".to_owned())
         };
         match loaded {
             Ok(layout) => {
@@ -776,10 +781,31 @@ impl Hdf5Writer {
             }
             Err(e) => {
                 self.layout = None;
-                Err(ADError::UnsupportedConversion(format!(
-                    "NDFileHDF5::openFile ERROR Failed to create the specified file layout: {e}"
-                )))
+                // NDFileHDF5.cpp:279-284.
+                lines.push(
+                    "NDFileHDF5::openFile ERROR Failed to create the specified file layout"
+                        .to_owned(),
+                );
+                Err(ADError::Reported {
+                    lines,
+                    message: format!("Failed to create the specified file layout: {e}"),
+                })
             }
+        }
+    }
+
+    /// C `createNewFile`'s failure (NDFileHDF5.cpp:3846-3851) as `openFile`
+    /// reports it (:271-275).
+    fn create_failed(path: &Path, e: impl std::fmt::Display) -> ADError {
+        ADError::Reported {
+            lines: vec![
+                format!(
+                    "NDFileHDF5::createNewFile Unable to create HDF5 file: {}",
+                    path.display()
+                ),
+                "NDFileHDF5::openFile ERROR Failed to create a new output file".to_owned(),
+            ],
+            message: format!("HDF5 create error: {e}"),
         }
     }
 
@@ -1355,8 +1381,7 @@ impl Hdf5Writer {
     /// group the path names is therefore also the dataset's single placement
     /// owner — nothing re-parents it afterwards.
     fn open_swmr(&mut self, path: &Path, array: &NDArray) -> ADResult<()> {
-        let mut swmr = SwmrFileWriter::create(path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("SWMR create error: {}", e)))?;
+        let mut swmr = SwmrFileWriter::create(path).map_err(|e| Self::create_failed(path, e))?;
         self.build_swmr_layout_groups(&mut swmr)?;
 
         let usize_frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
@@ -3200,9 +3225,7 @@ impl NDFileWriter for Hdf5Writer {
         if let Err(e) = self.load_layout() {
             // C creates the file before it loads the layout (NDFileHDF5.cpp:
             // 271, :279), so a failed layout leaves the empty file behind.
-            drop(H5File::create(path).map_err(|e| {
-                ADError::UnsupportedConversion(format!("HDF5 create error: {}", e))
-            })?);
+            drop(H5File::create(path).map_err(|e| Self::create_failed(path, e))?);
             return Err(e);
         }
         // Resolve where image/attribute/performance datasets land for this
@@ -3215,8 +3238,7 @@ impl NDFileWriter for Hdf5Writer {
         if self.cfg.swmr_mode && mode == NDFileMode::Stream {
             self.open_swmr(path, array)
         } else {
-            let h5file = H5File::create(path)
-                .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 create error: {}", e)))?;
+            let h5file = H5File::create(path).map_err(|e| Self::create_failed(path, e))?;
             self.handle = Some(Hdf5Handle::Standard {
                 file: h5file,
                 detectors: std::collections::HashMap::new(),
@@ -4092,9 +4114,9 @@ impl NDPluginProcess for Hdf5FileProcessor {
             return out;
         }
         let kept = out.verdict.kept();
-        let updates = self.ctrl.lock().store_int32(reason, kept);
+        let out = self.ctrl.lock().store_int32(reason, out);
         self.store(reason, &ParamChangeValue::Int32(kept), params);
-        out.set_updates(updates)
+        out
     }
 
     fn validate_float64(
@@ -7564,5 +7586,49 @@ mod tests {
         );
         writer.close_file().ok();
         std::fs::remove_file(&path).ok();
+    }
+
+    /// C's `openFile` lines for a missing layout file (NDFileHDF5.cpp:3934-3937,
+    /// :279-284), a layout that does not parse (silent but for the second,
+    /// NDFileHDF5LayoutXML.h:34-41), and a file it cannot create
+    /// (:3846-3851, :271-275).
+    #[test]
+    fn a_failed_open_carries_c_open_file_lines() {
+        let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        let layout_failed = "NDFileHDF5::openFile ERROR Failed to create the specified file layout";
+
+        let mut writer = Hdf5Writer::new();
+        writer.set_layout_filename("/nonexistent/layout.xml");
+        let err = writer
+            .open_file(&temp_path("hdf5_no_layout"), NDFileMode::Single, &arr)
+            .unwrap_err();
+        assert_eq!(
+            err.lines(),
+            [
+                "NDFileHDF5createFileLayout Warning: specified XML file does not exist",
+                layout_failed,
+            ]
+        );
+
+        let mut writer = Hdf5Writer::new();
+        writer.set_layout_filename("<?xml version=\"1.0\"?><hdf5_layout>");
+        let err = writer
+            .open_file(&temp_path("hdf5_bad_layout"), NDFileMode::Single, &arr)
+            .unwrap_err();
+        assert_eq!(err.lines(), [layout_failed]);
+
+        let path = Path::new("/nonexistent/dir/f.h5");
+        for mode in [NDFileMode::Single, NDFileMode::Stream] {
+            let mut writer = Hdf5Writer::new();
+            writer.set_swmr_mode(mode == NDFileMode::Stream);
+            let err = writer.open_file(path, mode, &arr).unwrap_err();
+            assert_eq!(
+                err.lines(),
+                [
+                    "NDFileHDF5::createNewFile Unable to create HDF5 file: /nonexistent/dir/f.h5",
+                    "NDFileHDF5::openFile ERROR Failed to create a new output file",
+                ]
+            );
+        }
     }
 }

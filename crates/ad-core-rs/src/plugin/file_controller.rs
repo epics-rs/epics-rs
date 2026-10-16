@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::error::ADResult;
+use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataType, NDDimension};
 
-use super::file_base::{FileIo, NDFileMode, NDFileWriter, NDPluginFileBase, with_open_file};
+use super::file_base::{FileIo, NDFileMode, NDFileWriter, NDPluginFileBase, read_file_base};
 use super::runtime::{ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict};
 use asyn_rs::trace::TraceMask;
 
@@ -447,8 +447,13 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// The failure exit of one `process_array` cycle: keep everything the cycle
     /// accumulated, add the error surface, and re-derive the `file_base`
     /// readbacks over the top of whatever the cycle published before it failed.
-    fn fail_cycle(&mut self, proc_result: &mut ProcessResult, message: String) {
-        self.push_error_updates(&mut proc_result.param_updates, false, false, message);
+    fn fail_cycle(&mut self, proc_result: &mut ProcessResult, err: &ADError) {
+        let ProcessResult {
+            param_updates,
+            trace,
+            ..
+        } = proc_result;
+        self.push_error_updates(param_updates, trace, false, false, err);
         self.push_file_base_readbacks(&mut proc_result.param_updates);
     }
 
@@ -463,7 +468,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     /// Append the error surface for a failed file operation onto the updates
-    /// the caller has already accumulated.
+    /// the caller has already accumulated, and the lines C prints for it onto
+    /// `trace`. `NDFileWriteMessage` takes the error's text.
     ///
     /// Takes the accumulator rather than returning a fresh `Vec`, so an error
     /// exit **cannot** replace what the same cycle published before it failed:
@@ -482,10 +488,12 @@ impl<W: NDFileWriter> FilePluginController<W> {
     fn push_error_updates(
         &self,
         updates: &mut Vec<ParamUpdate>,
+        trace: &mut Vec<(TraceMask, String)>,
         read_reason: bool,
         write_reason: bool,
-        message: String,
+        err: &ADError,
     ) {
+        trace.extend(err.lines().iter().map(|l| (TraceMask::ERROR, l.clone())));
         if write_reason {
             if let Some(idx) = self.params.write_file {
                 updates.push(ParamUpdate::Int32 {
@@ -515,7 +523,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
             updates.push(ParamUpdate::Octet {
                 reason: idx,
                 addr: 0,
-                value: message,
+                value: err.to_string(),
             });
         }
         // The capture state belongs on the error surface in its own right: a
@@ -611,8 +619,9 @@ pub trait FileControl<W> {
 
     /// Mirror a stored int32 setting into the controller. The settings live
     /// here, not in the param library, because `process_array` runs without
-    /// it; they are written only from the write path, in write order.
-    fn store_int32(&mut self, reason: usize, value: i32) -> Vec<ParamUpdate>;
+    /// it; they are written only from the write path, in write order. `out`
+    /// is the write's outcome so far, and the value stored is what it keeps.
+    fn store_int32(&mut self, reason: usize, out: WriteOutcome<i32>) -> WriteOutcome<i32>;
 }
 
 impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P {
@@ -642,8 +651,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
             .unwrap_or(false);
         if force_close {
             if let Err(e) = NDPluginFileBase::force_close_io(&mut PortIo::new(self)) {
-                self.controller()
-                    .fail_cycle(&mut proc_result, e.to_string());
+                self.controller().fail_cycle(&mut proc_result, &e);
                 return proc_result;
             }
             let _ = stop_capture(self, &mut proc_result.param_updates);
@@ -711,8 +719,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                         c.apply_filename_attributes(&array, &mut proc_result.param_updates);
                     if reopen && c.file_base.is_open() {
                         if let Err(e) = NDPluginFileBase::force_close_io(&mut PortIo::new(self)) {
-                            self.controller()
-                                .fail_cycle(&mut proc_result, e.to_string());
+                            self.controller().fail_cycle(&mut proc_result, &e);
                             return proc_result;
                         }
                     }
@@ -729,8 +736,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                     let target = c.file_base.num_capture_target();
                     if r.is_ok() && target > 0 && c.file_base.num_captured() >= target {
                         if let Err(e) = NDPluginFileBase::close_stream_io(&mut PortIo::new(self)) {
-                            self.controller()
-                                .fail_cycle(&mut proc_result, e.to_string());
+                            self.controller().fail_cycle(&mut proc_result, &e);
                             return proc_result;
                         }
                         stop_capture(self, &mut proc_result.param_updates).ok();
@@ -761,7 +767,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                 });
             }
         } else if let Err(err) = result {
-            c.fail_cycle(&mut proc_result, err.to_string());
+            c.fail_cycle(&mut proc_result, &err);
         }
         proc_result
     }
@@ -776,8 +782,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         if out.settled {
             return out;
         }
-        let updates = self.store_int32(reason, out.verdict.kept());
-        out.set_updates(updates)
+        self.store_int32(reason, out)
     }
 
     fn validate_int32(
@@ -806,6 +811,8 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                 }
             };
             let c = self.controller();
+            // C sets the flag back to 0, since this could be a busy record (:820).
+            let mut out = WriteOutcome::from(WriteVerdict::Accept(0));
             match result {
                 Ok(()) => {
                     updates.extend(c.success_updates());
@@ -816,23 +823,18 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                     // The write that failed is `flush_capture` in Capture
                     // mode, which lands frames one at a time, so the
                     // readbacks have to come back off `file_base`.
-                    c.push_error_updates(&mut updates, false, true, err.to_string());
+                    c.push_error_updates(&mut updates, &mut out.trace, false, true, &err);
                     c.push_file_base_readbacks(&mut updates);
                 }
             }
-            // C sets the flag back to 0, since this could be a busy record (:820).
-            return WriteOutcome::from(WriteVerdict::Accept(0)).set_updates(updates);
+            return out.set_updates(updates);
         }
         if Some(reason) == p.read_file && value != 0 {
             let path = PathBuf::from(c.file_base.open_file_name());
             let layout = NDArray::new(vec![NDDimension::new(1)], NDDataType::UInt8);
-            let result = PortIo::new(self).io(|w| {
-                with_open_file(w, &path, NDFileMode::Single, &layout, |w| {
-                    w.read_file().map(Arc::new)
-                })
-            });
+            let result = PortIo::new(self).io(|w| read_file_base(w, &path, &layout).map(Arc::new));
             let c = self.controller();
-            let out = WriteOutcome::from(WriteVerdict::Accept(0));
+            let mut out = WriteOutcome::from(WriteVerdict::Accept(0));
             return match result {
                 Ok(array) => {
                     c.latest_array = Some(array.clone());
@@ -843,7 +845,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                 Err(err) => {
                     // The name, and FileNumber past it, are set before the
                     // open that failed (:146-155).
-                    c.push_error_updates(&mut updates, true, false, err.to_string());
+                    c.push_error_updates(&mut updates, &mut out.trace, true, false, &err);
                     c.push_file_number_update(&mut updates);
                     c.push_full_file_name_update(&mut updates);
                     out.set_updates(updates)
@@ -859,7 +861,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         if Some(reason) != p.capture {
             return verdict.succeed().into();
         }
-        let out = c.check_capture(value, verdict);
+        let mut out = c.check_capture(value, verdict);
         if out.settled {
             return out;
         }
@@ -872,8 +874,13 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         match started {
             Ok(()) => out.set_updates(updates),
             Err(e) => {
-                self.controller()
-                    .push_error_updates(&mut updates, false, false, e.to_string());
+                self.controller().push_error_updates(
+                    &mut updates,
+                    &mut out.trace,
+                    false,
+                    false,
+                    &e,
+                );
                 WriteOutcome {
                     verdict: WriteVerdict::Accept(0),
                     ..out
@@ -883,7 +890,8 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         }
     }
 
-    fn store_int32(&mut self, reason: usize, value: i32) -> Vec<ParamUpdate> {
+    fn store_int32(&mut self, reason: usize, mut out: WriteOutcome<i32>) -> WriteOutcome<i32> {
+        let value = out.verdict.kept();
         let c = self.controller();
         let p = c.params;
         let mut updates = Vec::new();
@@ -899,9 +907,14 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
             let new_mode = NDFileMode::from_i32(value);
             if c.capture_active && new_mode != c.file_base.mode() {
                 if let Err(e) = stop_capture(self, &mut updates) {
-                    self.controller()
-                        .push_error_updates(&mut updates, false, false, e.to_string());
-                    return updates;
+                    self.controller().push_error_updates(
+                        &mut updates,
+                        &mut out.trace,
+                        false,
+                        false,
+                        &e,
+                    );
+                    return out.set_updates(updates);
                 }
             }
             self.controller().file_base.set_mode(new_mode);
@@ -916,7 +929,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         } else if Some(reason) == p.delete_driver_file {
             c.delete_driver_file = value != 0;
         }
-        updates
+        out.set_updates(updates)
     }
 }
 
@@ -1084,6 +1097,8 @@ mod tests {
         fail_write_after: Option<usize>,
         /// Make `read_file` return `array(77)`.
         readable: bool,
+        /// Make `open_file` fail with a line of the writer's own.
+        fail_open: bool,
     }
     impl MockWriter {
         fn new(multi: bool) -> Self {
@@ -1095,12 +1110,19 @@ mod tests {
                 fail_close: false,
                 fail_write_after: None,
                 readable: false,
+                fail_open: false,
             }
         }
     }
     impl NDFileWriter for MockWriter {
         fn open_file(&mut self, _p: &Path, _m: NDFileMode, _a: &NDArray) -> ADResult<()> {
             self.opens += 1;
+            if self.fail_open {
+                return Err(ADError::Reported {
+                    lines: vec!["Mock::openFile cannot open".into()],
+                    message: "cannot open".into(),
+                });
+            }
             Ok(())
         }
         fn write_file(&mut self, _a: &Arc<NDArray>) -> ADResult<()> {
@@ -1796,8 +1818,14 @@ mod tests {
         crate::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         let mut c = FilePluginController::new(MockWriter::new(true));
         c.register_params(&mut base).unwrap();
-        c.store_int32(c.params.lazy_open.unwrap(), lazy);
-        c.store_int32(c.params.write_mode.unwrap(), mode);
+        c.store_int32(
+            c.params.lazy_open.unwrap(),
+            WriteVerdict::Accept(lazy).into(),
+        );
+        c.store_int32(
+            c.params.write_mode.unwrap(),
+            WriteVerdict::Accept(mode).into(),
+        );
         c
     }
 
@@ -1910,8 +1938,8 @@ mod tests {
         let dir = std::env::temp_dir().to_string_lossy().into_owned() + "/";
         c.store_octet(p.file_path.unwrap(), &dir);
         c.store_octet(p.file_template.unwrap(), "%s%s_%3.3d.x");
-        c.store_int32(p.auto_increment.unwrap(), 1);
-        c.store_int32(p.file_number.unwrap(), 7);
+        c.store_int32(p.auto_increment.unwrap(), WriteVerdict::Accept(1).into());
+        c.store_int32(p.file_number.unwrap(), WriteVerdict::Accept(7).into());
         c.latest_array = Some(Arc::new(array(1)));
         let out = c.write_int32(p.write_file.unwrap(), 1, WriteVerdict::Accept(1));
         assert_eq!(out.verdict, WriteVerdict::Accept(0));
@@ -2011,8 +2039,8 @@ mod tests {
             let p = c.params;
             c.writer.lock().readable = readable;
             c.store_octet(p.file_template.unwrap(), "%s%s_%d.x");
-            c.store_int32(p.auto_increment.unwrap(), 1);
-            c.store_int32(p.file_number.unwrap(), 5);
+            c.store_int32(p.auto_increment.unwrap(), WriteVerdict::Accept(1).into());
+            c.store_int32(p.file_number.unwrap(), WriteVerdict::Accept(5).into());
             let out = c.write_int32(p.read_file.unwrap(), 1, WriteVerdict::Accept(1));
             assert_eq!(
                 side_int(&out, p.file_number.unwrap()),
@@ -2049,5 +2077,123 @@ mod tests {
         let out = c.write_int32(66, 0, WriteVerdict::Accept(0));
         assert_eq!(c.file_base.num_captured(), 0);
         assert_eq!(side_int(&out, NUM_CAPTURED), Some(0));
+    }
+
+    /// A Single-mode port named `/d/f_<n>` with a frame to write and the
+    /// WriteMessage/WriteStatus readbacks wired.
+    fn base_port() -> FilePluginController<MockWriter> {
+        let mut c = write_port(0, 0);
+        c.file_base.file_path = "/d/".into();
+        c.file_base.file_name = "f".into();
+        c.file_base.file_template = "%s%s_%d".into();
+        c.latest_array = Some(Arc::new(array(1)));
+        c
+    }
+
+    fn write_file(c: &mut FilePluginController<MockWriter>) -> WriteOutcome<i32> {
+        let reason = c.params.write_file.unwrap();
+        c.write_int32(reason, 1, WriteVerdict::Accept(1))
+    }
+
+    fn error_lines(lines: &[&str]) -> Vec<(TraceMask, String)> {
+        lines
+            .iter()
+            .map(|l| (TraceMask::ERROR, l.to_string()))
+            .collect()
+    }
+
+    /// NDPluginFile.cpp:66-73: the writer's own lines, then C's, and C's
+    /// text in WriteMessage.
+    #[test]
+    fn a_failed_open_prints_open_file_base_after_the_writer() {
+        let mut c = base_port();
+        c.writer.lock().fail_open = true;
+        let out = write_file(&mut c);
+        assert_eq!(
+            out.trace,
+            error_lines(&[
+                "Mock::openFile cannot open",
+                "NDPluginFile::openFileBase Error opening file /d/f_0, status=3",
+            ])
+        );
+        assert_eq!(
+            message(&c, &out).as_deref(),
+            Some("Error opening file /d/f_0, status=3")
+        );
+        assert_eq!(side_int(&out, c.params.write_status.unwrap()), Some(1));
+    }
+
+    /// NDPluginFile.cpp:254-260, from a frame (AutoSave) as from WriteFile.
+    #[test]
+    fn a_failed_frame_write_prints_write_file_base() {
+        let mut c = base_port();
+        c.auto_save = true;
+        c.writer.lock().fail_write_after = Some(0);
+        let result = c.process_array(&Arc::new(array(2)));
+        assert_eq!(
+            result.trace,
+            error_lines(&["NDPluginFile::writeFileBase Error writing file, status=3"])
+        );
+        let message = result.param_updates.iter().rev().find_map(|u| match u {
+            ParamUpdate::Octet { reason, value, .. } if Some(*reason) == c.params.write_message => {
+                Some(value.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(message.as_deref(), Some("Error writing file, status=3"));
+    }
+
+    /// NDPluginFile.cpp:104-127: a failed close, and a temp file that cannot
+    /// be renamed — the mock never creates it.
+    #[test]
+    fn a_failed_close_or_rename_prints_close_file_base() {
+        let mut c = base_port();
+        c.writer.lock().fail_close = true;
+        let out = write_file(&mut c);
+        assert_eq!(
+            out.trace,
+            error_lines(&["NDPluginFile::closeFileBase Error closing file, status=3"])
+        );
+        assert_eq!(
+            message(&c, &out).as_deref(),
+            Some("Error closing file, status=3")
+        );
+
+        let mut c = base_port();
+        c.file_base.temp_suffix = ".tmp".into();
+        let out = write_file(&mut c);
+        let text = "Error renaming temporary file /d/f_0.tmp to /d/f_0";
+        assert_eq!(
+            out.trace,
+            error_lines(&[&format!("NDPluginFile::closeFileBase {text}")])
+        );
+        assert_eq!(message(&c, &out).as_deref(), Some(text));
+    }
+
+    /// NDPluginFile.cpp:160-180, the double space included.
+    #[test]
+    fn a_failed_read_prints_read_file_base() {
+        let mut c = base_port();
+        let reason = c.params.read_file.unwrap();
+        let out = c.write_int32(reason, 1, WriteVerdict::Accept(1));
+        assert_eq!(
+            out.trace,
+            error_lines(&["NDPluginFile::readFileBase Error  file /d/f_0, status=3"])
+        );
+        assert_eq!(
+            message(&c, &out).as_deref(),
+            Some("Error  file /d/f_0, status=3")
+        );
+
+        let mut c = base_port();
+        c.writer.lock().fail_open = true;
+        let out = c.write_int32(reason, 1, WriteVerdict::Accept(1));
+        assert_eq!(
+            out.trace,
+            error_lines(&[
+                "Mock::openFile cannot open",
+                "NDPluginFile::readFileBase Error opening file /d/f_0, status=3",
+            ])
+        );
     }
 }

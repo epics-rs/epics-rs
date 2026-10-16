@@ -529,6 +529,7 @@ impl NDPluginProcess for ROIProcessor {
                 param_updates: updates,
                 scatter: false,
                 addressed: vec![],
+                trace: vec![],
             },
             None => ProcessResult::sink(updates),
         }

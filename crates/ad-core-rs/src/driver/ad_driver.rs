@@ -186,8 +186,9 @@ impl ADDriverBase {
     ///   `setShutter` themselves.
     ///
     /// C++ never writes `ADShutterStatus` here — the actual shutter status is
-    /// driven by the shutter hardware / EPICS records, not assumed.
-    pub fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+    /// driven by the shutter hardware / EPICS records, not assumed. C's is void
+    /// and drops every param status, so no failure can reach `writeInt32`.
+    pub fn set_shutter(&mut self, open: bool) {
         // C ignores the get*Param statuses (ADDriver.cpp:36-38); ADDriver
         // seeds none of the three, so an unset one reads as 0.
         let mode = ShutterMode::from_i32(
@@ -211,12 +212,12 @@ impl ADDriverBase {
                     .port_base
                     .get_float64_param(self.params.shutter_close_delay, 0)
                     .unwrap_or(0.0);
-                self.port_base.set_int32_param(
+                let _ = self.port_base.set_int32_param(
                     self.params.shutter_control_epics,
                     0,
                     if open { 1 } else { 0 },
-                )?;
-                self.port_base.call_param_callbacks(0)?;
+                );
+                let _ = self.port_base.call_param_callbacks(0);
                 // C++: epicsThreadSleep(shutterOpenDelay - shutterCloseDelay).
                 let delay = open_delay - close_delay;
                 if delay > 0.0 {
@@ -224,8 +225,6 @@ impl ADDriverBase {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Handle a write to a pool-control Int32 parameter (`POOL_EMPTY_FREELIST`,
@@ -334,7 +333,7 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
 
     /// C++ virtual `ADDriver::setShutter` (ADDriver.cpp:29-52); a detector
     /// that drives its own shutter overrides it.
-    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+    fn set_shutter(&mut self, open: bool) {
         self.ad_base_mut().set_shutter(open)
     }
 
@@ -347,8 +346,7 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
                 .set_int32_param(user.reason, user.addr, value);
         let params = &self.ad_base().params;
         if user.reason == params.shutter_control {
-            // C's setShutter returns nothing to keep (ADDriver.cpp:98).
-            let _ = self.set_shutter(value != 0);
+            self.set_shutter(value != 0);
         } else if user.reason < params.first_ad_param {
             status = self.ad_base_mut().ndarray_write_int32(user, value);
         }
@@ -414,9 +412,8 @@ mod tests {
         fn ad_base_mut(&mut self) -> &mut ADDriverBase {
             &mut self.ad
         }
-        fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+        fn set_shutter(&mut self, open: bool) {
             self.shutter.push(open);
-            Ok(())
         }
     }
 
@@ -817,7 +814,7 @@ mod tests {
             .set_int32_param(ad.params.shutter_control, 0, 7)
             .unwrap();
 
-        ad.set_shutter(true).unwrap();
+        ad.set_shutter(true);
         // Unchanged — base setShutter does nothing for detector mode.
         assert_eq!(
             ad.port_base
@@ -828,13 +825,25 @@ mod tests {
     }
 
     #[test]
+    fn set_shutter_with_shutter_mode_unset_reads_it_as_none() {
+        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        ad.set_shutter(true);
+        assert!(
+            ad.port_base
+                .get_int32_param(ad.params.shutter_control_epics, 0)
+                .is_err(),
+            "mode 0 (None) leaves ShutterControlEPICS unwritten"
+        );
+    }
+
+    #[test]
     fn test_shutter_control_epics_mode() {
         let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
         ad.port_base
             .set_int32_param(ad.params.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
             .unwrap();
 
-        ad.set_shutter(true).unwrap();
+        ad.set_shutter(true);
         assert_eq!(
             ad.port_base
                 .get_int32_param(ad.params.shutter_control_epics, 0)
@@ -868,7 +877,7 @@ mod tests {
             .unwrap();
 
         let start = std::time::Instant::now();
-        ad.set_shutter(true).unwrap();
+        ad.set_shutter(true);
         let elapsed = start.elapsed();
         // delay = 0.05 - 0.01 = 0.04 s.
         assert!(

@@ -501,6 +501,10 @@ mod tests {
         )
         .unwrap();
         let handle = rt.port_handle();
+        // The ArrayCallbacks record's PINI; the driver leaves it unset as C does.
+        handle
+            .write_int32_blocking(rt.ad_params.base.array_callbacks, 0, 1)
+            .unwrap();
         handle
             .write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Single as i32)
             .unwrap();
@@ -537,6 +541,10 @@ mod tests {
         )
         .unwrap();
         let handle = rt.port_handle();
+        // The ArrayCallbacks record's PINI; the driver leaves it unset as C does.
+        handle
+            .write_int32_blocking(rt.ad_params.base.array_callbacks, 0, 1)
+            .unwrap();
         let file = rt.ad_params.base.attributes_file;
         let xml = r#"<Attributes>
             <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>

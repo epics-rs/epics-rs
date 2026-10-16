@@ -13,7 +13,8 @@ use crate::error::{CaError, CaResult, JsonLexFault};
 
 use super::reader::Feed;
 
-/// The lexer's `yyerrorAbort`s over one text (`dbLex.l:129-153`).
+/// The lexer's `yyerrorAbort`s over one text (`dbLex.l:129-153`), kept by
+/// [`Feed::refuse`].
 #[derive(Default)]
 pub(super) struct LexAborts {
     /// The line the lexer held at the first refusal; every later one is on
@@ -50,7 +51,6 @@ struct Lexer<'a> {
     pos: &'a mut usize,
     line: &'a mut usize,
     col: &'a mut usize,
-    aborts: &'a mut LexAborts,
 }
 
 fn is_barechar(c: u8) -> bool {
@@ -147,22 +147,9 @@ impl Lexer<'_> {
         *self.pos += 1;
     }
 
-    /// Record a refusal raised with the lexer on `line`, whose `yytext`
-    /// began at `start`.
+    /// [`Feed::refuse`] for a `yytext` that began at `start`, on `line`.
     fn refuse_at(&mut self, start: usize, line: usize, fault: JsonLexFault) {
-        if self.aborts.eof.is_none() {
-            let read = self.chars.read_len();
-            let eof = self
-                .chars
-                .bytes(start..read)
-                .iter()
-                .position(|&c| c == b'\n')
-                .map_or(read, |at| start + at + 1);
-            self.aborts.line = line;
-            self.aborts.eof = Some(eof);
-            self.chars.close_at(eof);
-        }
-        self.aborts.faults.push(fault);
+        self.chars.refuse(start, line, fault);
     }
 
     /// [`Self::refuse_at`] for the one character just consumed.
@@ -171,7 +158,7 @@ impl Lexer<'_> {
     }
 
     fn aborted(&self) -> bool {
-        self.aborts.eof.is_some()
+        self.chars.aborted()
     }
 
     /// C `yylex` in the `JSON` start condition.
@@ -263,61 +250,6 @@ impl Lexer<'_> {
                 c if c == quote => return Some(j),
                 _ => j += 1,
             }
-        }
-    }
-
-    /// The token the grammar asks for once a value is complete: `C` has left
-    /// the `JSON` start condition, so the rest of the buffered line is lexed
-    /// by the `INITIAL` rules (`dbLex.l:76-95,131-133,143-155`). Refusals are
-    /// recorded and scanning goes on, as the `yyerrorAbort` rules do, until a
-    /// token the grammar can see or the end of the line. Returns without
-    /// moving past that token.
-    fn lookahead(&mut self) {
-        loop {
-            while let Some(c) = self.chars.get(*self.pos) {
-                if c == b'\n' && self.aborted() {
-                    return;
-                }
-                if c == b'#' {
-                    while self.chars.get(*self.pos).is_some_and(|c| c != b'\n') {
-                        self.advance();
-                    }
-                } else if matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            let Some(c) = self.chars.get(*self.pos) else {
-                return;
-            };
-            let start = *self.pos;
-            if c == b'"' {
-                // `{doublequote}({dqschar}|{escape})*` then a quote (a token)
-                // or a newline (the error rule, which takes the newline too).
-                match self.string_end(b'"') {
-                    Some(_) => return,
-                    None => {
-                        let line = *self.line;
-                        while let Some(c) = self.chars.get(*self.pos) {
-                            self.advance();
-                            if c == b'\n' {
-                                break;
-                            }
-                        }
-                        let text = lossy(self.chars.bytes(start..*self.pos));
-                        self.refuse_at(start, line, JsonLexFault::NewlineInString(text));
-                        continue;
-                    }
-                }
-            }
-            let is_initial_token =
-                matches!(c, b'{' | b'}' | b'(' | b')' | b',' | b'%') || super::is_bareword_char(c);
-            if is_initial_token {
-                return;
-            }
-            self.advance();
-            self.refuse(JsonLexFault::Invalid(c));
         }
     }
 
@@ -422,7 +354,7 @@ impl Lexer<'_> {
 }
 
 /// Read one field value as C's `json_value` would, rebuilt (see
-/// [`Lexer::value`]). A lexer refusal lands in `aborts` and the value still
+/// [`Lexer::value`]). A lexer refusal lands in [`Feed::refuse`] and the value still
 /// completes if the grammar lets it; only the grammar's own rejection is an
 /// error, its `syntax error`.
 pub(super) fn read_json_value(
@@ -430,7 +362,6 @@ pub(super) fn read_json_value(
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
-    aborts: &mut LexAborts,
 ) -> CaResult<Vec<u8>> {
     let start_line = *line;
     let close = if chars.get(*pos) == Some(b'[') {
@@ -443,7 +374,6 @@ pub(super) fn read_json_value(
         pos,
         line,
         col,
-        aborts,
     };
     let first = lx.token();
     match lx.value(first) {
@@ -467,19 +397,12 @@ pub(super) fn read_json_value(
 
 /// What the lexer refuses between a value that parsed and the token that
 /// follows it, which it does not consume.
-pub(super) fn after_value(
-    chars: &mut Feed,
-    pos: &mut usize,
-    line: &mut usize,
-    col: &mut usize,
-    aborts: &mut LexAborts,
-) {
+pub(super) fn after_value(chars: &mut Feed, pos: &mut usize, line: &mut usize, col: &mut usize) {
     Lexer {
         chars,
         pos,
         line,
         col,
-        aborts,
     }
     .look_past();
 }
@@ -499,12 +422,15 @@ fn lossy(text: &[u8]) -> String {
 }
 
 impl Lexer<'_> {
-    /// [`Self::lookahead`], moving past only what it refused.
+    /// The token the grammar asks for once a value is complete: C has left
+    /// the `JSON` start condition, so the rest of the line is lexed by the
+    /// `INITIAL` rules ([`super::skip_whitespace_and_comments`]). Moves past
+    /// only what they refused, never the token itself.
     fn look_past(&mut self) {
         let at = (*self.pos, *self.line, *self.col);
-        let refused = self.aborts.faults.len();
-        self.lookahead();
-        if self.aborts.faults.len() == refused {
+        let refused = self.chars.lexed.faults.len();
+        super::skip_whitespace_and_comments(self.chars, self.pos, self.line, self.col);
+        if self.chars.lexed.faults.len() == refused {
             (*self.pos, *self.line, *self.col) = at;
         }
     }

@@ -1,16 +1,15 @@
 use thiserror::Error;
 
-/// One `yyerrorAbort` from the `.db` lexer's `JSON` start condition
-/// (`dbLex.l:136-155`).
+/// One `yyerrorAbort` from the `.db` lexer, in either start condition
+/// (`dbLex.l:129-155`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonLexFault {
     /// `Invalid character '%c'`; carries the character.
     Invalid(u8),
     /// `Bad character in JSON string`; carries the whole string, quotes included.
     BadString(String),
-    /// `Newline in string, closing quote missing` (`dbLex.l:131-133`), the
-    /// `INITIAL`-state rule the lookahead token after a value can draw; carries
-    /// the text through the newline it consumed.
+    /// `Newline in string, closing quote missing` (`dbLex.l:131-133`), an
+    /// `INITIAL`-state rule; carries the text through the newline it consumed.
     NewlineInString(String),
 }
 

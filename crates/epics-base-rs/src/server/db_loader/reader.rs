@@ -13,13 +13,14 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::error::{CaError, CaResult};
+use crate::error::{CaError, CaResult, JsonLexFault};
 use crate::runtime::log::ERL_ERROR;
 
 use super::include::{
     DbLoadConfig, DbOpenedFile, db_add_path, db_open_file_located, db_path, parse_macro_defns,
     parse_substitute_directive,
 };
+use super::json_lex::LexAborts;
 use super::{DbFaults, DbIncludeFrame, DbSource, MacroDefs, MacroExpandOptions, MacroTable};
 
 /// One entry of C's `inputFileList`.
@@ -32,8 +33,6 @@ struct InputFile {
     frame: DbIncludeFrame,
     content: Vec<u8>,
     cursor: usize,
-    /// The include search path the file's `path`/`addpath` act on.
-    paths: Vec<PathBuf>,
 }
 
 /// The text the parser has been handed so far, and the reader that hands it
@@ -41,6 +40,8 @@ struct InputFile {
 pub(super) struct Feed {
     buf: Vec<u8>,
     pub(super) faults: DbFaults,
+    /// The lexer's `yyerrorAbort`s, whichever start condition raised them.
+    pub(super) lexed: LexAborts,
     /// One table for the whole read, includes and all: C `dbReadCOM` has one
     /// `MAC_HANDLE` and `dbIncludeNew` pushes a file without touching it
     /// (`dbLexRoutines.c:256-300`, `:443-461`).
@@ -50,6 +51,10 @@ pub(super) struct Feed {
     /// command, not C `.db` grammar) is not recognised.
     config: Option<DbLoadConfig>,
     files: Vec<InputFile>,
+    /// The include search path: one for the whole read, as C keeps it on
+    /// `savedPdbbase`, set from the load's own at `dbReadCOM`
+    /// (`dbLexRoutines.c:245-253`).
+    paths: Vec<PathBuf>,
     /// C `yyAbort` as `db_yyinput` sees it (`dbLexRoutines.c:374`): no more
     /// lines are read.
     closed: bool,
@@ -58,9 +63,13 @@ pub(super) struct Feed {
 impl Feed {
     fn new(macros: MacroDefs, config: Option<DbLoadConfig>, mut faults: DbFaults) -> Self {
         faults.bind_source(DbSource::default());
+        let paths = config
+            .as_ref()
+            .map_or_else(Vec::new, |config| config.include_paths.clone());
         Self {
             buf: Vec::new(),
             faults,
+            lexed: LexAborts::default(),
             table: MacroTable::new(
                 macros,
                 MacroExpandOptions {
@@ -70,6 +79,7 @@ impl Feed {
             ),
             config,
             files: Vec::new(),
+            paths,
             closed: false,
         }
     }
@@ -86,7 +96,6 @@ impl Feed {
             },
             content: input.to_vec(),
             cursor: 0,
-            paths: Vec::new(),
         });
         feed
     }
@@ -122,20 +131,32 @@ impl Feed {
         &self.buf[range]
     }
 
-    /// How much has been read; past it lies only what [`Self::get`] reads.
-    pub(super) fn read_len(&self) -> usize {
-        self.buf.len()
+    /// A lexer `yyerrorAbort` (`dbLex.l:129-153`) raised with the lexer on
+    /// `line`, its `yytext` beginning at `start`: the text ends with the
+    /// line the lexer holds, and nothing more is read.
+    pub(super) fn refuse(&mut self, start: usize, line: usize, fault: JsonLexFault) {
+        if self.lexed.eof.is_none() {
+            let read = self.buf.len();
+            let eof = self.buf[start..read]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(read, |at| start + at + 1);
+            self.lexed.line = line;
+            self.lexed.eof = Some(eof);
+            self.buf.truncate(eof);
+            self.closed = true;
+        }
+        self.lexed.faults.push(fault);
     }
 
-    /// A lexer `yyerrorAbort`: the text ends at `end`, the end of the line
-    /// the lexer holds, and nothing more is read.
-    pub(super) fn close_at(&mut self, end: usize) {
-        self.buf.truncate(end);
-        self.closed = true;
+    /// A `yyerrorAbort` has been raised: the line the lexer holds is the
+    /// last.
+    pub(super) fn aborted(&self) -> bool {
+        self.lexed.eof.is_some()
     }
 
-    pub(super) fn into_parts(self) -> (Vec<u8>, DbFaults) {
-        (self.buf, self.faults)
+    pub(super) fn into_parts(self) -> (Vec<u8>, DbFaults, LexAborts) {
+        (self.buf, self.faults, self.lexed)
     }
 
     /// C `db_yyinput`: the next line of the innermost open file, expanded,
@@ -215,18 +236,14 @@ impl Feed {
         end: usize,
         line: u32,
     ) -> CaResult<()> {
-        let Some(config) = &self.config else {
+        if self.config.is_none() {
             return Ok(());
-        };
+        }
         let name = String::from_utf8_lossy(name).into_owned();
         // C opens the file while this line is read, and the open's own
         // `macEnvExpand` prints at once.
         self.faults.read_through(line);
-        let paths = self
-            .files
-            .last()
-            .map_or(&config.include_paths, |file| &file.paths);
-        let Some(included) = db_open_file_located(&name, paths) else {
+        let Some(included) = db_open_file_located(&name, &self.paths) else {
             // `yyerror(NULL)`: the include is skipped and the load goes on.
             self.faults.seek(line, yytext);
             self.faults
@@ -254,13 +271,10 @@ impl Feed {
         // byte cannot reach here on a platform that would mind — see
         // `db_add_path`.
         let dirs = unsafe { OsStr::from_encoded_bytes_unchecked(dirs) };
-        let Some(file) = self.files.last_mut() else {
-            return;
-        };
         if add {
-            file.paths.extend(db_add_path(dirs));
+            self.paths.extend(db_add_path(dirs));
         } else {
-            file.paths = db_path(dirs);
+            self.paths = db_path(dirs);
         }
     }
 
@@ -299,12 +313,19 @@ impl Feed {
         }
         // Bytes, not text: C `fgets` hands its lexer whatever the file
         // holds, and `dbLoadRecords` loads a record whose name is not UTF-8.
-        let content = std::fs::read(&identity).map_err(|e| CaError::DbParseError {
-            line: 0,
-            token: String::new(),
-            message: format!("cannot read '{named}': {e}"),
-        })?;
-        let paths = config.include_paths.clone();
+        let content = match std::fs::read(&identity) {
+            Ok(content) => content,
+            // C `fopen`s a directory and its first `fgets` fails, which
+            // `db_yyinput` takes for the end of an empty file.
+            Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => Vec::new(),
+            Err(e) => {
+                return Err(CaError::DbParseError {
+                    line: 0,
+                    token: String::new(),
+                    message: format!("cannot read '{named}': {e}"),
+                });
+            }
+        };
         self.files.push(InputFile {
             identity: Some(identity),
             frame: DbIncludeFrame {
@@ -314,7 +335,6 @@ impl Feed {
             },
             content,
             cursor: 0,
-            paths,
         });
         Ok(())
     }

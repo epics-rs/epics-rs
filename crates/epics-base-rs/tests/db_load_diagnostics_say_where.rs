@@ -530,3 +530,316 @@ line 2: '}}'
     );
     assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
 }
+
+/// Run `dbLoadRecords("<name>")` over `db` in a directory of its own that
+/// is the include path, prepared by `setup`; return what it wrote, the
+/// directory, and the records it left, sorted.
+async fn load_in_dir(
+    name: &str,
+    db: &[u8],
+    setup: impl FnOnce(&std::path::Path),
+) -> (String, String, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(name), db).expect("write the .db");
+    setup(dir.path());
+    let found_under = dir.path().display().to_string();
+    let pvdb = Arc::new(PvDatabase::new());
+
+    // SAFETY: the process-global env is why the callers are `serial`.
+    unsafe { std::env::set_var("EPICS_DB_INCLUDE_PATH", &found_under) };
+    let got = stderr_of(&format!("dbLoadRecords(\"{name}\")"), pvdb.clone());
+    unsafe { std::env::remove_var("EPICS_DB_INCLUDE_PATH") };
+    let mut records: Vec<String> = pvdb
+        .all_record_names()
+        .await
+        .iter()
+        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+        .collect();
+    records.sort();
+    (got, found_under, records)
+}
+
+/// A character no `INITIAL` rule of `dbLex.l` takes is a `yyerrorAbort`
+/// wherever the lexer meets it, not only after a field value: the rest of
+/// its line is still lexed, and records the grammar completes on it are
+/// created, but the next line is EOF and the load fails. Each case is one
+/// boundary of the rule; every expected text is `softIoc` R7.0.10's (`dbl`
+/// for the records), with its `"."` search path for the test's directory.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn an_initial_state_refusal_ends_the_load_after_its_line() {
+    let cases: &[(&str, &[u8], &str, &[&str])] = &[
+        // Alone on a line, at file scope: EOF follows, which the grammar
+        // accepts there.
+        (
+            "stray.db",
+            b"record(ai, \"A\") {}\n@\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"stray.db\" line 2
+
+ 2 | @
+
+ERROR: Failed to load 'stray.db'
+",
+            &["A"],
+        ),
+        // Before a token: the record on the line is still completed.
+        (
+            "c3.db",
+            b"record(ai, \"A\") {}\nrecord(ai, @\"X\") {}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c3.db\" line 2
+
+ 2 | record(ai, @\"X\") {}
+
+ERROR: Failed to load 'c3.db'
+",
+            &["A", "X"],
+        ),
+        // A string the newline ends: its own rule, `yytext` through the
+        // newline, and the grammar then meets EOF.
+        (
+            "c4.db",
+            b"record(ai, \"A\") {}\nrecord(ai, \"X) {}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Newline in string, closing quote missing
+ at or before '\"X) {}
+' in path \"{dir}\"  file \"c4.db\" line 2
+
+ 2 | record(ai, \"X) {}
+
+ERROR: syntax error
+
+ 2 | record(ai, \"X) {}
+
+ERROR: Failed to load 'c4.db'
+",
+            &["A"],
+        ),
+        // A string a backslash-newline ends matches neither string rule: the
+        // quote alone is refused, and the lexer goes on after it.
+        (
+            "c5.db",
+            b"record(ai, \"A\") {}\nrecord(ai, \"X\\\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '\"'
+ at or before '\"' in path \"{dir}\"  file \"c5.db\" line 2
+
+ 2 | record(ai, \"X\\
+
+ERROR: Invalid character '\\'
+
+ 2 | record(ai, \"X\\
+
+ERROR: syntax error
+
+ 2 | record(ai, \"X\\
+
+ERROR: Failed to load 'c5.db'
+",
+            &["A"],
+        ),
+        // A single quote delimits a string only in the `JSON` state.
+        (
+            "c6.db",
+            b"record(ai, \"A\") {}\nrecord(ai, 'X') {}\n",
+            "\
+ERROR: Invalid character '''
+ at or before ''' in path \"{dir}\"  file \"c6.db\" line 2
+
+ 2 | record(ai, 'X') {}
+
+ERROR: Invalid character '''
+
+ 2 | record(ai, 'X') {}
+
+ERROR: Failed to load 'c6.db'
+",
+            &["A", "X"],
+        ),
+        // Inside a record body.
+        (
+            "c7.db",
+            b"record(ai, \"A\") { @ field(DESC, \"x\") }\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c7.db\" line 1
+
+ 1 | record(ai, \"A\") { @ field(DESC, \"x\") }
+
+ERROR: Failed to load 'c7.db'
+",
+            &["A"],
+        ),
+        // `%` starts a token, which the grammar refuses at file scope.
+        (
+            "c8.db",
+            b"record(ai, \"A\") {}\n%foo\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: syntax error
+ at or before '%foo' in path \"{dir}\"  file \"c8.db\" line 2
+
+ 2 | %foo
+
+ERROR: Failed to load 'c8.db'
+",
+            &["A"],
+        ),
+        // So does a quoted string.
+        (
+            "c14.db",
+            b"record(ai, \"A\") {}\n\"X\" record(ai, \"B\") {}\n",
+            "\
+ERROR: syntax error
+ at or before '\"X\"' in path \"{dir}\"  file \"c14.db\" line 2
+
+ 2 | \"X\" record(ai, \"B\") {}
+
+ERROR: Failed to load 'c14.db'
+",
+            &["A"],
+        ),
+        // A character that does not print is named by its byte.
+        (
+            "c9.db",
+            b"record(ai, \"A\") {}\n\x01 record(ai, \"C\") {}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character 0x01
+ at or before '\x01' in path \"{dir}\"  file \"c9.db\" line 2
+
+ 2 | \x01 record(ai, \"C\") {}
+
+ERROR: Failed to load 'c9.db'
+",
+            &["A", "C"],
+        ),
+        // Every refusal on the line is reported, the position only once.
+        (
+            "c10.db",
+            b"record(ai, \"A\") {}\n@ @ record(ai, \"C\") {} $\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c10.db\" line 2
+
+ 2 | @ @ record(ai, \"C\") {} $
+
+ERROR: Invalid character '@'
+
+ 2 | @ @ record(ai, \"C\") {} $
+
+ERROR: Invalid character '$'
+
+ 2 | @ @ record(ai, \"C\") {} $
+
+ERROR: Failed to load 'c10.db'
+",
+            &["A", "C"],
+        ),
+        // A body left open by the EOF is a syntax error, and not a dirty
+        // parser stack.
+        (
+            "c11.db",
+            b"record(ai, \"A\") {\n  field(DESC, \"x\") @\n}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c11.db\" line 2
+
+ 2 |   field(DESC, \"x\") @
+
+ERROR: syntax error
+
+ 2 |   field(DESC, \"x\") @
+
+ERROR: Failed to load 'c11.db'
+",
+            &["A"],
+        ),
+    ];
+    for (name, db, want, records) in cases {
+        let (got, dir, loaded) = load_in_dir(name, db, |_| {}).await;
+        let want = want.replace("{dir}", &dir);
+        assert_eq!(
+            got, want,
+            "{name}\n--- got ---\n{got}\n--- want ---\n{want}"
+        );
+        assert_eq!(loaded, *records, "{name}: records left");
+    }
+}
+
+/// `include sub/S.template` names `sub`: `/` is no bareword character, and
+/// is refused after the include is reduced, in the file it pushed. Measured
+/// on `softIoc` R7.0.10 with `sub` absent, then a directory, which `fopen`
+/// opens and the first read finds empty.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn a_slash_after_an_include_name_is_refused() {
+    let db = b"record(ai, \"A\") {}\ninclude sub/S.template\nrecord(ai, \"B\") {}\n";
+    let (got, dir, loaded) = load_in_dir("n2.db", db, |_| {}).await;
+    let want = format!(
+        "\
+ERROR: Can't open include file 'sub'
+ERROR:  at or before 'sub' in path \"{dir}\"  file \"n2.db\" line 2
+
+ 2 | include sub/S.template
+
+ERROR: Invalid character '/'
+
+ 2 | include sub/S.template
+
+ERROR: syntax error
+
+ 2 | include sub/S.template
+
+ERROR: Failed to load 'n2.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+    assert_eq!(loaded, ["A"]);
+
+    let db = b"include sub/S.template\nrecord(ai, \"B\") {}\n";
+    let (got, dir, loaded) = load_in_dir("c2.db", db, |dir| {
+        std::fs::create_dir(dir.join("sub")).expect("mkdir sub");
+        std::fs::write(dir.join("sub/S.template"), "record(ai, \"S\") {}\n").expect("write S");
+    })
+    .await;
+    let want = format!(
+        "\
+ERROR: Invalid character '/'
+ at or before '/' in path \"{dir}\"  file \"sub\" line 0
+ in path \"{dir}\"  file \"c2.db\" line 1
+
+ 0 | include sub/S.template
+
+ERROR: syntax error
+
+ 0 | include sub/S.template
+
+ERROR: Failed to load 'c2.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+    assert!(loaded.is_empty(), "records left: {loaded:?}");
+}
+
+/// A keyword is the whole bareword run, as flex's longest match makes it:
+/// `record.x` is refused as one token. Measured on `softIoc` R7.0.10.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn a_keyword_is_the_whole_bareword_run() {
+    let db = b"record(ai, \"A\") {}\nrecord.x(ai, \"B\") {}\n";
+    let (got, dir, loaded) = load_in_dir("kw.db", db, |_| {}).await;
+    let want = format!(
+        "\
+ERROR: syntax error
+ at or before 'record.x' in path \"{dir}\"  file \"kw.db\" line 2
+
+ 2 | record.x(ai, \"B\") {{}}
+
+ERROR: Failed to load 'kw.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+    assert_eq!(loaded, ["A"]);
+}

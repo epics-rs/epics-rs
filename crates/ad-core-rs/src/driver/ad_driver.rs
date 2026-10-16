@@ -50,6 +50,8 @@ impl ADDriverBase {
 
         let params = ADDriverParams::create(&mut port_base)?;
         let pool = NDArrayPool::new(max_memory);
+        let queued_counter = Arc::new(QueuedArrayCounter::new());
+        acquire_busy_rules(&mut port_base, &params, &queued_counter);
 
         // C `ADDriver::ADDriver` (ADDriver.cpp:150) chains to
         // `asynNDArrayDriver::asynNDArrayDriver`, so its whole read-only block
@@ -103,7 +105,7 @@ impl ADDriverBase {
             params,
             pool,
             array_output: NDArrayOutput::new(),
-            queued_counter: Arc::new(QueuedArrayCounter::new()),
+            queued_counter,
             last_array: None,
             attributes: DriverAttributes::new(),
         })
@@ -284,56 +286,54 @@ impl ADDriverBase {
         self.attributes.attach(&self.port_base, array);
     }
 
-    /// Write `ADAcquire` and drive `ADAcquireBusy` accordingly.
-    ///
-    /// Mirrors the `ADAcquire` branch of C++ `asynNDArrayDriver::setIntegerParam`
-    /// (asynNDArrayDriver.cpp:636-663):
-    /// - `value != 0` (start): `ADAcquireBusy = 1`.
-    /// - `value == 0` (stop): `ADAcquireBusy = 0`, but when `ADWaitForPlugins`
-    ///   is set, only once the live queued-array count has reached 0.
-    ///
-    /// `ADAcquire` itself is always written to `value`.
+    /// Store `ADAcquire`; its rule keeps `ADAcquireBusy` in step.
     pub fn set_acquire(&mut self, value: i32) -> AsynResult<()> {
-        if value == 0 {
-            let wait_for_plugins = self
-                .port_base
-                .get_int32_param(self.params.wait_for_plugins, 0)
-                .unwrap_or(0)
-                != 0;
-            if !wait_for_plugins || self.queued_counter.get() == 0 {
-                self.port_base
-                    .set_int32_param(self.params.acquire_busy, 0, 0)?;
-            }
-        } else {
-            self.port_base
-                .set_int32_param(self.params.acquire_busy, 0, 1)?;
-        }
         self.port_base
-            .set_int32_param(self.params.acquire, 0, value)?;
-        Ok(())
+            .set_int32_param(self.params.acquire, 0, value)
     }
 
-    /// Write `NDNumQueuedArrays` and clear `ADAcquireBusy` when the queue
-    /// drains while acquisition has already stopped.
-    ///
-    /// Mirrors the `NDNumQueuedArrays` branch of C++
-    /// `asynNDArrayDriver::setIntegerParam`: when `NDNumQueuedArrays` reaches 0
-    /// and `ADAcquire == 0`, `ADAcquireBusy` is set to 0.
+    /// Store `NDNumQueuedArrays`; its rule clears `ADAcquireBusy` once the
+    /// queue drains after acquisition stopped.
     pub fn set_num_queued_arrays(&mut self, value: i32) -> AsynResult<()> {
-        if value == 0 {
-            let acquire = self
-                .port_base
-                .get_int32_param(self.params.acquire, 0)
-                .unwrap_or(0);
-            if acquire == 0 {
-                self.port_base
-                    .set_int32_param(self.params.acquire_busy, 0, 0)?;
-            }
-        }
         self.port_base
-            .set_int32_param(self.params.base.num_queued_arrays, 0, value)?;
-        Ok(())
+            .set_int32_param(self.params.base.num_queued_arrays, 0, value)
     }
+}
+
+/// C++ `asynNDArrayDriver::setIntegerParam` (asynNDArrayDriver.cpp:636-663),
+/// which every store of `ADAcquire` or `NDNumQueuedArrays` reaches, whoever
+/// makes it. A stop clears `ADAcquireBusy` at once unless `ADWaitForPlugins`
+/// is set and arrays are still queued; it reads the live count, because the
+/// `NDNumQueuedArrays` parameter lags it (:633-635).
+fn acquire_busy_rules(
+    port_base: &mut PortDriverBase,
+    params: &ADDriverParams,
+    queued: &Arc<QueuedArrayCounter>,
+) {
+    let (acquire, busy, wait) = (params.acquire, params.acquire_busy, params.wait_for_plugins);
+    let queued = Arc::clone(queued);
+    port_base.set_int32_rule(
+        acquire,
+        Arc::new(move |base: &mut PortDriverBase, list, value| {
+            if value != 0 {
+                base.set_int32_param(busy, list, 1)
+            } else if base.get_int32_param(wait, list).unwrap_or(0) == 0 || queued.get() == 0 {
+                base.set_int32_param(busy, list, 0)
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    port_base.set_int32_rule(
+        params.base.num_queued_arrays,
+        Arc::new(move |base: &mut PortDriverBase, list, value| {
+            if value == 0 && base.get_int32_param(acquire, list).unwrap_or(0) == 0 {
+                base.set_int32_param(busy, list, 0)
+            } else {
+                Ok(())
+            }
+        }),
+    );
 }
 
 /// Trait for areaDetector drivers.
@@ -374,6 +374,11 @@ mod tests {
     use crate::driver::ndarray_driver::tests::{assert_c_read_only_block, assert_fresh_pool_stats};
     use crate::plugin::runtime::ASYN_CANBLOCK;
     use asyn_rs::param::ParamType;
+    use asyn_rs::param::ParamValue;
+    use asyn_rs::registry::PortRegistry;
+    use asyn_rs::request::ParamSetValue;
+    use asyn_rs::runtime::RuntimeConfig;
+    use asyn_rs::runtime::port::create_port_runtime;
 
     #[test]
     fn test_constructor_seeds_the_c_read_only_block() {
@@ -861,6 +866,94 @@ mod tests {
             elapsed >= std::time::Duration::from_millis(35),
             "expected ~40ms sleep, got {elapsed:?}"
         );
+    }
+
+    fn busy(ad: &ADDriverBase) -> i32 {
+        ad.port_base
+            .get_int32_param(ad.params.acquire_busy, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn every_acquire_store_drives_acquire_busy() {
+        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let acquire = ad.params.acquire;
+        ad.port_base.set_int32_param(acquire, 0, 1).unwrap();
+        assert_eq!(busy(&ad), 1);
+        // A driver's background ParamSetValue stores through the same rule.
+        ad.port_base
+            .set_param_value(acquire, 0, ParamValue::Int32(0))
+            .unwrap();
+        assert_eq!(busy(&ad), 0);
+    }
+
+    #[test]
+    fn a_param_set_value_through_the_port_clears_acquire_busy() {
+        struct Det(ADDriverBase);
+        impl asyn_rs::port::PortDriver for Det {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let ad = ADDriverBase::new("ADRULEPORT", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let (acquire, acquire_busy) = (ad.params.acquire, ad.params.acquire_busy);
+        let claim = PortRegistry::new().claim("ADRULEPORT").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, Det(ad), RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle().clone();
+        let read_busy = move |d: &mut Det| d.0.port_base.get_int32_param(acquire_busy, 0).unwrap();
+        for (value, want) in [(1, 1), (0, 0)] {
+            handle
+                .set_params_and_notify_blocking(
+                    0,
+                    vec![ParamSetValue::new(acquire, 0, ParamValue::Int32(value))],
+                )
+                .unwrap();
+            assert_eq!(handle.with_driver_blocking(read_busy).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn wait_for_plugins_holds_acquire_busy_until_the_queue_drains_after_stop() {
+        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let (acquire, queued) = (ad.params.acquire, ad.params.base.num_queued_arrays);
+        ad.port_base
+            .set_int32_param(ad.params.wait_for_plugins, 0, 1)
+            .unwrap();
+        ad.port_base.set_int32_param(acquire, 0, 1).unwrap();
+        ad.queued_counter.increment();
+
+        // The queue draining while still acquiring leaves it busy.
+        ad.port_base.set_int32_param(queued, 0, 0).unwrap();
+        assert_eq!(busy(&ad), 1);
+        // A stop with an array queued keeps it busy (the live count, not the
+        // NDNumQueuedArrays parameter, which already reads 0).
+        ad.port_base.set_int32_param(acquire, 0, 0).unwrap();
+        assert_eq!(busy(&ad), 1);
+        // A non-zero queue store clears nothing.
+        ad.port_base.set_int32_param(queued, 0, 1).unwrap();
+        assert_eq!(busy(&ad), 1);
+        ad.queued_counter.decrement();
+        ad.port_base.set_int32_param(queued, 0, 0).unwrap();
+        assert_eq!(busy(&ad), 0);
+    }
+
+    #[test]
+    fn a_stop_with_an_empty_queue_clears_acquire_busy_under_wait_for_plugins() {
+        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        ad.port_base
+            .set_int32_param(ad.params.wait_for_plugins, 0, 1)
+            .unwrap();
+        ad.port_base
+            .set_int32_param(ad.params.acquire, 0, 1)
+            .unwrap();
+        ad.port_base
+            .set_int32_param(ad.params.acquire, 0, 0)
+            .unwrap();
+        assert_eq!(busy(&ad), 0);
     }
 
     #[test]

@@ -313,17 +313,17 @@ impl AsynMotor for SimMotor {
             moving: self.moving,
             high_limit: self.position >= self.high_limit,
             low_limit: self.position <= self.low_limit,
-            home: self.position == 0.0,
-            // The sim tracks a real encoder image (encoder_position,
-            // set_encoder_position), so it reports the encoder present
-            // — otherwise the record demotes UEIP=Yes to No on the
-            // first poll (C 3671-3675) and the EA_HOME path is dead.
-            // The encoder index asserts at the same physical home spot
-            // as the switch.
-            has_encoder: true,
-            encoder_home: self.encoder_position == 0.0,
+            // motorSimDriver.cpp:471-477 sets only these bits: Home (EA_HOME,
+            // bit 7) at the home position, Direction from the signed
+            // velocity (0 at rest), and never AtHome or HasEncoder.
+            encoder_home: self.position == 0.0,
             problem: false,
-            direction: self.velocity_direction,
+            direction: self.moving
+                && if self.velocity_mode {
+                    self.velocity_direction
+                } else {
+                    self.target > self.start_position
+                },
             homed: self.homed,
             ..MotorStatus::default()
         })
@@ -348,20 +348,17 @@ mod tests {
     }
 
     #[test]
-    fn test_sim_motor_reports_encoder_and_home_index() {
+    fn test_sim_motor_reports_home_on_encoder_home_bit_only() {
         let user = AsynUser::new(0);
         let mut motor = SimMotor::new();
         let at_home = motor.poll(&user).unwrap();
-        assert!(at_home.has_encoder, "sim encoder is present");
-        assert!(at_home.encoder_home, "encoder index asserts at home");
-        assert!(at_home.home);
+        assert!(at_home.encoder_home);
+        assert!(!at_home.home && !at_home.has_encoder && !at_home.direction);
 
         motor.move_absolute(&user, 10.0, 0.0, 10000.0, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let away = motor.poll(&user).unwrap();
-        assert!(away.has_encoder);
-        assert!(!away.encoder_home, "index drops off the home position");
-        assert!(!away.home);
+        assert!(!away.encoder_home && !away.home);
     }
 
     #[test]

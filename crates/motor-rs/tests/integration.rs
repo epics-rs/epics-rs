@@ -1214,3 +1214,36 @@ async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
     );
     let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
 }
+
+/// MSTA a motorSim axis reads at rest, through init + process: C reads 130
+/// (Done | Home) at the home position and 2 (Done) off it
+/// (motorSimDriver.cpp:471-477, bit order asynMotorController.cpp:85-99).
+#[tokio::test]
+async fn sim_motor_msta_at_rest_matches_motor_sim_driver() {
+    for (start, c_msta) in [(0.0, 130u32), (5.0, 2)] {
+        let motor: Arc<Mutex<dyn AsynMotor>> =
+            Arc::new(Mutex::new(SimMotor::new().with_position(start)));
+        let mut setup = MotorBuilder::new(motor)
+            .poll_interval(Duration::from_millis(5))
+            .build();
+        setup.device_support.init(&mut setup.record).unwrap();
+        let poll_handle = tokio::spawn(setup.poll_loop.run());
+
+        let msta = |rec: &motor_rs::record::MotorRecord| match rec.get_field("MSTA") {
+            Some(EpicsValue::ULong(v)) => v,
+            other => panic!("MSTA read {other:?}"),
+        };
+        let record_ref = &mut setup.record;
+        let ds_ref = &mut setup.device_support;
+        wait_until(Duration::from_secs(2), || {
+            record_ref.process().unwrap();
+            ds_ref.write(record_ref).unwrap();
+            msta(record_ref) == c_msta
+        })
+        .await;
+        assert_eq!(msta(&setup.record), c_msta, "MSTA at position {start}");
+
+        let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+        let _ = poll_handle.await;
+    }
+}

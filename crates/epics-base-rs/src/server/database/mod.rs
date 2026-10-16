@@ -43,7 +43,8 @@ pub use processing::{
 };
 pub(crate) use record_lock::{CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard};
 pub use record_lock::{
-    LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, scan_lock_held,
+    LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, in_sync_driver_wait,
+    scan_lock_held, sync_driver_wait,
 };
 pub(crate) use record_table::RecordIdx;
 pub(crate) use subroutine_context::RecordDb;

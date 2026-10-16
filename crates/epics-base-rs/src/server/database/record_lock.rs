@@ -691,6 +691,43 @@ impl Drop for InitPass {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    /// How many [`sync_driver_wait`] calls this thread is inside.
+    static SYNC_DRIVER_WAIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f`, a driver call C makes inline under `dbScanLock` that may wait on
+/// a can-block port: asynRecord's `drvUserCreate` (asynRecord.c:1249) and
+/// devScalerAsyn's reset/preset/arm, which a synchronous port (drvScaler974)
+/// serves through SyncIO. A caller list is a workaround until the asyn
+/// driver-model change.
+pub fn sync_driver_wait<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(debug_assertions)]
+    struct Scope;
+    #[cfg(debug_assertions)]
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            SYNC_DRIVER_WAIT.with(|n| n.set(n.get() - 1));
+        }
+    }
+    #[cfg(debug_assertions)]
+    SYNC_DRIVER_WAIT.with(|n| n.set(n.get() + 1));
+    #[cfg(debug_assertions)]
+    let _scope = Scope;
+    f()
+}
+
+/// Whether this thread is inside [`sync_driver_wait`]; `false` in a release
+/// build, which does not count.
+#[inline]
+pub fn in_sync_driver_wait() -> bool {
+    #[cfg(debug_assertions)]
+    return SYNC_DRIVER_WAIT.with(std::cell::Cell::get) > 0;
+    #[cfg(not(debug_assertions))]
+    false
+}
+
 impl LockSet {
     /// C `dbScanLock` (`dbLock.c:180-234`) minus the reference dance: take the
     /// set's mutex, or count one more level if this thread is already inside

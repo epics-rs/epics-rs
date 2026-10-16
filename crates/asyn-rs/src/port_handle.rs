@@ -84,30 +84,6 @@ fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
     }
 }
 
-#[cfg(all(feature = "epics", debug_assertions))]
-thread_local! {
-    static DRV_USER_ON_PUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// [`PortHandle::drv_user_create_on_put`]'s scope.
-#[cfg(all(feature = "epics", debug_assertions))]
-struct DrvUserOnPut(());
-
-#[cfg(all(feature = "epics", debug_assertions))]
-impl DrvUserOnPut {
-    fn enter() -> Self {
-        DRV_USER_ON_PUT.with(|f| f.set(true));
-        Self(())
-    }
-}
-
-#[cfg(all(feature = "epics", debug_assertions))]
-impl Drop for DrvUserOnPut {
-    fn drop(&mut self) {
-        DRV_USER_ON_PUT.with(|f| f.set(false));
-    }
-}
-
 /// Block the calling thread on a reply that only the port actor can produce.
 ///
 /// The actor runs on its own OS thread, so the reply arrives no matter what the
@@ -671,13 +647,15 @@ impl PortHandle {
         guard_reentrant(self.actor, &self.port_name, what)?;
         // A blocking port's actor answers only after the driver call it is in,
         // so waiting under a record's hold holds the record for that call — a
-        // read's whole timeout. C waits there only on a synchronous port's
-        // `synchronousLock` (asynManager.c:1555-1584).
+        // read's whole timeout. C waits there on a synchronous port's
+        // `synchronousLock` (asynManager.c:1555-1584), and in a synchronous
+        // port's driver call that drives a can-block port through SyncIO
+        // (drvScaler974 under devScalerAsyn) — the `sync_driver_wait` callers.
         #[cfg(all(feature = "epics", debug_assertions))]
         assert!(
             !(self.can_block
                 && epics_base_rs::server::database::scan_lock_held() == Some(true)
-                && !DRV_USER_ON_PUT.with(std::cell::Cell::get)),
+                && !epics_base_rs::server::database::in_sync_driver_wait()),
             "{what} on port {} under a record's hold",
             self.port_name
         );
@@ -1090,12 +1068,11 @@ impl PortHandle {
     /// calls `pasynDrvUser->create` directly under `dbScanLock`
     /// (asynRecord.c:1249); here the driver lives on its actor, and a driver
     /// may create the parameter in it, so there is no direct form.
-    /// The sole caller-side exemption, until the post-stage-3 driver-model item.
+    /// A [`sync_driver_wait`](epics_base_rs::server::database::sync_driver_wait)
+    /// caller, until the post-stage-3 driver-model item.
     #[cfg(feature = "epics")]
     pub(crate) fn drv_user_create_on_put(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
-        #[cfg(debug_assertions)]
-        let _exempt = DrvUserOnPut::enter();
-        self.drv_user_create_blocking(req)
+        epics_base_rs::server::database::sync_driver_wait(|| self.drv_user_create_blocking(req))
     }
 
     pub fn drv_user_create_blocking(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {

@@ -6,6 +6,7 @@ use std::time::Instant;
 use super::dbd_generated;
 use crate::device_support::scaler_asyn::ScalerDriver;
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::sync_driver_wait;
 use epics_base_rs::server::record::{
     CycleMarks, CyclePostMask, DeclaredFields, FieldDesc, FieldIx, FieldMetadataOverride,
     PostTable, ProcessAction, ProcessOutcome, Record, declared_post_table, declared_set,
@@ -518,7 +519,7 @@ impl ScalerRecord {
     /// the dset status at every call site; so does the port.
     fn dset_disarm(dset: Option<&mut dyn ScalerDriver>) {
         if let Some(dset) = dset {
-            let _ = dset.arm(false);
+            let _ = sync_driver_wait(|| dset.arm(false));
         }
     }
 
@@ -530,6 +531,10 @@ impl ScalerRecord {
     /// cycle's change detection.
     fn dset_start_count(&mut self, dset: Option<&mut dyn ScalerDriver>) {
         let Some(dset) = dset else { return };
+        sync_driver_wait(|| self.start_count_on(dset));
+    }
+
+    fn start_count_on(&mut self, dset: &mut dyn ScalerDriver) {
         let _ = dset.reset();
         let old_pr1 = self.reqstart_old_pr1;
         let old_freq = self.freq;
@@ -581,46 +586,7 @@ impl ScalerRecord {
         }
         let mut actions = Vec::new();
         if let Some(dset) = dset {
-            let old_pr1 = self.pr[0];
-            let old_freq = self.freq;
-            let _ = dset.reset();
-            if self.tp1 >= 1.0e-3 {
-                // C:513-514 — truncating cast, not NINT.
-                let save_pr1 = self.pr[0];
-                let auto_pr1 = Self::pr1_trunc(self.tp1, self.freq);
-                self.pr[0] = dset.write_preset(0, auto_pr1).unwrap_or(auto_pr1);
-                // C:515-522 — the driver adjusted the preset (it picked a
-                // different clock): recalc from tp1 at that clock, re-write.
-                if save_pr1 != self.pr[0] {
-                    if let Some(freq) = dset.actual_frequency() {
-                        self.freq = freq;
-                    }
-                    let recalc = Self::pr1_trunc(self.tp1, self.freq);
-                    self.pr[0] = dset.write_preset(0, recalc).unwrap_or(recalc);
-                }
-            } else {
-                for i in 0..self.active_channels() {
-                    if self.g[i] != 0 {
-                        let _ = dset.write_preset(i, self.pr[i]);
-                    }
-                }
-            }
-            if let Some(freq) = dset.actual_frequency() {
-                self.freq = freq;
-            }
-            // C:530, after the :470 epilogue.
-            if old_freq != self.freq {
-                static FREQ_POST: [(FieldIx, CyclePostMask); 1] = declared_post_table(
-                    dbd_generated::SCALER_FIELDS,
-                    [("FREQ", CyclePostMask::Value)],
-                );
-                actions.push(ProcessAction::PostAfterEpilogue(CycleMarks::of(
-                    &FREQ_POST, 1,
-                )));
-            }
-            // C:532 — "Don't let autocount disturb user's channel-1 preset".
-            self.pr[0] = old_pr1;
-            let _ = dset.arm(true);
+            sync_driver_wait(|| self.start_autocount_on(dset, &mut actions));
         }
         // C scalerRecord.c:537-538 — once autocount is armed and
         // `ss = SCALER_STATE_COUNTING`, the record schedules the first
@@ -636,6 +602,53 @@ impl ScalerRecord {
             actions.push(refresh);
         }
         actions
+    }
+
+    fn start_autocount_on(
+        &mut self,
+        dset: &mut dyn ScalerDriver,
+        actions: &mut Vec<ProcessAction>,
+    ) {
+        let old_pr1 = self.pr[0];
+        let old_freq = self.freq;
+        let _ = dset.reset();
+        if self.tp1 >= 1.0e-3 {
+            // C:513-514 — truncating cast, not NINT.
+            let save_pr1 = self.pr[0];
+            let auto_pr1 = Self::pr1_trunc(self.tp1, self.freq);
+            self.pr[0] = dset.write_preset(0, auto_pr1).unwrap_or(auto_pr1);
+            // C:515-522 — the driver adjusted the preset (it picked a
+            // different clock): recalc from tp1 at that clock, re-write.
+            if save_pr1 != self.pr[0] {
+                if let Some(freq) = dset.actual_frequency() {
+                    self.freq = freq;
+                }
+                let recalc = Self::pr1_trunc(self.tp1, self.freq);
+                self.pr[0] = dset.write_preset(0, recalc).unwrap_or(recalc);
+            }
+        } else {
+            for i in 0..self.active_channels() {
+                if self.g[i] != 0 {
+                    let _ = dset.write_preset(i, self.pr[i]);
+                }
+            }
+        }
+        if let Some(freq) = dset.actual_frequency() {
+            self.freq = freq;
+        }
+        // C:530, after the :470 epilogue.
+        if old_freq != self.freq {
+            static FREQ_POST: [(FieldIx, CyclePostMask); 1] = declared_post_table(
+                dbd_generated::SCALER_FIELDS,
+                [("FREQ", CyclePostMask::Value)],
+            );
+            actions.push(ProcessAction::PostAfterEpilogue(CycleMarks::of(
+                &FREQ_POST, 1,
+            )));
+        }
+        // C:532 — "Don't let autocount disturb user's channel-1 preset".
+        self.pr[0] = old_pr1;
+        let _ = dset.arm(true);
     }
 }
 

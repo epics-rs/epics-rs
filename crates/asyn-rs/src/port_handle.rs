@@ -1784,7 +1784,8 @@ mod tests {
             );
             base.set_auto_connect_addr(1, false);
             base.set_addr_connected(1, false);
-            let handle = make_handle(TestDriver { base });
+            let mut handle = make_handle(TestDriver { base });
+            handle.set_can_block(true);
             let (tx, rx) = std_mpsc::sync_channel(1);
             let cell = handle.new_cell(Arc::new(Body { tx, timeout_user }));
             handle

@@ -11,7 +11,7 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{
     CycleHooks, CycleMarks, CyclePostMask, FieldDesc, FieldIx, ProcessAction, ProcessOutcome,
-    Record, uniform_post_table,
+    Record, ReturnPact, uniform_post_table,
 };
 use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue};
 
@@ -80,6 +80,7 @@ impl Record for Probe {
                 ProcessOutcome::complete_with(vec![ProcessAction::WriteDbLinkOrReturn {
                     link_field: "COUT",
                     value: EpicsValue::Double(1.0),
+                    pact: ReturnPact::Held,
                 }])
             }
         })

@@ -983,7 +983,7 @@ impl AsyncDbHandle {
     /// it, with no Passive gate. No-op if the database is gone.
     pub fn scan_once(&self, name: &str) {
         if let Some(db) = self.db() {
-            db.scan_once(name);
+            db.scan_once(name.as_bytes());
         }
     }
 

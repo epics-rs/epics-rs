@@ -12,7 +12,9 @@ use std::time::Duration;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::task::CallbackPriority;
 use epics_base_rs::server::database::{DeviceDone, DeviceDoneSource};
-use epics_base_rs::server::device_support::{DeviceSupport, WriteStart};
+use epics_base_rs::server::device_support::{
+    DeviceInitOutcome, DeviceSupport, DeviceUdf, WriteStart,
+};
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
@@ -24,6 +26,10 @@ type Pending = Arc<Mutex<Option<(DeviceDone, CallbackPriority)>>>;
 struct Submits(Pending);
 
 impl DeviceSupport for Submits {
+    /// Status 2: TGT keeps VAL 7 rather than converting RVAL 0.
+    fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched))
+    }
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         unreachable!("write_begin always submits")
     }

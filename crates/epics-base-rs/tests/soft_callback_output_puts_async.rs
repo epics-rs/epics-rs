@@ -194,7 +194,12 @@ async fn a_refused_put_raises_the_link_alarm_and_stays_idle() {
     let r = rig(PutAdmission::Refused).await;
     add_ao(&r.db, "AO_DOWN", "ca://REMOTE:OUT", 1.0).await;
 
-    process(&r.db, "AO_DOWN").await;
+    // aoRecord's process returns write_ao's status (aoRecord.c:110).
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
+    let status =
+        r.db.process_record_with_links("AO_DOWN", &mut visited)
+            .await;
+    assert!(status.is_err(), "{status:?}");
     r.db.sync_external_link_puts().await;
 
     assert!(!pact(&r.db, "AO_DOWN"));

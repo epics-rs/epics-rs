@@ -7,7 +7,6 @@
 //! appends each event to one stream as it is posted.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
@@ -19,6 +18,7 @@ use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_base_rs::types::DbFieldType;
 use scaler_rs::MAX_SCALER_CHANNELS;
 use scaler_rs::device_support::scaler_asyn::{ScalerAsynDeviceSupport, ScalerDriver};
+use scaler_rs::records::scaler::ScalerRecord;
 
 // RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed on the
 // exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
@@ -49,9 +49,8 @@ record(calc, "SCF") {
 }
 "#;
 
-/// A driver running its own clock, as the Joerger VS64 does (`:397-404`);
-/// `done()` takes the shared flag.
-struct OwnClock(Arc<AtomicBool>);
+/// A driver running its own clock, as the Joerger VS64 does (`:397-404`).
+struct OwnClock;
 
 impl ScalerDriver for OwnClock {
     fn reset(&mut self) -> epics_base_rs::error::CaResult<()> {
@@ -69,8 +68,10 @@ impl ScalerDriver for OwnClock {
     fn actual_frequency(&self) -> Option<f64> {
         Some(1.25e7)
     }
-    fn done(&mut self) -> bool {
-        self.0.swap(false, Ordering::SeqCst)
+    fn register_done_interrupt(
+        &mut self,
+        _user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+    ) {
     }
     fn num_channels(&self) -> usize {
         1
@@ -102,21 +103,16 @@ impl SubscriptionFilter for Stream {
 
 type Lines = Arc<Mutex<Vec<String>>>;
 
-/// The IOC with every `(record, field, pv)` watched into one stream, and the
-/// driver's done flag.
+/// The IOC with every `(record, field, pv)` watched into one stream.
 async fn boot(
     dly1: &str,
     watched: &[(&str, &str, &'static str)],
-) -> (Arc<PvDatabase>, Lines, Vec<EventReader>, Arc<AtomicBool>) {
-    let done = Arc::new(AtomicBool::new(false));
-    let flag = done.clone();
+) -> (Arc<PvDatabase>, Lines, Vec<EventReader>) {
     let (name, factory) = scaler_rs::scaler_record_factory();
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
         .register_device_support("scaler", &ASYN_SCALER, move || {
-            Box::new(ScalerAsynDeviceSupport::new(Box::new(OwnClock(
-                flag.clone(),
-            ))))
+            Box::new(ScalerAsynDeviceSupport::new(Box::new(OwnClock)))
         })
         .db_string(DB, &HashMap::from([("DLY1".to_string(), dly1.to_string())]))
         .unwrap()
@@ -145,7 +141,18 @@ async fn boot(
             }),
         ));
     }
-    (db, lines, readers, done)
+    (db, lines, readers)
+}
+
+/// The driver's done interrupt has landed: `pPvt->done` is set.
+fn set_done(db: &PvDatabase) {
+    let cell = db.get_record("SC").unwrap();
+    let mut inst = cell.write();
+    inst.record
+        .as_any_mut()
+        .and_then(|a| a.downcast_mut::<ScalerRecord>())
+        .unwrap()
+        .set_done();
 }
 
 async fn process(db: &PvDatabase) {
@@ -158,7 +165,7 @@ async fn process(db: &PvDatabase) {
 /// posts, the FLNK processes SCF, then the autocount start posts the clock.
 #[tokio::test]
 async fn an_autocount_freq_post_follows_the_epilogue_with_its_alarm() {
-    let (db, lines, _readers, _) = boot(
+    let (db, lines, _readers) = boot(
         "0",
         &[
             ("SC", "SEVR", "SC.SEVR"),
@@ -192,11 +199,11 @@ async fn an_autocount_freq_post_follows_the_epilogue_with_its_alarm() {
 /// init alarm, and nothing posts it again on the completion cycle.
 #[tokio::test]
 async fn a_count_start_freq_post_is_not_repeated_by_the_walk() {
-    let (db, lines, _readers, done) = boot("0", &[("SC", "FREQ", "SC.FREQ")]).await;
+    let (db, lines, _readers) = boot("0", &[("SC", "FREQ", "SC.FREQ")]).await;
     db.put_record_field_from_ca("SC", "CNT", epics_base_rs::types::EpicsValue::Short(1))
         .await
         .unwrap();
-    done.store(true, Ordering::SeqCst);
+    set_done(&db);
     process(&db).await;
     let lines = lines.lock().unwrap().clone();
     assert_eq!(lines, ["SC.FREQ 12500000 3"], "one post, UDF INVALID");
@@ -207,7 +214,7 @@ async fn a_count_start_freq_post_is_not_repeated_by_the_walk() {
 /// autocount start still posts FREQ once with the committed alarm.
 #[tokio::test]
 async fn a_waiting_restart_posts_freq_once_with_the_committed_alarm() {
-    let (db, lines, _readers, _) = boot("0.2", &[("SC", "FREQ", "SC.FREQ")]).await;
+    let (db, lines, _readers) = boot("0.2", &[("SC", "FREQ", "SC.FREQ")]).await;
     process(&db).await;
     assert_eq!(*lines.lock().unwrap(), [] as [String; 0], "no restart yet");
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;

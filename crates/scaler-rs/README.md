@@ -29,9 +29,9 @@ scaler-rs is a faithful Rust port of the C++ scalerRecord, including the full st
 - **Status fields** — CNT (count enable), CONT (continuous counting), TCNT (counts when finished), VAL (elapsed time)
 
 ### Device Support
-- **Device support** (`scaler_asyn.rs`) — bridges the scaler record to a `ScalerDriver` trait with `reset`, `read`, `write_preset`, `arm`, `done` operations, and exports the seven asyn `drvInfo` strings (`SCALER_RESET`, `SCALER_READ`, …) a port driver would match on. It implements `epics_base_rs`'s `DeviceSupport` directly; the crate does not depend on `asyn-rs`
+- **Device support** (`scaler_asyn.rs`) — bridges the scaler record to a `ScalerDriver` trait with `reset`, `read`, `write_preset`, `arm` operations and a `SCALER_DONE` interrupt registration (`DoneInterrupt`, with `DoneParam` for an `asynPortDriver`-style driver and its boot replay), and exports the seven asyn `drvInfo` strings (`SCALER_RESET`, `SCALER_READ`, …) a port driver would match on. It implements `epics_base_rs`'s `DeviceSupport` directly; the crate does not depend on `asyn-rs`
 - **Software scaler** (`scaler_soft.rs`) — pure Rust simulation driver for testing (configurable count rates per channel)
-- **Synchronous dset** — device support binds the driver to the record at init; `process()` calls `done`/`arm`/`reset`/`write_preset`/`read` at the points C's `scalerRecord.c` does
+- **Synchronous dset** — device support binds the driver to the record at init; `process()` calls `arm`/`reset`/`write_preset`/`read` at the points C's `scalerRecord.c` does; completion arrives as the driver's done interrupt, which processes the record (`deviceCallbackFunc`)
 
 ### Database Templates (bundled)
 - `scaler.db` — base scaler record (64-channel)

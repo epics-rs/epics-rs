@@ -94,6 +94,9 @@ async fn boot() -> (Arc<PvDatabase>, Counts) {
         .await
         .unwrap();
     let counts = counts.lock().unwrap().take().expect("SC bound its DTYP");
+    // `iocRun`: the done interrupt processes the record only once
+    // `interruptAccept` is set.
+    db.scan_control().run();
     (db, counts)
 }
 

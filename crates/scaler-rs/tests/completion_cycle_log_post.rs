@@ -24,19 +24,23 @@
 // itself, which the backend does not remove.
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use scaler_rs::device_support::scaler_asyn::ScalerDriver;
+use scaler_rs::device_support::scaler_asyn::{
+    DoneInterrupt, ScalerAsynDeviceSupport, ScalerDriver,
+};
 use scaler_rs::records::scaler::{MAX_SCALER_CHANNELS, ScalerRecord};
 
 use std::sync::{Arc, Mutex};
 
-/// What the hardware holds: the counts `read()` returns and the `done()` flag.
+/// What the hardware holds: the counts `read()` returns and the record's
+/// done interrupt user.
 struct Hardware {
     counts: [u32; MAX_SCALER_CHANNELS],
-    done: bool,
+    done_user: Option<DoneInterrupt>,
 }
 
 struct HardwareDriver(Arc<Mutex<Hardware>>);
@@ -62,8 +66,8 @@ impl ScalerDriver for HardwareDriver {
     fn arm(&mut self, _start: bool) -> epics_base_rs::error::CaResult<()> {
         Ok(())
     }
-    fn done(&mut self) -> bool {
-        std::mem::take(&mut self.0.lock().unwrap().done)
+    fn register_done_interrupt(&mut self, user: DoneInterrupt) {
+        self.0.lock().unwrap().done_user = Some(user);
     }
     fn num_channels(&self) -> usize {
         4
@@ -74,15 +78,15 @@ async fn scaler_db() -> (PvDatabase, Arc<Mutex<Hardware>>) {
     let db = PvDatabase::new();
     let hardware = Arc::new(Mutex::new(Hardware {
         counts: [0; MAX_SCALER_CHANNELS],
-        done: false,
+        done_user: None,
     }));
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 1.0;
     rec.nch = 4;
-    rec.bind_dset(Arc::new(Mutex::new(Box::new(HardwareDriver(
-        hardware.clone(),
-    )))));
+    ScalerAsynDeviceSupport::new(Box::new(HardwareDriver(hardware.clone())))
+        .init(&mut rec)
+        .unwrap();
     rec.init_record(1).unwrap();
     db.add_record("SCAL", Box::new(rec)).await.unwrap();
     (db, hardware)
@@ -110,12 +114,13 @@ fn drain(rx: &mut EventReader) -> usize {
     n
 }
 
-/// Hardware holds new counts and acquisition is complete: the next cycle's
-/// dset `done()` (`scalerRecord.c:366`) and `read()` (`:572`) see them.
+/// Hardware holds new counts and its done interrupt has fired: the next
+/// cycle's dset `done()` (`scalerRecord.c:366`) and `read()` (`:572`) see
+/// them.
 fn hardware_finishes_with(hardware: &Mutex<Hardware>, counts: [u32; 4]) {
     let mut hw = hardware.lock().unwrap();
     hw.counts[..4].copy_from_slice(&counts);
-    hw.done = true;
+    hw.done_user.as_ref().unwrap().callback(1);
 }
 
 #[tokio::test]

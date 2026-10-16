@@ -279,8 +279,10 @@ impl ScalerDriver for QuantizingDriver {
     fn actual_frequency(&self) -> Option<f64> {
         Some(Self::DRIVER_FREQ)
     }
-    fn done(&mut self) -> bool {
-        false
+    fn register_done_interrupt(
+        &mut self,
+        _user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+    ) {
     }
     fn num_channels(&self) -> usize {
         8

@@ -272,16 +272,21 @@ async fn test_epid_fast_output_clamping() {
 
 #[tokio::test]
 async fn test_scaler_soft_counting_simulation() {
-    use scaler_rs::device_support::scaler_asyn::ScalerDriver;
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
     use scaler_rs::device_support::scaler_soft::SoftScalerDriver;
-    use scaler_rs::records::scaler::MAX_SCALER_CHANNELS;
+    use scaler_rs::records::scaler::{MAX_SCALER_CHANNELS, ScalerRecord};
 
-    let mut driver = SoftScalerDriver::new(8);
-    let shared = driver.shared_counts();
+    let soft = SoftScalerDriver::new(8);
+    let shared = soft.shared_counts();
+    let mut support = ScalerAsynDeviceSupport::new(Box::new(soft));
+    support.init(&mut ScalerRecord::default()).unwrap();
+    let mut done_pulses = support.io_intr_receiver().unwrap();
+    let driver = support.driver();
 
     // Configure preset on channel 0
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
+    driver.lock().unwrap().write_preset(0, 1000).unwrap();
+    driver.lock().unwrap().arm(true).unwrap();
 
     // Simulate counting: background task increments counters
     let shared_clone = shared.clone();
@@ -299,13 +304,18 @@ async fn test_scaler_soft_counting_simulation() {
     // Wait for counting to finish
     counter_task.await.unwrap();
 
-    // Read counts — should detect done
+    // Read counts; the next read judges them and makes the done callback.
+    let mut driver = driver.lock().unwrap();
     let mut counts = [0u32; MAX_SCALER_CHANNELS];
     driver.read(&mut counts).unwrap();
 
     assert_eq!(counts[0], 1000, "Channel 0 should reach 1000");
     assert_eq!(counts[1], 500, "Channel 1 should be 500");
-    assert!(driver.done(), "Should be done — channel 0 reached preset");
+    driver.read(&mut counts).unwrap();
+    assert!(
+        done_pulses.try_recv().is_ok(),
+        "Should be done — channel 0 reached preset"
+    );
 }
 
 // ============================================================

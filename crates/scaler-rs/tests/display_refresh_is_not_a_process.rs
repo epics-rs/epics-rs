@@ -126,6 +126,28 @@ fn a_refresh_landing_mid_count_refreshes_and_rearms() {
     );
 }
 
+/// The refresh lands with the done interrupt already raised: `updateCounts`
+/// never asks `done()`, so the count stays live and the latch waits for the
+/// `deviceCallbackFunc` process that completes it (`:366`).
+#[test]
+fn a_refresh_landing_after_done_leaves_completion_to_the_interrupt() {
+    let mut rec = counting();
+    rec.set_done();
+
+    let actions = fire_timer(&mut rec);
+    assert_eq!(rec.ss, SCALER_STATE_COUNTING, "a refresh completes nothing");
+    assert!(has_reprocess(&actions), "and re-arms the next update");
+    assert!(!rec.should_fire_forward_link());
+
+    rec.process().unwrap();
+    assert_eq!(
+        rec.ss, SCALER_STATE_IDLE,
+        "the interrupt's process completes it"
+    );
+    assert_eq!(rec.cnt, 0);
+    assert!(rec.should_fire_forward_link());
+}
+
 /// The delayed start is the OTHER callback: it lands with `ss == IDLE` too and
 /// must still start the count.
 #[test]

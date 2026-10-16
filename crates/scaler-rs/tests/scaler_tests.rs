@@ -525,19 +525,63 @@ fn test_val_set_on_completion() {
 // Soft scaler driver
 // ============================================================
 
+/// A soft driver bound to a record as device support's `init` binds it;
+/// `fired` is whether a done callback has processed-requested the record.
+struct SoftRig {
+    rec: ScalerRecord,
+    driver: std::sync::Arc<std::sync::Mutex<Box<dyn ScalerDriver>>>,
+    counts: std::sync::Arc<std::sync::Mutex<[u32; MAX_SCALER_CHANNELS]>>,
+    pulses: epics_base_rs::runtime::sync::mpsc::Receiver<()>,
+}
+
+impl SoftRig {
+    fn new() -> Self {
+        use epics_base_rs::server::device_support::DeviceSupport;
+        use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
+
+        let driver = SoftScalerDriver::new(8);
+        let counts = driver.shared_counts();
+        let mut support = ScalerAsynDeviceSupport::new(Box::new(driver));
+        let mut rec = ScalerRecord::default();
+        support.init(&mut rec).unwrap();
+        Self {
+            rec,
+            driver: support.driver(),
+            counts,
+            pulses: support.io_intr_receiver().unwrap(),
+        }
+    }
+
+    fn driver(&self) -> std::sync::MutexGuard<'_, Box<dyn ScalerDriver>> {
+        self.driver.lock().unwrap()
+    }
+
+    fn read(&self) -> [u32; MAX_SCALER_CHANNELS] {
+        let mut counts = [0; MAX_SCALER_CHANNELS];
+        self.driver().read(&mut counts).unwrap();
+        counts
+    }
+
+    fn fired(&mut self) -> bool {
+        self.pulses.try_recv().is_ok()
+    }
+}
+
 #[test]
 fn test_soft_driver_basics() {
-    let mut driver = SoftScalerDriver::new(8);
-    assert_eq!(driver.num_channels(), 8);
-    assert!(!driver.done());
+    let mut rig = SoftRig::new();
+    assert_eq!(rig.driver().num_channels(), 8);
+    rig.read();
+    assert!(!rig.fired());
 }
 
 #[test]
 fn test_soft_driver_reset() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.arm(true).unwrap();
-    driver.reset().unwrap();
-    assert!(!driver.done());
+    let mut rig = SoftRig::new();
+    rig.driver().arm(true).unwrap();
+    rig.driver().reset().unwrap();
+    rig.read();
+    assert!(!rig.fired());
 }
 
 #[test]
@@ -599,97 +643,69 @@ fn test_soft_driver_read_counts() {
     assert_eq!(counts[1], 1000);
 }
 
-#[test]
-fn test_soft_driver_preset_done() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-
-    // Simulate counting reaching preset
-    let shared = driver.shared_counts();
-    {
-        let mut guard = shared.lock().unwrap();
-        guard[0] = 1000;
-    }
-
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert!(driver.done());
-}
-
 /// C `int32ArrayRead` runs `checkAcquireDone` before `dbGetField`
 /// (`drvScalerSoft.c:409-424`): the read that fetches the preset count does
-/// not latch done; the next one does.
+/// not complete the count; the next one makes the done callback.
 #[test]
 fn test_soft_driver_done_is_seen_one_read_later() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-    driver.shared_counts().lock().unwrap()[0] = 1000;
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.counts.lock().unwrap()[0] = 1000;
 
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert_eq!(counts[0], 1000, "the read fetched the preset count");
-    // `done()` is itself a read: it judges what the previous read fetched.
-    assert!(driver.done(), "the next read latches done");
+    assert_eq!(rig.read()[0], 1000, "the read fetched the preset count");
+    assert!(!rig.fired(), "this read judged the previous counts");
+    rig.read();
+    assert!(rig.fired(), "the next read made the done callback");
 }
 
-/// The first poll after the count arrives fetches it and is not yet done; the
-/// next poll is. Reading first, as the port did, finished on the first.
+/// `acquireDoneCallbacks` calls back only while `prevAcquiring` is set and
+/// clears it (`drvScalerSoft.c:618-620`): one callback per arm, however many
+/// reads see the preset reached; the record's `scaler_done()` takes the
+/// latch once (`devScalerAsyn.c:292-301`).
 #[test]
-fn test_soft_driver_first_poll_after_the_count_is_not_done() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-    driver.shared_counts().lock().unwrap()[0] = 1000;
+fn test_soft_driver_calls_back_once_per_arm() {
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.counts.lock().unwrap()[0] = 1000;
+    rig.read();
+    rig.read();
+    assert!(rig.fired());
+    rig.read();
+    assert!(!rig.fired(), "prevAcquiring was cleared by the callback");
 
-    assert!(!driver.done(), "this poll fetched the count");
-    assert!(driver.done(), "this one judged it");
+    rig.rec.ss = 2; // COUNTING
+    rig.rec.process().unwrap();
+    assert_eq!(rig.rec.ss, 0, "process() took the done latch");
+    rig.rec.ss = 2;
+    rig.rec.process().unwrap();
+    assert_eq!(rig.rec.ss, 2, "the latch was read and cleared");
 }
 
-/// C `devScalerAsyn.c:292-301` `scaler_done()` is read-and-clear: it
-/// returns 1 exactly once per completed count, then `pPvt->done` is 0
-/// so the next poll returns 0. `ScalerDriver::done` must consume the
-/// flag the same way.
+/// A disarm leaves `prevAcquiring` set (`drvScalerSoft.c:326`), so inputs
+/// that go on counting past the preset still make the done callback.
 #[test]
-fn test_soft_driver_done_is_read_and_clear() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-
-    let shared = driver.shared_counts();
-    {
-        let mut guard = shared.lock().unwrap();
-        guard[0] = 1000;
-    }
-
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-
-    // First poll reports the completed count.
-    assert!(driver.done(), "first done() poll must report completion");
-    // The flag is cleared — a second poll without a new count is false.
-    assert!(
-        !driver.done(),
-        "done() must clear the flag (C scaler_done read-and-clear)"
-    );
+fn test_soft_driver_disarm_keeps_prev_acquiring() {
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.driver().arm(false).unwrap();
+    rig.counts.lock().unwrap()[0] = 1000;
+    rig.read();
+    rig.read();
+    assert!(rig.fired());
 }
 
 #[test]
 fn test_soft_driver_preset_not_reached() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-
-    let shared = driver.shared_counts();
-    {
-        let mut guard = shared.lock().unwrap();
-        guard[0] = 500; // Not yet at preset
-    }
-
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert!(!driver.done());
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.counts.lock().unwrap()[0] = 500; // Not yet at preset
+    rig.read();
+    rig.read();
+    assert!(!rig.fired());
 }
 
 // ============================================================
@@ -789,8 +805,10 @@ fn test_asyn_device_support_clamps_nch() {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn done(&mut self) -> bool {
-            false
+        fn register_done_interrupt(
+            &mut self,
+            _user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+        ) {
         }
         fn num_channels(&self) -> usize {
             999
@@ -1005,43 +1023,33 @@ fn test_autocount_starts_immediately_when_no_delay() {
 /// C drvScalerSoft.c:303-313 — scalerResetCommand clears all presets.
 #[test]
 fn test_soft_driver_reset_clears_presets() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-    driver.reset().unwrap();
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.driver().reset().unwrap();
     // After reset the preset is gone, so a count that previously would
     // have completed no longer triggers done.
-    let shared = driver.shared_counts();
-    {
-        let mut g = shared.lock().unwrap();
-        g[0] = 5000;
-    }
-    driver.arm(true).unwrap();
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert!(!driver.done(), "no preset after reset -> never done");
+    rig.counts.lock().unwrap()[0] = 5000;
+    rig.driver().arm(true).unwrap();
+    rig.read();
+    rig.read();
+    assert!(!rig.fired(), "no preset after reset -> never done");
 }
 
 /// C drvScalerSoft.c:315-329 — scalerArmCommand clears the scaler data
 /// so a stale count cannot make the scaler report done immediately.
 #[test]
 fn test_soft_driver_arm_clears_counts() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
     // A stale count above the preset is sitting in shared state.
-    let shared = driver.shared_counts();
-    {
-        let mut g = shared.lock().unwrap();
-        g[0] = 5000;
-    }
+    rig.counts.lock().unwrap()[0] = 5000;
 
-    // Arming must wipe that stale count, so the first read is not "done".
-    driver.arm(true).unwrap();
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert_eq!(counts[0], 0, "arm() cleared the stale count");
-    assert!(!driver.done(), "arm() prevented an immediate done");
+    // Arming must wipe that stale count, so no read completes the count.
+    rig.driver().arm(true).unwrap();
+    assert_eq!(rig.read()[0], 0, "arm() cleared the stale count");
+    rig.read();
+    assert!(!rig.fired(), "arm() prevented an immediate done");
 }
 
 // ============================================================
@@ -1114,8 +1122,10 @@ impl ScalerDriver for QuantizingDriver {
     fn actual_frequency(&self) -> Option<f64> {
         Some(Self::DRIVER_FREQ)
     }
-    fn done(&mut self) -> bool {
-        false
+    fn register_done_interrupt(
+        &mut self,
+        _user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+    ) {
     }
     fn num_channels(&self) -> usize {
         8
@@ -1690,12 +1700,11 @@ fn test_autocount_timed_branch_does_not_touch_directions() {
 #[derive(Default)]
 struct FlakyScalerState {
     fail_read: bool,
-    done: bool,
-    done_reads: usize,
+    done_user: Option<scaler_rs::device_support::scaler_asyn::DoneInterrupt>,
 }
 
 /// A scaler whose count read can be made to fail while a completed count is
-/// still waiting in the read-and-clear `done()` latch.
+/// still waiting in the record's read-and-clear `done` latch.
 struct FlakyScalerDriver(std::sync::Arc<std::sync::Mutex<FlakyScalerState>>);
 
 impl ScalerDriver for FlakyScalerDriver {
@@ -1722,10 +1731,11 @@ impl ScalerDriver for FlakyScalerDriver {
         counts[0] = 4242;
         Ok(())
     }
-    fn done(&mut self) -> bool {
-        let mut st = self.0.lock().unwrap();
-        st.done_reads += 1;
-        std::mem::take(&mut st.done)
+    fn register_done_interrupt(
+        &mut self,
+        user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+    ) {
+        self.0.lock().unwrap().done_user = Some(user);
     }
     fn num_channels(&self) -> usize {
         1
@@ -1739,8 +1749,7 @@ fn flaky_scaler() -> (
 ) {
     let state = std::sync::Arc::new(std::sync::Mutex::new(FlakyScalerState {
         fail_read: true,
-        done: true,
-        done_reads: 0,
+        done_user: None,
     }));
     let dev = scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(Box::new(
         FlakyScalerDriver(std::sync::Arc::clone(&state)),
@@ -1764,6 +1773,13 @@ fn completing_with_flaky_read() -> (
     rec.cnt = 1;
     rec.pcnt = 1;
     rec.s[0] = 7;
+    state
+        .lock()
+        .unwrap()
+        .done_user
+        .as_ref()
+        .unwrap()
+        .callback(1);
     (state, rec)
 }
 
@@ -1789,8 +1805,7 @@ fn test_asyn_read_error_raises_no_alarm() {
 /// that cycle's read fails.
 #[test]
 fn test_asyn_read_error_still_completes_the_count() {
-    let (state, mut rec) = completing_with_flaky_read();
+    let (_state, mut rec) = completing_with_flaky_read();
     rec.process().unwrap();
-    assert_eq!(state.lock().unwrap().done_reads, 1);
     assert_eq!((rec.ss, rec.us, rec.cnt), (0, 0, 0), "the count completed");
 }

@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -163,8 +164,10 @@ pub struct ScalerRecord {
     /// The dset `process()` calls; `None` until device support binds one.
     dset: Option<ScalerDset>,
 
-    /// The `done()` answer of a record with no dset bound ([`Self::set_done`]).
-    pub(crate) done_flag: bool,
+    /// C devScalerAsyn `pPvt->done`: raised by the driver's done interrupt
+    /// ([`DoneInterrupt`](crate::device_support::scaler_asyn::DoneInterrupt)),
+    /// read and cleared by `process()`.
+    done: Arc<AtomicBool>,
 
     /// Channel-1 preset captured by `process()` at the start of a
     /// REQSTART count, BEFORE the `pr[0] = NINT(tp*freq)`
@@ -224,11 +227,16 @@ pub struct ScalerRecord {
 }
 
 impl ScalerRecord {
-    /// Mark counting as complete, for a record with no dset bound: the
-    /// next `process()` takes it as `(*pdset->done)(pscal)` returning true
-    /// (`scalerRecord.c:366`).
+    /// Raise `done` as C `interruptCallback` does, without the process
+    /// request: the next `process()` takes it as `(*pdset->done)(pscal)`
+    /// returning true (`scalerRecord.c:366`).
     pub fn set_done(&mut self) {
-        self.done_flag = true;
+        self.done.store(true, Ordering::Release);
+    }
+
+    /// The `done` latch a done interrupt user raises.
+    pub(crate) fn done_latch(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.done)
     }
 
     /// Bind the dset `process()` calls (C `pscal->dset`).
@@ -287,7 +295,7 @@ impl Default for ScalerRecord {
             pending_reentry: None,
             continuation: false,
             dset: None,
-            done_flag: false,
+            done: Arc::default(),
             reqstart_old_pr1: 0,
             special_actions: Vec::new(),
             side_effect_posts: &[],
@@ -376,6 +384,23 @@ impl ScalerRecord {
             }
         }
         None
+    }
+
+    /// C `updateCallbackFunc`: `updateCounts` outside `process()`, which
+    /// returns at once when the count is over (`scalerRecord.c:562-568`) and
+    /// re-arms the next refresh while it is not.
+    fn display_refresh(&mut self) -> ProcessOutcome {
+        if self.ss == SCALER_STATE_IDLE {
+            return ProcessOutcome::complete_no_emit();
+        }
+        let dset_cell = self.dset.clone();
+        let mut dset_guard = dset_cell.as_ref().map(|d| d.lock().unwrap());
+        let dset = dset_guard.as_deref_mut().map(|d| &mut **d);
+        let mut actions = Vec::new();
+        if let Some(reprocess) = self.update_counts(dset) {
+            actions.push(self.arm_reentry(ReentryKind::DisplayRefresh, reprocess));
+        }
+        ProcessOutcome::complete_no_emit_with(actions)
     }
 
     /// Number of active channels, clamped to the physical array bound.
@@ -483,12 +508,10 @@ impl ScalerRecord {
         }
     }
 
-    /// C `(*pdset->done)(pscal)` (`scalerRecord.c:366`), read-and-clear.
-    fn dset_done(&mut self, dset: Option<&mut dyn ScalerDriver>) -> bool {
-        match dset {
-            Some(dset) => dset.done(),
-            None => std::mem::take(&mut self.done_flag),
-        }
+    /// C `(*pdset->done)(pscal)` (`scalerRecord.c:366`), `scaler_done()`'s
+    /// read-and-clear of `pPvt->done` (`devScalerAsyn.c:292-301`).
+    fn dset_done(&self) -> bool {
+        self.done.swap(false, Ordering::AcqRel)
     }
 
     /// C `(*pdset->arm)(pscal, 0)` (`scalerRecord.c:384`, `:447`). C ignores
@@ -772,33 +795,16 @@ impl Record for ScalerRecord {
         self.fire_fwd_link = false;
 
         // C `updateCallbackFunc` (scalerRecord.c:203-214) calls `updateCounts`
-        // and nothing else, so a periodic display refresh never reaches
-        // `recGblFwdLink` (:480). `updateCounts` in turn refuses the call
-        // outright when it did not come from `process()` and the count is over
-        // (:562-568):
-        //
-        //     called_by_process = (pscal->pact == TRUE);
-        //     if (!called_by_process) {
-        //         if (pscal->ss != SCALER_STATE_IDLE) pscal->pact = TRUE;
-        //         else return;
-        //     }
-        //
-        // The port's refresh is a `ReprocessAfter` re-entry — a whole
-        // `process()` — so without that gate a refresh armed while counting
-        // lands after the count has stopped, reaches the "done counting?" block
-        // with `ss`/`pcnt`/`us` all clear, and fires FLNK a second time. The
-        // refresh still runs the full cycle while `ss != IDLE`: unlike C, which
-        // is driven to `process()` by `deviceCallbackFunc` on completion, this
-        // port polls `done()` from the process cycle, and the refresh IS that
-        // poll while a count is live.
+        // and nothing else; the port's refresh timer is a whole `process()`,
+        // so it stops here. Completion reaches `process()` through the done
+        // interrupt (`deviceCallbackFunc`), never through a refresh.
         let reentry = if std::mem::take(&mut self.continuation) {
             self.pending_reentry.take()
         } else {
             None
         };
-        if reentry == Some(ReentryKind::DisplayRefresh) && self.ss == SCALER_STATE_IDLE {
-            // C never enters `process()` here, so nothing of its epilogue runs.
-            return Ok(ProcessOutcome::complete_no_emit());
+        if reentry == Some(ReentryKind::DisplayRefresh) {
+            return Ok(self.display_refresh());
         }
 
         let mut just_finished_user_count = false;
@@ -818,7 +824,7 @@ impl Record for ScalerRecord {
         // C scalerRecord.c:366 — the record asks device support whether
         // counting has finished (`(*pdset->done)(pscal)`) UNCONDITIONALLY,
         // every process cycle.
-        if self.dset_done(dset.as_deref_mut()) {
+        if self.dset_done() {
             self.ss = SCALER_STATE_IDLE;
             // C:370 — an auto-count cycle is NOT allowed to reset CNT.
             if self.us == USER_STATE_COUNTING {

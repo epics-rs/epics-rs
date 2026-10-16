@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use epics_base_rs::error::CaResult;
 
-use super::scaler_asyn::ScalerDriver;
+use super::scaler_asyn::{DoneInterrupt, ScalerDriver};
 use crate::records::scaler::MAX_SCALER_CHANNELS;
 
 /// Where a soft scaler's counters come from: C `drvScalerSoft`'s input PVs
@@ -43,8 +43,9 @@ pub struct SoftScalerDriver<S: CountSource = SharedCounts> {
     num_channels: usize,
     counts: [u32; MAX_SCALER_CHANNELS],
     presets: [u32; MAX_SCALER_CHANNELS],
-    armed: bool,
-    done_flag: bool,
+    /// C `pPvt->prevAcquiring`: armed since the last done callback.
+    prev_acquiring: bool,
+    done_users: Vec<DoneInterrupt>,
     start_time: Option<Instant>,
     source: S,
 }
@@ -69,8 +70,8 @@ impl<S: CountSource> SoftScalerDriver<S> {
             num_channels: num_channels.min(MAX_SCALER_CHANNELS),
             counts: [0; MAX_SCALER_CHANNELS],
             presets: [0; MAX_SCALER_CHANNELS],
-            armed: false,
-            done_flag: false,
+            prev_acquiring: false,
+            done_users: Vec::new(),
             start_time: None,
             source,
         }
@@ -96,10 +97,16 @@ impl<S: CountSource> SoftScalerDriver<S> {
     /// first, on the counts the previous read left, then the inputs. A count
     /// that reaches its preset is therefore seen done one read after the read
     /// that fetched it.
+    ///
+    /// `checkAcquireDone` clears `acquiring` and signals
+    /// `acquireDoneCallbacks` (`:588-631`), which makes the done callback
+    /// only while `prevAcquiring` says the scaler was armed since the last
+    /// one; the port makes it here.
     fn sample(&mut self) -> CaResult<()> {
-        if self.armed && self.check_presets() {
-            self.done_flag = true;
-            self.armed = false;
+        if self.check_presets() && std::mem::take(&mut self.prev_acquiring) {
+            for user in &self.done_users {
+                user.callback(1);
+            }
         }
         self.source.sample(&mut self.counts)
     }
@@ -113,8 +120,7 @@ impl<S: CountSource> ScalerDriver for SoftScalerDriver<S> {
     fn reset(&mut self) -> CaResult<()> {
         self.counts = [0; MAX_SCALER_CHANNELS];
         self.presets = [0; MAX_SCALER_CHANNELS];
-        self.done_flag = false;
-        self.armed = false;
+        self.prev_acquiring = false;
         self.start_time = None;
         self.source.reset();
         Ok(())
@@ -149,8 +155,8 @@ impl<S: CountSource> ScalerDriver for SoftScalerDriver<S> {
     /// rather than its last value. An unconnected source refuses, and C
     /// then leaves `acquiring` alone (`:318`).
     ///
-    /// Note: a normal preset-reached completion disarms inside `read()`
-    /// (`self.armed = false`, no count clear), NOT via an arm command —
+    /// Note: a normal preset-reached completion ends inside `read()`
+    /// (no count clear), NOT via an arm command —
     /// matching C, where the done path sets `ss = IDLE` and the record's
     /// stop branch skips `arm(0)`. So the final counts survive a normal
     /// completion; only an explicit disarm (manual stop / pre-restart)
@@ -159,9 +165,8 @@ impl<S: CountSource> ScalerDriver for SoftScalerDriver<S> {
         // C:319-322 — clear scaler data on arm AND disarm.
         self.source.clear()?;
         self.counts = [0; MAX_SCALER_CHANNELS];
-        self.armed = start;
         if start {
-            self.done_flag = false;
+            self.prev_acquiring = true;
             self.start_time = Some(Instant::now());
         } else {
             self.start_time = None;
@@ -169,21 +174,8 @@ impl<S: CountSource> ScalerDriver for SoftScalerDriver<S> {
         Ok(())
     }
 
-    /// C `devScalerAsyn.c:292-301` `scaler_done()` — read-and-clear: a
-    /// completed count is reported exactly once, then the flag is
-    /// cleared so the next poll returns `false`.
-    ///
-    /// C reaches `scaler_done()` only after a read's `checkAcquireDone`
-    /// raised the done interrupt (`acquireDoneCallbacks`); the poll is that
-    /// read. It judges the counts the previous read fetched, so the count
-    /// completes on the refresh after the one that displayed it, as C's
-    /// interrupt-driven process does.
-    fn done(&mut self) -> bool {
-        // An unreadable source leaves the done latch as the last read left it.
-        let _ = self.sample();
-        let was_done = self.done_flag;
-        self.done_flag = false;
-        was_done
+    fn register_done_interrupt(&mut self, user: DoneInterrupt) {
+        self.done_users.push(user);
     }
 
     fn num_channels(&self) -> usize {

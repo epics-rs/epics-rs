@@ -12,12 +12,12 @@ use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
 use crate::driver::ndarray_driver::{
-    DriverAttributes, handle_write_int32, init_read_only_params, trace_write_int32,
+    ArrayOwner, handle_write_int32, init_read_only_params, trace_write_int32,
 };
 use crate::ndarray::NDArray;
-use crate::ndarray_pool::NDArrayPool;
+use crate::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use crate::params::ad_driver::ADDriverParams;
-use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
+use crate::plugin::channel::{NDArrayOutput, NDArraySender};
 
 use super::{ADStatus, ShutterMode};
 
@@ -25,14 +25,9 @@ use super::{ADStatus, ShutterMode};
 pub struct ADDriverBase {
     pub port_base: PortDriverBase,
     pub params: ADDriverParams,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub array_output: NDArrayOutput,
-    pub queued_counter: Arc<QueuedArrayCounter>,
-    /// Most recently prepared array (C++ `pArrays[0]`), used as the template
-    /// for `preAllocateBuffers`.
-    pub last_array: Option<Arc<NDArray>>,
-    /// The `NDAttributesFile` attribute set (C++ `pAttributeList`).
-    pub attributes: DriverAttributes,
+    pub owner: Arc<ArrayOwner>,
 }
 
 impl ADDriverBase {
@@ -47,10 +42,8 @@ impl ADDriverBase {
         // C takes `maxAddr` and `asynFlags` from the detector (ADDriver.cpp:126-133).
         let mut port_base = PortDriverBase::new(port_name, max_addr, asyn_flags);
 
-        let params = ADDriverParams::create(&mut port_base)?;
-        let pool = NDArrayPool::new(max_memory);
-        let queued_counter = Arc::new(QueuedArrayCounter::new());
-        acquire_busy_rules(&mut port_base, &params, &queued_counter);
+        let (params, owner) = ADDriverParams::create(&mut port_base)?;
+        let pool = DriverPool::for_driver(max_memory, &owner);
 
         // C `ADDriver::ADDriver` (ADDriver.cpp:150) chains to
         // `asynNDArrayDriver::asynNDArrayDriver`, so its whole read-only block
@@ -95,15 +88,12 @@ impl ADDriverBase {
             params,
             pool,
             array_output: NDArrayOutput::new(),
-            queued_counter,
-            last_array: None,
-            attributes: DriverAttributes::new(),
+            owner,
         })
     }
 
     /// Connect a downstream channel-based receiver.
-    pub fn connect_downstream(&mut self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&mut self, sender: NDArraySender) {
         self.array_output.add(sender);
     }
 
@@ -115,7 +105,7 @@ impl ADDriverBase {
     ///
     /// This function does NOT publish the array — the caller is responsible
     /// for that in an async context. Returns `None` when callbacks are disabled.
-    pub fn prepare_array(&mut self, mut array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
+    pub fn prepare_array(&mut self, mut array: DriverArray) -> AsynResult<Option<PublishedArray>> {
         let counter = self
             .port_base
             .get_int32_param(self.params.base.array_counter, 0)?
@@ -124,7 +114,10 @@ impl ADDriverBase {
             .set_int32_param(self.params.base.array_counter, 0, counter)?;
 
         // C++ `getAttributes(pArray->pAttributeList)` before the callback.
-        self.attributes.attach(&self.port_base, &mut array);
+        self.owner
+            .attributes()
+            .lock()
+            .attach(&self.port_base, &mut array);
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -133,9 +126,9 @@ impl ADDriverBase {
             &self.params.base,
             &array,
         )?;
+        let array = array.share();
 
-        // Record this as the template array for preAllocateBuffers.
-        self.last_array = Some(array.clone());
+        self.owner.store_array(0, Some(array.array().clone()));
 
         // Update pool stats
         self.port_base.set_float64_param(
@@ -164,7 +157,7 @@ impl ADDriverBase {
             self.port_base.set_generic_pointer_param(
                 self.params.base.ndarray_data,
                 0,
-                array.clone() as Arc<dyn std::any::Any + Send + Sync>,
+                array.array().clone() as Arc<dyn std::any::Any + Send + Sync>,
             )?;
             Some(array)
         } else {
@@ -234,7 +227,7 @@ impl ADDriverBase {
     /// Returns `true` when `param_index` was a recognized pool-control
     /// parameter.
     pub fn write_int32_pool(&mut self, param_index: usize, _value: i32) -> AsynResult<bool> {
-        let template = self.last_array.clone();
+        let template = self.owner.array(0);
         crate::driver::ndarray_driver::handle_pool_write_int32(
             &mut self.port_base,
             &self.params.base,
@@ -247,7 +240,7 @@ impl ADDriverBase {
     /// C++ `asynNDArrayDriver::writeInt32`, which `ADDriver::writeInt32`
     /// hands every parameter below `FIRST_AD_PARAM`.
     fn ndarray_write_int32(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
-        let template = self.last_array.clone();
+        let template = self.owner.array(0);
         handle_write_int32(
             &mut self.port_base,
             &self.params.base,
@@ -258,22 +251,19 @@ impl ADDriverBase {
         )
     }
 
-    /// C++ `ADDriver::writeOctet`, which is `asynNDArrayDriver::writeOctet`;
-    /// see `handle_write_octet`.
+    /// C++ `ADDriver::writeOctet`, which is `asynNDArrayDriver::writeOctet`,
+    /// for an override to chain to.
     pub fn write_octet(&mut self, user: &AsynUser, data: &[u8]) -> AsynResult<usize> {
-        crate::driver::ndarray_driver::handle_write_octet(
-            &mut self.port_base,
-            &self.params.base,
-            &mut self.attributes,
-            user,
-            data,
-        )
+        self.port_base.write_octet(user, data)
     }
 
     /// C++ `asynNDArrayDriver::getAttributes`, for a driver that fills the
     /// array's attribute list itself before publishing.
-    pub fn attach_attributes(&mut self, array: &mut Arc<NDArray>) {
-        self.attributes.attach(&self.port_base, array);
+    pub fn attach_attributes(&mut self, array: &mut NDArray) {
+        self.owner
+            .attributes()
+            .lock()
+            .attach(&self.port_base, array);
     }
 
     /// Store `ADAcquire`; its rule keeps `ADAcquireBusy` in step.
@@ -290,42 +280,6 @@ impl ADDriverBase {
     }
 }
 
-/// C++ `asynNDArrayDriver::setIntegerParam` (asynNDArrayDriver.cpp:636-663),
-/// which every store of `ADAcquire` or `NDNumQueuedArrays` reaches, whoever
-/// makes it. A stop clears `ADAcquireBusy` at once unless `ADWaitForPlugins`
-/// is set and arrays are still queued; it reads the live count, because the
-/// `NDNumQueuedArrays` parameter lags it (:633-635).
-fn acquire_busy_rules(
-    port_base: &mut PortDriverBase,
-    params: &ADDriverParams,
-    queued: &Arc<QueuedArrayCounter>,
-) {
-    let (acquire, busy, wait) = (params.acquire, params.acquire_busy, params.wait_for_plugins);
-    let queued = Arc::clone(queued);
-    port_base.set_int32_rule(
-        acquire,
-        Arc::new(move |base: &mut PortDriverBase, list, value| {
-            if value != 0 {
-                base.set_int32_param(busy, list, 1)
-            } else if base.get_int32_param(wait, list).unwrap_or(0) == 0 || queued.get() == 0 {
-                base.set_int32_param(busy, list, 0)
-            } else {
-                Ok(())
-            }
-        }),
-    );
-    port_base.set_int32_rule(
-        params.base.num_queued_arrays,
-        Arc::new(move |base: &mut PortDriverBase, list, value| {
-            if value == 0 && base.get_int32_param(acquire, list).unwrap_or(0) == 0 {
-                base.set_int32_param(busy, list, 0)
-            } else {
-                Ok(())
-            }
-        }),
-    );
-}
-
 /// Trait for areaDetector drivers.
 pub trait ADDriver: asyn_rs::port::PortDriver {
     fn ad_base(&self) -> &ADDriverBase;
@@ -335,6 +289,13 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
     /// that drives its own shutter overrides it.
     fn set_shutter(&mut self, open: bool) {
         self.ad_base_mut().set_shutter(open)
+    }
+
+    /// The `asynNDArrayDriver::writeInt32` call `ad_write_int32` makes
+    /// (ADDriver.cpp:101); a driver whose `pArrays[0]` is not in its
+    /// `ArrayOwner` overrides it to pass that array to `handle_write_int32`.
+    fn ndarray_write_int32(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
+        self.ad_base_mut().ndarray_write_int32(user, value)
     }
 
     /// C++ `ADDriver::writeInt32` (ADDriver.cpp:84-116). A driver's
@@ -348,7 +309,7 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
         if user.reason == params.shutter_control {
             self.set_shutter(value != 0);
         } else if user.reason < params.first_ad_param {
-            status = self.ad_base_mut().ndarray_write_int32(user, value);
+            status = ADDriver::ndarray_write_int32(self, user, value);
         }
         let ad = self.ad_base_mut();
         let _ = ad.port_base.call_param_callbacks(user.addr);
@@ -394,6 +355,7 @@ mod tests {
     struct OwnShutter {
         ad: ADDriverBase,
         shutter: Vec<bool>,
+        nd_writes: Vec<usize>,
     }
 
     impl asyn_rs::port::PortDriver for OwnShutter {
@@ -414,6 +376,10 @@ mod tests {
         }
         fn set_shutter(&mut self, open: bool) {
             self.shutter.push(open);
+        }
+        fn ndarray_write_int32(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
+            self.nd_writes.push(user.reason);
+            self.ad.ndarray_write_int32(user, value)
         }
     }
 
@@ -442,7 +408,22 @@ mod tests {
         OwnShutter {
             ad: ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap(),
             shutter: Vec::new(),
+            nd_writes: Vec::new(),
         }
+    }
+
+    /// Only a parameter below FIRST_AD_PARAM reaches asynNDArrayDriver
+    /// (ADDriver.cpp:97-101), through the driver's override.
+    #[test]
+    fn a_base_class_write_reaches_an_overridden_ndarray_write_int32() {
+        let mut d = own_shutter();
+        let p = d.ad.params;
+        d.ad_write_int32(&AsynUser::new(p.base.pool_poll_stats), 1)
+            .unwrap();
+        d.ad_write_int32(&AsynUser::new(p.shutter_control), 1)
+            .unwrap();
+        d.ad_write_int32(&AsynUser::new(p.image_mode), 1).unwrap();
+        assert_eq!(d.nd_writes, vec![p.base.pool_poll_stats]);
     }
 
     #[test]
@@ -704,7 +685,7 @@ mod tests {
                     crate::ndarray::NDDataType::UInt8,
                 )
                 .unwrap();
-            let out = ad.prepare_array(Arc::new(arr)).unwrap().unwrap();
+            let out = ad.prepare_array(arr).unwrap().unwrap();
             assert_eq!(
                 out.attributes.get("Gain").unwrap().value,
                 NDAttrValue::Float64(gain)
@@ -725,7 +706,7 @@ mod tests {
                 crate::ndarray::NDDataType::UInt8,
             )
             .unwrap();
-        ad.prepare_array(Arc::new(arr)).unwrap();
+        ad.prepare_array(arr).unwrap();
         assert_eq!(
             ad.port_base
                 .get_int32_param(ad.params.base.array_counter, 0)
@@ -756,7 +737,7 @@ mod tests {
                 crate::ndarray::NDDataType::UInt8,
             )
             .unwrap();
-        ad.prepare_array(Arc::new(arr)).unwrap();
+        ad.prepare_array(arr).unwrap();
 
         // Counter still increments, but generic pointer should NOT be updated to an NDArray
         assert_eq!(
@@ -791,7 +772,7 @@ mod tests {
             )
             .unwrap();
         let id = arr.unique_id;
-        ad.prepare_array(Arc::new(arr)).unwrap();
+        ad.prepare_array(arr).unwrap();
 
         let gp = ad
             .port_base
@@ -942,7 +923,7 @@ mod tests {
             .set_int32_param(ad.params.wait_for_plugins, 0, 1)
             .unwrap();
         ad.port_base.set_int32_param(acquire, 0, 1).unwrap();
-        ad.queued_counter.increment();
+        ad.owner.queued().increment();
 
         // The queue draining while still acquiring leaves it busy.
         ad.port_base.set_int32_param(queued, 0, 0).unwrap();
@@ -954,7 +935,7 @@ mod tests {
         // A non-zero queue store clears nothing.
         ad.port_base.set_int32_param(queued, 0, 1).unwrap();
         assert_eq!(busy(&ad), 1);
-        ad.queued_counter.decrement();
+        ad.owner.queued().decrement();
         ad.port_base.set_int32_param(queued, 0, 0).unwrap();
         assert_eq!(busy(&ad), 0);
     }
@@ -1008,7 +989,7 @@ mod tests {
             .set_int32_param(ad.params.wait_for_plugins, 0, 1)
             .unwrap();
         ad.set_acquire(1).unwrap();
-        ad.queued_counter.increment(); // one array still queued
+        ad.owner.queued().increment(); // one array still queued
 
         ad.set_acquire(0).unwrap();
         // Still busy — queue not drained.
@@ -1020,7 +1001,7 @@ mod tests {
         );
 
         // Drain the queue, then NDNumQueuedArrays=0 clears AcquireBusy.
-        ad.queued_counter.decrement();
+        ad.owner.queued().decrement();
         ad.set_num_queued_arrays(0).unwrap();
         assert_eq!(
             ad.port_base
@@ -1062,7 +1043,7 @@ mod tests {
                 crate::ndarray::NDDataType::UInt8,
             )
             .unwrap();
-        ad.prepare_array(Arc::new(arr)).unwrap();
+        ad.prepare_array(arr).unwrap();
         ad.port_base
             .set_int32_param(ad.params.base.pool_num_pre_alloc_buffers, 0, 3)
             .unwrap();
@@ -1080,6 +1061,38 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// A task that publishes without `prepare_array` reaches the driver's
+    /// `pArrays[0]` through its pool, as C's tasks write `this->pArrays[0]`.
+    #[test]
+    fn an_array_stored_through_the_pool_is_the_pre_alloc_template() {
+        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 10_000_000, ASYN_CANBLOCK).unwrap();
+        let task_pool = ad.pool.clone();
+        let arr = task_pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(64)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
+        task_pool
+            .owner()
+            .store_array(0, Some(arr.share().array().clone()));
+        assert_eq!(ad.pool.allocated_bytes(), 64, "the slot keeps it charged");
+        ad.port_base
+            .set_int32_param(ad.params.base.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        ad.write_int32_pool(ad.params.base.pool_pre_alloc, 1)
+            .unwrap();
+        assert_eq!(ad.pool.num_free_buffers(), 2);
+
+        // Released before a refused alloc, the slot leaves no template.
+        task_pool.owner().store_array(0, None);
+        ad.write_int32_pool(ad.params.base.pool_empty_free_list, 1)
+            .unwrap();
+        ad.write_int32_pool(ad.params.base.pool_pre_alloc, 1)
+            .unwrap();
+        assert_eq!(ad.pool.num_free_buffers(), 0);
     }
 
     #[test]
@@ -1136,7 +1149,7 @@ mod tests {
             )
             .unwrap();
         let id = arr.unique_id;
-        let to_publish = ad.prepare_array(Arc::new(arr)).unwrap().unwrap();
+        let to_publish = ad.prepare_array(arr).unwrap().unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

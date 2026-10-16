@@ -280,6 +280,45 @@ pub struct PortHandle {
     trace: Arc<TraceManager>,
 }
 
+/// A [`PortHandle`] that does not keep its port alive: the actor ends once
+/// every `PortHandle` is gone, as it would without this one. For a port's own
+/// helper thread, which C holds as `this` and so never keeps the port up.
+#[derive(Clone)]
+pub struct WeakPortHandle {
+    tx: mpsc::WeakUnboundedSender<ActorMessage>,
+    port_name: Arc<str>,
+    actor: ActorId,
+    cells: Arc<crate::request::CellQueue>,
+    gate: QueueGate,
+    devices: crate::port::DeviceTable,
+    interrupts: Arc<InterruptManager>,
+    can_block: bool,
+    multi_device: bool,
+    max_addr: i32,
+    interfaces: Arc<[Capability]>,
+    trace: Arc<TraceManager>,
+}
+
+impl WeakPortHandle {
+    /// The handle, or `None` once the last [`PortHandle`] has dropped.
+    pub fn upgrade(&self) -> Option<PortHandle> {
+        Some(PortHandle {
+            tx: self.tx.upgrade()?,
+            port_name: self.port_name.clone(),
+            actor: self.actor,
+            cells: self.cells.clone(),
+            gate: self.gate.clone(),
+            devices: self.devices.clone(),
+            interrupts: self.interrupts.clone(),
+            can_block: self.can_block,
+            multi_device: self.multi_device,
+            max_addr: self.max_addr,
+            interfaces: self.interfaces.clone(),
+            trace: self.trace.clone(),
+        })
+    }
+}
+
 /// A synchronous port's callback runs on the caller's thread, each call a
 /// blocking round trip — C's `queueRequest` on a port without
 /// `ASYN_CANBLOCK`. The request is a message to the port's actor, so it owns
@@ -324,6 +363,24 @@ impl PortHandle {
             max_addr: 1,
             interfaces: crate::interfaces::default_capabilities().into(),
             trace,
+        }
+    }
+
+    /// A handle that does not keep the port alive — see [`WeakPortHandle`].
+    pub fn downgrade(&self) -> WeakPortHandle {
+        WeakPortHandle {
+            tx: self.tx.downgrade(),
+            port_name: self.port_name.clone(),
+            actor: self.actor,
+            cells: self.cells.clone(),
+            gate: self.gate.clone(),
+            devices: self.devices.clone(),
+            interrupts: self.interrupts.clone(),
+            can_block: self.can_block,
+            multi_device: self.multi_device,
+            max_addr: self.max_addr,
+            interfaces: self.interfaces.clone(),
+            trace: self.trace.clone(),
         }
     }
 
@@ -1185,6 +1242,34 @@ impl PortHandle {
         })
     }
 
+    /// C `getStringParam(list, index, maxChars, value)` from a driver's own
+    /// thread (asynPortDriver.cpp:543-553): the stored text up to its first
+    /// NUL and at most `max_chars - 1` bytes, read on the actor. Not
+    /// `readOctet`, whose count includes the NUL it appends.
+    pub async fn get_string_param(
+        &self,
+        reason: usize,
+        addr: i32,
+        max_chars: usize,
+    ) -> AsynResult<Vec<u8>> {
+        let (call, result) = string_param_call(reason, addr, max_chars);
+        self.submit_async(RequestOp::WithDriver(call), AsynUser::default())
+            .await?;
+        string_param_result(&result)
+    }
+
+    /// [`Self::get_string_param`] for sync callers.
+    pub fn get_string_param_blocking(
+        &self,
+        reason: usize,
+        addr: i32,
+        max_chars: usize,
+    ) -> AsynResult<Vec<u8>> {
+        let (call, result) = string_param_call(reason, addr, max_chars);
+        self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
+        string_param_result(&result)
+    }
+
     fn driver_call<D, R>(
         &self,
         f: impl FnOnce(&mut D) -> R + Send + 'static,
@@ -1620,6 +1705,34 @@ impl PortHandle {
     }
 }
 
+type StringParamSlot = Arc<Mutex<Option<AsynResult<Vec<u8>>>>>;
+
+fn string_param_call(reason: usize, addr: i32, max_chars: usize) -> (DriverCall, StringParamSlot) {
+    let result: StringParamSlot = Arc::new(Mutex::new(None));
+    let slot = result.clone();
+    let call = DriverCall::new(move |driver| {
+        let value = driver.base().get_string_param(reason, addr).map(|bytes| {
+            let text = &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())];
+            text[..text.len().min(max_chars.saturating_sub(1))].to_vec()
+        });
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+    });
+    (call, result)
+}
+
+fn string_param_result(result: &StringParamSlot) -> AsynResult<Vec<u8>> {
+    result
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_else(|| {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "getStringParam did not run".into(),
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1934,6 +2047,17 @@ mod tests {
         let e = read.wait_blocking(Duration::from_secs(5)).unwrap_err();
         assert_eq!(e.status(), AsynStatus::Disabled, "{e}");
         jam.join().unwrap();
+    }
+
+    #[test]
+    fn a_weak_handle_fails_to_upgrade_after_the_last_handle_drops() {
+        let handle = make_handle(TestDriver::new());
+        let weak = handle.downgrade();
+        let again = weak.upgrade().expect("a live handle upgrades");
+        drop(handle);
+        assert!(weak.upgrade().is_some(), "one handle is still alive");
+        drop(again);
+        assert!(weak.upgrade().is_none());
     }
 
     /// C `connectDevice` runs on the caller's thread under `asynManagerLock`

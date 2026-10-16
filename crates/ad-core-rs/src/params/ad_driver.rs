@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 
 use super::ndarray_driver::NDArrayDriverParams;
+use crate::driver::ndarray_driver::ArrayOwner;
 
 /// Additional parameters for ADDriver (detector-specific: gain, shutter, temperature, trigger).
 #[derive(Clone, Copy)]
@@ -61,11 +64,12 @@ pub struct ADDriverParams {
 }
 
 impl ADDriverParams {
-    pub fn create(port_base: &mut PortDriverBase) -> AsynResult<Self> {
-        let base = NDArrayDriverParams::create(port_base)?;
+    /// [`NDArrayDriverParams::create`] plus the `ADDriver` parameters.
+    pub fn create(port_base: &mut PortDriverBase) -> AsynResult<(Self, Arc<ArrayOwner>)> {
+        let (base, owner) = NDArrayDriverParams::create(port_base)?;
         let first_ad_param = port_base.params.len();
 
-        Ok(Self {
+        let params = Self {
             base,
             first_ad_param,
 
@@ -118,7 +122,8 @@ impl ADDriverParams {
             // Temperature
             temperature: port_base.create_param("TEMPERATURE", ParamType::Float64)?,
             temperature_actual: port_base.create_param("TEMPERATURE_ACTUAL", ParamType::Float64)?,
-        })
+        };
+        Ok((params, owner))
     }
 }
 
@@ -130,7 +135,7 @@ mod tests {
     #[test]
     fn test_create_ad_driver_params() {
         let mut base = PortDriverBase::new("test", 1, PortFlags::default());
-        let params = ADDriverParams::create(&mut base).unwrap();
+        let (params, _) = ADDriverParams::create(&mut base).unwrap();
         assert!(base.find_param("ACQUIRE").is_some());
         assert!(base.find_param("GAIN").is_some());
         assert!(base.find_param("SHUTTER_CONTROL").is_some());
@@ -150,7 +155,7 @@ mod tests {
     #[test]
     fn test_ad_driver_inherits_base() {
         let mut base = PortDriverBase::new("test", 1, PortFlags::default());
-        let params = ADDriverParams::create(&mut base).unwrap();
+        let (params, _) = ADDriverParams::create(&mut base).unwrap();
         // Should be able to access base params through the base field
         assert!(base.find_param("ARRAY_COUNTER").is_some());
         assert_eq!(

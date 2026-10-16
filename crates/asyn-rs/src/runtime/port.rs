@@ -319,6 +319,7 @@ pub fn create_port_runtime_boxed(
     // registration is where `registerInterface` is called too, and the set never
     // changes afterwards (asynManager.c:2104-2140).
     let interfaces = driver.capabilities();
+    let runtime_hooks = std::mem::take(&mut driver.base_mut().runtime_hooks);
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
@@ -403,6 +404,9 @@ pub fn create_port_runtime_boxed(
     port_handle.set_can_block(can_block);
     port_handle.set_capabilities(multi_device, max_addr);
     port_handle.set_interfaces(interfaces);
+    for hook in runtime_hooks {
+        hook(&port_handle);
+    }
     let client = InProcessClient::new(port_handle.clone());
 
     let handle = PortRuntimeHandle {
@@ -671,6 +675,46 @@ mod tests {
                     == "asynPortDriver:asynPortDriver ERROR: Can't register port: unavail_port"),
             "{stdout}"
         );
+    }
+
+    /// The hook gets a handle that already reaches the running port.
+    #[test]
+    fn a_runtime_hook_runs_once_with_a_live_handle() {
+        let mut port = TestPort::new("rt_hook");
+        let (tx, rx) = std::sync::mpsc::channel();
+        port.base.on_runtime(move |handle| {
+            tx.send(handle.clone()).unwrap();
+        });
+        let (_runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+
+        let handle = rx.try_recv().expect("the hook ran during creation");
+        assert!(rx.try_recv().is_err(), "the hook ran twice");
+        handle.write_int32_blocking(0, 0, 7).unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 7);
+    }
+
+    /// getStringParam's text, without the NUL readOctet counts, cut to
+    /// `max_chars - 1` (asynPortDriver.cpp:551-552).
+    #[test]
+    fn get_string_param_reads_the_stored_text() {
+        let mut port = TestPort::new("rt_string_param");
+        let msg = port.base.create_param("MSG", ParamType::Octet).unwrap();
+        port.base.set_string_param(msg, 0, b"file://x.png").unwrap();
+        let (runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let handle = runtime.port_handle();
+
+        assert_eq!(
+            handle.get_string_param_blocking(msg, 0, 256).unwrap(),
+            b"file://x.png"
+        );
+        assert_eq!(
+            handle.get_string_param_blocking(msg, 0, 5).unwrap(),
+            b"file"
+        );
+        assert_eq!(handle.get_string_param_blocking(msg, 0, 0).unwrap(), b"");
+        assert!(handle.get_string_param_blocking(0, 0, 256).is_err());
     }
 
     #[test]

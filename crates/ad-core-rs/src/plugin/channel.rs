@@ -1,15 +1,17 @@
-// RTEMS-EXEC-MODEL-ALLOW(17): checked, not waived — all 17 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(20): checked, not waived — all 20 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
-// --all-features`, 345/345). ad-core-rs became a census subject when its
+// --all-features`, 437/437). ad-core-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 use std::time::Duration;
 
 use crate::ndarray::NDArray;
+use crate::ndarray_pool::PublishedArray;
 
 /// Tracks the number of queued (in-flight) arrays across plugins.
 /// Used by drivers to perform a bounded wait at end of acquisition.
@@ -17,6 +19,9 @@ pub struct QueuedArrayCounter {
     count: AtomicUsize,
     mutex: parking_lot::Mutex<()>,
     condvar: parking_lot::Condvar,
+    /// The port's `NDNumQueuedArrays` updater, unparked on every change —
+    /// C's `queuedArrayEvent_` (asynNDArrayDriver.cpp:812, :828).
+    updater: OnceLock<Thread>,
 }
 
 impl QueuedArrayCounter {
@@ -26,12 +31,14 @@ impl QueuedArrayCounter {
             count: AtomicUsize::new(0),
             mutex: parking_lot::Mutex::new(()),
             condvar: parking_lot::Condvar::new(),
+            updater: OnceLock::new(),
         }
     }
 
     /// Increment the queued count (called before send).
     pub fn increment(&self) {
         self.count.fetch_add(1, Ordering::AcqRel);
+        self.wake_updater();
     }
 
     /// Decrement the queued count. Notifies waiters when reaching zero.
@@ -40,6 +47,21 @@ impl QueuedArrayCounter {
         if prev == 1 {
             let _guard = self.mutex.lock();
             self.condvar.notify_all();
+        }
+        self.wake_updater();
+    }
+
+    /// Make `updater` the thread every change unparks. Set once.
+    pub(crate) fn set_updater(&self, updater: Thread) {
+        if self.updater.set(updater).is_ok() {
+            // A change made before the updater existed is published now.
+            self.wake_updater();
+        }
+    }
+
+    fn wake_updater(&self) {
+        if let Some(updater) = self.updater.get() {
+            updater.unpark();
         }
     }
 
@@ -66,6 +88,13 @@ impl QueuedArrayCounter {
     }
 }
 
+impl Drop for QueuedArrayCounter {
+    /// The updater holds the counter weakly and ends when it is gone.
+    fn drop(&mut self) {
+        self.wake_updater();
+    }
+}
+
 impl Default for QueuedArrayCounter {
     fn default() -> Self {
         Self::new()
@@ -76,7 +105,7 @@ impl Default for QueuedArrayCounter {
 /// When dropped, decrements the counter (if present) — this signals that
 /// the downstream plugin has finished processing the array.
 pub struct ArrayMessage {
-    pub array: Arc<NDArray>,
+    pub array: PublishedArray,
     pub(crate) counter: Option<Arc<QueuedArrayCounter>>,
     /// When Some, the sender awaits this to confirm downstream processing completed.
     /// Fired when ArrayMessage is dropped (i.e., after plugin process_array finishes).
@@ -273,29 +302,29 @@ impl OverflowEpisode {
 /// is counted the same however the array got to the queue.
 fn try_send_arm(
     tx: &parking_lot::RwLock<tokio::sync::mpsc::Sender<ArrayMessage>>,
-    queued_counter: &Option<Arc<QueuedArrayCounter>>,
     dropped_arrays: &AtomicI32,
-    array: Arc<NDArray>,
+    array: PublishedArray,
     episode: &OverflowEpisode,
     admission: &ArrayAdmission,
 ) -> PublishOutcome {
     // C reads and clears `auxStatus` before deciding anything else (:405-406),
     // so a successful enqueue below ends the episode by simply not re-arming.
     let ignore_queue_full = episode.take();
-    // Build the message only on the way into try_send so a full queue does
-    // not touch the counter.
-    if let Some(c) = queued_counter {
-        c.increment();
-    }
-    let msg = ArrayMessage {
-        array,
-        counter: queued_counter.clone(),
-        done_tx: None,
-    };
-    match tx.read().try_send(msg) {
-        Ok(()) => PublishOutcome::Delivered,
-        // `msg` is dropped here → counter decremented by ArrayMessage::drop.
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+    let tx = tx.read();
+    match tx.try_reserve() {
+        Ok(slot) => {
+            // Counted on the array's driver only once the slot is held
+            // (NDPluginDriver.cpp:462), and before the receiver can see it.
+            let counter = Arc::clone(array.pool().owner().queued());
+            counter.increment();
+            slot.send(ArrayMessage {
+                array,
+                counter: Some(counter),
+                done_tx: None,
+            });
+            PublishOutcome::Delivered
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
             episode.arm();
             if !ignore_queue_full {
                 dropped_arrays.fetch_add(1, Ordering::AcqRel);
@@ -303,7 +332,7 @@ fn try_send_arm(
             }
             PublishOutcome::DroppedQueueFull
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => PublishOutcome::ChannelClosed,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => PublishOutcome::ChannelClosed,
     }
 }
 
@@ -339,7 +368,6 @@ pub struct NDArraySender {
     port_name: String,
     enabled: Arc<AtomicBool>,
     blocking_mode: Arc<AtomicBool>,
-    queued_counter: Option<Arc<QueuedArrayCounter>>,
     /// Cumulative count of arrays dropped because this sender's downstream
     /// input queue was full. Owned by the downstream plugin (which publishes
     /// it to its `DROPPED_ARRAYS` param), shared back to every upstream
@@ -365,8 +393,8 @@ impl NDArraySender {
     ///   the array is dropped and `DroppedQueueFull` is returned (C++ parity).
     /// - `blocking_callbacks=1`: reliable `send().await` + awaits downstream
     ///   processing completion (explicit opt-in, never drops).
-    pub async fn publish(&self, array: Arc<NDArray>) -> PublishOutcome {
-        self.publish_inner(array).await
+    pub async fn publish(&self, array: impl Into<PublishedArray>) -> PublishOutcome {
+        self.publish_inner(array.into()).await
     }
 
     /// Publish for the scatter reroute path. Mirrors C++ `NDPluginScatter`'s
@@ -379,7 +407,7 @@ impl NDArraySender {
     /// arm/disarm of the episode rather than a bypass flag: were they two
     /// mechanisms, a scatter round following a natural overflow would silence
     /// the last node too.
-    pub async fn publish_scatter(&self, array: Arc<NDArray>, is_last: bool) -> PublishOutcome {
+    pub async fn publish_scatter(&self, array: PublishedArray, is_last: bool) -> PublishOutcome {
         if is_last {
             self.overflow.disarm();
         } else {
@@ -389,7 +417,7 @@ impl NDArraySender {
     }
 
     /// Shared publish body.
-    async fn publish_inner(&self, array: Arc<NDArray>) -> PublishOutcome {
+    async fn publish_inner(&self, array: PublishedArray) -> PublishOutcome {
         if !self.enabled.load(Ordering::Acquire) {
             return PublishOutcome::Disabled;
         }
@@ -412,7 +440,6 @@ impl NDArraySender {
         if !blocking {
             return try_send_arm(
                 &self.tx,
-                &self.queued_counter,
                 &self.dropped_arrays,
                 array,
                 &self.overflow,
@@ -423,14 +450,13 @@ impl NDArraySender {
         // Reliable blocking path: never drops, awaits completion. C clears
         // `auxStatus` at :406 before branching on `blockingCallbacks` and the
         // inline arm never touches the queue, so an episode ends here too.
+        // Nor does it count the array as queued: C runs `processCallbacks`
+        // inline (:419-422) and only the trySend arm increments (:446).
         self.overflow.disarm();
-        if let Some(ref c) = self.queued_counter {
-            c.increment();
-        }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let msg = ArrayMessage {
             array,
-            counter: self.queued_counter.clone(),
+            counter: None,
             done_tx: Some(done_tx),
         };
         let tx = self.tx.read().clone();
@@ -454,11 +480,6 @@ impl NDArraySender {
 
     pub fn port_name(&self) -> &str {
         &self.port_name
-    }
-
-    /// Set the queued-array counter for tracking in-flight arrays.
-    pub fn set_queued_counter(&mut self, counter: Arc<QueuedArrayCounter>) {
-        self.queued_counter = Some(counter);
     }
 
     /// Attach the downstream plugin's shared `DroppedArrays` counter so that
@@ -498,7 +519,6 @@ impl NDArraySender {
     pub(crate) fn self_queue_handle(&self) -> SelfQueueHandle {
         SelfQueueHandle {
             tx: Arc::downgrade(&self.tx),
-            queued_counter: self.queued_counter.clone(),
             dropped_arrays: self.dropped_arrays.clone(),
             // NOT `self.overflow`: C reaches `driverCallback` with
             // `pasynUserSelf` for a `ProcessPlugin` re-injection (:741) and
@@ -558,12 +578,12 @@ impl NDArrayReceiver {
 
     /// Blocking receive (for use in std::thread data processing loops).
     pub fn blocking_recv(&mut self) -> Option<Arc<NDArray>> {
-        self.rx.blocking_recv().map(|msg| msg.array.clone())
+        self.rx.blocking_recv().map(|msg| msg.array.array().clone())
     }
 
     /// Async receive.
     pub async fn recv(&mut self) -> Option<Arc<NDArray>> {
-        self.rx.recv().await.map(|msg| msg.array.clone())
+        self.rx.recv().await.map(|msg| msg.array.array().clone())
     }
 
     /// Receive the full ArrayMessage (crate-internal). The message's Drop
@@ -592,7 +612,6 @@ pub(crate) struct WeakNDArraySender {
     port_name: String,
     enabled: Arc<AtomicBool>,
     blocking_mode: Arc<AtomicBool>,
-    queued_counter: Option<Arc<QueuedArrayCounter>>,
     dropped_arrays: Arc<AtomicI32>,
     overflow: Arc<OverflowEpisode>,
     admission: Arc<ArrayAdmission>,
@@ -607,7 +626,6 @@ impl WeakNDArraySender {
             port_name: self.port_name.clone(),
             enabled: self.enabled.clone(),
             blocking_mode: self.blocking_mode.clone(),
-            queued_counter: self.queued_counter.clone(),
             dropped_arrays: self.dropped_arrays.clone(),
             overflow: self.overflow.clone(),
             admission: self.admission.clone(),
@@ -622,7 +640,6 @@ impl NDArraySender {
             port_name: self.port_name.clone(),
             enabled: self.enabled.clone(),
             blocking_mode: self.blocking_mode.clone(),
-            queued_counter: self.queued_counter.clone(),
             dropped_arrays: self.dropped_arrays.clone(),
             overflow: self.overflow.clone(),
             admission: self.admission.clone(),
@@ -639,7 +656,6 @@ impl NDArraySender {
 /// moves every producer at once.
 pub(crate) struct SelfQueueHandle {
     tx: std::sync::Weak<parking_lot::RwLock<tokio::sync::mpsc::Sender<ArrayMessage>>>,
-    queued_counter: Option<Arc<QueuedArrayCounter>>,
     dropped_arrays: Arc<AtomicI32>,
     /// This producer's own `pasynUserSelf->auxStatus`.
     overflow: OverflowEpisode,
@@ -686,7 +702,7 @@ impl SelfQueueHandle {
     /// thread — so the caller keeps its own inline path for that mode.
     ///
     /// `None` once every sender is gone, which is the caller shutting down.
-    pub(crate) fn try_enqueue(&self, array: Arc<NDArray>) -> Option<PublishOutcome> {
+    pub(crate) fn try_enqueue(&self, array: PublishedArray) -> Option<PublishOutcome> {
         let cell = self.tx.upgrade()?;
         match self.admission.classify(&array) {
             Admission::Admit => {}
@@ -699,7 +715,6 @@ impl SelfQueueHandle {
         }
         Some(try_send_arm(
             &cell,
-            &self.queued_counter,
             &self.dropped_arrays,
             array,
             &self.overflow,
@@ -718,7 +733,6 @@ pub fn ndarray_channel(port_name: &str, queue_size: usize) -> (NDArraySender, ND
             port_name: port_name.to_string(),
             enabled: Arc::new(AtomicBool::new(true)),
             blocking_mode: Arc::new(AtomicBool::new(false)),
-            queued_counter: None,
             dropped_arrays: Arc::new(AtomicI32::new(0)),
             overflow: Arc::new(OverflowEpisode::default()),
             admission: Arc::clone(&admission),
@@ -758,13 +772,18 @@ impl NDArrayOutput {
     /// Each sender publishes independently. Returns the per-sender outcomes
     /// so the caller can count `DroppedArrays` for any downstream whose queue
     /// was full (C++ `driverCallback` semantics).
-    pub async fn publish(&self, array: Arc<NDArray>) -> Vec<PublishOutcome> {
+    pub async fn publish(&self, array: impl Into<PublishedArray>) -> Vec<PublishOutcome> {
+        let array = array.into();
         let futs = self.senders.iter().map(|s| s.publish(array.clone()));
         futures_util::future::join_all(futs).await
     }
 
     /// Publish an array to a single downstream receiver by index (for scatter/round-robin).
-    pub async fn publish_to(&self, index: usize, array: Arc<NDArray>) -> Option<PublishOutcome> {
+    pub async fn publish_to(
+        &self,
+        index: usize,
+        array: impl Into<PublishedArray>,
+    ) -> Option<PublishOutcome> {
         if let Some(sender) = self.senders.get(index % self.senders.len().max(1)) {
             Some(sender.publish(array).await)
         } else {
@@ -791,7 +810,7 @@ impl NDArrayOutput {
 /// # Example
 /// ```ignore
 /// if config.array_callbacks {
-///     publisher.publish(Arc::new(frame)).await;
+///     publisher.publish(frame).await; // a DriverArray from the driver's pool
 /// }
 /// ```
 #[derive(Clone)]
@@ -811,7 +830,8 @@ impl ArrayPublisher {
     /// that downstream plugin's input queue was full and the array was dropped
     /// (C++ `driverCallback` `trySend`). The driver should count those as
     /// `DroppedArrays`.
-    pub async fn publish(&self, array: Arc<NDArray>) -> Vec<PublishOutcome> {
+    pub async fn publish(&self, array: impl Into<PublishedArray>) -> Vec<PublishOutcome> {
+        let array = array.into();
         let senders = self.output.lock().senders_clone();
         let futs = senders.iter().map(|s| s.publish(array.clone()));
         futures_util::future::join_all(futs).await
@@ -827,12 +847,25 @@ impl Default for NDArrayOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ndarray::{NDArray, NDDataType, NDDimension};
+    use crate::driver::ndarray_driver::ArrayOwner;
+    use crate::ndarray::{NDDataType, NDDimension};
+    use crate::ndarray_pool::DriverPool;
 
-    fn make_test_array(id: i32) -> Arc<NDArray> {
-        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+    /// An array of a driver no test reads.
+    fn make_test_array(id: i32) -> PublishedArray {
+        let mut arr = owned_array_mut(&DriverPool::standalone(0));
         arr.unique_id = id;
-        Arc::new(arr)
+        arr.share()
+    }
+
+    fn owned_array_mut(pool: &DriverPool) -> crate::ndarray_pool::DriverArray {
+        pool.alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
+            .unwrap()
+    }
+
+    /// An array allocated from `pool`.
+    fn owned_array(pool: &DriverPool) -> PublishedArray {
+        owned_array_mut(pool).share()
     }
 
     #[tokio::test]
@@ -893,16 +926,35 @@ mod tests {
     #[tokio::test]
     async fn test_drop_on_full_does_not_leak_counter() {
         // A dropped array must not leave the queued-array counter incremented.
-        let counter = Arc::new(QueuedArrayCounter::new());
-        let (mut sender, _receiver) = ndarray_channel("TEST", 1);
-        sender.set_queued_counter(counter.clone());
+        let owner = ArrayOwner::new();
+        let counter = owner.queued().clone();
+        let pool = DriverPool::for_driver(1_000_000, &owner);
+        let (sender, _receiver) = ndarray_channel("TEST", 1);
 
-        sender.publish(make_test_array(1)).await; // delivered, counter=1
+        sender.publish(owned_array(&pool)).await; // delivered, counter=1
         assert_eq!(counter.get(), 1);
-        let outcome = sender.publish(make_test_array(2)).await; // dropped
+        let outcome = sender.publish(owned_array(&pool)).await; // dropped
         assert_eq!(outcome, PublishOutcome::DroppedQueueFull);
         // Counter must still be 1 — the dropped message decremented on drop.
         assert_eq!(counter.get(), 1);
+    }
+
+    /// C counts an array only after `trySend` took it (NDPluginDriver.cpp:462),
+    /// so a refused array never moves NDNumQueuedArrays, not even briefly.
+    #[tokio::test]
+    async fn a_refused_array_never_wakes_the_queued_count_updater() {
+        let owner = ArrayOwner::new();
+        let pool = DriverPool::for_driver(1_000_000, &owner);
+        owner.queued().set_updater(std::thread::current());
+        let (sender, _receiver) = ndarray_channel("TEST", 1);
+        sender.publish(owned_array(&pool)).await;
+        std::thread::park_timeout(Duration::ZERO);
+
+        let outcome = sender.publish(owned_array(&pool)).await;
+        assert_eq!(outcome, PublishOutcome::DroppedQueueFull);
+        let start = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_millis(200));
+        assert!(start.elapsed() >= Duration::from_millis(200));
     }
 
     #[tokio::test]
@@ -930,6 +982,25 @@ mod tests {
         assert!(completed.load(Ordering::Acquire));
 
         recv_handle.await.unwrap();
+    }
+
+    /// C's blocking arm calls `processCallbacks` inline and never touches
+    /// the queued count (NDPluginDriver.cpp:435-438 vs :462).
+    #[tokio::test]
+    async fn a_blocking_publish_is_not_counted_as_queued() {
+        let owner = ArrayOwner::new();
+        let counter = owner.queued().clone();
+        let pool = DriverPool::for_driver(1_000_000, &owner);
+        let (sender, mut receiver) = ndarray_channel("TEST", 10);
+        sender.blocking_mode.store(true, Ordering::Release);
+
+        let seen = tokio::spawn(async move {
+            let _msg = receiver.recv_msg().await.unwrap();
+            counter.get()
+        });
+        sender.publish(owned_array(&pool)).await;
+        assert_eq!(seen.await.unwrap(), 0);
+        assert_eq!(owner.queued().get(), 0);
     }
 
     #[tokio::test]
@@ -1017,14 +1088,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_increments_counter() {
-        let counter = Arc::new(QueuedArrayCounter::new());
-        let (mut sender, mut _receiver) = ndarray_channel("TEST", 10);
-        sender.set_queued_counter(counter.clone());
+        let owner = ArrayOwner::new();
+        let counter = owner.queued().clone();
+        let pool = DriverPool::for_driver(1_000_000, &owner);
+        let (sender, mut _receiver) = ndarray_channel("TEST", 10);
 
-        sender.publish(make_test_array(1)).await;
+        sender.publish(owned_array(&pool)).await;
         assert_eq!(counter.get(), 1);
-        sender.publish(make_test_array(2)).await;
+        sender.publish(owned_array(&pool)).await;
         assert_eq!(counter.get(), 2);
+    }
+
+    /// C counts a queued array on `pArray->pDriver` (NDPluginDriver.cpp:462,
+    /// :538), its pool's driver, whichever port queues it: a plugin's output
+    /// edge counts the detector's array on the detector.
+    #[tokio::test]
+    async fn an_array_is_counted_on_its_pools_driver_on_any_edge() {
+        let owner = ArrayOwner::new();
+        let detector = owner.queued().clone();
+        let pool = DriverPool::for_driver(1_000_000, &owner);
+        let (detector_edge, mut plugin_in) = ndarray_channel("PLUGIN", 4);
+        let (plugin_edge, mut next_in) = ndarray_channel("NEXT", 4);
+
+        detector_edge.publish(owned_array(&pool)).await;
+        let msg = plugin_in.recv_msg().await.unwrap();
+        plugin_edge.publish(msg.array.clone()).await;
+        drop(msg);
+        assert_eq!(detector.get(), 1, "the plugin's queued output");
+        drop(next_in.recv_msg().await.unwrap());
+        assert_eq!(detector.get(), 0);
+
+        // Another driver's array is counted on that driver.
+        plugin_edge.publish(make_test_array(1)).await;
+        assert_eq!(detector.get(), 0);
     }
 
     #[tokio::test]

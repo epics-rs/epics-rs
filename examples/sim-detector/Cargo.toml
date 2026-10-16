@@ -28,3 +28,4 @@ path = "examples/demo.rs"
 [dev-dependencies]
 asyn-rs = { workspace = true, features = ["test-support"] }
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"

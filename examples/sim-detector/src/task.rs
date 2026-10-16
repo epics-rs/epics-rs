@@ -14,7 +14,8 @@ use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::runtime as rt;
 
 use ad_core_rs::color_layout::ColorLayout;
-use ad_core_rs::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use ad_core_rs::ndarray_pool::{DriverArray, DriverPool};
+use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::roi::crop_roi;
 
 use crate::compute::{self, SineState};
@@ -37,25 +38,19 @@ pub(crate) struct AcquisitionContext {
     pub dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     pub ad: ADBaseParams,
     pub sim: SimDetectorParams,
-    pub queued_counter: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
 }
 
 impl AcquisitionContext {
-    /// Drain in-flight arrays (if configured) and transition to Idle.
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.queued_counter.wait_until_zero(Duration::from_secs(5));
-        }
+    /// Transition to Idle. Storing ADAcquire=0 is what clears ADAcquireBusy,
+    /// held while ADWaitForPlugins waits on the queued arrays
+    /// (asynNDArrayDriver.cpp:636-663).
+    async fn end_acquisition(&self) {
         if let Err(e) = self
             .port_handle
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::new(
-                        self.ad.acquire_busy,
-                        0,
-                        ParamValue::Int32(0),
-                    ),
                     asyn_rs::request::ParamSetValue::new(
                         self.ad.status,
                         0,
@@ -115,7 +110,13 @@ impl TaskState {
         }
     }
 
-    fn compute_frame(&mut self, config: &SimConfigSnapshot, reset: bool) -> NDArray {
+    /// `None` when the pool refused the frame; it has printed its limit line.
+    fn compute_frame(
+        &mut self,
+        pool: &DriverPool,
+        config: &SimConfigSnapshot,
+        reset: bool,
+    ) -> Option<DriverArray> {
         let layout = ColorLayout {
             color_mode: config.color_mode,
             size_x: config.max_size_x,
@@ -148,8 +149,7 @@ impl TaskState {
         // Build a temporary NDArray wrapper for crop_roi (which now takes &NDArray)
         let mut temp_arr = NDArray::new(layout.make_dims(), self.raw_buf.data_type());
         temp_arr.data = self.raw_buf.clone();
-        let mut frame = crop_roi(&temp_arr, &layout, min_x, min_y, size_x, size_y)
-            .expect("crop_roi failed on uncompressed data");
+        let mut frame = crop_roi(pool, &temp_arr, &layout, min_x, min_y, size_x, size_y).ok()?;
         // C computeImage labels every image (simDetector.cpp:171); the
         // attribute is what `NDArray::info` reads the layout from.
         frame.attributes.add(NDAttribute::new_static(
@@ -158,7 +158,7 @@ impl TaskState {
             NDAttrSource::Driver,
             NDAttrValue::Int32(config.color_mode as i32),
         ));
-        frame
+        pool.adopt(frame)
     }
 }
 
@@ -266,14 +266,16 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
             task_state.apply_dirty(&dirty_flags, &config);
 
-            let mut frame = task_state.compute_frame(&config, reset);
+            let Some(mut frame) = task_state.compute_frame(&ctx.pool, &config, reset) else {
+                continue;
+            };
 
             // Exposure time sleep with stop interruption
             let elapsed = start_time.elapsed().as_secs_f64();
             let delay = (config.acquire_time - elapsed).max(MIN_DELAY_SECS);
             match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(delay)).await {
                 WaitOutcome::Stop => {
-                    ctx.end_acquisition(config.wait_for_plugins).await;
+                    ctx.end_acquisition().await;
                     break;
                 }
                 WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback
@@ -355,8 +357,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 eprintln!("set_params_and_notify error (frame update): {e}");
             }
 
+            // C `getAttributes(pImage->pAttributeList)` (simDetector.cpp:828).
+            if let Err(e) = ctx.pool.owner().get_attributes(&mut frame).await {
+                eprintln!("getAttributes error: {e}");
+            }
+
             if config.array_callbacks {
-                ctx.publisher.publish(Arc::new(frame)).await;
+                ctx.publisher.publish(frame).await;
             }
 
             // Check stop conditions
@@ -365,7 +372,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             if image_mode == ImageMode::Single
                 || (image_mode == ImageMode::Multiple && num_counter >= num_images)
             {
-                ctx.end_acquisition(config.wait_for_plugins).await;
+                ctx.end_acquisition().await;
                 break;
             }
 
@@ -375,7 +382,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             if period_delay > 0.0 {
                 match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(period_delay)).await {
                     WaitOutcome::Stop => {
-                        ctx.end_acquisition(config.wait_for_plugins).await;
+                        ctx.end_acquisition().await;
                         break;
                     }
                     WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback
@@ -468,10 +475,93 @@ mod tests {
             let mut all = DirtyFlags::default();
             all.set_all();
             state.apply_dirty(&all, &config);
-            let frame = state.compute_frame(&config, true);
+            let frame = state.compute_frame(&det.ad.pool, &config, true).unwrap();
             let got: Vec<usize> = frame.dims.iter().map(|d| d.size).collect();
             assert_eq!(got, dims, "{mode:?}");
         }
+    }
+
+    /// C `computeImage` converts into an array from the driver's own pool
+    /// (simDetector.cpp:696), so `pArray->pDriver` is this driver and its
+    /// queued count is the one a downstream queue counts on.
+    #[test]
+    fn a_frame_comes_from_the_driver_pool() {
+        use ad_core_rs::plugin::channel::ndarray_channel;
+
+        let (sender, mut receiver) = ndarray_channel("SIM_POOL_DOWN", 4);
+        let mut output = NDArrayOutput::new();
+        output.add(sender);
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_POOL").unwrap(),
+            8,
+            8,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            output,
+        )
+        .unwrap();
+        let handle = rt.port_handle();
+        handle
+            .write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Single as i32)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001)
+            .unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 1)
+            .unwrap();
+
+        let frame = receiver.blocking_recv().unwrap();
+        let owner = frame.owner().expect("frame from an owned pool");
+        assert!(Arc::ptr_eq(&owner, rt.pool().owner()));
+    }
+
+    /// C `simDetector::simTask` runs `getAttributes` on every image before
+    /// its callback (simDetector.cpp:828), so the `NDAttributesFile` set and
+    /// its `PARAM` values ride on each frame.
+    #[test]
+    fn a_frame_carries_the_attributes_file_set() {
+        use ad_core_rs::attributes::NDAttrValue;
+        use ad_core_rs::plugin::channel::ndarray_channel;
+
+        let (sender, mut receiver) = ndarray_channel("SIM_ATTR_DOWN", 4);
+        let mut output = NDArrayOutput::new();
+        output.add(sender);
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_ATTR").unwrap(),
+            8,
+            8,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            output,
+        )
+        .unwrap();
+        let handle = rt.port_handle();
+        let file = rt.ad_params.base.attributes_file;
+        let xml = r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+        </Attributes>"#;
+        handle
+            .submit_blocking(
+                asyn_rs::request::RequestOp::OctetWrite { data: xml.into() },
+                asyn_rs::user::AsynUser::new(file),
+            )
+            .unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Single as i32)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001)
+            .unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 1)
+            .unwrap();
+
+        let frame = receiver.blocking_recv().unwrap();
+        assert_eq!(
+            frame.attributes.get("Counter").map(|a| &a.value),
+            Some(&NDAttrValue::Int32(frame.unique_id))
+        );
     }
 
     #[test]

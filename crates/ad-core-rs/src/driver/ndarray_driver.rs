@@ -14,7 +14,7 @@ use crate::attributes::{
 };
 use crate::color::NDColorMode;
 use crate::ndarray::NDArray;
-use crate::ndarray_pool::NDArrayPool;
+use crate::ndarray_pool::{DriverArray, DriverPool, NDArrayPool, PublishedArray};
 use crate::params::ndarray_driver::NDArrayDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
 
@@ -576,8 +576,10 @@ pub fn handle_pool_write_int32(
 }
 
 /// C++ `asynNDArrayDriver::writeInt32` (asynNDArrayDriver.cpp:671-708):
-/// store, the pool branch, callbacks, and the closing trace line.
-pub(crate) fn handle_write_int32(
+/// store, the pool branch, callbacks, and the closing trace line. For a
+/// driver built directly on `asynNDArrayDriver`; `template_array` is its
+/// `pArrays[0]`.
+pub fn handle_write_int32(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
     pool: &NDArrayPool,
@@ -697,10 +699,10 @@ impl DriverAttributes {
     /// re-evaluate every attribute and merge the values onto `array`. An empty
     /// set leaves the array untouched, so a plain array is never deep-copied
     /// through `Arc::make_mut`.
-    pub fn attach(&mut self, port_base: &PortDriverBase, array: &mut Arc<NDArray>) {
+    pub fn attach(&mut self, port_base: &PortDriverBase, array: &mut NDArray) {
         if !self.list.is_empty() {
             let fresh = self.update(port_base);
-            Arc::make_mut(array).attributes.copy_from(&fresh);
+            array.attributes.copy_from(&fresh);
         }
     }
 
@@ -904,19 +906,72 @@ impl DriverAttributes {
     /// attributes read whatever value a CA-monitor task last fed into their
     /// cell. `CONST` / `DRIVER` attributes are static.
     pub fn update(&mut self, port_base: &PortDriverBase) -> crate::attributes::NDAttributeList {
-        // 1. Feed each PARAM attribute's cell from the parameter library.
-        //    Done first (immutable borrow of attributes + port_base), so the
-        //    subsequent update_values() re-read picks up the fresh value.
+        let reads = self.param_reads(port_base, &[]);
+        self.update_with(&reads, &[])
+    }
+
+    /// The store half of [`Self::update`]: every `PARAM` attribute's read,
+    /// taken now. A read `pending` covers is not taken, since C would read
+    /// the value it has just set (see [`Self::update_with`]).
+    pub fn param_reads(&self, port_base: &PortDriverBase, pending: &[PendingParam]) -> ParamReads {
+        let mut reads = Vec::new();
         for attr in self.list.iter() {
-            if let Some(param_src) = attr.param_source() {
-                if let Some(value) = Self::read_param_value(port_base, param_src) {
-                    param_src.cell().set(value);
-                }
+            let Some(src) = attr.param_source() else {
+                continue;
+            };
+            let Some(index) = port_base.params.find_param(&src.param_name) else {
+                continue;
+            };
+            let stored = port_base
+                .params
+                .get_value(index, src.addr)
+                .ok()
+                .map(std::mem::discriminant);
+            let read = ParamRead {
+                name: src.param_name.clone(),
+                addr: src.addr,
+                param_type: src.param_type,
+                index,
+                stored,
+                value: None,
+            };
+            let value = match read.pending(pending) {
+                Some(_) => None,
+                None => Self::read_param_value(port_base, src),
+            };
+            reads.push(ParamRead { value, ..read });
+        }
+        ParamReads(reads)
+    }
+
+    /// Re-evaluate the set from `reads`, with `pending` — values set ahead
+    /// of the call and not yet flushed — read in place of the store, as C's
+    /// `getXxxParam` reads its own earlier `setXxxParam`. A pending value of
+    /// another type than the stored one is one C's set refused, so the store
+    /// is read. Nothing is written to the store.
+    pub fn update_with(
+        &mut self,
+        reads: &ParamReads,
+        pending: &[PendingParam],
+    ) -> crate::attributes::NDAttributeList {
+        for attr in self.list.iter() {
+            let Some(src) = attr.param_source() else {
+                continue;
+            };
+            let Some(read) = reads.0.iter().find(|r| {
+                r.name == src.param_name && r.addr == src.addr && r.param_type == src.param_type
+            }) else {
+                continue;
+            };
+            let value = match read.pending(pending) {
+                Some(value) => read_as(value, read.param_type),
+                None => read.value.clone(),
+            };
+            if let Some(value) = value {
+                src.cell().set(value);
             }
         }
-        // 2. Re-evaluate every attribute from its (now-fresh) source.
         self.list.update_values();
-        // 3. Return a snapshot for the outgoing array.
         self.list.clone()
     }
 
@@ -957,6 +1012,55 @@ impl DriverAttributes {
             )),
             ParamAttrType::Unknown => None,
         }
+    }
+}
+
+/// A value set ahead of a `getAttributes` call: reason, address, value.
+pub type PendingParam = (usize, i32, ParamValue);
+
+/// The store's answers to a set's `PARAM` reads, taken in one pass on the
+/// port (see [`DriverAttributes::param_reads`]).
+#[derive(Debug, Clone, Default)]
+pub struct ParamReads(Vec<ParamRead>);
+
+#[derive(Debug, Clone)]
+struct ParamRead {
+    name: String,
+    addr: i32,
+    param_type: crate::attributes::ParamAttrType,
+    index: usize,
+    /// The stored value's type, which a pending set must match to land.
+    stored: Option<std::mem::Discriminant<ParamValue>>,
+    value: Option<NDAttrValue>,
+}
+
+impl ParamRead {
+    /// The latest pending set of this param that C's set would have stored.
+    fn pending<'a>(&self, pending: &'a [PendingParam]) -> Option<&'a ParamValue> {
+        pending
+            .iter()
+            .rev()
+            .find(|(reason, addr, _)| *reason == self.index && *addr == self.addr)
+            .map(|(_, _, value)| value)
+            .filter(|value| Some(std::mem::discriminant(*value)) == self.stored)
+    }
+}
+
+/// `value` through the getter `param_type` names; a type the getter cannot
+/// read gives its zero-initialized local, as `paramAttribute` publishes it.
+fn read_as(
+    value: &ParamValue,
+    param_type: crate::attributes::ParamAttrType,
+) -> Option<NDAttrValue> {
+    use crate::attributes::ParamAttrType;
+    match param_type {
+        ParamAttrType::Int32 => Some(NDAttrValue::Int32(value.as_int32().unwrap_or(0))),
+        ParamAttrType::Int64 => Some(NDAttrValue::Int64(value.as_int64().unwrap_or(0))),
+        ParamAttrType::Float64 => Some(NDAttrValue::Float64(value.as_float64().unwrap_or(0.0))),
+        ParamAttrType::String => Some(NDAttrValue::String(
+            value.as_octet().map(octet_text).unwrap_or_default(),
+        )),
+        ParamAttrType::Unknown => None,
     }
 }
 
@@ -1007,44 +1111,282 @@ pub(crate) fn check_path(
     Ok(exists)
 }
 
-/// C++ `asynNDArrayDriver::writeOctet`: store the text, reload the attribute
-/// set on `ND_ATTRIBUTES_FILE` / `ND_ATTRIBUTES_MACROS`, run `checkPath` (and
-/// `createFilePath` bounded by `CREATE_DIR`) on `FILE_PATH`, then do the
-/// callbacks. A driver's `write_octet` falls back to this for every
-/// parameter it does not own, as C drivers call `ADDriver::writeOctet`.
-pub(crate) fn handle_write_octet(
+/// How `asynNDArrayDriver::writeOctet` names itself in its closing line and
+/// error message (asynNDArrayDriver.cpp:540-546).
+pub const ASYN_ND_ARRAY_DRIVER: asyn_rs::port::OctetWriter = asyn_rs::port::OctetWriter {
+    driver: "asynNDArrayDriver",
+    name_key: "paramName",
+};
+
+/// The branches of C++ `asynNDArrayDriver::writeOctet` (asynNDArrayDriver.cpp
+/// :526-538), as rules the `writeOctet` default runs after the store:
+/// `NDAttributesFile` / `NDAttributesMacros` reload the attribute set, and
+/// `FilePath` runs `checkPath`, then `createFilePath` bounded by `CREATE_DIR`
+/// and `checkPath` again when the directory is missing.
+pub(crate) fn write_octet_rules(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
-    attributes: &mut DriverAttributes,
-    user: &AsynUser,
-    data: &[u8],
-) -> AsynResult<usize> {
-    let (function, addr) = (user.reason, user.addr);
-    // C receives a NUL-terminated `char *`.
-    let value = octet_text(data.split(|&b| b == 0).next().unwrap_or(&[]));
-    port_base.set_string_param(function, addr, value.clone())?;
-    if function == params.attributes_file || function == params.attributes_macros {
-        let _ = attributes.read_file(port_base, params);
-    } else if function == params.file_path && !check_path(port_base, params)? {
-        let depth = port_base.get_int32_param(params.create_dir, 0).unwrap_or(0);
-        let _ = NDArrayDriverBase::create_file_path(&value, depth);
-        check_path(port_base, params)?;
+    attributes: &Arc<parking_lot::Mutex<DriverAttributes>>,
+) {
+    port_base.set_octet_writer(ASYN_ND_ARRAY_DRIVER);
+    let p = *params;
+    let attrs = Arc::clone(attributes);
+    let reload = move |base: &mut PortDriverBase, _addr, _text: &[u8]| {
+        let _ = attrs.lock().read_file(base, &p);
+    };
+    port_base.set_write_octet_rule(params.attributes_file, Arc::new(reload.clone()));
+    port_base.set_write_octet_rule(params.attributes_macros, Arc::new(reload));
+    port_base.set_write_octet_rule(
+        params.file_path,
+        Arc::new(move |base: &mut PortDriverBase, _addr, text: &[u8]| {
+            if let Ok(false) = check_path(base, &p) {
+                let depth = base.get_int32_param(p.create_dir, 0).unwrap_or(0);
+                let _ = NDArrayDriverBase::create_file_path(&octet_text(text), depth);
+                let _ = check_path(base, &p);
+            }
+        }),
+    );
+}
+
+/// C++ `asynNDArrayDriver::setIntegerParam` (asynNDArrayDriver.cpp:636-663),
+/// which every store of `ADAcquire` or `NDNumQueuedArrays` reaches, whoever
+/// makes it. A stop clears `ADAcquireBusy` at once unless `ADWaitForPlugins`
+/// is set and arrays are still queued; it reads the live count, because the
+/// `NDNumQueuedArrays` parameter lags it (:633-635). The parameter is
+/// stored by the port's updater thread, which the drain branch waits on.
+pub(crate) fn acquire_busy_rules(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    queued: &Arc<QueuedArrayCounter>,
+) {
+    queued_count_updater(port_base, params.num_queued_arrays, queued);
+    let (acquire, busy, wait) = (params.acquire, params.acquire_busy, params.wait_for_plugins);
+    let queued = Arc::clone(queued);
+    port_base.set_int32_rule(
+        acquire,
+        Arc::new(move |base: &mut PortDriverBase, list, value| {
+            if value != 0 {
+                base.set_int32_param(busy, list, 1)
+            } else if base.get_int32_param(wait, list).unwrap_or(0) == 0 || queued.get() == 0 {
+                base.set_int32_param(busy, list, 0)
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    port_base.set_int32_rule(
+        params.num_queued_arrays,
+        Arc::new(move |base: &mut PortDriverBase, list, value| {
+            if value == 0 && base.get_int32_param(acquire, list).unwrap_or(0) == 0 {
+                base.set_int32_param(busy, list, 0)
+            } else {
+                Ok(())
+            }
+        }),
+    );
+}
+
+/// C's `<port>_updateQueuedArrayCount` thread (asynNDArrayDriver.cpp:782-797,
+/// created :1011-1021): on each change of the live count, store it as
+/// `NDNumQueuedArrays` and run the callbacks. Started once the port has a
+/// handle; it ends when the counter is dropped or the port stops.
+fn queued_count_updater(
+    port_base: &mut PortDriverBase,
+    num_queued_arrays: usize,
+    queued: &Arc<QueuedArrayCounter>,
+) {
+    let counter = Arc::downgrade(queued);
+    port_base.on_runtime(move |handle| {
+        let Some(queued) = counter.upgrade() else {
+            return;
+        };
+        let port = handle.port_name().to_string();
+        let trace = handle.trace().clone();
+        // Weak, so the updater never keeps its own port running.
+        let port_handle = handle.downgrade();
+        let spawned = std::thread::Builder::new()
+            .name(format!("{port}_updateQueuedArrayCount"))
+            .spawn(move || {
+                loop {
+                    std::thread::park();
+                    let Some(queued) = counter.upgrade() else {
+                        break;
+                    };
+                    let count = queued.get() as i32;
+                    drop(queued);
+                    let Some(handle) = port_handle.upgrade() else {
+                        break;
+                    };
+                    let update = ParamSetValue::new(num_queued_arrays, 0, ParamValue::Int32(count));
+                    if handle.set_params_and_notify_blocking(0, vec![update]).is_err() {
+                        break;
+                    }
+                }
+            });
+        match spawned {
+            Ok(thread) => queued.set_updater(thread.thread().clone()),
+            Err(_) => trace.print(
+                Some(&port),
+                None,
+                0,
+                asyn_rs::trace::TraceMask::ERROR,
+                format_args!(
+                    "asynNDArrayDriver::asynNDArrayDriver error creating updateQueuedArrayCount thread"
+                ),
+            ),
+        }
+    });
+}
+
+/// What C reaches through `pArray->pDriver`: the driver an array was
+/// allocated for. Its pool holds it weakly, so every array from that pool
+/// leads back to the driver's queued count, port and attribute set.
+pub struct ArrayOwner {
+    queued: Arc<QueuedArrayCounter>,
+    port: std::sync::OnceLock<asyn_rs::port_handle::WeakPortHandle>,
+    attributes: Arc<parking_lot::Mutex<DriverAttributes>>,
+    arrays: parking_lot::Mutex<Vec<Option<Arc<NDArray>>>>,
+}
+
+impl ArrayOwner {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queued: Arc::new(QueuedArrayCounter::new()),
+            port: std::sync::OnceLock::new(),
+            attributes: Arc::new(parking_lot::Mutex::new(DriverAttributes::new())),
+            arrays: parking_lot::Mutex::new(Vec::new()),
+        })
     }
-    port_base.call_param_callbacks(addr)?;
-    Ok(data.len())
+
+    /// Fill in the port handle once the port being built runs.
+    pub(crate) fn bind_port(self: &Arc<Self>, port_base: &mut PortDriverBase) {
+        let weak = Arc::downgrade(self);
+        port_base.on_runtime(move |handle| {
+            if let Some(owner) = weak.upgrade() {
+                let _ = owner.port.set(handle.downgrade());
+            }
+        });
+    }
+
+    /// C++ `queuedArrayCount_`.
+    pub fn queued(&self) -> &Arc<QueuedArrayCounter> {
+        &self.queued
+    }
+
+    /// The driver's port, `None` before it runs or once it has stopped.
+    pub fn port(&self) -> Option<asyn_rs::port_handle::PortHandle> {
+        self.port.get()?.upgrade()
+    }
+
+    /// The `NDAttributesFile` attribute set (C++ `pAttributeList`).
+    pub fn attributes(&self) -> &Arc<parking_lot::Mutex<DriverAttributes>> {
+        &self.attributes
+    }
+
+    /// C++ `pArrays[addr]` (asynNDArrayDriver.h:238): the driver's last
+    /// array at `addr`, which keeps its buffer charged; `pArrays[0]` is the
+    /// `preAllocateBuffers` template (asynNDArrayDriver.cpp:717-726).
+    /// Returns what the slot held.
+    pub fn store_array(&self, addr: usize, array: Option<Arc<NDArray>>) -> Option<Arc<NDArray>> {
+        let mut arrays = self.arrays.lock();
+        if arrays.len() <= addr {
+            arrays.resize(addr + 1, None);
+        }
+        std::mem::replace(&mut arrays[addr], array)
+    }
+
+    /// The array [`ArrayOwner::store_array`] last left at `addr`.
+    pub fn array(&self, addr: usize) -> Option<Arc<NDArray>> {
+        self.arrays.lock().get(addr).cloned().flatten()
+    }
+
+    /// C++ `getAttributes(pArray->pAttributeList)` from a driver's own task
+    /// (simDetector.cpp:828), which holds the driver lock: the set is
+    /// re-evaluated on the port's actor, where its `PARAM` values live, and
+    /// merged onto `array`. An empty set or a stopped port leaves it alone.
+    pub async fn get_attributes(&self, array: &mut NDArray) -> AsynResult<()> {
+        if self.attributes.lock().list.is_empty() {
+            return Ok(());
+        }
+        let Some(port) = self.port() else {
+            return Ok(());
+        };
+        let attributes = self.attributes.clone();
+        let fresh = Arc::new(parking_lot::Mutex::new(None));
+        let slot = fresh.clone();
+        let call = asyn_rs::request::DriverCall::new(move |driver| {
+            *slot.lock() = Some(attributes.lock().update(driver.base()));
+        });
+        port.submit_async(
+            asyn_rs::request::RequestOp::WithDriver(call),
+            asyn_rs::user::AsynUser::default(),
+        )
+        .await?;
+        if let Some(fresh) = fresh.lock().take() {
+            array.attributes.copy_from(&fresh);
+        }
+        Ok(())
+    }
+
+    /// C++ `getAttributes(pList)` from a plugin's `processCallbacks`, which
+    /// holds the port lock: the set re-evaluated on the port's actor, `None`
+    /// when it is empty or the port has stopped. `pending` are values the
+    /// plugin has set ahead of the call but not yet flushed; a `PARAM`
+    /// attribute reads them as C reads its own sets
+    /// ([`DriverAttributes::update_with`]). Blocks the caller, which must not
+    /// be the port's actor.
+    pub fn evaluate_attributes_blocking(
+        &self,
+        pending: Vec<PendingParam>,
+    ) -> Option<crate::attributes::NDAttributeList> {
+        if self.attributes.lock().list.is_empty() {
+            return None;
+        }
+        let port = self.port()?;
+        let attributes = self.attributes.clone();
+        let fresh = Arc::new(parking_lot::Mutex::new(None));
+        let slot = fresh.clone();
+        let call = asyn_rs::request::DriverCall::new(move |driver| {
+            let base = driver.base();
+            let mut attributes = attributes.lock();
+            let reads = attributes.param_reads(base, &pending);
+            *slot.lock() = Some(attributes.update_with(&reads, &pending));
+        });
+        let _ = port.submit_blocking(
+            asyn_rs::request::RequestOp::WithDriver(call),
+            asyn_rs::user::AsynUser::default(),
+        );
+        fresh.lock().take()
+    }
+
+    /// The store half of [`Self::evaluate_attributes_blocking`], for a
+    /// caller that evaluates later against what has been set by then. `None`
+    /// when the set is empty or the port has stopped.
+    pub fn param_reads_blocking(&self, pending: Vec<PendingParam>) -> Option<ParamReads> {
+        if self.attributes.lock().list.is_empty() {
+            return None;
+        }
+        let port = self.port()?;
+        let attributes = self.attributes.clone();
+        let taken = Arc::new(parking_lot::Mutex::new(None));
+        let slot = taken.clone();
+        let call = asyn_rs::request::DriverCall::new(move |driver| {
+            *slot.lock() = Some(attributes.lock().param_reads(driver.base(), &pending));
+        });
+        let _ = port.submit_blocking(
+            asyn_rs::request::RequestOp::WithDriver(call),
+            asyn_rs::user::AsynUser::default(),
+        );
+        taken.lock().take()
+    }
 }
 
 pub struct NDArrayDriverBase {
     pub port_base: PortDriverBase,
     pub params: NDArrayDriverParams,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub array_output: NDArrayOutput,
-    pub queued_counter: Arc<QueuedArrayCounter>,
-    /// Most recently prepared array (C++ `pArrays[0]`), used as the template
-    /// for `preAllocateBuffers`.
-    pub last_array: Option<Arc<NDArray>>,
-    /// The `NDAttributesFile` attribute set (C++ `pAttributeList`).
-    pub attributes: DriverAttributes,
+    pub owner: Arc<ArrayOwner>,
 }
 
 impl NDArrayDriverBase {
@@ -1057,8 +1399,8 @@ impl NDArrayDriverBase {
         // C takes `maxAddr` and `asynFlags` from the driver (asynNDArrayDriver.cpp:862-868).
         let mut port_base = PortDriverBase::new(port_name, max_addr, asyn_flags);
 
-        let params = NDArrayDriverParams::create(&mut port_base)?;
-        let pool = NDArrayPool::new(max_memory);
+        let (params, owner) = NDArrayDriverParams::create(&mut port_base)?;
+        let pool = DriverPool::for_driver(max_memory, &owner);
 
         init_read_only_params(&mut port_base, &params, &pool, port_name)?;
 
@@ -1067,15 +1409,12 @@ impl NDArrayDriverBase {
             params,
             pool,
             array_output: NDArrayOutput::new(),
-            queued_counter: Arc::new(QueuedArrayCounter::new()),
-            last_array: None,
-            attributes: DriverAttributes::new(),
+            owner,
         })
     }
 
     /// Connect a downstream channel-based receiver.
-    pub fn connect_downstream(&mut self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&mut self, sender: NDArraySender) {
         self.array_output.add(sender);
     }
 
@@ -1087,7 +1426,7 @@ impl NDArrayDriverBase {
     /// parameter. Driver layers route their `writeInt32` through this so the
     /// `POOL_*` parameters act on the pool instead of being dead.
     pub fn write_int32_pool(&mut self, param_index: usize, _value: i32) -> AsynResult<bool> {
-        let template = self.last_array.clone();
+        let template = self.owner.array(0);
         handle_pool_write_int32(
             &mut self.port_base,
             &self.params,
@@ -1109,7 +1448,7 @@ impl NDArrayDriverBase {
     ///
     /// This function does NOT publish the array — the caller is responsible
     /// for that in an async context. Returns `None` when callbacks are disabled.
-    pub fn prepare_array(&mut self, mut array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
+    pub fn prepare_array(&mut self, mut array: DriverArray) -> AsynResult<Option<PublishedArray>> {
         let counter = self
             .port_base
             .get_int32_param(self.params.array_counter, 0)?
@@ -1122,14 +1461,17 @@ impl NDArrayDriverBase {
         // merge the fresh values onto the outgoing array. Port of C++
         // `asynNDArrayDriver::doCallbacksGenericPointer` calling
         // `getAttributes(pArray->pAttributeList)` before the callback.
-        self.attributes.attach(&self.port_base, &mut array);
+        self.owner
+            .attributes
+            .lock()
+            .attach(&self.port_base, &mut array);
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
         write_array_params(&mut self.port_base, &self.params, &array)?;
+        let array = array.share();
 
-        // Record this as the template array for preAllocateBuffers.
-        self.last_array = Some(array.clone());
+        self.owner.store_array(0, Some(array.array().clone()));
 
         // Update pool stats
         self.port_base.set_float64_param(
@@ -1158,7 +1500,7 @@ impl NDArrayDriverBase {
             self.port_base.set_generic_pointer_param(
                 self.params.ndarray_data,
                 0,
-                array.clone() as Arc<dyn std::any::Any + Send + Sync>,
+                array.array().clone() as Arc<dyn std::any::Any + Send + Sync>,
             )?;
             Some(array)
         } else {
@@ -1293,15 +1635,9 @@ impl NDArrayDriverBase {
         Ok(())
     }
 
-    /// C++ `asynNDArrayDriver::writeOctet`; see `handle_write_octet`.
+    /// C++ `asynNDArrayDriver::writeOctet`, for an override to chain to.
     pub fn write_octet(&mut self, user: &AsynUser, data: &[u8]) -> AsynResult<usize> {
-        handle_write_octet(
-            &mut self.port_base,
-            &self.params,
-            &mut self.attributes,
-            user,
-            data,
-        )
+        self.port_base.write_octet(user, data)
     }
 
     /// See [`DriverAttributes::set_ca_client`].
@@ -1311,23 +1647,26 @@ impl NDArrayDriverBase {
         client: std::sync::Arc<epics_ca_rs::client::CaClient>,
         runtime: tokio::runtime::Handle,
     ) {
-        self.attributes.set_ca_client(client, runtime);
+        self.owner.attributes.lock().set_ca_client(client, runtime);
     }
 
     /// See [`DriverAttributes::read_file`].
     pub fn read_nd_attributes_file(&mut self) -> AsynResult<()> {
-        self.attributes.read_file(&mut self.port_base, &self.params)
+        self.owner
+            .attributes
+            .lock()
+            .read_file(&mut self.port_base, &self.params)
     }
 
     /// Access the driver's NDArray attribute list (populated by
     /// `read_nd_attributes_file`).
-    pub fn attributes(&self) -> &crate::attributes::NDAttributeList {
-        &self.attributes.list
+    pub fn attributes(&self) -> crate::attributes::NDAttributeList {
+        self.owner.attributes.lock().list.clone()
     }
 
     /// See [`DriverAttributes::update`].
     pub fn update_attributes(&mut self) -> crate::attributes::NDAttributeList {
-        self.attributes.update(&self.port_base)
+        self.owner.attributes.lock().update(&self.port_base)
     }
 }
 
@@ -1458,6 +1797,178 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_ndarray_driver_port_drives_acquire_busy() {
+        // C ADCSimDetector is an asynNDArrayDriver, not an ADDriver.
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let (acquire, busy, wait, queued) = (
+            drv.params.acquire,
+            drv.params.acquire_busy,
+            drv.params.wait_for_plugins,
+            drv.params.num_queued_arrays,
+        );
+        let read = |d: &NDArrayDriverBase| d.port_base.get_int32_param(busy, 0).unwrap();
+        drv.port_base.set_int32_param(acquire, 0, 1).unwrap();
+        assert_eq!(read(&drv), 1);
+        drv.port_base.set_int32_param(acquire, 0, 0).unwrap();
+        assert_eq!(read(&drv), 0);
+
+        drv.port_base.set_int32_param(wait, 0, 1).unwrap();
+        drv.port_base.set_int32_param(acquire, 0, 1).unwrap();
+        drv.owner.queued().increment();
+        drv.port_base.set_int32_param(acquire, 0, 0).unwrap();
+        assert_eq!(read(&drv), 1);
+        drv.owner.queued().decrement();
+        drv.port_base.set_int32_param(queued, 0, 0).unwrap();
+        assert_eq!(read(&drv), 0);
+    }
+
+    /// The updater stores the live count, so a stop under WaitForPlugins
+    /// clears AcquireBusy when the queue drains, with no driver writing
+    /// NDNumQueuedArrays.
+    #[test]
+    fn a_stop_with_arrays_queued_clears_acquire_busy_when_the_queue_drains() {
+        use asyn_rs::registry::PortRegistry;
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+
+        struct Port(NDArrayDriverBase);
+        impl asyn_rs::port::PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let drv = NDArrayDriverBase::new("NDQUEUEDUPD", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let p = drv.params;
+        let queued = drv.owner.queued().clone();
+        let claim = PortRegistry::new().claim("NDQUEUEDUPD").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, Port(drv), RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle().clone();
+        let store = |reason, value| {
+            handle
+                .set_params_and_notify_blocking(
+                    0,
+                    vec![ParamSetValue::new(reason, 0, ParamValue::Int32(value))],
+                )
+                .unwrap();
+        };
+        let read = |reason: usize| {
+            handle
+                .with_driver_blocking(move |d: &mut Port| {
+                    d.0.port_base.get_int32_param(reason, 0).unwrap()
+                })
+                .unwrap()
+        };
+        let settle = |reason: usize, want: i32| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while read(reason) != want && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            read(reason)
+        };
+
+        store(p.wait_for_plugins, 1);
+        store(p.acquire, 1);
+        queued.increment();
+        assert_eq!(settle(p.num_queued_arrays, 1), 1);
+        store(p.acquire, 0);
+        assert_eq!(read(p.acquire_busy), 1);
+
+        queued.decrement();
+        assert_eq!(settle(p.num_queued_arrays, 0), 0);
+        assert_eq!(read(p.acquire_busy), 0);
+    }
+
+    /// The updater must not hold the port up: dropping every handle stops the
+    /// actor, which drops the driver and so ends the updater.
+    #[test]
+    fn a_refused_alloc_reports_on_the_owning_port() {
+        use asyn_rs::registry::PortRegistry;
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+
+        struct Port(NDArrayDriverBase);
+        impl asyn_rs::port::PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let drv = NDArrayDriverBase::new("NDPOOLLIMIT", 1, 64, ASYN_CANBLOCK).unwrap();
+        let pool = drv.pool.clone();
+        let owner = drv.owner.clone();
+        let claim = PortRegistry::new().claim("NDPOOLLIMIT").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, Port(drv), RuntimeConfig::default()).unwrap();
+        let log = std::env::temp_dir().join(format!("pool-limit-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        runtime.port_handle().trace().set_trace_file(
+            Some("NDPOOLLIMIT"),
+            asyn_rs::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        assert!(owner.port().is_some());
+
+        let refused = pool.wrap(
+            vec![crate::ndarray::NDDimension::new(100)],
+            crate::ndarray::NDDataBuffer::U8(vec![0; 100]),
+        );
+        assert!(refused.is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains("NDArrayPool::alloc:: error: reached limit of 64 memory (1 buffers)"),
+            "{text}"
+        );
+        drop(runtime);
+    }
+
+    #[test]
+    fn dropping_every_handle_stops_an_ndarray_port() {
+        use asyn_rs::registry::PortRegistry;
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+
+        struct Port(NDArrayDriverBase);
+        impl asyn_rs::port::PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let drv = NDArrayDriverBase::new("NDQUEUEDDROP", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let counter = Arc::downgrade(drv.owner.queued());
+        let owner = Arc::downgrade(&drv.owner);
+        let claim = PortRegistry::new().claim("NDQUEUEDDROP").unwrap();
+        let (runtime, actor) =
+            create_port_runtime(&claim, Port(drv), RuntimeConfig::default()).unwrap();
+        // Wake the updater once so it has taken and released a handle.
+        counter.upgrade().unwrap().increment();
+        assert!(
+            owner.upgrade().unwrap().port().is_some(),
+            "the owner learns its port"
+        );
+        drop(runtime);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !actor.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            actor.is_finished(),
+            "the port actor outlived its last handle"
+        );
+        assert!(counter.upgrade().is_none(), "the driver outlived its port");
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
     fn test_empty_attributes_file_keeps_the_constructor_status() {
         // C `:327` returns asynSuccess on an empty NDAttributesFile without
         // touching NDAttributesStatus, so an IOC that never loads one reads
@@ -1499,7 +2010,7 @@ pub(crate) mod tests {
                 crate::ndarray::NDDataType::UInt8,
             )
             .unwrap();
-        drv.prepare_array(Arc::new(arr)).unwrap();
+        drv.prepare_array(arr).unwrap();
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.array_counter, 0)
@@ -1521,7 +2032,7 @@ pub(crate) mod tests {
                 crate::ndarray::NDDataType::UInt16,
             )
             .unwrap();
-        drv.prepare_array(Arc::new(arr)).unwrap();
+        drv.prepare_array(arr).unwrap();
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.array_size_x, 0)
@@ -1740,7 +2251,7 @@ pub(crate) mod tests {
             sec: 1234,
             nsec: 5678,
         };
-        drv.prepare_array(Arc::new(arr)).unwrap();
+        drv.prepare_array(arr).unwrap();
 
         assert_eq!(
             drv.port_base
@@ -1810,7 +2321,7 @@ pub(crate) mod tests {
             value: NDAttrValue::Int32(crate::color::NDBayerPattern::GRBG as i32),
             source_impl: None,
         });
-        drv.prepare_array(Arc::new(arr)).unwrap();
+        drv.prepare_array(arr).unwrap();
 
         assert_eq!(
             drv.port_base.get_string_param(drv.params.codec, 0).unwrap(),
@@ -1848,7 +2359,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let id = arr.unique_id;
-        let to_publish = drv.prepare_array(Arc::new(arr)).unwrap().unwrap();
+        let to_publish = drv.prepare_array(arr).unwrap().unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1900,14 +2411,15 @@ pub(crate) mod tests {
         assert!(drv.read_nd_attributes_file().is_err());
 
         assert_eq!(drv.attributes().len(), 3);
-        let gain = drv.attributes().get("Gain").unwrap();
+        let attributes = drv.attributes();
+        let gain = attributes.get("Gain").unwrap();
         assert!(matches!(gain.source, NDAttrSource::Param { .. }));
-        let comment = drv.attributes().get("Comment").unwrap();
+        let comment = attributes.get("Comment").unwrap();
         assert_eq!(comment.value, NDAttrValue::String("hello".into()));
         // C publishes the original XML `source` string verbatim, not a label.
         assert_eq!(comment.source.source_string(), "hello");
         assert_eq!(gain.source.source_string(), "GAIN");
-        let temp = drv.attributes().get("Temp").unwrap();
+        let temp = attributes.get("Temp").unwrap();
         assert!(matches!(temp.source, NDAttrSource::EpicsPV(_)));
         assert_eq!(temp.source.source_string(), "$(P)Temp");
         assert_eq!(
@@ -2214,7 +2726,9 @@ pub(crate) mod tests {
         // Register a function whose return value changes on each call.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         let c = counter.clone();
-        drv.attributes
+        drv.owner
+            .attributes()
+            .lock()
             .functions
             .register("tick", move |param: &str| {
                 let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -2269,12 +2783,16 @@ pub(crate) mod tests {
         // status it leaves behind is asserted by
         // `test_empty_attributes_file_keeps_the_constructor_status`.
         let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
-        drv.attributes.list.add(NDAttribute::new_static(
-            "Gone",
-            "",
-            NDAttrSource::Constant("1".into()),
-            NDAttrValue::Int32(1),
-        ));
+        drv.owner
+            .attributes()
+            .lock()
+            .list
+            .add(NDAttribute::new_static(
+                "Gone",
+                "",
+                NDAttrSource::Constant("1".into()),
+                NDAttrValue::Int32(1),
+            ));
         drv.read_nd_attributes_file().unwrap();
         assert_eq!(drv.attributes().len(), 0);
     }
@@ -2293,6 +2811,54 @@ pub(crate) mod tests {
                 .unwrap(),
             ATTR_STATUS_FILE_NOT_FOUND
         );
+    }
+
+    /// asynNDArrayDriver.cpp:544-546: the write closes with its own line.
+    #[test]
+    fn a_write_octet_closes_with_the_asyn_nd_array_driver_line() {
+        use asyn_rs::registry::PortRegistry;
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+
+        struct Port(NDArrayDriverBase);
+        impl asyn_rs::port::PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let drv = NDArrayDriverBase::new("NDOCTETLINE", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let file_name = drv.params.file_name;
+        let claim = PortRegistry::new().claim("NDOCTETLINE").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, Port(drv), RuntimeConfig::default()).unwrap();
+        let port = runtime.port_handle();
+        let log = std::env::temp_dir().join(format!("octet-line-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        port.trace().set_trace_file(
+            Some("NDOCTETLINE"),
+            asyn_rs::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        port.trace()
+            .set_trace_mask(Some("NDOCTETLINE"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        port.submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: b"img".to_vec(),
+            },
+            AsynUser::new(file_name),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "asynNDArrayDriver:writeOctet: function={file_name}, paramName=FILE_NAME, value=img"
+            )),
+            "{text}"
+        );
+        drop(runtime);
     }
 
     #[test]

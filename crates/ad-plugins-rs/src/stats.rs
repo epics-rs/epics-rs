@@ -2134,7 +2134,7 @@ impl NDPluginProcess for StatsProcessor {
 /// address 1 carrying the time-series point an NDPluginTimeSeries port reads.
 pub fn create_stats_runtime(
     claim: &asyn_rs::registry::PortClaim,
-    pool: Arc<NDArrayPool>,
+    max_memory: usize,
     queue_size: usize,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
@@ -2151,7 +2151,7 @@ pub fn create_stats_runtime(
 
     // C maxAddr 2 (NDPluginStats.cpp:777): addr 1 carries the TS point.
     let (plugin_handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        claim, processor, pool, queue_size, source, wiring, 2, threads,
+        claim, processor, max_memory, queue_size, source, wiring, 2, threads,
     );
 
     let stats_params = *params_handle.lock();
@@ -2185,7 +2185,7 @@ mod tests {
         // NDPluginStats.cpp's constructor sets only PluginType.
         let (handle, _stats, p, _jh) = create_stats_runtime(
             &asyn_rs::asyn_record::claim_port("STATS_INIT").unwrap(),
-            NDArrayPool::new(1_000_000),
+            1_000_000,
             1,
             "",
             Arc::new(WiringRegistry::new()),
@@ -3226,7 +3226,7 @@ mod tests {
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, stats, _params, _jh) = create_stats_runtime(
             &asyn_rs::asyn_record::claim_port("STATS_RT").unwrap(),
-            pool,
+            pool.max_memory(),
             10,
             "",
             wiring,
@@ -3259,7 +3259,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(Arc::new(arr)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&arr)
+                    .unwrap(),
+            ),
+        );
 
         // Wait on the observable itself — the stats land when the data thread
         // processes the array; a fixed sleep is a race on a loaded machine.

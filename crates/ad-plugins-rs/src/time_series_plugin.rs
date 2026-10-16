@@ -34,7 +34,8 @@ use std::time::Instant;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    ArrayCallbacks, NDPluginProcess, ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict,
+    ArrayCallbacks, NDPluginProcess, ParamUpdate, PluginAttributes, ProcessResult, WriteOutcome,
+    WriteVerdict,
 };
 use ad_core_rs::timestamp::EpicsTimestamp;
 use asyn_rs::param::ParamType;
@@ -180,12 +181,23 @@ fn coalesce_updates(updates: Vec<ParamUpdate>) -> Vec<ParamUpdate> {
 /// Standalone `NDPluginTimeSeries` processor.
 pub struct TimeSeriesProcessor {
     state: Mutex<TimeSeriesState>,
-    /// The port's pool, which C's posts allocate from on both the frame and
-    /// the write path.
-    pool: Arc<NDArrayPool>,
     /// The runtime's NDArrayCallbacks; the posts and the copy, allocation and
     /// uniqueId they take happen only while it is set (C :341-385).
     array_callbacks: ArrayCallbacks,
+    attributes: Option<PluginAttributes>,
+}
+
+/// C `getAttributes(pArray->pAttributeList)` on every post
+/// (NDPluginTimeSeries.cpp:364, :379).
+fn with_attributes(
+    posts: &mut [(usize, Arc<NDArray>)],
+    attributes: &ad_core_rs::attributes::NDAttributeList,
+) {
+    for (_, post) in posts {
+        if let Some(post) = Arc::get_mut(post) {
+            post.attributes.copy_from(attributes);
+        }
+    }
 }
 
 /// Every field C's `NDPluginTimeSeries` mutates from a frame or a param write.
@@ -239,11 +251,11 @@ struct TimeSeriesState {
 impl TimeSeriesProcessor {
     /// Create a processor for `max_signals` signals (clamped to at least 1, per C
     /// `if (maxSignals < 1) maxSignals = 1`).
-    pub fn new(max_signals: usize, pool: Arc<NDArrayPool>) -> Self {
+    pub fn new(max_signals: usize) -> Self {
         Self {
             state: Mutex::new(TimeSeriesState::new(max_signals)),
-            pool,
             array_callbacks: ArrayCallbacks::new(true),
+            attributes: None,
         }
     }
 }
@@ -344,12 +356,11 @@ impl TimeSeriesState {
     fn do_time_series_callbacks(
         &mut self,
         array_callbacks: &ArrayCallbacks,
-        pool: &NDArrayPool,
         posts: &mut Vec<(usize, Arc<NDArray>)>,
     ) -> Vec<ParamUpdate> {
         let updates = self.time_series_waveforms();
         if array_callbacks.get() {
-            self.post_time_series_arrays(pool, posts);
+            self.post_time_series_arrays(posts);
         }
         updates
     }
@@ -357,12 +368,10 @@ impl TimeSeriesState {
     /// C :341-385: the whole series as a 2-D `[numTimePoints, numSignals]`
     /// array at `addr == numSignals_`, then each signal's row as a 1-D array at
     /// `addr == signal`. Fixed mode copies the buffer as is; Circular mode
-    /// rotates it so the oldest point is first.
-    fn post_time_series_arrays(
-        &mut self,
-        pool: &NDArrayPool,
-        posts: &mut Vec<(usize, Arc<NDArray>)>,
-    ) {
+    /// rotates it so the oldest point is first. The posts are built outside
+    /// any pool; publishing copies them into C's `pNDArrayPool`, the last
+    /// frame's pool (NDPluginDriver.cpp:419), on the frame and write path alike.
+    fn post_time_series_arrays(&mut self, posts: &mut Vec<(usize, Arc<NDArray>)>) {
         let ntp = self.num_time_points;
         let ns = self.num_signals;
         let cur = self.current_time_point;
@@ -381,19 +390,20 @@ impl TimeSeriesState {
         let time_stamp = EpicsTimestamp::now().as_f64();
         let epics_ts = self.epics_ts;
         let data_type = self.data_type;
-        let make = |dims: Vec<NDDimension>, values: &[f64]| -> Option<Arc<NDArray>> {
-            let mut arr = pool.alloc(dims, data_type).ok()?;
+        let make = |dims: Vec<NDDimension>, values: &[f64]| -> Arc<NDArray> {
+            let mut arr = NDArray::new(dims, data_type);
             arr.data.fill_from_f64(values);
             arr.unique_id = unique_id;
             arr.time_stamp = time_stamp;
             arr.timestamp = epics_ts;
-            Some(Arc::new(arr))
+            Arc::new(arr)
         };
-        posts.extend(
-            make(vec![NDDimension::new(ntp), NDDimension::new(ns)], &series).map(|a| (ns, a)),
-        );
+        posts.push((
+            ns,
+            make(vec![NDDimension::new(ntp), NDDimension::new(ns)], &series),
+        ));
         for (signal, row) in series.chunks(ntp).enumerate() {
-            posts.extend(make(vec![NDDimension::new(ntp)], row).map(|a| (signal, a)));
+            posts.push((signal, make(vec![NDDimension::new(ntp)], row)));
         }
     }
 
@@ -448,7 +458,6 @@ impl TimeSeriesState {
         &mut self,
         array: &NDArray,
         array_callbacks: &ArrayCallbacks,
-        pool: &NDArrayPool,
         posts: &mut Vec<(usize, Arc<NDArray>)>,
     ) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
@@ -495,7 +504,7 @@ impl TimeSeriesState {
                         // C setIntegerParam(P_TSAcquire, 0); doTimeSeriesCallbacks(); break.
                         self.acquiring = false;
                         updates.push(ParamUpdate::int32(self.p.ts_acquire, 0));
-                        updates.extend(self.do_time_series_callbacks(array_callbacks, pool, posts));
+                        updates.extend(self.do_time_series_callbacks(array_callbacks, posts));
                         break;
                     }
                     AcquireMode::Circular => {
@@ -529,7 +538,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
         _addr: i32,
         value: i32,
         verdict: WriteVerdict<i32>,
-        _params: &PortDriverBase,
+        params: &PortDriverBase,
     ) -> WriteOutcome<i32> {
         let verdict = match verdict {
             WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
@@ -561,13 +570,21 @@ impl NDPluginProcess for TimeSeriesProcessor {
             if value != 0 {
                 state.acquire_reset()
             } else {
-                state.do_time_series_callbacks(&self.array_callbacks, &self.pool, &mut posts)
+                state.do_time_series_callbacks(&self.array_callbacks, &mut posts)
             }
         } else if reason == p.ts_read {
-            state.do_time_series_callbacks(&self.array_callbacks, &self.pool, &mut posts)
+            state.do_time_series_callbacks(&self.array_callbacks, &mut posts)
         } else {
             return verdict.into();
         };
+        if let Some(fresh) = self
+            .attributes
+            .as_ref()
+            .filter(|_| !posts.is_empty())
+            .and_then(|a| a.evaluate_on(params))
+        {
+            with_attributes(&mut posts, &fresh);
+        }
         WriteOutcome::from(verdict)
             .set_updates(updates)
             .post_addressed(posts)
@@ -623,14 +640,20 @@ impl NDPluginProcess for TimeSeriesProcessor {
 
         // C: only accumulate while P_TSAcquire is set.
         if state.acquiring {
-            updates.extend(state.add_to_time_series(
-                array,
-                &self.array_callbacks,
-                &self.pool,
-                &mut posts,
-            ));
+            updates.extend(state.add_to_time_series(array, &self.array_callbacks, &mut posts));
         }
 
+        // Off the state lock: the evaluation waits on the actor, whose
+        // writes take it.
+        drop(state);
+        if let Some(fresh) = self
+            .attributes
+            .as_ref()
+            .filter(|_| !posts.is_empty())
+            .and_then(|a| a.evaluate(&[]))
+        {
+            with_attributes(&mut posts, &fresh);
+        }
         let mut result = ProcessResult::sink(coalesce_updates(updates));
         result.addressed = posts;
         result
@@ -638,6 +661,10 @@ impl NDPluginProcess for TimeSeriesProcessor {
 
     fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
         self.array_callbacks = array_callbacks;
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -701,10 +728,46 @@ mod tests {
     use super::*;
     use ad_core_rs::plugin::runtime::SideParam;
 
+    /// C `getAttributes` on each post (NDPluginTimeSeries.cpp:364, :379),
+    /// whether a TSRead write or a filled series made it.
+    #[test]
+    fn every_post_carries_the_plugin_attributes() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Points" type="PARAM" source="TS_NUM_POINTS" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TS_ATTRS", TimeSeriesProcessor::new(1), xml);
+        let port = handle.port_runtime().port_handle();
+        let reason = |name: &str| {
+            port.drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason
+        };
+        let write = |reason: usize, v: i32| {
+            port.write_int32_blocking(reason, 0, v).unwrap();
+            assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        };
+        write(reason("TS_NUM_POINTS"), 2);
+        write(reason("TS_ACQUIRE"), 1);
+        let frame = NDArray::with_data(vec![NDDimension::new(1)], NDDataBuffer::F64(vec![1.0]));
+        publish(&handle, &frame);
+        write(reason("TS_READ"), 1);
+        publish(&handle, &frame);
+        for _ in 0..2 {
+            let post = rx.blocking_recv().unwrap();
+            assert_eq!(
+                post.attributes.get("Points").map(|a| a.value.clone()),
+                Some(NDAttrValue::Int32(2))
+            );
+        }
+    }
+
     /// `"%s: status=%d, function=%d, value=%d"` (NDPluginTimeSeries.cpp:481).
     #[test]
     fn a_refused_base_write_carries_c_error_message() {
-        let proc = TimeSeriesProcessor::new(1, NDArrayPool::new(0));
+        let proc = TimeSeriesProcessor::new(1);
         let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -786,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_register_params_seeds_only_what_the_c_constructor_sets() {
-        let mut proc = TimeSeriesProcessor::new(2, NDArrayPool::new(0));
+        let mut proc = TimeSeriesProcessor::new(2);
         let mut base = PortDriverBase::new("TS_INIT", 3, PortFlags::default());
         proc.register_params(&mut base).unwrap();
         let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
@@ -804,7 +867,7 @@ mod tests {
     // ---- process_array end-to-end ----
 
     fn make_proc(max_signals: usize, port: &str) -> TimeSeriesProcessor {
-        let mut proc = TimeSeriesProcessor::new(max_signals, NDArrayPool::new(0));
+        let mut proc = TimeSeriesProcessor::new(max_signals);
         let mut base = PortDriverBase::new(port, max_signals + 1, PortFlags::default());
         proc.register_params(&mut base).unwrap();
         proc

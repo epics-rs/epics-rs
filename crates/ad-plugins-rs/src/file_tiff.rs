@@ -3,14 +3,14 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
 use parking_lot::Mutex;
 
 // TIFF tag numbers. 256-339 are the baseline tags C sets through TIFFSetField
@@ -158,11 +158,16 @@ fn attribute_tag_string(attr: &NDAttribute) -> String {
 /// TIFF file writer using the `tiff` crate for proper encoding/decoding.
 pub struct TiffWriter {
     current_path: Option<PathBuf>,
+    /// The plugin's own set, C `getAttributes` in `openFile` and `readFile`.
+    plugin_attributes: NDAttributeList,
 }
 
 impl TiffWriter {
     pub fn new() -> Self {
-        Self { current_path: None }
+        Self {
+            current_path: None,
+            plugin_attributes: NDAttributeList::new(),
+        }
     }
 
     /// C's `openFile` structure switch (NDFileTIFF.cpp:180-224). Note the two
@@ -288,7 +293,12 @@ impl TiffWriter {
     /// YResolution / ResolutionUnit, which C never sets. The tag set below is
     /// exactly C's `TIFFSetField` calls plus the baseline structural tags libtiff
     /// itself writes (Compression, StripOffsets, StripByteCounts).
-    fn encode(array: &NDArray, layout: &TiffLayout) -> ADResult<Vec<u8>> {
+    /// `attributes` is C's `pFileAttributes`, every tag below reads it.
+    fn encode(
+        array: &NDArray,
+        attributes: &NDAttributeList,
+        layout: &TiffLayout,
+    ) -> ADResult<Vec<u8>> {
         let raw = array.data.as_u8_slice();
         let (sample_format, bits_per_sample) = Self::sample_format_and_bits(array.data.data_type());
         let bytes_per_sample = usize::from(bits_per_sample) / 8;
@@ -337,20 +347,18 @@ impl TiffWriter {
         ];
 
         // Standard tags derived from well-known attributes (NDFileTIFF.cpp:244-267).
-        let model = array
-            .attributes
+        let model = attributes
             .get("Model")
             .map(|a| a.value.as_string())
             .unwrap_or_else(|| "Unknown".to_string());
-        let make = array
-            .attributes
+        let make = attributes
             .get("Manufacturer")
             .map(|a| a.value.as_string())
             .unwrap_or_else(|| "Unknown".to_string());
         entries.push(IfdEntry::ascii(TAG_MODEL, &model));
         entries.push(IfdEntry::ascii(TAG_MAKE, &make));
         entries.push(IfdEntry::ascii(TAG_SOFTWARE, "EPICS areaDetector"));
-        if let Some(desc) = array.attributes.get("TIFFImageDescription") {
+        if let Some(desc) = attributes.get("TIFFImageDescription") {
             entries.push(IfdEntry::ascii(
                 TAG_IMAGE_DESCRIPTION,
                 &desc.value.as_string(),
@@ -364,7 +372,7 @@ impl TiffWriter {
         entries.push(IfdEntry::long(TIFFTAG_EPICSTSNSEC, &[array.timestamp.nsec]));
 
         // NDArray attributes as ASCII tags from 65010 (:277-355).
-        for (i, attr) in array.attributes.iter().enumerate() {
+        for (i, attr) in attributes.iter().enumerate() {
             let Some(tag) = TIFFTAG_FIRST_ATTRIBUTE.checked_add(i as u16) else {
                 break; // C stops at TIFFTAG_LAST_ATTRIBUTE (65535).
             };
@@ -427,7 +435,11 @@ impl NDFileWriter for TiffWriter {
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
         let layout = Self::layout(array)?;
-        let bytes = Self::encode(array, &layout)?;
+        // C `openFile`: the plugin's set, then the frame's on top
+        // (NDFileTIFF.cpp:240-242).
+        let mut attributes = self.plugin_attributes.clone();
+        attributes.copy_from(&array.attributes);
+        let bytes = Self::encode(array, &attributes, &layout)?;
         std::fs::write(path, bytes)?;
         Ok(())
     }
@@ -438,7 +450,7 @@ impl NDFileWriter for TiffWriter {
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
         let bytes = std::fs::read(path)?;
-        decode(&bytes)
+        decode(&bytes, self.plugin_attributes.clone())
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -448,6 +460,10 @@ impl NDFileWriter for TiffWriter {
 
     fn supports_multiple_arrays(&self) -> bool {
         false
+    }
+
+    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
+        self.plugin_attributes = attributes;
     }
 }
 
@@ -460,7 +476,9 @@ impl NDFileWriter for TiffWriter {
 /// even when written from an RGB2 array, because the strips are read in index
 /// order and that order is plane R, plane G, plane B. Anything else is an error.
 /// Strips are concatenated in index order into the array buffer (:513-524).
-fn decode(bytes: &[u8]) -> ADResult<NDArray> {
+/// The image starts from `attributes`, the plugin's set C `readFile` gets
+/// ahead of ColorMode (NDFileTIFF.cpp:540-543).
+fn decode(bytes: &[u8], attributes: NDAttributeList) -> ADResult<NDArray> {
     let err = |m: &str| ADError::UnsupportedConversion(format!("TIFF decode error: {m}"));
 
     let read_u16 = |off: usize| -> ADResult<u16> {
@@ -589,6 +607,7 @@ fn decode(bytes: &[u8]) -> ADResult<NDArray> {
     let mut array = NDArray::new(dims, data_type);
     array.data = crate::codec::buffer_from_bytes(&raw, data_type)
         .ok_or_else(|| err("strip data is not a whole number of samples"))?;
+    array.attributes = attributes;
     TiffWriter::attach_color_mode(&mut array, color_mode);
     Ok(array)
 }
@@ -596,12 +615,14 @@ fn decode(bytes: &[u8]) -> ADResult<NDArray> {
 /// TIFF file processor wrapping `FilePluginController<TiffWriter>`.
 pub struct TiffFileProcessor {
     pub ctrl: Mutex<FilePluginController<TiffWriter>>,
+    attributes: Option<PluginAttributes>,
 }
 
 impl TiffFileProcessor {
     pub fn new() -> Self {
         Self {
             ctrl: Mutex::new(FilePluginController::new(TiffWriter::new())),
+            attributes: None,
         }
     }
 }
@@ -626,9 +647,12 @@ impl NDPluginProcess for TiffFileProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        self.ctrl.lock().write_int32(reason, value, verdict)
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads_on(params));
+        let mut ctrl = self.ctrl.lock();
+        ctrl.set_attribute_reads(attributes);
+        ctrl.write_int32(reason, value, verdict)
     }
 
     /// C NDPluginFile::writeOctet: the setting is stored inside the write.
@@ -643,7 +667,16 @@ impl NDPluginProcess for TiffFileProcessor {
         self.ctrl.lock().write_octet(reason, verdict)
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Read before the controller lock: the read waits on the actor,
+        // which takes that lock in its writes.
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads());
+        let mut ctrl = self.ctrl.lock();
+        ctrl.set_attribute_reads(attributes);
+        ctrl.process_array(array)
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -687,6 +720,151 @@ mod tests {
             prefix,
             n
         ))
+    }
+
+    /// C `openFile` reads Model, Manufacturer and the 65010 tags from
+    /// `pFileAttributes`: the plugin's own set with the frame's on top
+    /// (NDFileTIFF.cpp:240-242).
+    #[test]
+    fn the_file_carries_the_plugin_attributes_under_the_frame() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="Model" type="CONST" source="PluginModel"/>
+            <Attribute name="Manufacturer" type="CONST" source="PluginMake"/>
+            <Attribute name="ColorMode" type="CONST" source="5" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_ATTRS", TiffFileProcessor::new(), xml);
+        let path = temp_path("plugin_attrs");
+        auto_save_to(&handle, &path);
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "Manufacturer",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("FrameMake".into()),
+        ));
+        publish(&handle, &arr);
+        wait_saved(&handle, 1);
+        let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let tag = |d: &mut Decoder<std::fs::File>, t| d.get_tag(t).unwrap().into_string().unwrap();
+        assert_eq!(tag(&mut decoder, Tag::Model), "PluginModel");
+        assert_eq!(tag(&mut decoder, Tag::Make), "FrameMake");
+
+        // C `readFile` gets the set onto the image, then adds ColorMode
+        // (NDFileTIFF.cpp:540-543); `readFileBase`'s `endProcessCallbacks`
+        // gets the set again, over it (NDPluginFile.cpp:193).
+        let port = handle.port_runtime().port_handle();
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 1)
+            .unwrap();
+        let reason = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("READ_FILE", 0))
+            .unwrap()
+            .reason;
+        port.write_int32_blocking(reason, 0, 1).unwrap();
+        let image = rx.blocking_recv().unwrap();
+        let value = |name: &str| image.attributes.get(name).map(|a| a.value.clone());
+        assert_eq!(
+            value("Model"),
+            Some(NDAttrValue::String("PluginModel".into()))
+        );
+        assert_eq!(value("ColorMode"), Some(NDAttrValue::String("5".into())));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C `openFile`'s `getAttributes` runs after `createFileName` set
+    /// FullFileName and moved FileNumber past it (NDPluginFile.cpp:43-52).
+    #[test]
+    fn the_file_attributes_read_the_name_being_written() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="Model" type="PARAM" source="FULL_FILE_NAME" datatype="STRING"/>
+            <Attribute name="Number" type="PARAM" source="FILE_NUMBER" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, _rx, _jh) = with_attributes_file("TIFF_NAME", TiffFileProcessor::new(), xml);
+        let path = temp_path("name_being_written");
+        auto_save_to(&handle, &path);
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        port.submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: b"%s%s_%d".to_vec(),
+            },
+            asyn_rs::user::AsynUser::new(p.file_template),
+        )
+        .unwrap();
+        port.write_int32_blocking(p.file_number, 0, 3).unwrap();
+        port.write_int32_blocking(p.auto_increment, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        let written = format!("{}_3", path.display());
+        let mut decoder = Decoder::new(std::fs::File::open(&written).unwrap()).unwrap();
+        let model = decoder.get_tag(Tag::Model).unwrap().into_string().unwrap();
+        let number = (65010..65020)
+            .filter_map(|t| decoder.get_tag(Tag::Unknown(t)).ok())
+            .filter_map(|v| v.into_string().ok())
+            .find(|v| v.starts_with("Number:"));
+        std::fs::remove_file(&written).ok();
+        assert_eq!(model, written);
+        assert_eq!(number.as_deref(), Some("Number:4"));
+    }
+
+    /// C `readFileBase` counts the image it read and gets the set onto it
+    /// after that (NDPluginFile.cpp:187-193).
+    #[test]
+    fn a_read_image_gets_the_set_after_it_is_counted() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_READ_COUNT", TiffFileProcessor::new(), xml);
+        let path = temp_path("read_count");
+        auto_save_to(&handle, &path);
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        let port = handle.port_runtime().port_handle();
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 1)
+            .unwrap();
+        let reason = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("READ_FILE", 0))
+            .unwrap()
+            .reason;
+        port.write_int32_blocking(reason, 0, 1).unwrap();
+        let image = rx.blocking_recv().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            image.attributes.get("Counter").map(|a| a.value.clone()),
+            Some(NDAttrValue::Int32(2))
+        );
+    }
+
+    /// A setting write while a file write holds the writer returns at once:
+    /// staging the plugin's attribute set must not take the writer lock.
+    #[test]
+    fn a_setting_write_during_a_busy_write_returns_at_once() {
+        let mut base = PortDriverBase::new("TIFFBUSY", 1, PortFlags::default());
+        let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
+        let mut proc = TiffFileProcessor::new();
+        proc.register_params(&mut base).unwrap();
+        let auto_increment = base.find_param("AUTO_INCREMENT").unwrap();
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        assert!(
+            crate::test_util::returns_while_busy(&writer, || {
+                proc.validate_int32(auto_increment, 0, 1, WriteVerdict::Accept(1), &base);
+            }),
+            "the setting write waited for the file write"
+        );
     }
 
     /// R8-75: a 3-D array whose ColorMode attribute is absent is an error in C.

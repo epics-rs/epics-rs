@@ -195,7 +195,7 @@ fn resolve_axis(cfg: &ROIDimConfig, dim_size: usize) -> (usize, usize, usize) {
 /// offset/size/binning/reverse per dimension (`NDPluginROI.cpp:166-175`).
 ///
 /// The pixel math is NOT open-coded here — it is
-/// [`ad_core_rs::convert::convert_dims`], the single owner of C's
+/// [`ad_core_rs::convert::convert_dims_into`], the single owner of C's
 /// `convertDim` semantics (bin sums accumulate in the OUTPUT type and wrap
 /// modulo its width; casts are C casts, never clamped/saturated).
 ///
@@ -625,7 +625,7 @@ impl NDPluginProcess for ROIProcessor {
 /// Create an ROI plugin runtime, returning the handle and param reasons.
 pub fn create_roi_runtime(
     claim: &asyn_rs::registry::PortClaim,
-    pool: Arc<NDArrayPool>,
+    max_memory: usize,
     queue_size: usize,
     source: impl Into<ArraySource>,
     wiring: Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
@@ -637,7 +637,7 @@ pub fn create_roi_runtime(
 ) {
     let processor = ROIProcessor::new(ROIConfig::default());
     let (handle, jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        claim, processor, pool, queue_size, source, wiring, threads,
+        claim, processor, max_memory, queue_size, source, wiring, threads,
     );
     // Recreate param layout on a scratch PortDriverBase to get matching reasons.
     let params = {
@@ -737,7 +737,7 @@ mod tests {
         // NDPluginROI.cpp's constructor sets only PluginType.
         let (handle, p, _jh) = create_roi_runtime(
             &asyn_rs::asyn_record::claim_port("ROI_INIT").unwrap(),
-            NDArrayPool::new(1_000_000),
+            1_000_000,
             1,
             "",
             Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),

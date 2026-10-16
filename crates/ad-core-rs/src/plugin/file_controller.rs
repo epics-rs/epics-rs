@@ -8,7 +8,8 @@ use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataType, NDDimension};
 
 use super::file_base::{FileIo, NDFileMode, NDFileWriter, NDPluginFileBase, read_file_base};
-use super::runtime::{ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict};
+use super::runtime::{AttributeReads, ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict};
+use crate::driver::ndarray_driver::PendingParam;
 use asyn_rs::trace::TraceMask;
 
 /// Param indices for file plugin control (looked up once at registration time).
@@ -81,9 +82,29 @@ pub struct FilePluginController<W: NDFileWriter> {
     /// plugin must count saved frames, not every callback — the runtime bumps
     /// ArrayCounter per callback, so the controller overrides it with this.
     saved_frames: i32,
+    /// See [`Self::set_attribute_reads`].
+    attribute_reads: Option<AttributeReads>,
 }
 
 impl<W: NDFileWriter> FilePluginController<W> {
+    /// Stage the plugin's attribute reads for the writer calls that follow,
+    /// `None` being the empty set. Each call evaluates them with the file
+    /// name and number C has set by its `openFile` (NDPluginFile.cpp:43-52),
+    /// and the writer gets the set inside the I/O window, so a setting write
+    /// never waits on the writer lock.
+    pub fn set_attribute_reads(&mut self, reads: Option<AttributeReads>) {
+        self.attribute_reads = reads;
+    }
+
+    /// The sets C has made by the time the writer runs that the store does
+    /// not have yet: `createFileName`'s FullFileName and FileNumber.
+    fn file_sets(&self) -> Vec<PendingParam> {
+        let mut updates = Vec::new();
+        self.push_file_number_update(&mut updates);
+        self.push_full_file_name_update(&mut updates);
+        updates.iter().map(ParamUpdate::stored).collect()
+    }
+
     pub fn new(writer: W) -> Self {
         Self {
             file_base: NDPluginFileBase::new(),
@@ -99,6 +120,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
             stream_data_type: None,
             port_name: String::new(),
             saved_frames: 0,
+            attribute_reads: None,
         }
     }
 
@@ -582,8 +604,18 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileIo for PortIo<'_
     }
 
     fn io<R>(&mut self, f: impl FnOnce(&mut dyn NDFileWriter) -> R) -> R {
-        let writer = Arc::clone(&self.0.controller().writer);
-        self.0.unlocked(|| f(&mut *writer.lock()))
+        let c = self.0.controller();
+        let writer = Arc::clone(&c.writer);
+        let attributes = c
+            .attribute_reads
+            .as_ref()
+            .map(|reads| reads.evaluate(&c.file_sets()))
+            .unwrap_or_default();
+        self.0.unlocked(|| {
+            let mut writer = writer.lock();
+            writer.set_plugin_attributes(attributes);
+            f(&mut *writer)
+        })
     }
 }
 

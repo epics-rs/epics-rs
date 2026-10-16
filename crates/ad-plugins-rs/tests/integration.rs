@@ -47,7 +47,7 @@ fn test_driver_to_stats_pipeline() {
     let wiring = Arc::new(WiringRegistry::new());
     let (stats_handle, stats_data, _params, _jh) = create_stats_runtime(
         &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
-        pool.clone(),
+        pool.max_memory(),
         10,
         "SIM1",
         wiring,
@@ -84,7 +84,7 @@ fn test_driver_to_stats_pipeline() {
         }
     }
 
-    let to_publish = driver.prepare_array(Arc::new(arr)).unwrap().unwrap();
+    let to_publish = driver.prepare_array(arr).unwrap().unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -106,7 +106,7 @@ fn test_driver_to_std_arrays_pipeline() {
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) = create_std_arrays_runtime(
         &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
-        pool.clone(),
+        pool.max_memory(),
         "SIM1",
         wiring,
         ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -137,7 +137,7 @@ fn test_driver_to_std_arrays_pipeline() {
         .unwrap();
 
     let id = arr.unique_id;
-    let to_publish = driver.prepare_array(Arc::new(arr)).unwrap().unwrap();
+    let to_publish = driver.prepare_array(arr).unwrap().unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -230,7 +230,7 @@ fn test_rewire_ndarray_port_at_runtime() {
     let (handle, _jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
         proc,
-        pool,
+        pool.max_memory(),
         10,
         "SIM1",
         wiring.clone(),
@@ -251,7 +251,13 @@ fn test_rewire_ndarray_port_at_runtime() {
     // Send array from SIM1
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.unique_id = 100;
-    rt.block_on(sim_publisher.publish(Arc::new(arr)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive array from SIM1", || {
         *last_id.lock() == 100
     });
@@ -274,7 +280,13 @@ fn test_rewire_ndarray_port_at_runtime() {
     // STATS1's sender and delivery is impossible — no wait needed.
     let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr2.unique_id = 200;
-    rt.block_on(sim_publisher.publish(Arc::new(arr2)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr2)
+                .unwrap(),
+        ),
+    );
     assert_eq!(
         *last_id.lock(),
         100,
@@ -284,7 +296,13 @@ fn test_rewire_ndarray_port_at_runtime() {
     // Send array from ROI1 — should reach STATS1
     let mut arr3 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr3.unique_id = 300;
-    rt.block_on(roi_publisher.publish(Arc::new(arr3)));
+    rt.block_on(
+        roi_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr3)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive from ROI1 after rewire", || {
         *last_id.lock() == 300
     });
@@ -332,7 +350,7 @@ fn test_rewire_through_real_roi_plugin() {
     let (roi_handle, _roi_jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("ROI1").unwrap(),
         ROIProcessor::new(roi_config),
-        pool.clone(),
+        pool.max_memory(),
         10,
         "SIM1",
         wiring.clone(),
@@ -378,7 +396,7 @@ fn test_rewire_through_real_roi_plugin() {
     let (stats_handle, _stats_jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
         proc,
-        pool.clone(),
+        pool.max_memory(),
         10,
         "SIM1",
         wiring.clone(),
@@ -403,7 +421,13 @@ fn test_rewire_through_real_roi_plugin() {
         NDDataType::UInt8,
     );
     arr.unique_id = 100;
-    rt.block_on(sim_publisher.publish(Arc::new(arr)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to get the array from SIM1", || {
         *last_id.lock() == 100
     });
@@ -429,7 +453,13 @@ fn test_rewire_through_real_roi_plugin() {
         NDDataType::UInt8,
     );
     arr2.unique_id = 200;
-    rt.block_on(sim_publisher.publish(Arc::new(arr2)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr2)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive the new array through ROI1", || {
         *last_id.lock() != 100
     });
@@ -456,7 +486,7 @@ fn test_roi_param_change_enables_output() {
     // Create ROI1 with DEFAULT config (size=0) — like the real IOC
     let (roi_handle, roi_params, _roi_jh) = ad_plugins_rs::roi::create_roi_runtime(
         &asyn_rs::asyn_record::claim_port("ROI1").unwrap(),
-        pool.clone(),
+        pool.max_memory(),
         10,
         "SIM1",
         wiring.clone(),
@@ -501,7 +531,7 @@ fn test_roi_param_change_enables_output() {
     let (stats_handle, _jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
         proc,
-        pool.clone(),
+        pool.max_memory(),
         10,
         "ROI1",
         wiring.clone(),
@@ -526,7 +556,13 @@ fn test_roi_param_change_enables_output() {
         NDDataType::UInt8,
     );
     arr.unique_id = 100;
-    rt.block_on(sim_publisher.publish(Arc::new(arr)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr)
+                .unwrap(),
+        ),
+    );
     // ROI size=0 clamps to a 1-pixel ROI (C++ MAX(size,1)) and still emits.
     wait_until("STATS1 to receive the 1-pixel ROI output", || {
         *last_id.lock() == 100
@@ -548,7 +584,13 @@ fn test_roi_param_change_enables_output() {
         NDDataType::UInt8,
     );
     arr2.unique_id = 200;
-    rt.block_on(sim_publisher.publish(Arc::new(arr2)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr2)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive after ROI size set to 8x8", || {
         *last_id.lock() == 200
     });
@@ -799,7 +841,7 @@ fn test_process_and_publish_writes_array_size_params() {
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) = create_std_arrays_runtime(
         &asyn_rs::asyn_record::claim_port("IMG_SZ").unwrap(),
-        pool.clone(),
+        pool.max_memory(),
         "DRV1",
         wiring,
         ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -833,7 +875,10 @@ fn test_process_and_publish_writes_array_size_params() {
         NDDataType::UInt8,
     );
     arr.unique_id = 42;
-    let to_publish = driver.prepare_array(Arc::new(arr)).unwrap().unwrap();
+    let to_publish = driver
+        .prepare_array(driver.pool.alloc_copy(&arr).unwrap())
+        .unwrap()
+        .unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

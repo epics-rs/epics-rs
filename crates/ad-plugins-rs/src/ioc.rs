@@ -9,8 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use ad_core_rs::ioc::{
-    PluginManager, attr_arg_defs, count_arg, extract_plugin_args, gather_arg_defs, max_threads_arg,
-    plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands, threads_arg,
+    PluginManager, attr_arg_defs, count_arg, extract_plugin_args, gather_arg_defs, max_memory_arg,
+    max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
+    threads_arg,
 };
 use ad_core_rs::plugin::runtime::{
     ArraySource, create_plugin_runtime, create_plugin_runtime_multi_addr,
@@ -132,11 +133,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 let (handle, _data, _jh) = crate::std_arrays::create_std_arrays_runtime(
                     &claim,
-                    pool,
+                    max_memory_arg(args, 6),
                     &source,
                     m.wiring().clone(),
                     threads_arg(args, 8),
@@ -168,11 +168,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 let (handle, _stats, _stats_params, _jh) = crate::stats::create_stats_runtime(
                     &claim,
-                    pool,
+                    max_memory_arg(args, 6),
                     queue_size,
                     &source,
                     m.wiring().clone(),
@@ -207,11 +206,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 let (handle, _roi_params, _jh) = crate::roi::create_roi_runtime(
                     &claim,
-                    pool,
+                    max_memory_arg(args, 6),
                     queue_size,
                     &source,
                     m.wiring().clone(),
@@ -235,14 +233,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDProcessConfigure",
         plugin_arg_defs(),
+        Some(6),
         None,
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::process::{ProcessConfig, ProcessProcessor};
             create_plugin_runtime(
                 claim,
                 ProcessProcessor::new(ProcessConfig::default()),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -257,14 +256,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDPosPluginConfigure",
         plugin_arg_defs(),
+        Some(6),
         None,
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::pos_plugin::{PosMode, PosPluginProcessor};
             create_plugin_runtime(
                 claim,
                 PosPluginProcessor::new(PosMode::Discard),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -277,14 +277,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDTransformConfigure",
         plugin_arg_defs(),
+        Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::transform::{TransformProcessor, TransformType};
             create_plugin_runtime(
                 claim,
                 TransformProcessor::new(TransformType::None),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -297,9 +298,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDColorConvertConfigure",
         plugin_arg_defs(),
+        Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::color_convert::{ColorConvertConfig, ColorConvertProcessor};
             use ad_core_rs::color::{NDBayerPattern, NDColorMode};
             let config = ColorConvertConfig {
@@ -310,7 +312,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             create_plugin_runtime(
                 claim,
                 ColorConvertProcessor::new(config),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -335,12 +337,11 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
                 let max_overlays = count_arg(args, 5);
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &claim,
                     crate::overlay::OverlayProcessor::new(max_overlays, vec![]),
-                    pool,
+                    max_memory_arg(args, 7),
                     queue_size,
                     &source,
                     m.wiring().clone(),
@@ -365,14 +366,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDFFTConfigure",
         plugin_arg_defs(),
+        Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::fft::FFTProcessor;
             create_plugin_runtime(
                 claim,
                 FFTProcessor::new(),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -385,16 +387,17 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDCircularBuffConfigure",
         plugin_arg_defs(),
+        Some(6),
         None,
         PluginThreadArgs::Fixed(2_000_000),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::circular_buff::{CircularBuffProcessor, TriggerCondition};
             create_plugin_runtime(
                 claim,
                 // queue_size is C `maxBuffers_` (NDCircularBuffConfigure
                 // queueSize); the processor bounds the accepted pre-count by it.
                 CircularBuffProcessor::new(100, 100, TriggerCondition::default(), queue_size),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -407,9 +410,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDCodecConfigure",
         plugin_arg_defs(),
+        Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::codec::{CodecMode, CodecProcessor};
             use ad_core_rs::codec::CodecName;
             create_plugin_runtime(
@@ -418,7 +422,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     codec: CodecName::LZ4,
                     quality: 90,
                 }),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -431,14 +435,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDScatterConfigure",
         plugin_arg_defs(),
+        Some(6),
         None,
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::scatter::ScatterProcessor;
             create_plugin_runtime(
                 claim,
                 ScatterProcessor::new(),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -466,12 +471,11 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
                 let max_ports = count_arg(args, 3);
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &claim,
                     crate::gather::GatherProcessor::new(max_ports),
-                    pool,
+                    max_memory_arg(args, 5),
                     queue_size,
                     "",
                     m.wiring().clone(),
@@ -541,8 +545,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 // Addr 0 always exists, so at least one address even for a
                 // degenerate 0/0 request.
                 let max_addr = n_attributes.max(n_data_blocks).max(1);
@@ -553,7 +556,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                         cache_size,
                         n_data_blocks,
                     ),
-                    pool,
+                    usize::MAX,
                     queue_size,
                     &source,
                     m.wiring().clone(),
@@ -578,13 +581,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileTIFFConfigure",
         plugin_arg_defs(),
         None,
+        None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::file_tiff::TiffFileProcessor;
             create_plugin_runtime(
                 claim,
                 TiffFileProcessor::new(),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -598,13 +602,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileJPEGConfigure",
         plugin_arg_defs(),
         None,
+        None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::file_jpeg::JpegFileProcessor;
             create_plugin_runtime(
                 claim,
                 JpegFileProcessor::new(50),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -618,13 +623,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileHDF5Configure",
         plugin_arg_defs(),
         None,
+        None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::file_hdf5::Hdf5FileProcessor;
             create_plugin_runtime(
                 claim,
                 Hdf5FileProcessor::new(),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -638,13 +644,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileNetCDFConfigure",
         plugin_arg_defs(),
         None,
+        None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::file_netcdf::NetcdfFileProcessor;
             create_plugin_runtime(
                 claim,
                 NetcdfFileProcessor::new(),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -658,13 +665,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileMagickConfigure",
         plugin_arg_defs(),
         None,
+        None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::file_magick::MagickFileProcessor;
             create_plugin_runtime(
                 claim,
                 MagickFileProcessor::new(),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -692,12 +700,11 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
 
                 let (handle, _jh) = crate::attribute::create_attribute_runtime(
                     &claim,
-                    pool,
+                    max_memory_arg(args, 7),
                     queue_size,
                     &source,
                     m.wiring().clone(),
@@ -731,11 +738,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 let (handle, _roi_stat_params, _jh) = crate::roi_stat::create_roi_stat_runtime(
                     &claim,
-                    pool,
+                    max_memory_arg(args, 7),
                     queue_size,
                     &source,
                     m.wiring().clone(),
@@ -762,14 +768,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDBadPixelConfigure",
         plugin_arg_defs(),
+        Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::bad_pixel::BadPixelProcessor;
             create_plugin_runtime(
                 claim,
                 BadPixelProcessor::new(vec![]),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -784,13 +791,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         "NDFileNexusConfigure",
         plugin_arg_defs(),
         None,
+        None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, pool, wiring, threads| {
+        |claim, queue_size, source, max_memory, wiring, threads| {
             use crate::file_nexus::NexusFileProcessor;
             create_plugin_runtime(
                 claim,
                 NexusFileProcessor::new(),
-                pool,
+                max_memory,
                 queue_size,
                 source,
                 wiring,
@@ -820,12 +828,11 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,
                     _ => 1,
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &claim,
-                    crate::time_series_plugin::TimeSeriesProcessor::new(max_signals, pool.clone()),
-                    pool,
+                    crate::time_series_plugin::TimeSeriesProcessor::new(max_signals),
+                    max_memory_arg(args, 7),
                     queue_size,
                     source,
                     m.wiring().clone(),
@@ -875,8 +882,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let drv = m.driver()?;
-                let pool = drv.pool();
+                m.driver()?;
 
                 // C++ NDPvaConfigure args[5] is pvName (6th argument).
                 // If not provided, fall back to "{portName}:Image". Only the
@@ -906,7 +912,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 let (handle, _jh) = create_plugin_runtime(
                     &claim,
                     processor,
-                    pool,
+                    max_memory_arg(args, 7),
                     queue_size,
                     &source,
                     m.wiring().clone(),
@@ -969,6 +975,7 @@ fn register_generic_plugin<F>(
     mgr: &Arc<PluginManager>,
     cmd_name: &'static str,
     arg_defs: Vec<ArgDesc>,
+    max_memory_idx: Option<usize>,
     max_threads_idx: Option<usize>,
     thread_args: PluginThreadArgs,
     factory: F,
@@ -978,7 +985,7 @@ where
             &PortClaim,
             usize,
             &ArraySource,
-            Arc<ad_core_rs::ndarray_pool::NDArrayPool>,
+            usize,
             Arc<WiringRegistry>,
             ad_core_rs::plugin::runtime::PluginThreads,
         ) -> (
@@ -1001,8 +1008,9 @@ where
                 Ok(claim) => claim,
                 Err(e) => return Ok(ctx.cxx_error(e)),
             };
-            let drv = m.driver()?;
-            let pool = drv.pool();
+            m.driver()?;
+            // C's file plugins hand `NDPluginFile` a 0 (e.g. NDFileTIFF.cpp:614).
+            let max_memory = max_memory_idx.map_or(0, |idx| max_memory_arg(args, idx));
             let threads = match thread_args {
                 PluginThreadArgs::Arg(idx) => threads_arg(args, idx),
                 PluginThreadArgs::Fixed(bytes) => {
@@ -1013,7 +1021,7 @@ where
                 &claim,
                 queue_size,
                 &source,
-                pool,
+                max_memory,
                 m.wiring().clone(),
                 threads,
             );

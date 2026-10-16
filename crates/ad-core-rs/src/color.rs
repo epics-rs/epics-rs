@@ -338,18 +338,12 @@ fn rgb_layout_rows_scalar<T: Copy>(
     }
 }
 
-/// Convert NDArray element type using C cast semantics.
-///
-/// Thin alias for [`crate::convert::convert_type`] — C++ `convertType`
-/// (`NDArrayPool.cpp:378-388`), `*pDataOut++ = (dataTypeOut)(*pDataIn++)`.
-/// A C cast truncates to the low bits on narrowing (`(epicsUInt8)300 == 44`);
-/// it does **not** clamp, so this must not reintroduce a `clamp()`.
-pub fn convert_data_type(src: &NDArray, target_type: NDDataType) -> ADResult<NDArray> {
-    crate::convert::convert_type(src, target_type)
-}
-
-/// [`convert_data_type`] into a buffer the caller owns — the alias for
-/// [`crate::convert::convert_type_into`].
+/// Convert NDArray element type using C cast semantics, into a buffer the
+/// caller owns — the alias for [`crate::convert::convert_type_into`], C++
+/// `convertType` (`NDArrayPool.cpp:378-388`), `*pDataOut++ =
+/// (dataTypeOut)(*pDataIn++)`. A C cast truncates to the low bits on
+/// narrowing (`(epicsUInt8)300 == 44`); it does **not** clamp, so this must
+/// not reintroduce a `clamp()`.
 pub fn convert_data_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
     crate::convert::convert_type_into(src, out)
 }
@@ -1774,7 +1768,9 @@ mod tests {
             v[1] = 128;
             v[2] = 255;
         }
-        let result = convert_data_type(&arr, NDDataType::UInt16).unwrap();
+        let result = NDArrayPool::new(0)
+            .convert_type(&arr, NDDataType::UInt16)
+            .unwrap();
         assert_eq!(result.data.data_type(), NDDataType::UInt16);
         if let NDDataBuffer::U16(ref v) = result.data {
             assert_eq!(v[0], 10);
@@ -1793,7 +1789,9 @@ mod tests {
             v[1] = 128.7;
             v[2] = 300.0;
         }
-        let result = convert_data_type(&arr, NDDataType::UInt8).unwrap();
+        let result = NDArrayPool::new(0)
+            .convert_type(&arr, NDDataType::UInt8)
+            .unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v[0], 246); // (epicsUInt8)-10
             assert_eq!(v[1], 128); // truncated
@@ -1806,7 +1804,9 @@ mod tests {
     #[test]
     fn test_convert_data_type_same_type_noop() {
         let arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        let result = convert_data_type(&arr, NDDataType::UInt8).unwrap();
+        let result = NDArrayPool::new(0)
+            .convert_type(&arr, NDDataType::UInt8)
+            .unwrap();
         assert_eq!(result.data.len(), 5);
         assert_eq!(result.data.data_type(), NDDataType::UInt8);
     }

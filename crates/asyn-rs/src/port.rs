@@ -482,6 +482,41 @@ impl QueueGate {
 pub type Int32StoreRule =
     Arc<dyn Fn(&mut PortDriverBase, i32, i32) -> AsynResult<()> + Send + Sync>;
 
+/// The text a C `writeOctet` sees in its `const char *value`: the bytes
+/// before the first NUL.
+pub fn c_str(data: &[u8]) -> &[u8] {
+    data.split(|&b| b == 0).next().unwrap_or(data)
+}
+
+/// Runs on a client `writeOctet` of one reason, after the value is stored and
+/// before the callbacks: what a C driver overrides the virtual `writeOctet`
+/// for (asynNDArrayDriver.cpp's `NDAttributesFile` reload). Takes the address
+/// and the text before the first NUL; C discards the handler's status for the
+/// callbacks'.
+pub type OctetWriteRule = Arc<dyn Fn(&mut PortDriverBase, i32, &[u8]) + Send + Sync>;
+
+/// The C class whose `writeOctet` [`PortDriverBase::write_octet`] stands
+/// for, as its closing trace line and error message name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OctetWriter {
+    pub driver: &'static str,
+    /// The key the line prints the parameter's name under.
+    pub name_key: &'static str,
+}
+
+impl OctetWriter {
+    /// asynPortDriver.cpp:2677-2683.
+    pub const ASYN_PORT_DRIVER: Self = Self {
+        driver: "asynPortDriver",
+        name_key: "name",
+    };
+}
+
+/// Runs once, when the port's first [`crate::port_handle::PortHandle`]
+/// exists: a C driver's own thread that holds `this` from the constructor
+/// on (asynNDArrayDriver.cpp:1012's `updateQueuedArrayCount`).
+pub type RuntimeHook = Box<dyn FnOnce(&crate::port_handle::PortHandle) + Send + Sync>;
+
 pub struct PortDriverBase {
     pub port_name: Arc<str>,
     pub max_addr: usize,
@@ -598,6 +633,12 @@ pub struct PortDriverBase {
     /// By reason; empty until a rule is registered, so a port without one
     /// pays a bounds check per store.
     int32_rules: Vec<Option<Int32StoreRule>>,
+    /// By reason, as `int32_rules`.
+    octet_write_rules: Vec<Option<OctetWriteRule>>,
+    /// See [`Self::set_octet_writer`].
+    octet_writer: OctetWriter,
+    /// Taken and run by `create_port_runtime_boxed`; see [`Self::on_runtime`].
+    pub(crate) runtime_hooks: Vec<RuntimeHook>,
     /// Port-level anchor for the 2s auto-reconnect throttle — the
     /// monotonic instant of the last connect/disconnect transition or
     /// auto-connect attempt (C `dpCommon.lastConnectDisconnect`). `None`
@@ -714,6 +755,9 @@ impl PortDriverBase {
                     epics_libcom_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS,
                 ),
             int32_rules: Vec::new(),
+            octet_write_rules: Vec::new(),
+            octet_writer: OctetWriter::ASYN_PORT_DRIVER,
+            runtime_hooks: Vec::new(),
             last_connect_disconnect: None,
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
@@ -865,14 +909,27 @@ impl PortDriverBase {
     /// functionName: function=N, name=PARAM, value=V`, through the user's
     /// device-level trace config.
     fn trace_io(&self, user: &AsynUser, function_name: &str, value: std::fmt::Arguments<'_>) {
+        self.trace_io_by(OctetWriter::ASYN_PORT_DRIVER, user, function_name, value);
+    }
+
+    /// The `ASYN_TRACEIO_DRIVER` line a C write closes with, as `writer`'s.
+    pub fn trace_io_by(
+        &self,
+        writer: OctetWriter,
+        user: &AsynUser,
+        function_name: &str,
+        value: std::fmt::Arguments<'_>,
+    ) {
         user.print(
             crate::trace::TraceMask::IO_DRIVER,
             file!(),
             line!(),
             format_args!(
-                "asynPortDriver:{}: function={}, name={}, value={}",
+                "{}:{}: function={}, {}={}, value={}",
+                writer.driver,
                 function_name,
                 user.reason,
+                writer.name_key,
                 self.params.param_name(user.reason).unwrap_or(""),
                 value
             ),
@@ -913,6 +970,31 @@ impl PortDriverBase {
             )
         })?;
         self.trace_io(user, "writeInt64", format_args!("{value}"));
+        Ok(())
+    }
+
+    /// C `asynPortDriver::writeFloat64` (asynPortDriver.cpp:2544-2569); see
+    /// [`Self::write_int32_param`]. A refused store is the write's status.
+    pub fn write_float64_param(&mut self, user: &AsynUser, value: f64) -> AsynResult<()> {
+        let addr = self.parse_user(user)?;
+        let status = self.set_float64_param(user.reason, addr, value);
+        let _ = self.call_param_callbacks(addr);
+        if let Err(e) = &status {
+            user.print(
+                crate::trace::TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={:.6}",
+                    e.param_status_code(),
+                    user.reason,
+                    self.params.param_name(user.reason).unwrap_or(""),
+                    value
+                ),
+            );
+            return status;
+        }
+        self.trace_io(user, "writeFloat64", format_args!("{value:.6}"));
         Ok(())
     }
 
@@ -1763,6 +1845,15 @@ impl PortDriverBase {
         result
     }
 
+    /// Run `hook` with the port's handle once its runtime exists. A port that
+    /// never gets a runtime never runs it.
+    pub fn on_runtime(
+        &mut self,
+        hook: impl FnOnce(&crate::port_handle::PortHandle) + Send + Sync + 'static,
+    ) {
+        self.runtime_hooks.push(Box::new(hook));
+    }
+
     /// Run `rule` on every Int32 store of `reason`, replacing any rule
     /// registered for it.
     pub fn set_int32_rule(&mut self, reason: usize, rule: Int32StoreRule) {
@@ -1770,6 +1861,61 @@ impl PortDriverBase {
             self.int32_rules.resize(reason + 1, None);
         }
         self.int32_rules[reason] = Some(rule);
+    }
+
+    /// Run `rule` on every client `writeOctet` of `reason`, replacing any rule
+    /// registered for it.
+    pub fn set_write_octet_rule(&mut self, reason: usize, rule: OctetWriteRule) {
+        if self.octet_write_rules.len() <= reason {
+            self.octet_write_rules.resize(reason + 1, None);
+        }
+        self.octet_write_rules[reason] = Some(rule);
+    }
+
+    /// The rule [`Self::set_write_octet_rule`] registered for `reason`, for an
+    /// override that stores the value itself and runs the base's branch.
+    pub fn write_octet_rule(&self, reason: usize) -> Option<OctetWriteRule> {
+        self.octet_write_rules.get(reason).cloned().flatten()
+    }
+
+    /// Name `writer` in [`Self::write_octet`]'s line and error message, for a
+    /// port whose base class overrides `writeOctet`.
+    pub fn set_octet_writer(&mut self, writer: OctetWriter) {
+        self.octet_writer = writer;
+    }
+
+    pub fn octet_writer(&self) -> OctetWriter {
+        self.octet_writer
+    }
+
+    /// C `asynPortDriver::writeOctet` with the base class's rules applied: the
+    /// [`PortDriver::write_octet`] default, and what an override calls to chain
+    /// to it as a C override calls its base class.
+    pub fn write_octet(&mut self, user: &AsynUser, data: &[u8]) -> AsynResult<usize> {
+        let addr = self.parse_user(user)?;
+        let text = c_str(data);
+        let _ = self.set_string_param(user.reason, addr, text);
+        if let Some(Some(rule)) = self.octet_write_rules.get(user.reason) {
+            rule.clone()(self, addr, text);
+        }
+        let writer = self.octet_writer;
+        self.call_param_callbacks(addr).map_err(|e| {
+            param_access_error_by(
+                writer,
+                &self.params,
+                user,
+                "writeOctet",
+                e,
+                format_args!("value={}", crate::fixed_text::LossyText(text)),
+            )
+        })?;
+        self.trace_io_by(
+            writer,
+            user,
+            "writeOctet",
+            format_args!("{}", crate::fixed_text::LossyText(text)),
+        );
+        Ok(data.len())
     }
 
     /// The one Int32 store: every setter of an Int32 value comes through here,
@@ -2351,6 +2497,24 @@ fn param_access_error(
     e: AsynError,
     value: std::fmt::Arguments<'_>,
 ) -> AsynError {
+    param_access_error_by(
+        OctetWriter::ASYN_PORT_DRIVER,
+        params,
+        user,
+        function,
+        e,
+        value,
+    )
+}
+
+fn param_access_error_by(
+    writer: OctetWriter,
+    params: &crate::param::ParamList,
+    user: &AsynUser,
+    function: &str,
+    e: AsynError,
+    value: std::fmt::Arguments<'_>,
+) -> AsynError {
     if matches!(
         e,
         AsynError::AddressOutOfRange(_) | AsynError::ParamIndexOutOfRange(_)
@@ -2358,9 +2522,11 @@ fn param_access_error(
         return e;
     }
     let message = format!(
-        "asynPortDriver:{function}: status={}, function={}, name={}, {value}",
+        "{}:{function}: status={}, function={}, {}={}, {value}",
+        writer.driver,
         e.param_status_code(),
         user.reason,
+        writer.name_key,
         params.param_name(user.reason).unwrap_or(""),
     );
     e.in_param_access(message)
@@ -2629,28 +2795,7 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let base = self.base_mut();
-        let addr = base.parse_user(user)?;
-        let status = base.set_float64_param(user.reason, addr, value);
-        let _ = base.call_param_callbacks(addr);
-        let base = self.base();
-        if let Err(e) = &status {
-            user.print(
-                crate::trace::TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={:.6}",
-                    e.param_status_code(),
-                    user.reason,
-                    base.params.param_name(user.reason).unwrap_or(""),
-                    value
-                ),
-            );
-            return status;
-        }
-        base.trace_io(user, "writeFloat64", format_args!("{value:.6}"));
-        Ok(())
+        self.base_mut().write_float64_param(user, value)
     }
 
     /// C `asynPortDriver::readOctet`: `getStringParam(maxChars)` keeps at most
@@ -2679,24 +2824,7 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let base = self.base_mut();
-        let addr = base.parse_user(user)?;
-        let _ = base.set_string_param(user.reason, addr, data);
-        base.call_param_callbacks(addr).map_err(|e| {
-            param_access_error(
-                &base.params,
-                user,
-                "writeOctet",
-                e,
-                format_args!("value={}", crate::fixed_text::LossyText(data)),
-            )
-        })?;
-        self.base().trace_io(
-            user,
-            "writeOctet",
-            format_args!("{}", crate::fixed_text::LossyText(data)),
-        );
-        Ok(data.len())
+        self.base_mut().write_octet(user, data)
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
@@ -3539,6 +3667,15 @@ mod tests {
         drv.write_float64(&mut user, 3.14).unwrap();
         let user = AsynUser::new(1);
         assert!((drv.read_float64(&user).unwrap() - 3.14).abs() < 1e-10);
+    }
+
+    #[test]
+    fn default_write_octet_stores_up_to_the_first_nul() {
+        // asynPortDriver.cpp:2671 stores `(char *)value`; nActual is nChars.
+        let mut drv = TestDriver::new();
+        let mut user = AsynUser::new(2);
+        assert_eq!(drv.write_octet(&mut user, b"abc\0def").unwrap(), 7);
+        assert_eq!(drv.base().get_string_param(2, 0).unwrap(), b"abc");
     }
 
     #[test]

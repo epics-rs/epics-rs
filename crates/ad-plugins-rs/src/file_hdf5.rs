@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ad_core_rs::attributes::{NDAttrDataType, NDAttrSource, NDAttrValue, NDAttribute};
+use ad_core_rs::attributes::{
+    NDAttrDataType, NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList,
+};
 use ad_core_rs::codec::{Codec, CodecName};
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::finalize::Finalize;
@@ -12,8 +14,8 @@ use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate, PluginParamSnapshot,
-    ProcessResult, WriteOutcome, WriteVerdict,
+    NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate, PluginAttributes,
+    PluginParamSnapshot, ProcessResult, WriteOutcome, WriteVerdict,
 };
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::trace::TraceMask;
@@ -563,6 +565,8 @@ pub struct Hdf5Writer {
     /// C `pFileAttributes` (NDFileHDF5.cpp:243, :1437): the writer's own
     /// attribute list, sticky for the life of the file.
     file_attributes: FileAttributes,
+    /// The plugin's own set, C `getAttributes` in `openFile`/`writeFile`.
+    plugin_attributes: NDAttributeList,
     /// The layout `layout_spec` gave at the last open.
     layout: Option<Hdf5Layout>,
     /// Full path of the primary image dataset for the currently-open file.
@@ -609,6 +613,7 @@ impl Hdf5Writer {
             perf_first: None,
             attr_datasets: Vec::new(),
             file_attributes: FileAttributes::default(),
+            plugin_attributes: NDAttributeList::new(),
             // No user layout XML by default → C's built-in NeXus DEFAULT_LAYOUT.
             layout: Some(Self::default_layout()),
             resolved_dataset_path: "data".to_string(),
@@ -3202,6 +3207,41 @@ impl Default for Hdf5Writer {
     }
 }
 
+/// C `addDefaultAttributes` (NDFileHDF5.cpp:3663-3677).
+fn default_attributes(array: &NDArray) -> NDAttributeList {
+    let mut list = NDAttributeList::new();
+    for (name, description, value) in [
+        (
+            "NDArrayUniqueId",
+            "The unique ID of the NDArray",
+            NDAttrValue::Int32(array.unique_id),
+        ),
+        (
+            "NDArrayTimeStamp",
+            "The timestamp of the NDArray as float64",
+            NDAttrValue::Float64(array.time_stamp),
+        ),
+        (
+            "NDArrayEpicsTSSec",
+            "The NDArray EPICS timestamp seconds past epoch",
+            NDAttrValue::UInt32(array.timestamp.sec),
+        ),
+        (
+            "NDArrayEpicsTSnSec",
+            "The NDArray EPICS timestamp nanoseconds",
+            NDAttrValue::UInt32(array.timestamp.nsec),
+        ),
+    ] {
+        list.add(NDAttribute::new_static(
+            name,
+            description,
+            NDAttrSource::Driver,
+            value,
+        ));
+    }
+    list
+}
+
 impl NDFileWriter for Hdf5Writer {
     fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()> {
         self.read_settings();
@@ -3218,10 +3258,13 @@ impl NDFileWriter for Hdf5Writer {
         self.perf_prev = None;
         self.perf_first = None;
         self.attr_datasets.clear();
-        // C `openFile` clears `pFileAttributes` and copies this frame's list
-        // into it (NDFileHDF5.cpp:243-252); every attribute read for the rest
-        // of the file goes through it, not through the frame.
-        self.file_attributes.open(array);
+        // C `openFile` clears `pFileAttributes`, adds the default attributes,
+        // the plugin's set and this frame's list (NDFileHDF5.cpp:243-252);
+        // every attribute read for the rest of the file goes through it, not
+        // through the frame.
+        let mut set = default_attributes(array);
+        set.copy_from(&self.plugin_attributes);
+        self.file_attributes.open(&set, array);
         if let Err(e) = self.load_layout() {
             // C creates the file before it loads the layout (NDFileHDF5.cpp:
             // 271, :279), so a failed layout leaves the empty file behind.
@@ -3251,13 +3294,20 @@ impl NDFileWriter for Hdf5Writer {
         self.num_capture = n;
     }
 
+    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
+        self.plugin_attributes = attributes;
+    }
+
     fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         self.read_settings();
         let start = std::time::Instant::now();
 
-        // C `writeFile` merges this frame into `pFileAttributes` before it
-        // writes anything (NDFileHDF5.cpp:1420-1437).
-        self.file_attributes.frame(array);
+        // C `writeFile` merges the plugin's set, the default attributes and
+        // this frame into `pFileAttributes` before it writes anything
+        // (NDFileHDF5.cpp:1420-1437).
+        let mut set = self.plugin_attributes.clone();
+        set.copy_from(&default_attributes(array));
+        self.file_attributes.frame(&set, array);
 
         let is_swmr = matches!(self.handle, Some(Hdf5Handle::Swmr { .. }));
         if is_swmr {
@@ -3490,6 +3540,7 @@ pub struct Hdf5FileProcessor {
     /// The writer's settings store, written without the writer's lock.
     settings: SettingsStore<Hdf5Settings>,
     hdf5_params: Hdf5ParamIndices,
+    attributes: Option<PluginAttributes>,
 }
 
 impl Hdf5FileProcessor {
@@ -3499,6 +3550,7 @@ impl Hdf5FileProcessor {
             settings: writer.settings(),
             ctrl: Mutex::new(FilePluginController::new(writer)),
             hdf5_params: Hdf5ParamIndices::default(),
+            attributes: None,
         }
     }
 
@@ -4038,7 +4090,11 @@ const POS_INDEX_PARAMS: [&str; MAX_EXTRA_DIMS] = [
 impl NDPluginProcess for Hdf5FileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        // Read before the controller lock: the read waits on the actor,
+        // which takes that lock in its writes.
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads());
         let mut ctrl = self.ctrl.lock();
+        ctrl.set_attribute_reads(attributes);
         let was_swmr = ctrl.writer.lock().is_swmr_active();
         let mut result = ctrl.process_array(array);
         let is_swmr = ctrl.writer.lock().is_swmr_active();
@@ -4082,6 +4138,10 @@ impl NDPluginProcess for Hdf5FileProcessor {
         }
 
         result
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -4230,6 +4290,8 @@ impl NDPluginProcess for Hdf5FileProcessor {
         verdict: WriteVerdict<i32>,
         params: &PortDriverBase,
     ) -> WriteOutcome<i32> {
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads_on(params));
+        self.ctrl.lock().set_attribute_reads(attributes);
         let out = self.check_int32(reason, addr, value, verdict, params);
         if out.settled {
             return out;
@@ -5150,6 +5212,82 @@ mod tests {
             }
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C `openFile`/`writeFile` fill `pFileAttributes` from `getAttributes`
+    /// with the frame's list copied on top (NDFileHDF5.cpp:250-252,
+    /// :1421-1438), so the plugin's own set gets attribute datasets.
+    #[test]
+    fn the_plugin_attributes_get_datasets_under_the_frame() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="plugin_only" type="PARAM" source="AUTO_SAVE" datatype="INT"/>
+            <Attribute name="count" type="CONST" source="99"/>
+        </Attributes>"#;
+        let (handle, _rx, _jh) = with_attributes_file("HDF5_ATTRS", Hdf5FileProcessor::new(), xml);
+        let path = temp_path("plugin_attrs");
+        auto_save_to(&handle, &path);
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "count",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(10),
+        ));
+        publish(&handle, &arr);
+        wait_saved(&handle, 1);
+        let h5 = H5File::open(&path).unwrap();
+        let values = |name: &str| -> Vec<i32> {
+            h5.dataset(&format!("entry/instrument/NDAttributes/{name}"))
+                .unwrap()
+                .read_raw()
+                .unwrap()
+        };
+        assert_eq!(values("plugin_only"), vec![1]);
+        assert_eq!(values("count"), vec![10]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C `addDefaultAttributes` puts the array's id and timestamps into
+    /// `pFileAttributes` (NDFileHDF5.cpp:3663-3677), so every file carries
+    /// them as attribute datasets.
+    #[test]
+    fn the_default_attributes_get_datasets() {
+        let path = temp_path("hdf5_default_attrs");
+        let mut writer = Hdf5Writer::new();
+        let mk = |id: i32, sec: u32| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.unique_id = id;
+            arr.time_stamp = f64::from(sec) + 0.5;
+            arr.timestamp.sec = sec;
+            arr.timestamp.nsec = 7;
+            arr
+        };
+        let a0 = mk(3, 100);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk(4, 101))).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = |name: &str| {
+            h5.dataset(&format!("entry/instrument/NDAttributes/{name}"))
+                .unwrap()
+        };
+        assert_eq!(ds("NDArrayUniqueId").read_raw::<i32>().unwrap(), vec![3, 4]);
+        assert_eq!(
+            ds("NDArrayTimeStamp").read_raw::<f64>().unwrap(),
+            vec![100.5, 101.5]
+        );
+        assert_eq!(
+            ds("NDArrayEpicsTSSec").read_raw::<u32>().unwrap(),
+            vec![100, 101]
+        );
+        assert_eq!(
+            ds("NDArrayEpicsTSnSec").read_raw::<u32>().unwrap(),
+            vec![7, 7]
+        );
         std::fs::remove_file(&path).ok();
     }
 

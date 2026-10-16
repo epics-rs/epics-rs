@@ -85,6 +85,26 @@ mod tests {
     use super::*;
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
+    /// C `getAttributes` on the copy it scatters (NDPluginScatter.cpp:38-40),
+    /// which the runtime's `endProcessCallbacks` evaluation is here.
+    #[test]
+    fn a_scattered_frame_carries_the_plugin_attributes() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Site" type="CONST" source="BL7"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("SCATTER_ATTRS", ScatterProcessor::new(), xml);
+        let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        publish(&handle, &arr);
+        let out = rx.blocking_recv().unwrap();
+        assert_eq!(
+            out.attributes.get("Site").map(|a| a.value.clone()),
+            Some(NDAttrValue::String("BL7".into()))
+        );
+    }
+
     #[test]
     fn test_scatter_processor_marks_scatter_frame() {
         // The processor flags every frame as a scatter frame and passes the

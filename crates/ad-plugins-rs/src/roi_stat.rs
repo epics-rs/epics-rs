@@ -733,7 +733,7 @@ impl NDPluginProcess for ROIStatProcessor {
 /// Create a ROIStat plugin runtime.
 pub fn create_roi_stat_runtime(
     claim: &asyn_rs::registry::PortClaim,
-    pool: Arc<NDArrayPool>,
+    max_memory: usize,
     queue_size: usize,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
@@ -749,7 +749,7 @@ pub fn create_roi_stat_runtime(
     let params_handle = processor.params_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        claim, processor, pool, queue_size, source, wiring, num_rois, threads,
+        claim, processor, max_memory, queue_size, source, wiring, num_rois, threads,
     );
 
     let roi_stat_params = *params_handle.lock();
@@ -791,7 +791,7 @@ mod tests {
         // the controls stay undefined.
         let (handle, p, _jh) = create_roi_stat_runtime(
             &asyn_rs::asyn_record::claim_port("RS_INIT").unwrap(),
-            NDArrayPool::new(1_000_000),
+            1_000_000,
             1,
             "",
             Arc::new(WiringRegistry::new()),

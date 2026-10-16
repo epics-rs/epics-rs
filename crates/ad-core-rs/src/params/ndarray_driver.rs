@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
+
+use crate::driver::ndarray_driver::ArrayOwner;
 
 /// Parameters for asynNDArrayDriver base (file I/O, pool stats, array info, attributes).
 #[derive(Clone, Copy)]
@@ -91,7 +95,20 @@ pub struct NDArrayDriverParams {
 }
 
 impl NDArrayDriverParams {
-    pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    /// Create the parameters with what C's `asynNDArrayDriver` constructor
+    /// attaches to them, for drivers and plugins alike (NDPluginDriver.h:57):
+    /// the `ADAcquireBusy` store rules and the `NDNumQueuedArrays` updater,
+    /// both reading the returned counter.
+    pub fn create(base: &mut PortDriverBase) -> AsynResult<(Self, Arc<ArrayOwner>)> {
+        let params = Self::create_params(base)?;
+        let owner = ArrayOwner::new();
+        owner.bind_port(base);
+        crate::driver::ndarray_driver::acquire_busy_rules(base, &params, owner.queued());
+        crate::driver::ndarray_driver::write_octet_rules(base, &params, owner.attributes());
+        Ok((params, owner))
+    }
+
+    fn create_params(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
             // Detector info
             port_name_self: base.create_param("PORT_NAME_SELF", ParamType::Octet)?,
@@ -189,7 +206,7 @@ mod tests {
     #[test]
     fn test_create_ndarray_driver_params() {
         let mut base = PortDriverBase::new("test", 1, PortFlags::default());
-        let params = NDArrayDriverParams::create(&mut base).unwrap();
+        let (params, _) = NDArrayDriverParams::create(&mut base).unwrap();
         assert!(base.find_param("ARRAY_COUNTER").is_some());
         assert!(base.find_param("FILE_PATH").is_some());
         assert!(base.find_param("POOL_MAX_MEMORY").is_some());

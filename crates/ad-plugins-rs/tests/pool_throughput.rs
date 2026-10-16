@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use ad_core_rs::codec::CodecName;
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 use ad_core_rs::plugin::file_base::NDFileMode;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, PluginRuntimeHandle, ProcessResult, create_plugin_runtime,
@@ -115,7 +115,7 @@ impl NDPluginProcess for Locked {
 /// Build the frames once, outside any timed region: the fill below costs about
 /// as much as a plugin's own work, and generating frames inside the clock would
 /// put that cost on the publisher thread where no worker can overlap it.
-fn frames() -> Vec<Arc<NDArray>> {
+fn frames() -> Vec<PublishedArray> {
     let mut seed = NDArray::new(
         vec![NDDimension::new(WIDTH), NDDimension::new(HEIGHT)],
         NDDataType::UInt16,
@@ -129,11 +129,12 @@ fn frames() -> Vec<Arc<NDArray>> {
         x ^= x << 17;
         seed.data.set_from_f64(i, (x % 4096) as f64);
     }
+    let pool = DriverPool::standalone(0);
     (0..FRAMES as i32)
         .map(|id| {
-            let mut arr = seed.clone();
+            let mut arr = pool.alloc_copy(&seed).unwrap();
             arr.unique_id = id;
-            Arc::new(arr)
+            arr.share()
         })
         .collect()
 }
@@ -158,7 +159,7 @@ fn set_threads(handle: &PluginRuntimeHandle, n: i32) {
 /// from the first publish to full quiescence.
 fn drive(
     handle: &PluginRuntimeHandle,
-    frames: &[Arc<NDArray>],
+    frames: &[PublishedArray],
     threads: i32,
 ) -> std::time::Duration {
     set_threads(handle, threads);
@@ -167,7 +168,7 @@ fn drive(
         .read_int32_blocking(handle.plugin_params.dropped_arrays, 0)
         .unwrap();
     let sender = handle.array_sender().clone();
-    let frames: Vec<Arc<NDArray>> = frames.to_vec();
+    let frames: Vec<PublishedArray> = frames.to_vec();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -214,7 +215,7 @@ fn measure_pool_throughput() {
         Unlocked {
             sink: parking_lot::Mutex::new(0),
         },
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -229,7 +230,7 @@ fn measure_pool_throughput() {
         Locked {
             sink: parking_lot::Mutex::new(0),
         },
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -267,7 +268,7 @@ fn measure_shipped_plugin_throughput() {
     // Control: C releases at NDPluginStats.cpp:479, and so do we.
     let (stats, _sink, stats_params, _j) = create_stats_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_STATS").unwrap(),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -290,7 +291,7 @@ fn measure_shipped_plugin_throughput() {
     // C releases at NDPluginROI.cpp:140.
     let (roi, roi_params, _j) = create_roi_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_ROI").unwrap(),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -325,7 +326,7 @@ fn measure_shipped_plugin_throughput() {
             ],
             16,
         ),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -347,7 +348,7 @@ fn measure_shipped_plugin_throughput() {
             codec: CodecName::Zlib,
             quality: 85,
         }),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -374,7 +375,7 @@ fn measure_shipped_plugin_throughput() {
     let (bad_pixel, _j) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_BADPIX").unwrap(),
         BadPixelProcessor::new(pixels),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -391,7 +392,7 @@ fn measure_shipped_plugin_throughput() {
     let (transform, _j) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_TRANSFORM").unwrap(),
         TransformProcessor::new(TransformType::Rot90CW),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -408,7 +409,7 @@ fn measure_shipped_plugin_throughput() {
     let (fft, _j) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_FFT").unwrap(),
         FFTProcessor::new(),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -429,7 +430,7 @@ fn measure_shipped_plugin_throughput() {
             high_clip_value: 60000.0,
             ..ProcessConfig::default()
         }),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),
@@ -462,7 +463,7 @@ fn measure_shipped_plugin_throughput() {
     let (tiff, _j) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_TIFF").unwrap(),
         tiff,
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
         "",
         wiring.clone(),

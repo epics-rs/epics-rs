@@ -63,6 +63,11 @@ pub trait NDFileWriter: Send + Sync {
     /// the capture target (e.g. HDF5 chunk sizing, C `calculateAttributeChunking`)
     /// uses it; the default ignores it.
     fn set_num_capture(&mut self, _n: usize) {}
+    /// The plugin's own NDAttributesFile set as C `getAttributes` returns it
+    /// to `openFile`/`writeFile`, evaluated by the processor ahead of the
+    /// call because the evaluation cannot run under the writer lock. A
+    /// writer whose C counterpart never calls `getAttributes` ignores it.
+    fn set_plugin_attributes(&mut self, _attributes: NDAttributeList) {}
     /// Whether [`write_file`](NDFileWriter::write_file) has put the frame on
     /// disk by the time it returns.
     ///
@@ -100,15 +105,17 @@ pub struct FileAttributes {
 }
 
 impl FileAttributes {
-    /// Start a new file from `array`'s attributes (C `openFile`: `clear()`
-    /// then `copy`).
-    pub fn open(&mut self, array: &NDArray) {
+    /// Start a new file from the plugin's set and `array`'s attributes on
+    /// top (C `openFile`: `clear()`, `getAttributes`, then `copy`).
+    pub fn open(&mut self, plugin: &NDAttributeList, array: &NDArray) {
         self.list.clear();
-        self.list.copy_from(&array.attributes);
+        self.frame(plugin, array);
     }
 
-    /// Merge one frame's attributes in (C `writeFile`: `copy` with no clear).
-    pub fn frame(&mut self, array: &NDArray) {
+    /// Merge the plugin's set and one frame's attributes in (C `writeFile`:
+    /// `getAttributes` and `copy` with no clear).
+    pub fn frame(&mut self, plugin: &NDAttributeList, array: &NDArray) {
+        self.list.copy_from(plugin);
         self.list.copy_from(&array.attributes);
     }
 

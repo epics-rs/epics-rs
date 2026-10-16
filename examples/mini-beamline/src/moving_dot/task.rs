@@ -8,9 +8,10 @@ use rand::rngs::StdRng;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
-use ad_core_rs::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::runtime as rt;
 
 use crate::physics::{self, MovingDotImageConfig};
@@ -35,25 +36,19 @@ pub(crate) struct AcquisitionContext {
     pub ad: ADBaseParams,
     pub dot: MovingDotParams,
     pub image_config: MovingDotImageConfig,
-    pub queued_counter: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
 }
 
 impl AcquisitionContext {
-    /// Drain in-flight arrays (if configured) and transition to Idle.
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.queued_counter.wait_until_zero(Duration::from_secs(5));
-        }
+    /// Transition to Idle. Storing ADAcquire=0 is what clears ADAcquireBusy,
+    /// held while ADWaitForPlugins waits on the queued arrays
+    /// (asynNDArrayDriver.cpp:636-663).
+    async fn end_acquisition(&self) {
         if let Err(e) = self
             .port_handle
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::new(
-                        self.ad.acquire_busy,
-                        0,
-                        ParamValue::Int32(0),
-                    ),
                     asyn_rs::request::ParamSetValue::new(
                         self.ad.status,
                         0,
@@ -232,14 +227,17 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .collect();
 
             let dims = vec![NDDimension::new(out_w), NDDimension::new(out_h)];
-            let mut frame = NDArray::with_data(dims, NDDataBuffer::U16(u16_data));
+            // A refused wrap has printed the pool's limit line.
+            let Ok(mut frame) = ctx.pool.wrap(dims, NDDataBuffer::U16(u16_data)) else {
+                continue;
+            };
 
             // Exposure time delay with stop interruption
             let elapsed = start_time.elapsed().as_secs_f64();
             let delay = (config.acquire_time - elapsed).max(MIN_DELAY_SECS);
             match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(delay)).await {
                 WaitOutcome::Stop => {
-                    ctx.end_acquisition(config.wait_for_plugins).await;
+                    ctx.end_acquisition().await;
                     break;
                 }
                 WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback
@@ -318,14 +316,14 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
 
             if config.array_callbacks {
-                ctx.publisher.publish(Arc::new(frame)).await;
+                ctx.publisher.publish(frame).await;
             }
 
             // Check stop conditions
             if config.image_mode == ImageMode::Single
                 || (config.image_mode == ImageMode::Multiple && num_counter >= config.num_images)
             {
-                ctx.end_acquisition(config.wait_for_plugins).await;
+                ctx.end_acquisition().await;
                 break;
             }
 
@@ -335,7 +333,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             if period_delay > 0.0 {
                 match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(period_delay)).await {
                     WaitOutcome::Stop => {
-                        ctx.end_acquisition(config.wait_for_plugins).await;
+                        ctx.end_acquisition().await;
                         break;
                     }
                     WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback

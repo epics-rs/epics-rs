@@ -48,6 +48,7 @@ struct PosParamIndices {
 /// NDPosPlugin processor: attaches position metadata to arrays from a position list.
 pub struct PosPluginProcessor {
     state: Mutex<PosPluginState>,
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 /// The position cursor and the frame-ID tracking counters. One frame consumes
@@ -74,6 +75,7 @@ impl PosPluginProcessor {
     pub fn new(mode: PosMode) -> Self {
         Self {
             state: Mutex::new(PosPluginState::new(mode)),
+            attributes: None,
         }
     }
 
@@ -477,6 +479,12 @@ fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
 
 impl NDPluginProcess for PosPluginProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    /// NDPosPlugin.cpp:203.
+    const READ_ATTRIBUTES: bool = false;
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
+    }
 
     /// C `NDPosPlugin::writeInt32` drops the base class status
     /// (`status = (asynStatus)callParamCallbacks();`, NDPosPlugin.cpp:260): a refused NDPluginDriver write keeps
@@ -652,6 +660,32 @@ impl NDPluginProcess for PosPluginProcessor {
                 return ProcessResult::empty();
             }
         };
+        // C `getAttributes` on the copy (NDPosPlugin.cpp:143), before the
+        // position attributes and with the counters set so far (:126, :134).
+        if let Some(attributes) = &self.attributes {
+            let mut pending = Vec::new();
+            push_int(
+                &mut pending,
+                state.params.missing_frames,
+                state.missing_frames,
+            );
+            push_int(
+                &mut pending,
+                state.params.duplicate_frames,
+                state.duplicate_frames,
+            );
+            push_int(
+                &mut pending,
+                state.params.current_qty,
+                state.remaining_positions() as i32,
+            );
+            push_int(
+                &mut pending,
+                state.params.current_index,
+                state.current_index_param(),
+            );
+            attributes.get_attributes(&mut out.attributes, &pending);
+        }
         // C iterates the position std::map (sorted ascending by key), building
         // the CurrentPos string "[k=v,...]" and attaching each attribute in the
         // same loop (NDPosPlugin.cpp:149-166). The attribute description is the
@@ -871,6 +905,32 @@ mod tests {
         assert!((x - 3.1).abs() < 1e-10);
 
         assert_eq!(proc.remaining_positions(), 0);
+    }
+
+    /// C `getAttributes` on the copy (NDPosPlugin.cpp:143) comes before the
+    /// position attributes (:161-162) and the CurrentIndex step (:190): a
+    /// position overrides a file attribute of its name, and a PARAM reads the
+    /// index the frame was taken at.
+    #[test]
+    fn the_plugin_attributes_precede_the_position() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let proc = PosPluginProcessor::new(PosMode::Keep);
+        let positions = [10.0, 20.0].map(|x| HashMap::from([("X".to_string(), x)]));
+        proc.load_positions(positions.to_vec());
+        proc.start();
+        let xml = r#"<Attributes>
+            <Attribute name="X" type="CONST" source="file"/>
+            <Attribute name="Index" type="PARAM" source="NDPos_CurrentIndex" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) = with_attributes_file("POS_ATTRS", proc, xml);
+        let value = |a: &NDArray, name: &str| a.attributes.get(name).map(|a| a.value.clone());
+        for (id, x) in [(1, 10.0), (2, 20.0)] {
+            publish(&handle, &make_array(id));
+            let out = rx.blocking_recv().unwrap();
+            assert_eq!(value(&out, "X"), Some(NDAttrValue::Float64(x)));
+            assert_eq!(value(&out, "Index"), Some(NDAttrValue::Int32(id - 1)));
+        }
     }
 
     #[test]

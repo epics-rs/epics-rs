@@ -203,6 +203,18 @@ pub fn count_arg(args: &[ArgValue], index: usize) -> usize {
     }
 }
 
+/// The `maxMemory` argument of a plugin `*Configure` command at `index`, the
+/// limit of the pool C builds the plugin (asynNDArrayDriver.cpp:881).
+///
+/// iocsh reads it as an `int` that C converts to `size_t`, so -1 is as
+/// unlimited as an absent argument's 0.
+pub fn max_memory_arg(args: &[ArgValue], index: usize) -> usize {
+    match args.get(index) {
+        Some(ArgValue::Int(n)) => *n as i32 as isize as usize,
+        _ => 0,
+    }
+}
+
 /// Auto-derive DTYP name from port name: `"ROI1"` → `"asynROI1"`.
 pub fn dtyp_from_port(port_name: &str) -> String {
     format!("asyn{port_name}")

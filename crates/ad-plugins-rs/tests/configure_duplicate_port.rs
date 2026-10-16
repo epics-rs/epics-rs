@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use ad_core_rs::ioc::GenericDriverContext;
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use ad_plugins_rs::ioc::AdIoc;
 use epics_base_rs::server::database::PvDatabase;
@@ -15,7 +15,7 @@ use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::server::iocsh::registry::CommandOutcome;
 
 fn shell(ioc: &AdIoc) -> IocShell {
-    let pool = NDArrayPool::new(4_000_000);
+    let pool = DriverPool::standalone(4_000_000);
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     ioc.mgr().set_driver(Arc::new(GenericDriverContext::new(
         pool,

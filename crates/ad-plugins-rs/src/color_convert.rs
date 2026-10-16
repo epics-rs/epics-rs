@@ -993,6 +993,7 @@ pub struct ColorConvertProcessor {
     config: Mutex<ColorConvertConfig>,
     color_mode_out_idx: Option<usize>,
     false_color_idx: Option<usize>,
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 impl ColorConvertProcessor {
@@ -1001,12 +1002,25 @@ impl ColorConvertProcessor {
             config: Mutex::new(config),
             color_mode_out_idx: None,
             false_color_idx: None,
+            attributes: None,
         }
+    }
+
+    /// C `getAttributes(pArrayOut->pAttributeList)` (NDPluginColorConvert.cpp:543).
+    fn plugin_attributes(&self) -> Option<ad_core_rs::attributes::NDAttributeList> {
+        self.attributes.as_ref()?.evaluate(&[])
     }
 }
 
 impl NDPluginProcess for ColorConvertProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    /// NDPluginColorConvert.cpp:548.
+    const READ_ATTRIBUTES: bool = false;
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
+    }
+
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
@@ -1051,8 +1065,18 @@ impl NDPluginProcess for ColorConvertProcessor {
         // Every arm that does not convert (same mode, unsupported pair, or a shape the
         // arm rejects, e.g. Mono with `ndims != 2` at :84) leaves `pArrayOut` NULL and
         // the untouched input is forwarded — with its own ColorMode, since
-        // `changedColorMode` stayed 0 (:589). A frame is never dropped.
-        let passthrough = || ProcessResult::forward(array, vec![]);
+        // `changedColorMode` stayed 0 (:589). A frame is never dropped. The
+        // plugin's attribute set goes on a copy, as C sets it on its copy.
+        let passthrough = || match self.plugin_attributes() {
+            None => ProcessResult::forward(array, vec![]),
+            Some(attributes) => match pool.alloc_copy(array) {
+                Ok(mut copy) => {
+                    copy.attributes.copy_from(&attributes);
+                    ProcessResult::arrays(vec![Arc::new(copy)])
+                }
+                Err(_) => ProcessResult::forward(array, vec![]),
+            },
+        };
 
         if src_mode == target {
             return passthrough();
@@ -1146,6 +1170,9 @@ impl NDPluginProcess for ColorConvertProcessor {
                     NDColorMode::YUV422 => 6,
                     NDColorMode::YUV411 => 7,
                 };
+                if let Some(attributes) = self.plugin_attributes() {
+                    out.attributes.copy_from(&attributes);
+                }
                 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
                 out.attributes.add(NDAttribute::new_static(
                     "ColorMode",
@@ -1813,6 +1840,43 @@ mod tests {
                 "no ColorMode attribute -> Mono, never an RGB layout guessed from a \
                  size-3 dimension"
             );
+        }
+    }
+
+    /// C `getAttributes(pArrayOut->pAttributeList)` (NDPluginColorConvert.cpp
+    /// :540-545): the plugin's set reaches a converted and an unconverted
+    /// output, and on a converted one its own ColorMode is added after it.
+    #[test]
+    fn the_plugin_attributes_file_reaches_both_outputs() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Site" type="CONST" source="BL7"/>
+            <Attribute name="ColorMode" type="CONST" source="9"/>
+        </Attributes>"#;
+        let input = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        let value = |a: &NDArray, name: &str| a.attributes.get(name).map(|a| a.value.clone());
+        for (port, target, color_mode) in [
+            ("CC_ATTR_RGB", NDColorMode::RGB1, NDAttrValue::Int32(2)),
+            (
+                "CC_ATTR_SAME",
+                NDColorMode::Mono,
+                NDAttrValue::String("9".into()),
+            ),
+        ] {
+            let proc = ColorConvertProcessor::new(ColorConvertConfig {
+                target_mode: target,
+                bayer_pattern: NDBayerPattern::RGGB,
+                false_color: 0,
+            });
+            let (handle, mut rx, _jh) = with_attributes_file(port, proc, xml);
+            publish(&handle, &input);
+            let out = rx.blocking_recv().unwrap();
+            assert_eq!(value(&out, "Site"), Some(NDAttrValue::String("BL7".into())));
+            assert_eq!(value(&out, "ColorMode"), Some(color_mode));
         }
     }
 

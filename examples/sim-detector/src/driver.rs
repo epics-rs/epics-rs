@@ -9,11 +9,9 @@ use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::user::AsynUser;
 
 use ad_core_rs::driver::{ADDriver, ADDriverBase, ImageMode};
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
-use ad_core_rs::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use ad_core_rs::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use ad_core_rs::plugin::runtime::ASYN_NONE;
 use ad_core_rs::runtime as rt;
 
@@ -237,9 +235,8 @@ pub struct SimDetectorRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub sim_params: SimDetectorParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     task_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -249,7 +246,7 @@ impl SimDetectorRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -259,8 +256,7 @@ impl SimDetectorRuntime {
     }
 
     /// Connect a downstream plugin's sender to this detector's output fan-out.
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -301,7 +297,6 @@ pub fn create_sim_detector(
     let (runtime_handle, _actor_jh) = create_port_runtime(claim, det, RuntimeConfig::default())?;
 
     let shared_output = Arc::new(parking_lot::Mutex::new(array_output));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task_handle = start_acquisition_task(AcquisitionContext {
         acq_rx,
@@ -310,7 +305,7 @@ pub fn create_sim_detector(
         dirty,
         ad: ad_params,
         sim: sim_params,
-        queued_counter: queued_counter.clone(),
+        pool: pool.clone(),
     });
 
     Ok(SimDetectorRuntime {
@@ -319,7 +314,6 @@ pub fn create_sim_detector(
         sim_params,
         pool,
         array_output: shared_output,
-        queued_counter,
         task_handle: Some(task_handle),
     })
 }

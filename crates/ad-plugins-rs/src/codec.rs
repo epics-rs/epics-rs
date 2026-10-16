@@ -2332,7 +2332,7 @@ mod tests {
         let (handle, _jh) = create_plugin_runtime_with_output(
             &asyn_rs::asyn_record::claim_port("CODEC_DECOMP").unwrap(),
             CodecProcessor::new(CodecMode::Decompress),
-            pool,
+            pool.max_memory(),
             10,
             output,
             "",
@@ -2355,8 +2355,20 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(Arc::new(compressed)));
-        rt.block_on(handle.array_sender().publish(Arc::new(sentinel)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&compressed)
+                    .unwrap(),
+            ),
+        );
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&sentinel)
+                    .unwrap(),
+            ),
+        );
 
         let first = ds_rx.blocking_recv().expect("downstream array");
         assert_eq!(

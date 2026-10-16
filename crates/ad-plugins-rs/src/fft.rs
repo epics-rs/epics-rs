@@ -1342,6 +1342,44 @@ mod tests {
         assert!(result.attributes.get("ColorMode").is_some());
     }
 
+    /// C `getAttributes(pArrayOut->pAttributeList)` (NDPluginFFT.cpp:215)
+    /// runs after `setIntegerParam(P_FFTNumAveraged, ...)` (:202): the
+    /// spectrum carries the plugin's set with this frame's NumAveraged. The
+    /// runtime's `endProcessCallbacks` evaluation is the same call here.
+    #[test]
+    fn the_spectrum_carries_the_plugin_attributes() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Averaged" type="PARAM" source="FFT_NUM_AVERAGED" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) = with_attributes_file("FFT_ATTRS", FFTProcessor::new(), xml);
+        let port = handle.port_runtime().port_handle();
+        let num_average = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("FFT_NUM_AVERAGE", 0))
+            .unwrap()
+            .reason;
+        port.write_int32_blocking(num_average, 0, 4).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            v[0] = 1.0;
+        }
+        let mut averaged = Vec::new();
+        for _ in 0..2 {
+            publish(&handle, &arr);
+            let out = rx.blocking_recv().unwrap();
+            averaged.push(out.attributes.get("Averaged").map(|a| a.value.clone()));
+        }
+        let read = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("FFT_NUM_AVERAGED", 0))
+            .unwrap()
+            .reason;
+        let last = port.read_int32_blocking(read, 0).unwrap();
+        assert_eq!(averaged[1], Some(NDAttrValue::Int32(last)));
+        assert_ne!(averaged[0], averaged[1]);
+    }
+
     /// The id comes off the plugin's own counter and runs 0, 1, 2 — C's
     /// `uniqueId_` is zeroed in the constructor (NDPluginFFT.cpp:54) and
     /// post-incremented per emitted array (`:219`), so it is independent of

@@ -733,7 +733,7 @@ mod tests {
         let (handle, _jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("PVA1").unwrap(),
             processor,
-            pool,
+            pool.max_memory(),
             10,
             "",
             Arc::new(WiringRegistry::new()),
@@ -755,7 +755,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(Arc::new(compressed)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&compressed)
+                    .unwrap(),
+            ),
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let served = loop {

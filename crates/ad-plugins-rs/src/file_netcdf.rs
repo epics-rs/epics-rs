@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ad_core_rs::attributes::{NDAttrSource, NDAttrValue};
+use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttributeList};
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{FileAttributes, NDFileMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
 
 use parking_lot::Mutex;
 use rust_hdf5::format::messages::datatype::DatatypeMessage;
@@ -136,6 +136,8 @@ pub struct NetcdfWriter {
     /// C `pFileAttributes` (NDFileNetCDF.cpp:72, :362): the writer's own
     /// attribute list, sticky for the life of the file.
     file_attributes: FileAttributes,
+    /// The plugin's own set, C `getAttributes` in `openFile`/`writeFile`.
+    plugin_attributes: NDAttributeList,
 }
 
 /// The variables C defines in `openFile`, held from open to close.
@@ -166,6 +168,7 @@ impl NetcdfWriter {
             current_path: None,
             open: None,
             file_attributes: FileAttributes::default(),
+            plugin_attributes: NDAttributeList::new(),
         }
     }
 }
@@ -460,9 +463,9 @@ impl NDFileWriter for NetcdfWriter {
     fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()> {
         self.open = None;
         self.current_path = Some(path.to_path_buf());
-        // C `openFile` clears `pFileAttributes` and copies this frame's list
-        // into it (NDFileNetCDF.cpp:72-77).
-        self.file_attributes.open(array);
+        // C `openFile` clears `pFileAttributes`, gets the plugin's set and
+        // copies this frame's list on top (NDFileNetCDF.cpp:72-77).
+        self.file_attributes.open(&self.plugin_attributes, array);
         // C: NDPluginFile opens Single with `NDFileModeWrite` and Capture/Stream
         // with `NDFileModeWrite | NDFileModeMultiple` (NDPluginFile.cpp:245, :281,
         // :335) — this writer reports supportsMultipleArrays, so those two modes
@@ -483,9 +486,9 @@ impl NDFileWriter for NetcdfWriter {
             .open
             .as_mut()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-        // C `writeFile` merges this frame into `pFileAttributes` first
-        // (NDFileNetCDF.cpp:359-362).
-        self.file_attributes.frame(array);
+        // C `writeFile` merges the plugin's set and this frame into
+        // `pFileAttributes` first (NDFileNetCDF.cpp:359-362).
+        self.file_attributes.frame(&self.plugin_attributes, array);
         open.append(array, &self.file_attributes)
     }
 
@@ -573,6 +576,10 @@ impl NDFileWriter for NetcdfWriter {
         }
     }
 
+    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
+        self.plugin_attributes = attributes;
+    }
+
     fn supports_multiple_arrays(&self) -> bool {
         true
     }
@@ -581,12 +588,14 @@ impl NDFileWriter for NetcdfWriter {
 /// NetCDF file processor wrapping NDPluginFileBase + NetcdfWriter.
 pub struct NetcdfFileProcessor {
     ctrl: Mutex<FilePluginController<NetcdfWriter>>,
+    attributes: Option<PluginAttributes>,
 }
 
 impl NetcdfFileProcessor {
     pub fn new() -> Self {
         Self {
             ctrl: Mutex::new(FilePluginController::new(NetcdfWriter::new())),
+            attributes: None,
         }
     }
 }
@@ -611,9 +620,12 @@ impl NDPluginProcess for NetcdfFileProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        self.ctrl.lock().write_int32(reason, value, verdict)
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads_on(params));
+        let mut ctrl = self.ctrl.lock();
+        ctrl.set_attribute_reads(attributes);
+        ctrl.write_int32(reason, value, verdict)
     }
 
     /// C NDPluginFile::writeOctet: the setting is stored inside the write.
@@ -628,7 +640,16 @@ impl NDPluginProcess for NetcdfFileProcessor {
         self.ctrl.lock().write_octet(reason, verdict)
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Read before the controller lock: the read waits on the actor,
+        // which takes that lock in its writes.
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads());
+        let mut ctrl = self.ctrl.lock();
+        ctrl.set_attribute_reads(attributes);
+        ctrl.process_array(array)
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -896,6 +917,37 @@ mod tests {
             Some(1),
             "Single must be a fixed frame axis"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C `openFile`/`writeFile` fill `pFileAttributes` from `getAttributes`
+    /// with the frame's list copied on top (NDFileNetCDF.cpp:72-77,
+    /// :359-362), so the plugin's own set gets `Attr_` variables.
+    #[test]
+    fn the_plugin_attributes_get_variables_under_the_frame() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="plugin_only" type="PARAM" source="AUTO_SAVE" datatype="INT"/>
+            <Attribute name="gain" type="CONST" source="99"/>
+        </Attributes>"#;
+        let (handle, _rx, _jh) =
+            with_attributes_file("NETCDF_ATTRS", NetcdfFileProcessor::new(), xml);
+        let path = temp_path("plugin_attrs");
+        auto_save_to(&handle, &path);
+        let mut arr = make_u8(&[4], |_| 0);
+        arr.attributes.add(NDAttribute::new_static(
+            "gain",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(42),
+        ));
+        publish(&handle, &arr);
+        wait_saved(&handle, 1);
+        let file = H5File::open(&path).unwrap();
+        let values = |name: &str| -> Vec<i32> { file.dataset(name).unwrap().read_raw().unwrap() };
+        assert_eq!(values("Attr_plugin_only"), vec![1]);
+        assert_eq!(values("Attr_gain"), vec![42]);
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 

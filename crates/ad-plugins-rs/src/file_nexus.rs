@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ad_core_rs::attributes::NDAttributeList;
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -22,7 +23,7 @@ use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
 use parking_lot::Mutex;
 
 use rust_hdf5::{H5Dataset, H5File};
@@ -336,6 +337,8 @@ pub struct NexusWriter {
     /// (built-in hierarchy only — `Some("entry/data")`). `None` in template
     /// mode, where the template controls all dataset placement.
     nxdata_group_path: Option<String>,
+    /// The plugin's own set, C `getAttributes` in `openFile`.
+    plugin_attributes: NDAttributeList,
 }
 
 impl NexusWriter {
@@ -351,6 +354,7 @@ impl NexusWriter {
             data_group_path: "entry/instrument/detector".to_string(),
             data_node_name: "data".to_string(),
             nxdata_group_path: None,
+            plugin_attributes: NDAttributeList::new(),
         }
     }
 
@@ -403,7 +407,7 @@ impl NexusWriter {
     fn process_template(
         h5file: &H5File,
         template: &XmlElement,
-        array: &NDArray,
+        attributes: &NDAttributeList,
     ) -> ADResult<(String, String)> {
         let mut data_group = String::new();
         let mut data_node = String::new();
@@ -419,7 +423,7 @@ impl NexusWriter {
                 None,
                 "",
                 child,
-                array,
+                attributes,
                 &mut data_group,
                 &mut data_node,
             )?;
@@ -438,7 +442,7 @@ impl NexusWriter {
         parent: Option<&rust_hdf5::H5Group>,
         parent_path: &str,
         node: &XmlElement,
-        array: &NDArray,
+        attributes: &NDAttributeList,
         data_group: &mut String,
         data_node: &mut String,
     ) -> ADResult<()> {
@@ -473,7 +477,7 @@ impl NexusWriter {
                     Some(&group),
                     &child_path,
                     child,
-                    array,
+                    attributes,
                     data_group,
                     data_node,
                 )?;
@@ -499,7 +503,7 @@ impl NexusWriter {
                 // Dataset sourced from an NDAttribute, written once.
                 if let Some(parent) = parent {
                     let source = node.attr("source").unwrap_or(&node.name);
-                    if let Some(attr) = array.attributes.get(source) {
+                    if let Some(attr) = attributes.get(source) {
                         Self::write_attr_dataset(parent, &node.name, &attr.value)?;
                     }
                 }
@@ -511,7 +515,7 @@ impl NexusWriter {
                     let attr_name = node.attr("name").unwrap_or(&node.name);
                     let value = if node.attr("type") == Some("ND_ATTR") {
                         node.attr("source")
-                            .and_then(|s| array.attributes.get(s))
+                            .and_then(|s| attributes.get(s))
                             .map(|a| a.value.as_string())
                             .unwrap_or_default()
                     } else {
@@ -630,7 +634,11 @@ impl NDFileWriter for NexusWriter {
         if let Some(template) = (*self.template).clone() {
             // Template mode: build the group/dataset tree from the user's
             // NeXus XML template (C++ NDFileNexus::loadTemplateFile).
-            let (data_group, data_node) = Self::process_template(&h5file, &template, array)?;
+            // C walks the template against `pFileAttributes`: the plugin's
+            // set with the frame's list on top (NDFileNexus.cpp:53-71).
+            let mut attributes = self.plugin_attributes.clone();
+            attributes.copy_from(&array.attributes);
+            let (data_group, data_node) = Self::process_template(&h5file, &template, &attributes)?;
             self.data_group_path = data_group;
             self.data_node_name = data_node;
         } else {
@@ -930,6 +938,10 @@ impl NDFileWriter for NexusWriter {
         Ok(())
     }
 
+    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
+        self.plugin_attributes = attributes;
+    }
+
     fn supports_multiple_arrays(&self) -> bool {
         true
     }
@@ -953,6 +965,7 @@ pub struct NexusFileProcessor {
     template_path_idx: Option<usize>,
     template_file_idx: Option<usize>,
     template_valid_idx: Option<usize>,
+    attributes: Option<PluginAttributes>,
 }
 
 impl NexusFileProcessor {
@@ -964,6 +977,7 @@ impl NexusFileProcessor {
             template_path_idx: None,
             template_file_idx: None,
             template_valid_idx: None,
+            attributes: None,
         }
     }
 
@@ -996,9 +1010,12 @@ impl NDPluginProcess for NexusFileProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        self.ctrl.lock().write_int32(reason, value, verdict)
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads_on(params));
+        let mut ctrl = self.ctrl.lock();
+        ctrl.set_attribute_reads(attributes);
+        ctrl.write_int32(reason, value, verdict)
     }
 
     /// C `NDFileNexus::writeOctet` (NDFileNexus.cpp:776-813) loads the
@@ -1045,7 +1062,16 @@ impl NDPluginProcess for NexusFileProcessor {
         )
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Read before the controller lock: the read waits on the actor,
+        // which takes that lock in its writes.
+        let attributes = self.attributes.as_ref().and_then(|a| a.reads());
+        let mut ctrl = self.ctrl.lock();
+        ctrl.set_attribute_reads(attributes);
+        ctrl.process_array(array)
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -1281,6 +1307,56 @@ mod tests {
             "const-title"
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C walks the template against `pFileAttributes`, the plugin's
+    /// `getAttributes` set with the frame's list on top (NDFileNexus.cpp:
+    /// 53-71, :322).
+    #[test]
+    fn template_nd_attr_nodes_read_the_plugin_attributes_under_the_frame() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let template = r#"<NXroot>
+              <NXentry name="entry">
+                <NXdata name="data">
+                  <frames type="pArray"/>
+                  <model type="ND_ATTR" source="Model"/>
+                  <make type="ND_ATTR" source="Manufacturer"/>
+                </NXdata>
+              </NXentry>
+            </NXroot>"#;
+        let proc = NexusFileProcessor::new();
+        assert!(proc.ctrl.lock().writer.lock().load_template(template));
+        let xml = r#"<Attributes>
+            <Attribute name="Model" type="CONST" source="PluginModel"/>
+            <Attribute name="Manufacturer" type="CONST" source="PluginMake"/>
+        </Attributes>"#;
+        let (handle, _rx, _jh) = with_attributes_file("NEXUS_ATTRS", proc, xml);
+        let path = temp_path("plugin_attrs");
+        auto_save_to(&handle, &path);
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.attributes
+            .add(ad_core_rs::attributes::NDAttribute::new_static(
+                "Manufacturer",
+                "",
+                ad_core_rs::attributes::NDAttrSource::Driver,
+                ad_core_rs::attributes::NDAttrValue::String("FrameMake".into()),
+            ));
+        publish(&handle, &arr);
+        wait_saved(&handle, 1);
+        let h5file = H5File::open(&path).unwrap();
+        let text = |name: &str| {
+            let bytes: Vec<u8> = h5file
+                .dataset(&format!("entry/data/{name}"))
+                .unwrap()
+                .read_raw()
+                .unwrap();
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(text("model"), "PluginModel");
+        assert_eq!(text("make"), "FrameMake");
         std::fs::remove_file(&path).ok();
     }
 

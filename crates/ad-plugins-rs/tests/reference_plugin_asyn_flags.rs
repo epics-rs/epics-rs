@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use ad_core_rs::ioc::GenericDriverContext;
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use ad_plugins_rs::ioc::{AdIoc, C_PLUGIN_ASYN_FLAGS};
 use epics_base_rs::reference::{ReferenceTree, reference_path};
@@ -83,7 +83,7 @@ fn every_registered_configure_command_has_a_row() {
 
 fn ad_ioc_with_driver(upstream: &str) -> (AdIoc, IocShell) {
     let ioc = AdIoc::new();
-    let pool = NDArrayPool::new(4_000_000);
+    let pool = DriverPool::standalone(4_000_000);
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     ioc.mgr().set_driver(Arc::new(GenericDriverContext::new(
         pool,

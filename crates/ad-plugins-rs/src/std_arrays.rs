@@ -73,7 +73,7 @@ impl NDPluginProcess for StdArraysProcessor {
 /// Create a StdArrays plugin runtime.
 pub fn create_std_arrays_runtime(
     claim: &asyn_rs::registry::PortClaim,
-    pool: Arc<NDArrayPool>,
+    max_memory: usize,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
@@ -86,7 +86,7 @@ pub fn create_std_arrays_runtime(
     let data_handle = processor.data_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        claim, processor, pool, 1, // LatestOnly semantics
+        claim, processor, max_memory, 1, // LatestOnly semantics
         source, wiring, threads,
     );
 
@@ -142,7 +142,7 @@ mod tests {
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, data, _jh) = create_std_arrays_runtime(
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
-            pool,
+            pool.max_memory(),
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -160,7 +160,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(make_array(42)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(42))
+                    .unwrap(),
+            ),
+        );
         wait_until("StdArrays to store the published array", || {
             data.lock().as_ref().is_some_and(|a| a.unique_id == 42)
         });
@@ -174,7 +180,7 @@ mod tests {
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime(
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
-            pool,
+            pool.max_memory(),
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -257,7 +263,7 @@ mod tests {
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, data, _jh) = create_std_arrays_runtime(
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
-            pool,
+            pool.max_memory(),
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -274,7 +280,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(Arc::new(compressed)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&compressed)
+                    .unwrap(),
+            ),
+        );
         wait_until("StdArrays to store the compressed frame", || {
             data.lock().as_ref().is_some_and(|a| a.unique_id == 7)
         });
@@ -324,7 +336,7 @@ mod tests {
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime(
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
-            pool,
+            pool.max_memory(),
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -345,7 +357,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(make_array(7)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(7))
+                    .unwrap(),
+            ),
+        );
         // ArrayCounter==1 ⟹ the frame was processed and its param batch
         // (including the waveform interrupts) flushed.
         wait_until("StdArrays to process the frame", || {
@@ -386,7 +404,7 @@ mod tests {
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime(
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
-            pool,
+            pool.max_memory(),
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -406,7 +424,13 @@ mod tests {
             .build()
             .unwrap();
 
-        rt.block_on(handle.array_sender().publish(make_array(1)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(1))
+                    .unwrap(),
+            ),
+        );
         wait_until("first frame to be served and counted", || {
             port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
                 .is_ok_and(|v| v == 1)
@@ -415,7 +439,13 @@ mod tests {
             .read_int32_blocking(handle.ndarray_params.array_counter, 0)
             .unwrap();
 
-        rt.block_on(handle.array_sender().publish(make_array(2)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(2))
+                    .unwrap(),
+            ),
+        );
         // The throttled frame leaves ArrayCounter unchanged, so wait on the
         // observable it DOES advance: DroppedArrays.
         wait_until("throttled frame to advance DroppedArrays", || {

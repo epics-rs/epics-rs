@@ -18,13 +18,14 @@
 //! 44`), same-width sign changes reinterpret (`(epicsInt8)(epicsUInt8)255
 //! == -1`). Both kernels cast through one definition, `CCast`, and never
 //! clamp. Any plugin that re-implements extraction with an f64 accumulator
-//! plus a clamp/saturate re-opens this divergence — call [`convert_dims`] /
-//! [`convert_type`] instead.
+//! plus a clamp/saturate re-opens this divergence — call
+//! [`crate::ndarray_pool::NDArrayPool::convert`] /
+//! [`crate::ndarray_pool::NDArrayPool::convert_type`] instead.
 
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use crate::ndarray::{NDArray, NDDataBuffer, NDDimension};
 
-/// Accumulator for [`convert_dims`]'s binning sum. C `convertDim`
+/// Accumulator for [`convert_dims_into`]'s binning sum. C `convertDim`
 /// (`NDArrayPool.cpp:465`) does `*pDOut += (dataTypeOut)*pDIn` — each source
 /// element is cast to the OUTPUT type and summed in the OUTPUT type, with C
 /// integer arithmetic wrapping on overflow. The port does the same in the
@@ -112,7 +113,7 @@ bin_acc!(f32, 0.0, |a, b| a + b, bin2_f32, bin4_f32);
 bin_acc!(f64, 0.0, |a, b| a + b, bin2_f64, bin4_f64);
 
 /// The C cast `(D)value` of a source element, and the row operations of
-/// [`convert_dims`] built on it.
+/// [`convert_dims_into`] built on it.
 ///
 /// Between integer types and between float types Rust's `as` is the C cast.
 /// Float to integer is the one edge where they differ: C truncates toward
@@ -397,33 +398,16 @@ mod simd_kernels {
     bin_kernels!(f64, f64s, bin2_f64, bin4_f64);
 }
 
-/// Element-type conversion only — C++ `convertType` (`NDArrayPool.cpp:378`).
+/// Element-type conversion only — C++ `convertType` (`NDArrayPool.cpp:378`),
+/// into a buffer the caller owns: `out` keeps its element type (that is the
+/// target) and its allocation when it is large enough, so a pooled output
+/// buffer is filled in place as C's `convertType` fills the buffer
+/// `NDArrayPool::alloc` handed it.
 ///
 /// Every element goes through the C cast (`(dataTypeOut)value`) of
 /// `CCast`: narrowing truncates to the low bits and wraps, it does not
 /// clamp, and a float source truncates toward zero before that, exactly as
-/// [`convert_dims`] casts it.
-///
-/// Dimensions, timestamps and attributes are carried over unchanged.
-pub fn convert_type(src: &NDArray, target_type: NDDataType) -> ADResult<NDArray> {
-    if src.data.data_type() == target_type {
-        return Ok(src.clone());
-    }
-
-    let mut data = NDDataBuffer::zeros(target_type, 0);
-    convert_type_into(src, &mut data)?;
-    let mut arr = NDArray::with_data(src.dims.clone(), data);
-    arr.unique_id = src.unique_id;
-    arr.copy_time_stamps_from(src);
-    arr.attributes = src.attributes.clone();
-    arr.codec = src.codec.clone();
-    Ok(arr)
-}
-
-/// [`convert_type`] into a buffer the caller owns: `out` keeps its element
-/// type (that is the target) and its allocation when it is large enough, so
-/// a pooled output buffer is filled in place as C's `convertType` fills the
-/// buffer `NDArrayPool::alloc` handed it.
+/// [`convert_dims_into`] casts it.
 pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
     if src.data.data_type() == out.data_type() {
         out.copy_from(&src.data);
@@ -444,40 +428,10 @@ pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> 
     Ok(())
 }
 
-/// Sub-region + binning + reverse + element-type conversion — C++
-/// `NDArrayPool::convert()` (`NDArrayPool.cpp:620-730`, kernel `convertDim`).
-///
-/// `dims_out` gives offset/size/binning/reverse per source dimension:
-/// - output size per dim = `dims_out[i].size / dims_out[i].binning`
-/// - source pixels are **summed** (not averaged) across each binning window,
-///   accumulated in the TARGET type (so the sum wraps modulo the target width)
-/// - `reverse` flips the output along that dimension
-/// - cumulative offset: `out.dims[i].offset = src.dims[i].offset + dims_out[i].offset`
-/// - cumulative binning: `out.dims[i].binning = src.dims[i].binning * dims_out[i].binning`
-/// - cumulative reverse: `out.dims[i].reverse = dims_out[i].reverse ^ src.dims[i].reverse`
-///
-/// The array is built outside any pool; [`crate::ndarray_pool::NDArrayPool::convert`]
-/// wraps this to allocate the result through the pool (C's `convert` calls
-/// `alloc()` for its output).
-pub fn convert_dims(
-    src: &NDArray,
-    dims_out: &[NDDimension],
-    target_type: NDDataType,
-) -> ADResult<NDArray> {
-    let out_dims = output_dims(src, dims_out)?;
-    let mut data = NDDataBuffer::zeros(target_type, 0);
-    convert_dims_into(src, dims_out, &mut data)?;
-    let mut arr = NDArray::with_data(out_dims, data);
-    arr.unique_id = src.unique_id;
-    arr.copy_time_stamps_from(src);
-    arr.attributes.copy_from(&src.attributes);
-    Ok(arr)
-}
-
-/// The dimensions [`convert_dims`] produces for `dims_out`, after the checks
+/// The dimensions [`convert_dims_into`] produces for `dims_out`, after the checks
 /// it applies (C++ NDArrayPool.cpp:626-724): each output size is
 /// `size / binning`, offsets add, binning multiplies, and `reverse` toggles
-/// against the source dimension's own flag. Fails as `convert_dims` fails.
+/// against the source dimension's own flag. Fails as `convert_dims_into` fails.
 pub fn output_dims(src: &NDArray, dims_out: &[NDDimension]) -> ADResult<Vec<NDDimension>> {
     // C parity (NDArrayPool.cpp:620-625): cannot convert compressed data.
     if src.codec.is_some() {
@@ -539,11 +493,23 @@ pub fn output_dims(src: &NDArray, dims_out: &[NDDimension]) -> ADResult<Vec<NDDi
     Ok(out_dims)
 }
 
-/// [`convert_dims`] into a buffer the caller owns: `out`'s element type is
-/// the target type, and its allocation is kept when it is large enough, so a
-/// pooled output buffer is filled in place as C's `convert` fills the buffer
-/// `NDArrayPool::alloc` handed it. `out` ends up holding exactly the
-/// elements of [`output_dims`].
+/// Sub-region + binning + reverse + element-type conversion — C++
+/// `NDArrayPool::convert()` (`NDArrayPool.cpp:620-730`, kernel `convertDim`).
+///
+/// `dims_out` gives offset/size/binning/reverse per source dimension:
+/// - output size per dim = `dims_out[i].size / dims_out[i].binning`
+/// - source pixels are **summed** (not averaged) across each binning window,
+///   accumulated in the TARGET type (so the sum wraps modulo the target width)
+/// - `reverse` flips the output along that dimension
+/// - cumulative offset: `out.dims[i].offset = src.dims[i].offset + dims_out[i].offset`
+/// - cumulative binning: `out.dims[i].binning = src.dims[i].binning * dims_out[i].binning`
+/// - cumulative reverse: `out.dims[i].reverse = dims_out[i].reverse ^ src.dims[i].reverse`
+///
+/// Into a buffer the caller owns: `out`'s element type is the target type,
+/// and its allocation is kept when it is large enough, so a pooled output
+/// buffer is filled in place as C's `convert` fills the buffer
+/// `NDArrayPool::alloc` handed it. `out` ends up holding exactly the elements
+/// of [`output_dims`].
 pub fn convert_dims_into(
     src: &NDArray,
     dims_out: &[NDDimension],
@@ -687,11 +653,12 @@ mod tests {
         assert_eq!(<f32 as CCast<i32>>::c_cast(f32::INFINITY), -1);
     }
 
-    /// Both free-function converts carry the source `uniqueId`, as C++
+    /// Both pool converts carry the source `uniqueId`, as C++
     /// `NDArrayPool::convert` does (NDArrayPool.cpp:660).
     #[test]
     fn both_converts_carry_the_source_unique_id() {
         use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+        let pool = crate::ndarray_pool::NDArrayPool::new(0);
         let mut src = NDArray::with_data(
             vec![NDDimension::new(4)],
             NDDataBuffer::U8(vec![1, 2, 3, 4]),
@@ -699,7 +666,7 @@ mod tests {
         src.unique_id = 91;
 
         assert_eq!(
-            super::convert_type(&src, NDDataType::Float64)
+            pool.convert_type(&src, NDDataType::Float64)
                 .unwrap()
                 .unique_id,
             91
@@ -707,7 +674,7 @@ mod tests {
         let mut d = NDDimension::new(2);
         d.offset = 1;
         assert_eq!(
-            super::convert_dims(&src, &[d], NDDataType::UInt8)
+            pool.convert(&src, &[d], NDDataType::UInt8)
                 .unwrap()
                 .unique_id,
             91
@@ -729,13 +696,15 @@ mod tests {
             vec![NDDimension::new(values.len())],
             NDDataBuffer::F32(values),
         );
-        let typed = super::convert_type(&src, NDDataType::UInt8).unwrap();
-        let dims = super::convert_dims(
-            &src,
-            &[NDDimension::new(src.dims[0].size)],
-            NDDataType::UInt8,
-        )
-        .unwrap();
+        let pool = crate::ndarray_pool::NDArrayPool::new(0);
+        let typed = pool.convert_type(&src, NDDataType::UInt8).unwrap();
+        let dims = pool
+            .convert(
+                &src,
+                &[NDDimension::new(src.dims[0].size)],
+                NDDataType::UInt8,
+            )
+            .unwrap();
         let (NDDataBuffer::U8(typed), NDDataBuffer::U8(dims)) = (&typed.data, &dims.data) else {
             panic!("target type not honoured");
         };

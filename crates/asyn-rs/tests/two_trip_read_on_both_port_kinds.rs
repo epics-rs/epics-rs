@@ -7,6 +7,8 @@
 //! inline (asynManager.c:1555-1584) and the re-entered passes run nested:
 //! three reads and three FLNKs, as C mca's three nested `process` calls.
 
+#![cfg(feature = "epics")]
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};

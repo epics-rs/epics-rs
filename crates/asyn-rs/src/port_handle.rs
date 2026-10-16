@@ -165,6 +165,16 @@ fn block_on_prebounded_reply<F: Future>(fut: F) -> F::Output {
 /// "this handle points at me" is not knowable at any call site the compiler can
 /// see. The error names the fix.
 fn guard_reentrant(actor: ActorId, port_name: &str, what: &str) -> AsynResult<()> {
+    if HELD.with(|held| held.borrow().contains(&actor)) {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!(
+                "{what} called on port {port_name} by a thread holding its driver: the \
+                 request would wait for its own release. Run the step through \
+                 DriverHold::run instead."
+            ),
+        });
+    }
     if crate::port_actor::current_actor() == Some(actor) {
         return Err(AsynError::Status {
             status: AsynStatus::Error,
@@ -178,6 +188,94 @@ fn guard_reentrant(actor: ActorId, port_name: &str, what: &str) -> AsynResult<()
         });
     }
     Ok(())
+}
+
+thread_local! {
+    /// The ports whose driver this thread holds through a [`DriverHold`].
+    static HELD: std::cell::RefCell<Vec<ActorId>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+type HeldOp<D> = Box<dyn FnOnce(&mut D) + Send>;
+
+/// The driver lock [`PortHandle::hold_driver_blocking`] took; dropping it is
+/// C's `unlock()`. Tied to the thread that took it, as a C mutex is.
+pub struct DriverHold<D: PortDriver> {
+    port: PortHandle,
+    /// `None` once a re-take after [`Self::unlocked`] found the port gone.
+    ops: Option<std::sync::mpsc::Sender<HeldOp<D>>>,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl<D: PortDriver> DriverHold<D> {
+    /// Run `f` on the driver inside the hold and return what it returns.
+    pub fn run<R: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut D) -> R + Send + 'static,
+    ) -> AsynResult<R> {
+        let ended = || AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("port {}: the driver hold ended", self.port.port_name),
+        };
+        let ops = self.ops.as_ref().ok_or_else(ended)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        ops.send(Box::new(move |d| {
+            let _ = tx.send(f(d));
+        }))
+        .map_err(|_| ended())?;
+        rx.recv().map_err(|_| ended())
+    }
+
+    /// C `unlock()` … `lock()` around `wait`. A port gone by the re-take
+    /// leaves the hold ended: every later [`Self::run`] errors.
+    pub fn unlocked<R>(&mut self, wait: impl FnOnce() -> R) -> R {
+        self.release();
+        let r = wait();
+        self.ops = self.enter().ok();
+        r
+    }
+
+    fn enter(&self) -> AsynResult<std::sync::mpsc::Sender<HeldOp<D>>> {
+        let port = &self.port;
+        guard_reentrant(port.actor, &port.port_name, "hold_driver_blocking")?;
+        let (ops, session) = std::sync::mpsc::channel::<HeldOp<D>>();
+        let (entered, taken) = std::sync::mpsc::sync_channel(1);
+        let call = DriverCall::new(move |driver| {
+            let driver: &mut dyn Any = driver;
+            let Some(driver) = driver.downcast_mut::<D>() else {
+                return;
+            };
+            let _ = entered.send(());
+            for op in session {
+                op(driver);
+            }
+        });
+        let done = port.try_submit(RequestOp::WithDriver(call), AsynUser::default())?;
+        if taken.recv().is_ok() {
+            HELD.with(|held| held.borrow_mut().push(port.actor));
+            return Ok(ops);
+        }
+        // The call never entered: the actor's refusal, or a driver of
+        // another type.
+        port.blocking("hold_driver_blocking", done)?;
+        Err(port.wrong_driver::<D>())
+    }
+
+    fn release(&mut self) {
+        if self.ops.take().is_some() {
+            HELD.with(|held| {
+                let mut held = held.borrow_mut();
+                if let Some(at) = held.iter().position(|a| *a == self.port.actor) {
+                    held.swap_remove(at);
+                }
+            });
+        }
+    }
+}
+
+impl<D: PortDriver> Drop for DriverHold<D> {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Async completion handle returned by [`PortHandle::try_submit`].
@@ -1198,6 +1296,21 @@ impl PortHandle {
         self.driver_result::<D, R>(result)
     }
 
+    /// A driver thread's C `lock()`, held across several steps until the
+    /// returned [`DriverHold`] drops (`unlock()`): the actor stays inside one
+    /// request running the steps [`DriverHold::run`] sends, so a client
+    /// request issued meanwhile lands after the release. Returns once the
+    /// lock is taken.
+    pub fn hold_driver_blocking<D: PortDriver>(&self) -> AsynResult<DriverHold<D>> {
+        let mut hold = DriverHold {
+            port: self.clone(),
+            ops: None,
+            _thread: std::marker::PhantomData,
+        };
+        hold.ops = Some(hold.enter()?);
+        Ok(hold)
+    }
+
     /// C `updateTimeStamp` from a driver's own task: refresh the port's
     /// timestamp through its source, on the actor, and return it.
     pub async fn update_time_stamp(&self) -> AsynResult<SystemTime> {
@@ -1291,14 +1404,18 @@ impl PortHandle {
 
     fn driver_result<D, R>(&self, result: Arc<Mutex<Option<R>>>) -> AsynResult<R> {
         let value = result.lock().unwrap_or_else(|e| e.into_inner()).take();
-        value.ok_or_else(|| AsynError::Status {
+        value.ok_or_else(|| self.wrong_driver::<D>())
+    }
+
+    fn wrong_driver<D>(&self) -> AsynError {
+        AsynError::Status {
             status: AsynStatus::Error,
             message: format!(
                 "port {}: driver is not a {}",
                 self.port_name,
                 std::any::type_name::<D>()
             ),
-        })
+        }
     }
 
     // --- Option convenience methods ---
@@ -2397,6 +2514,73 @@ mod tests {
             .with_driver_blocking(|_: &mut Other| unreachable!())
             .unwrap_err();
         assert!(err.to_string().contains("Other"), "{err}");
+    }
+
+    /// A client write issued between two steps of a held span lands after
+    /// the release, as one queued behind a C driver thread's `lock()` does.
+    #[test]
+    fn a_write_issued_during_a_held_span_lands_after_it() {
+        let handle = make_handle(TestDriver::new());
+        let mut hold = handle.hold_driver_blocking::<TestDriver>().unwrap();
+        hold.run(|d| d.base.set_int32_param(0, 0, 5).unwrap())
+            .unwrap();
+        let writer = {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.write_int32_blocking(0, 0, 7))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let seen = hold.run(|d| d.base.get_int32_param(0, 0).unwrap()).unwrap();
+        assert_eq!(seen, 5, "the write reached the driver inside the span");
+        assert!(!writer.is_finished());
+        drop(hold);
+        writer.join().unwrap().unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 7);
+    }
+
+    /// `unlocked` is C's `unlock()` … `lock()`: a write queued in the window
+    /// lands before the span resumes.
+    #[test]
+    fn a_write_lands_while_the_hold_is_unlocked() {
+        let handle = make_handle(TestDriver::new());
+        let mut hold = handle.hold_driver_blocking::<TestDriver>().unwrap();
+        let writer = {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.write_int32_blocking(0, 0, 7))
+        };
+        hold.unlocked(|| writer.join().unwrap().unwrap());
+        let seen = hold.run(|d| d.base.get_int32_param(0, 0).unwrap()).unwrap();
+        assert_eq!(seen, 7);
+    }
+
+    /// Boundary: the holder's own blocking request would wait for its own
+    /// release — refused, not deadlocked; after the release it runs.
+    #[test]
+    fn a_holders_own_blocking_request_is_refused() {
+        let handle = make_handle(TestDriver::new());
+        let hold = handle.hold_driver_blocking::<TestDriver>().unwrap();
+        let err = handle.read_int32_blocking(0, 0).unwrap_err();
+        assert!(err.to_string().contains("holding its driver"), "{err}");
+        drop(hold);
+        handle.write_int32_blocking(0, 0, 3).unwrap();
+    }
+
+    /// Boundary: a hold of another driver type errors and leaves the port
+    /// free.
+    #[test]
+    fn a_hold_of_another_driver_type_is_refused() {
+        struct Other(PortDriverBase);
+        impl PortDriver for Other {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+        let handle = make_handle(TestDriver::new());
+        let err = handle.hold_driver_blocking::<Other>().err().unwrap();
+        assert!(err.to_string().contains("Other"), "{err}");
+        handle.write_int32_blocking(0, 0, 3).unwrap();
     }
 
     /// Boundary: a call with no closure — the second clone of a request, or one

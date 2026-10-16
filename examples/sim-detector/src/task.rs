@@ -432,6 +432,39 @@ mod tests {
         assert!(counter >= 1, "should have produced at least 1 frame");
     }
 
+    /// C `computeImage` puts the colour axis where the mode says
+    /// (simDetector.cpp:599-623): RGB1 first, RGB2 between X and Y, RGB3 last.
+    #[test]
+    fn each_rgb_mode_puts_the_colour_axis_where_c_does() {
+        use ad_core_rs::driver::ColorMode;
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
+        let mut det =
+            crate::driver::SimDetector::new("SIM_RGB_DIMS", 8, 4, 1_000_000, acq_tx, dirty)
+                .unwrap();
+        for (mode, dims) in [
+            (ColorMode::Mono, vec![8, 4]),
+            (ColorMode::RGB1, vec![3, 8, 4]),
+            (ColorMode::RGB2, vec![8, 3, 4]),
+            (ColorMode::RGB3, vec![8, 4, 3]),
+        ] {
+            det.ad
+                .port_base
+                .set_int32_param(det.ad.params.base.color_mode, 0, mode as i32)
+                .unwrap();
+            let config =
+                SimConfigSnapshot::read_from(&det.ad.port_base, &det.ad.params, &det.sim_params)
+                    .unwrap();
+            let mut state = TaskState::new();
+            let mut all = DirtyFlags::default();
+            all.set_all();
+            state.apply_dirty(&all, &config);
+            let frame = state.compute_frame(&config, true);
+            let got: Vec<usize> = frame.dims.iter().map(|d| d.size).collect();
+            assert_eq!(got, dims, "{mode:?}");
+        }
+    }
+
     #[test]
     fn test_continuous_mode_produces_frames() {
         let rt = create_sim_detector(

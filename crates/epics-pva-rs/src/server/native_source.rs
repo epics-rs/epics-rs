@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::channel_shape::ChannelShape;
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
-use crate::server_native::source::{PutOptions, SourceRead};
+use crate::server_native::source::{ProcessMode, PutOptions, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 use epics_base_rs::server::database::char_view::{DollarView, PvaDollar, long_string_text};
 
@@ -1481,7 +1481,6 @@ impl ChannelSource for PvDatabaseSource {
         value: PvField,
         ctx: crate::server_native::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        use epics_base_rs::server::access_security as acs;
         let db = self.db.clone();
         async move {
             if !checked.allows_write() {
@@ -1494,7 +1493,6 @@ impl ChannelSource for PvDatabaseSource {
             let Some(PvEntry::Record(rec)) = channel_entry(&db, &cn).await else {
                 return self.put_value(&name, value).await;
             };
-            let (epics, char_address) = record_put_value(&rec, &cn, &value)?;
             // pvxs reads `record._options.process` / `.block` off the INIT
             // pvRequest inside `onPut` (`singlesource.cpp:347-352`) and
             // routes the write on them; this source used to write
@@ -1502,35 +1500,86 @@ impl ChannelSource for PvDatabaseSource {
             // `process=false` still processed, `process=true` never forced,
             // and `block=true` replied before processing finished.
             let opts = put_options_from_ctx(&ctx);
-            // pvxs logs `dbChannelFinalFieldType(pChan)`, i.e. the DBF of
-            // the addressed field, not the type the client sent. This
-            // source keeps no per-channel state, so the field is resolved
-            // here — and only when an event would actually be dispatched,
-            // since resolving it clones the field's current value.
-            let dbr_type = if acs::trap_write_armed(checked.rule_was_trap()) {
-                let inst = rec.read();
-                // The declaration first: a long-string field is served as the
-                // `LEN` elements it holds, while its address is `DBF_STRING`.
-                let dbf = inst.declared_field_type(&cn.field).or_else(|| {
-                    inst.client_field_value(&cn.field)
-                        .map(|v| v.db_field_type())
-                });
-                dbf.map(|t| t as u16).unwrap_or_default()
-            } else {
-                0
-            };
-            let peer = ctx.peer.to_string();
-            let meta = acs::TrapWriteMeta {
-                pv_name: &name,
-                user: ctx.creds.account.as_bytes(),
-                host: &ctx.creds.host,
-                peer: &peer,
-                dbr_type,
-            };
-            acs::put_with_trap(checked.rule_was_trap(), meta, epics, |v| {
-                put_record_field(&db, &cn, (v, char_address), &opts)
-            })
+            put_record(
+                &db,
+                &checked,
+                &ctx,
+                &cn,
+                &rec,
+                RecordPut::Write(value),
+                &opts,
+            )
             .await
+        }
+    }
+
+    /// A record channel's PUT takes the value pvxs's `SingleSource::onPut`
+    /// receives, not the trait default's read-merge-write.
+    ///
+    /// pvxs decodes every EXEC into a freshly built value
+    /// (`Value::Helper::build(op->type)` + `from_wire_valid`,
+    /// `serverget.cpp:466-469`), so an unmarked leaf is its type default, and
+    /// the non-blocking put writes `value` (an NTEnum's `value.index`) whether
+    /// marked or not (`singlesource.cpp:371-380`, `iocsource.cpp:589-591`).
+    /// A blocking put whose `value` is unmarked is `processRequest`
+    /// (`singlesource.cpp:363-364`), which `dbNotify.c:233-252` answers with
+    /// neither a write nor a process; a non-blocking one whose unmarked
+    /// `value` is a numeric array writes nothing (`putArray` of a null array)
+    /// and still post-processes. A mailbox `SharedPV` keeps the merge.
+    fn put_delta_checked(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        desc: Arc<FieldDesc>,
+        changed: crate::proto::BitSet,
+        delta: &PvField,
+        ctx: crate::server_native::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        use crate::pvdata::encode::{default_value_for, fill_unmarked_from_prior, prune_to_marked};
+        let db = self.db.clone();
+        let delta = delta.clone();
+        async move {
+            if !checked.allows_write() {
+                return Err(crate::server_native::source::put_denied(&checked, &ctx));
+            }
+            let entry = match resolve_channel(&db, checked.pv_name()) {
+                Some((cn, _filters)) => channel_entry(&db, &cn).await.map(|e| (cn, e)),
+                None => None,
+            };
+            let Some((cn, PvEntry::Record(rec))) = entry else {
+                let prior = self.get_value_checked(checked.clone(), ctx.clone()).await;
+                let merged = match prior {
+                    Some(prior) => fill_unmarked_from_prior(&desc, &changed, 0, delta, &prior),
+                    None => delta,
+                };
+                return self.put_value_checked(checked, merged, ctx).await;
+            };
+            let opts = put_options_from_ctx(&ctx);
+            let value_marked = matches!(
+                prune_to_marked(&desc, &changed, 0, &delta),
+                Some(PvField::Structure(s)) if s.get_field("value").is_some()
+            );
+            let null_array = match &*desc {
+                FieldDesc::Structure { fields, .. } => fields.iter().any(|(n, d)| {
+                    n == "value"
+                        && matches!(d, FieldDesc::ScalarArray(t) if *t != ScalarType::String)
+                }),
+                _ => false,
+            };
+            // `forceProcessing == False` clears `doWait` (`singlesource.cpp:349-351`).
+            let put = if opts.block && opts.process != ProcessMode::Inhibit && !value_marked {
+                RecordPut::Nothing
+            } else if !opts.block && !value_marked && null_array {
+                RecordPut::PostProcess
+            } else {
+                RecordPut::Write(fill_unmarked_from_prior(
+                    &desc,
+                    &changed,
+                    0,
+                    delta,
+                    &default_value_for(&desc),
+                ))
+            };
+            put_record(&db, &checked, &ctx, &cn, &rec, put, &opts).await
         }
     }
 
@@ -2261,6 +2310,103 @@ fn scalar_shaped(
 }
 
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────
+
+/// `write` inside the `asTrapWrite` put-log bracket pvxs's `SecurityLogger`
+/// opens for every record put ([`acs::put_with_trap`]).
+async fn trapped_put<F, Fut>(
+    checked: &epics_base_rs::server::access_security::AccessChecked,
+    ctx: &crate::server_native::ChannelContext,
+    cn: &ChannelName,
+    rec: &epics_base_rs::server::record::RecordCell,
+    epics: EpicsValue,
+    write: F,
+) -> Result<(), OpError>
+where
+    F: FnOnce(EpicsValue) -> Fut,
+    Fut: std::future::Future<Output = Result<(), OpError>>,
+{
+    use epics_base_rs::server::access_security as acs;
+    // pvxs logs `dbChannelFinalFieldType(pChan)`, i.e. the DBF of the
+    // addressed field, not the type the client sent. This source keeps no
+    // per-channel state, so the field is resolved here — and only when an
+    // event would actually be dispatched, since resolving it clones the
+    // field's current value.
+    let dbr_type = if acs::trap_write_armed(checked.rule_was_trap()) {
+        let inst = rec.read();
+        // The declaration first: a long-string field is served as the
+        // `LEN` elements it holds, while its address is `DBF_STRING`.
+        let dbf = inst.declared_field_type(&cn.field).or_else(|| {
+            inst.client_field_value(&cn.field)
+                .map(|v| v.db_field_type())
+        });
+        dbf.map(|t| t as u16).unwrap_or_default()
+    } else {
+        0
+    };
+    let peer = ctx.peer.to_string();
+    let meta = acs::TrapWriteMeta {
+        pv_name: checked.pv_name(),
+        user: ctx.creds.account.as_bytes(),
+        host: &ctx.creds.host,
+        peer: &peer,
+        dbr_type,
+    };
+    acs::put_with_trap(checked.rule_was_trap(), meta, epics, write).await
+}
+
+/// What a record channel's PUT does to the record.
+enum RecordPut {
+    /// Write this value, then process as the options ask.
+    Write(PvField),
+    /// Write nothing and post-process: pvxs's `putArray` of a null array.
+    PostProcess,
+    /// Write nothing, process nothing: pvxs's blocking `processRequest`.
+    Nothing,
+}
+
+/// The record arm of every PUT, inside the put-log bracket. A put that
+/// writes nothing logs the field as it stands, which is what the record
+/// holds afterwards; `doPreProcessing`'s DISP gate still runs.
+async fn put_record(
+    db: &PvDatabase,
+    checked: &epics_base_rs::server::access_security::AccessChecked,
+    ctx: &crate::server_native::ChannelContext,
+    cn: &ChannelName,
+    rec: &epics_base_rs::server::record::RecordCell,
+    put: RecordPut,
+    opts: &PutOptions,
+) -> Result<(), OpError> {
+    let failed = |e: epics_base_rs::error::CaError| OpError::failed(e.to_string());
+    let current = || {
+        let value = rec.read().client_field_value(&cn.field);
+        value.unwrap_or(EpicsValue::Long(0))
+    };
+    match put {
+        RecordPut::Write(value) => {
+            let (epics, char_address) = record_put_value(rec, cn, &value)?;
+            trapped_put(checked, ctx, cn, rec, epics, |v| {
+                put_record_field(db, cn, (v, char_address), opts)
+            })
+            .await
+        }
+        RecordPut::PostProcess => {
+            trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                db.process_field_from_client(&cn.record, &cn.field, opts.process)
+                    .await
+                    .map_err(failed)
+            })
+            .await
+        }
+        RecordPut::Nothing => {
+            trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                db.check_external_put_preconditions(&cn.record, &cn.field)
+                    .await
+                    .map_err(failed)
+            })
+            .await
+        }
+    }
+}
 
 /// The record-arm backing write of a PVA PUT, shared by the ctx-less
 /// [`ChannelSource::put_value`] and the audited `put_value_checked`.
@@ -6109,6 +6255,127 @@ ASG(PLAIN) {
             .resolve_field("VAL")
             .and_then(|v| v.to_f64())
             .unwrap()
+    }
+
+    /// An NTEnum PUT to `MB` (an mbbo at index 2) whose wire delta carries a
+    /// stale index 1 and marks `value.index` only when `mark_index` is set.
+    async fn enum_delta_put(mark_index: bool, ctx: ChannelContext) -> Arc<PvDatabase> {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(mbbo, "MB") { field(ZRST, "A") field(ONST, "B") field(TWST, "C") field(VAL, "2") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let desc = Arc::new(source.get_introspection(b"MB").await.expect("desc"));
+        let mut delta = crate::pvdata::encode::default_value_for(&desc);
+        if let PvField::Structure(root) = &mut delta
+            && let Some(PvField::Structure(value)) = root.get_field_mut("value")
+        {
+            value.set("index", PvField::Scalar(ScalarValue::Int(1)));
+        }
+        // NTEnum bits: 0 root, 1 value, 2 value.index.
+        let mut changed = crate::proto::BitSet::new();
+        if mark_index {
+            changed.set(2);
+        }
+        let checked = source
+            .access()
+            .check(
+                "MB",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        source
+            .put_delta_checked(checked, desc, changed, &delta, ctx)
+            .await
+            .expect("PUT must succeed");
+        db
+    }
+
+    fn mb_index(db: &PvDatabase) -> f64 {
+        val_of(db, "MB")
+    }
+
+    /// pvxs builds each EXEC's value fresh and its non-blocking put writes
+    /// `value.index` marked or not (`serverget.cpp:466-469`,
+    /// `singlesource.cpp:371-380`): an unmarked index lands as 0, never as the
+    /// record's prior index nor the stale delta slot.
+    #[epics_macros_rs::epics_test]
+    async fn unmarked_enum_index_put_writes_zero() {
+        let db = enum_delta_put(false, make_ctx("lab-pc1", "op", "ca")).await;
+        assert_eq!(mb_index(&db), 0.0);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn marked_enum_index_put_writes_the_index() {
+        let db = enum_delta_put(true, make_ctx("lab-pc1", "op", "ca")).await;
+        assert_eq!(mb_index(&db), 1.0);
+    }
+
+    /// A blocking put with `value` unmarked is `processRequest`
+    /// (`singlesource.cpp:363-364`): `dbNotify.c:233-252` neither writes nor
+    /// processes.
+    #[epics_macros_rs::epics_test]
+    async fn blocking_unmarked_enum_put_neither_writes_nor_processes() {
+        let ctx = ctx_with_options(&[("block", PvField::Scalar(ScalarValue::Boolean(true)))]);
+        let db = enum_delta_put(false, ctx).await;
+        assert_eq!(mb_index(&db), 2.0);
+        assert!(!has_processed(&db, "MB"));
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn blocking_marked_enum_put_writes_and_processes() {
+        let ctx = ctx_with_options(&[("block", PvField::Scalar(ScalarValue::Boolean(true)))]);
+        let db = enum_delta_put(true, ctx).await;
+        assert_eq!(mb_index(&db), 1.0);
+        assert!(has_processed(&db, "MB"));
+    }
+
+    /// pvxs's `putArray` drops a null array before any `dbPut`
+    /// (`iocsource.cpp:542-543`) and `doPostProcessing` still runs, so a put
+    /// marking nothing leaves a waveform's elements and processes it.
+    #[epics_macros_rs::epics_test]
+    async fn unmarked_array_put_writes_nothing_and_processes() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(waveform, "WF") { field(FTVL, "DOUBLE") field(NELM, "4") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.put_pv("WF", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let desc = Arc::new(source.get_introspection(b"WF").await.expect("desc"));
+        let delta = crate::pvdata::encode::default_value_for(&desc);
+        let ctx = make_ctx("lab-pc1", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "WF",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        source
+            .put_delta_checked(checked, desc, crate::proto::BitSet::new(), &delta, ctx)
+            .await
+            .expect("PUT must succeed");
+        let val = db.get_record("WF").unwrap().read().resolve_field("VAL");
+        assert_eq!(val.map(|v| v.count()), Some(3), "elements untouched");
+        assert!(has_processed(&db, "WF"));
     }
 
     /// `record[process=false]` — pvxs `setForceProcessingFlag` maps it to

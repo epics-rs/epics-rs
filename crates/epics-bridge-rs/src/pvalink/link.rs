@@ -977,12 +977,28 @@ impl PvaLink {
         let req = build_put_request(combined_proc, block);
 
         let put_result = if staged.is_empty() {
-            // Forced with nothing staged: pvxs `linkBuildPut` returns the
-            // prototype untouched, so the DATA phase carries an empty
-            // changed bitset and no value (`pvxs/ioc/pvalink_channel.cpp:127-184`).
-            self.client
-                .pvput_empty_with_request(&self.config.pv_name, &req)
+            // Forced with nothing staged: pvxs's `build()` put fetches the
+            // present value first (`_doGet`, `src/clientget.cpp:678-692`) and
+            // `linkBuildPut` returns it untouched, so the target's own value
+            // goes back marked as the readback marked it. An empty bitset
+            // instead has a QSRV server write `value`'s type default.
+            match self
+                .client
+                .pvput_begin(&self.config.pv_name, Some(&req), true)
                 .await
+            {
+                Ok(mut op) => {
+                    let (value, changed) = op.take_present().unwrap_or_else(|| {
+                        let desc = op.introspection();
+                        (
+                            epics_pva_rs::pvdata::encode::default_value_for(desc),
+                            epics_pva_rs::proto::BitSet::new(),
+                        )
+                    });
+                    op.commit(&value, &changed).await
+                }
+                Err(e) => Err(e),
+            }
         } else if staged.len() == 1 {
             let (field, sp) = &staged[0];
             self.put_single(field, &sp.value, &req).await
@@ -3038,6 +3054,23 @@ mod tests {
                     let subcmd = payload[8];
                     let mut p = Vec::new();
                     p.put_u32(ioid, ORDER);
+                    if subcmd & 0x40 != 0 {
+                        // GetOPut: the present value, `value` = 5 marked.
+                        p.put_u8(0x40);
+                        Status::ok().write_into(ORDER, &mut p);
+                        let mut changed = epics_pva_rs::proto::BitSet::new();
+                        changed.set(1);
+                        changed.write_into(ORDER, &mut p);
+                        p.put_f64(5.0, ORDER);
+                        if sock
+                            .write_all(&app_frame(Command::Put.code(), p))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     if subcmd & 0x08 != 0 {
                         obs.lock().unwrap().put_init_req = Some(payload[9..].to_vec());
                         p.put_u8(0x08);
@@ -3087,14 +3120,15 @@ mod tests {
     /// spelled CMD_PROCESS: `pvaScanForward` is `lchan->put(true)`
     /// (`pvxs/ioc/pvalink_lset.cpp:683`), which `pvaLinkChannel::put` turns into a
     /// PUT with `record._options.process = "true"`
-    /// (`pvxs/ioc/pvalink_channel.cpp:257-263`) whose `linkBuildPut` marked no field
-    /// (`:127-184`), i.e. an EMPTY changed bitset.
+    /// (`pvxs/ioc/pvalink_channel.cpp:257-263`) whose `linkBuildPut` returns
+    /// the fetched present value untouched (`:127-184`,
+    /// `src/clientget.cpp:678-692`).
     ///
     /// Pre-fix `scan_forward` sent cmd 16; the switch above drained it and
     /// the op blocked to the client timeout, so the remote record never
     /// processed and no in-tree epics-rs-to-epics-rs test could see it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn forward_link_puts_an_empty_bitset_with_process_true() {
+    async fn forward_link_puts_the_present_value_with_process_true() {
         use epics_pva_rs::proto::ByteOrder;
         use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
@@ -3143,7 +3177,7 @@ mod tests {
              (pvxs/ioc/pvalink_channel.cpp:258-260)"
         );
 
-        // The DATA phase marks nothing: an empty changed bitset, no value.
+        // The DATA phase is the present value as fetched, marked as fetched.
         let data = seen
             .put_data_body
             .as_ref()
@@ -3151,16 +3185,15 @@ mod tests {
         let mut cur = std::io::Cursor::new(&data[..]);
         let changed = epics_pva_rs::proto::BitSet::decode(&mut cur, ByteOrder::Little)
             .expect("changed bitset");
-        assert_eq!(
-            changed.count(),
-            0,
-            "a forward link writes no field, so linkBuildPut leaves the \
-             prototype unmarked (pvxs/ioc/pvalink_channel.cpp:127-184)"
+        assert!(
+            changed.get(1) && changed.count() == 1,
+            "a forward link sends back the readback's marks: {changed:?}"
         );
+        let rest = &data[cur.position() as usize..];
         assert_eq!(
-            cur.position() as usize,
-            data.len(),
-            "an unmarked bitset must be followed by no value bytes"
+            rest,
+            5.0f64.to_le_bytes(),
+            "the target's present value goes back unchanged"
         );
     }
 
@@ -4689,5 +4722,53 @@ mod tests {
             PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(d, 42.0),
             other => panic!("expected Double 42, got {other:?}"),
         }
+    }
+
+    /// softIocPVX writes an unmarked `value` as its type default, so a
+    /// forward link that marks nothing zeroes an ai and blanks a stringin.
+    /// pvxs's own forward sends the readback back and leaves both as they were.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+    #[test]
+    #[ignore = "spawns pvxs softIocPVX; runs in --profile interop"]
+    fn a_forward_link_leaves_a_softiocpvx_target_value_alone() {
+        use epics_oracle_rs::ioc::{Ioc as _, PvxIoc, PvxTools};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("fwd.db");
+        std::fs::write(
+            &db,
+            "record(ai, \"FWD:AI\") { field(VAL, \"5\") }\n\
+             record(stringin, \"FWD:SI\") { field(VAL, \"hello\") }\n",
+        )
+        .expect("write the db");
+        let tools = PvxTools::discover().expect("the pvxs tools");
+        let ioc = PvxIoc::boot(&tools, &db).expect("boot softIocPVX");
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], ioc.port()).into();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for pv in ["FWD:AI", "FWD:SI"] {
+                let client = PvaClient::builder()
+                    .server_addr(addr)
+                    .timeout(Duration::from_secs(5))
+                    .build();
+                let before = client.pvget(pv).await.expect("read before");
+                let link = PvaLink::for_test_with_client(
+                    PvaLinkConfig::defaults_for(pv, LinkDirection::Inp),
+                    client.clone(),
+                );
+                link.scan_forward(true).await.expect("forward link fires");
+                let after = client.pvget(pv).await.expect("read after");
+                let value = |v: &PvField| match v {
+                    PvField::Structure(s) => s.get_field("value").cloned(),
+                    _ => None,
+                };
+                assert_eq!(value(&after), value(&before), "{pv}");
+            }
+        });
     }
 }

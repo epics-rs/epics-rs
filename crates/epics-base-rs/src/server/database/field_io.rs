@@ -3474,6 +3474,33 @@ impl PvDatabase {
         }
     }
 
+    /// An external non-blocking put that writes nothing but still owes its
+    /// post-processing: pvxs's `putArray` of a null array returns before any
+    /// `dbPut` (`ioc/iocsource.cpp:542-543`) and `doPostProcessing` runs as
+    /// for any put (`:397-419`).
+    pub async fn process_field_from_client(
+        &self,
+        record_name: impl AsRef<[u8]>,
+        field: &str,
+        process: ProcessMode,
+    ) -> CaResult<()> {
+        let record_name = record_name.as_ref();
+        self.check_external_put_preconditions(record_name, field)
+            .await?;
+        let drive = match process {
+            ProcessMode::Inhibit => false,
+            ProcessMode::Force => true,
+            ProcessMode::Passive => self
+                .get_record(record_name)
+                .is_some_and(|rec| put_drives_processing_of(&rec.read(), field)),
+        };
+        if drive {
+            self.put_driven_process(record_name).await
+        } else {
+            Ok(())
+        }
+    }
+
     /// Await a blocking external PUT's completion under
     /// [`ClientAwaitingNotify`], so a client that goes away mid-put hands the
     /// record back instead of wedging every put queued behind it.

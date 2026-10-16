@@ -112,6 +112,17 @@ pub struct SimConfigSnapshot {
     pub wait_for_plugins: bool,
 }
 
+/// The layout C `simDetector::computeImage` draws for `NDColorMode`
+/// (simDetector.cpp:599-623): Mono, RGB1, RGB2 or RGB3. It has no case for
+/// Bayer or YUV, which `simDetector.template` does not offer; those are drawn
+/// as Mono.
+fn sim_color_mode(value: i32) -> ColorMode {
+    match ColorMode::from_i32(value) {
+        mode @ (ColorMode::RGB1 | ColorMode::RGB2 | ColorMode::RGB3) => mode,
+        _ => ColorMode::Mono,
+    }
+}
+
 impl SimConfigSnapshot {
     /// Read config via PortHandle (async). For use from the acquisition task thread.
     pub async fn read_via_handle(
@@ -123,10 +134,7 @@ impl SimConfigSnapshot {
         let data_type = NDDataType::from_ordinal(dt_ord).unwrap_or(NDDataType::UInt8);
 
         let cm = handle.read_int32(ad.base.color_mode, 0).await?;
-        let color_mode = match cm {
-            2 => ColorMode::RGB1,
-            _ => ColorMode::Mono,
-        };
+        let color_mode = sim_color_mode(cm);
 
         Ok(Self {
             sim_mode: SimMode::from_i32(handle.read_int32(sim.sim_mode, 0).await?),
@@ -205,10 +213,7 @@ impl SimConfigSnapshot {
         let data_type = NDDataType::from_ordinal(dt_ord).unwrap_or(NDDataType::UInt8);
 
         let cm = base.get_int32_param(ad.base.color_mode, 0)?;
-        let color_mode = match cm {
-            2 => ColorMode::RGB1,
-            _ => ColorMode::Mono,
-        };
+        let color_mode = sim_color_mode(cm);
 
         Ok(Self {
             sim_mode: SimMode::from_i32(base.get_int32_param(sim.sim_mode, 0)?),

@@ -4140,11 +4140,12 @@ mod tests {
             .unwrap();
         let write = |v: &str| rt.block_on(port.write_octet(name, 0, v.as_bytes().to_vec()));
         let read = || rt.block_on(port.read_octet(name, 0, 64)).unwrap();
+        // asynPortDriver::readOctet counts the NUL: `strlen(value) + 1`.
         assert!(write("good").is_ok());
         assert!(write("old").is_err());
-        assert_eq!(read(), b"good");
+        assert_eq!(read(), b"good\0");
         assert!(write("bad").is_err());
-        assert_eq!(read(), b"bad");
+        assert_eq!(read(), b"bad\0");
 
         params_applied(&handle);
         assert_eq!(
@@ -4943,7 +4944,7 @@ mod tests {
         assert_eq!(
             rt.block_on(port.read_octet(p.nd_array_port, 0, 16))
                 .unwrap(),
-            b"NOPE"
+            b"NOPE\0"
         );
         assert!(
             rt.block_on(port.write_octet(p.nd_array_port, 0, b"UP".to_vec()))

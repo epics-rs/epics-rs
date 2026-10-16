@@ -320,6 +320,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     ("optics-rs", "tests/ml_mono_reads_monitor_vars.rs"),
     ("optics-rs", "tests/hr_reads_monitor_vars.rs"),
+    ("optics-rs", "tests/orient_reads_monitor_vars.rs"),
     ("optics-rs", "tests/table_link_kind.rs"),
     ("regression-ioc", "tests/families.rs"),
     ("regression-ioc", "tests/motor.rs"),

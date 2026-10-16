@@ -522,3 +522,63 @@ async fn an_e_put_queued_after_auto_mode_moves() {
     }
     eventually_near(&server, "K:y.VAL", -17.77).await;
 }
+
+/// updateRdbk takes no command while the motors move: the next
+/// waitForCmndEnter drops the theta setpoint raised meanwhile, and a theta
+/// HLM put waits for the move (C kohzuIoc oracle: theta 20 and th.HLM 85
+/// put during the move to 30 leave DRVH 89 until it stops, then th.VAL 30,
+/// BraggThetaAO 20, DRVH 85, "Theta Motor Soft Limits Changed", Done).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setpoint_put_during_a_move_is_dropped() {
+    let server = boot([10.0, -17.77, 100.78]).await;
+    settled(&server, "y offset changed to 17.500000").await;
+    let db = (**server.database()).clone();
+    let put = |pv: &'static str, v: f64| {
+        let db = db.clone();
+        async move {
+            optics_rs::db_access::DbChannel::new(&db, pv)
+                .put_f64_process(v)
+                .await
+                .unwrap();
+        }
+    };
+    // The test motors have no driver, so the test owns DMOV for all three.
+    let set_dmov = |done: bool| {
+        for motor in ["K:th", "K:y", "K:z"] {
+            db.get_record(motor)
+                .unwrap()
+                .write()
+                .record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
+                .unwrap()
+                .stat
+                .dmov = done;
+        }
+    };
+    let drvh = f64_of(&server, "K:BraggThetaAO.DRVH").await;
+    put("K:KohzuModeBO", 1.0).await;
+    set_dmov(false);
+    put("K:BraggThetaAO", 30.0).await;
+    eventually_near(&server, "K:th.VAL", 30.0).await;
+    put("K:BraggThetaAO", 20.0).await;
+    put("K:th.HLM", 85.0).await;
+    // Nothing to wait on for an absence: give a taken command time to show.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_near(&server, "K:th.VAL", 30.0).await;
+    assert_near(&server, "K:BraggThetaAO.DRVH", drvh).await;
+    set_dmov(true);
+    eventually(|| async {
+        let msg1 = string_of(&server, "K:KohzuSeqMsg1SI").await;
+        if msg1 == "Theta Motor Soft Limits Changed" {
+            Ok(())
+        } else {
+            Err(format!("SeqMsg1 {msg1:?}"))
+        }
+    })
+    .await;
+    eventually_near(&server, "K:BraggThetaAO.DRVH", 85.0).await;
+    eventually_near(&server, "K:KohzuMoving", 0.0).await;
+    assert_near(&server, "K:th.VAL", 30.0).await;
+    assert_near(&server, "K:BraggThetaAO", 20.0).await;
+}

@@ -11,13 +11,15 @@
 //! Modes: Normal (Z moves) and Freeze-Z (channel-cut, Z frozen).
 //! Z position: z = y_offset / tan(2*theta).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use tracing::info;
 
 use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
-use crate::snl::kohzu_ctl::HC;
+use crate::snl::kohzu_ctl::{HC, update_set};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -262,6 +264,29 @@ pub async fn run(
     config: MlMonoConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let use_set_pv = config.pv("UseSet");
+    let use_set_mode = Arc::new(AtomicBool::new(
+        DbChannel::new(&db, &use_set_pv).get_i16().await != 0,
+    ));
+    // updateSet (ml_monoCtl.st:1262-1305).
+    let update_set = update_set(
+        db.clone(),
+        use_set_pv,
+        [&config.m_theta, &config.m_theta2, &config.m_z].map(|m| config.motor_pv(m, ".SET")),
+        use_set_mode.clone(),
+    );
+    tokio::select! {
+        r = ml_mono_ctl(config, db, use_set_mode) => r,
+        () = update_set => Ok(()),
+    }
+}
+
+/// The ml_monoCtl state set.
+async fn ml_mono_ctl(
+    config: MlMonoConfig,
+    db: PvDatabase,
+    use_set_mode: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("ml_monoCtl: starting for prefix={}", config.prefix);
 
     let my_origin = alloc_origin();
@@ -374,14 +399,6 @@ pub async fn run(
     let ch_y_mot_rbv =
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".RBV"), my_origin);
 
-    let _ch_use_set = DbChannel::with_origin(&db, &config.pv("UseSet"), my_origin);
-    let ch_theta_mot_set_flag =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".SET"), my_origin);
-    let ch_theta2_mot_set_flag =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".SET"), my_origin);
-    let ch_z_mot_set_flag =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".SET"), my_origin);
-
     let ch_y_offset = DbChannel::with_origin(&db, &config.pv("_yOffset"), my_origin);
 
     // Tweak (inc/dec) feature: ± step buttons for E / lambda / theta.
@@ -414,7 +431,6 @@ pub async fn run(
         config.motor_pv(&config.m_theta, ".HLM"),
         config.motor_pv(&config.m_theta, ".LLM"),
         config.pv("_yOffset"),
-        config.pv("UseSet"),
         config.pv("EInc"),
         config.pv("EDec"),
         config.pv("LambdaInc"),
@@ -486,7 +502,6 @@ pub async fn run(
     let mut e_val = lambda_to_energy(lambda_val);
     let _ = ch_e.put_f64_process(e_val).await;
 
-    let mut use_set_mode = false;
     let mut y_offset_val = config.y_offset;
     let mut _caused_move = false;
 
@@ -512,7 +527,6 @@ pub async fn run(
     let pv_theta_hilim = config.motor_pv(&config.m_theta, ".HLM");
     let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
     let pv_y_offset = config.pv("_yOffset");
-    let pv_use_set = config.pv("UseSet");
     let pv_e_inc = config.pv("EInc");
     let pv_e_dec = config.pv("EDec");
     let pv_lambda_inc = config.pv("LambdaInc");
@@ -741,12 +755,6 @@ pub async fn run(
                 .await;
             let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
             proceed_to_theta_changed = true;
-        } else if changed_pv == pv_use_set {
-            use_set_mode = new_val as i16 != 0;
-            let sv = if use_set_mode { 1i16 } else { 0 };
-            let _ = ch_theta_mot_set_flag.put_i16_process(sv).await;
-            let _ = ch_theta2_mot_set_flag.put_i16_process(sv).await;
-            let _ = ch_z_mot_set_flag.put_i16_process(sv).await;
         }
 
         if !proceed_to_theta_changed {
@@ -801,7 +809,10 @@ pub async fn run(
 
         // -- Move --
         let put_requested = ch_put_vals.get_i16().await != 0;
-        if monitor.var(&pv_auto_mode) != 0.0 || put_requested || use_set_mode {
+        if monitor.var(&pv_auto_mode) != 0.0
+            || put_requested
+            || use_set_mode.load(Ordering::Relaxed)
+        {
             let th_speed = ch_theta_mot_velo.get_f64().await;
             let z_speed = ch_z_mot_velo.get_f64().await;
             // Save the pre-coordination motor speeds for restoration after the

@@ -856,8 +856,6 @@ pub async fn run(
     let ch_msg = DbChannel::with_origin(&db, &format!("{p}Msg"), my_origin);
     let _ch_mot_put = DbChannel::with_origin(&db, &format!("{p}motPut"), my_origin);
     let _ch_mot_get = DbChannel::with_origin(&db, &format!("{p}motGet"), my_origin);
-    let ch_mot_put_auto = DbChannel::with_origin(&db, &format!("{p}motPut_Auto"), my_origin);
-    let ch_mot_get_auto = DbChannel::with_origin(&db, &format!("{p}motGet_Auto"), my_origin);
 
     // Build multi-monitor
     let monitored_pvs: Vec<String> = vec![
@@ -878,10 +876,16 @@ pub async fn run(
         format!("{p}Mode"),
         format!("{p}motPut"),
         format!("{p}motGet"),
-        format!("{p}motPut_Auto"),
-        format!("{p}motGet_Auto"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+    // C `ASSIGN_MONITOR` syncs no event flag (orient_st.st:70-72, :126, :136)
+    // and only action code reads them (:557, :993, :1024, :1053), so they are
+    // written on arrival and wake nothing.
+    let pv_mot_put_auto = format!("{p}motPut_Auto");
+    let pv_mot_get_auto = format!("{p}motGet_Auto");
+    monitor
+        .add_vars(&db, &[pv_mot_put_auto.clone(), pv_mot_get_auto.clone()])
+        .await;
     println!(
         "orient: subscribed to {} PVs, {} active",
         monitored_pvs.len(),
@@ -920,8 +924,6 @@ pub async fn run(
             gamma,
         };
     }
-    ctrl.mot_put_auto = ch_mot_put_auto.get_i16().await as i32 != 0;
-    ctrl.mot_get_auto = ch_mot_get_auto.get_i16().await as i32 != 0;
 
     // Initial A0 + OMTX
     ctrl.recalc_a0();
@@ -948,8 +950,6 @@ pub async fn run(
     let pv_mode = format!("{p}Mode");
     let pv_mot_put = format!("{p}motPut");
     let pv_mot_get = format!("{p}motGet");
-    let pv_mot_put_auto = format!("{p}motPut_Auto");
-    let pv_mot_get_auto = format!("{p}motGet_Auto");
 
     // Main event loop
     loop {
@@ -1019,17 +1019,13 @@ pub async fn run(
             } else {
                 None
             }
-        } else if changed_pv == pv_mot_put_auto {
-            ctrl.mot_put_auto = new_val as i32 != 0;
-            None
-        } else if changed_pv == pv_mot_get_auto {
-            ctrl.mot_get_auto = new_val as i32 != 0;
-            None
         } else {
             None
         };
 
         if let Some(ev) = event {
+            ctrl.mot_put_auto = monitor.var(&pv_mot_put_auto) as i16 != 0;
+            ctrl.mot_get_auto = monitor.var(&pv_mot_get_auto) as i16 != 0;
             let actions = ctrl.step(ev);
 
             // Apply actions

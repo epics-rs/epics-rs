@@ -299,6 +299,7 @@ pub fn coordinate_speeds(
 /// then the connect-time monitor events.
 enum Step {
     ThChanged,
+    UpdateRdbk,
     ChkMotorLimits,
     Ready,
     Event(String, f64),
@@ -312,6 +313,7 @@ enum Next {
     EChanged,
     LChanged,
     ThChanged,
+    ThetaMotStopped,
     CalcMovements,
 }
 
@@ -802,7 +804,10 @@ async fn kohzu_ctl(
     #[allow(unused_assignments)]
     let mut speed_control: bool = false;
     let mut y_offset_val: f64 = ch_y_offset.get_f64().await;
-    let mut _caused_move = false;
+    // C's causedMove, and the speeds moveKohzu replaced, which
+    // thetaMotStopped restores (kohzuCtl.st:997, :1181-1195).
+    let mut caused_move = false;
+    let mut old_speeds = [0.0; 3];
     let risk_averse = false;
 
     // Last *accepted* motor setpoints. C kohzuCtl snapshots prev_thetaMotDesired/
@@ -854,8 +859,6 @@ async fn kohzu_ctl(
         two_d, theta_lo, theta_hi
     );
 
-    let mut deferred_events: HashMap<String, f64> = HashMap::new();
-    let mut pending_retarget = false;
     loop {
         // C waitForCmndEnter (kohzuCtl.st:607-671), which only acts once
         // initSeqDone.
@@ -865,7 +868,6 @@ async fn kohzu_ctl(
                 &pv_h, &pv_k, &pv_l, &pv_a, &pv_e, &pv_moving, &pv_lambda, &pv_theta,
             ] {
                 monitor.clear(pv);
-                deferred_events.remove(pv);
             }
             let _ = ch_theta_rdbk_echo
                 .put_f64_process(ch_theta_mot_rbv.get_f64().await)
@@ -928,6 +930,10 @@ async fn kohzu_ctl(
             Some(Step::Event(pv, val)) => (pv, val),
             Some(Step::ThChanged) => {
                 next = Next::ThChanged;
+                (String::new(), 0.0)
+            }
+            Some(Step::UpdateRdbk) => {
+                next = Next::UpdateRdbk;
                 (String::new(), 0.0)
             }
             Some(Step::ChkMotorLimits) => {
@@ -1020,20 +1026,7 @@ async fn kohzu_ctl(
                 next = Next::ThChanged;
                 (String::new(), 0.0)
             }
-            None if pending_retarget => {
-                // Retarget: values already updated, skip wait and go straight to move
-                pending_retarget = false;
-                next = Next::ThChanged;
-                (String::new(), 0.0)
-            }
-            None => {
-                if let Some(key) = deferred_events.keys().next().cloned() {
-                    let val = deferred_events.remove(&key).unwrap();
-                    (key, val)
-                } else {
-                    monitor.wait_change().await
-                }
-            }
+            None => monitor.wait_change().await,
         };
         tracing::trace!("kohzuCtl: PV changed: {} = {}", changed_pv, new_val);
 
@@ -1207,29 +1200,30 @@ async fn kohzu_ctl(
         }
 
         if next == Next::UpdateRdbk {
-            // C updateRdbk -> thetaMotStopped for a theta move kohzuCtl did
-            // not command (kohzuCtl.st:1102-1216); its own moves are followed
-            // by the move loop below.
-            if ch_theta_mot_rbv.get_f64().await == 0.0 {
-                let _ = ch_seq_msg1
-                    .put_string_process("Theta Motor Readback is 0 !")
-                    .await;
-                let _ = ch_seq_msg2
-                    .put_string_process("Monochromator stopped")
-                    .await;
-                let _ = ch_alert.put_i16_process(1).await;
-                enter_wait = true;
-                continue;
-            }
+            // C updateRdbk (kohzuCtl.st:1102-1179): no command is taken
+            // while the motors move; the setpoint monitors raised meanwhile
+            // are dropped by the next waitForCmndEnter.
             loop {
+                if ch_theta_mot_rbv.get_f64().await == 0.0 {
+                    let _ = ch_seq_msg1
+                        .put_string_process("Theta Motor Readback is 0 !")
+                        .await;
+                    let _ = ch_seq_msg2
+                        .put_string_process("Monochromator stopped")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                    break;
+                }
                 if ch_theta_dmov.get_i16().await != 0
                     && ch_y_dmov.get_i16().await != 0
                     && ch_z_dmov.get_i16().await != 0
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
+                    next = Next::ThetaMotStopped;
                     break;
                 }
                 if let Some(msg) = limit_switches.hit(cc_mode_of(&mut monitor)).await {
+                    // stopKohzu, stoppedKohzuWait (kohzuCtl.st:1289-1305).
                     let _ = ch_seq_msg1.put_string_process(msg).await;
                     let _ = ch_alert.put_i16_process(1).await;
                     let _ = ch_auto_mode.put_i16_process(0).await;
@@ -1250,6 +1244,10 @@ async fn kohzu_ctl(
                 let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
                 let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
             }
+            if next != Next::ThetaMotStopped {
+                enter_wait = true;
+                continue;
+            }
             theta_rdbk_val = ch_theta_mot_rbv.get_f64().await;
             lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
             e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
@@ -1259,14 +1257,29 @@ async fn kohzu_ctl(
             kohzu_done = true;
             let _ = ch_theta_rdbk_echo.put_f64_process(theta_rdbk_val).await;
             monitor.clear(&pv_theta_mot_rbv);
-            let _ = ch_alert.put_i16_process(1).await;
-            let _ = ch_seq_msg1
-                .put_string_process("Only Theta Motor Moved")
-                .await;
-            let _ = ch_seq_msg2
-                .put_string_process("Hit MOVE to Adjust Y & Z")
-                .await;
-            let _ = ch_auto_mode.put_i16_process(0).await;
+            // C thetaMotStopped (kohzuCtl.st:1181-1216).
+            if std::mem::take(&mut caused_move) {
+                if speed_control {
+                    for (ch, speed) in [&ch_theta_mot_velo, &ch_y_mot_velo, &ch_z_mot_velo]
+                        .into_iter()
+                        .zip(old_speeds)
+                    {
+                        let _ = ch.put_f64_process(speed).await;
+                    }
+                }
+                enter_wait = true;
+                continue;
+            }
+            if init_seq_done {
+                let _ = ch_alert.put_i16_process(1).await;
+                let _ = ch_seq_msg1
+                    .put_string_process("Only Theta Motor Moved")
+                    .await;
+                let _ = ch_seq_msg2
+                    .put_string_process("Hit MOVE to Adjust Y & Z")
+                    .await;
+                let _ = ch_auto_mode.put_i16_process(0).await;
+            }
             theta_val = theta_rdbk_val;
             let _ = ch_theta.put_f64_process(theta_val).await;
             lambda_val = theta_to_lambda(theta_val, two_d);
@@ -1427,30 +1440,13 @@ async fn kohzu_ctl(
             || put_requested
             || use_set_mode.load(Ordering::Relaxed)
         {
-            let _ = ch_moving.put_i16_process(1).await;
-
-            // Save the pre-coordination motor speeds so they can be restored
-            // once the move finishes. C `kohzuCtl.st` saves oldThSpeed/
-            // oldYSpeed/oldZSpeed before applying the coordinated speeds
-            // (state moveKohzu) and restores them when the motors stop
-            // (state thetaMotStopped). Without the restore, each coordinated
-            // move leaves a reduced `.VELO` that the next move reads back as
-            // its baseline, so the speeds decay geometrically toward zero.
-            let mut old_th_speed = 0.0;
-            let mut old_y_speed = 0.0;
-            let mut old_z_speed = 0.0;
-            let mut speeds_coordinated = false;
-
             // Coordinate speeds
             speed_control = ch_speed_ctrl.get_i16().await != 0;
             if speed_control {
                 let th_speed = ch_theta_mot_velo.get_f64().await;
                 let y_speed = ch_y_mot_velo.get_f64().await;
                 let z_speed = ch_z_mot_velo.get_f64().await;
-                old_th_speed = th_speed;
-                old_y_speed = y_speed;
-                old_z_speed = z_speed;
-                speeds_coordinated = true;
+                old_speeds = [th_speed, y_speed, z_speed];
                 let th_delta = theta_val - current_rbv;
                 let y_delta = y_mot_desired - ch_y_mot_rbv.get_f64().await;
                 let z_delta = z_mot_desired - ch_z_mot_rbv.get_f64().await;
@@ -1496,141 +1492,9 @@ async fn kohzu_ctl(
             }
 
             let _ = ch_put_vals.put_i16_process(0).await;
-            _caused_move = true;
-
-            // Wait for motors done, while still accepting new setpoints.
-            // If a new setpoint arrives during the move, stop motors and
-            // let the outer loop recalculate and re-issue the move.
-            let mut retarget = false;
-            loop {
-                tokio::select! {
-                    // Poll DMOV every 100ms
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        let th_dmov = ch_theta_dmov.get_i16().await;
-                        let y_dmov = ch_y_dmov.get_i16().await;
-                        let z_dmov = ch_z_dmov.get_i16().await;
-
-                        if let Some(msg) = limit_switches.hit(cc_mode_of(&mut monitor)).await {
-                            let _ = ch_seq_msg1.put_string_process(msg).await;
-                            let _ = ch_alert.put_i16_process(1).await;
-                            let _ = ch_auto_mode.put_i16_process(0).await;
-                            let _ = ch_seq_msg2.put_string_process("Setting to Manual Mode").await;
-                            let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                            let _ = ch_y_stop.put_i16_process(1).await;
-                            let _ = ch_z_stop.put_i16_process(1).await;
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            break;
-                        }
-
-                        // Update readbacks while moving
-                        let rbv = ch_theta_mot_rbv.get_f64().await;
-                        theta_rdbk_val = rbv;
-                        lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-                        e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                        let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-                        let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-                        let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-                        if th_dmov != 0 && y_dmov != 0 && z_dmov != 0 {
-                            break;
-                        }
-                    }
-                    // Monitor event during move — only retarget for setpoint changes
-                    (changed_pv_new, new_val_new) = monitor.wait_change() => {
-                        // Only retarget for energy/lambda/theta setpoint changes
-                        let is_setpoint = changed_pv_new == pv_e
-                            || changed_pv_new == pv_lambda
-                            || changed_pv_new == pv_theta;
-                        if !is_setpoint {
-                            if changed_pv_new != pv_theta_mot_rbv {
-                                deferred_events.insert(changed_pv_new.clone(), new_val_new);
-                            }
-                            if changed_pv_new == pv_put_vals {
-                                let _ = ch_seq_msg2
-                                    .put_string_process("Control change deferred until move completes")
-                                    .await;
-                            }
-                            continue;
-                        }
-                        tracing::debug!("kohzuCtl: new setpoint during move: {} = {}", changed_pv_new, new_val_new);
-                        // Stop current motors — with processing, like a C
-                        // pvPut (motorRecord.dbd STOP is pp(TRUE)). A bare
-                        // field write leaves the stop latent until the next
-                        // record process, which is the very put that commands
-                        // the retargeted move — the latent stop then cancels
-                        // that move at the following poll, so the motor stays
-                        // at the pre-retarget position while the seq reports
-                        // the move done.
-                        let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                        let _ = ch_y_stop.put_i16_process(1).await;
-                        let _ = ch_z_stop.put_i16_process(1).await;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        // Update internal state directly (don't defer —
-                        // deferred events would be filtered as "no change"
-                        // since we already updated the value here)
-                        if changed_pv_new == pv_e {
-                            e_val = new_val_new;
-                            lambda_val = energy_to_lambda(e_val);
-                            if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                                theta_val = th;
-                            }
-                        } else if changed_pv_new == pv_lambda {
-                            lambda_val = new_val_new;
-                            e_val = lambda_to_energy(lambda_val);
-                            if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                                theta_val = th;
-                            }
-                        } else if changed_pv_new == pv_theta {
-                            theta_val = new_val_new;
-                            lambda_val = theta_to_lambda(theta_val, two_d);
-                            e_val = lambda_to_energy(lambda_val);
-                        }
-                        let _ = ch_moving.put_i16_process(0).await;
-                        retarget = true;
-                        break;
-                    }
-                }
-            }
-            // Restore the pre-coordination motor speeds on every exit from
-            // the move — normal completion, limit-switch stop, or retarget.
-            // C `kohzuCtl.st` restores them in state thetaMotStopped
-            // (kohzuCtl.st:1147-1153). Restoring *before* the retarget
-            // `continue` is what keeps the baseline read at the top of the
-            // next move clean, so coordinated speeds never compound across
-            // retargets.
-            if speeds_coordinated {
-                let _ = ch_theta_mot_velo.put_f64_process(old_th_speed).await;
-                if !cc_mode_of(&mut monitor).y_frozen() {
-                    let _ = ch_y_mot_velo.put_f64_process(old_y_speed).await;
-                }
-                if !cc_mode_of(&mut monitor).z_frozen() {
-                    let _ = ch_z_mot_velo.put_f64_process(old_z_speed).await;
-                }
-            }
-
-            // If retarget, recalculate and immediately re-enter move logic
-            if retarget {
-                let _ = ch_seq_msg1.put_string_process("Retargeting...").await;
-                pending_retarget = true;
-                _caused_move = false;
-                continue;
-            }
-
-            _caused_move = false;
-
-            // Final readback update
-            let rbv = ch_theta_mot_rbv.get_f64().await;
-            theta_rdbk_val = rbv;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-            kohzu_done = true;
-            let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
-            // updateRdbk's efClear(thetaMotRdbk_mon) (kohzuCtl.st:1127).
-            monitor.clear(&pv_theta_mot_rbv);
+            caused_move = true;
+            steps.push_back(Step::UpdateRdbk);
+            continue;
         }
         enter_wait = true;
     }

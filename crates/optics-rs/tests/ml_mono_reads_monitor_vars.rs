@@ -1,6 +1,7 @@
 #![cfg(tokio_backend)]
 //! ml_monoCtl reads autoMode and ccMode as C's monitored variables, written
-//! as each monitor arrives (ml_monoCtl.st:55-64, no efflag).
+//! as each monitor arrives (ml_monoCtl.st:55-64, no efflag), and its
+//! updateSet state set ties UseSet to the motor .SET fields (:1262-1305).
 
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::busy::BusyRecord;
@@ -105,5 +106,57 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         "theta {} not driven: th.VAL {}",
         f64_of(&server, "M:ml_monoTheta").await,
         f64_of(&server, "M:th.VAL").await
+    );
+}
+
+async fn set_flags(server: &CaServer) -> [f64; 4] {
+    let mut flags = [0.0; 4];
+    for (flag, pv) in flags
+        .iter_mut()
+        .zip(["M:th.SET", "M:th2.SET", "M:z.SET", "M:y.SET"])
+    {
+        *flag = f64_of(server, pv).await;
+    }
+    flags
+}
+
+async fn put_process(server: &CaServer, pv: &str, v: f64) {
+    optics_rs::db_access::DbChannel::new(server.database(), pv)
+        .put_f64_process(v)
+        .await
+        .unwrap();
+}
+
+/// C kohzuIoc oracle: UseSet 1 sets th/th2/z .SET and leaves y alone; a
+/// th2.SET 0 then takes UseSet, and through it th and z, back to Use.
+#[tokio::test]
+async fn use_set_and_the_motor_set_fields_follow_each_other() {
+    let server = boot([10.0, 10.0, 0.0, 100.0]).await;
+    put_process(&server, "M:ml_monoUseSet", 1.0).await;
+    let mut flags = [0.0; 4];
+    for _ in 0..100 {
+        flags = set_flags(&server).await;
+        if flags == [1.0, 1.0, 1.0, 0.0] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        flags,
+        [1.0, 1.0, 1.0, 0.0],
+        "th, th2, z, y .SET after UseSet 1"
+    );
+
+    put_process(&server, "M:th2.SET", 0.0).await;
+    for _ in 0..100 {
+        flags = set_flags(&server).await;
+        if f64_of(&server, "M:ml_monoUseSet").await == 0.0 && flags == [0.0; 4] {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "UseSet {} .SET {flags:?} after th2.SET 0",
+        f64_of(&server, "M:ml_monoUseSet").await
     );
 }

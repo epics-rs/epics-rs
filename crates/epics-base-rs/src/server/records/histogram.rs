@@ -947,6 +947,16 @@ mod tests {
         );
     }
 
+    /// C init_record turns NELM <= 0 into 1 (histogramRecord.c:158).
+    #[test]
+    fn nelm_zero_loads_as_one() {
+        for n in [0, 1] {
+            let mut rec = HistogramRecord::default();
+            rec.put_field("NELM", EpicsValue::ULong(n)).unwrap();
+            assert_eq!(rec.nelm, 1, "{n}");
+        }
+    }
+
     #[test]
     fn nelm_defaults_to_one_per_dbd_initial() {
         let rec = HistogramRecord::default();

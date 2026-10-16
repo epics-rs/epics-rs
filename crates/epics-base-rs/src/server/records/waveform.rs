@@ -1421,14 +1421,11 @@ impl Record for WaveformRecord {
                 } else {
                     // waveform/aai/aao: NELM is `special(SPC_NOMOD)`, so a CA put
                     // never reaches here — this arm is the `.db`-load / builder
-                    // sizing path, where NELM must be a positive element count.
-                    // Preserve the existing element data instead of wiping VAL.
-                    if n <= 0 {
-                        return Err(CaError::InvalidValue(format!(
-                            "NELM must be positive, got {n}"
-                        )));
-                    }
-                    self.nelm = n;
+                    // sizing path. C init_record turns NELM <= 0 into 1
+                    // (waveformRecord.c:94, aaiRecord.c:109, aaoRecord.c:112);
+                    // areaDetector loads NELM=0 (NDStats YSIZE=0), so refusing it
+                    // would drop the whole file. Preserve the existing element data.
+                    self.nelm = n.max(1);
                     self.resize_val_preserving();
                     Ok(())
                 }
@@ -1966,6 +1963,23 @@ mod array_kind_tests {
         r.put_field("NELM", EpicsValue::Long(-1)).unwrap();
         r.sa_clamp_bounds();
         assert_eq!(r.get_field("NELM"), Some(EpicsValue::ULong(1)));
+    }
+
+    /// C init_record turns a loaded NELM 0 into 1 for waveform, aai and aao;
+    /// areaDetector's NDStats.template loads NELM=$(YSIZE)=0 on quadEM.
+    #[test]
+    fn array_nelm_zero_loads_as_one() {
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::Aao] {
+            for n in [0, 1] {
+                let mut r = WaveformRecord::with_kind(kind);
+                r.put_field("NELM", EpicsValue::ULong(n)).unwrap();
+                assert_eq!(
+                    r.get_field("NELM"),
+                    Some(EpicsValue::ULong(1)),
+                    "{kind:?} {n}"
+                );
+            }
+        }
     }
 
     #[test]

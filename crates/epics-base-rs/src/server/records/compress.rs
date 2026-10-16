@@ -1109,6 +1109,17 @@ mod pbuf_tests {
         assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::ULong(1)));
     }
 
+    /// C init_record turns NSAM < 1 into 1 (compressRecord.c:311).
+    #[test]
+    fn nsam_zero_loads_as_one() {
+        for n in [0, 1] {
+            let mut rec = CompressRecord::default();
+            rec.put_field("NSAM", EpicsValue::ULong(n)).unwrap();
+            assert_eq!(rec.nsam, 1, "{n}");
+            assert_eq!(rec.val.len(), 1, "{n}");
+        }
+    }
+
     /// The overrides answer what the trait defaults derive from `val()`, which
     /// is a `DoubleArray` whether the ring is empty, partial or full.
     #[test]

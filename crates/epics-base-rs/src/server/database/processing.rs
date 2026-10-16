@@ -435,6 +435,7 @@ enum Completion {
 /// `PRIO` selects.
 pub struct DeviceDoneSource<'a> {
     done: &'a DeviceDone,
+    pact: bool,
 }
 
 impl<'a> DeviceDoneSource<'a> {
@@ -442,10 +443,26 @@ impl<'a> DeviceDoneSource<'a> {
     /// generation now current is the one a read's completion re-enters on, so
     /// a cancel or a newer token in between makes that re-entry a no-op.
     pub fn new(done: &'a DeviceDone) -> Self {
+        Self::arm(done, false)
+    }
+
+    /// [`Self::new`] for the pass a completion re-entered, which may queue
+    /// again: C mca's status pass sends `mcaData` (devMcaAsyn.c:284-289).
+    pub fn continuing(done: &'a DeviceDone) -> Self {
+        Self::arm(done, true)
+    }
+
+    fn arm(done: &'a DeviceDone, pact: bool) -> Self {
         let body = done.0.body();
         body.epoch
             .store(body.generation.load(Ordering::Acquire), Ordering::Release);
-        Self { done }
+        Self { done, pact }
+    }
+
+    /// C `pr->pact` as the dset reads it: set on a pass a completion
+    /// re-entered, where devAsyn's `if (!pr->pact) queueRequest` does not queue.
+    pub fn pact(&self) -> bool {
+        self.pact
     }
 
     /// The record's band, C `pr->prio`.
@@ -6047,15 +6064,15 @@ impl PvDatabase {
                         // (`devTimeOfDay.c:122` uses `psi->phas`).
                         dev.set_process_context(&instance.common.process_context());
                         // C devAsyn's `if (!pr->pact) queueRequest` on a canBlock
-                        // port (devAsynInt32.c:836-839): a pass entered idle may
-                        // queue the read and end here; the pass its completion
-                        // re-enters reads what landed.
-                        let begun = if is_continuation {
-                            Ok(crate::server::device_support::ReadStart::Synchronous)
+                        // port (devAsynInt32.c:836-839): a pass may queue the read
+                        // and end here, and the pass its completion re-enters is
+                        // asked again — C mca queues its data read from there.
+                        let done = if is_continuation {
+                            DeviceDoneSource::continuing(&instance.device_done)
                         } else {
-                            let done = DeviceDoneSource::new(&instance.device_done);
-                            dev.read_begin(&mut *instance.record, &done)
+                            DeviceDoneSource::new(&instance.device_done)
                         };
+                        let begun = dev.read_begin(&mut *instance.record, &done);
                         if let Ok(crate::server::device_support::ReadStart::Pending) = begun {
                             instance.enter_pact();
                             instance.device = Some(dev);

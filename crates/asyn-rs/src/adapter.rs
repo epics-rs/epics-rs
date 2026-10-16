@@ -3732,7 +3732,8 @@ impl DeviceSupport for AsynDeviceSupport {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        if !self.reason_set
+        if done.pact()
+            || !self.reason_set
             || !self.handle.can_block()
             || self.time_series.is_some()
             || (!self.write_only && (self.average.is_some() || self.asyn_readback))

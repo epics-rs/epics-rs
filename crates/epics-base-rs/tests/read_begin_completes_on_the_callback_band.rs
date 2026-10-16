@@ -36,6 +36,9 @@ impl DeviceSupport for Queues {
         _record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
+        if done.pact() {
+            return Ok(ReadStart::Synchronous);
+        }
         self.begins.fetch_add(1, Ordering::SeqCst);
         *self.pending.lock().unwrap() = Some((done.device_done(), done.priority()));
         Ok(ReadStart::Pending)

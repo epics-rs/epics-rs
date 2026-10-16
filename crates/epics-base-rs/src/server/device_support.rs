@@ -989,10 +989,11 @@ pub trait DeviceSupport: Send + Sync + 'static {
     }
 
     /// Begin the record's input read — C devAsyn's `queueRequest` on a
-    /// `canBlock` port with `pr->pact = 1` (devAsynInt32.c:838-842). Asked
-    /// only on a pass the record entered idle; the pass a
-    /// [`ReadStart::Pending`] completion re-enters calls [`read`](Self::read)
-    /// alone. The default has no submit-only path.
+    /// `canBlock` port with `pr->pact = 1` (devAsynInt32.c:838-842). Asked on
+    /// every pass; on the pass a [`ReadStart::Pending`] completion re-entered,
+    /// [`DeviceDoneSource::pact`](crate::server::database::DeviceDoneSource::pact)
+    /// is set, and a device that reads what landed answers `Synchronous`.
+    /// The default has no submit-only path.
     fn read_begin(
         &mut self,
         _record: &mut dyn Record,

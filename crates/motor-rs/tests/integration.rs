@@ -1114,3 +1114,103 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
     let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
 }
+
+/// The IOC starts the poller with `ctx.bridge().spawn(poll_loop.run())`, from
+/// the iocsh thread; on the exec backend that lands on a cbMedium worker with
+/// no tokio runtime. The poller must serve a move and keep its timed polls
+/// there, on either backend.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use asyn_rs::user::AsynUser;
+    use epics_base_rs::runtime::task::BlockingBridge;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Seen {
+        polls: AtomicUsize,
+        moved: AtomicBool,
+    }
+    struct Counting(Arc<Seen>);
+    impl AsynMotor for Counting {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            self.0.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            self.0.moved.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, _position: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+    }
+
+    let seen = Arc::new(Seen::default());
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Counting(seen.clone())));
+    let mut setup = make_builder(motor).build();
+    setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    let bridge = BlockingBridge::capture();
+    let poll_loop = setup.poll_loop;
+    std::thread::spawn(move || {
+        drop(bridge.spawn(poll_loop.run()));
+    })
+    .join()
+    .unwrap();
+
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    setup
+        .poll_cmd_tx
+        .send(PollCommand::StartPolling)
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!seen.moved.load(Ordering::SeqCst) || seen.polls.load(Ordering::SeqCst) < 5)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        seen.moved.load(Ordering::SeqCst),
+        "the move never reached the driver"
+    );
+    assert!(
+        seen.polls.load(Ordering::SeqCst) >= 5,
+        "timed polls stopped at {}",
+        seen.polls.load(Ordering::SeqCst)
+    );
+    let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+}

@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
 use asyn_rs::user::AsynUser;
-use tokio::runtime::Handle;
+use epics_base_rs::runtime::task::{
+    CallbackPriority, block_on_sync, sleep_background, spawn_background,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::device_state::*;
@@ -197,13 +199,15 @@ impl MotorPollLoop {
     /// loop keeps servicing commands (Shutdown/Stop/Start) while the delay
     /// runs. On expiry it records `expired_delay_id` and pulses io_intr.
     ///
-    /// The timer runs on the IOC runtime (`ioc`), not on the poller thread, so
-    /// a driver call blocked there cannot hold the settle delay past expiry.
-    fn spawn_delay(&self, ioc: &Handle, delay_id: u64, dur: Duration) {
+    /// C `callbackRequestDelayed` (motorRecord.cc:1437): the timer runs on the
+    /// callback pool, not on the poller thread, so a driver call blocked there
+    /// cannot hold the settle delay past expiry. LOW is the record's default
+    /// `PRIO`; the poll loop does not carry the record's own.
+    fn spawn_delay(&self, delay_id: u64, dur: Duration) {
         let device_state = self.device_state.clone();
         let io_intr_tx = self.io_intr_tx.clone();
-        ioc.spawn(async move {
-            tokio::time::sleep(dur).await;
+        spawn_background(CallbackPriority::Low, async move {
+            sleep_background(dur).await;
             match device_state.lock() {
                 Ok(mut ds) => ds.expired_delay_id = Some(delay_id),
                 Err(e) => {
@@ -227,20 +231,16 @@ impl MotorPollLoop {
     }
 
     /// Run the poll loop on a dedicated `motorPoller` thread until Shutdown;
-    /// the returned future completes when that thread ends. Call from a task
-    /// on the IOC runtime, which keeps the settle-delay timers.
+    /// the returned future completes when that thread ends. Needs no ambient
+    /// runtime: the thread parks between polls and its timers are the
+    /// background timer's, so either backend's executor can await it.
     pub async fn run(self) {
-        let ioc = Handle::current();
         let (done_tx, done_rx) = oneshot::channel::<()>();
         let spawned = std::thread::Builder::new()
             .name("motorPoller".into())
             .spawn(move || {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                {
-                    Ok(rt) => rt.block_on(self.serve(ioc)),
-                    Err(e) => tracing::error!("motorPoller: runtime build failed: {e}"),
+                if let Err(e) = block_on_sync(self.serve()) {
+                    tracing::error!("motorPoller: cannot drive the poll loop: {e}");
                 }
                 drop(done_tx);
             });
@@ -252,7 +252,7 @@ impl MotorPollLoop {
         }
     }
 
-    async fn serve(mut self, ioc: Handle) {
+    async fn serve(mut self) {
         // Start idle: device support init() sends StartPolling after
         // iocInit, matching C EPICS where the poller starts in init_record.
         let mut active = false;
@@ -278,7 +278,7 @@ impl MotorPollLoop {
                             }
                             Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
                                 active = false;
-                                self.spawn_delay(&ioc, delay_id, dur);
+                                self.spawn_delay(delay_id, dur);
                             }
                             Some(PollCommand::Shutdown) => {
                                 return;
@@ -292,7 +292,7 @@ impl MotorPollLoop {
                     // blocks on the event (no timed poll). A zero effective
                     // interval disables this timed arm so the loop is
                     // event-driven only, never busy-spinning on sleep(0).
-                    _ = tokio::time::sleep(interval), if !interval.is_zero() => {
+                    _ = sleep_background(interval), if !interval.is_zero() => {
                         // Autonomous timed poll: notify only on a real change
                         // (C statusChanged_ gate).
                         self.poll_and_notify(false).await;
@@ -319,7 +319,7 @@ impl MotorPollLoop {
                         active = false;
                     }
                     Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
-                        self.spawn_delay(&ioc, delay_id, dur);
+                        self.spawn_delay(delay_id, dur);
                     }
                     Some(PollCommand::Shutdown) | None => {
                         return;

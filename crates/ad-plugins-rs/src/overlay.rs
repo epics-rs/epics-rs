@@ -467,10 +467,6 @@ struct OverlaySlot {
     draw_mode: i32, // 0=Set, 1=XOR
     position_x: usize,
     position_y: usize,
-    // Stored CenterX/CenterY (signed, like the C++ param) so a SizeX change
-    // with freeze OFF can recover the frozen center exactly.
-    center_x: i32,
-    center_y: i32,
     size_x: usize,
     size_y: usize,
     width_x: usize,
@@ -498,8 +494,6 @@ impl Default for OverlaySlot {
             draw_mode: 0,
             position_x: 0,
             position_y: 0,
-            center_x: 0,
-            center_y: 0,
             size_x: 0,
             size_y: 0,
             width_x: 1,
@@ -693,6 +687,71 @@ impl OverlayProcessor {
 
 impl NDPluginProcess for OverlayProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+
+    /// C `NDPluginOverlay::writeInt32` drops the base class status
+    /// (`NDPluginDriver::writeInt32(pasynUser, value);`, NDPluginOverlay.cpp:508): a refused NDPluginDriver write keeps
+    /// its clamp and succeeds. A Position/Center/Size write sets the other
+    /// of Position/Center from the params and the freeze flag (:466-506).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let outcome = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict.succeed());
+        let p = &self.params;
+        for (x, pos, center, size) in [
+            (true, p.position_x, p.center_x, p.size_x),
+            (false, p.position_y, p.center_y, p.size_y),
+        ] {
+            let (Some(pos), Some(center), Some(size)) = (pos, center, size) else {
+                continue;
+            };
+            if ![pos, center, size].contains(&reason) {
+                continue;
+            }
+            let get = |r| params.get_int32_param(r, addr).unwrap_or(0);
+            let mut slots = self.slots.lock();
+            let Some(slot) = slots.get_mut(addr as usize) else {
+                return outcome;
+            };
+            let (frozen, slot_pos, slot_size) = if x {
+                (
+                    &mut slot.freeze_position_x,
+                    &mut slot.position_x,
+                    &mut slot.size_x,
+                )
+            } else {
+                (
+                    &mut slot.freeze_position_y,
+                    &mut slot.position_y,
+                    &mut slot.size_y,
+                )
+            };
+            let (other, other_value, position) = if reason == center {
+                *frozen = false;
+                let at = value.wrapping_sub(get(size) / 2);
+                (pos, at, at)
+            } else if reason == pos {
+                *frozen = true;
+                (center, value.wrapping_add(get(size) / 2), value)
+            } else {
+                *slot_size = value.max(0) as usize;
+                if *frozen {
+                    let at = get(pos);
+                    (center, at.wrapping_add(value / 2), at)
+                } else {
+                    let at = get(center).wrapping_sub(value / 2);
+                    (pos, at, at)
+                }
+            };
+            *slot_pos = position.max(0) as usize;
+            return outcome.set_int32(other, addr, other_value).settled();
+        }
+        outcome
+    }
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let active = self.build_active_overlays();
         match draw_overlays(pool, array, &active) {
@@ -764,88 +823,19 @@ impl NDPluginProcess for OverlayProcessor {
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
-        use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamChangeValue, ParamUpdate};
+        use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamChangeValue};
 
         let idx = params.addr as usize;
         let mut slots = self.slots.lock();
         let Some(slot) = slots.get_mut(idx) else {
             return ParamChangeResult::updates(vec![]);
         };
-        let mut updates = Vec::new();
-
-        // C++ NDPluginOverlay::writeInt32 freeze semantics. Position/Center/
-        // Size are stored as signed i32 so the center<->position recompute
-        // can pass through negative intermediates exactly like C++.
         if Some(reason) == self.params.use_overlay {
             slot.use_overlay = params.value.as_i32() != 0;
         } else if Some(reason) == self.params.shape {
             slot.shape = params.value.as_i32();
         } else if Some(reason) == self.params.draw_mode {
             slot.draw_mode = params.value.as_i32();
-        } else if Some(reason) == self.params.position_x {
-            // PositionX written -> CenterX = PositionX + SizeX/2; freeze ON.
-            let pos = params.value.as_i32().max(0);
-            slot.position_x = pos as usize;
-            slot.freeze_position_x = true;
-            slot.center_x = pos + (slot.size_x / 2) as i32;
-            if let Some(ci) = self.params.center_x {
-                updates.push(ParamUpdate::int32_addr(ci, idx as i32, slot.center_x));
-            }
-        } else if Some(reason) == self.params.position_y {
-            let pos = params.value.as_i32().max(0);
-            slot.position_y = pos as usize;
-            slot.freeze_position_y = true;
-            slot.center_y = pos + (slot.size_y / 2) as i32;
-            if let Some(ci) = self.params.center_y {
-                updates.push(ParamUpdate::int32_addr(ci, idx as i32, slot.center_y));
-            }
-        } else if Some(reason) == self.params.center_x {
-            // CenterX written -> PositionX = CenterX - SizeX/2; freeze OFF.
-            slot.center_x = params.value.as_i32();
-            let pos = slot.center_x - (slot.size_x / 2) as i32;
-            slot.position_x = pos.max(0) as usize;
-            slot.freeze_position_x = false;
-            if let Some(pi) = self.params.position_x {
-                updates.push(ParamUpdate::int32_addr(pi, idx as i32, pos));
-            }
-        } else if Some(reason) == self.params.center_y {
-            slot.center_y = params.value.as_i32();
-            let pos = slot.center_y - (slot.size_y / 2) as i32;
-            slot.position_y = pos.max(0) as usize;
-            slot.freeze_position_y = false;
-            if let Some(pi) = self.params.position_y {
-                updates.push(ParamUpdate::int32_addr(pi, idx as i32, pos));
-            }
-        } else if Some(reason) == self.params.size_x {
-            // SizeX written: if PositionX is frozen keep it and move the
-            // center; otherwise keep the center and move the position.
-            slot.size_x = params.value.as_i32().max(0) as usize;
-            if slot.freeze_position_x {
-                slot.center_x = slot.position_x as i32 + (slot.size_x / 2) as i32;
-                if let Some(ci) = self.params.center_x {
-                    updates.push(ParamUpdate::int32_addr(ci, idx as i32, slot.center_x));
-                }
-            } else {
-                let pos = slot.center_x - (slot.size_x / 2) as i32;
-                slot.position_x = pos.max(0) as usize;
-                if let Some(pi) = self.params.position_x {
-                    updates.push(ParamUpdate::int32_addr(pi, idx as i32, pos));
-                }
-            }
-        } else if Some(reason) == self.params.size_y {
-            slot.size_y = params.value.as_i32().max(0) as usize;
-            if slot.freeze_position_y {
-                slot.center_y = slot.position_y as i32 + (slot.size_y / 2) as i32;
-                if let Some(ci) = self.params.center_y {
-                    updates.push(ParamUpdate::int32_addr(ci, idx as i32, slot.center_y));
-                }
-            } else {
-                let pos = slot.center_y - (slot.size_y / 2) as i32;
-                slot.position_y = pos.max(0) as usize;
-                if let Some(pi) = self.params.position_y {
-                    updates.push(ParamUpdate::int32_addr(pi, idx as i32, pos));
-                }
-            }
         } else if Some(reason) == self.params.width_x {
             slot.width_x = params.value.as_i32().max(0) as usize;
         } else if Some(reason) == self.params.width_y {
@@ -873,13 +863,29 @@ impl NDPluginProcess for OverlayProcessor {
             slot.font = (params.value.as_i32().max(0) as usize).min(NUM_FONTS - 1);
         }
 
-        ParamChangeResult::updates(updates)
+        ParamChangeResult::empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `NDPluginDriver::writeInt32(pasynUser, value);` (NDPluginOverlay.cpp:508).
+    #[test]
+    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = OverlayProcessor::new(8, vec![]);
+        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
     fn pool() -> Arc<NDArrayPool> {
@@ -1629,29 +1635,37 @@ mod tests {
 
     // ---- Center/Position freeze semantics (C++ writeInt32) ----------------
 
-    use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+    use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot, SideParam};
 
-    /// Drive one int32 param change on overlay slot 0 and return the updates.
-    fn drive(p: &mut OverlayProcessor, reason: usize, value: i32) -> Vec<ParamUpdate> {
-        let snap = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason,
-            addr: 0,
-            value: ParamChangeValue::Int32(value),
-        };
-        p.on_param_change(reason, &snap).param_updates
+    /// Write one int32 to overlay 0 as the port does: validate, store the
+    /// written value and the side params. Returns the side params.
+    fn drive(
+        p: &OverlayProcessor,
+        base: &mut asyn_rs::port::PortDriverBase,
+        reason: usize,
+        value: i32,
+    ) -> Vec<(usize, i32)> {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let out = p.validate_int32(reason, 0, value, WriteVerdict::Accept(value), base);
+        assert!(out.settled);
+        base.set_int32_param(reason, 0, out.verdict.kept()).unwrap();
+        out.side
+            .into_iter()
+            .map(|s| match s {
+                SideParam::Int32 { reason, value, .. } => {
+                    base.set_int32_param(reason, 0, value).unwrap();
+                    (reason, value)
+                }
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
     }
 
-    fn find_int_update(updates: &[ParamUpdate], reason: usize) -> Option<i32> {
-        updates.iter().find_map(|u| match u {
-            ParamUpdate::Int32 {
-                reason: r, value, ..
-            } if *r == reason => Some(*value),
-            _ => None,
-        })
-    }
-
-    fn setup_processor() -> (OverlayProcessor, OverlayParamIndices) {
+    fn setup_processor() -> (
+        OverlayProcessor,
+        asyn_rs::port::PortDriverBase,
+        OverlayParamIndices,
+    ) {
         let mut p = OverlayProcessor::new(8, vec![]);
         let mut base =
             asyn_rs::port::PortDriverBase::new("OV_TEST", 8, asyn_rs::port::PortFlags::default());
@@ -1665,7 +1679,7 @@ mod tests {
             size_y: base.find_param("OVERLAY_SIZE_Y"),
             ..Default::default()
         };
-        (p, params)
+        (p, base, params)
     }
 
     #[test]
@@ -1697,51 +1711,48 @@ mod tests {
         );
     }
 
+    /// NDPluginOverlay.cpp:484-488 and :490-494: PositionX freezes, and a
+    /// SizeX write then moves CenterX inside the same write.
     #[test]
     fn test_freeze_position_then_resize_moves_center() {
-        // Write PositionX last -> freeze ON. A later SizeX change keeps
-        // PositionX fixed and moves CenterX (C++ freezePositionX == true).
-        let (mut p, idx) = setup_processor();
-        drive(&mut p, idx.size_x.unwrap(), 20);
-        drive(&mut p, idx.position_x.unwrap(), 100);
+        let (p, mut base, idx) = setup_processor();
+        let (px, cx, sx) = (
+            idx.position_x.unwrap(),
+            idx.center_x.unwrap(),
+            idx.size_x.unwrap(),
+        );
+        drive(&p, &mut base, sx, 20);
+        assert_eq!(drive(&p, &mut base, px, 100), [(cx, 110)]);
+        assert_eq!(drive(&p, &mut base, sx, 40), [(cx, 120)]);
         assert_eq!(p.slots.lock()[0].position_x, 100);
-        assert_eq!(p.slots.lock()[0].center_x, 110); // 100 + 20/2
-
-        let updates = drive(&mut p, idx.size_x.unwrap(), 40);
-        // PositionX stays 100; CenterX moves to 100 + 40/2 = 120.
-        assert_eq!(p.slots.lock()[0].position_x, 100);
-        assert_eq!(p.slots.lock()[0].center_x, 120);
-        assert_eq!(find_int_update(&updates, idx.center_x.unwrap()), Some(120));
+        assert_eq!(p.slots.lock()[0].size_x, 40);
     }
 
+    /// :476-479 and :495-497: CenterX unfreezes, and a SizeX write then
+    /// moves PositionX, negative as C's int param can be.
     #[test]
     fn test_freeze_center_then_resize_moves_position() {
-        // Write CenterX last -> freeze OFF. A later SizeX change keeps
-        // CenterX fixed and moves PositionX (C++ freezePositionX == false).
-        let (mut p, idx) = setup_processor();
-        drive(&mut p, idx.size_x.unwrap(), 20);
-        drive(&mut p, idx.center_x.unwrap(), 200);
-        assert_eq!(p.slots.lock()[0].center_x, 200);
-        assert_eq!(p.slots.lock()[0].position_x, 190); // 200 - 20/2
-
-        let updates = drive(&mut p, idx.size_x.unwrap(), 60);
-        // CenterX stays 200; PositionX moves to 200 - 60/2 = 170.
-        assert_eq!(p.slots.lock()[0].center_x, 200);
-        assert_eq!(p.slots.lock()[0].position_x, 170);
-        assert_eq!(
-            find_int_update(&updates, idx.position_x.unwrap()),
-            Some(170)
+        let (p, mut base, idx) = setup_processor();
+        let (px, cx, sx) = (
+            idx.position_x.unwrap(),
+            idx.center_x.unwrap(),
+            idx.size_x.unwrap(),
         );
+        drive(&p, &mut base, sx, 20);
+        assert_eq!(drive(&p, &mut base, cx, 200), [(px, 190)]);
+        assert_eq!(drive(&p, &mut base, sx, 60), [(px, 170)]);
+        assert_eq!(p.slots.lock()[0].position_x, 170);
+        assert_eq!(drive(&p, &mut base, sx, 500), [(px, -50)]);
+        assert_eq!(p.slots.lock()[0].position_x, 0);
     }
 
     #[test]
     fn test_freeze_y_axis_independent() {
-        // The Y freeze flag is tracked independently of X.
-        let (mut p, idx) = setup_processor();
-        drive(&mut p, idx.size_y.unwrap(), 10);
-        drive(&mut p, idx.center_y.unwrap(), 50); // freeze_y OFF
-        drive(&mut p, idx.size_x.unwrap(), 10);
-        drive(&mut p, idx.position_x.unwrap(), 5); // freeze_x ON
+        let (p, mut base, idx) = setup_processor();
+        drive(&p, &mut base, idx.size_y.unwrap(), 10);
+        drive(&p, &mut base, idx.center_y.unwrap(), 50);
+        drive(&p, &mut base, idx.size_x.unwrap(), 10);
+        drive(&p, &mut base, idx.position_x.unwrap(), 5);
         assert!(p.slots.lock()[0].freeze_position_x);
         assert!(!p.slots.lock()[0].freeze_position_y);
     }

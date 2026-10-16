@@ -1,50 +1,24 @@
 //! File-writing plugin base: file-name construction, the capture buffer, and
 //! the flush that drains it.
 //!
-//! Two deliberate deviations from C++ `NDPluginFile` / `asynNDArrayDriver`
-//! live here, and they are one decision taken twice.
+//! One deliberate deviation from C++ `NDPluginFile` lives here. C frees the
+//! capture buffer unconditionally once a flush ends, at `NDPluginFile.cpp:325`
+//! (`freeCaptureBuffer()`), so a flush that fails on one frame discards every
+//! frame including the ones never written, and a second `WriteFile` finds an
+//! empty buffer and reports "no capture buffer present".
+//! [`NDPluginFileBase::flush_capture`] instead keeps exactly the frames that
+//! have not reached disk, so the operator can free the disk and resume where
+//! the flush stopped.
 //!
-//! C frees the capture buffer unconditionally once a flush ends, at
-//! `NDPluginFile.cpp:325` (`freeCaptureBuffer()`), so a flush that fails on
-//! one frame discards every frame including the ones never written, and a
-//! second `WriteFile` finds an empty buffer and reports "no capture buffer
-//! present". [`NDPluginFileBase::flush_capture`] instead keeps exactly the
-//! frames that have not reached disk, so the operator can free the disk and
-//! resume where the flush stopped.
-//!
-//! C burns the file number when it builds the name, before the write is
-//! attempted, and never rolls it back: `asynNDArrayDriver::createFileName`
-//! increments `NDFileNumber` at `asynNDArrayDriver.cpp:216-219`, and again in
-//! the by-parts variant at `asynNDArrayDriver.cpp:256-259`, while
-//! `openFileBase` calls it at `NDPluginFile.cpp:43` ahead of `openFile` — once
-//! per frame in the single-image capture loop (`NDPluginFile.cpp:288-292`).
-//! So under C the number advances once per ATTEMPT. Here it advances once per
-//! completed file: the increment sits after the write and the rename in both
-//! branches of `flush_capture`.
-//!
-//! Increment-per-attempt is coherent in C only because C never retries. Laid
-//! over a resumable buffer it would put the partial file of a failed frame at
-//! N and its retry at N+1, so a three-frame capture that failed once would
-//! leave four files, two of them the same frame, with a hole in the numbering
-//! — the shape the resumable drain exists to make unconstructible.
-//! Increment-per-success keeps one frame to one file with consecutive
-//! numbers whether or not the flush was retried, at the cost that
-//! `NDFileNumber_RBV` advances more slowly than C's after a failure and that
-//! the retry reuses the number the failed attempt had already opened a file
-//! at. What sits at that number is not a partial image: every writer creates
-//! or truncates the file at open, before any image data reaches it —
-//! `TIFFOpen(fileName, "w")` (`NDFileTIFF.cpp:120`), `fopen(fileName, "wb")`
-//! followed straight away by `jpeg_start_compress` (`NDFileJPEG.cpp:87`,
-//! `:103`), `H5Fcreate(fileName, H5F_ACC_TRUNC, ..)`
-//! (`NDFileHDF5.cpp:3833`) — so the leftover is empty, header-only or an
-//! empty container according to which writer failed, and the retry's own open
-//! truncates it again. Tier 3, correctness over byte parity.
+//! File numbering follows C: `asynNDArrayDriver::createFileName` advances
+//! `NDFileNumber` as it makes the name (`asynNDArrayDriver.cpp:216-219`), and
+//! [`NDPluginFileBase::open_file_name`] is the one place that does it here, so
+//! a failed open or ReadFile consumes its number and a resumed flush leaves a
+//! gap at the frame that failed, as C would have had there.
 //!
 //! C++ line numbers here resolve against ADCore `R3-14-111-g6c53844e`, the
-//! revision this port was written from. `NDPluginFile.cpp`, `NDFileTIFF.cpp`
-//! and `NDFileJPEG.cpp` are byte-identical between it and the checkout at
-//! `R3-14-173-g926bb4c8`; `NDFileHDF5.cpp` is not, and `:3833` above was read
-//! at the pin.
+//! revision this port was written from; `NDPluginFile.cpp` is byte-identical
+//! between it and the checkout at `R3-14-173-g926bb4c8`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -189,6 +163,54 @@ pub(crate) fn with_open_file<W: NDFileWriter + ?Sized, R>(
     closed.map(|()| value)
 }
 
+/// The file I/O half of NDPluginFile's locking. C runs `openFile`,
+/// `writeFile`, `readFile` and `closeFile` with the port lock released and
+/// `fileMutex` held (NDPluginFile.cpp:62-76, :247-251), so a frame callback
+/// can queue while a file is written. `io` is that window; `base` is the
+/// state the port lock guards, and is never reached from inside `io`.
+pub trait FileIo {
+    fn base(&mut self) -> &mut NDPluginFileBase;
+    fn io<R>(&mut self, f: impl FnOnce(&mut dyn NDFileWriter) -> R) -> R;
+}
+
+/// A base and writer with no port lock between them.
+struct InPlace<'a> {
+    base: &'a mut NDPluginFileBase,
+    writer: &'a mut dyn NDFileWriter,
+}
+
+impl FileIo for InPlace<'_> {
+    fn base(&mut self) -> &mut NDPluginFileBase {
+        self.base
+    }
+
+    fn io<R>(&mut self, f: impl FnOnce(&mut dyn NDFileWriter) -> R) -> R {
+        f(self.writer)
+    }
+}
+
+/// Write `frames` into one file at `path` and rename it to `final_path`.
+fn write_one_file(
+    writer: &mut dyn NDFileWriter,
+    num_capture: usize,
+    mode: NDFileMode,
+    path: &Path,
+    final_path: Option<&Path>,
+    frames: &[Arc<NDArray>],
+) -> ADResult<()> {
+    writer.set_num_capture(num_capture);
+    with_open_file(writer, path, mode, &frames[0], |w| {
+        for arr in frames {
+            w.write_file(arr)?;
+        }
+        Ok(())
+    })?;
+    if let Some(final_path) = final_path {
+        NDPluginFileBase::rename_temp(path, final_path)?;
+    }
+    Ok(())
+}
+
 /// File path/name management and capture buffering for file plugins.
 pub struct NDPluginFileBase {
     pub file_path: String,
@@ -205,7 +227,7 @@ pub struct NDPluginFileBase {
     num_captured: usize,
     is_open: bool,
     mode: NDFileMode,
-    last_written_name: String,
+    full_file_name: String,
 }
 
 impl NDPluginFileBase {
@@ -225,7 +247,7 @@ impl NDPluginFileBase {
             num_captured: 0,
             is_open: false,
             mode: NDFileMode::Single,
-            last_written_name: String::new(),
+            full_file_name: String::new(),
         }
     }
 
@@ -351,9 +373,24 @@ impl NDPluginFileBase {
         }
     }
 
-    /// Return the full file name that was last written.
-    pub fn last_written_name(&self) -> &str {
-        &self.last_written_name
+    /// `NDFullFileName`: the name the last open made.
+    pub fn full_file_name(&self) -> &str {
+        &self.full_file_name
+    }
+
+    pub fn clear_full_file_name(&mut self) {
+        self.full_file_name.clear();
+    }
+
+    /// C `createFileName` at an open (asynNDArrayDriver.cpp:192-219): the
+    /// name is made and AutoIncrement moves FileNumber past it there, whether
+    /// or not the open then succeeds.
+    pub fn open_file_name(&mut self) -> String {
+        self.full_file_name = self.create_file_name();
+        if self.auto_increment {
+            self.file_number += 1;
+        }
+        self.full_file_name.clone()
     }
 
     /// Create directory if needed.
@@ -367,9 +404,10 @@ impl NDPluginFileBase {
         Ok(())
     }
 
-    /// Write to temp path if temp_suffix is set, then rename to final path.
-    fn write_path(&self) -> (PathBuf, Option<PathBuf>) {
-        let final_path = PathBuf::from(self.create_file_name());
+    /// Open the next file name, under its temp suffix when one is set; the
+    /// second path is the final name to rename to.
+    fn write_path(&mut self) -> (PathBuf, Option<PathBuf>) {
+        let final_path = PathBuf::from(self.open_file_name());
         if self.temp_suffix.is_empty() {
             (final_path, None)
         } else {
@@ -405,43 +443,73 @@ impl NDPluginFileBase {
         }
     }
 
-    /// Process an incoming array according to the current file mode.
+    /// Process an incoming array according to the current file mode, with
+    /// the writer called in place. [`process_array_io`](Self::process_array_io)
+    /// is the same step for a caller that has a port lock to release.
     pub fn process_array(
         &mut self,
         array: Arc<NDArray>,
         writer: &mut dyn NDFileWriter,
     ) -> ADResult<()> {
-        // The writer's open-time layout (e.g. HDF5 attribute/performance chunk
-        // sizing) depends on the capture target; keep it current before any open.
-        writer.set_num_capture(self.num_capture);
-        match self.mode {
+        Self::process_array_io(&mut InPlace { base: self, writer }, array)
+    }
+
+    /// [`flush_capture_io`](Self::flush_capture_io) with the writer in place.
+    pub fn flush_capture(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
+        Self::flush_capture_io(&mut InPlace { base: self, writer })
+    }
+
+    /// [`open_stream_io`](Self::open_stream_io) with the writer in place.
+    pub fn open_stream(&mut self, writer: &mut dyn NDFileWriter, array: &NDArray) -> ADResult<()> {
+        Self::open_stream_io(&mut InPlace { base: self, writer }, array)
+    }
+
+    /// [`force_close_io`](Self::force_close_io) with the writer in place.
+    pub fn force_close(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
+        Self::force_close_io(&mut InPlace { base: self, writer })
+    }
+
+    /// [`close_stream_io`](Self::close_stream_io) with the writer in place.
+    pub fn close_stream(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
+        Self::close_stream_io(&mut InPlace { base: self, writer })
+    }
+
+    /// Process an incoming array according to the current file mode.
+    pub fn process_array_io(lock: &mut impl FileIo, array: Arc<NDArray>) -> ADResult<()> {
+        let base = lock.base();
+        let num_capture = base.num_capture;
+        match base.mode {
             NDFileMode::Single => {
-                self.last_written_name = self.create_file_name();
-                let (write_path, final_path) = self.write_path();
-                with_open_file(writer, &write_path, NDFileMode::Single, &array, |w| {
-                    w.write_file(&array)
+                let (write_path, final_path) = base.write_path();
+                lock.io(|w| {
+                    write_one_file(
+                        w,
+                        num_capture,
+                        NDFileMode::Single,
+                        &write_path,
+                        final_path.as_deref(),
+                        std::slice::from_ref(&array),
+                    )
                 })?;
-                if let Some(final_path) = final_path {
-                    Self::rename_temp(&write_path, &final_path)?;
-                }
-                self.maybe_delete_driver_file(&array);
-                if self.auto_increment {
-                    self.file_number += 1;
-                }
+                lock.base().maybe_delete_driver_file(&array);
             }
             NDFileMode::Capture => {
-                self.capture_buffer.push(array);
-                self.num_captured = self.capture_buffer.len();
+                base.capture_buffer.push(array);
+                base.num_captured = base.capture_buffer.len();
                 // B7: num_capture==0 → buffer forever, never auto-flush.
-                if self.num_capture > 0 && self.num_captured >= self.num_capture {
-                    self.flush_capture(writer)?;
+                if base.num_capture > 0 && base.num_captured >= base.num_capture {
+                    Self::flush_capture_io(lock)?;
                 }
             }
             NDFileMode::Stream => {
-                self.open_stream(writer, &array)?;
-                writer.write_file(&array)?;
-                self.maybe_delete_driver_file(&array);
-                self.num_captured += 1;
+                Self::open_stream_io(lock, &array)?;
+                lock.io(|w| {
+                    w.set_num_capture(num_capture);
+                    w.write_file(&array)
+                })?;
+                let base = lock.base();
+                base.maybe_delete_driver_file(&array);
+                base.num_captured += 1;
             }
         }
         Ok(())
@@ -460,66 +528,69 @@ impl NDPluginFileBase {
     /// second `WriteFile` resumes at the first of them instead of starting
     /// over on files that are already written under numbers `file_number` has
     /// moved past.
-    pub fn flush_capture(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
-        if self.capture_buffer.is_empty() {
+    pub fn flush_capture_io(lock: &mut impl FileIo) -> ADResult<()> {
+        if lock.base().capture_buffer.is_empty() {
             return Ok(());
         }
-        writer.set_num_capture(self.num_capture);
-
-        if writer.supports_multiple_arrays() {
+        let num_capture = lock.base().num_capture;
+        if lock.io(|w| w.supports_multiple_arrays()) {
             // Multi-array format: open once, write all, close once. The frames
             // share one file, so they land together or not at all.
-            self.last_written_name = self.create_file_name();
-            let (write_path, final_path) = self.write_path();
-            let buffer = &self.capture_buffer;
-            with_open_file(writer, &write_path, NDFileMode::Capture, &buffer[0], |w| {
-                for arr in buffer {
-                    w.write_file(arr)?;
-                }
-                Ok(())
+            let base = lock.base();
+            let (write_path, final_path) = base.write_path();
+            let frames = base.capture_buffer.clone();
+            lock.io(|w| {
+                write_one_file(
+                    w,
+                    num_capture,
+                    NDFileMode::Capture,
+                    &write_path,
+                    final_path.as_deref(),
+                    &frames,
+                )
             })?;
-            if let Some(final_path) = final_path {
-                Self::rename_temp(&write_path, &final_path)?;
-            }
-            let landed = self.take_landed(self.capture_buffer.len());
+            let base = lock.base();
             // C++ deletes the driver file per frame in Capture mode too.
-            for arr in &landed {
-                self.maybe_delete_driver_file(arr);
-            }
-            if self.auto_increment {
-                self.file_number += 1;
+            for arr in base.take_landed(&frames) {
+                base.maybe_delete_driver_file(&arr);
             }
         } else {
             // Single-image format: open/write/close per frame with
             // auto-increment. The head of the buffer is the resume point: it
             // is dropped once its file is complete, so the `?` below leaves
             // the failing frame and everything behind it queued.
-            while !self.capture_buffer.is_empty() {
-                let arr = Arc::clone(&self.capture_buffer[0]);
-                self.last_written_name = self.create_file_name();
-                let (write_path, final_path) = self.write_path();
-                with_open_file(writer, &write_path, NDFileMode::Single, &arr, |w| {
-                    w.write_file(&arr)
+            while let Some(arr) = lock.base().capture_buffer.first().cloned() {
+                let (write_path, final_path) = lock.base().write_path();
+                lock.io(|w| {
+                    write_one_file(
+                        w,
+                        num_capture,
+                        NDFileMode::Single,
+                        &write_path,
+                        final_path.as_deref(),
+                        std::slice::from_ref(&arr),
+                    )
                 })?;
-                if let Some(final_path) = final_path {
-                    Self::rename_temp(&write_path, &final_path)?;
-                }
-                self.take_landed(1);
-                self.maybe_delete_driver_file(&arr);
-                if self.auto_increment {
-                    self.file_number += 1;
-                }
+                let base = lock.base();
+                base.take_landed(std::slice::from_ref(&arr));
+                base.maybe_delete_driver_file(&arr);
             }
         }
-
         Ok(())
     }
 
-    /// Drop the first `n` frames from the capture buffer — the only place a
-    /// frame leaves it, and the only place `num_captured` is set while frames
-    /// are queued, so the readback cannot claim frames the buffer no longer
-    /// holds or hide ones it still does.
-    fn take_landed(&mut self, n: usize) -> Vec<Arc<NDArray>> {
+    /// Drop the frames of `written` that still head the capture buffer — the
+    /// only place a frame leaves it, and the only place `num_captured` is set
+    /// while frames are queued, so the readback cannot claim frames the buffer
+    /// no longer holds or hide ones it still does. A capture restarted or
+    /// freed while the file was written replaced the head; those frames stay.
+    fn take_landed(&mut self, written: &[Arc<NDArray>]) -> Vec<Arc<NDArray>> {
+        let n = self
+            .capture_buffer
+            .iter()
+            .zip(written)
+            .take_while(|(queued, done)| Arc::ptr_eq(queued, done))
+            .count();
         let landed: Vec<Arc<NDArray>> = self.capture_buffer.drain(..n).collect();
         self.num_captured = self.capture_buffer.len();
         landed
@@ -539,56 +610,60 @@ impl NDPluginFileBase {
     /// those frames as captured.
     ///
     /// `array` supplies the layout the writer needs at open time. A no-op when
-    /// a file is already open.
-    pub fn open_stream(&mut self, writer: &mut dyn NDFileWriter, array: &NDArray) -> ADResult<()> {
-        if self.is_open {
+    /// a file is already open; `is_open` is claimed before the writer opens,
+    /// so a frame arriving while the open runs queues behind it on the writer
+    /// instead of opening a second file.
+    pub fn open_stream_io(lock: &mut impl FileIo, array: &NDArray) -> ADResult<()> {
+        if lock.base().is_open {
             return Ok(());
         }
-        if !writer.writes_incrementally() {
+        if !lock.io(|w| w.writes_incrementally()) {
             return Err(ADError::UnsupportedConversion(
                 "this file format writes the whole file when it is closed and \
                  cannot stream; use FileWriteMode=Capture"
                     .into(),
             ));
         }
-        writer.set_num_capture(self.num_capture);
-        self.last_written_name = self.create_file_name();
-        let (write_path, _) = self.write_path();
-        writer.open_file(&write_path, NDFileMode::Stream, array)?;
-        self.is_open = true;
-        Ok(())
+        let base = lock.base();
+        let num_capture = base.num_capture;
+        let (write_path, _) = base.write_path();
+        base.is_open = true;
+        let opened = lock.io(|w| {
+            w.set_num_capture(num_capture);
+            w.open_file(&write_path, NDFileMode::Stream, array)
+        });
+        if opened.is_err() {
+            lock.base().is_open = false;
+        }
+        opened
     }
 
     /// Force a file close (used by the FilePluginClose attribute, G9).
     /// Safe to call when no file is open.
-    pub fn force_close(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
-        if self.is_open {
-            self.close_stream(writer)?;
-        }
-        Ok(())
+    pub fn force_close_io(lock: &mut impl FileIo) -> ADResult<()> {
+        Self::close_stream_io(lock)
     }
 
     /// Close stream mode.
     ///
-    /// This transition owns `is_open`: from the moment the close begins, the
-    /// guard clears the marker on every exit path, so a failing `close_file` or
-    /// temp rename ends the open state and reports the error instead of
-    /// latching the plugin open against a file it can no longer write.
-    pub fn close_stream(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
-        if !self.is_open {
+    /// The close owns `is_open` and clears it before the writer runs, so a
+    /// failing `close_file` or temp rename ends the open state and reports the
+    /// error instead of latching the plugin open against a file it can no
+    /// longer write.
+    pub fn close_stream_io(lock: &mut impl FileIo) -> ADResult<()> {
+        let base = lock.base();
+        if !base.is_open {
             return Ok(());
         }
-        let mut closing = Finalize::new(self, |base: &mut Self| base.is_open = false);
-        closing.run(|base| {
-            writer.close_file()?;
-            // Rename temp to final if temp_suffix was set
-            if !base.temp_suffix.is_empty() {
-                let final_name = base.create_file_name();
-                let temp_name = format!("{}{}", final_name, base.temp_suffix);
+        base.is_open = false;
+        // C renames the name the open made, NDFullFileName (:96-117).
+        let final_name = base.full_file_name.clone();
+        let temp_name =
+            (!base.temp_suffix.is_empty()).then(|| format!("{}{}", final_name, base.temp_suffix));
+        lock.io(|w| {
+            w.close_file()?;
+            if let Some(temp_name) = temp_name {
                 Self::rename_temp(Path::new(&temp_name), Path::new(&final_name))?;
-            }
-            if base.auto_increment {
-                base.file_number += 1;
             }
             Ok(())
         })
@@ -861,6 +936,48 @@ mod tests {
 
         let temp = fb.temp_file_path().unwrap();
         assert_eq!(temp.to_str().unwrap(), "/data/img_0001.tmp");
+    }
+
+    /// C closeFileBase renames NDFullFileName (NDPluginFile.cpp:96-117),
+    /// the name the open made, not one made again after FileNumber moved.
+    #[test]
+    fn a_stream_close_renames_the_temp_file_it_opened() {
+        let dir = std::env::temp_dir().join(format!("fb-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = format!("{}/", dir.display());
+        fb.file_name = "s".into();
+        fb.file_template = "%s%s_%d.h5".into();
+        fb.file_number = 3;
+        fb.auto_increment = true;
+        fb.temp_suffix = ".tmp".into();
+        fb.set_mode(NDFileMode::Stream);
+        struct Touch(MockWriter);
+        impl NDFileWriter for Touch {
+            fn open_file(&mut self, p: &Path, m: NDFileMode, a: &NDArray) -> ADResult<()> {
+                std::fs::write(p, b"")?;
+                self.0.open_file(p, m, a)
+            }
+            fn write_file(&mut self, a: &Arc<NDArray>) -> ADResult<()> {
+                self.0.write_file(a)
+            }
+            fn read_file(&mut self) -> ADResult<NDArray> {
+                self.0.read_file()
+            }
+            fn close_file(&mut self) -> ADResult<()> {
+                self.0.close_file()
+            }
+            fn writes_incrementally(&self) -> bool {
+                true
+            }
+        }
+        let mut writer = Touch(MockWriter::new(true));
+        fb.open_stream(&mut writer, &make_array(1)).unwrap();
+        assert_eq!(fb.file_number, 4);
+        fb.close_stream(&mut writer).unwrap();
+        assert!(dir.join("s_3.h5").is_file());
+        assert_eq!(fb.file_number, 4);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn make_array_with_driver_file(id: i32, driver_file: &str) -> Arc<NDArray> {

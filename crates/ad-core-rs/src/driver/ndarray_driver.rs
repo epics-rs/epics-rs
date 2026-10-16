@@ -535,7 +535,9 @@ pub fn handle_pool_write_int32(
         match template_array {
             None => port_base.trace_print(
                 TraceMask::ERROR,
-                "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first",
+                format_args!(
+                    "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first"
+                ),
             ),
             Some(template) => {
                 let count = port_base
@@ -545,7 +547,7 @@ pub fn handle_pool_write_int32(
                 if let Err(e) = pool.pre_allocate_buffers(template, count) {
                     port_base.trace_print(
                         TraceMask::ERROR,
-                        &format!("asynNDArrayDriver::preAllocateBuffers: ERROR, {e}"),
+                        format_args!("asynNDArrayDriver::preAllocateBuffers: ERROR, {e}"),
                     );
                 }
                 refresh_pool_stats(port_base, params, pool)?;

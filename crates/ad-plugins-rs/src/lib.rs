@@ -87,6 +87,9 @@ pub mod std_arrays;
 pub mod time_series_plugin;
 pub mod transform;
 
+#[cfg(test)]
+mod test_util;
+
 #[cfg(feature = "pva")]
 pub mod pva;
 

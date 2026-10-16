@@ -107,19 +107,25 @@ fn captured_three() -> NDPluginFileBase {
 }
 
 /// What three frames must look like on disk once they are all saved, whatever
-/// happened on the way: one file per frame, in order, and `file_number` three
-/// past where it started.
-fn assert_single_image_outcome(fb: &NDPluginFileBase, writer: &RecordingWriter) {
+/// happened on the way: one file per frame, in order, under `numbers`. Every
+/// name made consumes a number, a failed open's included, as C
+/// `createFileName` increments when it makes the name
+/// (asynNDArrayDriver.cpp:216-218).
+fn assert_single_image_outcome(fb: &NDPluginFileBase, writer: &RecordingWriter, numbers: [i32; 3]) {
+    let expected: Vec<(String, i32)> = numbers
+        .iter()
+        .zip(1..)
+        .map(|(n, id)| (format!("img_{n:04}"), id))
+        .collect();
     assert_eq!(
-        writer.landed,
-        vec![
-            ("img_0001".to_string(), 1),
-            ("img_0002".to_string(), 2),
-            ("img_0003".to_string(), 3),
-        ],
+        writer.landed, expected,
         "three frames must produce three files, each written once"
     );
-    assert_eq!(fb.file_number, 4, "one increment per file written");
+    assert_eq!(
+        fb.file_number,
+        numbers[2] + 1,
+        "one increment per name made"
+    );
     assert_eq!(fb.num_captured(), 0, "nothing is still owed");
 }
 
@@ -138,7 +144,7 @@ fn a_retry_after_a_middle_failure_produces_one_file_per_frame() {
     writer.fail_write_number = None;
     let _ = fb.flush_capture(&mut writer);
 
-    assert_single_image_outcome(&fb, &writer);
+    assert_single_image_outcome(&fb, &writer, [1, 3, 4]);
 }
 
 /// Negative control.
@@ -149,7 +155,7 @@ fn a_clean_single_image_flush_writes_one_file_per_frame() {
 
     fb.flush_capture(&mut writer).expect("no writer failure");
 
-    assert_single_image_outcome(&fb, &writer);
+    assert_single_image_outcome(&fb, &writer, [1, 2, 3]);
 }
 
 #[test]
@@ -161,12 +167,12 @@ fn a_failure_on_the_first_frame_leaves_all_three_queued() {
     assert!(fb.flush_capture(&mut writer).is_err());
     assert!(writer.landed.is_empty(), "nothing reached disk");
     assert_eq!(fb.num_captured(), 3, "all three frames are still owed");
-    assert_eq!(fb.file_number, 1, "no file was written, no number consumed");
+    assert_eq!(fb.file_number, 2, "the failed frame's name consumed 1");
 
     writer.fail_write_number = None;
     fb.flush_capture(&mut writer)
         .expect("the disk is free again");
-    assert_single_image_outcome(&fb, &writer);
+    assert_single_image_outcome(&fb, &writer, [2, 3, 4]);
 }
 
 #[test]
@@ -178,12 +184,12 @@ fn a_failure_on_a_middle_frame_leaves_the_unwritten_tail_queued() {
     assert!(fb.flush_capture(&mut writer).is_err());
     assert_eq!(writer.files(), vec!["img_0001"], "only frame 1 landed");
     assert_eq!(fb.num_captured(), 2, "frames 2 and 3 are still owed");
-    assert_eq!(fb.file_number, 2);
+    assert_eq!(fb.file_number, 3);
 
     writer.fail_write_number = None;
     fb.flush_capture(&mut writer)
         .expect("the disk is free again");
-    assert_single_image_outcome(&fb, &writer);
+    assert_single_image_outcome(&fb, &writer, [1, 3, 4]);
 }
 
 #[test]
@@ -199,17 +205,17 @@ fn a_failure_on_the_last_frame_leaves_only_that_frame_queued() {
         "frames 1 and 2 landed"
     );
     assert_eq!(fb.num_captured(), 1, "frame 3 is still owed");
-    assert_eq!(fb.file_number, 3);
+    assert_eq!(fb.file_number, 4);
 
     writer.fail_write_number = None;
     fb.flush_capture(&mut writer)
         .expect("the disk is free again");
-    assert_single_image_outcome(&fb, &writer);
+    assert_single_image_outcome(&fb, &writer, [1, 2, 4]);
 }
 
 /// The multi-array branch under the same rule: the frames share one file, so
-/// they land together or stay queued together, and the retry reuses the file
-/// number rather than consuming a second one.
+/// they land together or stay queued together; the failed attempt's name
+/// consumed a number, so the retry opens the next one.
 fn multi_array_flush_failing_on_write(fail_write_number: usize) {
     let mut fb = captured_three();
     let mut writer = RecordingWriter::new(true);
@@ -221,7 +227,7 @@ fn multi_array_flush_failing_on_write(fail_write_number: usize) {
         3,
         "the file never completed, so every frame is still owed"
     );
-    assert_eq!(fb.file_number, 1, "no completed file, no number consumed");
+    assert_eq!(fb.file_number, 2, "the failed open's name consumed 1");
 
     writer.fail_write_number = None;
     writer.landed.clear();
@@ -231,13 +237,13 @@ fn multi_array_flush_failing_on_write(fail_write_number: usize) {
     assert_eq!(
         writer.landed,
         vec![
-            ("img_0001".to_string(), 1),
-            ("img_0001".to_string(), 2),
-            ("img_0001".to_string(), 3),
+            ("img_0002".to_string(), 1),
+            ("img_0002".to_string(), 2),
+            ("img_0002".to_string(), 3),
         ],
-        "all three frames in the one file the failed attempt had claimed"
+        "all three frames in the one file the retry opened"
     );
-    assert_eq!(fb.file_number, 2, "one completed file, one increment");
+    assert_eq!(fb.file_number, 3, "two names made, two increments");
     assert_eq!(fb.num_captured(), 0);
 }
 

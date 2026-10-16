@@ -9,10 +9,8 @@ use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
-};
+use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
 
 // TIFF tag numbers. 256-339 are the baseline tags C sets through TIFFSetField
@@ -616,6 +614,34 @@ impl Default for TiffFileProcessor {
 
 impl NDPluginProcess for TiffFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        self.ctrl.lock().write_int32(reason, value, verdict)
+    }
+
+    /// C NDPluginFile::writeOctet: the setting is stored inside the write.
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        self.ctrl.lock().write_octet(reason, verdict)
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
@@ -636,10 +662,6 @@ impl NDPluginProcess for TiffFileProcessor {
     ) -> asyn_rs::error::AsynResult<()> {
         self.ctrl.lock().register_params(base)
     }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        self.ctrl.lock().on_param_change(reason, params)
-    }
 }
 
 #[cfg(test)]
@@ -649,7 +671,7 @@ mod tests {
     // The tests verify the bytes this module writes with an INDEPENDENT TIFF
     // decoder (the `tiff` crate), not with our own reader.
     use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
-    use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+    use ad_core_rs::plugin::runtime::WriteVerdict;
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tiff::decoder::Decoder;
@@ -839,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn test_on_param_change_read_file_emits_array_and_resets_busy() {
+    fn a_read_file_write_publishes_the_array_and_resets_busy() {
         let path = temp_path("tiff_read_param");
         let mut writer = TiffWriter::new();
 
@@ -869,54 +891,25 @@ mod tests {
         let reason_template = base.find_param("FILE_TEMPLATE").unwrap();
         let reason_read = base.find_param("READ_FILE").unwrap();
 
-        let _ = proc.on_param_change(
+        let octet = |reason, v: String| {
+            proc.validate_octet(reason, 0, &v, WriteVerdict::Accept(v.clone()), &base);
+        };
+        // As the port's FilePath write leaves it: with checkPath's separator.
+        octet(
             reason_path,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_path,
-                addr: 0,
-                value: ParamChangeValue::Octet(
-                    path.parent().unwrap().to_str().unwrap().to_string(),
-                ),
-            },
+            format!("{}/", path.parent().unwrap().to_str().unwrap()),
         );
-        let _ = proc.on_param_change(
+        octet(
             reason_name,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_name,
-                addr: 0,
-                value: ParamChangeValue::Octet(
-                    path.file_name().unwrap().to_str().unwrap().to_string(),
-                ),
-            },
+            path.file_name().unwrap().to_str().unwrap().to_string(),
         );
-        let _ = proc.on_param_change(
-            reason_template,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_template,
-                addr: 0,
-                value: ParamChangeValue::Octet("%s%s".into()),
-            },
-        );
+        octet(reason_template, "%s%s".into());
 
-        let result = proc.on_param_change(
-            reason_read,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_read,
-                addr: 0,
-                value: ParamChangeValue::Int32(1),
-            },
-        );
+        let out = proc.validate_int32(reason_read, 0, 1, WriteVerdict::Accept(1), &base);
 
-        assert_eq!(result.output_arrays.len(), 1);
-        assert!(result.param_updates.iter().any(|u| matches!(
-            u,
-            ParamUpdate::Int32 { reason, value: 0, .. } if *reason == reason_read
-        )));
-        match &result.output_arrays[0].data {
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        assert_eq!(out.publish.0.len(), 1);
+        match &out.publish.0[0].data {
             NDDataBuffer::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("unexpected data buffer: {other:?}"),
         }

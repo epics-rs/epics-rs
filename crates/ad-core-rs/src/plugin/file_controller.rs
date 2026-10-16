@@ -1,17 +1,18 @@
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::error::{ADError, ADResult};
-use crate::finalize::Finalize;
+use parking_lot::{Mutex, MutexGuard};
+
+use crate::error::ADResult;
 use crate::ndarray::{NDArray, NDDataType, NDDimension};
 
-use super::file_base::{NDFileMode, NDFileWriter, NDPluginFileBase, with_open_file};
-use super::runtime::{
-    ParamChangeResult, ParamChangeValue, ParamUpdate, PluginParamSnapshot, ProcessResult,
-};
+use super::file_base::{FileIo, NDFileMode, NDFileWriter, NDPluginFileBase, with_open_file};
+use super::runtime::{ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict};
+use asyn_rs::trace::TraceMask;
 
 /// Param indices for file plugin control (looked up once at registration time).
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct FileParamIndices {
     pub file_path: Option<usize>,
     pub file_name: Option<usize>,
@@ -56,7 +57,11 @@ pub struct FileParamIndices {
 /// state inconsistent (e.g. a stream open while `capture_active` is false).
 pub struct FilePluginController<W: NDFileWriter> {
     pub file_base: NDPluginFileBase,
-    pub writer: W,
+    /// C's `fileMutexId`: held for file I/O, which runs with the port lock
+    /// released. Never locked from inside it.
+    pub writer: Arc<Mutex<W>>,
+    /// `supportsMultipleArrays`, a constructor constant in C.
+    multiple_arrays: bool,
     pub params: FileParamIndices,
     pub auto_save: bool,
     /// Capture/stream-in-progress flag. INVARIANT: only `start_capture` /
@@ -82,7 +87,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
     pub fn new(writer: W) -> Self {
         Self {
             file_base: NDPluginFileBase::new(),
-            writer,
+            multiple_arrays: writer.supports_multiple_arrays(),
+            writer: Arc::new(Mutex::new(writer)),
             params: FileParamIndices::default(),
             auto_save: false,
             capture_active: false,
@@ -133,60 +139,6 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     // ── capture state owner (B8) ──
-
-    /// Start capture/stream (single owner of the capture-state transition).
-    ///
-    /// B8: clears the capture buffer, resets validation state, sets
-    /// `capture_active`, and emits the `CAPTURE`/`NUM_CAPTURED` PV updates.
-    /// B9: for a non-lazy Stream plugin whose writer supports multiple arrays
-    /// the file is opened eagerly here (C++ `doCapture`) so a bad path is
-    /// reported at capture-start; a lazy plugin defers to the first frame.
-    fn start_capture(&mut self, updates: &mut Vec<ParamUpdate>) -> ADResult<()> {
-        self.file_base.clear_capture();
-        self.stream_dims = None;
-        self.stream_data_type = None;
-        self.file_base.lazy_open = self.lazy_open;
-        self.file_base.delete_driver_file = self.delete_driver_file;
-
-        if self.file_base.mode() == NDFileMode::Stream
-            && !self.lazy_open
-            && self.writer.supports_multiple_arrays()
-        {
-            // B9: eager open — needs a frame to know the layout.
-            if let Some(array) = self.latest_array.clone() {
-                self.file_base.open_stream(&mut self.writer, &array)?;
-            }
-        }
-        self.capture_active = true;
-        self.push_capture_update(updates);
-        self.push_num_captured_update(updates);
-        Ok(())
-    }
-
-    /// Stop capture/stream (single owner of the capture-state transition).
-    ///
-    /// B8/B17: closes any open stream file, clears `capture_active`, and
-    /// emits the `CAPTURE` PV update. Idempotent.
-    ///
-    /// The B8 invariant — that `capture_active`, the file-base capture state
-    /// and the `CAPTURE` PV move together — holds for the failing close as
-    /// well: the finalizer performs the whole transition on every exit path, so
-    /// a `close_stream` error is reported without latching `Capture_RBV` at 1
-    /// against a plugin that is no longer capturing.
-    fn stop_capture(&mut self, updates: &mut Vec<ParamUpdate>) -> ADResult<()> {
-        let mut stopping = Finalize::new(self, |ctrl: &mut Self| {
-            ctrl.capture_active = false;
-            ctrl.stream_dims = None;
-            ctrl.stream_data_type = None;
-            ctrl.push_capture_update(updates);
-        });
-        stopping.run(|ctrl| {
-            if ctrl.file_base.mode() == NDFileMode::Stream {
-                ctrl.file_base.close_stream(&mut ctrl.writer)?;
-            }
-            Ok(())
-        })
-    }
 
     /// `isFrameValid` (C++ NDPluginFile.cpp:665): a frame is valid if its
     /// dimensions and data type match the first frame of the capture/stream.
@@ -301,314 +253,111 @@ impl<W: NDFileWriter> FilePluginController<W> {
         reopen
     }
 
-    /// Process an incoming array: auto_save, capture buffering, stream write.
-    ///
-    /// The frame is kept by reference, as C's `pArray->reserve()` keeps it
-    /// (NDPluginFile.cpp:744); nothing here copies the data.
-    pub fn process_array(&mut self, array: &Arc<NDArray>) -> ProcessResult {
-        let mut proc_result = ProcessResult::empty();
-        let array = Arc::clone(array);
-        self.latest_array = Some(Arc::clone(&array));
-
-        // G9: FilePluginDestination routing — skip frames not for this plugin.
-        if !self.destination_matches(&array) {
-            return proc_result;
-        }
-
-        // Re-check file-path existence before every write. C++ NDPluginFile
-        // calls checkPath() before each write so a directory deleted after
-        // FilePath was set is reflected; the Rust port previously updated
-        // FilePathExists only on the FilePath param change.
-        self.refresh_file_path_exists(&mut proc_result.param_updates);
-
-        // G9: FilePluginClose attribute forces an immediate file close.
-        let force_close = array
-            .attributes
-            .get("FilePluginClose")
-            .and_then(|a| a.value.as_i64())
-            .map(|v| v != 0)
-            .unwrap_or(false);
-        if force_close {
-            if let Err(e) = self.file_base.force_close(&mut self.writer) {
-                self.fail_cycle(&mut proc_result, e.to_string());
-                return proc_result;
-            }
-            let _ = self.stop_capture(&mut proc_result.param_updates);
-            return proc_result;
-        }
-
-        let result = match self.file_base.mode() {
-            NDFileMode::Single => {
-                if self.auto_save {
-                    let r = self.write_single(array);
-                    if r.is_ok() {
-                        self.saved_frames += 1; // G10: count saved frame
-                    }
-                    r
-                } else {
-                    Ok(())
-                }
-            }
-            NDFileMode::Capture => {
-                if self.capture_active {
-                    // G12: validate frame dims/dtype in Capture mode too.
-                    if !self.frame_valid(&array) {
-                        return proc_result;
-                    }
-                    self.file_base.capture_array(array);
-                    self.push_num_captured_update(&mut proc_result.param_updates);
-                    let target = self.file_base.num_capture_target();
-                    if target > 0 && self.file_base.num_captured() >= target {
-                        if self.auto_save {
-                            let to_save = self.file_base.num_captured() as i32;
-                            if let Err(err) = self.file_base.flush_capture(&mut self.writer) {
-                                Err(err)
-                            } else {
-                                self.saved_frames += to_save; // G10
-                                self.push_full_file_name_update(&mut proc_result.param_updates);
-                                self.push_num_captured_update(&mut proc_result.param_updates);
-                                self.stop_capture(&mut proc_result.param_updates).ok();
-                                Ok(())
-                            }
-                        } else {
-                            self.stop_capture(&mut proc_result.param_updates).ok();
-                            Ok(())
-                        }
-                    } else {
-                        Ok(())
-                    }
-                } else {
-                    Ok(())
-                }
-            }
-            NDFileMode::Stream => {
-                if self.capture_active {
-                    // G12: validate frame dims/dtype against the first frame.
-                    if !self.frame_valid(&array) {
-                        return proc_result;
-                    }
-                    // G9: attribute-driven filename override / mid-stream reopen.
-                    let reopen =
-                        self.apply_filename_attributes(&array, &mut proc_result.param_updates);
-                    if reopen && self.file_base.is_open() {
-                        if let Err(e) = self.file_base.force_close(&mut self.writer) {
-                            self.fail_cycle(&mut proc_result, e.to_string());
-                            return proc_result;
-                        }
-                    }
-                    let r = self.file_base.process_array(array, &mut self.writer);
-                    if r.is_ok() {
-                        self.saved_frames += 1; // G10: count saved frame
-                        // C++ NDPluginFile::processCallbacks publishes
-                        // NDFileNumCaptured after every successful stream
-                        // write — without this an unbounded stream
-                        // (NumCapture=0) reports NumCaptured_RBV=0 forever.
-                        self.push_num_captured_update(&mut proc_result.param_updates);
-                    }
-                    let target = self.file_base.num_capture_target();
-                    if r.is_ok() && target > 0 && self.file_base.num_captured() >= target {
-                        if let Err(e) = self.file_base.close_stream(&mut self.writer) {
-                            self.fail_cycle(&mut proc_result, e.to_string());
-                            return proc_result;
-                        }
-                        self.stop_capture(&mut proc_result.param_updates).ok();
-                        self.push_full_file_name_update(&mut proc_result.param_updates);
-                    }
-                    r
-                } else {
-                    Ok(())
-                }
-            }
-        };
-
-        if result.is_ok() {
-            proc_result.param_updates.extend(self.success_updates());
-            if self.file_base.mode() == NDFileMode::Single && self.auto_save {
-                self.push_full_file_name_update(&mut proc_result.param_updates);
-            }
-            if self.file_base.mode() == NDFileMode::Stream && self.capture_active {
-                self.push_full_file_name_update(&mut proc_result.param_updates);
-            }
-            // G10: override ArrayCounter (the runtime bumped it per callback)
-            // with the saved-frame count so a file plugin's ArrayCounter_RBV
-            // reflects frames actually written, not callbacks received.
-            if let Some(idx) = self.params.array_counter {
-                proc_result.param_updates.push(ParamUpdate::Int32 {
-                    reason: idx,
-                    addr: 0,
-                    value: self.saved_frames,
-                });
-            }
-        } else if let Err(err) = result {
-            self.fail_cycle(&mut proc_result, err.to_string());
-        }
-        proc_result
+    /// C posts a nonzero `WriteFile`/`ReadFile` before its file I/O
+    /// (NDPluginFile.cpp:808-811, :823-826).
+    pub fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        value != 0 && [self.params.write_file, self.params.read_file].contains(&Some(reason))
     }
 
-    /// Handle a control-plane param change. Returns true if the reason was handled.
-    pub fn on_param_change(
+    /// C `NDPluginFile::writeOctet` on the port thread: the setting is in
+    /// the controller before any file I/O written after it.
+    pub fn write_octet(
         &mut self,
         reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
-        let mut updates = Vec::new();
+        verdict: WriteVerdict<String>,
+    ) -> WriteOutcome<String> {
+        self.store_octet(reason, &verdict.kept());
+        verdict.into()
+    }
 
-        if Some(reason) == self.params.file_path {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                let (normalized, exists) = check_file_path(s);
-                self.file_base.file_path = normalized;
-                if let Some(idx) = self.params.file_path_exists {
-                    updates.push(ParamUpdate::Int32 {
-                        reason: idx,
-                        addr: 0,
-                        value: if exists { 1 } else { 0 },
-                    });
-                }
-            }
-        } else if Some(reason) == self.params.file_name {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                self.file_base.file_name = s.clone();
-            }
-        } else if Some(reason) == self.params.file_number {
-            self.file_base.file_number = params.value.as_i32();
-        } else if Some(reason) == self.params.file_template {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                self.file_base.file_template = s.clone();
-            }
-        } else if Some(reason) == self.params.auto_increment {
-            self.file_base.auto_increment = params.value.as_i32() != 0;
-        } else if Some(reason) == self.params.auto_save {
-            self.auto_save = params.value.as_i32() != 0;
-        } else if Some(reason) == self.params.write_mode {
-            // B17: WriteMode transitions are gated through stop_capture so a
-            // mode switch mid-capture cannot leave a stream file open.
-            let new_mode = NDFileMode::from_i32(params.value.as_i32());
-            if self.capture_active && new_mode != self.file_base.mode() {
-                if let Err(e) = self.stop_capture(&mut updates) {
-                    self.push_error_updates(&mut updates, false, false, e.to_string());
-                    return ParamChangeResult::updates(updates);
-                }
-            }
-            self.file_base.set_mode(new_mode);
-        } else if Some(reason) == self.params.num_capture {
-            // B7: numCapture==0 means "capture forever" — C++ buffers
-            // indefinitely. Do not force a minimum of 1.
-            self.file_base
-                .set_num_capture(params.value.as_i32().max(0) as usize);
-        } else if Some(reason) == self.params.create_dir {
-            self.file_base.create_dir = params.value.as_i32();
-        } else if Some(reason) == self.params.file_temp_suffix {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                self.file_base.temp_suffix = s.clone();
-            }
-        } else if Some(reason) == self.params.write_file {
-            if params.value.as_i32() != 0 {
-                let result = match self.file_base.mode() {
-                    NDFileMode::Single => {
-                        if let Some(array) = self.latest_array.clone() {
-                            self.write_single(array)
-                        } else {
-                            Err(ADError::UnsupportedConversion(
-                                "no array available for write".into(),
-                            ))
-                        }
-                    }
-                    NDFileMode::Capture => self.file_base.flush_capture(&mut self.writer),
-                    NDFileMode::Stream => {
-                        if let Some(array) = self.latest_array.clone() {
-                            self.file_base.process_array(array, &mut self.writer)
-                        } else {
-                            Err(ADError::UnsupportedConversion(
-                                "no array available for write".into(),
-                            ))
-                        }
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        updates.extend(self.success_updates());
-                        self.push_num_captured_update(&mut updates);
-                        self.push_full_file_name_update(&mut updates);
-                    }
-                    Err(err) => {
-                        // The write that failed is `flush_capture` in Capture
-                        // mode, which lands frames one at a time, so the
-                        // readbacks have to come back off `file_base`.
-                        self.push_error_updates(&mut updates, false, true, err.to_string());
-                        self.push_file_base_readbacks(&mut updates);
-                        return ParamChangeResult::updates(updates);
-                    }
-                }
-            }
-        } else if Some(reason) == self.params.read_file {
-            if params.value.as_i32() != 0 {
-                let result = (|| -> ADResult<Arc<NDArray>> {
-                    let path = PathBuf::from(self.file_base.create_file_name());
-                    let layout = NDArray::new(vec![NDDimension::new(1)], NDDataType::UInt8);
-                    let array = with_open_file(
-                        &mut self.writer,
-                        &path,
-                        NDFileMode::Single,
-                        &layout,
-                        |w| w.read_file().map(Arc::new),
-                    )?;
-                    self.latest_array = Some(array.clone());
-                    Ok(array)
-                })();
-                match result {
-                    Ok(array) => {
-                        updates.extend(self.success_updates());
-                        self.push_full_file_name_update(&mut updates);
-                        return ParamChangeResult::combined(vec![array], updates);
-                    }
-                    Err(err) => {
-                        self.push_error_updates(&mut updates, true, false, err.to_string());
-                        return ParamChangeResult::updates(updates);
-                    }
-                }
-            }
-        } else if Some(reason) == self.params.lazy_open {
-            self.lazy_open = params.value.as_i32() != 0;
-        } else if Some(reason) == self.params.delete_driver_file {
-            self.delete_driver_file = params.value.as_i32() != 0;
-        } else if Some(reason) == self.params.free_capture {
-            if params.value.as_i32() != 0 {
-                self.file_base.clear_capture();
-                self.push_num_captured_update(&mut updates);
-            }
-        } else if Some(reason) == self.params.capture {
-            // B8: capture start/stop routes through the single owner.
-            if params.value.as_i32() != 0 {
-                if self.file_base.mode() == NDFileMode::Single {
-                    // Capture is invalid in Single mode — leave it stopped.
-                    let _ = self.stop_capture(&mut updates);
-                    self.push_error_updates(
-                        &mut updates,
-                        false,
-                        false,
-                        "ERROR: capture not supported in Single mode".into(),
-                    );
-                    return ParamChangeResult::updates(updates);
-                }
-                if let Err(e) = self.start_capture(&mut updates) {
-                    self.push_error_updates(&mut updates, false, false, e.to_string());
-                    return ParamChangeResult::updates(updates);
-                }
-            } else if let Err(e) = self.stop_capture(&mut updates) {
-                self.push_error_updates(&mut updates, false, false, e.to_string());
-                return ParamChangeResult::updates(updates);
-            }
+    /// [`FileControl::store_int32`] for the octet settings.
+    pub fn store_octet(&mut self, reason: usize, value: &str) {
+        let p = self.params;
+        let field = if Some(reason) == p.file_path {
+            // The port's write already ran `checkPath` and set FilePathExists.
+            &mut self.file_base.file_path
+        } else if Some(reason) == p.file_name {
+            &mut self.file_base.file_name
+        } else if Some(reason) == p.file_template {
+            &mut self.file_base.file_template
+        } else if Some(reason) == p.file_temp_suffix {
+            &mut self.file_base.temp_suffix
+        } else {
+            return;
+        };
+        *field = value.to_owned();
+    }
+
+    /// `doCapture`'s checks and the readbacks C sets before it
+    /// (NDPluginFile.cpp:831-856, :418-490).
+    fn check_capture(&self, value: i32, verdict: WriteVerdict<i32>) -> WriteOutcome<i32> {
+        let p = &self.params;
+        let set_int = |out: WriteOutcome<i32>, idx: Option<usize>, v: i32| match idx {
+            Some(i) => out.set_int32(i, 0, v),
+            None => out,
+        };
+        let set_str = |out: WriteOutcome<i32>, idx: Option<usize>, v: &str| match idx {
+            Some(i) => out.set_octet(i, 0, v),
+            None => out,
+        };
+        let has_array = self.latest_array.is_some();
+        let out = WriteOutcome::from(verdict.succeed());
+        // C latches LazyOpen when a capture starts (:843).
+        let lazy = if value != 0 {
+            self.lazy_open
+        } else {
+            self.file_base.lazy_open
+        };
+        let mut out = out;
+        if value != 0 {
+            out = set_int(out, p.write_status, 0);
+            out = set_str(out, p.write_message, "");
+            out = set_str(out, p.full_file_name, "");
         }
-
-        ParamChangeResult::updates(updates)
+        let failed = |out: WriteOutcome<i32>, line: &str| {
+            WriteOutcome {
+                verdict: WriteVerdict::Accept(0),
+                ..out
+            }
+            .print(TraceMask::ERROR, line)
+            .settled()
+        };
+        if !has_array && !lazy {
+            if value == 0 {
+                return out;
+            }
+            return failed(
+                out,
+                "NDPluginFile::doCapture: ERROR, must collect an array to get dimensions first",
+            );
+        }
+        match self.file_base.mode() {
+            NDFileMode::Single => {
+                return failed(
+                    set_str(
+                        out,
+                        p.write_message,
+                        "ERROR: capture not supported in Single mode",
+                    ),
+                    "NDPluginFile:doCapture ERROR: capture not supported in Single mode",
+                );
+            }
+            NDFileMode::Capture if value != 0 && !has_array => {
+                return failed(
+                    out,
+                    "NDPluginFile::doCapture ERROR: No arrays collected: cannot allocate capture buffer",
+                );
+            }
+            NDFileMode::Stream => out = set_int(out, p.write_file, (value != 0) as i32),
+            NDFileMode::Capture => {}
+        }
+        if lazy {
+            out = set_str(out, p.write_message, "Lazy Open...");
+        }
+        out
     }
 
     // ── helpers ──
-
-    fn write_single(&mut self, array: Arc<NDArray>) -> ADResult<()> {
-        self.file_base.ensure_directory()?;
-        self.file_base.process_array(array, &mut self.writer)
-    }
 
     fn success_updates(&self) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
@@ -708,7 +457,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
             updates.push(ParamUpdate::Octet {
                 reason: idx,
                 addr: 0,
-                value: self.file_base.last_written_name().to_string(),
+                value: self.file_base.full_file_name().to_string(),
             });
         }
     }
@@ -776,6 +525,473 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 }
 
+/// The plugin's port lock as the file I/O sees it. C releases it around
+/// every `openFile`/`writeFile`/`readFile`/`closeFile` (NDPluginFile.cpp:
+/// 62-76, :247-251, :296-300), so a frame callback is never queued behind a
+/// file write.
+pub trait PortLock<C> {
+    fn controller(&mut self) -> &mut C;
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R;
+}
+
+impl<C> PortLock<C> for MutexGuard<'_, C> {
+    fn controller(&mut self) -> &mut C {
+        self
+    }
+
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        MutexGuard::unlocked(self, f)
+    }
+}
+
+/// A controller no lock guards, as in the unit tests.
+#[cfg(test)]
+impl<W: NDFileWriter> PortLock<Self> for FilePluginController<W> {
+    fn controller(&mut self) -> &mut Self {
+        self
+    }
+
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+}
+
+/// The file-base step of a port: `base` under the port lock, `io` with it
+/// released and the writer's lock held.
+struct PortIo<'a, P, W>(&'a mut P, PhantomData<fn() -> W>);
+
+impl<'a, P, W> PortIo<'a, P, W> {
+    fn new(port: &'a mut P) -> Self {
+        Self(port, PhantomData)
+    }
+}
+
+impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileIo for PortIo<'_, P, W> {
+    fn base(&mut self) -> &mut NDPluginFileBase {
+        &mut self.0.controller().file_base
+    }
+
+    fn io<R>(&mut self, f: impl FnOnce(&mut dyn NDFileWriter) -> R) -> R {
+        let writer = Arc::clone(&self.0.controller().writer);
+        self.0.unlocked(|| f(&mut *writer.lock()))
+    }
+}
+
+/// The NDPluginFile entry points that reach the file, called on the locked
+/// controller so the I/O can release the lock.
+pub trait FileControl<W> {
+    /// Process an incoming array: auto_save, capture buffering, stream write.
+    ///
+    /// The frame is kept by reference, as C's `pArray->reserve()` keeps it
+    /// (NDPluginFile.cpp:744); nothing here copies the data.
+    fn process_array(&mut self, array: &Arc<NDArray>) -> ProcessResult;
+
+    /// C `NDPluginFile::writeInt32` (NDPluginFile.cpp:799-870) on the port
+    /// thread: `validate_int32` then, unless that settled the write,
+    /// `store_int32` with the value the param keeps.
+    fn write_int32(
+        &mut self,
+        reason: usize,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+    ) -> WriteOutcome<i32>;
+
+    /// The writes `NDPluginFile::writeInt32` acts on (NDPluginFile.cpp:
+    /// 808-856), with the file I/O inside the write as C does it; the
+    /// readbacks they leave are side params. C ends in `status =
+    /// callParamCallbacks();` (:865), so every write succeeds; a WriteFile
+    /// with no array or a `doCapture` that fails (:418-490) is settled with
+    /// C's console line.
+    fn validate_int32(
+        &mut self,
+        reason: usize,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+    ) -> WriteOutcome<i32>;
+
+    /// Mirror a stored int32 setting into the controller. The settings live
+    /// here, not in the param library, because `process_array` runs without
+    /// it; they are written only from the write path, in write order.
+    fn store_int32(&mut self, reason: usize, value: i32) -> Vec<ParamUpdate>;
+}
+
+impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P {
+    fn process_array(&mut self, array: &Arc<NDArray>) -> ProcessResult {
+        let mut proc_result = ProcessResult::empty();
+        let array = Arc::clone(array);
+        let c = self.controller();
+        c.latest_array = Some(Arc::clone(&array));
+
+        // G9: FilePluginDestination routing — skip frames not for this plugin.
+        if !c.destination_matches(&array) {
+            return proc_result;
+        }
+
+        // Re-check file-path existence before every write. C++ NDPluginFile
+        // calls checkPath() before each write so a directory deleted after
+        // FilePath was set is reflected; the Rust port previously updated
+        // FilePathExists only on the FilePath param change.
+        c.refresh_file_path_exists(&mut proc_result.param_updates);
+
+        // G9: FilePluginClose attribute forces an immediate file close.
+        let force_close = array
+            .attributes
+            .get("FilePluginClose")
+            .and_then(|a| a.value.as_i64())
+            .map(|v| v != 0)
+            .unwrap_or(false);
+        if force_close {
+            if let Err(e) = NDPluginFileBase::force_close_io(&mut PortIo::new(self)) {
+                self.controller()
+                    .fail_cycle(&mut proc_result, e.to_string());
+                return proc_result;
+            }
+            let _ = stop_capture(self, &mut proc_result.param_updates);
+            return proc_result;
+        }
+
+        // `Ok(true)` only where C calls writeFileBase, which alone sets
+        // WriteStatus/WriteMessage (NDPluginFile.cpp:745-785).
+        let c = self.controller();
+        let result: ADResult<bool> = match c.file_base.mode() {
+            NDFileMode::Single => {
+                if c.auto_save {
+                    let r = write_single(self, array);
+                    if r.is_ok() {
+                        self.controller().saved_frames += 1; // G10: count saved frame
+                    }
+                    r.map(|()| true)
+                } else {
+                    Ok(false)
+                }
+            }
+            NDFileMode::Capture => {
+                if c.capture_active {
+                    // G12: validate frame dims/dtype in Capture mode too.
+                    if !c.frame_valid(&array) {
+                        return proc_result;
+                    }
+                    c.file_base.capture_array(array);
+                    c.push_num_captured_update(&mut proc_result.param_updates);
+                    let target = c.file_base.num_capture_target();
+                    if target > 0 && c.file_base.num_captured() >= target {
+                        if c.auto_save {
+                            let to_save = c.file_base.num_captured() as i32;
+                            if let Err(err) =
+                                NDPluginFileBase::flush_capture_io(&mut PortIo::new(self))
+                            {
+                                Err(err)
+                            } else {
+                                let c = self.controller();
+                                c.saved_frames += to_save; // G10
+                                c.push_full_file_name_update(&mut proc_result.param_updates);
+                                c.push_num_captured_update(&mut proc_result.param_updates);
+                                stop_capture(self, &mut proc_result.param_updates).ok();
+                                Ok(true)
+                            }
+                        } else {
+                            stop_capture(self, &mut proc_result.param_updates).ok();
+                            Ok(false)
+                        }
+                    } else {
+                        Ok(false)
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            NDFileMode::Stream => {
+                if c.capture_active {
+                    // G12: validate frame dims/dtype against the first frame.
+                    if !c.frame_valid(&array) {
+                        return proc_result;
+                    }
+                    // G9: attribute-driven filename override / mid-stream reopen.
+                    let reopen =
+                        c.apply_filename_attributes(&array, &mut proc_result.param_updates);
+                    if reopen && c.file_base.is_open() {
+                        if let Err(e) = NDPluginFileBase::force_close_io(&mut PortIo::new(self)) {
+                            self.controller()
+                                .fail_cycle(&mut proc_result, e.to_string());
+                            return proc_result;
+                        }
+                    }
+                    let r = NDPluginFileBase::process_array_io(&mut PortIo::new(self), array);
+                    let c = self.controller();
+                    if r.is_ok() {
+                        c.saved_frames += 1; // G10: count saved frame
+                        // C++ NDPluginFile::processCallbacks publishes
+                        // NDFileNumCaptured after every successful stream
+                        // write — without this an unbounded stream
+                        // (NumCapture=0) reports NumCaptured_RBV=0 forever.
+                        c.push_num_captured_update(&mut proc_result.param_updates);
+                    }
+                    let target = c.file_base.num_capture_target();
+                    if r.is_ok() && target > 0 && c.file_base.num_captured() >= target {
+                        if let Err(e) = NDPluginFileBase::close_stream_io(&mut PortIo::new(self)) {
+                            self.controller()
+                                .fail_cycle(&mut proc_result, e.to_string());
+                            return proc_result;
+                        }
+                        stop_capture(self, &mut proc_result.param_updates).ok();
+                        self.controller()
+                            .push_full_file_name_update(&mut proc_result.param_updates);
+                    }
+                    r.map(|()| true)
+                } else {
+                    Ok(false)
+                }
+            }
+        };
+
+        let c = self.controller();
+        if let Ok(wrote) = result {
+            if wrote {
+                proc_result.param_updates.extend(c.success_updates());
+                c.push_full_file_name_update(&mut proc_result.param_updates);
+            }
+            // G10: override ArrayCounter (the runtime bumped it per callback)
+            // with the saved-frame count so a file plugin's ArrayCounter_RBV
+            // reflects frames actually written, not callbacks received.
+            if let Some(idx) = c.params.array_counter {
+                proc_result.param_updates.push(ParamUpdate::Int32 {
+                    reason: idx,
+                    addr: 0,
+                    value: c.saved_frames,
+                });
+            }
+        } else if let Err(err) = result {
+            c.fail_cycle(&mut proc_result, err.to_string());
+        }
+        proc_result
+    }
+
+    fn write_int32(
+        &mut self,
+        reason: usize,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+    ) -> WriteOutcome<i32> {
+        let out = self.validate_int32(reason, value, verdict);
+        if out.settled {
+            return out;
+        }
+        let updates = self.store_int32(reason, out.verdict.kept());
+        out.set_updates(updates)
+    }
+
+    fn validate_int32(
+        &mut self,
+        reason: usize,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+    ) -> WriteOutcome<i32> {
+        let c = self.controller();
+        let p = c.params;
+        let mut updates = Vec::new();
+        if Some(reason) == p.write_file && value != 0 {
+            let Some(array) = c.latest_array.clone() else {
+                return WriteOutcome::from(WriteVerdict::Accept(0))
+                    .print(
+                        TraceMask::ERROR,
+                        "NDPluginFile::writeInt32: ERROR, no valid array to write",
+                    )
+                    .settled();
+            };
+            let result = match c.file_base.mode() {
+                NDFileMode::Single => write_single(self, array),
+                NDFileMode::Capture => NDPluginFileBase::flush_capture_io(&mut PortIo::new(self)),
+                NDFileMode::Stream => {
+                    NDPluginFileBase::process_array_io(&mut PortIo::new(self), array)
+                }
+            };
+            let c = self.controller();
+            match result {
+                Ok(()) => {
+                    updates.extend(c.success_updates());
+                    c.push_num_captured_update(&mut updates);
+                    c.push_full_file_name_update(&mut updates);
+                }
+                Err(err) => {
+                    // The write that failed is `flush_capture` in Capture
+                    // mode, which lands frames one at a time, so the
+                    // readbacks have to come back off `file_base`.
+                    c.push_error_updates(&mut updates, false, true, err.to_string());
+                    c.push_file_base_readbacks(&mut updates);
+                }
+            }
+            // C sets the flag back to 0, since this could be a busy record (:820).
+            return WriteOutcome::from(WriteVerdict::Accept(0)).set_updates(updates);
+        }
+        if Some(reason) == p.read_file && value != 0 {
+            let path = PathBuf::from(c.file_base.open_file_name());
+            let layout = NDArray::new(vec![NDDimension::new(1)], NDDataType::UInt8);
+            let result = PortIo::new(self).io(|w| {
+                with_open_file(w, &path, NDFileMode::Single, &layout, |w| {
+                    w.read_file().map(Arc::new)
+                })
+            });
+            let c = self.controller();
+            let out = WriteOutcome::from(WriteVerdict::Accept(0));
+            return match result {
+                Ok(array) => {
+                    c.latest_array = Some(array.clone());
+                    updates.extend(c.success_updates());
+                    c.push_full_file_name_update(&mut updates);
+                    out.set_updates(updates).publish(array)
+                }
+                Err(err) => {
+                    // The name, and FileNumber past it, are set before the
+                    // open that failed (:146-155).
+                    c.push_error_updates(&mut updates, true, false, err.to_string());
+                    c.push_file_number_update(&mut updates);
+                    c.push_full_file_name_update(&mut updates);
+                    out.set_updates(updates)
+                }
+            };
+        }
+        // C frees on any write, 0 included (:855-856).
+        if Some(reason) == p.free_capture {
+            c.file_base.clear_capture();
+            c.push_num_captured_update(&mut updates);
+            return WriteOutcome::from(verdict.succeed()).set_updates(updates);
+        }
+        if Some(reason) != p.capture {
+            return verdict.succeed().into();
+        }
+        let out = c.check_capture(value, verdict);
+        if out.settled {
+            return out;
+        }
+        // B8: capture start/stop routes through the single owner.
+        let started = if value != 0 {
+            start_capture(self, &mut updates)
+        } else {
+            stop_capture(self, &mut updates)
+        };
+        match started {
+            Ok(()) => out.set_updates(updates),
+            Err(e) => {
+                self.controller()
+                    .push_error_updates(&mut updates, false, false, e.to_string());
+                WriteOutcome {
+                    verdict: WriteVerdict::Accept(0),
+                    ..out
+                }
+                .set_updates(updates)
+            }
+        }
+    }
+
+    fn store_int32(&mut self, reason: usize, value: i32) -> Vec<ParamUpdate> {
+        let c = self.controller();
+        let p = c.params;
+        let mut updates = Vec::new();
+        if Some(reason) == p.file_number {
+            c.file_base.file_number = value;
+        } else if Some(reason) == p.auto_increment {
+            c.file_base.auto_increment = value != 0;
+        } else if Some(reason) == p.auto_save {
+            c.auto_save = value != 0;
+        } else if Some(reason) == p.write_mode {
+            // B17: WriteMode transitions are gated through stop_capture so a
+            // mode switch mid-capture cannot leave a stream file open.
+            let new_mode = NDFileMode::from_i32(value);
+            if c.capture_active && new_mode != c.file_base.mode() {
+                if let Err(e) = stop_capture(self, &mut updates) {
+                    self.controller()
+                        .push_error_updates(&mut updates, false, false, e.to_string());
+                    return updates;
+                }
+            }
+            self.controller().file_base.set_mode(new_mode);
+        } else if Some(reason) == p.num_capture {
+            // B7: numCapture==0 means "capture forever" — C++ buffers
+            // indefinitely. Do not force a minimum of 1.
+            c.file_base.set_num_capture(value.max(0) as usize);
+        } else if Some(reason) == p.create_dir {
+            c.file_base.create_dir = value;
+        } else if Some(reason) == p.lazy_open {
+            c.lazy_open = value != 0;
+        } else if Some(reason) == p.delete_driver_file {
+            c.delete_driver_file = value != 0;
+        }
+        updates
+    }
+}
+
+/// Start capture/stream (single owner of the capture-state transition).
+///
+/// B8: clears the capture buffer, resets validation state, sets
+/// `capture_active`, and emits the `CAPTURE`/`NUM_CAPTURED` PV updates.
+/// B9: for a non-lazy Stream plugin whose writer supports multiple arrays
+/// the file is opened eagerly here (C++ `doCapture`) so a bad path is
+/// reported at capture-start; a lazy plugin defers to the first frame.
+fn start_capture<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
+    port: &mut P,
+    updates: &mut Vec<ParamUpdate>,
+) -> ADResult<()> {
+    let c = port.controller();
+    c.file_base.clear_capture();
+    c.stream_dims = None;
+    c.stream_data_type = None;
+    c.file_base.lazy_open = c.lazy_open;
+    c.file_base.delete_driver_file = c.delete_driver_file;
+    // C clears NDFullFileName as a capture starts (NDPluginFile.cpp:847).
+    c.file_base.clear_full_file_name();
+
+    if c.file_base.mode() == NDFileMode::Stream && !c.lazy_open && c.multiple_arrays {
+        // B9: eager open — needs a frame to know the layout.
+        if let Some(array) = c.latest_array.clone() {
+            let opened = NDPluginFileBase::open_stream_io(&mut PortIo::new(port), &array);
+            let c = port.controller();
+            c.push_file_number_update(updates);
+            c.push_full_file_name_update(updates);
+            opened?;
+        }
+    }
+    let c = port.controller();
+    c.capture_active = true;
+    c.push_capture_update(updates);
+    c.push_num_captured_update(updates);
+    Ok(())
+}
+
+/// Stop capture/stream (single owner of the capture-state transition).
+///
+/// B8/B17: closes any open stream file, clears `capture_active`, and
+/// emits the `CAPTURE` PV update. Idempotent.
+///
+/// The B8 invariant — that `capture_active`, the file-base capture state
+/// and the `CAPTURE` PV move together — holds for the failing close as
+/// well: the transition runs after the close whatever it returned, so a
+/// `close_stream` error is reported without latching `Capture_RBV` at 1
+/// against a plugin that is no longer capturing.
+fn stop_capture<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
+    port: &mut P,
+    updates: &mut Vec<ParamUpdate>,
+) -> ADResult<()> {
+    let closed = if port.controller().file_base.mode() == NDFileMode::Stream {
+        NDPluginFileBase::close_stream_io(&mut PortIo::new(port))
+    } else {
+        Ok(())
+    };
+    let c = port.controller();
+    c.capture_active = false;
+    c.stream_dims = None;
+    c.stream_data_type = None;
+    c.push_capture_update(updates);
+    closed
+}
+
+fn write_single<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
+    port: &mut P,
+    array: Arc<NDArray>,
+) -> ADResult<()> {
+    port.controller().file_base.ensure_directory()?;
+    NDPluginFileBase::process_array_io(&mut PortIo::new(port), array)
+}
+
 /// Normalize `path` and report whether the directory exists, through the one
 /// implementation of C++ `asynNDArrayDriver::checkPath` that the file plugins
 /// inherit (`NDPluginFile` -> `NDPluginDriver` -> `asynNDArrayDriver`).
@@ -785,10 +1001,72 @@ fn check_file_path(path: &str) -> (String, bool) {
     (normalized, exists)
 }
 
+/// The port's side of a writer's settings: a write lands here at once, never
+/// behind a file write that holds the writer (C stores the param; the writer
+/// reads it at open, per frame and at close).
+pub struct SettingsStore<T>(Arc<Mutex<(u64, T)>>);
+
+impl<T> Clone for SettingsStore<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> SettingsStore<T> {
+    pub fn update(&self, f: impl FnOnce(&mut T)) {
+        let mut store = self.0.lock();
+        f(&mut store.1);
+        store.0 += 1;
+    }
+
+    pub fn get<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(&self.0.lock().1)
+    }
+}
+
+/// The writer's copy of its settings, refreshed from the [`SettingsStore`]
+/// only where the writer calls [`WriterSettings::refresh`].
+pub struct WriterSettings<T> {
+    store: SettingsStore<T>,
+    cfg: T,
+    seen: u64,
+}
+
+impl<T: Clone> WriterSettings<T> {
+    pub fn new(cfg: T) -> Self {
+        Self {
+            store: SettingsStore(Arc::new(Mutex::new((0, cfg.clone())))),
+            cfg,
+            seen: 0,
+        }
+    }
+
+    pub fn store(&self) -> SettingsStore<T> {
+        self.store.clone()
+    }
+
+    pub fn refresh(&mut self) {
+        let store = self.store.0.lock();
+        if store.0 != self.seen {
+            self.cfg = store.1.clone();
+            self.seen = store.0;
+        }
+    }
+}
+
+impl<T> std::ops::Deref for WriterSettings<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.cfg
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+    use crate::error::ADError;
     use crate::ndarray::{NDArray, NDDataType, NDDimension};
     use std::path::Path;
 
@@ -804,6 +1082,8 @@ mod tests {
         /// Fail every `write_file` past this many successful ones, standing in
         /// for a volume that fills part way through a multi-frame flush.
         fail_write_after: Option<usize>,
+        /// Make `read_file` return `array(77)`.
+        readable: bool,
     }
     impl MockWriter {
         fn new(multi: bool) -> Self {
@@ -814,6 +1094,7 @@ mod tests {
                 multi,
                 fail_close: false,
                 fail_write_after: None,
+                readable: false,
             }
         }
     }
@@ -832,6 +1113,9 @@ mod tests {
             Ok(())
         }
         fn read_file(&mut self) -> ADResult<NDArray> {
+            if self.readable {
+                return Ok(array(77));
+            }
             Err(ADError::UnsupportedConversion("n/a".into()))
         }
         fn close_file(&mut self) -> ADResult<()> {
@@ -887,7 +1171,11 @@ mod tests {
             "FilePluginDestination",
             "OTHER",
         )));
-        assert_eq!(c.writer.writes, 0, "frame for OTHER port must be skipped");
+        assert_eq!(
+            c.writer.lock().writes,
+            0,
+            "frame for OTHER port must be skipped"
+        );
 
         // Destination = this port → written.
         c.process_array(&Arc::new(with_str_attr(
@@ -895,7 +1183,7 @@ mod tests {
             "FilePluginDestination",
             "MYFILE",
         )));
-        assert_eq!(c.writer.writes, 1);
+        assert_eq!(c.writer.lock().writes, 1);
 
         // Destination = "all" → written.
         c.process_array(&Arc::new(with_str_attr(
@@ -903,7 +1191,7 @@ mod tests {
             "FilePluginDestination",
             "all",
         )));
-        assert_eq!(c.writer.writes, 2);
+        assert_eq!(c.writer.lock().writes, 2);
     }
 
     #[test]
@@ -923,7 +1211,8 @@ mod tests {
             42,
         )));
         assert_eq!(
-            c.writer.writes, 1,
+            c.writer.lock().writes,
+            1,
             "numeric FilePluginDestination must be ignored (frame processed), \
              not stringified to \"42\" and skipped"
         );
@@ -973,7 +1262,8 @@ mod tests {
             "allfoo",
         )));
         assert_eq!(
-            c.writer.writes, 1,
+            c.writer.lock().writes,
+            1,
             "destination with \"all\" prefix is processed (C 3-char prefix match)"
         );
 
@@ -985,7 +1275,8 @@ mod tests {
             "x",
         )));
         assert_eq!(
-            c.writer.writes, 1,
+            c.writer.lock().writes,
+            1,
             "1-char non-matching destination is skipped, not blanket-processed"
         );
     }
@@ -1000,7 +1291,7 @@ mod tests {
         c.lazy_open = true;
         let mut updates = Vec::new();
         c.process_array(&Arc::new(array(1))); // cache an array
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         let _ = &updates;
         c.process_array(&Arc::new(array(2))); // opens + writes
         assert!(c.file_base.is_open());
@@ -1021,9 +1312,9 @@ mod tests {
         c.file_base.set_mode(NDFileMode::Capture);
         c.params.capture = Some(7);
         let mut updates = Vec::new();
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         assert!(c.capture_active);
-        c.stop_capture(&mut updates).unwrap();
+        stop_capture(&mut c, &mut updates).unwrap();
         assert!(!c.capture_active);
         // CAPTURE PV updates emitted on each transition.
         assert!(!updates.is_empty());
@@ -1038,12 +1329,12 @@ mod tests {
         c.lazy_open = false;
         c.process_array(&Arc::new(array(1))); // cache a frame for the layout
         let mut updates = Vec::new();
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         assert!(
             c.file_base.is_open(),
             "non-lazy stream opens at capture start"
         );
-        assert_eq!(c.writer.opens, 1);
+        assert_eq!(c.writer.lock().opens, 1);
     }
 
     #[test]
@@ -1055,7 +1346,7 @@ mod tests {
         c.lazy_open = true;
         c.process_array(&Arc::new(array(1)));
         let mut updates = Vec::new();
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         assert!(
             !c.file_base.is_open(),
             "lazy stream does NOT open at capture start"
@@ -1072,7 +1363,7 @@ mod tests {
         c.file_base.set_mode(NDFileMode::Capture);
         c.file_base.set_num_capture(10);
         let mut updates = Vec::new();
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
 
         c.process_array(&Arc::new(array(1))); // first frame: 4-element, recorded
         assert_eq!(c.file_base.num_captured(), 1);
@@ -1098,17 +1389,12 @@ mod tests {
         c.params.read_file = Some(9);
 
         // MockWriter::read_file always fails, standing in for the malformed file.
-        let snap = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 9,
-            addr: 0,
-            value: ParamChangeValue::Int32(1),
-        };
-        c.on_param_change(9, &snap);
+        c.write_int32(9, 1, WriteVerdict::Accept(1));
 
-        assert_eq!(c.writer.opens, 1);
+        assert_eq!(c.writer.lock().opens, 1);
         assert_eq!(
-            c.writer.closes, 1,
+            c.writer.lock().closes,
+            1,
             "a failed read must still close the file it opened"
         );
     }
@@ -1126,14 +1412,14 @@ mod tests {
         c.process_array(&Arc::new(array(1)));
 
         let mut updates = Vec::new();
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         assert!(c.capture_active);
         assert!(c.file_base.is_open());
 
-        c.writer.fail_close = true;
+        c.writer.lock().fail_close = true;
         let mut updates = Vec::new();
         assert!(
-            c.stop_capture(&mut updates).is_err(),
+            stop_capture(&mut c, &mut updates).is_err(),
             "the close failure is still reported"
         );
         assert!(
@@ -1164,33 +1450,15 @@ mod tests {
         c.file_base.set_num_capture(0);
         c.process_array(&Arc::new(array(1)));
 
-        let on = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 7,
-            addr: 0,
-            value: ParamChangeValue::Int32(1),
-        };
-        c.on_param_change(7, &on);
+        c.write_int32(7, 1, WriteVerdict::Accept(1));
         assert!(c.capture_active);
 
-        c.writer.fail_close = true;
-        let off = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 7,
-            addr: 0,
-            value: ParamChangeValue::Int32(0),
-        };
-        let result = c.on_param_change(7, &off);
+        c.writer.lock().fail_close = true;
+        let out = c.write_int32(7, 0, WriteVerdict::Accept(0));
         assert!(!c.capture_active);
-        assert!(
-            result.param_updates.iter().any(|u| matches!(
-                u,
-                ParamUpdate::Int32 {
-                    reason: 7,
-                    value: 0,
-                    ..
-                }
-            )),
+        assert_eq!(
+            side_int(&out, 7),
+            Some(0),
             "Capture_RBV must read 0 after the failed close"
         );
     }
@@ -1206,17 +1474,12 @@ mod tests {
         c.lazy_open = false;
         c.process_array(&Arc::new(array(1)));
         let mut updates = Vec::new();
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         assert!(c.file_base.is_open());
 
         // Switch to Capture mode while a stream is open.
-        let snap = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 5,
-            addr: 0,
-            value: ParamChangeValue::Int32(NDFileMode::Capture as i32),
-        };
-        c.on_param_change(5, &snap);
+        let mode = NDFileMode::Capture as i32;
+        c.write_int32(5, mode, WriteVerdict::Accept(mode));
         assert!(
             !c.file_base.is_open(),
             "mode switch must close the open stream"
@@ -1233,7 +1496,7 @@ mod tests {
         c.file_base.set_num_capture(0);
         c.auto_save = true;
         let mut updates = Vec::new();
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         for id in 1..=5 {
             c.process_array(&Arc::new(array(id)));
         }
@@ -1242,7 +1505,11 @@ mod tests {
             5,
             "all frames buffered, no flush"
         );
-        assert_eq!(c.writer.writes, 0, "num_capture==0 never auto-flushes");
+        assert_eq!(
+            c.writer.lock().writes,
+            0,
+            "num_capture==0 never auto-flushes"
+        );
         assert!(c.capture_active, "still capturing");
     }
 
@@ -1270,7 +1537,7 @@ mod tests {
         c.file_base.set_num_capture(0);
         let mut updates = Vec::new();
         c.process_array(&Arc::new(array(1))); // latest_array for the eager open
-        c.start_capture(&mut updates).unwrap();
+        start_capture(&mut c, &mut updates).unwrap();
         for (id, expected) in [(2, 1), (3, 2)] {
             let r = c.process_array(&Arc::new(array(id)));
             let published = r.param_updates.iter().find_map(|u| match u {
@@ -1325,6 +1592,16 @@ mod tests {
         })
     }
 
+    /// `int_update` for the side params a write stores.
+    fn side_int<T>(out: &WriteOutcome<T>, reason: usize) -> Option<i32> {
+        out.side.iter().rev().find_map(|s| match s {
+            super::super::runtime::SideParam::Int32 {
+                reason: r, value, ..
+            } if *r == reason => Some(*value),
+            _ => None,
+        })
+    }
+
     const NUM_CAPTURED: usize = 61;
     const WRITE_STATUS: usize = 62;
     const FILE_NUMBER: usize = 63;
@@ -1340,7 +1617,7 @@ mod tests {
         c.params.file_path_exists = Some(PATH_EXISTS);
         c.params.write_file = Some(WRITE_FILE);
         c.file_base.set_mode(NDFileMode::Capture);
-        // The single-image arm burns a file number per frame that lands, which
+        // The single-image arm burns a file number per name it makes, which
         // is what makes NDFileNumber_RBV stale after a partial flush.
         c.file_base.auto_increment = true;
         c.auto_save = true;
@@ -1350,14 +1627,14 @@ mod tests {
 
     /// The headline case. A single-image flush lands frames one at a time, so a
     /// writer that fills the volume on frame 3 of 4 leaves two frames queued
-    /// and `file_number` two higher. `NDFileNumCaptured_RBV` has to name the
+    /// and `file_number` three higher. `NDFileNumCaptured_RBV` has to name the
     /// two that are still owed — before this it kept the 4 the controller
     /// pushed BEFORE the flush, because the error exit assigned over it.
     #[test]
     fn a_partial_capture_flush_republishes_the_frames_still_queued() {
         let mut c = capture_controller(false);
         c.file_base.set_num_capture(4);
-        c.writer.fail_write_after = Some(2);
+        c.writer.lock().fail_write_after = Some(2);
         let first_number = c.file_base.file_number;
 
         let mut last = ProcessResult::empty();
@@ -1378,8 +1655,9 @@ mod tests {
         );
         assert_eq!(
             int_update(&last.param_updates, FILE_NUMBER),
-            Some(first_number + 2),
-            "the two frames that DID land burned two file numbers"
+            Some(first_number + 3),
+            "every name made burns a number, the failed frame's included \
+             (asynNDArrayDriver.cpp:216-218)"
         );
         assert_eq!(
             int_update(&last.param_updates, WRITE_STATUS),
@@ -1396,7 +1674,7 @@ mod tests {
     fn a_partial_capture_flush_keeps_the_path_check_of_the_same_cycle() {
         let mut c = capture_controller(false);
         c.file_base.set_num_capture(4);
-        c.writer.fail_write_after = Some(2);
+        c.writer.lock().fail_write_after = Some(2);
 
         let mut last = ProcessResult::empty();
         for id in 1..=4 {
@@ -1422,7 +1700,7 @@ mod tests {
         c.file_base.set_mode(NDFileMode::Stream);
         c.file_base.set_num_capture(1);
         c.capture_active = true;
-        c.writer.fail_close = true;
+        c.writer.lock().fail_close = true;
 
         let r = c.process_array(&Arc::new(array(1)));
 
@@ -1450,21 +1728,48 @@ mod tests {
         }
         assert_eq!(c.file_base.num_captured(), 4, "all four are buffered");
 
-        c.writer.fail_write_after = Some(2);
-        let snap = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: WRITE_FILE,
-            addr: 0,
-            value: ParamChangeValue::Int32(1),
-        };
-        let r = c.on_param_change(WRITE_FILE, &snap);
+        c.writer.lock().fail_write_after = Some(2);
+        let out = c.write_int32(WRITE_FILE, 1, WriteVerdict::Accept(1));
 
         assert_eq!(
-            int_update(&r.param_updates, NUM_CAPTURED),
+            side_int(&out, NUM_CAPTURED),
             Some(2),
             "a failed manual flush must still say how many frames are owed"
         );
-        assert_eq!(int_update(&r.param_updates, WRITE_STATUS), Some(1));
+        assert_eq!(side_int(&out, WRITE_STATUS), Some(1));
+    }
+
+    /// C sets WriteStatus/WriteMessage only inside writeFileBase
+    /// (NDPluginFile.cpp:745-785), so a frame that writes nothing — Single
+    /// with AutoSave=0, Capture short of its target, Stream while not
+    /// capturing — leaves a
+    /// failed WriteFile's status standing.
+    #[test]
+    fn a_frame_that_writes_nothing_keeps_a_failed_write_status() {
+        for mode in [NDFileMode::Single, NDFileMode::Capture, NDFileMode::Stream] {
+            let mut c = capture_controller(false);
+            c.file_base.set_mode(mode);
+            c.auto_save = false;
+            // Capture buffers without a target, so the flush has a frame to
+            // fail on and no frame reaches a write.
+            c.capture_active = mode == NDFileMode::Capture;
+            c.file_base.set_num_capture(0);
+            c.process_array(&Arc::new(array(1)));
+            c.writer.lock().fail_write_after = Some(0);
+            let out = c.write_int32(WRITE_FILE, 1, WriteVerdict::Accept(1));
+            assert_eq!(
+                side_int(&out, WRITE_STATUS),
+                Some(1),
+                "{mode:?} write fails"
+            );
+
+            let r = c.process_array(&Arc::new(array(2)));
+            assert_eq!(
+                int_update(&r.param_updates, WRITE_STATUS),
+                None,
+                "{mode:?}: a frame that wrote nothing must not reset WriteStatus"
+            );
+        }
     }
 
     /// The success boundary: nothing above may turn a clean flush into an
@@ -1482,5 +1787,267 @@ mod tests {
         assert_eq!(c.file_base.num_captured(), 0);
         assert_eq!(int_update(&last.param_updates, NUM_CAPTURED), Some(0));
         assert_eq!(int_update(&last.param_updates, WRITE_STATUS), Some(0));
+    }
+
+    /// A controller wired to a port with the NDFile params, at the given
+    /// LazyOpen and FileWriteMode.
+    fn write_port(lazy: i32, mode: i32) -> FilePluginController<MockWriter> {
+        let mut base = asyn_rs::port::PortDriverBase::new("F", 1, Default::default());
+        crate::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.register_params(&mut base).unwrap();
+        c.store_int32(c.params.lazy_open.unwrap(), lazy);
+        c.store_int32(c.params.write_mode.unwrap(), mode);
+        c
+    }
+
+    fn capture_on(c: &mut FilePluginController<MockWriter>) -> WriteOutcome<i32> {
+        c.write_int32(c.params.capture.unwrap(), 1, WriteVerdict::Accept(1))
+    }
+
+    fn message(c: &FilePluginController<MockWriter>, out: &WriteOutcome<i32>) -> Option<String> {
+        out.side.iter().rev().find_map(|s| match s {
+            super::super::runtime::SideParam::Octet { reason, value, .. }
+                if Some(*reason) == c.params.write_message =>
+            {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// `"%s::%s: ERROR, must collect an array to get dimensions first\n"`
+    /// (NDPluginFile.cpp:435): Capture and Stream alike, Capture left 0.
+    #[test]
+    fn capture_without_an_array_fails_unless_lazy_as_c_do_capture_does() {
+        for mode in [1, 2] {
+            let mut c = write_port(0, mode);
+            let out = capture_on(&mut c);
+            assert_eq!(out.verdict, WriteVerdict::Accept(0));
+            assert!(out.settled);
+            assert_eq!(
+                out.trace,
+                vec![(
+                    TraceMask::ERROR,
+                    "NDPluginFile::doCapture: ERROR, must collect an array to get dimensions first"
+                        .to_string()
+                )]
+            );
+            assert_eq!(message(&c, &out).as_deref(), Some(""));
+        }
+    }
+
+    /// `"%s::%s ERROR: No arrays collected: cannot allocate capture buffer\n"`
+    /// (NDPluginFile.cpp:465): a lazy Capture still needs an array.
+    #[test]
+    fn a_lazy_capture_without_an_array_fails_as_c_do_capture_does() {
+        let mut c = write_port(1, 1);
+        let out = capture_on(&mut c);
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        assert!(out.settled);
+        assert_eq!(
+            out.trace,
+            vec![(
+                TraceMask::ERROR,
+                "NDPluginFile::doCapture ERROR: No arrays collected: cannot allocate capture buffer"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// `if (this->lazyOpen) setStringParam(NDFileWriteMessage, "Lazy Open...");`
+    /// (NDPluginFile.cpp:852): a lazy Stream starts with no array.
+    #[test]
+    fn a_lazy_stream_without_an_array_starts_as_c_write_int32_does() {
+        let mut c = write_port(1, 2);
+        let out = capture_on(&mut c);
+        assert_eq!(out.verdict, WriteVerdict::Accept(1));
+        assert!(!out.settled);
+        assert!(out.trace.is_empty());
+        assert_eq!(message(&c, &out).as_deref(), Some("Lazy Open..."));
+    }
+
+    /// `"%s::%s: ERROR, no valid array to write"` (NDPluginFile.cpp:816):
+    /// WriteFile drops back to 0, WriteMessage is untouched, the write
+    /// succeeds.
+    #[test]
+    fn write_file_without_an_array_prints_as_c_write_int32_does() {
+        let mut c = write_port(0, 0);
+        let write_file = c.params.write_file.unwrap();
+        let out = c.write_int32(write_file, 1, WriteVerdict::Accept(1));
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        assert!(out.settled);
+        assert!(out.side.is_empty());
+        assert_eq!(
+            out.trace,
+            vec![(
+                TraceMask::ERROR,
+                "NDPluginFile::writeInt32: ERROR, no valid array to write".to_string()
+            )]
+        );
+    }
+
+    /// `status = callParamCallbacks();` (NDPluginFile.cpp:865) drops a base
+    /// class failure.
+    #[test]
+    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
+        let mut c = write_port(0, 0);
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        let out = c.write_int32(usize::MAX, 98, clamp);
+        assert_eq!(out.verdict, WriteVerdict::Accept(1));
+        assert!(!out.settled);
+    }
+
+    /// NDPluginFile.cpp:808-822: WriteFile writes inside the write, leaves
+    /// the readbacks for the same callParamCallbacks, and drops back to 0.
+    #[test]
+    fn write_file_writes_inside_the_write_as_c_write_int32_does() {
+        let mut c = write_port(0, 0);
+        let p = c.params;
+        let dir = std::env::temp_dir().to_string_lossy().into_owned() + "/";
+        c.store_octet(p.file_path.unwrap(), &dir);
+        c.store_octet(p.file_template.unwrap(), "%s%s_%3.3d.x");
+        c.store_int32(p.auto_increment.unwrap(), 1);
+        c.store_int32(p.file_number.unwrap(), 7);
+        c.latest_array = Some(Arc::new(array(1)));
+        let out = c.write_int32(p.write_file.unwrap(), 1, WriteVerdict::Accept(1));
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        assert_eq!(c.writer.lock().writes, 1);
+        assert_eq!(side_int(&out, p.write_status.unwrap()), Some(0));
+        assert_eq!(side_int(&out, p.file_number.unwrap()), Some(8));
+    }
+
+    /// A writer whose `write_file` holds until the test lets it go.
+    struct GateWriter(Arc<std::sync::Barrier>);
+
+    impl NDFileWriter for GateWriter {
+        fn open_file(&mut self, _p: &Path, _m: NDFileMode, _a: &NDArray) -> ADResult<()> {
+            Ok(())
+        }
+        fn write_file(&mut self, _a: &Arc<NDArray>) -> ADResult<()> {
+            self.0.wait(); // entered
+            self.0.wait(); // released
+            Ok(())
+        }
+        fn read_file(&mut self) -> ADResult<NDArray> {
+            Ok(array(0))
+        }
+        fn close_file(&mut self) -> ADResult<()> {
+            Ok(())
+        }
+    }
+
+    /// C unlocks the port around `writeFile` (NDPluginFile.cpp:247-251), so
+    /// a frame callback during a busy WriteFile runs instead of queueing
+    /// until the file is written.
+    #[test]
+    fn a_frame_during_a_busy_write_file_is_not_blocked() {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let mut base = asyn_rs::port::PortDriverBase::new("F", 1, Default::default());
+        crate::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+        let mut c = FilePluginController::new(GateWriter(Arc::clone(&gate)));
+        c.register_params(&mut base).unwrap();
+        let p = c.params;
+        c.store_octet(
+            p.file_path.unwrap(),
+            &(std::env::temp_dir().to_string_lossy() + "/"),
+        );
+        c.store_octet(p.file_template.unwrap(), "%s%s_%d.x");
+        c.latest_array = Some(Arc::new(array(1)));
+        let ctrl = Arc::new(Mutex::new(c));
+
+        let writing = {
+            let ctrl = Arc::clone(&ctrl);
+            std::thread::spawn(move || {
+                ctrl.lock()
+                    .write_int32(p.write_file.unwrap(), 1, WriteVerdict::Accept(1))
+            })
+        };
+        gate.wait(); // the write is inside write_file
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let frame = {
+            let ctrl = Arc::clone(&ctrl);
+            std::thread::spawn(move || {
+                ctrl.lock().process_array(&Arc::new(array(2)));
+                done_tx.send(()).unwrap();
+            })
+        };
+        let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        gate.wait(); // release the write
+        assert!(returned.is_ok(), "process_array waited for write_file");
+        frame.join().unwrap();
+        let out = writing.join().unwrap();
+        assert_eq!(side_int(&out, p.write_status.unwrap()), Some(0));
+        assert_eq!(ctrl.lock().latest_array.as_ref().unwrap().unique_id, 2);
+    }
+
+    /// NDPluginFile.cpp:189-193: the array ReadFile reads goes downstream
+    /// from the write, and ReadFile drops back to 0 (:829).
+    #[test]
+    fn read_file_publishes_from_the_write_as_c_read_file_base_does() {
+        let mut c = write_port(0, 0);
+        c.writer.lock().readable = true;
+        let read_file = c.params.read_file.unwrap();
+        let out = c.write_int32(read_file, 1, WriteVerdict::Accept(1));
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        assert_eq!(out.publish.0.len(), 1);
+        assert_eq!(out.publish.0[0].unique_id, 77);
+        assert!(Arc::ptr_eq(
+            &out.publish.0[0],
+            c.latest_array.as_ref().unwrap()
+        ));
+        assert_eq!(side_int(&out, c.params.write_status.unwrap()), Some(0));
+    }
+
+    /// asynNDArrayDriver.cpp:216-218 via readFileBase (:146): a ReadFile
+    /// makes the name, so AutoIncrement moves FileNumber, read or not.
+    #[test]
+    fn read_file_moves_file_number_as_c_create_file_name_does() {
+        for readable in [true, false] {
+            let mut c = write_port(0, 0);
+            let p = c.params;
+            c.writer.lock().readable = readable;
+            c.store_octet(p.file_template.unwrap(), "%s%s_%d.x");
+            c.store_int32(p.auto_increment.unwrap(), 1);
+            c.store_int32(p.file_number.unwrap(), 5);
+            let out = c.write_int32(p.read_file.unwrap(), 1, WriteVerdict::Accept(1));
+            assert_eq!(
+                side_int(&out, p.file_number.unwrap()),
+                Some(6),
+                "{readable}"
+            );
+            assert_eq!(c.file_base.full_file_name(), "_5.x");
+        }
+    }
+
+    /// A setting written before a Capture is what the capture runs with:
+    /// both are applied on the write path, in write order.
+    #[test]
+    fn a_capture_runs_with_the_settings_written_before_it() {
+        let mut c = write_port(0, 0);
+        let p = c.params;
+        c.latest_array = Some(Arc::new(array(1)));
+        c.write_int32(p.write_mode.unwrap(), 2, WriteVerdict::Accept(2));
+        let out = capture_on(&mut c);
+        assert_eq!(out.verdict, WriteVerdict::Accept(1));
+        assert!(c.capture_active);
+        assert!(c.file_base.is_open(), "a non-lazy stream opens at capture");
+    }
+
+    /// NDPluginFile.cpp:855-856: FreeCapture frees the buffer whatever the
+    /// written value.
+    #[test]
+    fn free_capture_frees_on_any_write_as_c_write_int32_does() {
+        let mut c = capture_controller(false);
+        c.params.free_capture = Some(66);
+        c.file_base.set_num_capture(0);
+        c.process_array(&Arc::new(array(1)));
+        assert_eq!(c.file_base.num_captured(), 1);
+        let out = c.write_int32(66, 0, WriteVerdict::Accept(0));
+        assert_eq!(c.file_base.num_captured(), 0);
+        assert_eq!(side_int(&out, NUM_CAPTURED), Some(0));
     }
 }

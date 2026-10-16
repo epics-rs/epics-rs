@@ -277,6 +277,44 @@ impl BadPixelProcessor {
 
 impl NDPluginProcess for BadPixelProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+
+    /// C `NDPluginBadPixel::writeOctet` reads the file inside the write and
+    /// returns `readBadPixelFile`'s status (NDPluginBadPixel.cpp:319-322).
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        if Some(reason) != self.file_name_idx || value.is_empty() {
+            return verdict.into();
+        }
+        let loaded = std::fs::read_to_string(value)
+            .map_err(|e| e.to_string())
+            .and_then(|text| Self::load_from_json(&text).map_err(|e| e.to_string()));
+        match loaded {
+            Ok(pixels) => {
+                self.set_pixels(pixels);
+                WriteOutcome::from(verdict)
+            }
+            Err(e) => WriteOutcome::from(WriteVerdict::Refuse {
+                keep: value.to_string(),
+                message: format!(
+                    "NDPluginBadPixel:writeOctet: status=3, function={reason}, value={value}"
+                ),
+            })
+            .print(
+                asyn_rs::trace::TraceMask::ERROR,
+                format!(
+                    "NDPluginBadPixel::readBadPixelFile JSON error parsing bad pixel file: {e}"
+                ),
+            ),
+        }
+        .settled()
+    }
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let info = array.info();
         let width = info.x_size;
@@ -343,43 +381,48 @@ impl NDPluginProcess for BadPixelProcessor {
         self.file_name_idx = base.find_param("BAD_PIXEL_FILE_NAME");
         Ok(())
     }
-
-    fn on_param_change(
-        &self,
-        reason: usize,
-        params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
-    ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
-        use ad_core_rs::plugin::runtime::ParamChangeValue;
-
-        if Some(reason) == self.file_name_idx {
-            if let ParamChangeValue::Octet(path) = &params.value {
-                if !path.is_empty() {
-                    match std::fs::read_to_string(path) {
-                        Ok(json_str) => match Self::load_from_json(&json_str) {
-                            Ok(pixels) => {
-                                let n = pixels.len();
-                                self.set_pixels(pixels);
-                                tracing::info!("BadPixel: loaded {} pixels from {}", n, path);
-                            }
-                            Err(e) => {
-                                tracing::warn!("BadPixel: failed to parse {}: {}", path, e);
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!("BadPixel: failed to read {}: {}", path, e);
-                        }
-                    }
-                }
-            }
-        }
-
-        ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginBadPixel.cpp:321 `status = this->readBadPixelFile(value);`
+    /// and :290 `return asynError;` on a file that does not parse.
+    #[test]
+    fn file_name_reads_inside_the_write_as_c_write_octet_does() {
+        use ad_core_rs::plugin::runtime::{NDPluginProcess, WriteVerdict};
+        let mut proc = BadPixelProcessor::new(vec![]);
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        proc.register_params(&mut base).unwrap();
+        let file = proc.file_name_idx.unwrap();
+        let dir = std::env::temp_dir().join(format!("badpix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.json");
+        std::fs::write(&good, r#"{"Bad pixels": [{"Pixel": [1, 2]}]}"#).unwrap();
+        let write =
+            |v: &str| proc.validate_octet(file, 0, v, WriteVerdict::Accept(v.to_string()), &base);
+
+        let out = write(good.to_str().unwrap());
+        assert!(matches!(out.verdict, WriteVerdict::Accept(_)) && out.settled);
+        assert_eq!(proc.list.lock().pixels.len(), 1);
+
+        let bad = dir.join("missing.json");
+        let bad = bad.to_str().unwrap();
+        let out = write(bad);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            out.verdict,
+            WriteVerdict::Refuse {
+                keep: bad.to_string(),
+                message: format!(
+                    "NDPluginBadPixel:writeOctet: status=3, function={file}, value={bad}"
+                ),
+            }
+        );
+        assert_eq!(out.trace.len(), 1);
+        assert_eq!(proc.list.lock().pixels.len(), 1);
+    }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
     fn make_2d_array(x: usize, y: usize, fill: impl Fn(usize, usize) -> f64) -> NDArray {

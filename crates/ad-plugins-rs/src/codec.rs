@@ -12,7 +12,9 @@ use std::sync::Arc;
 use ad_core_rs::codec::{Codec, CodecName, CodecStatus};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
+use ad_core_rs::plugin::runtime::{
+    NDPluginProcess, ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict,
+};
 
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
@@ -1937,6 +1939,36 @@ impl NDPluginProcess for CodecProcessor {
         Ok(())
     }
 
+    /// C `NDPluginCodec::writeInt32` (NDPluginCodec.cpp:999-1031) clamps
+    /// these and stores the clamp with success, so the readback shows it.
+    /// For a base class param it stores the written value over the base
+    /// clamp and drops the base status: `status = (asynStatus)
+    /// setIntegerParam(function, value);` (:1031).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        _verdict: WriteVerdict<i32>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> WriteOutcome<i32> {
+        let p = &self.params;
+        let r = Some(reason);
+        let kept = if r == p.jpeg_quality {
+            value.clamp(1, 100)
+        } else if r == p.blosc_compressor {
+            // NDCODEC_BLOSC_BLOSCLZ..=NDCODEC_BLOSC_ZSTD (NDCodec.h:21-28)
+            value.clamp(0, 5)
+        } else if r == p.blosc_clevel || r == p.blosc_shuffle {
+            value.max(0)
+        } else if r == p.blosc_numthreads {
+            value.max(1)
+        } else {
+            value
+        };
+        WriteVerdict::Accept(kept).into()
+    }
+
     fn on_param_change(
         &self,
         reason: usize,
@@ -2909,6 +2941,43 @@ mod tests {
             })
             .expect("CodecError posted");
         assert_eq!(text, "JPEG only supports 8-bit data");
+    }
+
+    #[test]
+    fn writes_clamp_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::WriteVerdict::Accept;
+
+        let mut proc = CodecProcessor::new(CodecMode::Decompress);
+        let mut base = asyn_rs::port::PortDriverBase::new("CODECV", 1, Default::default());
+        proc.register_params(&mut base).unwrap();
+        let threads = base
+            .create_param("NUM_THREADS", asyn_rs::param::ParamType::Int32)
+            .unwrap();
+        let p = &proc.params;
+        let v = |reason: Option<usize>, value| {
+            proc.validate_int32(reason.unwrap(), 0, value, Accept(value), &base)
+                .verdict
+        };
+        assert_eq!(v(p.jpeg_quality, 0), Accept(1));
+        assert_eq!(v(p.jpeg_quality, 101), Accept(100));
+        assert_eq!(v(p.blosc_compressor, -1), Accept(0));
+        assert_eq!(v(p.blosc_compressor, 6), Accept(5));
+        assert_eq!(v(p.blosc_clevel, -3), Accept(0));
+        assert_eq!(v(p.blosc_clevel, 12), Accept(12));
+        assert_eq!(v(p.blosc_shuffle, -1), Accept(0));
+        assert_eq!(v(p.blosc_numthreads, 0), Accept(1));
+        assert_eq!(v(p.mode, -7), Accept(-7));
+
+        // NumThreads=98 over MaxThreads: the base clamps and fails, Codec
+        // stores 98 with success, as C's readback shows.
+        let clamp = ad_core_rs::plugin::runtime::WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(threads, 0, 98, clamp, &base).verdict,
+            Accept(98)
+        );
     }
 
     #[test]

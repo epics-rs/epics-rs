@@ -337,6 +337,31 @@ fn roi_stats_of<T: StatsElem>(
 
 impl NDPluginProcess for ROIStatProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+
+    /// C `NDPluginROIStat::writeInt32` keeps the base class clamp but replaces its
+    /// errorMessage with its own, carrying `getAddress`'s status
+    /// (`"%s: status=%d, function=%d, value=%d"`, NDPluginROIStat.cpp:393).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        match verdict {
+            ad_core_rs::plugin::runtime::WriteVerdict::Refuse { keep, .. } => {
+                ad_core_rs::plugin::runtime::WriteVerdict::Refuse {
+                    keep,
+                    message: format!(
+                        "NDPluginROIStat::writeInt32: status=0, function={reason}, value={value}"
+                    ),
+                }
+                .into()
+            }
+            accepted => accepted.into(),
+        }
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // NDPluginROIStat operates on the raw array dimensions like the C
         // plugin (NDPluginROIStat.cpp): dims[0] = X, dims[1] = Y. Only 1-D
@@ -734,6 +759,30 @@ pub fn create_roi_stat_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `"%s: status=%d, function=%d, value=%d"` (NDPluginROIStat.cpp:393).
+    #[test]
+    fn a_refused_base_write_carries_c_error_message() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = ROIStatProcessor::new(vec![], 0);
+        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(71, 0, 99, clamp, &base).verdict,
+            WriteVerdict::Refuse {
+                keep: 1,
+                message: "NDPluginROIStat::writeInt32: status=0, function=71, value=99".into(),
+            }
+        );
+        assert_eq!(
+            proc.validate_int32(71, 0, 1, WriteVerdict::Accept(1), &base)
+                .verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
     fn make_2d_array(x: usize, y: usize, fill: impl Fn(usize, usize) -> f64) -> NDArray {

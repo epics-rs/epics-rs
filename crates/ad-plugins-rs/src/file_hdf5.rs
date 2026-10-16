@@ -8,10 +8,15 @@ use ad_core_rs::finalize::Finalize;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{FileAttributes, NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
+use ad_core_rs::plugin::file_controller::{
+    FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
+use ad_core_rs::plugin::runtime::{
+    NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate, PluginParamSnapshot,
+    ProcessResult, WriteOutcome, WriteVerdict,
+};
+use asyn_rs::port::PortDriverBase;
+use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
 
 use rust_hdf5::H5File;
@@ -343,26 +348,11 @@ struct SwmrGridLayout {
     elem_size: usize,
 }
 
-/// HDF5 file writer using the rust-hdf5 crate.
-pub struct Hdf5Writer {
-    current_path: Option<PathBuf>,
-    handle: Option<Hdf5Handle>,
-    /// Total frames written to the file this open (C `nextRecord` across all
-    /// detector datasets): drives the create-on-first-frame gate, the
-    /// `frame_count()` accessor and the attribute-dataset row count. Per-dataset
-    /// leading-axis placement uses each [`DetectorDataset`]'s own `frame_count`.
-    frame_count: usize,
-    dataset_name: String,
-    /// Cached data type of the open primary dataset.
-    open_data_type: Option<NDDataType>,
-    /// Cached spatial (per-frame) dimensions, fastest-varying last.
-    open_frame_dims: Option<Vec<usize>>,
-    /// Codec of the open detector dataset(s) when they were created from a
-    /// pre-compressed first frame (direct chunk write path). `None` for an
-    /// uncompressed file. Mirrors C `NDFileHDF5Dataset::codec`, used by
-    /// `verifyChunking` to reject a mid-file codec change.
-    open_codec: Option<Codec>,
-    // compression
+/// The HDF5 settings as C keeps them in the param library: the port's write
+/// stores here without waiting on a file write in progress, and the writer
+/// reads them where C reads its params (open, each frame, close).
+#[derive(Clone)]
+pub struct Hdf5Settings {
     compression_type: i32,
     z_compress_level: u32,
     szip_num_pixels: u32,
@@ -372,81 +362,22 @@ pub struct Hdf5Writer {
     blosc_shuffle_type: i32,
     blosc_compressor: i32,
     blosc_compress_level: u32,
-    // chunking & layout
     chunk: ChunkConfig,
-    /// File write mode of the currently-open file (C `NDFileWriteMode`), and the
-    /// configured capture target (C `NDFileNumCapture`, pushed by the controller
-    /// before `open_file`). Both feed `attribute_chunking` — C's
-    /// `calculateAttributeChunking` resolves the auto (0) chunk from them.
-    open_mode: NDFileMode,
-    num_capture: usize,
     n_extra_dims: usize,
     extra_dims: [ExtraDim; MAX_EXTRA_DIMS],
     fill_value: f64,
     dim_att_datasets: bool,
-    // SWMR
     swmr_mode: bool,
     flush_nth_frame: usize,
-    pub swmr_cb_counter: u32,
-    // options
-    pub store_attributes: bool,
-    pub store_performance: bool,
-    /// Whether to fsync on file close (durable). Default `true`; set
-    /// `AD_HDF5_FSYNC_ON_CLOSE=0` (or `false`/`no`/`off`) to skip the
-    /// close-time fsync on the standard (non-SWMR) write path, trading
-    /// durability for a faster close (`H5File::close_no_sync`, rust-hdf5
-    /// 0.3.2). SWMR is unaffected — its high-level writer exposes no
-    /// no-fsync close, and it streams/flushes incrementally regardless.
-    fsync_on_close: bool,
-    pub total_runtime: f64,
-    pub total_bytes: u64,
-    /// Per-frame I/O timing rows for the `timestamp` performance dataset.
-    /// Each row is the 5 doubles C++ `writePerformanceDataset` records.
-    perf_rows: Vec<[f64; 5]>,
-    perf_prev: Option<std::time::Instant>,
-    perf_first: Option<std::time::Instant>,
-    /// Open NDAttribute time-series datasets, keyed by attribute name.
-    attr_datasets: Vec<AttributeDataset>,
-    /// C `pFileAttributes` (NDFileHDF5.cpp:243, :1437): the writer's own
-    /// attribute list, sticky for the life of the file.
-    file_attributes: FileAttributes,
-    /// Layout XML state.
-    layout_filename: Option<PathBuf>,
-    layout: Option<Hdf5Layout>,
-    pub layout_valid: bool,
-    pub layout_error: String,
-    /// Full path of the primary image dataset for the currently-open file.
-    /// `"data"` (flat root) when no valid layout is loaded; the layout's
-    /// `det_default` dataset path (e.g. `entry/instrument/detector/data`)
-    /// otherwise. Leading slash stripped — keyed as `rust-hdf5` keys datasets.
-    resolved_dataset_path: String,
-    /// Group prefix (no leading/trailing slash) for NDAttribute datasets.
-    /// Empty when flat; the layout `ndattr_default` group otherwise.
-    resolved_ndattr_group: String,
-    /// Group prefix for the performance dataset. Empty when flat.
-    resolved_perf_group: String,
-    /// Live NDAttribute values for the names referenced by layout
-    /// `<attribute source="ndattribute">` element-attrs (ADP-79). `first` is
-    /// the open-time frame (C `storeOnOpenAttributes` → OnFileOpen/OnFrame),
-    /// `last` the most recent frame (C `storeOnCloseAttributes` → OnFileClose).
-    /// Empty for the default layout, which declares no such element-attrs.
-    ndattr_first_values: std::collections::HashMap<String, NDAttrValue>,
-    ndattr_last_values: std::collections::HashMap<String, NDAttrValue>,
-    /// Distinct NDAttribute names referenced by element-attrs, captured at
-    /// open so per-frame updates need not re-walk the layout.
-    ndattr_element_names: Vec<String>,
+    store_attributes: bool,
+    store_performance: bool,
+    /// XMLFileName as written: a path, inline `<?xml`, or empty.
+    layout_spec: String,
 }
 
-impl Hdf5Writer {
-    pub fn new() -> Self {
+impl Default for Hdf5Settings {
+    fn default() -> Self {
         Self {
-            current_path: None,
-            handle: None,
-            frame_count: 0,
-            dataset_name: "data".to_string(),
-            open_data_type: None,
-            open_frame_dims: None,
-            open_codec: None,
             compression_type: 0,
             z_compress_level: 6,
             szip_num_pixels: 16,
@@ -460,62 +391,20 @@ impl Hdf5Writer {
             blosc_compressor: 0,
             blosc_compress_level: 5,
             chunk: ChunkConfig::default(),
-            open_mode: NDFileMode::Single,
-            num_capture: 1,
             n_extra_dims: 0,
             extra_dims: Default::default(),
             fill_value: 0.0,
             dim_att_datasets: false,
             swmr_mode: false,
             flush_nth_frame: 0,
-            swmr_cb_counter: 0,
             store_attributes: true,
             store_performance: false,
-            fsync_on_close: Self::env_fsync_on_close(),
-            total_runtime: 0.0,
-            total_bytes: 0,
-            perf_rows: Vec::new(),
-            perf_prev: None,
-            perf_first: None,
-            attr_datasets: Vec::new(),
-            file_attributes: FileAttributes::default(),
-            layout_filename: None,
-            // No user layout XML by default → C's built-in NeXus DEFAULT_LAYOUT.
-            layout: Some(Self::default_layout()),
-            layout_valid: false,
-            layout_error: String::new(),
-            resolved_dataset_path: "data".to_string(),
-            resolved_ndattr_group: String::new(),
-            resolved_perf_group: String::new(),
-            ndattr_first_values: std::collections::HashMap::new(),
-            ndattr_last_values: std::collections::HashMap::new(),
-            ndattr_element_names: Vec::new(),
+            layout_spec: String::new(),
         }
     }
+}
 
-    /// Read `AD_HDF5_FSYNC_ON_CLOSE` to decide the close-time fsync policy.
-    fn env_fsync_on_close() -> bool {
-        Self::parse_fsync_on_close_env(std::env::var("AD_HDF5_FSYNC_ON_CLOSE").ok().as_deref())
-    }
-
-    /// Pure parse of the `AD_HDF5_FSYNC_ON_CLOSE` value. `None` (unset) or any
-    /// value outside the falsey set keeps the durable default (`true`);
-    /// `0` / `false` / `no` / `off` (trimmed, case-insensitive) opts into the
-    /// no-fsync fast close on the standard write path.
-    fn parse_fsync_on_close_env(v: Option<&str>) -> bool {
-        match v {
-            Some(s) => !matches!(
-                s.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            ),
-            None => true,
-        }
-    }
-
-    pub fn set_dataset_name(&mut self, name: &str) {
-        self.dataset_name = name.to_string();
-    }
-
+impl Hdf5Settings {
     pub fn set_compression_type(&mut self, v: i32) {
         self.compression_type = v;
     }
@@ -619,6 +508,243 @@ impl Hdf5Writer {
         self.dim_att_datasets = v;
     }
 
+    /// Store XMLFileName; `load_layout` reads it at the next open, as C
+    /// re-reads the param there.
+    pub fn set_layout_filename(&mut self, spec: &str) {
+        self.layout_spec = spec.to_owned();
+    }
+}
+
+/// HDF5 file writer using the rust-hdf5 crate.
+pub struct Hdf5Writer {
+    current_path: Option<PathBuf>,
+    handle: Option<Hdf5Handle>,
+    /// Total frames written to the file this open (C `nextRecord` across all
+    /// detector datasets): drives the create-on-first-frame gate, the
+    /// `frame_count()` accessor and the attribute-dataset row count. Per-dataset
+    /// leading-axis placement uses each [`DetectorDataset`]'s own `frame_count`.
+    frame_count: usize,
+    dataset_name: String,
+    /// Cached data type of the open primary dataset.
+    open_data_type: Option<NDDataType>,
+    /// Cached spatial (per-frame) dimensions, fastest-varying last.
+    open_frame_dims: Option<Vec<usize>>,
+    /// Codec of the open detector dataset(s) when they were created from a
+    /// pre-compressed first frame (direct chunk write path). `None` for an
+    /// uncompressed file. Mirrors C `NDFileHDF5Dataset::codec`, used by
+    /// `verifyChunking` to reject a mid-file codec change.
+    open_codec: Option<Codec>,
+    /// The settings store the port writes into, and the copy of it this
+    /// writer last read (C reads its params at open, per frame and at close).
+    cfg: WriterSettings<Hdf5Settings>,
+    /// File write mode of the currently-open file (C `NDFileWriteMode`), and the
+    /// configured capture target (C `NDFileNumCapture`, pushed by the controller
+    /// before `open_file`). Both feed `attribute_chunking` — C's
+    /// `calculateAttributeChunking` resolves the auto (0) chunk from them.
+    open_mode: NDFileMode,
+    num_capture: usize,
+    pub swmr_cb_counter: u32,
+    /// Whether to fsync on file close (durable). Default `true`; set
+    /// `AD_HDF5_FSYNC_ON_CLOSE=0` (or `false`/`no`/`off`) to skip the
+    /// close-time fsync on the standard (non-SWMR) write path, trading
+    /// durability for a faster close (`H5File::close_no_sync`, rust-hdf5
+    /// 0.3.2). SWMR is unaffected — its high-level writer exposes no
+    /// no-fsync close, and it streams/flushes incrementally regardless.
+    fsync_on_close: bool,
+    pub total_runtime: f64,
+    pub total_bytes: u64,
+    /// Per-frame I/O timing rows for the `timestamp` performance dataset.
+    /// Each row is the 5 doubles C++ `writePerformanceDataset` records.
+    perf_rows: Vec<[f64; 5]>,
+    perf_prev: Option<std::time::Instant>,
+    perf_first: Option<std::time::Instant>,
+    /// Open NDAttribute time-series datasets, keyed by attribute name.
+    attr_datasets: Vec<AttributeDataset>,
+    /// C `pFileAttributes` (NDFileHDF5.cpp:243, :1437): the writer's own
+    /// attribute list, sticky for the life of the file.
+    file_attributes: FileAttributes,
+    /// The layout `layout_spec` gave at the last open.
+    layout: Option<Hdf5Layout>,
+    /// Full path of the primary image dataset for the currently-open file.
+    /// `"data"` (flat root) when no valid layout is loaded; the layout's
+    /// `det_default` dataset path (e.g. `entry/instrument/detector/data`)
+    /// otherwise. Leading slash stripped — keyed as `rust-hdf5` keys datasets.
+    resolved_dataset_path: String,
+    /// Group prefix (no leading/trailing slash) for NDAttribute datasets.
+    /// Empty when flat; the layout `ndattr_default` group otherwise.
+    resolved_ndattr_group: String,
+    /// Group prefix for the performance dataset. Empty when flat.
+    resolved_perf_group: String,
+    /// Live NDAttribute values for the names referenced by layout
+    /// `<attribute source="ndattribute">` element-attrs (ADP-79). `first` is
+    /// the open-time frame (C `storeOnOpenAttributes` → OnFileOpen/OnFrame),
+    /// `last` the most recent frame (C `storeOnCloseAttributes` → OnFileClose).
+    /// Empty for the default layout, which declares no such element-attrs.
+    ndattr_first_values: std::collections::HashMap<String, NDAttrValue>,
+    ndattr_last_values: std::collections::HashMap<String, NDAttrValue>,
+    /// Distinct NDAttribute names referenced by element-attrs, captured at
+    /// open so per-frame updates need not re-walk the layout.
+    ndattr_element_names: Vec<String>,
+}
+
+impl Hdf5Writer {
+    pub fn new() -> Self {
+        Self {
+            current_path: None,
+            handle: None,
+            frame_count: 0,
+            dataset_name: "data".to_string(),
+            open_data_type: None,
+            open_frame_dims: None,
+            open_codec: None,
+            cfg: WriterSettings::new(Hdf5Settings::default()),
+            open_mode: NDFileMode::Single,
+            num_capture: 1,
+            swmr_cb_counter: 0,
+            fsync_on_close: Self::env_fsync_on_close(),
+            total_runtime: 0.0,
+            total_bytes: 0,
+            perf_rows: Vec::new(),
+            perf_prev: None,
+            perf_first: None,
+            attr_datasets: Vec::new(),
+            file_attributes: FileAttributes::default(),
+            // No user layout XML by default → C's built-in NeXus DEFAULT_LAYOUT.
+            layout: Some(Self::default_layout()),
+            resolved_dataset_path: "data".to_string(),
+            resolved_ndattr_group: String::new(),
+            resolved_perf_group: String::new(),
+            ndattr_first_values: std::collections::HashMap::new(),
+            ndattr_last_values: std::collections::HashMap::new(),
+            ndattr_element_names: Vec::new(),
+        }
+    }
+
+    /// Read `AD_HDF5_FSYNC_ON_CLOSE` to decide the close-time fsync policy.
+    fn env_fsync_on_close() -> bool {
+        Self::parse_fsync_on_close_env(std::env::var("AD_HDF5_FSYNC_ON_CLOSE").ok().as_deref())
+    }
+
+    /// Pure parse of the `AD_HDF5_FSYNC_ON_CLOSE` value. `None` (unset) or any
+    /// value outside the falsey set keeps the durable default (`true`);
+    /// `0` / `false` / `no` / `off` (trimmed, case-insensitive) opts into the
+    /// no-fsync fast close on the standard write path.
+    fn parse_fsync_on_close_env(v: Option<&str>) -> bool {
+        match v {
+            Some(s) => !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            None => true,
+        }
+    }
+
+    /// The store this writer reads; the port writes settings through it.
+    pub fn settings(&self) -> SettingsStore<Hdf5Settings> {
+        self.cfg.store()
+    }
+
+    /// Read the settings where C reads its params: open, each frame, close.
+    fn read_settings(&mut self) {
+        self.cfg.refresh();
+    }
+
+    pub fn set_dataset_name(&mut self, name: &str) {
+        self.dataset_name = name.to_string();
+    }
+
+    pub fn set_compression_type(&mut self, v: i32) {
+        self.cfg.store().update(|s| s.set_compression_type(v));
+    }
+
+    pub fn set_z_compress_level(&mut self, v: u32) {
+        self.cfg.store().update(|s| s.set_z_compress_level(v));
+    }
+
+    pub fn set_szip_num_pixels(&mut self, v: u32) {
+        self.cfg.store().update(|s| s.set_szip_num_pixels(v));
+    }
+
+    pub fn set_blosc_shuffle_type(&mut self, v: i32) {
+        self.cfg.store().update(|s| s.set_blosc_shuffle_type(v));
+    }
+
+    pub fn set_blosc_compressor(&mut self, v: i32) {
+        self.cfg.store().update(|s| s.set_blosc_compressor(v));
+    }
+
+    pub fn set_blosc_compress_level(&mut self, v: u32) {
+        self.cfg.store().update(|s| s.set_blosc_compress_level(v));
+    }
+
+    pub fn set_nbit_precision(&mut self, v: u32) {
+        self.cfg.store().update(|s| s.set_nbit_precision(v));
+    }
+
+    pub fn set_nbit_offset(&mut self, v: u32) {
+        self.cfg.store().update(|s| s.set_nbit_offset(v));
+    }
+
+    pub fn set_jpeg_quality(&mut self, v: u32) {
+        self.cfg.store().update(|s| s.set_jpeg_quality(v));
+    }
+
+    pub fn set_store_attributes(&mut self, v: bool) {
+        self.cfg.store().update(|s| s.set_store_attributes(v));
+    }
+
+    pub fn set_store_performance(&mut self, v: bool) {
+        self.cfg.store().update(|s| s.set_store_performance(v));
+    }
+
+    pub fn set_swmr_mode(&mut self, v: bool) {
+        self.cfg.store().update(|s| s.set_swmr_mode(v));
+    }
+
+    pub fn set_flush_nth_frame(&mut self, v: usize) {
+        self.cfg.store().update(|s| s.set_flush_nth_frame(v));
+    }
+
+    pub fn set_chunk_size_auto(&mut self, v: bool) {
+        self.cfg.store().update(|s| s.set_chunk_size_auto(v));
+    }
+
+    pub fn set_n_row_chunks(&mut self, v: usize) {
+        self.cfg.store().update(|s| s.set_n_row_chunks(v));
+    }
+
+    pub fn set_n_col_chunks(&mut self, v: usize) {
+        self.cfg.store().update(|s| s.set_n_col_chunks(v));
+    }
+
+    pub fn set_n_frames_chunks(&mut self, v: usize) {
+        self.cfg.store().update(|s| s.set_n_frames_chunks(v));
+    }
+
+    pub fn set_ndattr_chunk(&mut self, v: usize) {
+        self.cfg.store().update(|s| s.set_ndattr_chunk(v));
+    }
+
+    pub fn set_n_extra_dims(&mut self, v: usize) {
+        self.cfg.store().update(|s| s.set_n_extra_dims(v));
+    }
+
+    pub fn set_extra_dim_size(&mut self, idx: usize, size: usize) {
+        self.cfg.store().update(|s| s.set_extra_dim_size(idx, size));
+    }
+
+    pub fn set_extra_dim_name(&mut self, idx: usize, name: &str) {
+        self.cfg.store().update(|s| s.set_extra_dim_name(idx, name));
+    }
+
+    pub fn set_fill_value(&mut self, v: f64) {
+        self.cfg.store().update(|s| s.set_fill_value(v));
+    }
+
+    pub fn set_dim_att_datasets(&mut self, v: bool) {
+        self.cfg.store().update(|s| s.set_dim_att_datasets(v));
+    }
+
     /// Parse the built-in [`DEFAULT_LAYOUT_XML`] into an `Hdf5Layout`. The
     /// constant is known-good (covered by a unit test), so a parse failure is a
     /// build bug, not a runtime condition.
@@ -626,34 +752,33 @@ impl Hdf5Writer {
         Hdf5Layout::parse(DEFAULT_LAYOUT_XML).expect("built-in default layout must parse")
     }
 
-    /// Set the layout XML filename and (re)parse it. Returns whether parsing
-    /// succeeded; `layout_error` carries any message (C `HDF5_layoutErrorMsg`).
-    pub fn set_layout_filename(&mut self, path: &str) -> bool {
-        if path.trim().is_empty() {
-            // C loads the built-in DEFAULT_LAYOUT for an empty filename
-            // (NDFileHDF5.cpp:3896-3906); `layout_valid` tracks user-file
-            // validity, so it stays false here.
-            self.layout_filename = None;
-            self.layout = Some(Self::default_layout());
-            self.layout_valid = false;
-            self.layout_error.clear();
-            return true;
-        }
-        let p = PathBuf::from(path);
-        match Hdf5Layout::from_file(&p) {
+    pub fn set_layout_filename(&mut self, spec: &str) {
+        self.cfg.store().update(|s| s.set_layout_filename(spec));
+    }
+
+    /// C `createFileLayout` (NDFileHDF5.cpp:3898-3939): the default layout
+    /// for an empty XMLFileName, inline XML or an existing file parsed, and
+    /// the open fails on a parse error or a missing file.
+    fn load_layout(&mut self) -> ADResult<()> {
+        self.read_settings();
+        let spec = self.cfg.layout_spec.as_str();
+        let loaded = if spec.is_empty() {
+            Ok(Self::default_layout())
+        } else if Hdf5Layout::is_inline(spec) || Path::new(spec).exists() {
+            Hdf5Layout::load(spec).map_err(|e| e.0)
+        } else {
+            Err("NDFileHDF5createFileLayout Warning: specified XML file does not exist".into())
+        };
+        match loaded {
             Ok(layout) => {
-                self.layout_filename = Some(p);
                 self.layout = Some(layout);
-                self.layout_valid = true;
-                self.layout_error.clear();
-                true
+                Ok(())
             }
             Err(e) => {
-                self.layout_filename = Some(p);
                 self.layout = None;
-                self.layout_valid = false;
-                self.layout_error = e.0;
-                false
+                Err(ADError::UnsupportedConversion(format!(
+                    "NDFileHDF5::openFile ERROR Failed to create the specified file layout: {e}"
+                )))
             }
         }
     }
@@ -689,9 +814,9 @@ impl Hdf5Writer {
 
     /// Build a FilterPipeline from the current compression settings.
     fn build_pipeline(&self, element_size: usize) -> Option<FilterPipeline> {
-        match self.compression_type {
+        match self.cfg.compression_type {
             COMPRESS_NONE => None,
-            COMPRESS_ZLIB => Some(FilterPipeline::deflate(self.z_compress_level)),
+            COMPRESS_ZLIB => Some(FilterPipeline::deflate(self.cfg.z_compress_level)),
             COMPRESS_SZIP => Some(FilterPipeline {
                 filters: vec![Filter {
                     id: FILTER_SZIP,
@@ -700,7 +825,7 @@ impl Hdf5Writer {
                     // (NDFileHDF5.cpp:3372): nearest-neighbor coding (mask 32), not
                     // entropy coding (mask 4). cd_values[1] is pixels_per_block; the
                     // rust-hdf5 SZIP filter defaults bits_per_pixel/pixels_per_scanline.
-                    cd_values: vec![SZIP_NN_OPTION_MASK, self.szip_num_pixels],
+                    cd_values: vec![SZIP_NN_OPTION_MASK, self.cfg.szip_num_pixels],
                 }],
             }),
             COMPRESS_LZ4 => Some(FilterPipeline::lz4()),
@@ -715,7 +840,7 @@ impl Hdf5Writer {
                 }],
             }),
             COMPRESS_BLOSC => {
-                let compressor_code = match self.blosc_compressor {
+                let compressor_code = match self.cfg.blosc_compressor {
                     BLOSC_LZ => 0,
                     BLOSC_LZ4 => 1,
                     BLOSC_LZ4HC => 2,
@@ -733,8 +858,8 @@ impl Hdf5Writer {
                             2,
                             element_size as u32,
                             0,
-                            self.blosc_compress_level,
-                            self.blosc_shuffle_type as u32,
+                            self.cfg.blosc_compress_level,
+                            self.cfg.blosc_shuffle_type as u32,
                             compressor_code,
                         ],
                     }],
@@ -762,7 +887,7 @@ impl Hdf5Writer {
                 filters: vec![Filter {
                     id: FILTER_JPEG,
                     flags: 0,
-                    cd_values: vec![self.jpeg_quality],
+                    cd_values: vec![self.cfg.jpeg_quality],
                 }],
             }),
             _ => None,
@@ -797,7 +922,7 @@ impl Hdf5Writer {
         data_type: NDDataType,
         chunk_nelmts: usize,
     ) -> Option<(DatatypeMessage, FilterPipeline)> {
-        if self.compression_type != COMPRESS_NBIT {
+        if self.cfg.compression_type != COMPRESS_NBIT {
             return None;
         }
         let (size, signed) = match data_type {
@@ -811,15 +936,15 @@ impl Hdf5Writer {
             NDDataType::UInt64 => (8, false),
             NDDataType::Float32 | NDDataType::Float64 => return None,
         };
-        if self.nbit_precision == 0 || self.nbit_precision > size * 8 {
+        if self.cfg.nbit_precision == 0 || self.cfg.nbit_precision > size * 8 {
             return None;
         }
         let dt = DatatypeMessage::FixedPoint {
             size,
             byte_order: ByteOrder::LittleEndian,
             signed,
-            bit_offset: self.nbit_offset as u16,
-            bit_precision: self.nbit_precision as u16,
+            bit_offset: self.cfg.nbit_offset as u16,
+            bit_precision: self.cfg.nbit_precision as u16,
         };
         let pipeline = FilterPipeline::nbit(&dt, chunk_nelmts);
         Some((dt, pipeline))
@@ -880,7 +1005,7 @@ impl Hdf5Writer {
                 filters: vec![Filter {
                     id: FILTER_JPEG,
                     flags: 0,
-                    cd_values: vec![self.jpeg_quality],
+                    cd_values: vec![self.cfg.jpeg_quality],
                 }],
             }),
             CodecName::None | CodecName::Zlib | CodecName::LZ4HDF5 => None,
@@ -898,8 +1023,8 @@ impl Hdf5Writer {
             let y = frame_dims[0].max(1);
             let x = frame_dims[1].max(1);
             vec![
-                Self::clamp_chunk(self.chunk.n_row_chunks, y, self.chunk.auto),
-                Self::clamp_chunk(self.chunk.n_col_chunks, x, self.chunk.auto),
+                Self::clamp_chunk(self.cfg.chunk.n_row_chunks, y, self.cfg.chunk.auto),
+                Self::clamp_chunk(self.cfg.chunk.n_col_chunks, x, self.cfg.chunk.auto),
             ]
         } else {
             frame_dims.iter().map(|&d| d.max(1)).collect()
@@ -916,13 +1041,13 @@ impl Hdf5Writer {
     /// uses `extraDimSize[N - i]`, so outermost is `extraDimSize[N]` and the
     /// innermost leading axis is `extraDimSize[0]` ("N", frames per point).
     fn extra_dim_axes(&self) -> Option<Vec<usize>> {
-        if self.n_extra_dims == 0 {
+        if self.cfg.n_extra_dims == 0 {
             return None;
         }
         Some(
-            (0..=self.n_extra_dims)
+            (0..=self.cfg.n_extra_dims)
                 .rev()
-                .map(|i| self.extra_dims[i].size.max(1))
+                .map(|i| self.cfg.extra_dims[i].size.max(1))
                 .collect(),
         )
     }
@@ -960,7 +1085,7 @@ impl Hdf5Writer {
             None => {
                 let mut shape = vec![1usize];
                 shape.extend_from_slice(frame_dims);
-                let mut chunk = vec![self.chunk.n_frames_chunks.max(1)];
+                let mut chunk = vec![self.cfg.chunk.n_frames_chunks.max(1)];
                 chunk.extend_from_slice(&frame_chunk);
                 (shape, chunk, None)
             }
@@ -1010,10 +1135,10 @@ impl Hdf5Writer {
     /// `Some(total_frames)` when extra dims fix the dataset size up front, or
     /// `None` when the leading frame axis is extended per write.
     fn primary_layout(&self, frame_dims: &[usize]) -> (Vec<usize>, Vec<usize>, Option<usize>) {
-        let extra_extent = if self.n_extra_dims > 0 {
+        let extra_extent = if self.cfg.n_extra_dims > 0 {
             Some(
-                (0..self.n_extra_dims)
-                    .map(|i| self.extra_dims[i].size.max(1))
+                (0..self.cfg.n_extra_dims)
+                    .map(|i| self.cfg.extra_dims[i].size.max(1))
                     .product::<usize>(),
             )
         } else {
@@ -1026,7 +1151,7 @@ impl Hdf5Writer {
         let mut chunk = vec![if extra_extent.is_some() {
             1
         } else {
-            self.chunk.n_frames_chunks.max(1)
+            self.cfg.chunk.n_frames_chunks.max(1)
         }];
         chunk.extend_from_slice(&self.frame_chunk_dims(frame_dims));
         (shape, chunk, extra_extent)
@@ -1338,13 +1463,13 @@ impl Hdf5Writer {
         // above. `compression_dropped` is only set when a compression type was
         // requested but no pipeline could be built for it (an unsupported
         // compressor) — never a silent drop.
-        let compression_dropped = self.compression_type != COMPRESS_NONE && pipeline.is_none();
+        let compression_dropped = self.cfg.compression_type != COMPRESS_NONE && pipeline.is_none();
         if compression_dropped {
             eprintln!(
                 "NDFileHDF5: WARNING — SWMR mode requested compression type {} \
                  but no filter pipeline could be built for it; the SWMR file \
                  will be written UNCOMPRESSED.",
-                self.compression_type
+                self.cfg.compression_type
             );
         }
 
@@ -1824,17 +1949,17 @@ impl Hdf5Writer {
             .collect();
 
         let dtype_ordinal = ds_data_type as i32;
-        let fill = self.fill_value;
-        let row_chunks = self.chunk.n_row_chunks as i32;
-        let col_chunks = self.chunk.n_col_chunks as i32;
-        let frame_chunks = self.chunk.n_frames_chunks as i32;
-        let n_extra = self.n_extra_dims as i32;
-        let extra_meta: Vec<(usize, i32, String)> = (0..self.n_extra_dims)
+        let fill = self.cfg.fill_value;
+        let row_chunks = self.cfg.chunk.n_row_chunks as i32;
+        let col_chunks = self.cfg.chunk.n_col_chunks as i32;
+        let frame_chunks = self.cfg.chunk.n_frames_chunks as i32;
+        let n_extra = self.cfg.n_extra_dims as i32;
+        let extra_meta: Vec<(usize, i32, String)> = (0..self.cfg.n_extra_dims)
             .map(|i| {
                 (
                     i,
-                    self.extra_dims[i].size.max(1) as i32,
-                    self.extra_dims[i].name.clone(),
+                    self.cfg.extra_dims[i].size.max(1) as i32,
+                    self.cfg.extra_dims[i].name.clone(),
                 )
             })
             .collect();
@@ -2203,7 +2328,7 @@ impl Hdf5Writer {
         // NDFileHDF5.cpp:2957). The datasets were built from that same list at
         // open and the list only grows, so the lookup cannot miss; C treats a
         // miss as `continue` (:2959-2963) rather than as a value.
-        if self.store_attributes {
+        if self.cfg.store_attributes {
             let Self {
                 attr_datasets,
                 file_attributes,
@@ -2222,7 +2347,7 @@ impl Hdf5Writer {
     /// the NDAttrValue numeric type. Mirrors C++ `createAttributeDataset`.
     fn create_attribute_datasets(&mut self) {
         self.attr_datasets.clear();
-        if !self.store_attributes {
+        if !self.cfg.store_attributes {
             return;
         }
         self.attr_datasets = self
@@ -2238,8 +2363,8 @@ impl Hdf5Writer {
     /// when auto, Single mode chunks at 1; otherwise at the capture target
     /// (`NDFileNumCapture`), or `16*1024` when that is unlimited (≤ 0).
     fn attribute_chunking(&self) -> usize {
-        if self.chunk.ndattr_chunk != 0 {
-            return self.chunk.ndattr_chunk;
+        if self.cfg.chunk.ndattr_chunk != 0 {
+            return self.cfg.chunk.ndattr_chunk;
         }
         if self.open_mode == NDFileMode::Single {
             return 1;
@@ -2563,7 +2688,7 @@ impl Hdf5Writer {
     /// Write the `timestamp` performance dataset (`[nframes, 5]` doubles)
     /// into the open standard file. Mirrors C++ `writePerformanceDataset`.
     fn flush_performance_dataset(&mut self) -> ADResult<()> {
-        if !self.store_performance || self.perf_rows.is_empty() {
+        if !self.cfg.store_performance || self.perf_rows.is_empty() {
             return Ok(());
         }
         let n = self.perf_rows.len();
@@ -2681,7 +2806,7 @@ impl Hdf5Writer {
 
         // Periodic flush
         let count = self.frame_count + 1; // will be incremented after return
-        if self.flush_nth_frame > 0 && count % self.flush_nth_frame == 0 {
+        if self.cfg.flush_nth_frame > 0 && count % self.cfg.flush_nth_frame == 0 {
             writer
                 .flush()
                 .map_err(|e| ADError::UnsupportedConversion(format!("SWMR flush error: {}", e)))?;
@@ -3054,6 +3179,7 @@ impl Default for Hdf5Writer {
 
 impl NDFileWriter for Hdf5Writer {
     fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()> {
+        self.read_settings();
         self.current_path = Some(path.to_path_buf());
         self.open_mode = mode;
         self.frame_count = 0;
@@ -3071,6 +3197,14 @@ impl NDFileWriter for Hdf5Writer {
         // into it (NDFileHDF5.cpp:243-252); every attribute read for the rest
         // of the file goes through it, not through the frame.
         self.file_attributes.open(array);
+        if let Err(e) = self.load_layout() {
+            // C creates the file before it loads the layout (NDFileHDF5.cpp:
+            // 271, :279), so a failed layout leaves the empty file behind.
+            drop(H5File::create(path).map_err(|e| {
+                ADError::UnsupportedConversion(format!("HDF5 create error: {}", e))
+            })?);
+            return Err(e);
+        }
         // Resolve where image/attribute/performance datasets land for this
         // file: the loaded layout XML tree, or the flat root default.
         self.resolve_layout_paths();
@@ -3078,7 +3212,7 @@ impl NDFileWriter for Hdf5Writer {
         // `<attribute source="ndattribute">` element-attrs (ADP-79).
         self.seed_ndattr_element_values();
 
-        if self.swmr_mode && mode == NDFileMode::Stream {
+        if self.cfg.swmr_mode && mode == NDFileMode::Stream {
             self.open_swmr(path, array)
         } else {
             let h5file = H5File::create(path)
@@ -3096,6 +3230,7 @@ impl NDFileWriter for Hdf5Writer {
     }
 
     fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
+        self.read_settings();
         let start = std::time::Instant::now();
 
         // C `writeFile` merges this frame into `pFileAttributes` before it
@@ -3115,7 +3250,7 @@ impl NDFileWriter for Hdf5Writer {
 
         let elapsed = start.elapsed().as_secs_f64();
         let frame_bytes = array.data.as_u8_slice().len();
-        if self.store_performance {
+        if self.cfg.store_performance {
             self.total_runtime += elapsed;
             self.total_bytes += frame_bytes as u64;
             self.record_performance(elapsed, frame_bytes);
@@ -3124,9 +3259,11 @@ impl NDFileWriter for Hdf5Writer {
     }
 
     fn read_file(&mut self) -> ADResult<NDArray> {
+        self.read_settings();
         // The image dataset lives at the layout-resolved path (flat `data`
         // by default, or the nested layout path). Resolve it so read-back
         // tracks the same placement as the write path.
+        self.load_layout()?;
         self.resolve_layout_paths();
         let dataset_path = self.resolved_dataset_path.clone();
         let path = self
@@ -3199,6 +3336,7 @@ impl NDFileWriter for Hdf5Writer {
     /// failing flush leaked one file id per attempt and left the file
     /// unfinalised under its `.tmp` name.
     fn close_file(&mut self) -> ADResult<()> {
+        self.read_settings();
         let mut closing = Finalize::new(self, |w: &mut Self| {
             w.handle = None;
             w.current_path = None;
@@ -3314,6 +3452,7 @@ struct Hdf5ParamIndices {
     n_frames_chunks: Option<usize>,
     ndattr_chunk: Option<usize>,
     n_extra_dims: Option<usize>,
+    pos_running: Option<usize>,
     extra_dim_size: [Option<usize>; MAX_EXTRA_DIMS],
     extra_dim_name: [Option<usize>; MAX_EXTRA_DIMS],
     fill_value: Option<usize>,
@@ -3326,19 +3465,364 @@ struct Hdf5ParamIndices {
 /// HDF5 file processor wrapping `FilePluginController<Hdf5Writer>`.
 pub struct Hdf5FileProcessor {
     ctrl: Mutex<FilePluginController<Hdf5Writer>>,
+    /// The writer's settings store, written without the writer's lock.
+    settings: SettingsStore<Hdf5Settings>,
     hdf5_params: Hdf5ParamIndices,
 }
 
 impl Hdf5FileProcessor {
     pub fn new() -> Self {
+        let writer = Hdf5Writer::new();
         Self {
-            ctrl: Mutex::new(FilePluginController::new(Hdf5Writer::new())),
+            settings: writer.settings(),
+            ctrl: Mutex::new(FilePluginController::new(writer)),
             hdf5_params: Hdf5ParamIndices::default(),
         }
     }
 
     pub fn set_dataset_name(&mut self, name: &str) {
-        self.ctrl.lock().writer.set_dataset_name(name);
+        self.ctrl.lock().writer.lock().set_dataset_name(name);
+    }
+
+    /// The capture count `validate_int32` stored for the grid (C
+    /// `calcNumFrames`, NDFileHDF5.cpp:2438-2459), mirrored into the writer.
+    fn calc_num_frames(&self, ctrl: &mut FilePluginController<Hdf5Writer>) {
+        let frames: usize = self.settings.get(|s| {
+            let n = s.n_extra_dims;
+            if n == 0 {
+                return 0;
+            }
+            s.extra_dims[..=n].iter().map(|d| d.size).product()
+        });
+        if frames != 0 {
+            ctrl.file_base.set_num_capture(frames);
+        }
+    }
+
+    /// C `NDFileHDF5::writeInt32` (NDFileHDF5.cpp:1764-2076): settings that
+    /// shape the file are refused while one is open, out-of-range values are
+    /// refused, and a refusal restores the old value and prints C's error line.
+    fn check_int32(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+        params: &asyn_rs::port::PortDriverBase,
+    ) -> WriteOutcome<i32> {
+        // C hands every write it has no branch for to NDPluginFile::writeInt32
+        // (NDFileHDF5.cpp:2059).
+        let file = || {
+            self.ctrl
+                .lock()
+                .validate_int32(reason, value, verdict.clone())
+        };
+        let Some(name) = params.params.param_name(reason) else {
+            return file();
+        };
+        // C's `this->file != 0`.
+        let open = self.ctrl.lock().file_base.is_open();
+        let int = |n: &str| {
+            params
+                .find_param(n)
+                .and_then(|i| params.get_int32_param(i, 0).ok())
+                .unwrap_or(0)
+        };
+        let old = params.get_int32_param(reason, addr).unwrap_or(0);
+        let refuse = |keep: i32| {
+            // C sets no errorMessage, so devAsyn's line ends in "error ".
+            WriteOutcome::from(WriteVerdict::Refuse {
+                keep,
+                message: String::new(),
+            })
+            .settled()
+            .print(
+                TraceMask::ERROR,
+                format!(
+                    "NDFileHDF5:writeInt32: ERROR status=3, function={reason}, value={value} old={old}"
+                ),
+            )
+        };
+        let refused = match name {
+            "HDF5_nExtraDims" => open || !(0..MAX_EXTRA_DIMS as i32).contains(&value),
+            "NUM_CAPTURE" => {
+                let n = int("HDF5_nExtraDims");
+                if value < 0 {
+                    true
+                } else if value > 0 && n > 0 {
+                    let frames = (0..=n as usize)
+                        .map(|i| int(EXTRA_DIM_SIZE_PARAMS[i]))
+                        .product::<i32>();
+                    return WriteVerdict::Accept(value.min(frames)).into();
+                } else {
+                    false
+                }
+            }
+            "HDF5_nColChunks" | "HDF5_nRowChunks" | "HDF5_nFramesChunks" => open || value < 0,
+            n if n.starts_with("HDF5_chunkSize") && n != "HDF5_chunkSizeAuto" => open || value < 0,
+            "HDF5_flushNthFrame" => value < int("HDF5_nFramesChunks"),
+            n if n.starts_with("HDF5_extraDimSize") => open || value <= 0,
+            n if n.starts_with("HDF5_extraDimChunk") => open || value < 0,
+            "HDF5_storeAttributes" | "HDF5_storePerformance" => open,
+            // HDF5Compression_t (NDFileHDF5.cpp:36-44) ends at JPEG = 8.
+            "HDF5_compressionType" => open || !(0..=8).contains(&value),
+            "HDF5_nbitsPrecision" | "HDF5_nbitsOffset" => open || value < 0,
+            "HDF5_szipNumPixels" => open || !(0..=32).contains(&value),
+            "HDF5_zCompressLevel" => open || !(0..=9).contains(&value),
+            // Read-only: the write fails and the param shows the support.
+            "HDF5_SWMRSupported" => return refuse(1),
+            // :2042 stores 1; the flush clears it (:398).
+            "HDF5_SWMRFlushNow" if open && value > 0 => return WriteVerdict::Accept(1).into(),
+            "HDF5_SWMRFlushNow" => true,
+            "HDF5_posRunning" => false,
+            _ => return file(),
+        };
+        if refused {
+            return refuse(old);
+        }
+        // calcNumFrames (NDFileHDF5.cpp:2438-2459) over the params as they
+        // stand once this write is stored.
+        let grid = |n: i32, size: Option<(usize, i32)>| {
+            (0..=n.max(0) as usize)
+                .map(|i| match size {
+                    Some((k, v)) if k == i => v,
+                    _ => int(EXTRA_DIM_SIZE_PARAMS[i]),
+                })
+                .product::<i32>()
+        };
+        let set = |out: WriteOutcome<i32>, n: &str, v: i32| match params.find_param(n) {
+            Some(i) => out.set_int32(i, 0, v),
+            None => out,
+        };
+        let out = WriteOutcome::from(WriteVerdict::Accept(value));
+        let size = EXTRA_DIM_SIZE_PARAMS.iter().position(|p| *p == name);
+        match name {
+            "HDF5_nExtraDims" if value > 0 => set(out, "NUM_CAPTURE", grid(value, None)),
+            _ if size.is_some() && int("HDF5_nExtraDims") > 0 => set(
+                out,
+                "NUM_CAPTURE",
+                grid(int("HDF5_nExtraDims"), size.map(|k| (k, value))),
+            ),
+            // An unbounded capture cannot use the fixed grid unless positions
+            // place the frames (:1814, :1834).
+            "NUM_CAPTURE" if value == 0 && int("HDF5_posRunning") == 0 => {
+                set(out, "HDF5_nExtraDims", 0)
+            }
+            "HDF5_posRunning" if value == 0 && int("NUM_CAPTURE") == 0 => {
+                set(out, "HDF5_nExtraDims", 0)
+            }
+            _ => out,
+        }
+    }
+
+    /// C `NDFileHDF5::writeOctet` (NDFileHDF5.cpp:2086-2119) keeps an
+    /// XMLFileName that `verifyLayoutXMLFile` (:2136-2175) rejects and fails
+    /// the write, after the console line naming why; LayoutValid and
+    /// LayoutErrorMsg are set inside the write either way.
+    fn check_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: &str,
+        verdict: WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> WriteOutcome<String> {
+        if Some(reason) != self.hdf5_params.layout_filename {
+            return verdict.into();
+        }
+        let p = &self.hdf5_params;
+        let verified = |out: WriteOutcome<String>, valid: bool, msg: &str| {
+            let out = match p.layout_valid {
+                Some(i) => out.set_int32(i, 0, valid as i32),
+                None => out,
+            };
+            match p.layout_error_msg {
+                Some(i) => out.set_octet(i, 0, msg),
+                None => out,
+            }
+        };
+        if value.is_empty() {
+            return verified(verdict.into(), true, "Default layout selected");
+        }
+        let fault = if !Hdf5Layout::is_inline(value) && !Path::new(value).exists() {
+            Some(("could not be opened", "cannot be opened"))
+        } else {
+            Hdf5Layout::load(value)
+                .err()
+                .map(|_| ("parser error", "parser error"))
+        };
+        let Some((line, msg)) = fault else {
+            return verified(verdict.into(), true, "");
+        };
+        verified(
+            WriteOutcome::from(WriteVerdict::Refuse {
+                keep: value.to_owned(),
+                message: format!(
+                    "NDFileHDF5:writeOctet: status=3, function={reason}, value={value}"
+                ),
+            }),
+            false,
+            &format!("XML description file {msg}"),
+        )
+        .print(
+            TraceMask::ERROR,
+            format!("NDFileHDF5::verifyLayoutXMLFile XML description file {line}."),
+        )
+    }
+
+    /// The writer half of C `NDFileHDF5::writeInt32`/`writeFloat64`/
+    /// `writeOctet`: the kept value reaches the writer inside the write, so
+    /// a Capture or WriteFile written after it opens the file with it.
+    fn store(&self, reason: usize, value: &ParamChangeValue, params: &PortDriverBase) {
+        let mut ctrl = self.ctrl.lock();
+        // -- compression params --
+        if Some(reason) == self.hdf5_params.compression_type {
+            self.settings
+                .update(|s| s.set_compression_type(value.as_i32()));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.z_compress_level {
+            self.settings
+                .update(|s| s.set_z_compress_level(value.as_i32() as u32));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.szip_num_pixels {
+            self.settings
+                .update(|s| s.set_szip_num_pixels(value.as_i32() as u32));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.blosc_shuffle_type {
+            self.settings
+                .update(|s| s.set_blosc_shuffle_type(value.as_i32()));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.blosc_compressor {
+            self.settings
+                .update(|s| s.set_blosc_compressor(value.as_i32()));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.blosc_compress_level {
+            self.settings
+                .update(|s| s.set_blosc_compress_level(value.as_i32() as u32));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.nbit_precision {
+            self.settings
+                .update(|s| s.set_nbit_precision(value.as_i32() as u32));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.nbit_offset {
+            self.settings
+                .update(|s| s.set_nbit_offset(value.as_i32() as u32));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.jpeg_quality {
+            self.settings
+                .update(|s| s.set_jpeg_quality(value.as_i32() as u32));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.store_attributes {
+            self.settings
+                .update(|s| s.set_store_attributes(value.as_i32() != 0));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.store_performance {
+            self.settings
+                .update(|s| s.set_store_performance(value.as_i32() != 0));
+            return;
+        }
+        // -- chunking params --
+        if Some(reason) == self.hdf5_params.chunk_size_auto {
+            self.settings
+                .update(|s| s.set_chunk_size_auto(value.as_i32() != 0));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.n_row_chunks {
+            self.settings
+                .update(|s| s.set_n_row_chunks(value.as_i32().max(0) as usize));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.n_col_chunks {
+            self.settings
+                .update(|s| s.set_n_col_chunks(value.as_i32().max(0) as usize));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.n_frames_chunks {
+            self.settings
+                .update(|s| s.set_n_frames_chunks(value.as_i32().max(0) as usize));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.ndattr_chunk {
+            // `0` (auto) is valid; only negatives are coerced away.
+            self.settings
+                .update(|s| s.set_ndattr_chunk(value.as_i32().max(0) as usize));
+            return;
+        }
+        // -- extra dimensions --
+        if Some(reason) == self.hdf5_params.n_extra_dims {
+            self.settings
+                .update(|s| s.set_n_extra_dims(value.as_i32().max(0) as usize));
+            self.calc_num_frames(&mut ctrl);
+            return;
+        }
+        for i in 0..MAX_EXTRA_DIMS {
+            if Some(reason) == self.hdf5_params.extra_dim_size[i] {
+                self.settings
+                    .update(|s| s.set_extra_dim_size(i, value.as_i32().max(1) as usize));
+                self.calc_num_frames(&mut ctrl);
+                return;
+            }
+            if Some(reason) == self.hdf5_params.extra_dim_name[i] {
+                self.settings
+                    .update(|s| s.set_extra_dim_name(i, value.as_string().unwrap_or("")));
+                return;
+            }
+        }
+        if Some(reason) == self.hdf5_params.fill_value {
+            self.settings.update(|s| s.set_fill_value(value.as_f64()));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.dim_att_datasets {
+            self.settings
+                .update(|s| s.set_dim_att_datasets(value.as_i32() != 0));
+            return;
+        }
+        // -- layout XML --
+        if Some(reason) == self.hdf5_params.layout_filename {
+            // The write set LayoutValid/LayoutErrorMsg; the next open loads it.
+            let path = value.as_string().unwrap_or("").to_string();
+            self.settings.update(|s| s.set_layout_filename(&path));
+            return;
+        }
+        // -- SWMR params --
+        if Some(reason) == self.hdf5_params.swmr_mode {
+            self.settings
+                .update(|s| s.set_swmr_mode(value.as_i32() != 0));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.flush_nth_frame {
+            self.settings
+                .update(|s| s.set_flush_nth_frame(value.as_i32().max(0) as usize));
+            return;
+        }
+        if Some(reason) == self.hdf5_params.pos_running {
+            let running = value.as_i32() != 0;
+            // NDFileHDF5.cpp:1823-1830
+            if !running && ctrl.file_base.num_capture_target() == 0 {
+                self.settings.update(|s| s.set_n_extra_dims(0));
+            }
+            return;
+        }
+        // NDFileHDF5.cpp:1804-1813: an unbounded capture cannot use the
+        // fixed extra-dimension grid unless positions place the frames.
+        let pos_running = self
+            .hdf5_params
+            .pos_running
+            .and_then(|i| params.get_int32_param(i, 0).ok())
+            .unwrap_or(0);
+        if Some(reason) == ctrl.params.num_capture && value.as_i32() == 0 && pos_running == 0 {
+            self.settings.update(|s| s.set_n_extra_dims(0));
+        }
     }
 }
 
@@ -3478,9 +3962,9 @@ impl NDPluginProcess for Hdf5FileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut ctrl = self.ctrl.lock();
-        let was_swmr = ctrl.writer.is_swmr_active();
+        let was_swmr = ctrl.writer.lock().is_swmr_active();
         let mut result = ctrl.process_array(array);
-        let is_swmr = ctrl.writer.is_swmr_active();
+        let is_swmr = ctrl.writer.lock().is_swmr_active();
 
         // SWMR running status changed
         if was_swmr != is_swmr {
@@ -3494,22 +3978,25 @@ impl NDPluginProcess for Hdf5FileProcessor {
         // SWMR callback counter
         if is_swmr {
             if let Some(idx) = self.hdf5_params.swmr_cb_counter {
-                result
-                    .param_updates
-                    .push(ParamUpdate::int32(idx, ctrl.writer.swmr_cb_counter as i32));
+                result.param_updates.push(ParamUpdate::int32(
+                    idx,
+                    ctrl.writer.lock().swmr_cb_counter as i32,
+                ));
             }
         }
 
         // Performance stats
-        if ctrl.writer.store_performance {
+        if ctrl.writer.lock().cfg.store_performance {
             if let Some(idx) = self.hdf5_params.total_runtime {
                 result
                     .param_updates
-                    .push(ParamUpdate::float64(idx, ctrl.writer.total_runtime));
+                    .push(ParamUpdate::float64(idx, ctrl.writer.lock().total_runtime));
             }
             if let Some(idx) = self.hdf5_params.total_io_speed {
-                let speed = if ctrl.writer.total_runtime > 0.0 {
-                    ctrl.writer.total_bytes as f64 / ctrl.writer.total_runtime / 1_000_000.0
+                let speed = if ctrl.writer.lock().total_runtime > 0.0 {
+                    ctrl.writer.lock().total_bytes as f64
+                        / ctrl.writer.lock().total_runtime
+                        / 1_000_000.0
                 } else {
                     0.0
                 };
@@ -3570,6 +4057,7 @@ impl NDPluginProcess for Hdf5FileProcessor {
         self.hdf5_params.n_frames_chunks = base.find_param("HDF5_nFramesChunks");
         self.hdf5_params.ndattr_chunk = base.find_param("HDF5_NDAttributeChunk");
         self.hdf5_params.n_extra_dims = base.find_param("HDF5_nExtraDims");
+        self.hdf5_params.pos_running = base.find_param("HDF5_posRunning");
         for i in 0..MAX_EXTRA_DIMS {
             self.hdf5_params.extra_dim_size[i] = base.find_param(EXTRA_DIM_SIZE_PARAMS[i]);
             self.hdf5_params.extra_dim_name[i] = base.find_param(EXTRA_DIM_NAME_PARAMS[i]);
@@ -3587,151 +4075,75 @@ impl NDPluginProcess for Hdf5FileProcessor {
         Ok(())
     }
 
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    fn validate_int32(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+        params: &PortDriverBase,
+    ) -> WriteOutcome<i32> {
+        let out = self.check_int32(reason, addr, value, verdict, params);
+        if out.settled {
+            return out;
+        }
+        let kept = out.verdict.kept();
+        let updates = self.ctrl.lock().store_int32(reason, kept);
+        self.store(reason, &ParamChangeValue::Int32(kept), params);
+        out.set_updates(updates)
+    }
+
+    fn validate_float64(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: f64,
+        verdict: WriteVerdict<f64>,
+        params: &PortDriverBase,
+    ) -> WriteOutcome<f64> {
+        self.store(reason, &ParamChangeValue::Float64(verdict.kept()), params);
+        verdict.into()
+    }
+
+    fn validate_octet(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: &str,
+        verdict: WriteVerdict<String>,
+        params: &PortDriverBase,
+    ) -> WriteOutcome<String> {
+        let out = self.check_octet(reason, addr, value, verdict, params);
+        if !out.settled {
+            let kept = out.verdict.kept();
+            self.ctrl.lock().store_octet(reason, &kept);
+            self.store(reason, &ParamChangeValue::Octet(kept), params);
+        }
+        out
+    }
+
     fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        let mut ctrl = self.ctrl.lock();
-        // -- compression params --
-        if Some(reason) == self.hdf5_params.compression_type {
-            ctrl.writer.set_compression_type(params.value.as_i32());
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.z_compress_level {
-            ctrl.writer
-                .set_z_compress_level(params.value.as_i32() as u32);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.szip_num_pixels {
-            ctrl.writer
-                .set_szip_num_pixels(params.value.as_i32() as u32);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.blosc_shuffle_type {
-            ctrl.writer.set_blosc_shuffle_type(params.value.as_i32());
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.blosc_compressor {
-            ctrl.writer.set_blosc_compressor(params.value.as_i32());
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.blosc_compress_level {
-            ctrl.writer
-                .set_blosc_compress_level(params.value.as_i32() as u32);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.nbit_precision {
-            ctrl.writer.set_nbit_precision(params.value.as_i32() as u32);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.nbit_offset {
-            ctrl.writer.set_nbit_offset(params.value.as_i32() as u32);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.jpeg_quality {
-            ctrl.writer.set_jpeg_quality(params.value.as_i32() as u32);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.store_attributes {
-            ctrl.writer.set_store_attributes(params.value.as_i32() != 0);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.store_performance {
-            ctrl.writer
-                .set_store_performance(params.value.as_i32() != 0);
-            return ParamChangeResult::updates(vec![]);
-        }
-        // -- chunking params --
-        if Some(reason) == self.hdf5_params.chunk_size_auto {
-            ctrl.writer.set_chunk_size_auto(params.value.as_i32() != 0);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.n_row_chunks {
-            ctrl.writer
-                .set_n_row_chunks(params.value.as_i32().max(0) as usize);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.n_col_chunks {
-            ctrl.writer
-                .set_n_col_chunks(params.value.as_i32().max(0) as usize);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.n_frames_chunks {
-            ctrl.writer
-                .set_n_frames_chunks(params.value.as_i32().max(0) as usize);
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.ndattr_chunk {
-            // `0` (auto) is valid; only negatives are coerced away.
-            ctrl.writer
-                .set_ndattr_chunk(params.value.as_i32().max(0) as usize);
-            return ParamChangeResult::updates(vec![]);
-        }
-        // -- extra dimensions --
-        if Some(reason) == self.hdf5_params.n_extra_dims {
-            ctrl.writer
-                .set_n_extra_dims(params.value.as_i32().max(0) as usize);
-            return ParamChangeResult::updates(vec![]);
-        }
-        for i in 0..MAX_EXTRA_DIMS {
-            if Some(reason) == self.hdf5_params.extra_dim_size[i] {
-                ctrl.writer
-                    .set_extra_dim_size(i, params.value.as_i32().max(1) as usize);
-                return ParamChangeResult::updates(vec![]);
-            }
-            if Some(reason) == self.hdf5_params.extra_dim_name[i] {
-                ctrl.writer
-                    .set_extra_dim_name(i, params.value.as_string().unwrap_or(""));
-                return ParamChangeResult::updates(vec![]);
-            }
-        }
-        if Some(reason) == self.hdf5_params.fill_value {
-            ctrl.writer.set_fill_value(params.value.as_f64());
-            return ParamChangeResult::updates(vec![]);
-        }
-        if Some(reason) == self.hdf5_params.dim_att_datasets {
-            ctrl.writer.set_dim_att_datasets(params.value.as_i32() != 0);
-            return ParamChangeResult::updates(vec![]);
-        }
-        // -- layout XML --
-        if Some(reason) == self.hdf5_params.layout_filename {
-            let path = params.value.as_string().unwrap_or("").to_string();
-            ctrl.writer.set_layout_filename(&path);
-            let mut updates = vec![];
-            if let Some(idx) = self.hdf5_params.layout_valid {
-                updates.push(ParamUpdate::int32(
-                    idx,
-                    if ctrl.writer.layout_valid { 1 } else { 0 },
-                ));
-            }
-            if let Some(idx) = self.hdf5_params.layout_error_msg {
-                updates.push(ParamUpdate::Octet {
-                    reason: idx,
-                    addr: 0,
-                    value: ctrl.writer.layout_error.clone(),
-                });
-            }
-            return ParamChangeResult::updates(updates);
-        }
-        // -- SWMR params --
-        if Some(reason) == self.hdf5_params.swmr_mode {
-            ctrl.writer.set_swmr_mode(params.value.as_i32() != 0);
-            return ParamChangeResult::updates(vec![]);
-        }
+        let ctrl = self.ctrl.lock();
         if Some(reason) == self.hdf5_params.swmr_flush_now {
             if params.value.as_i32() != 0 {
-                ctrl.writer.flush_swmr();
+                ctrl.writer.lock().flush_swmr();
                 let mut updates = vec![];
                 if let Some(idx) = self.hdf5_params.swmr_cb_counter {
-                    updates.push(ParamUpdate::int32(idx, ctrl.writer.swmr_cb_counter as i32));
+                    updates.push(ParamUpdate::int32(
+                        idx,
+                        ctrl.writer.lock().swmr_cb_counter as i32,
+                    ));
                 }
+                // C flushTask clears the request once flushed (:398).
+                updates.push(ParamUpdate::int32(reason, 0));
                 return ParamChangeResult::updates(updates);
             }
-            return ParamChangeResult::updates(vec![]);
         }
-        if Some(reason) == self.hdf5_params.flush_nth_frame {
-            ctrl.writer
-                .set_flush_nth_frame(params.value.as_i32().max(0) as usize);
-            return ParamChangeResult::updates(vec![]);
-        }
-        ctrl.on_param_change(reason, params)
+        ParamChangeResult::empty()
     }
 }
 
@@ -3789,6 +4201,370 @@ mod tests {
         assert_eq!(read_arr.dims[2].size, 1); // leading frame dim
 
         std::fs::remove_file(&path).ok();
+    }
+
+    fn hdf5_port() -> (Hdf5FileProcessor, asyn_rs::port::PortDriverBase) {
+        let mut proc = Hdf5FileProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new("HDF5V", 1, Default::default());
+        ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+        proc.register_params(&mut base).unwrap();
+        (proc, base)
+    }
+
+    fn idx(base: &asyn_rs::port::PortDriverBase, name: &str) -> usize {
+        base.find_param(name).unwrap()
+    }
+
+    #[test]
+    fn writes_are_refused_and_reverted_as_c_write_int32_does() {
+        let (proc, mut base) = hdf5_port();
+        let (zlevel, extra, chunks, flush) = (
+            idx(&base, "HDF5_zCompressLevel"),
+            idx(&base, "HDF5_nExtraDims"),
+            idx(&base, "HDF5_nFramesChunks"),
+            idx(&base, "HDF5_flushNthFrame"),
+        );
+        base.set_int32_param(zlevel, 0, 6).unwrap();
+        base.set_int32_param(chunks, 0, 4).unwrap();
+        let v = |r, value| {
+            proc.validate_int32(r, 0, value, WriteVerdict::Accept(value), &base)
+                .verdict
+        };
+        let refused = |keep| WriteVerdict::Refuse {
+            keep,
+            message: String::new(),
+        };
+
+        assert_eq!(v(zlevel, 9), WriteVerdict::Accept(9));
+        assert_eq!(v(zlevel, 10), refused(6));
+        assert_eq!(v(idx(&base, "HDF5_szipNumPixels"), 33), refused(0));
+        assert_eq!(v(extra, 9), WriteVerdict::Accept(9));
+        assert_eq!(v(extra, 10), refused(0));
+        assert_eq!(v(idx(&base, "HDF5_compressionType"), 9), refused(0));
+        assert_eq!(v(flush, 3), refused(0));
+        assert_eq!(v(flush, 4), WriteVerdict::Accept(4));
+        assert_eq!(v(idx(&base, "HDF5_extraDimSizeX"), 0), refused(0));
+        assert_eq!(v(idx(&base, "HDF5_chunkSize3"), -1), refused(0));
+        assert_eq!(v(idx(&base, "NUM_CAPTURE"), -1), refused(0));
+        assert_eq!(v(idx(&base, "HDF5_SWMRSupported"), 0), refused(1));
+        assert_eq!(v(idx(&base, "HDF5_SWMRFlushNow"), 1), refused(0));
+
+        // An open file freezes the layout settings.
+        let path = temp_path("hdf5_open_freezes");
+        {
+            let mut c = proc.ctrl.lock();
+            let c = &mut *c;
+            c.file_base.file_path = format!("{}/", path.parent().unwrap().display());
+            c.file_base.file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+            c.file_base.file_template = "%s%s".into();
+            c.file_base.set_mode(NDFileMode::Stream);
+            let arr = NDArray::new(
+                vec![NDDimension::new(4), NDDimension::new(4)],
+                NDDataType::UInt8,
+            );
+            c.file_base
+                .open_stream(&mut *c.writer.lock(), &arr)
+                .unwrap();
+        }
+        assert_eq!(v(zlevel, 3), refused(6));
+        assert_eq!(v(chunks, 8), refused(4));
+        assert_eq!(v(idx(&base, "HDF5_storeAttributes"), 0), refused(0));
+        assert_eq!(
+            v(idx(&base, "HDF5_SWMRFlushNow"), 1),
+            WriteVerdict::Accept(1)
+        );
+        assert_eq!(v(flush, 4), WriteVerdict::Accept(4));
+        {
+            let mut c = proc.ctrl.lock();
+            let c = &mut *c;
+            let arr = NDArray::new(
+                vec![NDDimension::new(4), NDDimension::new(4)],
+                NDDataType::UInt8,
+            );
+            c.file_base
+                .process_array(Arc::new(arr), &mut *c.writer.lock())
+                .unwrap();
+            c.file_base.close_stream(&mut *c.writer.lock()).unwrap();
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C stores a writer setting inside the write, so a Capture written
+    /// right after it opens the file with it.
+    #[test]
+    fn a_writer_setting_reaches_the_writer_inside_the_write() {
+        let (proc, mut base) = hdf5_port();
+        let compression = idx(&base, "HDF5_compressionType");
+        let extra = idx(&base, "HDF5_nExtraDims");
+        proc.validate_int32(compression, 0, 3, WriteVerdict::Accept(3), &base);
+        proc.validate_int32(extra, 0, 2, WriteVerdict::Accept(2), &base);
+        assert_eq!(proc.settings.get(|s| s.compression_type), 3);
+        assert_eq!(proc.settings.get(|s| s.n_extra_dims), 2);
+
+        // :1804-1813: an unbounded capture drops the grid unless positions
+        // place the frames.
+        let num_capture = idx(&base, "NUM_CAPTURE");
+        base.set_int32_param(idx(&base, "HDF5_posRunning"), 0, 1)
+            .unwrap();
+        proc.validate_int32(num_capture, 0, 0, WriteVerdict::Accept(0), &base);
+        assert_eq!(proc.settings.get(|s| s.n_extra_dims), 2);
+        base.set_int32_param(idx(&base, "HDF5_posRunning"), 0, 0)
+            .unwrap();
+        proc.validate_int32(num_capture, 0, 0, WriteVerdict::Accept(0), &base);
+        assert_eq!(proc.settings.get(|s| s.n_extra_dims), 0);
+    }
+
+    /// C stores an HDF5 setting in the param library and reads it at the next
+    /// open, so a setting write while a file write holds the writer returns at
+    /// once instead of waiting for the write.
+    #[test]
+    fn a_setting_write_during_a_busy_write_returns_at_once() {
+        let (proc, base) = hdf5_port();
+        let compression = idx(&base, "HDF5_compressionType");
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        assert!(
+            crate::test_util::returns_while_busy(&writer, || {
+                proc.validate_int32(compression, 0, 3, WriteVerdict::Accept(3), &base);
+            }),
+            "the setting write waited for the file write"
+        );
+        let mut w = writer.lock();
+        assert_eq!(w.cfg.compression_type, 0, "not read before the next open");
+        w.read_settings();
+        assert_eq!(w.cfg.compression_type, 3);
+    }
+
+    /// C loads an XMLFileName containing `<?xml` from memory
+    /// (NDFileHDF5LayoutXML.cpp:129-130), a path from disk, and the default
+    /// layout for an empty one (NDFileHDF5.cpp:2154-2163).
+    #[test]
+    fn a_layout_write_loads_inline_xml_a_file_or_the_default() {
+        let (proc, base) = hdf5_port();
+        let layout = idx(&base, "HDF5_layoutFilename");
+        let valid = idx(&base, "HDF5_layoutValid");
+        let write =
+            |v: &str| proc.validate_octet(layout, 0, v, WriteVerdict::Accept(v.to_owned()), &base);
+        let side_valid = |out: &WriteOutcome<String>| {
+            out.side.iter().rev().find_map(|p| match p {
+                ad_core_rs::plugin::runtime::SideParam::Int32 { reason, value, .. }
+                    if *reason == valid =>
+                {
+                    Some(*value)
+                }
+                _ => None,
+            })
+        };
+        let xml = r#"<?xml version="1.0"?><hdf5_layout><group name="inline"><dataset name="data" source="detector" det_default="true"/></group></hdf5_layout>"#;
+
+        let out = write(xml);
+        assert_eq!(out.verdict, WriteVerdict::Accept(xml.to_owned()));
+        assert_eq!(side_valid(&out), Some(1));
+        {
+            let c = proc.ctrl.lock();
+            c.writer.lock().load_layout().unwrap();
+            assert_eq!(
+                c.writer.lock().layout.as_ref().unwrap().groups[0].name,
+                "inline"
+            );
+        }
+
+        let file = temp_path("layout_file").with_extension("xml");
+        std::fs::write(&file, xml.replace("inline", "fromfile")).unwrap();
+        let out = write(file.to_str().unwrap());
+        assert_eq!(side_valid(&out), Some(1));
+        {
+            let c = proc.ctrl.lock();
+            c.writer.lock().load_layout().unwrap();
+            assert_eq!(
+                c.writer.lock().layout.as_ref().unwrap().groups[0].name,
+                "fromfile"
+            );
+        }
+        std::fs::remove_file(&file).ok();
+
+        let out = write("");
+        assert_eq!(side_valid(&out), Some(1));
+        let c = proc.ctrl.lock();
+        c.writer.lock().load_layout().unwrap();
+        assert!(
+            c.writer.lock().layout.is_some(),
+            "the default layout is loaded"
+        );
+    }
+
+    /// C re-reads XMLFileName at open and fails it (NDFileHDF5.cpp:279-283,
+    /// :3923-3938): a refused layout write still leaves the name, and the
+    /// Stream capture that follows fails, leaving the empty file C created
+    /// before the layout load (:271).
+    #[test]
+    fn a_stream_capture_with_a_malformed_layout_fails_to_open() {
+        let (proc, base) = hdf5_port();
+        let dir = std::env::temp_dir().join(format!("hdf5-badlayout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.xml");
+        std::fs::write(&bad, "<hdf5_layout><group").unwrap();
+        let octet = |name: &str, v: &str| {
+            proc.validate_octet(
+                idx(&base, name),
+                0,
+                v,
+                WriteVerdict::Accept(v.to_owned()),
+                &base,
+            )
+        };
+        octet("FILE_PATH", &format!("{}/", dir.display()));
+        octet("FILE_NAME", "s");
+        octet("FILE_TEMPLATE", "%s%s_%d.h5");
+        let out = octet("HDF5_layoutFilename", bad.to_str().unwrap());
+        assert!(matches!(out.verdict, WriteVerdict::Refuse { .. }));
+        let int = |name: &str, v: i32| {
+            proc.validate_int32(idx(&base, name), 0, v, WriteVerdict::Accept(v), &base)
+        };
+        int("WRITE_MODE", 2);
+        proc.ctrl.lock().latest_array = Some(Arc::new(NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        )));
+        let out = int("CAPTURE", 1);
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        let status = idx(&base, "WRITE_STATUS");
+        assert!(out.side.iter().any(|p| matches!(p,
+            ad_core_rs::plugin::runtime::SideParam::Int32 { reason, value: 1, .. } if *reason == status)));
+        assert!(!proc.ctrl.lock().file_base.is_open());
+        let h5 = H5File::open(dir.join("s_0.h5")).expect("C leaves the created file");
+        assert!(h5.dataset("data").is_err(), "the file holds no data");
+        drop(h5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C flushTask clears SWMRFlushNow once it has flushed (:398).
+    #[test]
+    fn a_swmr_flush_clears_the_request_as_c_flush_task_does() {
+        let (proc, base) = hdf5_port();
+        let flush = idx(&base, "HDF5_SWMRFlushNow");
+        let updates = proc
+            .on_param_change(
+                flush,
+                &PluginParamSnapshot {
+                    enable_callbacks: true,
+                    reason: flush,
+                    addr: 0,
+                    value: ad_core_rs::plugin::runtime::ParamChangeValue::Int32(1),
+                },
+            )
+            .param_updates;
+        assert!(updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 { reason, value: 0, .. } if *reason == flush
+        )));
+    }
+
+    #[test]
+    fn a_bad_layout_file_is_kept_and_refused_as_c_write_octet_does() {
+        let (proc, base) = hdf5_port();
+        let xml = idx(&base, "HDF5_layoutFilename");
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk.xml");
+        std::fs::write(&junk, "<hdf5_layout><group").unwrap();
+        let v = |value: &str| {
+            proc.validate_octet(xml, 0, value, WriteVerdict::Accept(value.into()), &base)
+                .verdict
+        };
+        let refused = |value: &str| WriteVerdict::Refuse {
+            keep: value.to_owned(),
+            message: format!("NDFileHDF5:writeOctet: status=3, function={xml}, value={value}"),
+        };
+
+        assert_eq!(v(""), WriteVerdict::Accept(String::new()));
+        assert_eq!(v("/nonexistent.xml"), refused("/nonexistent.xml"));
+        let junk = junk.to_str().unwrap();
+        assert_eq!(v(junk), refused(junk));
+        assert_eq!(
+            v("<?xml version=\"1.0\"?><bad"),
+            refused("<?xml version=\"1.0\"?><bad")
+        );
+
+        // verifyLayoutXMLFile (:2145-2174) sets both params inside the write.
+        let side = |value: &str| {
+            proc.validate_octet(xml, 0, value, WriteVerdict::Accept(value.into()), &base)
+                .side
+        };
+        let set = |valid, msg: &str| {
+            vec![
+                ad_core_rs::plugin::runtime::SideParam::Int32 {
+                    reason: idx(&base, "HDF5_layoutValid"),
+                    addr: 0,
+                    value: valid,
+                },
+                ad_core_rs::plugin::runtime::SideParam::Octet {
+                    reason: idx(&base, "HDF5_layoutErrorMsg"),
+                    addr: 0,
+                    value: msg.to_owned(),
+                },
+            ]
+        };
+        assert_eq!(side(""), set(1, "Default layout selected"));
+        assert_eq!(
+            side("/nonexistent.xml"),
+            set(0, "XML description file cannot be opened")
+        );
+        assert_eq!(side(junk), set(0, "XML description file parser error"));
+        let good = dir.path().join("good.xml");
+        std::fs::write(&good, DEFAULT_LAYOUT_XML).unwrap();
+        assert_eq!(side(good.to_str().unwrap()), set(1, ""));
+    }
+
+    #[test]
+    fn extra_dims_set_num_capture_as_c_calc_num_frames_does() {
+        let (proc, mut base) = hdf5_port();
+        let (num_capture, extra, size_n, size_x, pos) = (
+            idx(&base, "NUM_CAPTURE"),
+            idx(&base, "HDF5_nExtraDims"),
+            idx(&base, "HDF5_extraDimSizeN"),
+            idx(&base, "HDF5_extraDimSizeX"),
+            idx(&base, "HDF5_posRunning"),
+        );
+        let write = |base: &asyn_rs::port::PortDriverBase, reason, value| {
+            proc.validate_int32(reason, 0, value, WriteVerdict::Accept(value), base)
+        };
+        let side = |out: WriteOutcome<i32>, target| {
+            out.side.iter().find_map(|p| match p {
+                ad_core_rs::plugin::runtime::SideParam::Int32 { reason, value, .. }
+                    if *reason == target =>
+                {
+                    Some(*value)
+                }
+                _ => None,
+            })
+        };
+        base.set_int32_param(size_n, 0, 3).unwrap();
+        base.set_int32_param(size_x, 0, 4).unwrap();
+        // :1797 "if (value > 0) this->calcNumFrames();"
+        assert_eq!(side(write(&base, extra, 1), num_capture), Some(12));
+        // calcNumFrames :2448 "if (numExtraDims == 0) return;"
+        assert_eq!(side(write(&base, size_x, 5), num_capture), None);
+        base.set_int32_param(extra, 0, 1).unwrap();
+        // :1888 "this->calcNumFrames();" reads the size just written.
+        assert_eq!(side(write(&base, size_x, 5), num_capture), Some(15));
+
+        // :1822-1825: NumCapture above the grid keeps the grid; below it keeps the write.
+        assert_eq!(
+            write(&base, num_capture, 20).verdict,
+            WriteVerdict::Accept(12)
+        );
+        assert_eq!(
+            write(&base, num_capture, 5).verdict,
+            WriteVerdict::Accept(5)
+        );
+
+        // :1814 and :1834: an unbounded capture drops the grid
+        // unless positions place the frames.
+        base.set_int32_param(pos, 0, 1).unwrap();
+        assert_eq!(side(write(&base, num_capture, 0), extra), None);
+        base.set_int32_param(num_capture, 0, 0).unwrap();
+        assert_eq!(side(write(&base, pos, 0), extra), Some(0));
+        base.set_int32_param(pos, 0, 0).unwrap();
+        assert_eq!(side(write(&base, num_capture, 0), extra), Some(0));
     }
 
     #[test]
@@ -4516,11 +5292,7 @@ mod tests {
 
         let path = temp_path("hdf5_elem_attr");
         let mut writer = Hdf5Writer::new();
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let mk = |mode: &str, gain: i32| {
             let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -4615,11 +5387,7 @@ mod tests {
 
         let path = temp_path("hdf5_lazy_ds_attr");
         let mut writer = Hdf5Writer::new();
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let mk = |mode: &str, gain: i32| {
             let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -4693,11 +5461,7 @@ mod tests {
         let path = temp_path("hdf5_swmr_ds_attr");
         let mut writer = Hdf5Writer::new();
         writer.set_swmr_mode(true);
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let mk = |mode: &str| {
             let mut arr = NDArray::new(
@@ -5216,6 +5980,7 @@ mod tests {
         // must declare NN coding, and the data must round-trip.
         let mut writer = Hdf5Writer::new();
         writer.set_compression_type(COMPRESS_SZIP);
+        writer.read_settings(); // as open_file does
         let pipeline = writer.build_pipeline(1).expect("szip pipeline");
         assert_eq!(pipeline.filters[0].cd_values[0], SZIP_NN_OPTION_MASK);
 
@@ -5247,6 +6012,7 @@ mod tests {
         // BLOSC cd_values[5] carries the shuffle type.
         let mut writer = Hdf5Writer::new();
         writer.set_compression_type(COMPRESS_BLOSC);
+        writer.read_settings(); // as open_file does
         let pipeline = writer.build_pipeline(2).expect("blosc pipeline");
         assert_eq!(pipeline.filters[0].cd_values[5], 1);
     }
@@ -5266,6 +6032,7 @@ mod tests {
         writer.set_compression_type(COMPRESS_NBIT);
         writer.set_nbit_precision(10);
         writer.set_nbit_offset(0);
+        writer.read_settings(); // as open_file does
         assert!(
             writer.build_pipeline(2).is_none(),
             "N-bit packing is applied via a datatype override, not build_pipeline"
@@ -5735,7 +6502,9 @@ mod tests {
 
     #[test]
     fn test_layout_xml_param() {
-        // Valid and invalid layout XML drive layout_valid / layout_error.
+        // C createFileLayout (NDFileHDF5.cpp:3898-3939) loads at open: a
+        // good file, inline XML and an empty spec load; a bad or missing
+        // file fails the open.
         let mut writer = Hdf5Writer::new();
         let dir = std::env::temp_dir();
         let good = dir.join(format!("adcore_layout_good_{}.xml", std::process::id()));
@@ -5744,15 +6513,22 @@ mod tests {
             r#"<hdf5_layout><group name="entry"><dataset name="data" source="detector" det_default="true"/></group></hdf5_layout>"#,
         )
         .unwrap();
-        assert!(writer.set_layout_filename(good.to_str().unwrap()));
-        assert!(writer.layout_valid);
-        assert!(writer.layout_error.is_empty());
+        writer.set_layout_filename(good.to_str().unwrap());
+        writer.load_layout().unwrap();
+        assert_eq!(writer.layout.as_ref().unwrap().groups[0].name, "entry");
+
+        writer.set_layout_filename("");
+        writer.load_layout().unwrap();
+        assert!(writer.layout.is_some(), "the default layout");
 
         let bad = dir.join(format!("adcore_layout_bad_{}.xml", std::process::id()));
         std::fs::write(&bad, r#"<not_a_layout/>"#).unwrap();
-        assert!(!writer.set_layout_filename(bad.to_str().unwrap()));
-        assert!(!writer.layout_valid);
-        assert!(!writer.layout_error.is_empty());
+        writer.set_layout_filename(bad.to_str().unwrap());
+        assert!(writer.load_layout().is_err());
+        assert!(writer.layout.is_none());
+
+        writer.set_layout_filename(dir.join("adcore_layout_missing.xml").to_str().unwrap());
+        assert!(writer.load_layout().is_err());
 
         std::fs::remove_file(&good).ok();
         std::fs::remove_file(&bad).ok();
@@ -5790,11 +6566,7 @@ mod tests {
         let path = temp_path("hdf5_layout_nested");
         let mut writer = Hdf5Writer::new();
         writer.set_store_performance(true);
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let mk = |fill: f64| {
             let mut arr = NDArray::new(
@@ -5851,7 +6623,7 @@ mod tests {
         // Read-back resolves the nested dataset path.
         drop(h5);
         let mut reader = Hdf5Writer::new();
-        assert!(reader.set_layout_filename(layout.to_str().unwrap()));
+        reader.set_layout_filename(layout.to_str().unwrap());
         reader.current_path = Some(path.clone());
         let read_arr = reader.read_file().unwrap();
         assert_eq!(read_arr.dims.len(), 3);
@@ -5886,12 +6658,8 @@ mod tests {
         let path = temp_path("hdf5_multidet_route");
         let mut writer = Hdf5Writer::new();
         // Focus the test on image routing; no attribute time-series datasets.
-        writer.store_attributes = false;
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_store_attributes(false);
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         // Each frame is a uniform 2x2 UInt16 whose value identifies it, with an
         // optional `dest` string attribute selecting the destination dataset.
@@ -5995,8 +6763,8 @@ mod tests {
 
         let path = temp_path("hdf5_multidet_err");
         let mut writer = Hdf5Writer::new();
-        writer.store_attributes = false;
-        assert!(writer.set_layout_filename(layout.to_str().unwrap()));
+        writer.set_store_attributes(false);
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let mut arr = NDArray::new(
             vec![NDDimension::new(2), NDDimension::new(2)],
@@ -6044,11 +6812,7 @@ mod tests {
 
         let path = temp_path("hdf5_layout_hardlink");
         let mut writer = Hdf5Writer::new();
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -6108,11 +6872,7 @@ mod tests {
 
         let path = temp_path("hdf5_close_fail_releases_handle");
         let mut writer = Hdf5Writer::new();
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -6172,11 +6932,7 @@ mod tests {
         let path = temp_path("hdf5_swmr_layout_hardlink");
         let mut writer = Hdf5Writer::new();
         writer.set_swmr_mode(true);
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -6255,11 +7011,7 @@ mod tests {
         let path = temp_path("hdf5_swmr_layout_nested");
         let mut writer = Hdf5Writer::new();
         writer.set_swmr_mode(true);
-        assert!(
-            writer.set_layout_filename(layout.to_str().unwrap()),
-            "layout XML must parse: {}",
-            writer.layout_error
-        );
+        writer.set_layout_filename(layout.to_str().unwrap());
 
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],

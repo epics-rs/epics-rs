@@ -465,6 +465,32 @@ impl NDPluginProcess for ROIProcessor {
         destructible: true,
         ..ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE
     };
+
+    /// C `NDPluginROI::writeInt32` keeps the base class status and adds its
+    /// own line (`"%s:%s: function=%d %s, value=%d\n"`, NDPluginROI.cpp:271-273).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let refused = matches!(
+            verdict,
+            ad_core_rs::plugin::runtime::WriteVerdict::Refuse { .. }
+        );
+        let outcome = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict);
+        if !refused {
+            return outcome;
+        }
+        let name = params.params.param_name(reason).unwrap_or("");
+        outcome.print(
+            asyn_rs::trace::TraceMask::ERROR,
+            format!("NDPluginROI:writeInt32: function={reason} {name}, value={value}"),
+        )
+    }
+
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C `NDPluginROI.cpp:105-131`: DimNMaxSize is the size of the axis ROI
         // dim N *controls*, i.e. `pArray->dims[userDims[N]].size` with
@@ -474,19 +500,29 @@ impl NDPluginProcess for ROIProcessor {
         // only override within ndims).
         let user_dims = array.info().user_dims();
         let mut updates = Vec::new();
+        // C reads the ROI geometry under the port lock and releases it before
+        // extracting (NDPluginROI.cpp:140), so the copy below runs on a clone.
+        let mut guard = self.config.lock();
         for (i, dim_params) in self.params.dims.iter().enumerate() {
             let dim_size = if i < array.dims.len() {
-                array.dims[user_dims[i]].size as i32
+                array.dims[user_dims[i]].size
             } else {
                 0
             };
-            updates.push(ParamUpdate::int32(dim_params.max_size, dim_size));
+            updates.push(ParamUpdate::int32(dim_params.max_size, dim_size as i32));
+            // :113-115 etc. post the clamped geometry of an enabled axis. Min
+            // and Size keep the request (C requestedOffset_/requestedSize_);
+            // Bin has none, C reads the clamped param back next frame.
+            if i < array.dims.len() && guard.dims[i].enable {
+                let (offset, size, bin) = resolve_axis(&guard.dims[i], dim_size);
+                guard.dims[i].bin = bin;
+                updates.push(ParamUpdate::int32(dim_params.min, offset as i32));
+                updates.push(ParamUpdate::int32(dim_params.size, size as i32));
+                updates.push(ParamUpdate::int32(dim_params.bin, bin as i32));
+            }
         }
-
-        // C reads the ROI geometry under the port lock and releases it before
-        // extracting (NDPluginROI.cpp:140). A guard in the match scrutinee
-        // would live to the end of the match, i.e. across the whole copy.
-        let config = self.config.lock().clone();
+        let config = guard.clone();
+        drop(guard);
         match extract_roi(pool, array, &config) {
             Some(roi_arr) => ProcessResult {
                 output_arrays: vec![Arc::new(roi_arr)],
@@ -689,6 +725,32 @@ pub fn create_roi_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `"%s:%s: function=%d %s, value=%d\n"` (NDPluginROI.cpp:271-273).
+    #[test]
+    fn a_refused_base_write_stays_refused_with_c_line() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = ROIProcessor::new(ROIConfig::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let threads = base
+            .create_param("NUM_THREADS", asyn_rs::param::ParamType::Int32)
+            .unwrap();
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        let out = proc.validate_int32(threads, 0, 98, clamp.clone(), &base);
+        assert_eq!(out.verdict, clamp);
+        assert_eq!(
+            out.trace,
+            vec![(
+                asyn_rs::trace::TraceMask::ERROR,
+                format!("NDPluginROI:writeInt32: function={threads} NUM_THREADS, value=98")
+            )]
+        );
+        let out = proc.validate_int32(threads, 0, 1, WriteVerdict::Accept(1), &base);
+        assert!(out.trace.is_empty());
+    }
 
     fn pool() -> std::sync::Arc<NDArrayPool> {
         NDArrayPool::new(0)
@@ -1154,6 +1216,70 @@ mod tests {
         assert_eq!(max_size(reasons[0]), 6);
         assert_eq!(max_size(reasons[1]), 4);
         assert_eq!(max_size(reasons[2]), 0);
+    }
+
+    /// NDPluginROI.cpp:113-115 `setIntegerParam(NDPluginROIDim0Min,
+    /// (int)pDim->offset); ... Size ... Bin` — enabled axes only.
+    #[test]
+    fn process_posts_the_clamped_geometry_as_c_process_callbacks_does() {
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut config = ROIConfig::default();
+        config.dims[0] = ROIDimConfig {
+            min: 10,
+            size: 100,
+            bin: 5,
+            ..Default::default()
+        };
+        config.dims[1] = ROIDimConfig {
+            min: 1,
+            size: 2,
+            bin: 5,
+            ..Default::default()
+        };
+        config.dims[2].enable = false;
+        let mut proc = ROIProcessor::new(config);
+        let mut base = PortDriverBase::new("ROI", 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+        let pool = NDArrayPool::new(1_000_000);
+        let posted = |result: &ProcessResult, reason: usize| {
+            result.param_updates.iter().find_map(|u| match u {
+                ParamUpdate::Int32 {
+                    reason: r, value, ..
+                } if *r == reason => Some(*value),
+                _ => None,
+            })
+        };
+        let frame = || {
+            Arc::new(NDArray::new(
+                vec![NDDimension::new(8), NDDimension::new(6)],
+                NDDataType::UInt8,
+            ))
+        };
+        let r = proc.process_array(&frame(), &pool);
+        let d = proc.params().dims;
+        // offset MIN(10, 8-1) = 7, size MIN(100, 8-7) = 1, bin MIN(5, 1) = 1.
+        assert_eq!(
+            [d[0].min, d[0].size, d[0].bin].map(|i| posted(&r, i)),
+            [Some(7), Some(1), Some(1)]
+        );
+        assert_eq!(
+            [d[1].min, d[1].size, d[1].bin].map(|i| posted(&r, i)),
+            [Some(1), Some(2), Some(2)]
+        );
+        // :127 `if (pArray->ndims > 2)` and :130 `if (enableDim[2])`.
+        assert_eq!(posted(&r, d[2].min), None);
+
+        // The clamped bin is what the next frame reads; the offset keeps the
+        // request, so a wider frame gets it back.
+        let wide = Arc::new(NDArray::new(
+            vec![NDDimension::new(20), NDDimension::new(6)],
+            NDDataType::UInt8,
+        ));
+        let r = proc.process_array(&wide, &pool);
+        assert_eq!(
+            [d[0].min, d[0].size, d[0].bin].map(|i| posted(&r, i)),
+            [Some(10), Some(10), Some(1)]
+        );
     }
 
     // --- Auto-size / dim-disable / autocenter tests ---

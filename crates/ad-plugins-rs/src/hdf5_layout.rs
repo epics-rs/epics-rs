@@ -164,6 +164,22 @@ impl fmt::Display for LayoutError {
 impl std::error::Error for LayoutError {}
 
 impl Hdf5Layout {
+    /// Whether an XMLFileName is the layout itself rather than a path: C
+    /// loads one containing `<?xml` from memory (NDFileHDF5LayoutXML.cpp:
+    /// 129-130, :167-168).
+    pub fn is_inline(spec: &str) -> bool {
+        spec.contains("<?xml")
+    }
+
+    /// Load the layout an XMLFileName names, inline or from disk.
+    pub fn load(spec: &str) -> Result<Hdf5Layout, LayoutError> {
+        if Self::is_inline(spec) {
+            Self::parse(spec)
+        } else {
+            Self::from_file(std::path::Path::new(spec))
+        }
+    }
+
     /// Parse a layout XML file from disk.
     pub fn from_file(path: &std::path::Path) -> Result<Hdf5Layout, LayoutError> {
         let text = std::fs::read_to_string(path)

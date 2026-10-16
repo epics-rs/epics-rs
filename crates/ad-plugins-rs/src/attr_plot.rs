@@ -37,6 +37,7 @@ use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
+    WriteOutcome, WriteVerdict,
 };
 use parking_lot::Mutex;
 
@@ -195,6 +196,12 @@ impl AttrPlotState {
     /// Mirrors C++ `writeInt32(NDAttrPlotDataSelect)`: rejects out-of-range
     /// blocks and selections that point past the tracked attributes.
     fn set_data_select(&mut self, block: usize, value: i32) -> Result<(), &'static str> {
+        self.check_data_select(block, value)?;
+        self.data_selections[block] = value;
+        Ok(())
+    }
+
+    fn check_data_select(&self, block: usize, value: i32) -> Result<(), &'static str> {
         if block >= self.n_data_blocks {
             return Err("data block index out of range");
         }
@@ -203,7 +210,6 @@ impl AttrPlotState {
         if value > 0 && (value as usize) >= self.attributes.len() {
             return Err("attribute selection out of range");
         }
-        self.data_selections[block] = value;
         Ok(())
     }
 
@@ -471,6 +477,29 @@ impl NDPluginProcess for AttrPlotProcessor {
         Ok(())
     }
 
+    /// C `NDPluginAttrPlot::writeInt32` (NDPluginAttrPlot.cpp:270-296)
+    /// returns `asynError` for a selection it cannot bind and stores nothing.
+    fn validate_int32(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+        params: &asyn_rs::port::PortDriverBase,
+    ) -> WriteOutcome<i32> {
+        let state = self.state.lock();
+        if Some(reason) == state.params.data_select
+            && (addr < 0 || state.check_data_select(addr as usize, value).is_err())
+        {
+            return WriteOutcome::from(WriteVerdict::Refuse {
+                keep: params.get_int32_param(reason, addr).unwrap_or(0),
+                message: String::new(),
+            })
+            .settled();
+        }
+        verdict.into()
+    }
+
     fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         let mut state = self.state.lock();
         if Some(reason) == state.params.data_select {
@@ -596,6 +625,48 @@ mod tests {
                 matches!(u, ParamUpdate::Float64Array { reason: r, .. } if *r == data_reason)
             }),
             "a DataSelect write must post AP_Data even inside the period",
+        );
+    }
+
+    #[test]
+    fn an_unbindable_data_select_is_refused_as_c_write_int32_does() {
+        let mut proc = AttrPlotProcessor::new(8, 100, 4);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "ATTRPLOT_V",
+            8,
+            asyn_rs::port::PortFlags::default(),
+        );
+        proc.register_params(&mut base).unwrap();
+        let select = proc.state.lock().params.data_select.unwrap();
+        base.set_int32_param(select, 1, 0).unwrap();
+        proc.process_array(
+            &Arc::new(make_array_with_attrs(1, &[("Temp", 25.0)])),
+            &NDArrayPool::new(1_000_000),
+        );
+        let refused = WriteVerdict::Refuse {
+            keep: 0,
+            message: String::new(),
+        };
+
+        assert_eq!(
+            proc.validate_int32(select, 1, 0, WriteVerdict::Accept(0), &base)
+                .verdict,
+            WriteVerdict::Accept(0)
+        );
+        assert_eq!(
+            proc.validate_int32(select, 1, -1, WriteVerdict::Accept(-1), &base)
+                .verdict,
+            WriteVerdict::Accept(-1)
+        );
+        assert_eq!(
+            proc.validate_int32(select, 1, 9, WriteVerdict::Accept(9), &base)
+                .verdict,
+            refused
+        );
+        assert_eq!(
+            proc.validate_int32(select, 5, 0, WriteVerdict::Accept(0), &base)
+                .verdict,
+            refused
         );
     }
 

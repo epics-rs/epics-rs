@@ -393,7 +393,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 claim,
                 // queue_size is C `maxBuffers_` (NDCircularBuffConfigure
                 // queueSize); the processor bounds the accepted pre-count by it.
-                CircularBuffProcessor::new(100, 100, TriggerCondition::External, queue_size),
+                CircularBuffProcessor::new(100, 100, TriggerCondition::default(), queue_size),
                 pool,
                 queue_size,
                 source,

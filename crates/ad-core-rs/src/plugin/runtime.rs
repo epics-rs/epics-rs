@@ -13,10 +13,10 @@
 //! value is written back, so the PV is honest about the accepted value rather
 //! than silently inert.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): checked, not waived — all 9 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(10): checked, not waived — all 10 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
-// --all-features`, 385/385). ad-core-rs became a census subject when its
+// --all-features`, 402/402). ad-core-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -58,6 +58,10 @@ use super::wiring::WiringRegistry;
 enum PluginParamMsg {
     /// A param write to apply.
     Change(usize, i32, ParamChangeValue),
+    /// Arrays a write handed downstream (C `readFileBase` ->
+    /// `endProcessCallbacks`, NDPluginFile.cpp:189-193), then the arrays it
+    /// posted at an address (`doCallbacksGenericPointer`).
+    Publish(Vec<Arc<NDArray>>, Vec<(usize, Arc<NDArray>)>),
     /// Sync barrier — acknowledged (best-effort send of `()`) at full
     /// quiescence: every `Change` enqueued before it has been applied (FIFO
     /// channel) AND the array queue has drained. The second condition exists
@@ -345,15 +349,18 @@ pub enum WriteVerdict<T> {
     Refuse { keep: T, message: String },
 }
 
-impl<T: Copy> WriteVerdict<T> {
-    fn kept(&self) -> T {
+impl<T: Clone> WriteVerdict<T> {
+    /// The value the param keeps.
+    pub fn kept(&self) -> T {
         match self {
-            Self::Accept(v) | Self::Refuse { keep: v, .. } => *v,
+            Self::Accept(v) | Self::Refuse { keep: v, .. } => v.clone(),
         }
     }
 
-    fn is_refused(&self) -> bool {
-        matches!(self, Self::Refuse { .. })
+    /// Keep the value and drop the failure, as a C override does when it
+    /// overwrites the base class status with `status = callParamCallbacks()`.
+    pub fn succeed(self) -> Self {
+        Self::Accept(self.kept())
     }
 
     fn into_result(self) -> AsynResult<()> {
@@ -361,6 +368,185 @@ impl<T: Copy> WriteVerdict<T> {
             Self::Accept(_) => Ok(()),
             Self::Refuse { message, .. } => Err(write_refused(message)),
         }
+    }
+}
+
+/// A param a C write override sets beside the one written, stored before
+/// the same `callParamCallbacks`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SideParam {
+    Int32 {
+        reason: usize,
+        addr: i32,
+        value: i32,
+    },
+    Float64 {
+        reason: usize,
+        addr: i32,
+        value: f64,
+    },
+    Octet {
+        reason: usize,
+        addr: i32,
+        value: String,
+    },
+    /// C `doCallbacksFloat64Array`: posted at its address when stored.
+    Float64Array {
+        reason: usize,
+        addr: i32,
+        value: Vec<f64>,
+    },
+}
+
+impl From<ParamUpdate> for SideParam {
+    fn from(update: ParamUpdate) -> Self {
+        match update {
+            ParamUpdate::Int32 {
+                reason,
+                addr,
+                value,
+            } => Self::Int32 {
+                reason,
+                addr,
+                value,
+            },
+            ParamUpdate::Float64 {
+                reason,
+                addr,
+                value,
+            } => Self::Float64 {
+                reason,
+                addr,
+                value,
+            },
+            ParamUpdate::Octet {
+                reason,
+                addr,
+                value,
+            } => Self::Octet {
+                reason,
+                addr,
+                value,
+            },
+            ParamUpdate::Float64Array {
+                reason,
+                addr,
+                value,
+            } => Self::Float64Array {
+                reason,
+                addr,
+                value,
+            },
+        }
+    }
+}
+
+/// What a C write override leaves behind: the written param's verdict, the
+/// params it sets beside it, and the `asynPrint` lines it prints. The port
+/// applies all three; a `validate_*` hook never writes the port itself.
+/// `settled` means the override did everything C does for this write here,
+/// so `on_param_change` never sees it (a revert, or a start that failed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteOutcome<T> {
+    pub verdict: WriteVerdict<T>,
+    pub side: Vec<SideParam>,
+    pub trace: Vec<(TraceMask, String)>,
+    pub settled: bool,
+    pub publish: Published,
+    pub addressed: Addressed,
+}
+
+/// Arrays a write hands downstream, compared by identity.
+#[derive(Debug, Clone, Default)]
+pub struct Published(pub Vec<Arc<NDArray>>);
+
+impl PartialEq for Published {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().zip(&other.0).all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+}
+
+/// Arrays a write posts at an address (C `doCallbacksGenericPointer(array,
+/// NDArrayData, addr)`), compared by identity.
+#[derive(Debug, Clone, Default)]
+pub struct Addressed(pub Vec<(usize, Arc<NDArray>)>);
+
+impl PartialEq for Addressed {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|((a, x), (b, y))| a == b && Arc::ptr_eq(x, y))
+    }
+}
+
+impl<T> From<WriteVerdict<T>> for WriteOutcome<T> {
+    fn from(verdict: WriteVerdict<T>) -> Self {
+        Self {
+            verdict,
+            side: Vec::new(),
+            trace: Vec::new(),
+            settled: false,
+            publish: Published::default(),
+            addressed: Addressed::default(),
+        }
+    }
+}
+
+impl<T> WriteOutcome<T> {
+    pub fn set_int32(mut self, reason: usize, addr: i32, value: i32) -> Self {
+        self.side.push(SideParam::Int32 {
+            reason,
+            addr,
+            value,
+        });
+        self
+    }
+
+    pub fn set_float64(mut self, reason: usize, addr: i32, value: f64) -> Self {
+        self.side.push(SideParam::Float64 {
+            reason,
+            addr,
+            value,
+        });
+        self
+    }
+
+    pub fn set_octet(mut self, reason: usize, addr: i32, value: impl Into<String>) -> Self {
+        self.side.push(SideParam::Octet {
+            reason,
+            addr,
+            value: value.into(),
+        });
+        self
+    }
+
+    pub fn print(mut self, mask: TraceMask, line: impl Into<String>) -> Self {
+        self.trace.push((mask, line.into()));
+        self
+    }
+
+    pub fn settled(mut self) -> Self {
+        self.settled = true;
+        self
+    }
+
+    /// Store the updates a shared helper built, as side params.
+    pub fn set_updates(mut self, updates: Vec<ParamUpdate>) -> Self {
+        self.side.extend(updates.into_iter().map(SideParam::from));
+        self
+    }
+
+    pub fn publish(mut self, array: Arc<NDArray>) -> Self {
+        self.publish.0.push(array);
+        self
+    }
+
+    pub fn post_addressed(mut self, posts: Vec<(usize, Arc<NDArray>)>) -> Self {
+        self.addressed.0.extend(posts);
+        self
     }
 }
 
@@ -372,15 +558,26 @@ trait ValidateWrite: Send + Sync {
         reason: usize,
         addr: i32,
         value: i32,
+        verdict: WriteVerdict<i32>,
         base: &PortDriverBase,
-    ) -> WriteVerdict<i32>;
+    ) -> WriteOutcome<i32>;
     fn float64(
         &self,
         reason: usize,
         addr: i32,
         value: f64,
+        verdict: WriteVerdict<f64>,
         base: &PortDriverBase,
-    ) -> WriteVerdict<f64>;
+    ) -> WriteOutcome<f64>;
+    fn octet(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: &str,
+        verdict: WriteVerdict<String>,
+        base: &PortDriverBase,
+    ) -> WriteOutcome<String>;
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool;
 }
 
 impl<P: NDPluginProcess> ValidateWrite for P {
@@ -389,18 +586,33 @@ impl<P: NDPluginProcess> ValidateWrite for P {
         reason: usize,
         addr: i32,
         value: i32,
+        verdict: WriteVerdict<i32>,
         base: &PortDriverBase,
-    ) -> WriteVerdict<i32> {
-        self.validate_int32(reason, addr, value, base)
+    ) -> WriteOutcome<i32> {
+        self.validate_int32(reason, addr, value, verdict, base)
     }
     fn float64(
         &self,
         reason: usize,
         addr: i32,
         value: f64,
+        verdict: WriteVerdict<f64>,
         base: &PortDriverBase,
-    ) -> WriteVerdict<f64> {
-        self.validate_float64(reason, addr, value, base)
+    ) -> WriteOutcome<f64> {
+        self.validate_float64(reason, addr, value, verdict, base)
+    }
+    fn octet(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: &str,
+        verdict: WriteVerdict<String>,
+        base: &PortDriverBase,
+    ) -> WriteOutcome<String> {
+        self.validate_octet(reason, addr, value, verdict, base)
+    }
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        NDPluginProcess::posts_before_write(self, reason, value)
     }
 }
 
@@ -461,17 +673,22 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     }
 
     /// The synchronous half of a C plugin's `writeInt32` override: run on the
-    /// port before the store, it decides what the param keeps and whether
-    /// the write fails. `params` is the port's parameter library as it stands
-    /// before the store. `on_param_change` then sees the kept value.
+    /// port before the store, it decides what the param keeps, whether the
+    /// write fails, and what else C sets and prints on the way. `verdict` is
+    /// what C `NDPluginDriver::writeInt32` leaves for the base class params
+    /// (`Accept(value)` for every other param), as the override that calls
+    /// it sees the status. `params` is the parameter library before the
+    /// store. `on_param_change` then sees the kept value. The default keeps
+    /// the base verdict, as a plugin with no override does.
     fn validate_int32(
         &self,
         _reason: usize,
         _addr: i32,
-        value: i32,
+        _value: i32,
+        verdict: WriteVerdict<i32>,
         _params: &PortDriverBase,
-    ) -> WriteVerdict<i32> {
-        WriteVerdict::Accept(value)
+    ) -> WriteOutcome<i32> {
+        verdict.into()
     }
 
     /// `validate_int32` for a C `writeFloat64` override.
@@ -479,10 +696,30 @@ pub trait NDPluginProcess: Send + Sync + 'static {
         &self,
         _reason: usize,
         _addr: i32,
-        value: f64,
+        _value: f64,
+        verdict: WriteVerdict<f64>,
         _params: &PortDriverBase,
-    ) -> WriteVerdict<f64> {
-        WriteVerdict::Accept(value)
+    ) -> WriteOutcome<f64> {
+        verdict.into()
+    }
+
+    /// `validate_int32` for a C `writeOctet` override.
+    fn validate_octet(
+        &self,
+        _reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: WriteVerdict<String>,
+        _params: &PortDriverBase,
+    ) -> WriteOutcome<String> {
+        verdict.into()
+    }
+
+    /// Whether C's `writeInt32` stores and posts the written value before
+    /// the work `validate_int32` does, as `NDPluginFile` does for a busy
+    /// `WriteFile`/`ReadFile` so its 1 -> 0 reaches the record.
+    fn posts_before_write(&self, _reason: usize, _value: i32) -> bool {
+        false
     }
 
     /// Called when a param changes. Reason is the param index.
@@ -1705,79 +1942,155 @@ impl PluginPortDriver {
         Ok((driver, processor))
     }
 
-    /// What an int32 write keeps: C `NDPluginDriver::writeInt32` for its own
-    /// params, else the plugin's override (`validate_int32`). For NumThreads
+    /// What C `NDPluginDriver::writeInt32` leaves for an int32 write, which
+    /// the plugin's override (`validate_int32`) then sees. For NumThreads
     /// and QueueSize C stores the written value and lets
     /// `createCallbackThreads` overwrite it with the clamp
     /// (NDPluginDriver.cpp:973-994), so the write fails and the readback
-    /// shows what runs.
-    fn verdict_int32(&self, reason: usize, addr: i32, value: i32) -> AsynResult<WriteVerdict<i32>> {
+    /// shows what runs. C says why on the console and leaves errorMessage
+    /// empty (:766-769), whatever the override then makes of the status.
+    fn base_int32(&self, reason: usize, value: i32) -> AsynResult<WriteOutcome<i32>> {
         let p = &self.plugin_params;
-        // The line C's createCallbackThreads/connectToArrayPort prints
-        // before writeInt32 returns the error (NDPluginDriver.cpp:606, :973-990).
-        let refuse = |keep, message: String| {
-            self.base
-                .trace_print(TraceMask::ERROR, format_args!("{message}"));
-            Ok(WriteVerdict::Refuse { keep, message })
-        };
-        let threads_error = "NDPluginDriver::createCallbackThreads error";
-        if reason == p.num_threads {
+        // connectToArrayPort reads list 0 (NDPluginDriver.cpp:590-591).
+        let port =
+            String::from_utf8_lossy(self.base.get_string_param(p.nd_array_port, 0)?).into_owned();
+        let threads = "NDPluginDriver::createCallbackThreads error";
+        let (keep, why) = if reason == p.num_threads {
             let max = self.base.get_int32_param(p.max_threads, 0)?;
             if value > max {
-                return refuse(
+                (
                     max,
                     format!(
-                        "{threads_error}, numThreads={value} must be <= maxThreads={max}, setting to {max}"
+                        "{threads}, numThreads={value} must be <= maxThreads={max}, setting to {max}"
                     ),
-                );
-            }
-            if value < 1 {
-                return refuse(
+                )
+            } else if value < 1 {
+                (
                     1,
-                    format!("{threads_error}, numThreads={value} must be >= 1, setting to 1"),
-                );
+                    format!("{threads}, numThreads={value} must be >= 1, setting to 1"),
+                )
+            } else {
+                return Ok(WriteVerdict::Accept(value).into());
             }
         } else if reason == p.queue_size && value < 1 {
-            return refuse(
+            (
                 1,
-                format!("{threads_error}, queueSize={value} must be >= 1, setting to 1"),
-            );
+                format!("{threads}, queueSize={value} must be >= 1, setting to 1"),
+            )
         } else if reason == p.nd_array_addr {
-            // connectToArrayPort reads list 0 (NDPluginDriver.cpp:590).
-            let port = String::from_utf8_lossy(self.base.get_string_param(p.nd_array_port, 0)?)
-                .into_owned();
-            if let Some(message) = self.unresolved(&port, value) {
-                return refuse(value, message);
+            match self.unresolved(&port, value) {
+                Some(why) => (value, why),
+                None => return Ok(WriteVerdict::Accept(value).into()),
             }
         } else {
-            return Ok(self.validator.int32(reason, addr, value, &self.base));
-        }
-        Ok(WriteVerdict::Accept(value))
+            return Ok(WriteVerdict::Accept(value).into());
+        };
+        let connected = reason != p.nd_array_addr
+            && !port.is_empty()
+            && self
+                .unresolved(&port, self.base.get_int32_param(p.nd_array_addr, 0)?)
+                .is_none();
+        let name = self.base.params.param_name(reason).unwrap_or("");
+        Ok(WriteOutcome::from(WriteVerdict::Refuse {
+            keep,
+            message: String::new(),
+        })
+        .print(TraceMask::ERROR, why)
+        .print(
+            TraceMask::ERROR,
+            format!(
+                "NDPluginDriver::writeInt32 ERROR, status=3, function={reason}, paramName={name}, value={value}, connectedToArrayPort_={}",
+                connected as i32
+            ),
+        ))
     }
 
-    /// C `connectToArrayPort` fails when `connectDevice` finds no such port
-    /// (NDPluginDriver.cpp:605-611).
+    /// What C `asynNDArrayDriver::writeOctet` leaves for an octet write
+    /// (asynNDArrayDriver.cpp:529-538): FilePath is normalized by
+    /// `checkPath`, created to CreateDir's depth when missing, and
+    /// FilePathExists set. C's caller drops the status (NDPluginDriver.cpp:860).
+    fn base_octet(&self, reason: usize, value: &str) -> WriteOutcome<String> {
+        let nd = &self.ndarray_params;
+        if reason != nd.file_path || value.is_empty() {
+            return WriteVerdict::Accept(value.to_string()).into();
+        }
+        let mut path = value.to_string();
+        let mut exists = crate::driver::ndarray_driver::check_path_str(&mut path);
+        if !exists {
+            let depth = self.base.get_int32_param(nd.create_dir, 0).unwrap_or(0);
+            let _ =
+                crate::driver::ndarray_driver::NDArrayDriverBase::create_file_path(value, depth);
+            exists = crate::driver::ndarray_driver::check_path_str(&mut path);
+        }
+        WriteOutcome::from(WriteVerdict::Accept(path)).set_int32(
+            nd.file_path_exists,
+            0,
+            exists as i32,
+        )
+    }
+
+    /// Store what a write override set beside the written param, print its
+    /// lines, and post the written address. C overrides end in
+    /// `callParamCallbacks(addr)` or `callParamCallbacks()` on an address-0
+    /// write, so a side param at another address waits for that address's
+    /// next post, as NDPluginAttribute's Reset leaves channels 1.. (:122-136);
+    /// an array posts at once, as `doCallbacksFloat64Array` does.
+    fn store_side(
+        &mut self,
+        addr: i32,
+        side: Vec<SideParam>,
+        trace: Vec<(TraceMask, String)>,
+    ) -> AsynResult<()> {
+        for p in side {
+            match p {
+                SideParam::Int32 {
+                    reason,
+                    addr,
+                    value,
+                } => self.base.set_int32_param(reason, addr, value)?,
+                SideParam::Float64 {
+                    reason,
+                    addr,
+                    value,
+                } => self.base.set_float64_param(reason, addr, value)?,
+                SideParam::Octet {
+                    reason,
+                    addr,
+                    value,
+                } => self.base.set_string_param(reason, addr, &value)?,
+                SideParam::Float64Array {
+                    reason,
+                    addr,
+                    value,
+                } => {
+                    self.base.params.set_float64_array(reason, addr, value)?;
+                    self.base.call_param_callbacks(addr)?;
+                }
+            }
+        }
+        for (mask, line) in trace {
+            self.base.trace_print(mask, format_args!("{line}"));
+        }
+        self.base.call_param_callbacks(addr)
+    }
+
+    fn send_published(&self, publish: Published, addressed: Addressed) {
+        if !publish.0.is_empty() || !addressed.0.is_empty() {
+            let _ = self
+                .param_change_tx
+                .send(PluginParamMsg::Publish(publish.0, addressed.0));
+        }
+    }
+
+    /// C `connectToArrayPort` fails when `connectDevice` finds no such port,
+    /// with this console line (NDPluginDriver.cpp:605-611).
     fn unresolved(&self, port: &str, addr: i32) -> Option<String> {
         let key = self.wiring.key(port, addr);
         (!port.is_empty() && self.wiring.lookup_output(&key).is_none()).then(|| {
             format!(
-                "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice \
-                 to array port {port} address {addr}, status=3, \
-                 error=asynManager:connectDevice port {port} not found"
+                "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port {port} address {addr}, status=3, error=asynManager:connectDevice port {port} not found"
             )
         })
-    }
-
-    /// C's `connectedToArrayPort_` as `writeInt32` reports it.
-    fn connected(&self) -> bool {
-        let p = &self.plugin_params;
-        let port = self
-            .base
-            .get_string_param(p.nd_array_port, 0)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_default();
-        let addr = self.base.get_int32_param(p.nd_array_addr, 0).unwrap_or(0);
-        !port.is_empty() && self.unresolved(&port, addr).is_none()
     }
 }
 
@@ -1993,10 +2306,30 @@ impl PortDriver for PluginPortDriver {
     fn io_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
-        let verdict = self.verdict_int32(reason, addr, value)?;
+        let base = self.base_int32(reason, value)?;
+        for (mask, line) in &base.trace {
+            self.base.trace_print(*mask, format_args!("{line}"));
+        }
+        // The thread pool runs what `createCallbackThreads` settled on
+        // (`numThreads_`), even where an override then stores another value
+        // in the param (NDPluginCodec.cpp:1031).
+        let p = &self.plugin_params;
+        let runs = (reason == p.num_threads || reason == p.queue_size).then(|| base.verdict.kept());
+        if self.validator.posts_before_write(reason, value) {
+            self.base.set_int32_param(reason, addr, value)?;
+            self.base.call_param_callbacks(addr)?;
+        }
+        let WriteOutcome {
+            verdict,
+            side,
+            trace,
+            settled,
+            publish,
+            addressed,
+        } = self
+            .validator
+            .int32(reason, addr, value, base.verdict, &self.base);
         let value = verdict.kept();
-        let reverted =
-            verdict.is_refused() && self.base.get_int32_param(reason, addr).ok() == Some(value);
         self.base.set_int32_param(reason, addr, value)?;
         let p = &self.plugin_params;
         if reason == p.queue_size || reason == p.num_threads {
@@ -2005,29 +2338,14 @@ impl PortDriver for PluginPortDriver {
             let depth = self.base.get_int32_param(p.queue_size, 0)?;
             self.base.set_int32_param(p.queue_use, 0, depth)?;
         }
-        self.base.call_param_callbacks(addr)?;
-        if verdict.is_refused()
-            && (reason == p.num_threads || reason == p.queue_size || reason == p.nd_array_addr)
-        {
-            // NDPluginDriver.cpp:769-771
-            let name = self.base.params.param_name(reason).unwrap_or("");
-            self.base.trace_print(
-                TraceMask::ERROR,
-                format_args!(
-                    "NDPluginDriver::writeInt32 ERROR, status=3, function={reason}, \
-                     paramName={name}, value={value}, connectedToArrayPort_={}",
-                    u8::from(self.connected())
-                ),
-            );
-        }
-        // A refusal that reverts leaves nothing for the data plane to apply,
-        // as C's override skips its side effect.
-        if !reverted {
+        self.store_side(addr, side, trace)?;
+        self.send_published(publish, addressed);
+        if !settled {
             // B14: reliable send on an unbounded channel — never drop param changes.
             let _ = self.param_change_tx.send(PluginParamMsg::Change(
                 reason,
                 addr,
-                ParamChangeValue::Int32(value),
+                ParamChangeValue::Int32(runs.unwrap_or(value)),
             ));
         }
         verdict.into_result()
@@ -2036,13 +2354,21 @@ impl PortDriver for PluginPortDriver {
     fn io_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
-        let verdict = self.validator.float64(reason, addr, value, &self.base);
+        let WriteOutcome {
+            verdict,
+            side,
+            trace,
+            settled,
+            publish,
+            addressed,
+        } = self
+            .validator
+            .float64(reason, addr, value, WriteVerdict::Accept(value), &self.base);
         let value = verdict.kept();
-        let reverted =
-            verdict.is_refused() && self.base.get_float64_param(reason, addr).ok() == Some(value);
         self.base.set_float64_param(reason, addr, value)?;
-        self.base.call_param_callbacks(addr)?;
-        if !reverted {
+        self.store_side(addr, side, trace)?;
+        self.send_published(publish, addressed);
+        if !settled {
             let _ = self.param_change_tx.send(PluginParamMsg::Change(
                 reason,
                 addr,
@@ -2055,7 +2381,7 @@ impl PortDriver for PluginPortDriver {
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
         let addr = user.addr;
-        let s = String::from_utf8_lossy(data).into_owned();
+        let s = String::from_utf8_lossy(data);
         // C `writeOctet` ignores connectToArrayPort's status
         // (NDPluginDriver.cpp:834-836): the write succeeds, the line is printed.
         if reason == self.plugin_params.nd_array_port {
@@ -2068,14 +2394,30 @@ impl PortDriver for PluginPortDriver {
                     .trace_print(TraceMask::ERROR, format_args!("{line}"));
             }
         }
-        self.base.set_string_param(reason, addr, &s)?;
-        self.base.call_param_callbacks(addr)?;
-        let _ = self.param_change_tx.send(PluginParamMsg::Change(
-            reason,
-            addr,
-            ParamChangeValue::Octet(s),
-        ));
-        Ok(data.len())
+        let base = self.base_octet(reason, &s);
+        let WriteOutcome {
+            verdict,
+            mut side,
+            trace,
+            settled,
+            publish,
+            addressed,
+        } = self
+            .validator
+            .octet(reason, addr, &s, base.verdict, &self.base);
+        let value = verdict.kept();
+        self.base.set_string_param(reason, addr, &value)?;
+        side.splice(0..0, base.side);
+        self.store_side(addr, side, trace)?;
+        self.send_published(publish, addressed);
+        if !settled {
+            let _ = self.param_change_tx.send(PluginParamMsg::Change(
+                reason,
+                addr,
+                ParamChangeValue::Octet(value),
+            ));
+        }
+        verdict.into_result().map(|()| data.len())
     }
 
     fn read_int8_array(&mut self, _user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {
@@ -2938,6 +3280,26 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         Some(PluginParamMsg::Fence(ack)) => {
                             let _ = ack.send(());
                         }
+                        Some(PluginParamMsg::Publish(arrays, addressed)) => {
+                            let (po, senders, port) = {
+                                let mut guard = shared.lock();
+                                let deliver = guard.array_callbacks.get();
+                                let mut po = guard.build_publish_batch(
+                                    arrays,
+                                    Vec::new(),
+                                    false,
+                                    None,
+                                    None,
+                                    deliver,
+                                    true,
+                                );
+                                po.addressed = addressed;
+                                let senders = guard.senders_for(&po);
+                                (po, senders, guard.port_handle.clone())
+                            };
+                            po.publish_arrays(&senders, &mut scatter_cursor).await;
+                            po.batch.flush(&port).await;
+                        }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
                             // The base-class pool branch, which a plugin port
                             // inherits (NDPluginDriver.cpp:690-692). Answered
@@ -3561,13 +3923,20 @@ mod tests {
     }
 
     /// Clamps `LIMIT` to 0..=10 and reverts any negative `GAIN`, as C plugin
-    /// overrides do; records what reached the data plane.
+    /// overrides do; mirrors `LIMIT` into `TWICE`; forgives a base refusal of
+    /// 999 as an override that overwrites the status does, and stores 998
+    /// over the base clamp as NDPluginCodec does; records what reached the
+    /// data plane.
     #[derive(Default)]
     struct ValidatingProcessor {
         limit: usize,
+        twice: usize,
         gain: usize,
+        name: usize,
+        threads: usize,
         applied: Arc<parking_lot::Mutex<Vec<usize>>>,
-        ids: Arc<parking_lot::Mutex<(usize, usize)>>,
+        threads_run: Arc<parking_lot::Mutex<Vec<i32>>>,
+        ids: Arc<parking_lot::Mutex<(usize, usize, usize, usize)>>,
     }
 
     impl NDPluginProcess for ValidatingProcessor {
@@ -3580,47 +3949,107 @@ mod tests {
         }
         fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
             self.limit = base.create_param("LIMIT", asyn_rs::param::ParamType::Int32)?;
+            self.twice = base.create_param("TWICE", asyn_rs::param::ParamType::Int32)?;
             self.gain = base.create_param("GAIN", asyn_rs::param::ParamType::Float64)?;
+            self.name = base.create_param("NAME", asyn_rs::param::ParamType::Octet)?;
             base.set_float64_param(self.gain, 0, 1.0)?;
-            *self.ids.lock() = (self.limit, self.gain);
+            self.threads = base.find_param("NUM_THREADS").unwrap();
+            *self.ids.lock() = (self.limit, self.twice, self.gain, self.name);
             Ok(())
         }
         fn validate_int32(
             &self,
             reason: usize,
-            _addr: i32,
+            addr: i32,
             value: i32,
+            verdict: WriteVerdict<i32>,
             _params: &PortDriverBase,
-        ) -> WriteVerdict<i32> {
-            if reason == self.limit && value > 10 {
-                return WriteVerdict::Refuse {
-                    keep: 10,
-                    message: "limit".into(),
+        ) -> WriteOutcome<i32> {
+            // Busy, as WriteFile is: the work is done inside the write.
+            if reason == self.limit && value == 6 {
+                return WriteVerdict::Accept(0).into();
+            }
+            if reason != self.limit {
+                return match value {
+                    999 => verdict.succeed().into(),
+                    998 => WriteVerdict::Accept(value).into(),
+                    _ => verdict.into(),
                 };
             }
-            WriteVerdict::Accept(value)
+            let verdict = if value > 10 {
+                WriteVerdict::Refuse {
+                    keep: 10,
+                    message: "limit".into(),
+                }
+            } else {
+                verdict
+            };
+            let kept = verdict.kept();
+            let out = WriteOutcome::from(verdict)
+                .set_int32(self.twice, addr, 2 * kept)
+                .print(TraceMask::ERROR, "limit set");
+            match value {
+                // Also sets TWICE at the next address, as Attribute's Reset
+                // sets every channel.
+                7 => out.set_int32(self.twice, addr + 1, 2 * kept),
+                // Hands an array downstream, as ReadFile does.
+                5 => out.publish(make_test_array(5)),
+                _ => out,
+            }
+        }
+        fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+            reason == self.limit && value == 6
         }
         fn validate_float64(
             &self,
             reason: usize,
             addr: i32,
             value: f64,
+            verdict: WriteVerdict<f64>,
             params: &PortDriverBase,
-        ) -> WriteVerdict<f64> {
+        ) -> WriteOutcome<f64> {
             if reason == self.gain && value < 0.0 {
-                return WriteVerdict::Refuse {
+                return WriteOutcome::from(WriteVerdict::Refuse {
                     keep: params.get_float64_param(reason, addr).unwrap(),
                     message: "gain".into(),
-                };
+                })
+                .settled();
             }
-            WriteVerdict::Accept(value)
+            verdict.into()
+        }
+        /// Keeps and fails `bad`, as NDFileHDF5 keeps an XMLFileName it
+        /// cannot open; reverts `old`.
+        fn validate_octet(
+            &self,
+            reason: usize,
+            addr: i32,
+            value: &str,
+            verdict: WriteVerdict<String>,
+            params: &PortDriverBase,
+        ) -> WriteOutcome<String> {
+            let refuse = |keep: String| WriteVerdict::Refuse {
+                keep,
+                message: "name".into(),
+            };
+            match value {
+                "bad" if reason == self.name => refuse(value.into()).into(),
+                "old" if reason == self.name => WriteOutcome::from(refuse(
+                    String::from_utf8_lossy(params.get_string_param(reason, addr).unwrap())
+                        .into_owned(),
+                ))
+                .settled(),
+                _ => verdict.into(),
+            }
         }
         fn on_param_change(
             &self,
             reason: usize,
-            _params: &PluginParamSnapshot,
+            params: &PluginParamSnapshot,
         ) -> ParamChangeResult {
             self.applied.lock().push(reason);
+            if reason == self.threads {
+                self.threads_run.lock().push(params.value.as_i32());
+            }
             ParamChangeResult::empty()
         }
     }
@@ -3631,11 +4060,13 @@ mod tests {
     #[test]
     fn plugin_validate_hook_clamps_and_reverts_before_the_store() {
         let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let ids = Arc::new(parking_lot::Mutex::new((0, 0)));
+        let ids = Arc::new(parking_lot::Mutex::new((0, 0, 0, 0)));
+        let threads_run = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (handle, _jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("VALIDATE").unwrap(),
             ValidatingProcessor {
                 applied: applied.clone(),
+                threads_run: threads_run.clone(),
                 ids: ids.clone(),
                 ..Default::default()
             },
@@ -3646,18 +4077,61 @@ mod tests {
             DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
-        let (limit, gain) = *ids.lock();
+        let (limit, twice, gain, name) = *ids.lock();
 
         assert!(port.write_int32_blocking(limit, 0, 5).is_ok());
+        assert_eq!(port.read_int32_blocking(twice, 0).unwrap(), 10);
         assert!(port.write_int32_blocking(limit, 0, 50).is_err());
         assert_eq!(port.read_int32_blocking(limit, 0).unwrap(), 10);
+        assert_eq!(port.read_int32_blocking(twice, 0).unwrap(), 20);
+
+        // The base clamp reaches the override, which may keep its failure or
+        // drop it; the clamp is stored either way.
+        let num_threads = handle.plugin_params.num_threads;
+        assert!(port.write_int32_blocking(num_threads, 0, 50).is_err());
+        assert!(port.write_int32_blocking(num_threads, 0, 999).is_ok());
+        let max = port
+            .read_int32_blocking(handle.plugin_params.max_threads, 0)
+            .unwrap();
+        assert_eq!(port.read_int32_blocking(num_threads, 0).unwrap(), max);
+        // An override that stores the written value over the clamp leaves
+        // the pool running the clamp, as C's `numThreads_` does.
+        assert!(port.write_int32_blocking(num_threads, 0, 998).is_ok());
+        assert_eq!(port.read_int32_blocking(num_threads, 0).unwrap(), 998);
 
         assert!(port.write_float64_blocking(gain, 0, 2.0).is_ok());
         assert!(port.write_float64_blocking(gain, 0, -1.0).is_err());
         assert_eq!(port.read_float64_blocking(gain, 0).unwrap(), 2.0);
 
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let write = |v: &str| rt.block_on(port.write_octet(name, 0, v.as_bytes().to_vec()));
+        let read = || rt.block_on(port.read_octet(name, 0, 64)).unwrap();
+        assert!(write("good").is_ok());
+        assert!(write("old").is_err());
+        assert_eq!(read(), b"good");
+        assert!(write("bad").is_err());
+        assert_eq!(read(), b"bad");
+
         params_applied(&handle);
-        assert_eq!(*applied.lock(), vec![limit, limit, gain]);
+        assert_eq!(
+            *applied.lock(),
+            vec![
+                limit,
+                limit,
+                num_threads,
+                num_threads,
+                num_threads,
+                gain,
+                name,
+                name
+            ]
+        );
+        // C recreates the callback threads on every NumThreads write, a
+        // refused one included (NDPluginDriver.cpp:730-733).
+        assert_eq!(*threads_run.lock(), vec![max, max, max]);
     }
 
     /// A processor that serves its latest frame, as NDPluginStdArrays does.
@@ -3948,6 +4422,380 @@ mod tests {
     /// The writes C `NDPluginDriver::writeInt32`/`writeOctet` fail
     /// (NDPluginDriver.cpp:605-611, 973-994) fail here too, so the record
     /// takes its WRITE alarm; a clamp is what the readback shows.
+    /// C prints why NDPluginDriver refused (NDPluginDriver.cpp:974-976,
+    /// :606-609) and then
+    /// `"%s::%s ERROR, status=%d, function=%d, paramName=%s, value=%d, connectedToArrayPort_=%d\n"`
+    /// (:766-769), and leaves errorMessage empty.
+    #[test]
+    fn base_refusals_print_c_lines_and_leave_error_message_empty() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut drv, _) = PluginPortDriver::new(
+            "BASELINES",
+            "Passthrough",
+            10,
+            &"UP".into(),
+            1,
+            tx,
+            PassthroughProcessor,
+            None,
+            &NDArrayPool::new(1_000_000),
+            wiring,
+        )
+        .unwrap();
+        let (threads, addr) = (
+            drv.plugin_params.num_threads,
+            drv.plugin_params.nd_array_addr,
+        );
+        let refused = |keep| WriteVerdict::Refuse {
+            keep,
+            message: String::new(),
+        };
+
+        let out = drv.base_int32(threads, 98).unwrap();
+        assert_eq!(out.verdict, refused(1));
+        assert_eq!(
+            out.trace,
+            vec![
+                (
+                    TraceMask::ERROR,
+                    "NDPluginDriver::createCallbackThreads error, numThreads=98 must be <= maxThreads=1, setting to 1".to_string()
+                ),
+                (
+                    TraceMask::ERROR,
+                    format!("NDPluginDriver::writeInt32 ERROR, status=3, function={threads}, paramName=NUM_THREADS, value=98, connectedToArrayPort_=1")
+                ),
+            ]
+        );
+
+        drv.base
+            .set_string_param(drv.plugin_params.nd_array_port, 0, "BOGUS")
+            .unwrap();
+        let out = drv.base_int32(addr, 2).unwrap();
+        assert_eq!(out.verdict, refused(2));
+        assert_eq!(
+            out.trace,
+            vec![
+                (
+                    TraceMask::ERROR,
+                    "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port BOGUS address 2, status=3, error=asynManager:connectDevice port BOGUS not found".to_string()
+                ),
+                (
+                    TraceMask::ERROR,
+                    format!("NDPluginDriver::writeInt32 ERROR, status=3, function={addr}, paramName=NDARRAY_ADDR, value=2, connectedToArrayPort_=0")
+                ),
+            ]
+        );
+    }
+
+    /// A side param at another address is stored but posted only by that
+    /// address's next `callParamCallbacks`, as NDPluginAttribute's Reset
+    /// (:122-136) leaves channels 1.. until their next frame.
+    #[test]
+    fn a_write_posts_only_its_own_address() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let processor = ValidatingProcessor::default();
+        let ids = processor.ids.clone();
+        let (mut drv, _) = PluginPortDriver::new(
+            "POSTADDR",
+            "Validating",
+            10,
+            &"UP".into(),
+            2,
+            tx,
+            processor,
+            None,
+            &NDArrayPool::new(1_000_000),
+            wiring,
+        )
+        .unwrap();
+        let (limit, twice, _, _) = *ids.lock();
+        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        for a in 0..2 {
+            drv.base.params.take_changed(a).unwrap();
+        }
+        drv.io_write_int32(&mut AsynUser::new(limit).with_addr(0), 7)
+            .unwrap();
+        assert_eq!(drv.base.get_int32_param(twice, 1).unwrap(), 14);
+        assert_eq!(drv.base.params.take_changed(1).unwrap(), vec![twice]);
+        assert!(drv.base.params.take_changed(0).unwrap().is_empty());
+    }
+
+    /// NDPluginFile.cpp:189-193: the array a ReadFile write reads goes
+    /// downstream from the write.
+    #[test]
+    fn an_array_a_write_publishes_reaches_downstream() {
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+        let processor = ValidatingProcessor::default();
+        let ids = processor.ids.clone();
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("PUBLISH").unwrap(),
+            processor,
+            NDArrayPool::new(1_000_000),
+            10,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let (limit, ..) = *ids.lock();
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(limit, 0, 5)
+            .unwrap();
+        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 5);
+    }
+
+    /// NDPluginTimeSeries writeInt32 posts its waveforms and arrays from the
+    /// write (C `doCallbacksFloat64Array`, `doCallbacksGenericPointer`).
+    #[derive(Default)]
+    struct ArraySide {
+        ids: Arc<parking_lot::Mutex<(usize, usize)>>,
+    }
+
+    impl NDPluginProcess for ArraySide {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(array, vec![])
+        }
+        fn plugin_type(&self) -> &str {
+            "ArraySide"
+        }
+        fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
+            let go = base.create_param("GO", asyn_rs::param::ParamType::Int32)?;
+            let series = base.create_param("SERIES", asyn_rs::param::ParamType::Float64Array)?;
+            *self.ids.lock() = (go, series);
+            Ok(())
+        }
+        fn validate_int32(
+            &self,
+            reason: usize,
+            _addr: i32,
+            _value: i32,
+            verdict: WriteVerdict<i32>,
+            _params: &PortDriverBase,
+        ) -> WriteOutcome<i32> {
+            let (go, series) = *self.ids.lock();
+            if reason != go {
+                return verdict.into();
+            }
+            WriteOutcome::from(verdict)
+                .set_updates(vec![ParamUpdate::float64_array_addr(
+                    series,
+                    1,
+                    vec![1.0, 2.0],
+                )])
+                .post_addressed(vec![(1, make_test_array(42))])
+                .settled()
+        }
+    }
+
+    #[test]
+    fn an_array_side_param_is_posted_at_its_address_inside_the_write() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let processor = ArraySide::default();
+        let ids = processor.ids.clone();
+        let (mut drv, _) = PluginPortDriver::new(
+            "ARRSIDE",
+            "ArraySide",
+            10,
+            &"UP".into(),
+            2,
+            tx,
+            processor,
+            None,
+            &NDArrayPool::new(1_000_000),
+            wiring,
+        )
+        .unwrap();
+        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        let (go, series) = *ids.lock();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sync = drv.base.interrupts.register_sync_callback(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(series),
+                ..Default::default()
+            },
+            move |iv| {
+                if let ParamValue::Float64Array(v) = &iv.value {
+                    log.lock().push((iv.addr, v.to_vec()))
+                }
+            },
+        );
+        while rx.try_recv().is_ok() {}
+        drv.io_write_int32(&mut AsynUser::new(go), 1).unwrap();
+        assert_eq!(*seen.lock(), vec![(1, vec![1.0, 2.0])]);
+        // A settled write sends only its addressed post to the data task.
+        match rx.try_recv() {
+            Ok(PluginParamMsg::Publish(arrays, addressed)) => {
+                assert!(arrays.is_empty());
+                assert_eq!(addressed.len(), 1);
+                assert_eq!((addressed[0].0, addressed[0].1.unique_id), (1, 42));
+            }
+            other => panic!("expected the addressed post, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_array_a_write_posts_at_an_address_reaches_only_that_address() {
+        let wiring = test_wiring();
+        let processor = ArraySide::default();
+        let ids = processor.ids.clone();
+        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+            &asyn_rs::asyn_record::claim_port("ARRSIDE_MULTI").unwrap(),
+            processor,
+            NDArrayPool::new(1_000_000),
+            10,
+            "",
+            wiring.clone(),
+            2,
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let (down0, rx0) = ndarray_channel("ARRSIDE_DOWN0", 10);
+        let (down1, mut rx1) = ndarray_channel("ARRSIDE_DOWN1", 10);
+        wiring
+            .rewire(&down0, "", &wiring.key("ARRSIDE_MULTI", 0))
+            .unwrap();
+        wiring
+            .rewire(&down1, "", &wiring.key("ARRSIDE_MULTI", 1))
+            .unwrap();
+        let (go, _) = *ids.lock();
+        up.port_runtime()
+            .port_handle()
+            .write_int32_blocking(go, 0, 1)
+            .unwrap();
+        assert_eq!(rx1.blocking_recv().unwrap().unique_id, 42);
+        params_applied(&up);
+        assert_eq!(rx0.pending(), 0);
+    }
+
+    /// NDPluginFile.cpp:808-811: a busy write posts its 1 before the work
+    /// and its 0 after, so the record sees 1 -> 0 even when the param held
+    /// 0 before the write.
+    #[test]
+    fn a_busy_write_posts_its_value_before_the_work_and_its_reset_after() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let processor = ValidatingProcessor::default();
+        let ids = processor.ids.clone();
+        let (mut drv, _) = PluginPortDriver::new(
+            "BUSY",
+            "Validating",
+            10,
+            &"UP".into(),
+            1,
+            tx,
+            processor,
+            None,
+            &NDArrayPool::new(1_000_000),
+            wiring,
+        )
+        .unwrap();
+        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        let (limit, ..) = *ids.lock();
+        drv.base.set_int32_param(limit, 0, 0).unwrap();
+        drv.base.call_param_callbacks(0).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sync = drv.base.interrupts.register_sync_callback(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(limit),
+                ..Default::default()
+            },
+            move |iv| {
+                if let ParamValue::Int32(v) = iv.value {
+                    log.lock().push(v)
+                }
+            },
+        );
+        drv.io_write_int32(&mut AsynUser::new(limit), 6).unwrap();
+        drv.base.call_param_callbacks(0).unwrap();
+        assert_eq!(*seen.lock(), vec![6, 0]);
+    }
+
+    /// asynNDArrayDriver.cpp:529-538 inside the write: FilePath gains its
+    /// separator, a missing directory is created to CreateDir's depth, and
+    /// FilePathExists is set before the write returns.
+    #[test]
+    fn a_file_path_write_checks_and_creates_the_path_as_c_write_octet_does() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut drv, _) = PluginPortDriver::new(
+            "FILEPATH",
+            "Passthrough",
+            10,
+            &"UP".into(),
+            1,
+            tx,
+            PassthroughProcessor,
+            None,
+            &NDArrayPool::new(1_000_000),
+            wiring,
+        )
+        .unwrap();
+        let nd = drv.ndarray_params;
+        let dir = std::env::temp_dir().join(format!("filepath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("a").to_str().unwrap().to_string();
+        let write = |drv: &mut PluginPortDriver| {
+            let mut user = AsynUser::new(nd.file_path);
+            drv.io_write_octet(&mut user, path.as_bytes()).unwrap();
+            (
+                String::from_utf8_lossy(drv.base.get_string_param(nd.file_path, 0).unwrap())
+                    .into_owned(),
+                drv.base.get_int32_param(nd.file_path_exists, 0).unwrap(),
+            )
+        };
+
+        assert_eq!(
+            write(&mut drv),
+            (format!("{path}/"), 0),
+            "CreateDir 0 creates nothing"
+        );
+        drv.base.set_int32_param(nd.create_dir, 0, -2).unwrap();
+        assert_eq!(write(&mut drv), (format!("{path}/"), 1));
+        assert!(std::path::Path::new(&path).is_dir());
+        let mut last = None;
+        while let Ok(PluginParamMsg::Change(r, _, v)) = rx.try_recv() {
+            last = Some((r, v.as_string().map(str::to_string)));
+        }
+        assert_eq!(last, Some((nd.file_path, Some(format!("{path}/")))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn refused_plugin_writes_return_an_error() {
         let pool = NDArrayPool::new(1_000_000);
@@ -4000,9 +4848,16 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        // C `writeOctet` keeps callParamCallbacks' status
+        // (NDPluginDriver.cpp:845: `status = (asynStatus)callParamCallbacks(addr);`).
         assert!(
             rt.block_on(port.write_octet(p.nd_array_port, 0, b"NOPE".to_vec()))
                 .is_ok()
+        );
+        assert_eq!(
+            rt.block_on(port.read_octet(p.nd_array_port, 0, 16))
+                .unwrap(),
+            b"NOPE"
         );
         assert!(
             rt.block_on(port.write_octet(p.nd_array_port, 0, b"UP".to_vec()))
@@ -4016,7 +4871,7 @@ mod tests {
         for line in [
             "NDPluginDriver::createCallbackThreads error, numThreads=2 must be <= maxThreads=1, setting to 1".to_string(),
             format!(
-                "NDPluginDriver::writeInt32 ERROR, status=3, function={}, paramName=NUM_THREADS, value=1, connectedToArrayPort_=1",
+                "NDPluginDriver::writeInt32 ERROR, status=3, function={}, paramName=NUM_THREADS, value=2, connectedToArrayPort_=1",
                 p.num_threads
             ),
             "NDPluginDriver::createCallbackThreads error, numThreads=0 must be >= 1, setting to 1".to_string(),

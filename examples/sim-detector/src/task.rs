@@ -7,6 +7,7 @@ use rand::rngs::StdRng;
 
 use asyn_rs::port_handle::PortHandle;
 
+use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::driver::{ADStatus, ImageMode};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::params::ADBaseParams;
@@ -147,8 +148,17 @@ impl TaskState {
         // Build a temporary NDArray wrapper for crop_roi (which now takes &NDArray)
         let mut temp_arr = NDArray::new(layout.make_dims(), self.raw_buf.data_type());
         temp_arr.data = self.raw_buf.clone();
-        crop_roi(&temp_arr, &layout, min_x, min_y, size_x, size_y)
-            .expect("crop_roi failed on uncompressed data")
+        let mut frame = crop_roi(&temp_arr, &layout, min_x, min_y, size_x, size_y)
+            .expect("crop_roi failed on uncompressed data");
+        // C computeImage labels every image (simDetector.cpp:171); the
+        // attribute is what `NDArray::info` reads the layout from.
+        frame.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "Color mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(config.color_mode as i32),
+        ));
+        frame
     }
 }
 

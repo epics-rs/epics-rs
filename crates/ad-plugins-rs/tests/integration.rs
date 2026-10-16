@@ -661,7 +661,7 @@ fn test_circular_buff_trigger_flow() {
     let proc = CircularBuffProcessor::new(
         2, // pre_count
         1, // post_count
-        TriggerCondition::External,
+        TriggerCondition::default(),
         100, // max_buffers (C maxBuffers_)
     );
     // C NDCircBuffControl = 1: the plugin records nothing until acquisition is

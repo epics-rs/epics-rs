@@ -132,4 +132,15 @@ fn test_rgb1_mode_acquisition() {
         .read_int32_blocking(rt.ad_params.base.array_counter, 0)
         .unwrap();
     assert_eq!(counter, 1);
+    // The frame's ColorMode attribute (simDetector.cpp:171) sizes it as RGB1.
+    let read = |idx| handle.read_int32_blocking(idx, 0).unwrap();
+    let b = &rt.ad_params.base;
+    assert_eq!(
+        (
+            read(b.array_size_x),
+            read(b.array_size_y),
+            read(b.array_size)
+        ),
+        (16, 16, 16 * 16 * 3)
+    );
 }

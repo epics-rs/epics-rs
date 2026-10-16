@@ -19,10 +19,10 @@ use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
+use ad_core_rs::plugin::file_controller::{
+    FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
+use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
 
 use rust_hdf5::{H5Dataset, H5File};
@@ -325,8 +325,9 @@ pub struct NexusWriter {
     uid_dataset: Option<H5Dataset>,
     /// Per-frame `timeStamp` dataset.
     ts_dataset: Option<H5Dataset>,
-    /// Parsed NeXus XML template tree, if a valid template was loaded.
-    template: Option<XmlElement>,
+    /// Parsed NeXus XML template tree, if a valid template was loaded; read
+    /// at open, where C's `openFile` walks `configDoc`.
+    template: WriterSettings<Option<XmlElement>>,
     /// HDF5 path of the group that contains the main array dataset (template
     /// mode); the dataset itself is named by the template's `pArray` node.
     data_group_path: String,
@@ -346,7 +347,7 @@ impl NexusWriter {
             dataset: None,
             uid_dataset: None,
             ts_dataset: None,
-            template: None,
+            template: WriterSettings::new(None),
             data_group_path: "entry/instrument/detector".to_string(),
             data_node_name: "data".to_string(),
             nxdata_group_path: None,
@@ -359,7 +360,7 @@ impl NexusWriter {
 
     /// Whether a NeXus XML template is currently loaded.
     pub fn has_template(&self) -> bool {
-        self.template.is_some()
+        self.template.store().get(Option::is_some)
     }
 
     /// Load (parse and validate) a NeXus XML template. On success the template
@@ -367,21 +368,12 @@ impl NexusWriter {
     /// the writer falls back to its built-in NXentry/NXdata hierarchy. Returns
     /// whether the template parsed successfully (C++ `NDFileNexusTemplateValid`).
     pub fn load_template(&mut self, xml: &str) -> bool {
-        match parse_nexus_template(xml) {
-            Ok(root) => {
-                self.template = Some(root);
-                true
-            }
-            Err(_) => {
-                self.template = None;
-                false
-            }
-        }
+        store_template(&self.template.store(), Some(xml))
     }
 
     /// Clear any loaded template (revert to the built-in hierarchy).
     pub fn clear_template(&mut self) {
-        self.template = None;
+        store_template(&self.template.store(), None);
     }
 
     /// Write the NeXus `NX_class` group marker as a true HDF5 group attribute.
@@ -634,7 +626,8 @@ impl NDFileWriter for NexusWriter {
         self.ts_dataset = None;
         self.nxdata_group_path = None;
 
-        if let Some(template) = self.template.clone() {
+        self.template.refresh();
+        if let Some(template) = (*self.template).clone() {
             // Template mode: build the group/dataset tree from the user's
             // NeXus XML template (C++ NDFileNexus::loadTemplateFile).
             let (data_group, data_node) = Self::process_template(&h5file, &template, array)?;
@@ -946,61 +939,40 @@ impl NDFileWriter for NexusWriter {
 // Processor
 // ============================================================
 
+/// Parse `xml` into `store`, or clear it; whether a template is now loaded.
+fn store_template(store: &SettingsStore<Option<XmlElement>>, xml: Option<&str>) -> bool {
+    let root = xml.and_then(|x| parse_nexus_template(x).ok());
+    let valid = root.is_some();
+    store.update(|t| *t = root);
+    valid
+}
+
 pub struct NexusFileProcessor {
     ctrl: Mutex<FilePluginController<NexusWriter>>,
+    template: SettingsStore<Option<XmlElement>>,
     template_path_idx: Option<usize>,
     template_file_idx: Option<usize>,
     template_valid_idx: Option<usize>,
-    /// The template path/file pair a `NEXUS_TEMPLATE_*` write updates. Held
-    /// under its own lock, always taken before `ctrl`.
-    template: Mutex<NexusTemplateSource>,
-}
-
-/// The `NEXUS_TEMPLATE_PATH` / `NEXUS_TEMPLATE_FILE` pair, which
-/// `reload_template` concatenates.
-#[derive(Default)]
-struct NexusTemplateSource {
-    path: String,
-    file: String,
 }
 
 impl NexusFileProcessor {
     pub fn new() -> Self {
+        let writer = NexusWriter::new();
         Self {
-            ctrl: Mutex::new(FilePluginController::new(NexusWriter::new())),
+            template: writer.template.store(),
+            ctrl: Mutex::new(FilePluginController::new(writer)),
             template_path_idx: None,
             template_file_idx: None,
             template_valid_idx: None,
-            template: Mutex::new(NexusTemplateSource::default()),
         }
     }
 
-    /// Load the NeXus XML template from `template_path + template_file`
-    /// (C++ NDFileNexus::loadTemplateFile). Returns the validity flag value
-    /// for `NEXUS_TEMPLATE_VALID`: 1 if a template was loaded and parsed,
-    /// 0 if the file is unset, missing, or fails to parse.
-    fn reload_template(&self) -> i32 {
-        let full = {
-            let t = self.template.lock();
-            if t.file.is_empty() {
-                self.ctrl.lock().writer.clear_template();
-                return 0;
-            }
-            format!("{}{}", t.path, t.file)
-        };
-        match std::fs::read_to_string(&full) {
-            Ok(xml) => {
-                if self.ctrl.lock().writer.load_template(&xml) {
-                    1
-                } else {
-                    0
-                }
-            }
-            Err(_) => {
-                self.ctrl.lock().writer.clear_template();
-                0
-            }
-        }
+    /// Load the NeXus XML template at `full` (C++
+    /// NDFileNexus::loadTemplateFile); a file that cannot be read or parsed
+    /// leaves no template, as C's NULL `configDoc` does.
+    fn load_template(&self, full: &str) -> bool {
+        let xml = std::fs::read_to_string(full).ok();
+        store_template(&self.template, xml.as_deref())
     }
 }
 
@@ -1012,6 +984,66 @@ impl Default for NexusFileProcessor {
 
 impl NDPluginProcess for NexusFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        self.ctrl.lock().write_int32(reason, value, verdict)
+    }
+
+    /// C `NDFileNexus::writeOctet` (NDFileNexus.cpp:776-813) loads the
+    /// template inside the write, from the path and file in the param
+    /// library, so a capture opened next uses it; a file write in progress
+    /// does not hold the write up.
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        let out = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict);
+        let stored = |idx: Option<usize>| {
+            if Some(reason) == idx {
+                return out.verdict.kept();
+            }
+            idx.and_then(|i| params.get_string_param(i, 0).ok())
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default()
+        };
+        if Some(reason) != self.template_path_idx && Some(reason) != self.template_file_idx {
+            return self.ctrl.lock().write_octet(reason, out.verdict);
+        }
+        let file = stored(self.template_file_idx);
+        // C returns before touching the template or its flag (:825).
+        if file.is_empty() {
+            return out;
+        }
+        let full = format!("{}{file}", stored(self.template_path_idx));
+        let valid = self.load_template(&full);
+        let out = match self.template_valid_idx {
+            Some(i) => out.set_int32(i, 0, valid as i32),
+            None => out,
+        };
+        if valid {
+            return out;
+        }
+        out.print(
+            asyn_rs::trace::TraceMask::ERROR,
+            format!("NDFileNexus:loadTemplateFile: Parameter file {full} is invalid"),
+        )
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
@@ -1044,43 +1076,6 @@ impl NDPluginProcess for NexusFileProcessor {
         self.template_file_idx = Some(file_idx);
         self.template_valid_idx = Some(valid_idx);
         Ok(())
-    }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        use ad_core_rs::plugin::runtime::ParamChangeValue;
-
-        // NeXus XML template path / file changes trigger a template reload
-        // (C++ NDFileNexus::writeInt32 / writeOctet → loadTemplateFile).
-        if Some(reason) == self.template_path_idx {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                self.template.lock().path = s.clone();
-            }
-            let valid = self.reload_template();
-            return self.template_valid_result(valid);
-        }
-        if Some(reason) == self.template_file_idx {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                self.template.lock().file = s.clone();
-            }
-            let valid = self.reload_template();
-            return self.template_valid_result(valid);
-        }
-        self.ctrl.lock().on_param_change(reason, params)
-    }
-}
-
-impl NexusFileProcessor {
-    /// Build a ParamChangeResult that updates `NEXUS_TEMPLATE_VALID`.
-    fn template_valid_result(&self, valid: i32) -> ParamChangeResult {
-        use ad_core_rs::plugin::runtime::ParamUpdate;
-        match self.template_valid_idx {
-            Some(idx) => ParamChangeResult::updates(vec![ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: valid,
-            }]),
-            None => ParamChangeResult::empty(),
-        }
     }
 }
 
@@ -1299,8 +1294,8 @@ mod tests {
     }
 
     #[test]
-    fn test_template_param_change_sets_valid_flag() {
-        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+    fn a_template_write_stores_it_without_waiting_on_a_file_write() {
+        use ad_core_rs::plugin::runtime::SideParam;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let dir = std::env::temp_dir();
@@ -1321,22 +1316,55 @@ mod tests {
         let file_idx = proc.template_file_idx.unwrap();
         let valid_idx = proc.template_valid_idx.unwrap();
 
-        let result = proc.on_param_change(
-            file_idx,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: file_idx,
-                addr: 0,
-                value: ParamChangeValue::Octet(tmpl_path.to_string_lossy().into_owned()),
-            },
-        );
-        assert!(result.param_updates.iter().any(|u| matches!(
+        let path = tmpl_path.to_string_lossy().into_owned();
+        // A file write in progress does not hold the template write up; the
+        // writer takes the template at its next open.
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        let mut out = None;
+        assert!(crate::test_util::returns_while_busy(&writer, || {
+            out = Some(proc.validate_octet(
+                file_idx,
+                0,
+                &path,
+                ad_core_rs::plugin::runtime::WriteVerdict::Accept(path.clone()),
+                &base,
+            ));
+        }));
+        assert!(out.unwrap().side.iter().any(|u| matches!(
             u,
-            ParamUpdate::Int32 { reason, value: 1, .. } if *reason == valid_idx
+            SideParam::Int32 { reason, value: 1, .. } if *reason == valid_idx
         )));
-        assert!(proc.ctrl.lock().writer.has_template());
+        assert!(proc.template.get(Option::is_some));
+        assert!(
+            writer.lock().template.is_none(),
+            "not read before the next open"
+        );
 
         std::fs::remove_file(&tmpl_path).ok();
+
+        // :825 returns on an empty file; a bad one prints and clears (:830-836).
+        let write = |v: &str| {
+            proc.validate_octet(
+                file_idx,
+                0,
+                v,
+                ad_core_rs::plugin::runtime::WriteVerdict::Accept(v.to_owned()),
+                &base,
+            )
+        };
+        let out = write("");
+        assert!(out.side.is_empty() && out.trace.is_empty());
+        assert!(proc.template.get(Option::is_some));
+        let out = write(&path);
+        assert!(out.side.iter().any(|u| matches!(
+            u,
+            SideParam::Int32 { reason, value: 0, .. } if *reason == valid_idx
+        )));
+        assert_eq!(
+            out.trace[0].1,
+            format!("NDFileNexus:loadTemplateFile: Parameter file {path} is invalid")
+        );
+        assert!(!proc.template.get(Option::is_some));
     }
 
     #[test]

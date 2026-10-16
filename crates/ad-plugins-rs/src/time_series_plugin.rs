@@ -6,7 +6,7 @@
 //! averaged into one output point and written into a per-signal circular buffer.
 //!
 //! Stats and Attribute feed it as C does: each frame they post a 1-D Float64
-//! array of their per-frame values at address 1 ([`time_series_point`]), and an
+//! array of their per-frame values at address 1 (`time_series_point`), and an
 //! `NDTimeSeriesConfigure(…, "STATS1", 1, …)` port reads that address.
 //!
 //! Output form matches C exactly: `TS_TIME_SERIES` is read at `addr == signal`
@@ -34,8 +34,7 @@ use std::time::Instant;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    ArrayCallbacks, NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot,
-    ProcessResult,
+    ArrayCallbacks, NDPluginProcess, ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict,
 };
 use ad_core_rs::timestamp::EpicsTimestamp;
 use asyn_rs::param::ParamType;
@@ -55,6 +54,7 @@ enum AcquireMode {
 }
 
 /// Resolved parameter indices, filled by `register_params`.
+#[derive(Clone)]
 struct Params {
     ts_acquire: usize,
     ts_read: usize,
@@ -517,6 +517,87 @@ impl TimeSeriesState {
 
 impl NDPluginProcess for TimeSeriesProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+
+    /// C `NDPluginTimeSeries::writeInt32` (NDPluginTimeSeries.cpp:441-490):
+    /// its branch runs inside the write, before `callParamCallbacks`. It keeps
+    /// the base class clamp but replaces its errorMessage with its own,
+    /// carrying `getAddress`'s status (`"%s: status=%d, function=%d, value=%d"`,
+    /// :481).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+        _params: &PortDriverBase,
+    ) -> WriteOutcome<i32> {
+        let verdict = match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginTimeSeries::writeInt32: status=0, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        };
+        let value = verdict.kept();
+        let mut state = self.state.lock();
+        let p = &state.p;
+        let mut posts = Vec::new();
+        let updates = if reason == p.ts_num_points {
+            state.num_time_points = value.max(1) as usize;
+            state.allocate_arrays()
+        } else if reason == p.ts_acquire_mode {
+            state.acquire_mode = if value == 0 {
+                AcquireMode::Fixed
+            } else {
+                AcquireMode::Circular
+            };
+            let mut updates = state.acquire_reset();
+            updates.extend(state.create_axis_array());
+            updates
+        } else if reason == p.ts_acquire {
+            state.acquiring = value != 0;
+            if value != 0 {
+                state.acquire_reset()
+            } else {
+                state.do_time_series_callbacks(&self.array_callbacks, &self.pool, &mut posts)
+            }
+        } else if reason == p.ts_read {
+            state.do_time_series_callbacks(&self.array_callbacks, &self.pool, &mut posts)
+        } else {
+            return verdict.into();
+        };
+        WriteOutcome::from(verdict)
+            .set_updates(updates)
+            .post_addressed(posts)
+            .settled()
+    }
+
+    /// C `NDPluginTimeSeries::writeFloat64` (NDPluginTimeSeries.cpp:492-530):
+    /// `computeNumAverage` posts AveragingTime, NumAverage and the time axis
+    /// inside the write (:509, :512).
+    fn validate_float64(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: f64,
+        verdict: WriteVerdict<f64>,
+        _params: &PortDriverBase,
+    ) -> WriteOutcome<f64> {
+        let value = verdict.kept();
+        let mut state = self.state.lock();
+        if reason == state.p.ts_time_per_point {
+            state.time_per_point = value;
+        } else if reason == state.p.ts_averaging_time {
+            state.averaging_time_requested = value;
+        } else {
+            return verdict.into();
+        }
+        let updates = state.compute_num_average();
+        WriteOutcome::from(verdict).set_updates(updates).settled()
+    }
+
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // C processCallbacks: this plugin only handles 1-D or 2-D arrays.
         let ndims = array.dims.len();
@@ -598,57 +679,6 @@ impl NDPluginProcess for TimeSeriesProcessor {
             .set_float64_array(state.p.ts_time_axis, 0, axis)?;
         Ok(())
     }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        let mut state = self.state.lock();
-        let mut updates = Vec::new();
-        let mut posts = Vec::new();
-        if reason == state.p.ts_num_points {
-            // C writeInt32 P_TSNumPoints -> allocateArrays().
-            state.num_time_points = params.value.as_i32().max(1) as usize;
-            updates.extend(state.allocate_arrays());
-        } else if reason == state.p.ts_acquire_mode {
-            // C writeInt32 P_TSAcquireMode -> acquireReset(); createAxisArray().
-            state.acquire_mode = if params.value.as_i32() == 0 {
-                AcquireMode::Fixed
-            } else {
-                AcquireMode::Circular
-            };
-            updates.extend(state.acquire_reset());
-            updates.extend(state.create_axis_array());
-        } else if reason == state.p.ts_acquire {
-            // C writeInt32 P_TSAcquire -> if value acquireReset() else doTimeSeriesCallbacks().
-            if params.value.as_i32() != 0 {
-                state.acquiring = true;
-                updates.extend(state.acquire_reset());
-            } else {
-                state.acquiring = false;
-                updates.extend(state.do_time_series_callbacks(
-                    &self.array_callbacks,
-                    &self.pool,
-                    &mut posts,
-                ));
-            }
-        } else if reason == state.p.ts_read {
-            // C writeInt32 P_TSRead -> doTimeSeriesCallbacks().
-            updates.extend(state.do_time_series_callbacks(
-                &self.array_callbacks,
-                &self.pool,
-                &mut posts,
-            ));
-        } else if reason == state.p.ts_time_per_point {
-            // C writeFloat64 P_TSTimePerPoint -> computeNumAverage().
-            state.time_per_point = params.value.as_f64();
-            updates.extend(state.compute_num_average());
-        } else if reason == state.p.ts_averaging_time {
-            // C writeFloat64 P_TSAveragingTime -> computeNumAverage().
-            state.averaging_time_requested = params.value.as_f64();
-            updates.extend(state.compute_num_average());
-        }
-        let mut result = ParamChangeResult::updates(updates);
-        result.addressed = posts;
-        result
-    }
 }
 
 /// The 1-D Float64 array Stats and Attribute post at address 1 for an
@@ -675,6 +705,30 @@ pub(crate) fn time_series_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::plugin::runtime::SideParam;
+
+    /// `"%s: status=%d, function=%d, value=%d"` (NDPluginTimeSeries.cpp:481).
+    #[test]
+    fn a_refused_base_write_carries_c_error_message() {
+        let proc = TimeSeriesProcessor::new(1, NDArrayPool::new(0));
+        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(71, 0, 99, clamp, &base).verdict,
+            WriteVerdict::Refuse {
+                keep: 1,
+                message: "NDPluginTimeSeries::writeInt32: status=0, function=71, value=99".into(),
+            }
+        );
+        assert_eq!(
+            proc.validate_int32(71, 0, 1, WriteVerdict::Accept(1), &base)
+                .verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
     use asyn_rs::port::{PortDriverBase, PortFlags};
 
     // ---- averaged_value: divide first, then narrow (CBUG-B25) ----
@@ -795,23 +849,116 @@ mod tests {
         assert!(res.addressed.iter().all(|(_, a)| a.unique_id == 0));
     }
 
-    /// A TSAcquire 0 write posts from the write path (C writeInt32 :468), and
-    /// each post takes the next uniqueId (:367).
+    fn side_array(out: &WriteOutcome<i32>, reason: usize, addr: i32) -> Option<Vec<f64>> {
+        out.side.iter().find_map(|p| match p {
+            SideParam::Float64Array {
+                reason: r,
+                addr: a,
+                value,
+            } if *r == reason && *a == addr => Some(value.clone()),
+            _ => None,
+        })
+    }
+
+    /// A TSAcquire 0 write posts its waveforms and arrays inside the write
+    /// (C writeInt32 :468), and each post takes the next uniqueId (:367).
     #[test]
     fn test_stop_write_posts_with_the_next_unique_id() {
         let (proc, _) = filled_fixed_u16("TST_TS_STOP");
-        let acquire = proc.state.lock().p.ts_acquire;
-        let res = proc.on_param_change(
-            acquire,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: acquire,
-                addr: 0,
-                value: ad_core_rs::plugin::runtime::ParamChangeValue::Int32(0),
-            },
+        let base = PortDriverBase::new("TST_TS_STOP_B", 3, PortFlags::default());
+        let (acquire, series) = {
+            let st = proc.state.lock();
+            (st.p.ts_acquire, st.p.ts_time_series)
+        };
+        let out = proc.validate_int32(acquire, 0, 0, WriteVerdict::Accept(0), &base);
+        assert!(out.settled);
+        assert!(!proc.state.lock().acquiring);
+        assert_eq!(side_array(&out, series, 0), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(side_array(&out, series, 1), Some(vec![10.0, 20.0, 30.0]));
+        assert_eq!(out.addressed.0.len(), 3);
+        assert!(out.addressed.0.iter().all(|(_, a)| a.unique_id == 1));
+    }
+
+    /// C writeInt32 :457 and :459: NumPoints reallocates and AcquireMode
+    /// flips the axis, both inside the write.
+    #[test]
+    fn test_num_points_and_acquire_mode_writes_carry_the_axis() {
+        let proc = make_proc(1, "TST_TS_NPTS");
+        let base = PortDriverBase::new("TST_TS_NPTS_B", 2, PortFlags::default());
+        let p = proc.state.lock().p.clone();
+        proc.state.lock().averaging_time_actual = 1.0;
+        let out = proc.validate_int32(p.ts_num_points, 0, 3, WriteVerdict::Accept(3), &base);
+        assert!(out.settled);
+        assert_eq!(
+            side_array(&out, p.ts_time_axis, 0),
+            Some(vec![0.0, 1.0, 2.0])
         );
-        assert_eq!(res.addressed.len(), 3);
-        assert!(res.addressed.iter().all(|(_, a)| a.unique_id == 1));
+        assert!(out.side.contains(&SideParam::Int32 {
+            reason: p.ts_current_point,
+            addr: 0,
+            value: 0,
+        }));
+        let out = proc.validate_int32(p.ts_acquire_mode, 0, 1, WriteVerdict::Accept(1), &base);
+        assert!(out.settled);
+        assert_eq!(
+            side_array(&out, p.ts_time_axis, 0),
+            Some(vec![-2.0, -1.0, 0.0])
+        );
+        let out = proc.validate_int32(p.ts_acquire, 0, 1, WriteVerdict::Accept(1), &base);
+        assert!(out.settled && proc.state.lock().acquiring);
+        assert!(out.addressed.0.is_empty());
+    }
+
+    /// C writeFloat64 :509 and :512: computeNumAverage posts AveragingTime,
+    /// NumAverage and the axis inside the write.
+    #[test]
+    fn test_averaging_time_write_carries_num_average() {
+        let proc = make_proc(1, "TST_TS_AVG");
+        let base = PortDriverBase::new("TST_TS_AVG_B", 2, PortFlags::default());
+        let p = proc.state.lock().p.clone();
+        let out = proc.validate_float64(
+            p.ts_time_per_point,
+            0,
+            0.5,
+            WriteVerdict::Accept(0.5),
+            &base,
+        );
+        assert!(out.settled);
+        let out = proc.validate_float64(
+            p.ts_averaging_time,
+            0,
+            2.0,
+            WriteVerdict::Accept(2.0),
+            &base,
+        );
+        assert!(out.settled);
+        assert!(out.side.contains(&SideParam::Float64 {
+            reason: p.ts_averaging_time,
+            addr: 0,
+            value: 2.0,
+        }));
+        assert!(out.side.contains(&SideParam::Int32 {
+            reason: p.ts_num_average,
+            addr: 0,
+            value: 4,
+        }));
+        assert!(out.side.iter().any(|s| matches!(
+            s,
+            SideParam::Float64Array { reason, .. } if *reason == p.ts_time_axis
+        )));
+    }
+
+    /// A base-class param is left to the port: no side params, not settled.
+    #[test]
+    fn test_a_base_param_write_is_not_settled() {
+        let proc = make_proc(1, "TST_TS_BASE");
+        let base = PortDriverBase::new("TST_TS_BASE_B", 2, PortFlags::default());
+        // make_proc numbers the TS params from 0; this is none of them.
+        const BASE: usize = 1000;
+        let out = proc.validate_int32(BASE, 0, 1, WriteVerdict::Accept(1), &base);
+        assert!(!out.settled && out.side.is_empty() && out.addressed.0.is_empty());
+        let out = proc.validate_float64(BASE, 0, 1.0, WriteVerdict::Accept(1.0), &base);
+        assert!(!out.settled && out.side.is_empty());
     }
 
     fn find_array(res: &ProcessResult, reason: usize, addr: i32) -> Option<Vec<f64>> {

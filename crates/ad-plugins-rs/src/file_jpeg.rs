@@ -6,10 +6,10 @@ use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
+use ad_core_rs::plugin::file_controller::{
+    FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
+use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 use parking_lot::Mutex;
@@ -17,19 +17,19 @@ use parking_lot::Mutex;
 /// JPEG file writer using `jpeg-encoder` for encoding and `jpeg-decoder` for decoding.
 pub struct JpegWriter {
     current_path: Option<PathBuf>,
-    pub(crate) quality: u8,
+    pub(crate) quality: WriterSettings<u8>,
 }
 
 impl JpegWriter {
     pub fn new(quality: u8) -> Self {
         Self {
             current_path: None,
-            quality,
+            quality: WriterSettings::new(quality),
         }
     }
 
     pub fn set_quality(&mut self, quality: u8) {
-        self.quality = quality;
+        self.quality.store().update(|q| *q = quality);
     }
 }
 
@@ -41,6 +41,8 @@ impl NDFileWriter for JpegWriter {
                 "JPEG only supports UInt8/Int8 data".into(),
             ));
         }
+        // C reads NDFileJPEGQuality here (NDFileJPEG.cpp:98).
+        self.quality.refresh();
         self.current_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -112,7 +114,7 @@ impl NDFileWriter for JpegWriter {
         };
 
         let mut buf = Vec::new();
-        let encoder = JpegEncoder::new(&mut buf, self.quality);
+        let encoder = JpegEncoder::new(&mut buf, *self.quality);
         encoder
             .encode(&data, width as u16, height as u16, color_type)
             .map_err(|e| ADError::UnsupportedConversion(format!("JPEG encode error: {}", e)))?;
@@ -172,13 +174,16 @@ impl NDFileWriter for JpegWriter {
 /// JPEG file processor wrapping `FilePluginController<JpegWriter>`.
 pub struct JpegFileProcessor {
     ctrl: Mutex<FilePluginController<JpegWriter>>,
+    quality: SettingsStore<u8>,
     jpeg_quality_idx: Option<usize>,
 }
 
 impl JpegFileProcessor {
     pub fn new(quality: u8) -> Self {
+        let writer = JpegWriter::new(quality);
         Self {
-            ctrl: Mutex::new(FilePluginController::new(JpegWriter::new(quality))),
+            quality: writer.quality.store(),
+            ctrl: Mutex::new(FilePluginController::new(writer)),
             jpeg_quality_idx: None,
         }
     }
@@ -192,6 +197,42 @@ impl Default for JpegFileProcessor {
 
 impl NDPluginProcess for JpegFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870). C reads
+    /// NDFileJPEGQuality from the param library at open (NDFileJPEG.cpp:98),
+    /// so the write stores it without waiting on a file write in progress.
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let mut ctrl = self.ctrl.lock();
+        let out = ctrl.write_int32(reason, value, verdict);
+        if Some(reason) == self.jpeg_quality_idx {
+            let q = out.verdict.kept().clamp(1, 100) as u8;
+            self.quality.update(|v| *v = q);
+        }
+        out
+    }
+
+    /// C NDPluginFile::writeOctet: the setting is stored inside the write.
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        self.ctrl.lock().write_octet(reason, verdict)
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
@@ -216,19 +257,9 @@ impl NDPluginProcess for JpegFileProcessor {
         // Seed the readback PV with the actual encoder default (C++ NDFileJPEG.cpp:327
         // sets NDFileJPEGQuality default to 50). Without this the PV reads 0 while the
         // encoder uses its constructed default, so PV and effective quality disagree.
-        base.set_int32_param(idx, 0, i32::from(self.ctrl.lock().writer.quality))?;
+        base.set_int32_param(idx, 0, i32::from(self.quality.get(|q| *q)))?;
         self.jpeg_quality_idx = Some(idx);
         Ok(())
-    }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        // JPEG-specific: quality change
-        if Some(reason) == self.jpeg_quality_idx {
-            let q = params.value.as_i32().clamp(1, 100) as u8;
-            self.ctrl.lock().writer.set_quality(q);
-            return ParamChangeResult::empty();
-        }
-        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
@@ -410,8 +441,8 @@ mod tests {
     #[test]
     fn test_default_quality_is_50() {
         // C++ NDFileJPEG.cpp:327 default quality is 50.
-        assert_eq!(JpegFileProcessor::default().ctrl.lock().writer.quality, 50);
-        assert_eq!(JpegWriter::new(50).quality, 50);
+        assert_eq!(JpegFileProcessor::default().quality.get(|q| *q), 50);
+        assert_eq!(*JpegWriter::new(50).quality, 50);
     }
 
     #[test]
@@ -423,6 +454,29 @@ mod tests {
         let idx = proc.jpeg_quality_idx.unwrap();
         // Readback PV must equal the encoder's effective quality, not 0.
         assert_eq!(base.get_int32_param(idx, 0).unwrap(), 50);
+    }
+
+    /// C reads NDFileJPEGQuality at open (NDFileJPEG.cpp:98), so a quality
+    /// write during a file write returns at once and the next open takes it.
+    #[test]
+    fn a_quality_write_during_a_busy_write_returns_at_once() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("jpeg_quality_write", 1, PortFlags::default());
+        let mut proc = JpegFileProcessor::new(50);
+        proc.register_params(&mut base).unwrap();
+        let idx = proc.jpeg_quality_idx.unwrap();
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        assert!(
+            crate::test_util::returns_while_busy(&writer, || {
+                proc.validate_int32(idx, 0, 80, WriteVerdict::Accept(80), &base);
+            }),
+            "the quality write waited for the file write"
+        );
+        let mut w = writer.lock();
+        assert_eq!(*w.quality, 50, "not read before the next open");
+        w.quality.refresh();
+        assert_eq!(*w.quality, 80);
     }
 
     #[test]

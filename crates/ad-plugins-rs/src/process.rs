@@ -298,108 +298,6 @@ impl ProcessState {
         }
     }
 
-    /// Apply a named filter type preset, setting the FC/OC/RC coefficients.
-    ///
-    /// Uses the C++ coefficient scheme where:
-    ///
-    /// ```text
-    /// O1 = oScale * (oc[0] + oc[1]/N), O2 = oScale * (oc[2] + oc[3]/N)
-    /// F1 = fScale * (fc[0] + fc[1]/N), F2 = fScale * (fc[2] + fc[3]/N)
-    /// data[i]   = oOffset + O1*filter[i] + O2*data[i]
-    /// filter[i] = fOffset + F1*filter[i] + F2*data[i]
-    /// ```
-    pub fn apply_filter_type(&mut self, filter_type: i32) {
-        let fc = &mut self.config.filter;
-        match filter_type {
-            0 => {
-                // RecursiveAve: running average
-                // F1=fScale*(0 + 1/N)=1/N (old filter weight decreases)
-                // F2=fScale*(1 + -1/N)=(N-1)/N (new data weight increases)
-                // Actually: F[n]=(1-1/N)*F[n-1] + (1/N)*data[n]
-                //   fc1=0, fc2=1 → F1=fScale*(0+1/N)=1/N ← weight on filter
-                // Wait, the formula is: F2=fScale*(fc3+fc4/N)
-                // For recursive avg: filter = ((N-1)*filter + data)/N
-                //   F1 applied to filter: want (N-1)/N → fc1=1, fc2=-1
-                //     F1 = fScale*(1 + (-1)/N) = (N-1)/N ✓
-                //   F2 applied to data: want 1/N → fc3=0, fc4=1
-                //     F2 = fScale*(0 + 1/N) = 1/N ✓
-                // O1 applied to filter: want 1 → oc1=1, oc2=0
-                // O2 applied to data: want 0 → oc3=0, oc4=0
-                fc.fc = [1.0, -1.0, 0.0, 1.0];
-                fc.oc = [1.0, 0.0, 0.0, 0.0];
-                fc.rc = [0.0, 1.0]; // reset: filter = data
-                fc.r_offset = 0.0;
-                fc.f_offset = 0.0;
-                fc.f_scale = 1.0;
-                fc.o_offset = 0.0;
-                fc.o_scale = 1.0;
-            }
-            1 => {
-                // Average: accumulate sum in filter, output = filter/N
-                // filter = filter + data → F1=1*filter, F2=1*data
-                //   fc1=1,fc2=0 → F1=fScale*(1+0/N)=1; fc3=1,fc4=0 → F2=fScale*(1+0/N)=1
-                // output = filter/N → O1=1/N*filter
-                //   oc1=0,oc2=1 → O1=oScale*(0+1/N)=1/N; oc3=0,oc4=0 → O2=0
-                fc.fc = [1.0, 0.0, 1.0, 0.0];
-                fc.oc = [0.0, 1.0, 0.0, 0.0];
-                fc.rc = [0.0, 1.0]; // reset: filter = data
-                fc.r_offset = 0.0;
-                fc.f_offset = 0.0;
-                fc.f_scale = 1.0;
-                fc.o_offset = 0.0;
-                fc.o_scale = 1.0;
-            }
-            2 => {
-                // Sum: filter = filter + data, output = filter
-                fc.fc = [1.0, 0.0, 1.0, 0.0];
-                fc.oc = [1.0, 0.0, 0.0, 0.0];
-                fc.rc = [0.0, 1.0];
-                fc.r_offset = 0.0;
-                fc.f_offset = 0.0;
-                fc.f_scale = 1.0;
-                fc.o_offset = 0.0;
-                fc.o_scale = 1.0;
-            }
-            3 => {
-                // Difference: output = data - filter, filter = data
-                // O1=-1*filter, O2=1*data → oc1=-1,oc2=0,oc3=1,oc4=0
-                // F1=0, F2=1*data → fc1=0,fc2=0,fc3=1,fc4=0
-                fc.fc = [0.0, 0.0, 1.0, 0.0];
-                fc.oc = [-1.0, 0.0, 1.0, 0.0];
-                fc.rc = [0.0, 1.0];
-                fc.r_offset = 0.0;
-                fc.f_offset = 0.0;
-                fc.f_scale = 1.0;
-                fc.o_offset = 0.0;
-                fc.o_scale = 1.0;
-            }
-            4 => {
-                // RecursiveAveDiff: output = data - running_avg
-                // Same filter as RecursiveAve but output = data - filter
-                fc.fc = [1.0, -1.0, 0.0, 1.0];
-                fc.oc = [-1.0, 0.0, 1.0, 0.0];
-                fc.rc = [0.0, 1.0];
-                fc.r_offset = 0.0;
-                fc.f_offset = 0.0;
-                fc.f_scale = 1.0;
-                fc.o_offset = 0.0;
-                fc.o_scale = 1.0;
-            }
-            5 => {
-                // CopyToFilter: filter = data, output = filter
-                fc.fc = [0.0, 0.0, 1.0, 0.0];
-                fc.oc = [1.0, 0.0, 0.0, 0.0];
-                fc.rc = [0.0, 1.0];
-                fc.r_offset = 0.0;
-                fc.f_offset = 0.0;
-                fc.f_scale = 1.0;
-                fc.o_offset = 0.0;
-                fc.o_scale = 1.0;
-            }
-            _ => {} // Unknown type — leave coefficients unchanged
-        }
-    }
-
     /// Request a filter reset on the next processed frame.
     ///
     /// This is the `ResetFilter` parameter write. C only clears the PV
@@ -433,10 +331,9 @@ impl ProcessState {
         // ARMS scale/offset + clipping for the NEXT frame -- the trigger frame
         // itself is emitted with the pre-existing config, NOT the derived scale
         // (NDPluginProcess.cpp:164-178 only updates min/max; 238-250 arms the
-        // params after the output array is built). Consume the one-shot here and
-        // defer the arming until after this frame's output is produced.
+        // params after the output array is built). The request stays set
+        // until `finish_auto_offset_scale` clears it, as C's param does.
         let auto_offset_scale_now = self.config.auto_offset_scale_pending;
-        self.config.auto_offset_scale_pending = false;
 
         // Recompute valid background / flat field each frame from the element
         // count (C NDPluginProcess.cpp:120-125): a saved buffer is usable only
@@ -572,6 +469,17 @@ impl ProcessState {
         self.last_output = Some(Arc::clone(arr));
     }
 
+    /// C clears AutoOffsetScale after a frame that read it once an output
+    /// array exists (NDPluginProcess.cpp:263-265); until then every frame
+    /// reads it again. Returns whether it was cleared.
+    fn finish_auto_offset_scale(&mut self, frame: &ProcessFrame) -> bool {
+        let done = frame.auto_offset_scale_now && self.last_output.is_some();
+        if done {
+            self.config.auto_offset_scale_pending = false;
+        }
+        done
+    }
+
     /// Process an array through the configured pipeline.
     ///
     /// Returns `Some(output)` for a normal frame, or `None` when the frame is
@@ -597,10 +505,12 @@ impl ProcessState {
         let mut values = elements_as_f64(src);
         frame.apply_element_ops(&mut values);
         if !self.run_filter(&frame, &mut values) {
+            self.finish_auto_offset_scale(&frame);
             return Ok(None);
         }
         let arr = Arc::new(frame.build_output(pool, src, &values)?);
         self.end_frame(&frame, src, &arr);
+        self.finish_auto_offset_scale(&frame);
         Ok(Some(arr))
     }
 }
@@ -1002,7 +912,6 @@ struct ProcParamIndices {
     high_clip_thresh: Option<usize>,
     high_clip_value: Option<usize>,
     enable_filter: Option<usize>,
-    filter_type: Option<usize>,
     reset_filter: Option<usize>,
     auto_reset_filter: Option<usize>,
     filter_callbacks: Option<usize>,
@@ -1045,6 +954,47 @@ impl ProcessProcessor {
 
 impl NDPluginProcess for ProcessProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+
+    /// C `NDPluginProcess::writeInt32` drops the base class status
+    /// (`status = (asynStatus) callParamCallbacks(addr);`, NDPluginProcess.cpp:318): a refused NDPluginDriver write keeps
+    /// its clamp and succeeds.
+    ///
+    /// SaveBackground/SaveFlatField save and clear themselves inside the
+    /// write (:287-310); AutoOffsetScale is only stored, and the frame that
+    /// uses it clears it (:263-265).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let p = &self.params;
+        let saved = |valid: Option<usize>, ok: bool| {
+            let out = WriteOutcome::from(WriteVerdict::Accept(0));
+            match valid {
+                Some(i) => out.set_int32(i, 0, ok as i32),
+                None => out,
+            }
+            .settled()
+        };
+        if Some(reason) == p.save_background {
+            let mut s = self.state.lock();
+            s.save_background();
+            saved(p.valid_background, s.config.valid_background)
+        } else if Some(reason) == p.save_flat_field {
+            let mut s = self.state.lock();
+            s.save_flat_field();
+            saved(p.valid_flat_field, s.config.valid_flat_field)
+        } else if Some(reason) == p.auto_offset_scale {
+            self.state.lock().config.auto_offset_scale_pending = value != 0;
+            WriteOutcome::from(WriteVerdict::Accept(value)).settled()
+        } else {
+            verdict.succeed().into()
+        }
+    }
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
@@ -1136,6 +1086,11 @@ impl NDPluginProcess for ProcessProcessor {
         if let Some(idx) = self.params.reset_filter {
             result.param_updates.push(ParamUpdate::int32(idx, 0));
         }
+        if frame.auto_offset_scale_now && self.state.lock().finish_auto_offset_scale(&frame) {
+            if let Some(idx) = self.params.auto_offset_scale {
+                result.param_updates.push(ParamUpdate::int32(idx, 0));
+            }
+        }
 
         result
     }
@@ -1173,7 +1128,6 @@ impl NDPluginProcess for ProcessProcessor {
         base.create_param("HIGH_CLIP_THRESH", ParamType::Float64)?;
         base.create_param("HIGH_CLIP_VALUE", ParamType::Float64)?;
         base.create_param("ENABLE_FILTER", ParamType::Int32)?;
-        base.create_param("FILTER_TYPE", ParamType::Int32)?;
         base.create_param("RESET_FILTER", ParamType::Int32)?;
         base.create_param("AUTO_RESET_FILTER", ParamType::Int32)?;
         base.create_param("FILTER_CALLBACKS", ParamType::Int32)?;
@@ -1215,7 +1169,6 @@ impl NDPluginProcess for ProcessProcessor {
         self.params.high_clip_thresh = base.find_param("HIGH_CLIP_THRESH");
         self.params.high_clip_value = base.find_param("HIGH_CLIP_VALUE");
         self.params.enable_filter = base.find_param("ENABLE_FILTER");
-        self.params.filter_type = base.find_param("FILTER_TYPE");
         self.params.reset_filter = base.find_param("RESET_FILTER");
         self.params.auto_reset_filter = base.find_param("AUTO_RESET_FILTER");
         self.params.filter_callbacks = base.find_param("FILTER_CALLBACKS");
@@ -1244,12 +1197,11 @@ impl NDPluginProcess for ProcessProcessor {
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
-        use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamUpdate};
+        use ad_core_rs::plugin::runtime::ParamChangeResult;
 
         let mut state = self.state.lock();
         let s = &mut *state;
         let p = &self.params;
-        let mut updates = Vec::new();
 
         if Some(reason) == p.data_type {
             let v = params.value.as_i32();
@@ -1258,42 +1210,14 @@ impl NDPluginProcess for ProcessProcessor {
             } else {
                 NDDataType::from_ordinal(v as u8)
             };
-        } else if Some(reason) == p.save_background {
-            // C `writeInt32` (:287-298) acts on ANY write to SaveBackground,
-            // including a 0 — there is no value test — and does the whole save
-            // right here: clear the PV, drop the old buffer, then copy pArrays[0]
-            // (the last OUTPUT array) if one exists and latch ValidBackground.
-            s.save_background();
-            updates.push(ParamUpdate::int32(reason, 0));
-            if let Some(idx) = p.valid_background {
-                updates.push(ParamUpdate::int32(idx, s.config.valid_background as i32));
-            }
         } else if Some(reason) == p.enable_background {
             s.config.enable_background = params.value.as_i32() != 0;
-        } else if Some(reason) == p.save_flat_field {
-            // C `writeInt32` (:299-310), same shape as SaveBackground above.
-            s.save_flat_field();
-            updates.push(ParamUpdate::int32(reason, 0));
-            if let Some(idx) = p.valid_flat_field {
-                updates.push(ParamUpdate::int32(idx, s.config.valid_flat_field as i32));
-            }
         } else if Some(reason) == p.enable_flat_field {
             s.config.enable_flat_field = params.value.as_i32() != 0;
         } else if Some(reason) == p.scale_flat_field {
             s.config.scale_flat_field = params.value.as_f64();
         } else if Some(reason) == p.enable_offset_scale {
             s.config.enable_offset_scale = params.value.as_i32() != 0;
-        } else if Some(reason) == p.auto_offset_scale {
-            if params.value.as_i32() != 0 {
-                // Arm the one-shot: auto_offset_scale() runs on the next
-                // process() call (it needs an NDArray to read the data
-                // range). C++ resets NDPluginProcessAutoOffsetScale to 0
-                // after handling, so echo a 0 readback here.
-                s.config.auto_offset_scale_pending = true;
-                if let Some(idx) = p.auto_offset_scale {
-                    updates.push(ParamUpdate::int32(idx, 0));
-                }
-            }
         } else if Some(reason) == p.offset {
             s.config.offset = params.value.as_f64();
         } else if Some(reason) == p.scale {
@@ -1312,41 +1236,6 @@ impl NDPluginProcess for ProcessProcessor {
             s.config.high_clip_value = params.value.as_f64();
         } else if Some(reason) == p.enable_filter {
             s.config.enable_filter = params.value.as_i32() != 0;
-        } else if Some(reason) == p.filter_type {
-            // C maps FilterType to coefficients in the database
-            // (NDProcess.template:809-825 `FilterTypeSeq` writes FC/OC/RC only)
-            // and NDPluginProcess::writeInt32 (:274-329) never touches pFilter
-            // or numFiltered. Only the coefficients change here.
-            s.apply_filter_type(params.value.as_i32());
-            // Push updated coefficients back
-            let fc = &s.config.filter;
-            for (i, idx) in p.fc.iter().enumerate() {
-                if let Some(idx) = *idx {
-                    updates.push(ParamUpdate::float64(idx, fc.fc[i]));
-                }
-            }
-            for (i, idx) in p.oc.iter().enumerate() {
-                if let Some(idx) = *idx {
-                    updates.push(ParamUpdate::float64(idx, fc.oc[i]));
-                }
-            }
-            for (i, idx) in p.rc.iter().enumerate() {
-                if let Some(idx) = *idx {
-                    updates.push(ParamUpdate::float64(idx, fc.rc[i]));
-                }
-            }
-            if let Some(idx) = p.f_offset {
-                updates.push(ParamUpdate::float64(idx, fc.f_offset));
-            }
-            if let Some(idx) = p.f_scale {
-                updates.push(ParamUpdate::float64(idx, fc.f_scale));
-            }
-            if let Some(idx) = p.o_offset {
-                updates.push(ParamUpdate::float64(idx, fc.o_offset));
-            }
-            if let Some(idx) = p.o_scale {
-                updates.push(ParamUpdate::float64(idx, fc.o_scale));
-            }
         } else if Some(reason) == p.reset_filter {
             if params.value.as_i32() != 0 {
                 // Arm the reset; the next processed frame consumes it, clears
@@ -1390,13 +1279,29 @@ impl NDPluginProcess for ProcessProcessor {
             }
         }
 
-        ParamChangeResult::updates(updates)
+        ParamChangeResult::empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `status = (asynStatus) callParamCallbacks(addr);` (NDPluginProcess.cpp:318).
+    #[test]
+    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = ProcessProcessor::new(ProcessConfig::default());
+        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
     use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
 
     fn pool() -> Arc<NDArrayPool> {
@@ -1954,7 +1859,7 @@ mod tests {
         // C's writeInt32 branches on the FUNCTION, never on the value
         // (NDPluginProcess.cpp:287): a caput of 0 to SaveBackground runs the same
         // release-and-resave sequence. The port gated on `value != 0`.
-        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+        use ad_core_rs::plugin::runtime::{SideParam, WriteVerdict};
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let mut proc = ProcessProcessor::new(ProcessConfig {
@@ -1969,34 +1874,59 @@ mod tests {
 
         let reason = proc.params.save_background.unwrap();
         let valid = proc.params.valid_background.unwrap();
-        let snapshot = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason,
-            addr: 0,
-            value: ParamChangeValue::Int32(0),
-        };
-        let result = proc.on_param_change(reason, &snapshot);
+        let out = proc.validate_int32(reason, 0, 0, WriteVerdict::Accept(0), &base);
 
         assert_eq!(
             proc.state.lock().background.as_ref().unwrap().as_slice(),
             &[4.0, 5.0, 6.0],
             "a 0 write saves the background too"
         );
-        // The PV self-clears and ValidBackground is published from the same write.
-        let int_update = |r: usize| {
-            result.param_updates.iter().find_map(|u| match u {
-                ParamUpdate::Int32 {
-                    reason: ur, value, ..
-                } if *ur == r => Some(*value),
-                _ => None,
-            })
-        };
-        assert_eq!(int_update(reason), Some(0), "SaveBackground echoes 0");
+        // The PV self-clears and ValidBackground is set inside the same write.
         assert_eq!(
-            int_update(valid),
-            Some(1),
-            "ValidBackground latches on the write"
+            out.verdict,
+            WriteVerdict::Accept(0),
+            "SaveBackground keeps 0"
         );
+        assert_eq!(
+            out.side,
+            [SideParam::Int32 {
+                reason: valid,
+                addr: 0,
+                value: 1
+            }]
+        );
+        assert!(out.settled);
+    }
+
+    /// AutoOffsetScale is stored as written (C has no writeInt32 branch for
+    /// it) and the frame that reads it clears it (NDPluginProcess.cpp:263-265);
+    /// a 0 written before that frame cancels it.
+    #[test]
+    fn auto_offset_scale_is_cleared_by_the_frame_as_c_process_callbacks_does() {
+        use ad_core_rs::plugin::runtime::{ParamUpdate, WriteVerdict};
+        let mut proc = ProcessProcessor::new(ProcessConfig::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        proc.register_params(&mut base).unwrap();
+        let reason = proc.params.auto_offset_scale.unwrap();
+        let pool = NDArrayPool::new(1_000_000);
+        let cleared = |r: &ProcessResult| {
+            r.param_updates.iter().any(
+                |u| matches!(u, ParamUpdate::Int32 { reason: ur, value: 0, .. } if *ur == reason),
+            )
+        };
+
+        let out = proc.validate_int32(reason, 0, 1, WriteVerdict::Accept(1), &base);
+        assert_eq!(out.verdict, WriteVerdict::Accept(1));
+        assert!(out.side.is_empty());
+        proc.validate_int32(reason, 0, 0, WriteVerdict::Accept(0), &base);
+        let r = proc.process_array(&Arc::new(make_array(&[1, 9])), &pool);
+        assert!(!cleared(&r), "a written 0 cancels the request");
+        assert!(!proc.state.lock().config.enable_offset_scale);
+
+        proc.validate_int32(reason, 0, 1, WriteVerdict::Accept(1), &base);
+        let r = proc.process_array(&Arc::new(make_array(&[1, 9])), &pool);
+        assert!(cleared(&r));
+        assert!(proc.state.lock().config.enable_offset_scale);
     }
 
     #[test]

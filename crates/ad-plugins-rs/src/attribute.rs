@@ -173,6 +173,34 @@ impl NDPluginProcess for AttributeProcessor {
         Ok(())
     }
 
+    /// C `NDPluginAttribute::writeInt32` drops the base class status
+    /// (`status = (asynStatus) callParamCallbacks();`, NDPluginAttribute.cpp:136): a refused NDPluginDriver write keeps
+    /// its clamp and succeeds. Reset zeros Val/ValSum on every channel inside
+    /// the write, whatever the value (:122-128).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let out = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict.succeed());
+        if reason != self.params.reset {
+            return out;
+        }
+        let mut channels = self.channels.lock();
+        let mut out = out;
+        for (i, ch) in channels.iter_mut().enumerate() {
+            ch.value = 0.0;
+            ch.value_sum = 0.0;
+            out = out
+                .set_float64(self.params.value, i as i32, 0.0)
+                .set_float64(self.params.value_sum, i as i32, 0.0);
+        }
+        out.settled()
+    }
+
     fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         let addr = params.addr as usize;
 
@@ -183,18 +211,6 @@ impl NDPluginProcess for AttributeProcessor {
                     channels[addr].name = s.clone();
                 }
             }
-        } else if reason == self.params.reset {
-            // C zeros Val/ValSum for all channels on ANY write to the reset
-            // param — there is no value test (NDPluginAttribute.cpp:123-128).
-            let mut updates = Vec::new();
-            for (i, ch) in self.channels.lock().iter_mut().enumerate() {
-                ch.value = 0.0;
-                ch.value_sum = 0.0;
-                let a = i as i32;
-                updates.push(ParamUpdate::float64_addr(self.params.value, a, 0.0));
-                updates.push(ParamUpdate::float64_addr(self.params.value_sum, a, 0.0));
-            }
-            return ParamChangeResult::updates(updates);
         }
 
         ParamChangeResult::updates(vec![])
@@ -233,6 +249,22 @@ pub fn create_attribute_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `status = (asynStatus) callParamCallbacks();` (NDPluginAttribute.cpp:136).
+    #[test]
+    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = AttributeProcessor::new("", 8);
+        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 
@@ -277,6 +309,37 @@ mod tests {
         proc.process_array(&Arc::new(arr2), &pool);
         assert!((proc.value() - 20.0).abs() < 1e-10);
         assert!((proc.value_sum() - 30.0).abs() < 1e-10);
+    }
+
+    /// NDPluginAttribute.cpp:122-128: a Reset write of any value zeros every
+    /// channel's Val/ValSum inside the write.
+    #[test]
+    fn reset_zeros_every_channel_inside_the_write_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::{SideParam, WriteVerdict};
+        let mut proc = AttributeProcessor::new("Count", 2);
+        let mut base = PortDriverBase::new("T", 2, Default::default());
+        proc.register_params(&mut base).unwrap();
+        let pool = NDArrayPool::new(1_000_000);
+        proc.process_array(&Arc::new(make_array_with_attr("Count", 100.0, 1)), &pool);
+
+        let p = proc.params;
+        let out = proc.validate_int32(p.reset, 0, 0, WriteVerdict::Accept(0), &base);
+        assert!(out.settled);
+        let zero = |reason, addr| SideParam::Float64 {
+            reason,
+            addr,
+            value: 0.0,
+        };
+        assert_eq!(
+            out.side,
+            [
+                zero(p.value, 0),
+                zero(p.value_sum, 0),
+                zero(p.value, 1),
+                zero(p.value_sum, 1)
+            ]
+        );
+        assert_eq!(proc.value_sum(), 0.0);
     }
 
     #[test]
@@ -475,42 +538,6 @@ mod tests {
         );
         // C retains the last successfully-read Val across the missing frame.
         assert!((proc.value() - 5.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_reset_clears_on_zero_write() {
-        // C NDPluginAttribute::writeInt32 zeros Val/ValSum on ANY write to the
-        // reset param, including value 0 (NDPluginAttribute.cpp:123-128).
-        let mut proc = AttributeProcessor::new("Count", 8);
-        proc.params.value = 2;
-        proc.params.value_sum = 3;
-        proc.params.reset = 7;
-
-        let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&Arc::new(make_array_with_attr("Count", 100.0, 1)), &pool);
-        assert!((proc.value_sum() - 100.0).abs() < 1e-10);
-
-        let snapshot = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 7,
-            addr: 0,
-            value: ParamChangeValue::Int32(0),
-        };
-        let result = proc.on_param_change(7, &snapshot);
-
-        assert!((proc.value() - 0.0).abs() < 1e-10);
-        assert!((proc.value_sum() - 0.0).abs() < 1e-10);
-        assert!(
-            result.param_updates.iter().any(|u| matches!(
-                u,
-                ParamUpdate::Float64 {
-                    reason: 2,
-                    value,
-                    ..
-                } if *value == 0.0
-            )),
-            "zero write must post cleared ATTR_VAL"
-        );
     }
 
     #[test]

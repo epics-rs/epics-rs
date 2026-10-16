@@ -538,6 +538,23 @@ impl NDPluginProcess for TransformProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C NDPluginTransform has no writeInt32 override, so NDPluginDriver's
+    /// failure reaches the record.
+    #[test]
+    fn a_refused_base_write_stays_refused() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = TransformProcessor::new(TransformType::None);
+        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(0, 0, 98, clamp.clone(), &base).verdict,
+            clamp
+        );
+    }
     use ad_core_rs::ndarray::NDDataType;
 
     fn pool() -> std::sync::Arc<NDArrayPool> {
